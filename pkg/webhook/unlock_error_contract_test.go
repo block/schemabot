@@ -494,6 +494,54 @@ func TestUnlockCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Contains(t, body, "acquired after the command was received")
 		assert.Contains(t, body, "Comment `schemabot unlock` again")
 	})
+
+	t.Run("a lock timestamp in the receipt second is left in place", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		issuedAt := time.Now().Truncate(time.Second).Add(500 * time.Millisecond)
+		lock := prOwnedOrdersLock()
+		lock.CreatedAt = issuedAt.Add(-time.Hour)
+		lock.UpdatedAt = issuedAt.Truncate(time.Second)
+		lockStore := &unlockTestLockStore{locks: []*storage.Lock{lock}}
+		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.unlockCommandCore(t.Context(), issuedAt, "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+		require.NoError(t, err)
+		assert.False(t, retry)
+		assert.Zero(t, lockStore.releaseCalls, "a lock refreshed in the receipt second must stay held")
+		body := requireComment(t, comments, "stale-command answer")
+		assert.Contains(t, body, "At least one current lock")
+		assert.Contains(t, body, "this command released nothing")
+	})
+
+	t.Run("mixed reacquired and already gone locks report the held lock", func(t *testing.T) {
+		client, mux := setupGitHubServer(t)
+		comments := recordComments(t, mux)
+		ordersLock := prOwnedOrdersLock()
+		billingLock := prOwnedOrdersLock()
+		billingLock.DatabaseName = "billing"
+		lockStore := &unlockTestLockStore{
+			locks: []*storage.Lock{ordersLock, billingLock},
+			releaseErrs: map[string]error{
+				"orders":  storage.ErrLockIntentChanged,
+				"billing": storage.ErrLockNotFound,
+			},
+		}
+		st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+		retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
+
+		require.NoError(t, err)
+		assert.False(t, retry)
+		assert.Empty(t, lockStore.released, "this command released nothing")
+		body := requireComment(t, comments, "mixed stale-command answer")
+		assert.Contains(t, body, "At least one current lock")
+		assert.Contains(t, body, "this command released nothing")
+		assert.NotContains(t, body, "Every lock matched")
+	})
 }
 
 // serveUnlockInferencePR registers the PR read and changed-files routes

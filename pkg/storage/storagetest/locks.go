@@ -501,6 +501,13 @@ func TestLocks(t *testing.T, h Harness) {
 		require.NotNil(t, current, "the lock acquired again for a new plan must stay held")
 		assert.Equal(t, checked.ID, current.ID)
 		assert.Equal(t, "plan-2", current.PendingPlanID)
+
+		err = store.Locks().ReleaseByID(ctx, current.ID, "reacquired_db", storage.DatabaseTypeMySQL, "org/repo#42", "PLAN-2")
+		require.ErrorIs(t, err, storage.ErrLockIntentChanged, "the pending plan compares byte-exact")
+		current, err = store.Locks().Get(ctx, "reacquired_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, current, "a differently cased plan ID must not release the lock")
+		assert.Equal(t, "plan-2", current.PendingPlanID)
 	})
 
 	t.Run("ReleaseIfPendingPlanID", func(t *testing.T) {

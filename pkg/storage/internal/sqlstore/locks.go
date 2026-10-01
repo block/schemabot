@@ -277,7 +277,7 @@ func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType,
 	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
-		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND pending_plan_id = ?
+		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND `+s.dialect.BinaryEquals("pending_plan_id")+`
 	`, id, database, dbType, owner, pendingPlanID)
 	if err != nil {
 		return fmt.Errorf("release lock row %d for %s/%s owner=%s: %w", id, database, dbType, owner, err)

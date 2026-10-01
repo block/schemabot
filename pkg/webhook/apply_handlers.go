@@ -1148,8 +1148,9 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// stale-command answer prompting a fresh comment, never a wrongful release.
 	fresh := make([]*storage.Lock, 0, len(locks))
 	var skippedNewer int
+	receiptSecond := issuedAt.Truncate(time.Second)
 	for _, lock := range locks {
-		if lock.CreatedAt.After(issuedAt) || lock.UpdatedAt.After(issuedAt) {
+		if !lock.CreatedAt.Before(receiptSecond) || !lock.UpdatedAt.Before(receiptSecond) {
 			skippedNewer++
 			h.logger.Warn("unlock will not release a lock acquired after the command was received",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
@@ -1286,7 +1287,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		return true, fmt.Errorf("unlock command release locks %s#%d: %w", repo, pr, errors.Join(releaseErrs...))
 	}
 	if released == 0 && reacquired > 0 {
-		h.logger.Info("unlock released nothing because every remaining lock was acquired again after the command",
+		h.logger.Info("unlock released nothing because at least one current lock was acquired again after the command",
 			"repo", repo, "pr", pr, "reacquired", reacquired, "already_gone", alreadyGone)
 		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockStaleCommandMessage)
 		return false, nil
@@ -1303,9 +1304,9 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	return false, nil
 }
 
-// unlockStaleCommandMessage answers an unlock whose every matched lock was
-// acquired, or acquired again, after the command was received.
-const unlockStaleCommandMessage = "Every lock matched by this unlock command was acquired after the command was received, so nothing was released. Comment `schemabot unlock` again to release the current locks."
+// unlockStaleCommandMessage answers an unlock when at least one current lock
+// was acquired, or acquired again, no earlier than the command receipt second.
+const unlockStaleCommandMessage = "At least one current lock matched by this unlock command was acquired after the command was received, and this command released nothing. Comment `schemabot unlock` again to release the current locks."
 
 // isVettedLockGone reports whether a row-pinned release found that the lock
 // row unlock vetted no longer holds the lock: no lock is held at all
