@@ -58,10 +58,11 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
 2. **Apply** — the Spirit engine intercepts the `DROP TABLE` and renames the
    table into `_pending_drops` with a UTC timestamp prefix
    (`YYYYMMDDHHmmSSmmm_<table>`, capped at MySQL's 64-character name limit).
-   A table name too long to fit is shortened and ends in `_<hash>`, eight hex
-   characters derived from its schema and full name, and so is a name that
-   would otherwise match another table quarantined in the same rename (the
-   same table name in two schemas, say), so every table gets its own copy.
+   A table name too long to fit is shortened by characters and ends in
+   `_<hash>`, derived from its schema and full name. A name that would otherwise
+   match another table quarantined in the same rename (the same table name in
+   two schemas, say) uses progressively more hash characters until it is
+   unique, so every table gets its own copy.
    The rename is atomic and metadata-only, so it completes immediately
    regardless of table size. The apply log records the quarantine table name.
 3. **Retention** — the table sits in `_pending_drops` with its data intact.

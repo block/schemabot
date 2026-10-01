@@ -90,8 +90,11 @@ func Destinations(tables []TableMove, now time.Time) []QuarantinedTable {
 	taken := make(map[string]struct{}, len(tables))
 	for _, table := range tables {
 		name := TableName(table.SchemaName, table.TableName, now)
-		if _, ok := taken[strings.ToLower(name)]; ok {
-			name = disambiguatedTableName(timestampPrefix(now), table.SchemaName, table.TableName)
+		for attempt := 0; ; attempt++ {
+			if _, ok := taken[strings.ToLower(name)]; !ok {
+				break
+			}
+			name = disambiguatedTableName(timestampPrefix(now), table.SchemaName, table.TableName, attempt)
 		}
 		taken[strings.ToLower(name)] = struct{}{}
 		moved = append(moved, QuarantinedTable{

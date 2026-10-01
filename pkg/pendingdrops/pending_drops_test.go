@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,6 +44,21 @@ func TestTableNameCapsAtMySQLLimit(t *testing.T) {
 	parsed, ok := ParseTimestamp(name)
 	require.True(t, ok)
 	assert.Equal(t, now, parsed)
+}
+
+func TestTableNameCountsCharactersAndPreservesUTF8(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 0, time.UTC)
+	table := strings.Repeat("é", 40)
+
+	name := TableName("app", table, now)
+
+	assert.Equal(t, "20260610143022000_"+table, name)
+	assert.Equal(t, 58, len([]rune(name)))
+	assert.True(t, strings.Contains(name, table))
+
+	truncated := TableName("app", strings.Repeat("é", 80), now)
+	assert.True(t, utf8.ValidString(truncated))
+	assert.Equal(t, 64, len([]rune(truncated)))
 }
 
 func TestDestinationsAreUniqueWithinOneMove(t *testing.T) {
@@ -120,6 +136,39 @@ func TestDestinationsKeepPlainNameWhenNoCollision(t *testing.T) {
 	assert.Equal(t, "20260610143022123_users", moved[0].QuarantineTable)
 	assert.Equal(t, "20260610143022123_orders", moved[1].QuarantineTable)
 	assert.Equal(t, "20260610143022123_"+strings.Repeat("c", 46), moved[2].QuarantineTable)
+}
+
+func TestDestinationsProgressPastHashPrefixCollision(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 123*int(time.Millisecond), time.UTC)
+	tables := []TableMove{
+		{SchemaName: "app", TableName: strings.Repeat("a", 55) + "018256"},
+		{SchemaName: "app", TableName: strings.Repeat("a", 55) + "029916"},
+	}
+
+	moved := Destinations(tables, now)
+
+	require.Len(t, moved, 2)
+	assert.NotEqual(t, strings.ToLower(moved[0].QuarantineTable), strings.ToLower(moved[1].QuarantineTable))
+	assert.Equal(t, 64, len([]rune(moved[0].QuarantineTable)))
+	assert.Equal(t, 64, len([]rune(moved[1].QuarantineTable)))
+	assert.Equal(t, moved, Destinations(tables, now))
+}
+
+// Every attempt stays within the identifier limit and yields a distinct name,
+// including the attempts where the hash alone would overrun the room left
+// after the timestamp prefix.
+func TestDisambiguatedTableNameStaysDistinctAndBoundedAcrossAttempts(t *testing.T) {
+	prefix := timestampPrefix(time.Date(2026, 6, 10, 14, 30, 22, 0, time.UTC))
+	seen := make(map[string]struct{})
+	for attempt := range 120 {
+		name := disambiguatedTableName(prefix, "app", strings.Repeat("a", 80), attempt)
+		assert.LessOrEqual(t, utf8.RuneCountInString(name), 64, "attempt %d", attempt)
+		assert.True(t, strings.HasPrefix(name, prefix), "attempt %d: %s", attempt, name)
+		_, dup := seen[name]
+		assert.False(t, dup, "attempt %d repeated %s", attempt, name)
+		seen[name] = struct{}{}
+		assert.Equal(t, name, disambiguatedTableName(prefix, "app", strings.Repeat("a", 80), attempt))
+	}
 }
 
 func TestTableNameDisambiguatesTruncatedNamesBySource(t *testing.T) {

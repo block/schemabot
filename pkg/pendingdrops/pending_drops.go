@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strconv"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -53,8 +54,8 @@ const (
 // their leading characters still get different quarantine names.
 func TableName(schemaName, tableName string, now time.Time) string {
 	prefix := timestampPrefix(now)
-	if len(prefix)+len(tableName) > tableNameLengthLimit {
-		return disambiguatedTableName(prefix, schemaName, tableName)
+	if utf8.RuneCountInString(prefix)+utf8.RuneCountInString(tableName) > tableNameLengthLimit {
+		return disambiguatedTableName(prefix, schemaName, tableName, 0)
 	}
 	return prefix + tableName
 }
@@ -66,16 +67,27 @@ func timestampPrefix(now time.Time) string {
 }
 
 // disambiguatedTableName returns prefix, then as much of tableName as fits,
-// then "_" and a short hash of the source schema and full table name, capped
-// at MySQL's 64-character limit. The hash depends only on the source table, so
-// the same table and prefix always produce the same name, and the name still
-// starts with the timestamp prefix ParseTimestamp reads.
-func disambiguatedTableName(prefix, schemaName, tableName string) string {
-	sum := sha256.Sum256([]byte(schemaName + "\x00" + tableName))
-	suffix := "_" + hex.EncodeToString(sum[:])[:disambiguatorHashLen]
-	maxTableLen := tableNameLengthLimit - len(prefix) - len(suffix)
-	if len(tableName) > maxTableLen {
-		tableName = tableName[:maxTableLen]
+// then "_" and a hash of the source schema and full table name, capped at
+// MySQL's 64-character limit. Each later attempt consumes one more hex
+// character of the hash until the prefix and hash alone fill the limit, after
+// which attempts salt the hash instead, so every attempt yields a distinct
+// name. The same table, prefix, and attempt always produce the same name, and
+// the name still starts with the timestamp prefix ParseTimestamp reads.
+func disambiguatedTableName(prefix, schemaName, tableName string, attempt int) string {
+	prefixLen := utf8.RuneCountInString(prefix)
+	maxHashLen := tableNameLengthLimit - prefixLen - len("_")
+	hashInput := schemaName + "\x00" + tableName
+	hashLen := disambiguatorHashLen + attempt
+	if hashLen > maxHashLen {
+		hashInput += "\x00" + strconv.Itoa(attempt)
+		hashLen = disambiguatorHashLen
+	}
+	sum := sha256.Sum256([]byte(hashInput))
+	suffix := "_" + hex.EncodeToString(sum[:])[:hashLen]
+	maxTableLen := tableNameLengthLimit - prefixLen - len(suffix)
+	tableRunes := []rune(tableName)
+	if len(tableRunes) > maxTableLen {
+		tableName = string(tableRunes[:maxTableLen])
 	}
 	return prefix + tableName + suffix
 }
