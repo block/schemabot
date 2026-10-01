@@ -33,6 +33,10 @@ func previewLockReleasedOutput() {
 	WriteLockForceReleased("testapp", "mysql", "block/schemabot#123")
 }
 
+func previewLockKeptOutput() {
+	WriteLockKept("testapp", "mysql", "apply apply-a1b2c3d4 is stopped and can still be resumed")
+}
+
 func previewLocksListOutput() {
 	locks := []LockData{
 		{

@@ -25,6 +25,7 @@ import (
 type PlanCmd struct {
 	SchemaDir   string `short:"s" help:"Schema directory with schemabot.yaml and .sql files" default:"." name:"schema_dir"`
 	Environment string `short:"e" help:"Target environment (omit to show all environments)"`
+	Target      string `help:"Plan only this rollout member of the environment: its target, or deployment/target when the name is ambiguous; requires -e" name:"target"`
 	Repository  string `help:"Repository name (optional, for tracking)"`
 	PullRequest int    `help:"Pull request number (optional, for tracking)" name:"pull-request"`
 	JSON        bool   `help:"Output as JSON"`
@@ -32,6 +33,14 @@ type PlanCmd struct {
 
 // Run executes the plan command.
 func (cmd *PlanCmd) Run(g *Globals) error {
+	if cmd.Target != "" && cmd.Environment == "" {
+		errMsg := "--target names a rollout member of one environment; pass -e with it"
+		if cmd.JSON {
+			return client.ExitWithJSON("invalid_request", errMsg)
+		}
+		return fmt.Errorf("%s", errMsg)
+	}
+
 	// Load config from schema directory
 	cfg, err := LoadCLIConfig(cmd.SchemaDir)
 	if err != nil {
@@ -86,7 +95,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		var result *apitypes.PlanResponse
 		err := withLoading("Generating schema change plan...", !cmd.JSON, func() error {
 			var planErr error
-			result, ignoredByEnv[env], planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(), false)
+			result, ignoredByEnv[env], planErr = client.CallPlanAPIForTarget(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(), false, cmd.Target)
 			return planErr
 		})
 		if err != nil {
@@ -122,6 +131,9 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 
 	// Human-readable output for all environments
 	outputMultiEnvPlanResult(allResults, cfg.Database, cfg.SchemaDir)
+	if cmd.Target != "" {
+		writeNarrowedTo(allResults[cmd.Environment])
+	}
 	return nil
 }
 

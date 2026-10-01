@@ -17,7 +17,7 @@ import (
 
 // planColumns lists all columns for SELECT queries.
 const planColumns = `id, plan_identifier, database_name, database_type,
-	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at`
+	deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, narrowed_to, created_at`
 
 // planListColumns matches planColumns except schema_files, which is replaced
 // by a NULL placeholder so the scan shape stays identical. schema_files holds
@@ -25,7 +25,7 @@ const planColumns = `id, plan_identifier, database_name, database_type,
 // listings never need it, so List leaves SchemaFiles unhydrated rather than
 // transferring megabytes per page.
 const planListColumns = `id, plan_identifier, database_name, database_type,
-	deployment, target, repository, pull_request, schema_path, environment, NULL AS schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at`
+	deployment, target, repository, pull_request, schema_path, environment, NULL AS schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, narrowed_to, created_at`
 
 // planStore implements storage.PlanStore using MySQL.
 type planStore struct {
@@ -54,9 +54,9 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 	}
 
 	id, err := s.identity.InsertID(ctx, s.db, `
-		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.PrimaryPlanIdentifier, directExecutionJSON, plan.CreatedAt)
+		INSERT INTO plans (plan_identifier, database_name, database_type, deployment, target, repository, pull_request, schema_path, environment, schema_files, plan_data, head_sha, primary_plan_identifier, direct_execution, narrowed_to, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, plan.PlanIdentifier, plan.Database, plan.DatabaseType, plan.Deployment, plan.Target, plan.Repository, plan.PullRequest, plan.SchemaPath, plan.Environment, string(schemaFilesJSON), string(planDataJSON), plan.HeadSHA, plan.PrimaryPlanIdentifier, directExecutionJSON, plan.NarrowedTo, plan.CreatedAt)
 	if err != nil {
 		if s.classifier.IsDuplicateKey(err) {
 			return 0, storage.ErrPlanIDExists
@@ -65,6 +65,31 @@ func (s *planStore) Create(ctx context.Context, plan *storage.Plan) (int64, erro
 	}
 
 	return id, nil
+}
+
+// UpdateRoute restamps a stored plan's deployment, target and narrowing. The
+// update only matches a row that records no narrowing or this one, so it never
+// widens a narrowed row or points it at another member; the narrowing is read
+// back, and a row left on another narrowing is an error.
+func (s *planStore) UpdateRoute(ctx context.Context, planIdentifier, deployment, target, narrowedTo string) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE plans SET deployment = ?, target = ?, narrowed_to = ?
+		WHERE plan_identifier = ? AND (narrowed_to = '' OR narrowed_to = ?)
+	`, deployment, target, narrowedTo, planIdentifier, narrowedTo); err != nil {
+		return fmt.Errorf("update route of plan %s to deployment %q target %q narrowed to %q: %w", planIdentifier, deployment, target, narrowedTo, err)
+	}
+	var stored string
+	err := s.db.QueryRowContext(ctx, `SELECT narrowed_to FROM plans WHERE plan_identifier = ?`, planIdentifier).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("update route of plan %s: no plan carries the identifier", planIdentifier)
+	}
+	if err != nil {
+		return fmt.Errorf("read back narrowing of plan %s after updating its route: %w", planIdentifier, err)
+	}
+	if stored != narrowedTo {
+		return fmt.Errorf("update route of plan %s: the stored plan records narrowing %q, not %q, and was left unchanged", planIdentifier, stored, narrowedTo)
+	}
+	return nil
 }
 
 // Get returns a plan by plan_identifier (external identifier), or nil if not found.
@@ -257,6 +282,7 @@ func scanPlanInto(s scanner) (*storage.Plan, error) {
 		&plan.HeadSHA,
 		&plan.PrimaryPlanIdentifier,
 		&directExecutionJSON,
+		&plan.NarrowedTo,
 		&plan.CreatedAt,
 	)
 	if err != nil {

@@ -93,12 +93,15 @@ type CutoverCommandAcceptedData struct {
 }
 
 // RenderControlMissingApplyID renders the message posted when an apply-scoped
-// control command is invoked without the required apply ID.
-func RenderControlMissingApplyID(command string) string {
+// control command is invoked without the required apply ID. The usage line is
+// the PR-comment command; the status lookup is a CLI command, so it starts
+// with cliName and is scoped to the environment the command named, or to the
+// placeholder when it named none.
+func RenderControlMissingApplyID(cliName, command, environment string) string {
 	usage := fmt.Sprintf("schemabot %s <apply-id> -e <environment>", command)
 	return offerSupportChannel(fmt.Sprintf("## Missing Apply ID\n\n"+
 		"Usage: `%s`\n\n"+
-		"Use `schemabot status -e <environment>` to find the apply ID.", usage))
+		"Use `%s` to find the apply ID.", usage, cliCommand(cliName, "status "+environmentFlag(environment))))
 }
 
 // RenderStopCommandAccepted renders the acknowledgement posted when a PR

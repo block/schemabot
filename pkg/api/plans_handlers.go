@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -194,7 +193,7 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 			if change.IsUnsafe {
 				summary.UnsafeCount++
 			}
-			if change.ExecutionMode == engine.ExecutionModeBlocked {
+			if change.EngineBlocked() {
 				summary.BlockedCount++
 			}
 		}
@@ -229,6 +228,7 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 		Environment:  plan.Environment,
 		Deployment:   plan.Deployment,
 		Target:       plan.Target,
+		NarrowedTo:   plan.NarrowedTo,
 		Engine:       storage.EngineForType(plan.DatabaseType),
 		Changes:      []*apitypes.SchemaChangeResponse{},
 		LintResults:  []*apitypes.LintViolationResponse{},

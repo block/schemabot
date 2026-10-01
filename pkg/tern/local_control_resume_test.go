@@ -1768,3 +1768,67 @@ func TestResumeApplyWithTasks_StartStaysPendingWhenGroupedStoppedTaskRequeueFail
 	require.NoError(t, err)
 	assert.NotNil(t, startReq, "the start request stays pending for the next claim")
 }
+
+// A never-started finalizer settles for a pending command the way the database
+// type's stop settles: a stop that pauses leaves it resumable, a stop that
+// cannot pause cancels it, and a cancel always cancels it.
+func TestFinalizerSettledStateForControl(t *testing.T) {
+	cases := []struct {
+		operation    storage.ControlOperation
+		databaseType string
+		want         string
+	}{
+		{storage.ControlOperationStop, storage.DatabaseTypeStrata, state.ApplyOperation.Stopped},
+		{storage.ControlOperationStop, storage.DatabaseTypeMySQL, state.ApplyOperation.Stopped},
+		{storage.ControlOperationStop, storage.DatabaseTypeVitess, state.ApplyOperation.Cancelled},
+		{storage.ControlOperationCancel, storage.DatabaseTypeStrata, state.ApplyOperation.Cancelled},
+		{storage.ControlOperationCancel, storage.DatabaseTypeVitess, state.ApplyOperation.Cancelled},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.operation)+"/"+tc.databaseType, func(t *testing.T) {
+			assert.Equal(t, tc.want, finalizerSettledStateForControl(tc.operation, tc.databaseType))
+		})
+	}
+}
+
+// A finalizer re-drive resumes from what the engine reported, and re-applies
+// from the plan when the only stored state is the drive's own handoff record.
+func TestFinalizerEngineResumeState(t *testing.T) {
+	cases := []struct {
+		name   string
+		stored *storage.EngineResumeState
+		want   *engine.ResumeState
+	}{
+		{
+			name:   "handoff record only",
+			stored: &storage.EngineResumeState{Metadata: finalizerEngineHandoffMetadata},
+			want:   nil,
+		},
+		{
+			// A JSON storage column hands the record back re-serialized.
+			name:   "handoff record as a JSON column returns it",
+			stored: &storage.EngineResumeState{Metadata: `{"group_finalizer_engine_handoff": "true"}`},
+			want:   nil,
+		},
+		{
+			name:   "engine deploy state",
+			stored: &storage.EngineResumeState{MigrationContext: "deploy-ns-0", Metadata: `{"branch_name":"orders-ns-0"}`},
+			want:   &engine.ResumeState{MigrationContext: "deploy-ns-0", Metadata: `{"branch_name":"orders-ns-0"}`},
+		},
+		{
+			name:   "engine context alongside the handoff metadata",
+			stored: &storage.EngineResumeState{MigrationContext: "deploy-ns-0", Metadata: finalizerEngineHandoffMetadata},
+			want:   &engine.ResumeState{MigrationContext: "deploy-ns-0", Metadata: finalizerEngineHandoffMetadata},
+		},
+		{
+			name:   "empty engine metadata",
+			stored: &storage.EngineResumeState{Metadata: "{}"},
+			want:   &engine.ResumeState{Metadata: "{}"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, finalizerEngineResumeState(tc.stored))
+		})
+	}
+}

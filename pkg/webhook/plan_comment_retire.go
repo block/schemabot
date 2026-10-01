@@ -31,6 +31,16 @@ func (s planCommentSlot) environmentScope() string {
 	return strings.Join(envs, ",")
 }
 
+// soleEnvironment is the environment the slot's plan comment is about when it
+// covers exactly one, and empty when it covers several, so a CLI hint for the
+// comment scopes to an environment only when one is unambiguous.
+func (s planCommentSlot) soleEnvironment() string {
+	if len(s.Environments) != 1 {
+		return ""
+	}
+	return s.Environments[0]
+}
+
 // postTrackedPlanComment posts a plan comment, records it in plan_comments,
 // and retires the prior comments in the same slot that it supersedes.
 // Tracking and retirement failures never affect the posted comment: every
@@ -60,7 +70,7 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 		return
 	}
 
-	commentID, nodeID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, body))
+	commentID, nodeID, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, slot.soleEnvironment(), body))
 	if err != nil {
 		h.logger.Error("failed to post plan comment",
 			"repo", repo, "pr", pr, "installation_id", installationID, "error", err)

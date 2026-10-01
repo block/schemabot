@@ -70,6 +70,9 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// EstimatedBytes is the table's on-disk size when it was planned, shown
+	// beside the row counts. Nil when the plan had no estimate.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -171,6 +174,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
+			EstimatedBytes:      tbl.EstimatedBytes,
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,

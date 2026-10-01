@@ -110,6 +110,18 @@ func FormatApproxBytes(b int64) string {
 	}
 }
 
+// FormatTableSizeClause renders the " · ~23.4 GB" clause a copy progress line
+// carries after its row counts: the table's on-disk size when it was planned,
+// so the operator sees the scale of the copy beside how far it has come. It is
+// the whole table's size, not a measure of bytes copied. Empty when no
+// estimate is known.
+func FormatTableSizeClause(estimatedBytes *int64) string {
+	if estimatedBytes == nil {
+		return ""
+	}
+	return " \u00b7 " + FormatApproxBytes(*estimatedBytes)
+}
+
 // VSchemaStatusLabel maps an engine's vschema_status display value to a human
 // label, shared by the CLI progress view and the PR comment so both surfaces
 // describe VSchema application identically.

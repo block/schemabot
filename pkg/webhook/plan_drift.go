@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 
@@ -15,6 +16,19 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
+
+// plannedPrimaryMember is the rollout member a primary plan was created
+// against, as the plan response recorded it: the deployment and target, and
+// the namespaces the target's entry selected. The rollup checks all three
+// against its own resolution, so a config reloaded between the plan and the
+// rollup fails closed instead of pairing this plan with a different placement.
+func plannedPrimaryMember(planResp *apitypes.PlanResponse) routing.ExecutionTarget {
+	return routing.ExecutionTarget{
+		Deployment: planResp.Deployment,
+		Target:     planResp.Target,
+		Namespaces: planResp.SelectedNamespaces,
+	}
+}
 
 // reviewTimeDrift computes the review-time drift rollup for a database and
 // environment and turns it into the check-record outcome plus the preview
@@ -68,7 +82,8 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 			summary: "drift check failed; see logs",
 		}, &templates.DeploymentDriftData{Computed: false}
 	}
-	preview := deploymentDriftPreview(rollup)
+	preview := reviewDriftPreview(rollup,
+		"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)
 	if rollup.Clean {
 		return reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup)}, preview
 	}
@@ -84,6 +99,25 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 // PR markdown (it can carry internal hostnames, IPs, or DSN fragments) and is
 // logged server-side instead.
 const erroredDriftDetail = "diff failed; see server logs"
+
+// reviewDriftPreview builds the PR-preview rendering data for a computed
+// rollup, carrying each target's table sizes when the rollup is clean so the
+// size section totals a table across the targets that change it. A blocked
+// rollup's targets do not apply one reviewed plan, so its preview carries no
+// target sizes and the section shows the reviewed plan's. logAttrs identify
+// the plan in logs.
+func reviewDriftPreview(rollup api.PlanRollup, logAttrs ...any) *templates.DeploymentDriftData {
+	preview := deploymentDriftPreview(rollup)
+	if preview == nil {
+		return nil
+	}
+	if !rollup.Clean {
+		slog.Debug("review-time drift rollup is blocked; the size section shows the reviewed plan's sizes, not each target's", logAttrs...)
+		return preview
+	}
+	preview.TableSizes = targetTableSizes(rollup, logAttrs...)
+	return preview
+}
 
 // deploymentDriftPreview turns a computed rollup into the PR-preview rendering
 // data. It returns nil for a single-deployment database: with one deployment
@@ -167,20 +201,26 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 			byPlan[e.PlanFingerprint] = at
 		}
 		groups[at].Members = append(groups[at].Members, names[i])
-		for _, bc := range memberBlockedChanges(e.ChangeSet) {
-			addBlockedTarget(&groups[at], bc, names[i])
+		for _, bc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeBlocked) {
+			addModeTarget(&groups[at].BlockedChanges, bc, names[i])
+		}
+		// A direct verdict is read per member for the same reason a refusal is:
+		// the policy judges each target's own table, so members that run the same
+		// DDL can differ in how it runs. That write-blocking DDL is disclosed
+		// under the targets that run it, the way a refusal is.
+		for _, dc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeDirect) {
+			addModeTarget(&groups[at].DirectChanges, templates.DirectChangeData(dc), names[i])
 		}
 	}
-	// A change every target in the group refuses needs no names beside it: the
+	// A change every target in the group carries needs no names beside it: the
 	// group heading already lists them.
 	for gi := range groups {
+		members := len(groups[gi].Members)
 		for bi := range groups[gi].BlockedChanges {
-			bc := &groups[gi].BlockedChanges[bi]
-			if len(bc.Targets) == len(groups[gi].Members) {
-				bc.Targets = nil
-				continue
-			}
-			bc.TotalTargets = len(groups[gi].Members)
+			trimModeTargets(&groups[gi].BlockedChanges[bi].Targets, &groups[gi].BlockedChanges[bi].TotalTargets, members)
+		}
+		for di := range groups[gi].DirectChanges {
+			trimModeTargets(&groups[gi].DirectChanges[di].Targets, &groups[gi].DirectChanges[di].TotalTargets, members)
 		}
 	}
 	// The primary is the first member, so its group is already first. Ordering is
@@ -199,12 +239,89 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 	return groups
 }
 
-// memberBlockedChanges lists the changes in one member's plan that its engine
-// will refuse at apply. Grouping keys members on the work they would run, not on
-// whether their engines accept it, so each member's verdict is read from its own
-// plan. A sharded namespace is read per shard, the way the reviewed plan's
-// blocked changes are, so a change refused on some shards names them.
-func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
+// targetTableSizes lists every rollout target's size estimate for each
+// existing table its own plan copies, rebuilds, or scans, in rollout order,
+// primary first. Sizes are read from each target's own plan, since each target
+// applies to its own data. A table is listed once per target however many
+// statements change it, since each statement carries the whole table's
+// estimate, and tables a target creates are left out, having no data yet. The
+// namespace view is read for the estimate, which for a sharded namespace is
+// summed across its shards, while every shard's DDL decides whether the table
+// gets a size line. logAttrs identify the plan in logs.
+func targetTableSizes(rollup api.PlanRollup, logAttrs ...any) []templates.TargetTableSize {
+	names := rollupMemberNames(rollup)
+	var sizes []templates.TargetTableSize
+	for i, e := range rollup.Entries {
+		listed := make(map[planTableRef]bool)
+		shardDDL := memberShardDDLByTable(e.ChangeSet.Shards)
+		for _, sc := range e.ChangeSet.Changes {
+			for _, tc := range sc.GetTableChanges() {
+				ref := planTableRef{sc.GetNamespace(), tc.GetTableName()}
+				tableAttrs := slices.Concat(logAttrs, []any{"target", names[i], "namespace", ref.namespace, "table", ref.table})
+				if listed[ref] {
+					slog.Debug("table already has a size line on this target; skipping its further statements", tableAttrs...)
+					continue
+				}
+				if tc.GetChangeType() == ternv1.ChangeType_CHANGE_TYPE_CREATE {
+					slog.Debug("table is created by this target's plan; it has no size to show", tableAttrs...)
+					continue
+				}
+				ddls := append([]string{tc.GetDdl()}, shardDDL[ref]...)
+				if !tableCostScalesWithSize(e.DatabaseType, ddls, tableAttrs...) {
+					slog.Debug("table's changes on this target are metadata-only; it gets no size line", tableAttrs...)
+					continue
+				}
+				listed[ref] = true
+				sizes = append(sizes, templates.TargetTableSize{
+					Target:   names[i],
+					Keyspace: ref.namespace,
+					Size: templates.TableSizeData{
+						Table:          ref.table,
+						ShardCount:     int(tc.GetShardCount()),
+						EstimatedBytes: tc.EstimatedBytes,
+					},
+				})
+			}
+		}
+	}
+	return sizes
+}
+
+// memberShardDDLByTable collects every shard's DDL for each table of one
+// rollout member's plan, so a sharded namespace's size lines are decided from
+// what each shard runs.
+func memberShardDDLByTable(shards []*ternv1.ShardPlan) map[planTableRef][]string {
+	byTable := make(map[planTableRef][]string)
+	for _, sp := range shards {
+		for _, tc := range sp.GetChanges() {
+			if tc.GetDdl() == "" {
+				continue
+			}
+			ref := planTableRef{sp.GetNamespace(), tc.GetTableName()}
+			byTable[ref] = append(byTable[ref], tc.GetDdl())
+		}
+	}
+	return byTable
+}
+
+// trimModeTargets drops the target names from a group's disclosure when every
+// target in the group carries it, and otherwise records the group's size so a
+// subset too wide to name reads as coverage.
+func trimModeTargets(targets *[]string, totalTargets *int, members int) {
+	if len(*targets) == members {
+		*targets = nil
+		return
+	}
+	*totalTargets = members
+}
+
+// memberModeChanges lists the changes in one member's plan that its engine
+// judged to run in the given execution mode. Grouping keys members on the work
+// they would run, not on how their engines run it, so each member's verdict is
+// read from its own plan. A sharded namespace is read per shard, the way the
+// reviewed plan's verdicts are, so a change judged that way on some shards
+// names them.
+func memberModeChanges(cs tern.ChangeSet, mode string) []templates.BlockedChangeData {
 	if len(cs.Shards) > 0 {
 		total := 0
 		var out []templates.BlockedChangeData
@@ -214,10 +331,10 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 			}
 			total++
 			for _, tc := range sp.GetChanges() {
-				if tc.GetExecutionMode() != engine.ExecutionModeBlocked {
+				if !strings.EqualFold(tc.GetExecutionMode(), mode) {
 					continue
 				}
-				out = mergeBlockedShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
+				out = mergeModeShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
 			}
 		}
 		for i := range out {
@@ -228,7 +345,7 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 	var out []templates.BlockedChangeData
 	for _, sc := range cs.Changes {
 		for _, tc := range sc.GetTableChanges() {
-			if tc.GetExecutionMode() == engine.ExecutionModeBlocked {
+			if strings.EqualFold(tc.GetExecutionMode(), mode) {
 				out = append(out, templates.BlockedChangeData{Table: tc.GetTableName(), Reason: tc.GetModeReason()})
 			}
 		}
@@ -236,9 +353,9 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 	return out
 }
 
-// mergeBlockedShard records that a shard refuses a table change, folding it into
+// mergeModeShard records a shard's verdict on a table change, folding it into
 // the entry for the same table and reason when one exists.
-func mergeBlockedShard(out []templates.BlockedChangeData, table, reason, shard string) []templates.BlockedChangeData {
+func mergeModeShard(out []templates.BlockedChangeData, table, reason, shard string) []templates.BlockedChangeData {
 	for i := range out {
 		if out[i].Table == table && out[i].Reason == reason {
 			out[i].Shards = append(out[i].Shards, shard)
@@ -248,19 +365,35 @@ func mergeBlockedShard(out []templates.BlockedChangeData, table, reason, shard s
 	return append(out, templates.BlockedChangeData{Table: table, Reason: reason, Shards: []string{shard}})
 }
 
-// addBlockedTarget records that a target refuses one of its group's changes,
+// modeChange is a disclosure of how a target's engine runs one of its changes,
+// refused or direct, keyed the same way whichever verdict it discloses.
+type modeChange interface {
+	templates.BlockedChangeData | templates.DirectChangeData
+}
+
+// addModeTarget records that a target carries one of its group's verdicts,
 // folding it into the group's entry for the same change when another target
-// already refuses it.
-func addBlockedTarget(g *templates.DeploymentPlanGroup, bc templates.BlockedChangeData, target string) {
-	for i := range g.BlockedChanges {
-		existing := &g.BlockedChanges[i]
+// already carries it. A target is listed once however many of its changes
+// fold into the entry, such as the same table in two namespaces: the list is
+// compared against the group's size to decide whether every target carries
+// the verdict, so a repeated name would credit it to targets that do not.
+func addModeTarget[T modeChange](list *[]T, change T, target string) {
+	bc := templates.BlockedChangeData(change)
+	for i := range *list {
+		existing := templates.BlockedChangeData((*list)[i])
 		if existing.Table == bc.Table && existing.Reason == bc.Reason && slices.Equal(existing.Shards, bc.Shards) {
+			if slices.Contains(existing.Targets, target) {
+				slog.Debug("target already carries this verdict in its group; not listing it twice",
+					"target", target, "table", bc.Table)
+				return
+			}
 			existing.Targets = append(existing.Targets, target)
+			(*list)[i] = T(existing)
 			return
 		}
 	}
 	bc.Targets = []string{target}
-	g.BlockedChanges = append(g.BlockedChanges, bc)
+	*list = append(*list, T(bc))
 }
 
 // memberPlanChanges renders one member's plan into the shape the comment renders
