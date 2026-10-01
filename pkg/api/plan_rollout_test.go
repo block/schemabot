@@ -49,6 +49,7 @@ func TestPlanRollout_IndependentTargetsGroupByPlan(t *testing.T) {
 	assert.Equal(t, 2, rollout.Members)
 	assert.True(t, rollout.Independent)
 	assert.Empty(t, rollout.Attention)
+	assert.Empty(t, rollout.Refused, "a rollout-wide apply runs each target's own safe ALTER")
 	require.Len(t, rollout.Groups, 2, "the two targets plan different DDL")
 
 	primary := rollout.Groups[0]
@@ -114,6 +115,17 @@ func TestPlanRollout_SameDDLUnderDifferentExecutionModesSplitsGroups(t *testing.
 	tc := rollout.Groups[1].Changes[0].TableChanges[0]
 	assert.Equal(t, "direct", tc.ExecutionMode)
 	assert.Equal(t, "table is 12 MiB, within the direct execution bound", tc.ModeReason)
+
+	// Only a pull request comment discloses testapp-002's direct change under
+	// it, so a rollout-wide apply through the API refuses it, and the rollout
+	// names the target selector that applies testapp-002 on its own.
+	require.Len(t, rollout.Refused, 1)
+	assert.Equal(t, &apitypes.PlanMemberRefusalResponse{
+		Member: "eu/testapp-002",
+		Target: "testapp-002",
+		Reason: apitypes.PlanMemberNeedsTarget,
+		Detail: `runs table "users" as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target`,
+	}, rollout.Refused[0])
 }
 
 // Targets that run the same DDL directly are still separate groups when the
@@ -272,4 +284,18 @@ func TestPlanRollout_ListsTheOtherMembersAsNotPlannedBesideAPrimaryPlanWithError
 		Member: "eu/testapp-002", Reason: apitypes.PlanMemberUnplanned,
 		Detail: "not planned, because the primary's plan reported errors; fix them, then plan again",
 	}}, rollout.Attention)
+}
+
+// Once every member is planned, the plan reads its stored rows back to list
+// what a rollout-wide apply refuses. A failure there fails the plan rather
+// than returning an empty refusal list, and its error says that planning
+// succeeded and the read-back is what failed.
+func TestPlanRollout_RefusalCheckFailureFailsThePlanAndSaysWhatFailed(t *testing.T) {
+	svc := multiTargetService(t, &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)")}, &recordingPlanStore{})
+
+	_, err := svc.planRollout(t.Context(), planDiffReq(t), reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		&apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "every rollout member of plan plan_eu was planned, but the members a rollout-wide apply of it refuses could not be listed")
+	assert.Contains(t, err.Error(), "plan plan_eu was stored, but no row carries its identifier")
 }

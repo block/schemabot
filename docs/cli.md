@@ -539,6 +539,23 @@ Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
 Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
 
+An apply of the whole rollout runs each target's own plan, but holds every
+target to what the first target's plan discloses, since that is the plan you
+review and consent against. So the server refuses, whatever the flags,
+`--allow-unsafe` included, a target whose own plan carries an unsafe change
+the first target's plan does not, a change the engine runs as direct-execution
+DDL there, or work the apply, laid out from the first target's plan, has no
+operation to run. It returns those targets with the plan, and `apply` refuses
+before it takes a lock or prompts. For each target it prints the
+`apply --target <target>` that applies that target's own plan, with
+`--allow-unsafe` when that plan is unsafe; once those have landed, apply the
+rollout again for the rest. A target whose plan no apply runs, because its
+engine refuses a change or its own plan's work has no operation to run from,
+gets no such command: change the schema files instead. These refused targets
+are listed only once no target needs attention, since a target needing
+attention refuses the apply first. So after you fix a target that needed
+attention and plan again, the plan can still list a target the apply refuses.
+
 A database lock can also block a new apply. Inspect the owner and ongoing
 work before releasing it. Locks span the database's environments; forcing
 one away from its owner is an administrative action, not a routine retry.

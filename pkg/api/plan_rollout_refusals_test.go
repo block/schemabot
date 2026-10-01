@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,6 +19,153 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
 )
+
+// A rollout plan made through the API lists the targets whose own plans a
+// rollout-wide apply of it refuses, so the CLI can refuse before it locks and
+// prompts. The list is what apply creation refuses, member for member: each
+// listed target is refused by createStoredApply under the unsafe opt-in, and a
+// rollout with nothing listed is applied.
+func TestRolloutApplyRefusals_ListWhatApplyCreationRefuses(t *testing.T) {
+	alter := storage.TableChange{Namespace: "testapp", Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}
+	drop := storage.TableChange{Namespace: "testapp", Table: "legacy_orders", Operation: "drop", DDL: "DROP TABLE `legacy_orders`", IsUnsafe: true}
+	direct := alter
+	direct.ExecutionMode = "direct"
+	direct.ModeReason = "table is 12 MiB, within the direct execution bound"
+	blocked := alter
+	blocked.ExecutionMode = "blocked"
+	reviewedWith := func(changes ...storage.TableChange) *storage.Plan {
+		plan := primaryPlanRow("testapp-001")
+		plan.Environment = "production"
+		if len(changes) > 0 {
+			plan.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: changes}}
+		}
+		return plan
+	}
+	memberWith := func(changes ...storage.TableChange) *storage.Plan {
+		plan := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+		plan.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: changes}}
+		return plan
+	}
+	// Shard work in orders_a beside table statements in testapp alone: outside
+	// the per-shard shape, orders_a's shard changes have no operation to run
+	// from, whichever plan the apply runs.
+	shardWorkElsewhere := memberWith(alter)
+	shardWorkElsewhere.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "orders_a", Changes: []storage.TableChange{
+		{Namespace: "orders_a", Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `region` varchar(32)"},
+	}}}
+	// A finalize the engine asked for beside table statements and no per-shard
+	// plan has nowhere to run in one work operation per target.
+	finalizeUnsharded := memberWith(alter)
+	finalizeUnsharded.Namespaces["testapp"].Finalize = true
+
+	for _, tc := range []struct {
+		name     string
+		reviewed *storage.Plan
+		member   *storage.Plan
+		// want is the refusal listed for testapp-002, nil when none is.
+		want *apitypes.PlanMemberRefusalResponse
+		// applyRefusal is what apply creation's refusal names, the member
+		// when empty.
+		applyRefusal string
+		// narrowedRefusal is what an apply narrowed to a blocked target
+		// refuses it for.
+		narrowedRefusal string
+	}{
+		{name: "same work as the reviewed plan", reviewed: reviewedWith(alter), member: memberWith(alter)},
+		{name: "unsafe change the reviewed plan with work does not carry", reviewed: reviewedWith(alter), member: memberWith(alter, drop),
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberNeedsTarget,
+				Detail: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`, AllowUnsafe: true}},
+		{name: "unsafe change beside a converged reviewed target", reviewed: reviewedWith(), member: memberWith(drop),
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberNeedsTarget,
+				Detail: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`, AllowUnsafe: true}},
+		{name: "direct-execution change beside reviewed work", reviewed: reviewedWith(alter), member: memberWith(direct),
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberNeedsTarget,
+				Detail: `runs table "users" as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target`}},
+		{name: "direct-execution change beside a converged reviewed target", reviewed: reviewedWith(), member: memberWith(direct),
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberNeedsTarget,
+				Detail: `runs table "users" as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target`}},
+		{name: "blocked change", reviewed: reviewedWith(alter), member: memberWith(blocked),
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberBlocked,
+				Detail: "carries changes its target's engine refuses"},
+			narrowedRefusal: `contains a blocked change for table "users"`},
+		{name: "shard work in a namespace with no table statements", reviewed: reviewedWith(alter), member: shardWorkElsewhere,
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberBlocked,
+				Detail: "has per-shard changes in namespaces [orders_a] with no table statements to run them from, and this apply runs " + operationShapePerMember.String()},
+			narrowedRefusal: "has per-shard changes in namespaces [orders_a]"},
+		{name: "engine finalize with no per-shard plan", reviewed: reviewedWith(alter), member: finalizeUnsharded,
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberBlocked,
+				Detail: "asks to finalize namespaces [testapp] with no per-shard plan to schedule the finalize behind"},
+			applyRefusal: "plan plan-second asks to finalize namespaces [testapp]", narrowedRefusal: "asks to finalize namespaces [testapp]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := multiTargetApplyService(t, &listingPlanStore{
+				mockPlanLookupStore: mockPlanLookupStore{plan: tc.reviewed},
+				plans:               []*storage.Plan{tc.member},
+			})
+
+			refused, err := svc.rolloutApplyRefusals(t.Context(), "production", "plan-primary", targetsFor(t, svc))
+			require.NoError(t, err)
+
+			_, _, applyErr := svc.createStoredApply(t.Context(), tc.reviewed, ApplyRequest{Environment: "production"},
+				map[string]string{"allow_unsafe": "true"}, "apply-rollout-refusals")
+			if tc.want == nil {
+				assert.Empty(t, refused)
+				require.NoError(t, applyErr, "apply creation runs a rollout that lists no refusal")
+				return
+			}
+			require.Len(t, refused, 1)
+			assert.Equal(t, tc.want, refused[0])
+			require.Error(t, applyErr, "apply creation refuses the target the rollout lists")
+			assert.Contains(t, applyErr.Error(), cmp.Or(tc.applyRefusal, "rollout member eu/testapp-002"))
+			if tc.want.Reason == apitypes.PlanMemberBlocked {
+				// No apply runs a blocked target's plan, the one narrowed to it
+				// included, so the CLI offers it no --target rerun.
+				_, _, narrowedErr := svc.createStoredApply(t.Context(), tc.member, ApplyRequest{Environment: "production", Target: "testapp-002"},
+					map[string]string{"allow_unsafe": "true"}, "apply-rollout-refusals-narrowed")
+				require.Error(t, narrowedErr, "an apply narrowed to the blocked target refuses it too")
+				assert.Contains(t, narrowedErr.Error(), tc.narrowedRefusal)
+			}
+		})
+	}
+}
+
+// A deployment with one target is shown under its deployment name, "us", but
+// a target selector names a target, so the refusal hands back "us-main", the
+// selector the server resolves to us/us-main. The display name would be
+// refused as naming no rollout member.
+func TestRolloutApplyRefusals_NameEachTargetByASelectorTheServerAccepts(t *testing.T) {
+	drop := storage.TableChange{Namespace: "testapp", Table: "legacy_orders", Operation: "drop", DDL: "DROP TABLE `legacy_orders`", IsUnsafe: true}
+	alter := storage.TableChange{Namespace: "testapp", Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}
+	reviewed := primaryPlanRow("testapp-001")
+	reviewed.Environment = "production"
+	reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+	second := memberPlanRow("plan-second", "testapp-002", "plan-primary")
+	second.Namespaces = reviewed.Namespaces
+	usMain := memberPlanRow("plan-us-main", "us-main", "plan-primary")
+	usMain.Deployment = "us"
+	usMain.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter, drop}}}
+	svc := memberResolutionService(t, EnvironmentConfig{
+		Deployments: map[string]DeploymentTarget{
+			"eu": {Targets: targetNames("testapp-001", "testapp-002")},
+			"us": {Targets: targetNames("us-main")},
+		},
+		DeploymentOrder: []string{"eu", "us"},
+	}, &listingPlanStore{mockPlanLookupStore: mockPlanLookupStore{plan: reviewed}, plans: []*storage.Plan{second, usMain}})
+	targets := targetsFor(t, svc)
+
+	refused, err := svc.rolloutApplyRefusals(t.Context(), "production", "plan-primary", targets)
+	require.NoError(t, err)
+	require.Len(t, refused, 1)
+	assert.Equal(t, "us", refused[0].Member, "the target is shown the way the plan groups name it")
+	assert.Equal(t, "us-main", refused[0].Target)
+	assert.True(t, refused[0].AllowUnsafe)
+
+	member, err := selectRolloutMember("testapp", "production", targets, refused[0].Target)
+	require.NoError(t, err, "the selector handed back names the target")
+	assert.Equal(t, "us/us-main", member.MemberID())
+	_, err = selectRolloutMember("testapp", "production", targets, refused[0].Member)
+	require.Error(t, err, "the display name of a single-target deployment is not a selector")
+}
 
 // A schemabot CLI that predates rollout plans reads only the primary's plan
 // from a response. It would print "No changes" for a rollout whose primary is
@@ -127,4 +275,30 @@ func TestHandleApply_RefusesARolloutWideApplyFromACallerThatDoesNotRenderTheRoll
 			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
 		})
 	}
+}
+
+// A member paired with the reviewed plan runs exactly what the caller was
+// shown, so it is never refused, even when the pairing hands back a copy of
+// the reviewed plan rather than the same value: the plan is recognized by its
+// identifier. A member with a plan of its own is still held to the rule, and
+// its direct-execution change needs its own narrowed apply.
+func TestMemberWorkARolloutWideAPIApplyCannotRun_RecognizesTheReviewedPlanByItsIdentifier(t *testing.T) {
+	reviewed := memberPlanWithChange(storage.TableChange{
+		Namespace:     "testapp",
+		Table:         "users",
+		Operation:     "alter",
+		DDL:           "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		ExecutionMode: "direct",
+		ModeReason:    "table is 12 MiB, within the direct execution bound",
+	})
+
+	copied := *reviewed
+	reason, detail := memberWorkARolloutWideAPIApplyCannotRun(reviewed, &copied)
+	assert.Empty(t, reason, "a copy of the reviewed plan is the reviewed plan: %s", detail)
+
+	own := *reviewed
+	own.PlanIdentifier = "plan-own"
+	reason, detail = memberWorkARolloutWideAPIApplyCannotRun(reviewed, &own)
+	assert.Equal(t, apitypes.PlanMemberNeedsTarget, reason)
+	assert.Contains(t, detail, `runs table "users" as direct-execution DDL`)
 }
