@@ -617,46 +617,120 @@ func (g GitHubConfig) PromotionCheckRunNameBase() string {
 	return name
 }
 
-// Configured returns true if the GitHub App is configured (app ID and private key are set).
-// It actually resolves the private key so that file: or secretsmanager: references that
-// point to non-existent resources cause Configured() to return false instead of crashing.
+// Configured reports whether the GitHub App's credentials resolve. It is the
+// boolean form of ResolveCredentials for callers that only need to know whether
+// GitHub is on; a caller that must tell an App that is not configured from one
+// whose credentials are unavailable or malformed uses ResolveCredentials.
 func (g *GitHubConfig) Configured() bool {
-	appID := g.ResolveAppID()
-	if appID == 0 && g.PrivateKey == "" {
+	_, err := g.ResolveCredentials()
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, ErrGitHubAppNotConfigured):
 		slog.Info("GitHub App not configured — skipping GitHub setup")
-		return false
+	default:
+		slog.Warn("GitHub App credentials not usable — skipping GitHub setup", "error", err)
 	}
-	if appID == 0 {
-		slog.Warn("GitHub App private-key is set but app-id is missing — skipping GitHub setup")
-		return false
-	}
-	if g.PrivateKey == "" {
-		slog.Warn("GitHub App app-id is set but private-key is missing — skipping GitHub setup")
-		return false
-	}
-	// Actually resolve the private key — if the file/secret doesn't exist yet,
-	// treat GitHub as not configured rather than failing startup.
-	pk, err := g.ResolvePrivateKey()
+	return false
+}
+
+// GitHubAppCredentials is what a GitHub App's config resolves to: the App ID
+// and the private key material, read once from wherever the config points.
+type GitHubAppCredentials struct {
+	AppID      int64
+	PrivateKey string
+}
+
+// ErrGitHubAppNotConfigured reports a GitHub App with neither an App ID nor a
+// private key: the deployment runs without GitHub.
+var ErrGitHubAppNotConfigured = errors.New("no GitHub App is configured")
+
+// ErrGitHubAppCredentialsUnavailable reports a GitHub App whose credentials
+// are declared but cannot be used yet: a secret reference that does not
+// resolve, a private key without an App ID or the reverse, or a key that
+// resolves to nothing. The credentials may arrive later, so the App is
+// treated as off rather than as misconfigured.
+var ErrGitHubAppCredentialsUnavailable = errors.New("GitHub App credentials are not available")
+
+// ErrInvalidGitHubAppID marks an app ID that resolved to a value that cannot
+// be an App ID: non-numeric, negative, or out of range. It is a configuration
+// error, distinct from an app ID that is not configured at all (unset or the
+// placeholder 0) or whose secret reference cannot be resolved yet.
+var ErrInvalidGitHubAppID = errors.New("invalid GitHub App ID")
+
+// ResolveCredentials resolves the App ID and private key together, each read
+// once, and classifies the outcome so a caller can tell the three ways an App
+// is not usable apart:
+//   - ErrGitHubAppNotConfigured: no App ID and no private key are set.
+//   - ErrGitHubAppCredentialsUnavailable (wrapped): credentials are declared
+//     but do not resolve to a usable pair yet.
+//   - ErrInvalidGitHubAppID (wrapped): the App ID resolved to a value that
+//     cannot be an App ID (non-numeric, negative, or out of range).
+func (g *GitHubConfig) ResolveCredentials() (GitHubAppCredentials, error) {
+	appID, err := g.ResolveAppID()
 	if err != nil {
-		slog.Warn("GitHub App credentials not resolvable — skipping GitHub setup", "error", err)
-		return false
+		if errors.Is(err, ErrInvalidGitHubAppID) {
+			return GitHubAppCredentials{}, err
+		}
+		return GitHubAppCredentials{}, fmt.Errorf("%w: %w", ErrGitHubAppCredentialsUnavailable, err)
 	}
-	if pk == "" {
-		slog.Warn("GitHub App private key resolved to empty — skipping GitHub setup")
-		return false
+	switch {
+	case appID == 0 && g.PrivateKey == "":
+		return GitHubAppCredentials{}, ErrGitHubAppNotConfigured
+	case appID == 0:
+		return GitHubAppCredentials{}, fmt.Errorf("%w: private-key is set but app-id is empty", ErrGitHubAppCredentialsUnavailable)
+	case g.PrivateKey == "":
+		return GitHubAppCredentials{}, fmt.Errorf("%w: app-id is set but private-key is missing", ErrGitHubAppCredentialsUnavailable)
 	}
-	return true
+	privateKey, err := g.ResolvePrivateKey()
+	if err != nil {
+		return GitHubAppCredentials{}, fmt.Errorf("%w: resolve private-key: %w", ErrGitHubAppCredentialsUnavailable, err)
+	}
+	if privateKey == "" {
+		return GitHubAppCredentials{}, fmt.Errorf("%w: private-key resolved to empty", ErrGitHubAppCredentialsUnavailable)
+	}
+	return GitHubAppCredentials{AppID: appID, PrivateKey: privateKey}, nil
 }
 
 // ResolveAppID resolves the app ID from config (supports secret references),
-// falling back to GITHUB_APP_ID env var.
-func (g *GitHubConfig) ResolveAppID() int64 {
-	resolved, err := secrets.Resolve(g.AppID, "GITHUB_APP_ID")
-	if err == nil && resolved != "" {
-		n, _ := strconv.ParseInt(resolved, 10, 64)
-		return n
+// falling back to GITHUB_APP_ID env var. Surrounding whitespace is trimmed,
+// since mounted secrets and env vars commonly carry a trailing newline.
+//
+// It returns 0 and a nil error when no app ID is configured: the value is
+// unset, resolves to empty, or is 0, which GitHub never issues and which the
+// deployment templates seed as the placeholder before an App exists. It
+// returns an error when the secret reference cannot be resolved, and an error
+// wrapping ErrInvalidGitHubAppID when the resolved value is not a non-negative
+// integer. The error names the setting it was read from, never the value.
+func (g *GitHubConfig) ResolveAppID() (int64, error) {
+	const fallbackEnvVar = "GITHUB_APP_ID"
+	setting := "app-id"
+	if g.AppID == "" {
+		setting = fallbackEnvVar
 	}
-	return 0
+	resolved, err := secrets.Resolve(g.AppID, fallbackEnvVar)
+	if err != nil {
+		return 0, fmt.Errorf("resolve %s: %w", setting, err)
+	}
+	resolved = strings.TrimSpace(resolved)
+	if resolved == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(resolved, 10, 64)
+	if err != nil {
+		// strconv's error quotes the input; keep only its cause so the
+		// resolved value never reaches a log line or startup error.
+		cause := err
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) {
+			cause = numErr.Err
+		}
+		return 0, fmt.Errorf("%s must be a positive integer, or 0 for no App: %w (%w)", setting, ErrInvalidGitHubAppID, cause)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, or 0 for no App: %w", setting, ErrInvalidGitHubAppID)
+	}
+	return n, nil
 }
 
 // ResolvePrivateKey resolves the private key value using the secrets resolver.
@@ -3321,8 +3395,8 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 		}
 		return ResolvedGitHubApp{Name: repoConfig.GitHubApp, Config: appCfg}, nil
 	}
-	if !c.GitHub.Configured() {
-		return ResolvedGitHubApp{}, fmt.Errorf("no GitHub App is configured")
+	if _, err := c.GitHub.ResolveCredentials(); err != nil {
+		return ResolvedGitHubApp{}, fmt.Errorf("default GitHub App: %w", err)
 	}
 	return ResolvedGitHubApp{Name: "default", Config: c.GitHub}, nil
 }
@@ -3339,23 +3413,28 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 //
 // Legacy single-App configs (ServerConfig.GitHub set, ServerConfig.Apps empty)
 // are also resolved so callers can use a single uniform path; the resulting
-// map will contain a single entry under name "default".
+// map will contain a single entry under name "default". The error for that
+// shape wraps the ResolveCredentials classification, so a caller can tell an
+// App that is not configured from one whose credentials are unavailable.
 func (c *ServerConfig) ResolveGitHubAppsByID() (map[int64]ResolvedGitHubApp, error) {
 	if c == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	apps := c.Apps
-	if len(apps) == 0 {
-		if !c.GitHub.Configured() {
-			return nil, fmt.Errorf("no GitHub App is configured")
+	if len(c.Apps) == 0 {
+		creds, err := c.GitHub.ResolveCredentials()
+		if err != nil {
+			return nil, fmt.Errorf("default GitHub App: %w", err)
 		}
-		apps = map[string]GitHubAppConfig{"default": c.GitHub}
+		return map[int64]ResolvedGitHubApp{creds.AppID: {Name: "default", Config: c.GitHub}}, nil
 	}
-	out := make(map[int64]ResolvedGitHubApp, len(apps))
-	for name, app := range apps {
-		id := app.ResolveAppID()
+	out := make(map[int64]ResolvedGitHubApp, len(c.Apps))
+	for name, app := range c.Apps {
+		id, err := app.ResolveAppID()
+		if err != nil {
+			return nil, fmt.Errorf("app %q: %w", name, err)
+		}
 		if id == 0 {
-			return nil, fmt.Errorf("app %q has empty or unparseable app-id", name)
+			return nil, fmt.Errorf("app %q has no app-id configured (empty or 0)", name)
 		}
 		if existing, ok := out[id]; ok {
 			return nil, fmt.Errorf("apps %q and %q resolve to the same app-id %d", existing.Name, name, id)

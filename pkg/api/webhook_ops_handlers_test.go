@@ -595,6 +595,50 @@ func TestExecuteWebhookRedriveByIDsValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "nothing to narrow")
 }
 
+// On a single-App deployment a redrive that names an App is served only when
+// the name is the default App. Naming any other App is refused as the
+// operator's mistake, so a redrive aimed at an App that is not configured here
+// never replays the default App's deliveries in its place. Credentials that do
+// not resolve are reported before the name is checked, with the class a caller
+// can match on.
+func TestWebhookRedriveAppsSingleApp(t *testing.T) {
+	t.Parallel()
+
+	cfg := &ServerConfig{GitHub: GitHubConfig{AppID: "123", PrivateKey: "key"}}
+
+	t.Run("unscoped redrive serves the default App", func(t *testing.T) {
+		apps, err := webhookRedriveApps(cfg, "")
+		require.NoError(t, err)
+		require.Len(t, apps, 1)
+		assert.Equal(t, "default", apps[0].name)
+		assert.Equal(t, int64(123), apps[0].id)
+		assert.Equal(t, cfg.GitHub, apps[0].config)
+	})
+
+	t.Run("redrive scoped to the default App is served", func(t *testing.T) {
+		apps, err := webhookRedriveApps(cfg, "default")
+		require.NoError(t, err)
+		require.Len(t, apps, 1)
+		assert.Equal(t, int64(123), apps[0].id)
+	})
+
+	t.Run("redrive scoped to another App is refused as a request error", func(t *testing.T) {
+		_, err := webhookRedriveApps(cfg, "other-app")
+		var reqErr *webhookOpsRequestError
+		require.ErrorAs(t, err, &reqErr)
+		assert.Contains(t, err.Error(), `no configured GitHub App named "other-app"`)
+	})
+
+	t.Run("unusable credentials are reported with their class", func(t *testing.T) {
+		_, err := webhookRedriveApps(&ServerConfig{GitHub: GitHubConfig{AppID: "abc", PrivateKey: "key"}}, "")
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "default GitHub App: app-id must be a positive integer")
+
+		_, err = webhookRedriveApps(&ServerConfig{GitHub: GitHubConfig{AppID: "123"}}, "default")
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+	})
+}
+
 // The redrive repository is an optional filter: an incident redrive replays a
 // whole window across every repository, and passing no repository is how that
 // is asked for. A guard on the filter's shape must not turn into a requirement.
