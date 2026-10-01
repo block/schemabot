@@ -63,8 +63,8 @@ func rollbackAPIServer(t *testing.T, plan apitypes.PlanResponse) (endpoint strin
 // A rollback whose plan drops a table needs --allow-unsafe, the same consent an
 // apply needs. With -y and without the flag it is refused before any lock or
 // apply request, and the refusal names the command that permits it. With the
-// flag, the apply carries allow_unsafe; a rollback with no unsafe changes never
-// sends it.
+// flag, the apply carries allow_unsafe; a rollback with no unsafe changes and
+// no flag does not send it.
 func TestRollbackUnsafeChangesRequireAllowUnsafe(t *testing.T) {
 	dropPlan := apitypes.PlanResponse{PlanID: "plan-example-rollback", Database: "shop", DatabaseType: "mysql", Environment: "production",
 		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "refunds", ChangeType: "drop", DDL: "DROP TABLE `refunds`;"}}}}}
