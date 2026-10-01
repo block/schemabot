@@ -33,6 +33,28 @@ func (s *recordingPlanStore) Create(_ context.Context, plan *storage.Plan) (int6
 	return int64(len(s.created)), nil
 }
 
+// Get returns a plan this store created under the identifier, or the seeded
+// lookup plan, which stands in for the reviewed plan its planner stored.
+func (s *recordingPlanStore) Get(ctx context.Context, planIdentifier string) (*storage.Plan, error) {
+	for _, plan := range s.created {
+		if plan.PlanIdentifier == planIdentifier {
+			return plan, nil
+		}
+	}
+	return s.mockPlanLookupStore.Get(ctx, planIdentifier)
+}
+
+// List returns the created plans of the review round the options name.
+func (s *recordingPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	var matched []*storage.Plan
+	for _, plan := range s.created {
+		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
+			matched = append(matched, plan)
+		}
+	}
+	return matched, nil
+}
+
 // multiTargetService builds a database whose production environment addresses
 // two distinct targets through one deployment, which is the shape that makes its
 // members independently planned.

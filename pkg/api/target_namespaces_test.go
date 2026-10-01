@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
@@ -471,4 +472,43 @@ func TestBuildApplyOperationGroups_SameTableInTwoNamespacesOfOneTarget(t *testin
 	assert.Equal(t, []string{"ns_0.orders", "ns_1.orders"}, tasks)
 	require.Len(t, groups[1].Tasks, 1)
 	assert.Equal(t, "ns_2", groups[1].Tasks[0].Namespace)
+}
+
+// A plan requested through the API for a rollout whose primary selects
+// namespaces plans the other members beside it: the primary is held to the
+// selection it was planned under, which the plan response records, so the
+// rollout comes back with every member rather than failing the primary check
+// against an empty selection.
+func TestHandlePlan_RolloutWithNamespaceSelectingPrimaryPlansEveryMember(t *testing.T) {
+	client := &mockTernClient{
+		isRemote:     true,
+		planResp:     &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT},
+		planDiffResp: &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT},
+	}
+	plans := &recordingPlanStore{}
+	svc := namespaceSelectionService(t, client, plans)
+
+	planReq := threeNamespaceRequest()
+	planReq.RendersRollout = true
+	body, err := json.Marshal(planReq)
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	svc.handlePlan(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.PlanResponse
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+	assert.Equal(t, []string{"ns_0"}, resp.SelectedNamespaces)
+	require.NotNil(t, resp.Rollout, "the rollout is planned beside the namespace-selecting primary")
+	assert.Equal(t, 2, resp.Rollout.Members)
+	assert.Empty(t, resp.Rollout.Attention)
+
+	require.NotNil(t, client.planDiffReq)
+	assert.Equal(t, "orders-002", client.planDiffReq.Target)
+	assert.Equal(t, []string{"ns_1", "ns_2"}, slices.Sorted(maps.Keys(client.planDiffReq.SchemaFiles)))
+	require.Len(t, plans.created, 2, "the primary's plan and the other member's plan are both stored")
+	assert.Equal(t, "orders-002", plans.created[1].Target)
+	assert.Equal(t, "plan-primary", plans.created[1].PrimaryPlanIdentifier)
 }

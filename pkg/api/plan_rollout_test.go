@@ -49,6 +49,7 @@ func TestPlanRollout_IndependentTargetsGroupByPlan(t *testing.T) {
 	assert.Equal(t, 2, rollout.Members)
 	assert.True(t, rollout.Independent)
 	assert.Empty(t, rollout.Attention)
+	assert.Empty(t, rollout.Refused, "a rollout-wide apply runs each target's own safe ALTER")
 	require.Len(t, rollout.Groups, 2, "the two targets plan different DDL")
 
 	primary := rollout.Groups[0]
@@ -114,6 +115,17 @@ func TestPlanRollout_SameDDLUnderDifferentExecutionModesSplitsGroups(t *testing.
 	tc := rollout.Groups[1].Changes[0].TableChanges[0]
 	assert.Equal(t, "direct", tc.ExecutionMode)
 	assert.Equal(t, "table is 12 MiB, within the direct execution bound", tc.ModeReason)
+
+	// Only a pull request comment discloses testapp-002's direct change under
+	// it, so a rollout-wide apply through the API refuses it, and the rollout
+	// names the target selector that applies testapp-002 on its own.
+	require.Len(t, rollout.Refused, 1)
+	assert.Equal(t, &apitypes.PlanMemberRefusalResponse{
+		Member: "eu/testapp-002",
+		Target: "testapp-002",
+		Reason: apitypes.PlanMemberNeedsTarget,
+		Detail: `runs table "users" as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target`,
+	}, rollout.Refused[0])
 }
 
 // Targets that run the same DDL directly are still separate groups when the
