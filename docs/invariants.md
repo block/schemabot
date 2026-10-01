@@ -1504,7 +1504,7 @@ them. The re-plan that runs just before execution re-checks that verdict, so a p
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
 reviewed target's included, is what the confirmation was given against and carries no consequence
-it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
+it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversReviewedTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
 `pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), and apply creation refusing, whatever the flags,
 unsafe changes that the disclosure never named in a plan it did not come from
 (`rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`), plus rollback confirmation's transactional lock-intent check

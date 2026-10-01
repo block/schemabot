@@ -300,7 +300,12 @@ confirmation step:
   `apply` or at `apply-confirm`, that routes a statement to direct execution
   that the comment the operator was shown ran through Spirit pauses for
   `apply-confirm` against a comment that discloses it, the same way a
-  re-plan whose DDL changed does.
+  re-plan whose DDL changed does. An `apply-confirm` given on a comment that
+  rendered several targets' plans does not pause again: a statement on the
+  reviewed target that now runs differently, as direct execution or blocked,
+  refuses the apply and releases the lock, because how each statement runs
+  is part of the plan that confirmation covers. A fresh `schemabot apply`
+  reviews the rollout as it is now.
 - Other gates still apply: a direct statement that is also an unsafe change,
   such as dropping a primary key, still needs `--allow-unsafe`.
 - `--defer-cutover` is rejected on an all-direct plan — a direct statement has

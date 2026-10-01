@@ -707,6 +707,49 @@ func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testi
 	assert.NotContains(t, out, "applies only after")
 }
 
+// The reviewed target has work of its own too, and another target's plan runs a
+// statement directly, which the comment cannot disclose for confirmation. The
+// PR apply is refused whatever its flags, so the comment says why in place of
+// the apply command, without claiming the reviewed target is already done.
+func TestRenderPlanComment_ReviewedTargetWithWorkAndRefusedMemberWorkOffersNoApply(t *testing.T) {
+	data := reviewedTargetWithWorkPlanData()
+	data.MemberApplyRefusal = `target primary/testapp_2: its plan runs table "users" as direct-execution DDL`
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**: targets other than the reviewed one have plans of their own, but target primary/testapp\\_2: its plan runs table \"users\" as direct-execution DDL.")
+	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
+	assert.NotContains(t, out, "the reviewed target already has this schema", "the reviewed target still has work")
+	assert.NotContains(t, out, "schemabot apply", "an apply that is refused whatever its flags is never offered")
+}
+
+// The same refusal in a multi-environment comment: the environment's section
+// says why, and the footer neither offers its apply nor calls the PR done.
+func TestRenderMultiEnvPlanComment_ReviewedTargetWithWorkAndRefusedMemberWorkOffersNoApply(t *testing.T) {
+	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
+	refused := reviewedTargetWithWorkPlanData()
+	refused.MemberApplyRefusal = `target primary/testapp_2: its plan runs table "users" as direct-execution DDL`
+
+	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": converged, "production": &refused},
+	})
+	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**: targets other than the reviewed one have plans of their own")
+	assert.NotContains(t, out, "schemabot apply")
+	assert.NotContains(t, out, "No changes to apply", "every target still needs the change")
+}
+
+// reviewedTargetWithWorkPlanData is convergedPrimaryPlanData with the reviewed
+// target, primary/testapp_1, needing the column too.
+func reviewedTargetWithWorkPlanData() PlanCommentData {
+	data := convergedPrimaryPlanData()
+	data.Changes = []KeyspaceChangeData{{
+		Keyspace:   "testapp",
+		Statements: []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"},
+	}}
+	return data
+}
+
 // convergedPrimaryPlanData is a production plan whose reviewed target,
 // primary/testapp_1, already has the schema, while primary/testapp_2 and
 // primary/testapp_3 still need a column added.
