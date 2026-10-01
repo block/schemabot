@@ -151,6 +151,6 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying rollback...")
 
-	err = applyAndWatch(ep, planResult, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
+	_, err = applyAndWatch(ep, planResult, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
 	return err
 }

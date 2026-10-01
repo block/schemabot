@@ -68,7 +68,11 @@ func (s *Service) persistMemberPlans(ctx context.Context, req PlanRequest, plann
 			PrimaryPlanIdentifier: primaryPlanIdentifier,
 			DirectExecution:       resolvedDirectExecution(diffs[i].DirectExecution),
 		}
-		if err := s.storePlan(ctx, req, planIdentifier, diffs[i].Changes, diffs[i].Shards, route); err != nil {
+		// The member's plan records the desired state it was planned against,
+		// which a targets entry selecting namespaces narrows from the request's.
+		memberReq := req
+		memberReq.SchemaFiles = diffs[i].SchemaFiles
+		if err := s.storePlan(ctx, memberReq, planIdentifier, diffs[i].Changes, diffs[i].Shards, route); err != nil {
 			s.logger.Error("failed to store a rollout member's plan; the member will block the review because an apply would have no plan to run for it",
 				"repository", req.Repository,
 				"database", req.Database,

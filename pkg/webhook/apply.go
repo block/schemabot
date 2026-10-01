@@ -404,6 +404,7 @@ func tableProgressFromTasks(databaseFallback string, tasks []*storage.Task, shar
 			Status:              string(t.State),
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,
+			EstimatedBytes:      t.EstimatedBytes,
 			PercentComplete:     t.ProgressPercent,
 			ETASeconds:          int64(t.ETASeconds),
 			ChecksumRowsChecked: t.ChecksumRowsChecked,

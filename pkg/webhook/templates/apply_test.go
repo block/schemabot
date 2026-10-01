@@ -32,6 +32,36 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 
 	assert.Contains(t, rendered, "schemabot unlock -d example-db --force")
 	assert.NotContains(t, rendered, "schemabot unlock -d example-db -e staging --force")
+	assert.Contains(t, rendered, "Ask the lock holder to run `schemabot unlock -d example-db` from their CLI")
+
+	// The lock holder's unlock runs in their terminal, so it starts with the
+	// cli name; the force-unlock is a PR-comment command and keeps the bot's
+	// trigger word.
+	t.Run("cli name", func(t *testing.T) {
+		rendered := RenderApplyBlockedByOtherPR(ApplyLockConflictData{
+			Database:    "example-db",
+			Environment: "staging",
+			LockOwner:   "cli:testuser@example.local",
+			LockCreated: time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC),
+			CLIName:     "acme schemabot",
+		})
+		assert.Contains(t, rendered, "Ask the lock holder to run `acme schemabot unlock -d example-db` from their CLI")
+		assert.Contains(t, rendered, "```\nschemabot unlock -d example-db --force\n```")
+	})
+
+	// Locks are keyed by database and type and the CLI's unlock defaults to
+	// mysql, so the lock holder's unlock names the lock's type.
+	t.Run("database type", func(t *testing.T) {
+		rendered := RenderApplyBlockedByOtherPR(ApplyLockConflictData{
+			Database:     "example-db",
+			DatabaseType: "postgres",
+			Environment:  "staging",
+			LockOwner:    "cli:testuser@example.local",
+			LockCreated:  time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC),
+		})
+		assert.Contains(t, rendered, "Ask the lock holder to run `schemabot unlock -d example-db -t postgres` from their CLI")
+		assert.Contains(t, rendered, "```\nschemabot unlock -d example-db --force\n```")
+	})
 	assert.Contains(t, rendered, "**Locked by**: `cli:testuser`")
 	assert.NotContains(t, rendered, "example.local",
 		"the lock owner's machine is internal detail and stays out of PR markdown")
@@ -1560,6 +1590,53 @@ func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
 	assert.Contains(t, result, "Recovering after restart")
 	assert.NotContains(t, result, "Cutover will be available once recovery completes")
 	assert.NotContains(t, result, "schemabot cutover")
+}
+
+// A copying table shows its planned size beside the row counts, before the
+// ETA, and a stopped one keeps it. A table the plan had no estimate for shows
+// the row counts alone.
+func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	for _, tt := range []struct {
+		name  string
+		table TableProgressData
+		state string
+		want  string
+	}{
+		{
+			name:  "running with ETA",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n",
+		},
+		{
+			name:  "running without ETA",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n",
+		},
+		{
+			name:  "stopped",
+			state: state.Apply.Stopped,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Stopped, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n",
+		},
+		{
+			name:  "no estimate",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.table.DDL = "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+			result := RenderApplyStatusComment(ApplyStatusCommentData{
+				Database: "testapp", Environment: "staging", State: tt.state, Engine: "Spirit",
+				Tables: []TableProgressData{tt.table},
+			})
+			assert.Contains(t, result, tt.want)
+		})
+	}
 }
 
 func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {

@@ -387,7 +387,9 @@ func TestBuildDeploymentDetail_CarriesThePlanIdentifier(t *testing.T) {
 		operationDisplay{PlanIdentifier: "plan_3344"},
 		nil,
 		"",
+		"acme schemabot",
 	)
 
 	assert.Equal(t, "plan_3344", detail.PlanID)
+	assert.Equal(t, "acme schemabot", detail.CLIName, "the command that prints the plan starts with the server's cli name")
 }

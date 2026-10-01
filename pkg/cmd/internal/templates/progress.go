@@ -674,7 +674,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
-			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
+			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatTableSizeClause(t.EstimatedBytes))
 		}
 		b.WriteString("\n")
 		b.WriteString(FormatShardProgress(t.Shards))
@@ -802,11 +802,12 @@ func recoveringIsCopyingRows(t TableProgress) bool {
 }
 
 func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
+	size := ui.FormatTableSizeClause(t.EstimatedBytes)
 	if t.ETASeconds > 0 {
-		fmt.Fprintf(b, indentDetail+"Rows: %s / %s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatETA(t.ETASeconds))
+		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), size, ui.FormatETA(t.ETASeconds))
 		return
 	}
-	fmt.Fprintf(b, indentDetail+"Rows: %s / %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal))
+	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), size)
 }
 
 // writeEstimateExceededTable writes the header and detail lines of a table
