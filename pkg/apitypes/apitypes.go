@@ -1406,10 +1406,12 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 }
 
 // HasChanges reports whether the plan carries any work an apply would execute:
-// table DDL in any namespace, a VSchema update, or a finalizer the engine asked
-// for. Gates that decide whether a plan is actionable must use this rather than
-// counting table changes alone — a VSchema-only or finalizer-only plan has zero
-// table changes but still requires an apply.
+// table DDL in any namespace or on any shard, a VSchema update, or a finalizer
+// the engine asked for. Gates that decide whether a plan is actionable must use
+// this rather than counting table changes alone — a VSchema-only or
+// finalizer-only plan has zero table changes but still requires an apply. A
+// shard row's DDL is work even when the namespace view carries none, since the
+// shard rows are the authoritative representation of a sharded namespace.
 func (r *PlanResponse) HasChanges() bool {
 	for _, sc := range r.Changes {
 		if sc == nil {
@@ -1419,7 +1421,9 @@ func (r *PlanResponse) HasChanges() bool {
 			return true
 		}
 	}
-	return false
+	return slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && len(sp.Changes) > 0
+	})
 }
 
 // SchemaChangeResponse groups changes for a single namespace.

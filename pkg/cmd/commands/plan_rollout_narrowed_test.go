@@ -57,7 +57,8 @@ func TestWritePlanBody_NarrowedPlanIsNotPresentedAsTheRollout(t *testing.T) {
 	assert.Same(t, plan, plan.MemberPlans()[0])
 }
 
-// applyRecordingServer answers /api/plan with plan and records the body of the
+// applyRecordingServer answers /api/plan with plan and /api/status with an
+// environment with no active schema change, and records the body of the
 // /api/apply request, answering it with a server error so the command stops
 // once the request is made.
 func applyRecordingServer(t *testing.T, plan *apitypes.PlanResponse) (*httptest.Server, func() (apitypes.ApplyRequest, bool)) {
@@ -72,9 +73,9 @@ func applyRecordingServer(t *testing.T, plan *apitypes.PlanResponse) (*httptest.
 		defer mu.Unlock()
 		switch r.URL.Path {
 		case "/api/plan":
-			w.Header().Set("Content-Type", "application/json")
-			_, writeErr := w.Write(body)
-			assert.NoError(t, writeErr)
+			writeTestJSON(t, w, body)
+		case "/api/status":
+			writeTestJSON(t, w, []byte(`{}`))
 		case "/api/apply":
 			applied = true
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&applyReq))

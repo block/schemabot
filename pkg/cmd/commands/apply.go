@@ -121,9 +121,12 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// An apply runs on every member of a rollout, and one the server could
 	// not plan has no plan to run, so the apply is refused before it starts.
 	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Attention) > 0 {
-		if cmd.Output != OutputFormatJSON {
-			templates.WriteRolloutAttention(templates.RolloutNoun(rollout), rollout.Attention)
+		if cmd.Output == OutputFormatJSON {
+			// JSON output prints no member list, so the error itself names
+			// each member and what it needs.
+			return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one, then apply again: %s", len(rollout.Attention), rollout.Members, rolloutAttentionSummary(rollout.Attention))
 		}
+		templates.WriteRolloutAttention(templates.RolloutNoun(rollout), rollout.Attention)
 		return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one listed above, then apply again", len(rollout.Attention), rollout.Members)
 	}
 
@@ -542,12 +545,22 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 
 	// Then show the unsafe changes warning
 	unsafeChanges := planResult.RolloutUnsafeChanges()
-	retry := fmt.Sprintf("apply -s %s -e %s", schemaDir, environment)
+	retry := fmt.Sprintf("apply -s %s -e %s", initShellArg(schemaDir), initShellArg(environment))
 	if target != "" {
-		retry += " --target " + target
+		retry += " --target " + initShellArg(target)
 	}
 	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry+" --allow-unsafe")
 	return ErrSilent
+}
+
+// rolloutAttentionSummary names each rollout member that needs attention with
+// the server's sanitized description of what it needs, on one line.
+func rolloutAttentionSummary(attention []*apitypes.PlanMemberAttentionResponse) string {
+	entries := make([]string, 0, len(attention))
+	for _, a := range attention {
+		entries = append(entries, fmt.Sprintf("%s (%s)", a.Member, a.Detail))
+	}
+	return strings.Join(entries, "; ")
 }
 
 // blockRolloutApplyRefused displays the plan and refuses an apply of the
@@ -562,7 +575,7 @@ func blockRolloutApplyRefused(planResult *apitypes.PlanResponse, rollout *apityp
 		if r.Reason == apitypes.PlanMemberBlocked {
 			continue
 		}
-		rerun := fmt.Sprintf("apply -s %s -e %s --target %s", schemaDir, environment, r.Target)
+		rerun := fmt.Sprintf("apply -s %s -e %s --target %s", initShellArg(schemaDir), initShellArg(environment), initShellArg(r.Target))
 		if r.AllowUnsafe {
 			rerun += " --allow-unsafe"
 		}

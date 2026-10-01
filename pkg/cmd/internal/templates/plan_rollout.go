@@ -44,17 +44,14 @@ func WriteRolloutAttention(noun presentation.Noun, attention []*apitypes.PlanMem
 
 // WriteRolloutApplyRefused writes why an apply of a whole rollout was refused
 // before it started: members whose own plans the server will not run in a
-// rollout-wide apply, each with why, and the narrowed apply that runs each
-// one under its own plan and its own consent. reruns holds one command per
-// refused member that a narrowed apply runs, without the binary name; a
-// member whose change its engine refuses has none. Past
+// rollout-wide apply, each with why, and the next step for each. A member
+// whose change its engine refuses is told to change the schema files, since no
+// apply runs it. Every other member gets the narrowed apply that runs it under
+// its own plan and its own consent. reruns holds one command per refused
+// member that a narrowed apply runs, without the binary name. Past
 // memberNamesInlineLimit the rest are counted rather than spelled out.
 func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMemberRefusalResponse, reruns []string) {
-	label := noun.Plural
-	if len(refused) == 1 {
-		label = noun.Singular
-	}
-	fmt.Printf("%s Apply blocked: an apply of the whole rollout cannot run the plan of %d %s\n\n", glyph.Refused, len(refused), label)
+	fmt.Printf("%s Apply blocked: an apply of the whole rollout cannot run the plan of %d %s\n\n", glyph.Refused, len(refused), nounLabel(noun, len(refused)))
 	shown := min(len(refused), memberNamesInlineLimit)
 	for _, r := range refused[:shown] {
 		fmt.Printf("  • %s — %s\n", r.Member, r.Detail)
@@ -63,13 +60,24 @@ func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMe
 		fmt.Printf("  and %d more\n", rest)
 	}
 	fmt.Println()
-	if len(reruns) == 0 {
+	blocked := countBlockedRefusals(refused)
+	switch {
+	case blocked == len(refused):
 		fmt.Println("No apply can run these changes; change the schema files so each target's engine accepts them.")
 		fmt.Println()
+	case blocked > 0:
+		fmt.Printf("No apply can run the changes of the %d %s whose engine refuses them; change the schema files so each target's engine accepts them.\n", blocked, nounLabel(noun, blocked))
+		fmt.Println()
+	}
+	if len(reruns) == 0 {
 		return
 	}
-	fmt.Println("Apply each " + noun.Singular + " on its own, under its own plan and its own consent,")
-	fmt.Println("then apply the rollout again for the rest:")
+	if blocked > 0 {
+		fmt.Println("Apply each other " + noun.Singular + " on its own, under its own plan and its own consent:")
+	} else {
+		fmt.Println("Apply each " + noun.Singular + " on its own, under its own plan and its own consent,")
+		fmt.Println("then apply the rollout again for the rest:")
+	}
 	fmt.Println()
 	shownReruns := min(len(reruns), memberNamesInlineLimit)
 	for _, rerun := range reruns[:shownReruns] {
@@ -79,4 +87,24 @@ func WriteRolloutApplyRefused(noun presentation.Noun, refused []*apitypes.PlanMe
 		fmt.Printf("  and the same for %d more %s\n", rest, noun.Plural)
 	}
 	fmt.Println()
+}
+
+// countBlockedRefusals counts the refused members whose change their engine
+// refuses, which no apply runs.
+func countBlockedRefusals(refused []*apitypes.PlanMemberRefusalResponse) int {
+	n := 0
+	for _, r := range refused {
+		if r.Reason == apitypes.PlanMemberBlocked {
+			n++
+		}
+	}
+	return n
+}
+
+// nounLabel is noun's singular for one member and its plural otherwise.
+func nounLabel(noun presentation.Noun, n int) string {
+	if n == 1 {
+		return noun.Singular
+	}
+	return noun.Plural
 }

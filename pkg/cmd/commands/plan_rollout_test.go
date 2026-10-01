@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -97,9 +99,10 @@ func TestPlanResponse_RolloutUnsafeChangesKeepTheSameTableInEachNamespace(t *tes
 	}
 }
 
-// rolloutPlanServer serves plan as the response to every plan request and
-// records the path of every request the CLI makes, answering anything else
-// with a server error.
+// rolloutPlanServer serves plan as the response to every plan request and an
+// environment with no active schema change to every status request, records
+// the path of every request the CLI makes, and answers anything else with a
+// server error.
 func rolloutPlanServer(t *testing.T, plan *apitypes.PlanResponse) (*httptest.Server, *[]string) {
 	t.Helper()
 	body, err := json.Marshal(plan)
@@ -107,16 +110,25 @@ func rolloutPlanServer(t *testing.T, plan *apitypes.PlanResponse) (*httptest.Ser
 	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
-		if r.URL.Path != "/api/plan" {
+		switch r.URL.Path {
+		case "/api/plan":
+			writeTestJSON(t, w, body)
+		case "/api/status":
+			writeTestJSON(t, w, []byte(`{}`))
+		default:
 			w.WriteHeader(http.StatusInternalServerError)
-			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, writeErr := w.Write(body)
-		require.NoError(t, writeErr)
 	}))
 	t.Cleanup(server.Close)
 	return server, &paths
+}
+
+// writeTestJSON answers a test server request with body as JSON.
+func writeTestJSON(t *testing.T, w http.ResponseWriter, body []byte) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/json")
+	_, err := w.Write(body)
+	assert.NoError(t, err)
 }
 
 // An apply runs on every member of the rollout, so while one member could not
@@ -222,8 +234,9 @@ func TestApplyCmd_UnsafeChangeBesideAConvergedPrimaryNamesTheNarrowedApply(t *te
 // narrowed apply for each with the selector the server returned: us is a
 // deployment with the one target us-main, which is what --target accepts. The
 // opt-in is suggested only for the target whose own plan is unsafe. A target
-// whose change its engine refuses is named without a rerun, since no apply
-// runs it.
+// whose change its engine refuses gets no rerun, since no apply runs it: it is
+// told to change the schema files, and the narrowed applies are offered for
+// the other targets only, without the rollout rerun its refusal would block.
 func TestApplyCmd_RefusesTargetsARolloutWideApplyCannotRunBesidePrimaryWork(t *testing.T) {
 	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{
 		PlanID:  "plan-orders-1",
@@ -257,4 +270,131 @@ func TestApplyCmd_RefusesTargetsARolloutWideApplyCannotRunBesidePrimaryWork(t *t
 	assert.NotContains(t, out, "--target us ", "a deployment's display name is not a selector")
 	assert.NotContains(t, out, "--target payments-002", "no apply runs a change its engine refuses")
 	assert.NotContains(t, out, "retry with", "no opt-in the server would refuse is suggested")
+	assert.Contains(t, out, "No apply can run the changes of the 1 target whose engine refuses them; change the schema files so each target's engine accepts them.", "%s", out)
+	assert.Contains(t, out, "Apply each other target on its own, under its own plan and its own consent:", "%s", out)
+	assert.NotContains(t, out, "then apply the rollout again", "the rollout stays refused while a target's engine refuses its change:\n%s", out)
+}
+
+// A rollout whose only refused target carries a change its engine refuses
+// names no narrowed apply, only the schema-file remedy, and offers no rollout
+// rerun.
+func TestApplyCmd_RefusesARolloutWhoseOnlyRefusalIsBlocked(t *testing.T) {
+	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{
+		PlanID:  "plan-orders-1",
+		Engine:  "mysql",
+		Changes: addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     2,
+			Independent: true,
+			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 2), Primary: true, Changes: addColumnTo("region")}},
+			Refused: []*apitypes.PlanMemberRefusalResponse{
+				{Member: "prod/payments-002", Target: "payments-002", Reason: apitypes.PlanMemberBlocked, Detail: "carries changes its target's engine refuses"},
+			},
+		},
+	})
+
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true, AutoApprove: true}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+	require.ErrorIs(t, runErr, ErrSilent)
+	assert.NotContains(t, *paths, "/api/apply")
+	assert.Contains(t, out, "No apply can run these changes; change the schema files so each target's engine accepts them.", "%s", out)
+	assert.NotContains(t, out, "--target", "%s", out)
+	assert.NotContains(t, out, "Apply each", "%s", out)
+}
+
+// A plan can carry a sharded namespace's DDL on its shard rows alone. That is
+// work an apply runs, on the primary's plan and on any group's.
+func TestPlanResponse_ShardRowsAloneAreWork(t *testing.T) {
+	shardOnly := []*apitypes.ShardPlanResponse{{
+		Namespace: "orders_sharded",
+		Shard:     "-80",
+		Changes: []*apitypes.TableChangeResponse{{
+			TableName: "orders", Namespace: "orders_sharded", DDL: "ALTER TABLE `orders` ADD COLUMN `region` varchar(32)", ChangeType: "alter",
+		}},
+	}}
+	settled := []*apitypes.ShardPlanResponse{{Namespace: "orders_sharded", Shard: "80-"}}
+
+	assert.True(t, (&apitypes.PlanResponse{Shards: shardOnly}).HasChanges(), "the primary's shard rows are work")
+	assert.False(t, (&apitypes.PlanResponse{Shards: settled}).HasChanges(), "a shard row with no changes is a settled shard")
+
+	plan := &apitypes.PlanResponse{
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members: 2,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: []string{"prod/payments-001"}, Primary: true, Changes: []*apitypes.SchemaChangeResponse{}, Shards: settled},
+				{Members: []string{"prod/payments-002"}, Changes: []*apitypes.SchemaChangeResponse{}, Shards: shardOnly},
+			},
+		},
+	}
+	assert.True(t, plan.RolloutHasChanges(), "another group's shard rows are work of the rollout")
+}
+
+// With --output json the member list is not printed, so the refusal's error
+// names each member that needs attention and what it needs.
+func TestApplyCmd_JSONOutputNamesTheMembersThatNeedAttention(t *testing.T) {
+	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{
+		PlanID:  "plan-orders-1",
+		Engine:  "mysql",
+		Changes: addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 2), Primary: true, Changes: addColumnTo("region")}},
+			Attention: []*apitypes.PlanMemberAttentionResponse{
+				{Member: "prod/payments-003", Reason: apitypes.PlanMemberUnplanned, Detail: "could not be planned; see server logs for the cause, then plan again"},
+			},
+		},
+	})
+
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true, AutoApprove: true, Output: OutputFormatJSON}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+	require.Error(t, runErr)
+	assert.Equal(t, "1 of 3 rollout members cannot be applied as planned; resolve each one, then apply again: prod/payments-003 (could not be planned; see server logs for the cause, then plan again)", runErr.Error())
+	assert.NotContains(t, out, "• prod/payments-003", "the member list is not printed in JSON mode:\n%s", out)
+	assert.NotContains(t, *paths, "/api/apply")
+}
+
+// A suggested command is pasted into a shell, so a schema directory or
+// selector that the shell would split or interpret is quoted.
+func TestApplyCmd_SuggestedCommandsQuoteTheirArguments(t *testing.T) {
+	drop := []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders",
+		TableChanges: []*apitypes.TableChangeResponse{{
+			TableName: "legacy", Namespace: "orders", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+		}},
+	}}
+	schemaDir := filepath.Join(t.TempDir(), "my schema")
+	require.NoError(t, os.CopyFS(schemaDir, os.DirFS(writeTestSchemaDir(t))))
+
+	t.Run("narrowed rerun", func(t *testing.T) {
+		server, _ := rolloutPlanServer(t, &apitypes.PlanResponse{
+			PlanID: "plan-orders-1",
+			Engine: "mysql",
+			Rollout: &apitypes.PlanRolloutResponse{
+				Members:     2,
+				Independent: true,
+				Groups: []*apitypes.PlanMemberGroupResponse{
+					{Members: paymentsTargets(1, 1), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}},
+					{Members: paymentsTargets(2, 2), Changes: drop},
+				},
+				Refused: []*apitypes.PlanMemberRefusalResponse{
+					{Member: "prod/payments-002", Target: "payments 002", Reason: apitypes.PlanMemberNeedsTarget, Detail: "drops a table", AllowUnsafe: true},
+				},
+			},
+		})
+		cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", NoLock: true, AutoApprove: true}
+		out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
+		assert.Contains(t, out, "apply -s '"+schemaDir+"' -e production --target 'payments 002' --allow-unsafe", "%s", out)
+	})
+
+	t.Run("unsafe retry", func(t *testing.T) {
+		server, _ := rolloutPlanServer(t, &apitypes.PlanResponse{PlanID: "plan-orders-1", Engine: "mysql", Changes: drop})
+		cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", NoLock: true, AutoApprove: true}
+		out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
+		assert.Contains(t, out, "apply -s '"+schemaDir+"' -e production --allow-unsafe", "%s", out)
+	})
 }
