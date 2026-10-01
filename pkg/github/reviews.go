@@ -28,6 +28,9 @@ type ReviewInfo struct {
 	User        string
 	State       string // One of the Review* constants.
 	SubmittedAt time.Time
+	// CommitID is the PR head commit the review was submitted on. It is empty
+	// when GitHub reports no commit for the review.
+	CommitID string
 }
 
 // ListReviews fetches all reviews for a PR (paginated).
@@ -54,6 +57,7 @@ func (ic *InstallationClient) ListReviews(ctx context.Context, repo string, pr i
 				User:        r.GetUser().GetLogin(),
 				State:       r.GetState(),
 				SubmittedAt: r.GetSubmittedAt().Time,
+				CommitID:    r.GetCommitID(),
 			})
 		}
 		if resp.NextPage == 0 {
@@ -72,11 +76,20 @@ func (ic *InstallationClient) ListReviews(ctx context.Context, repo string, pr i
 // when determining the latest decisive review. On equal timestamps the later
 // entry wins, matching GitHub's chronological ordering.
 func GetApprovedReviewers(reviews []*ReviewInfo) []string {
-	type latestReview struct {
-		State       string
-		SubmittedAt time.Time
+	approvals := GetApprovedReviews(reviews)
+	approved := make([]string, 0, len(approvals))
+	for _, r := range approvals {
+		approved = append(approved, strings.ToLower(r.User))
 	}
-	latest := make(map[string]latestReview)
+	return approved
+}
+
+// GetApprovedReviews returns, for each user whose latest decisive review is
+// APPROVED, that approving review, so callers can see which commit each
+// approval was given on. Latest-decisive-review semantics match
+// GetApprovedReviewers.
+func GetApprovedReviews(reviews []*ReviewInfo) []*ReviewInfo {
+	latest := make(map[string]*ReviewInfo)
 	for _, r := range reviews {
 		if r.User == "" {
 			continue
@@ -86,14 +99,14 @@ func GetApprovedReviewers(reviews []*ReviewInfo) []string {
 		}
 		key := strings.ToLower(r.User)
 		if cur, ok := latest[key]; !ok || !r.SubmittedAt.Before(cur.SubmittedAt) {
-			latest[key] = latestReview{State: r.State, SubmittedAt: r.SubmittedAt}
+			latest[key] = r
 		}
 	}
 
-	var approved []string
-	for user, info := range latest {
-		if strings.EqualFold(info.State, ReviewApproved) {
-			approved = append(approved, user)
+	var approved []*ReviewInfo
+	for _, r := range latest {
+		if strings.EqualFold(r.State, ReviewApproved) {
+			approved = append(approved, r)
 		}
 	}
 	return approved
