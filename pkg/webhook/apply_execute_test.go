@@ -37,6 +37,39 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "staging", fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
 	})
 
+	// A refusal of one target's own plan names that target and the table, from
+	// fields SchemaBot controls, so the engine's reason and the plan identifier
+	// in the underlying error never reach the comment.
+	t.Run("member plan refusal names the target", func(t *testing.T) {
+		cause := errors.New("stored plan plan-7f3a contains a blocked change for table \"orders\": dial tcp 10.0.0.7:3306")
+		blocked := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanBlocked, Table: "orders", Err: cause,
+		})
+		msg := applyExecutionErrorMessage(action.Apply, "production", blocked)
+		assert.Equal(t, "Target `payments-002` has a change on table `orders` that its engine refuses to execute, so nothing was applied. Fix what that target's plan names as the reason, then run the command again.", msg)
+		assert.NotContains(t, msg, "10.0.0.7")
+		assert.NotContains(t, msg, "plan-7f3a")
+
+		unsafe := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Table: "legacy_orders", Err: cause,
+		})
+		msg = applyExecutionErrorMessage(action.Apply, "production", unsafe)
+		assert.Equal(t, "Target `payments-002` has an unsafe change on table `legacy_orders` that the reviewed plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the reviewed plan carries the same change.", msg)
+		assert.NotContains(t, msg, "10.0.0.7")
+		assert.NotContains(t, msg, "plan-7f3a")
+
+		vschema := &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Namespace: "ns_0", Err: cause,
+		}
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", vschema), "an unsafe change on the VSchema of namespace `ns_0` that the reviewed plan does not carry")
+
+		unknown := &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanRefusal(99), Table: "orders", Err: cause,
+		}
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "production", unknown),
+			"a refusal kind with no line of its own never renders the error text")
+	})
+
 	t.Run("internal error remains sanitized", func(t *testing.T) {
 		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "staging", errors.New("secret DSN")))
 	})

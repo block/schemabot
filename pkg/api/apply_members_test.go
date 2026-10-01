@@ -2,9 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -448,6 +452,11 @@ func TestCreateStoredApply_BlockedMemberPlanIsRefused(t *testing.T) {
 	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
 	assert.Contains(t, err.Error(), "blocked change")
 	assert.Contains(t, err.Error(), "orders")
+	refused, ok := errors.AsType[*MemberPlanRefusedError](err)
+	require.True(t, ok, "the refusal is typed so a caller can name the target without rendering the error")
+	assert.Equal(t, MemberPlanBlocked, refused.Refusal)
+	assert.Equal(t, "eu/testapp-002", refused.Target, "the target is named the way the plan comment names it")
+	assert.Equal(t, "orders", refused.Table)
 }
 
 // The unsafe opt-in is the operator's, given against the disclosure on the
@@ -504,6 +513,13 @@ func TestCreateStoredApply_UndisclosedUnsafeMemberChangeIsRefusedUnderTheOptIn(t
 		"the reviewed plan drops a column from users too, so the refusal says the statements differ")
 	assert.Contains(t, err.Error(), "the disclosure on reviewed plan plan-primary never named it")
 	assert.NotContains(t, err.Error(), "retry with allow_unsafe", "no opt-in covers a change the disclosure never named")
+	refused, ok := errors.AsType[*MemberPlanRefusedError](err)
+	require.True(t, ok, "the refusal is typed so a caller can name the target without rendering the error")
+	assert.Equal(t, MemberPlanUndisclosedUnsafe, refused.Refusal)
+	assert.Equal(t, "eu/testapp-002", refused.Target, "the target is named the way the plan comment names it")
+	assert.Equal(t, "eu/testapp-002", refused.MemberID)
+	assert.Equal(t, "users", refused.Table)
+	assert.Empty(t, refused.Namespace)
 	applies, ok := svc.storage.Applies().(*capturingApplyStore)
 	require.True(t, ok)
 	assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
@@ -535,8 +551,8 @@ func TestMemberWorkTheReviewedPlanCannotRun(t *testing.T) {
 		{name: "same work", reviewed: planWith(alter), member: planWith(alter), want: ""},
 		{name: "disclosed unsafe change", reviewed: planWith(alter, drop), member: planWith(alter, drop), want: ""},
 		{name: "undisclosed unsafe change", reviewed: planWith(alter), member: planWith(alter, drop), want: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`},
-		{name: "direct execution", reviewed: planWith(alter), member: planWith(direct), want: `runs table "users" as direct-execution DDL`},
-		{name: "direct execution the reviewed plan runs too", reviewed: planWith(direct), member: planWith(direct), want: `runs table "users" as direct-execution DDL`},
+		{name: "disclosed direct execution", reviewed: planWith(alter), member: planWith(direct), want: ""},
+		{name: "disclosed direct execution the reviewed plan runs too", reviewed: planWith(direct), member: planWith(direct), want: ""},
 		{name: "blocked change", reviewed: planWith(alter), member: planWith(blocked), want: "carries changes its target's engine refuses"},
 		{name: "work outside the shape", reviewed: planWith(alter), member: shardOnly, want: "has per-shard changes in namespaces [testapp]"},
 	} {
@@ -648,11 +664,37 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.
 	assert.Contains(t, tasks[0].DDL, "ADD COLUMN `email`")
 }
 
+// A member's own plan can run a statement as direct-execution DDL while the
+// reviewed target is already converged. The plan comment discloses that change
+// under the member that runs it, so an apply-confirm of that comment builds the
+// member's task with the direct verdict intact.
+func TestCreateStoredApply_EmptyReviewedPlanRunsAMembersDirectChange(t *testing.T) {
+	member := memberPlanWithChange(storage.TableChange{
+		Namespace:     "testapp",
+		Table:         "users",
+		Operation:     "alter",
+		DDL:           "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		ExecutionMode: "direct",
+		ModeReason:    "table is 12 MiB, within the direct execution bound",
+	})
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{member}})
+
+	_, _, err := svc.createStoredApply(t.Context(), primaryPlanRow("testapp-001"), ApplyRequest{Environment: "production", ConfirmedMemberWork: true}, nil, "apply-converged-primary")
+	require.NoError(t, err)
+
+	applies, ok := svc.storage.Applies().(*capturingApplyStore)
+	require.True(t, ok)
+	tasks := applies.taskStore.tasks
+	require.Len(t, tasks, 1, "only the member that needs the column gets work")
+	assert.Equal(t, "users", tasks[0].TableName)
+	assert.Equal(t, "direct", tasks[0].ExecutionMode)
+	assert.Equal(t, "table is 12 MiB, within the direct execution bound", tasks[0].ModeReason)
+}
+
 // An apply created from a reviewed plan with no work gives every member one work
 // operation, so member work that needs another shape is refused rather than
-// settled as done. So are direct-execution DDL and unsafe changes, even under
-// the opt-in, whose consent is given against a disclosure the empty reviewed
-// plan does not carry.
+// settled as done. So are unsafe changes, even under the opt-in, whose consent
+// is given against a disclosure the empty reviewed plan does not carry.
 func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
@@ -682,15 +724,6 @@ func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *te
 				return plan
 			},
 			want: "finalizes namespaces [testapp]",
-		},
-		{
-			name: "direct execution",
-			member: func() *storage.Plan {
-				direct := alter
-				direct.ExecutionMode = "direct"
-				return memberPlanWithChange(direct)
-			},
-			want: "runs table \"users\" as direct-execution DDL",
 		},
 		{
 			name: "unsafe change under the opt-in",
@@ -856,11 +889,13 @@ func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation
 	assert.Nil(t, byTarget["testapp-002"].StartedAt, "nothing ran on the converged member")
 }
 
-// The operator consents to direct-execution DDL against the locked comment's
-// disclosure, which names only the reviewed plan's statements. A member planned
-// on its own that runs direct-execution DDL is refused even when the reviewed
-// target has work of its own, including the same statement run directly.
-func TestCreateStoredApply_MemberDirectExecutionIsRefusedWhenTheReviewedPlanHasWork(t *testing.T) {
+// The reviewed target and another target both add a column, and the other
+// target's own plan runs it as direct-execution DDL because its table is within
+// the direct execution bound. The verdict belongs to the target that runs the
+// statement, and the comment the operator confirms discloses it under that
+// target, so apply creation builds each target's task with its own verdict: the
+// reviewed target's through Spirit, the other target's direct.
+func TestCreateStoredApply_ReviewedPlanWithWorkRunsAMembersDirectChange(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
 		Table:     "users",
@@ -869,22 +904,149 @@ func TestCreateStoredApply_MemberDirectExecutionIsRefusedWhenTheReviewedPlanHasW
 	}
 	direct := alter
 	direct.ExecutionMode = "direct"
-	// The disclosure names the reviewed target's table at the size measured
+	direct.ModeReason = "table is 12 MiB, within the direct execution bound"
+	svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
+	reviewed := primaryPlanRow("testapp-001")
+	reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+
+	_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production", ConfirmedMemberWork: true}, nil, "apply-member-direct")
+	require.NoError(t, err)
+
+	applies, ok := svc.storage.Applies().(*capturingApplyStore)
+	require.True(t, ok)
+	require.NotNil(t, applies.apply, "the apply is stored")
+	tasks := applies.taskStore.tasks
+	require.Len(t, tasks, 2, "each target runs its own ALTER")
+	targetOf := map[int64]string{}
+	for _, operation := range applies.operations {
+		targetOf[operation.ID] = operation.Target
+	}
+	modes := map[string]string{}
+	for _, task := range tasks {
+		assert.Equal(t, "users", task.TableName)
+		assert.Contains(t, task.DDL, "ADD COLUMN `email`")
+		require.NotNil(t, task.ApplyOperationID)
+		modes[targetOf[*task.ApplyOperationID]] = task.ExecutionMode
+	}
+	assert.Equal(t, map[string]string{"testapp-001": "", "testapp-002": "direct"}, modes,
+		"each target's task carries its own plan's verdict")
+}
+
+// A caller other than a pull request apply-confirm was shown the reviewed plan
+// alone: a direct API caller that posts the reviewed plan's id never saw the
+// other target's own plan, nor that it runs orders as write-blocking native
+// DDL. Apply creation refuses that member's direct change for it, whether or
+// not the reviewed target has work, even when the reviewed plan runs the same
+// statement directly, and stores nothing.
+func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) {
+	alter := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "orders",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)",
+	}
+	direct := alter
+	direct.ExecutionMode = "DIRECT"
+	direct.ModeReason = "table is 12 MiB, within the direct execution bound"
+	withWork := primaryPlanRow("testapp-001")
+	withWork.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+	// The reviewed plan names the reviewed target's table at the size measured
 	// there, so the reviewed plan running the identical statement directly
-	// consents to nothing on the other target's copy of the table.
-	for name, reviewedChange := range map[string]storage.TableChange{
-		"reviewed plan runs it online":   alter,
-		"reviewed plan runs it directly": direct,
+	// discloses nothing about the other target's copy of the table.
+	withDirect := primaryPlanRow("testapp-001")
+	withDirect.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{direct}}}
+
+	for name, reviewed := range map[string]*storage.Plan{
+		"reviewed target has work":             withWork,
+		"reviewed target runs it directly too": withDirect,
+		"reviewed target converged":            primaryPlanRow("testapp-001"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
-			reviewed := primaryPlanRow("testapp-001")
-			reviewed.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{reviewedChange}}}
 
-			_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-member-direct")
+			_, _, err := svc.createStoredApply(t.Context(), reviewed, ApplyRequest{Environment: "production"}, nil, "apply-unconfirmed-direct")
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
-			assert.Contains(t, err.Error(), "runs table \"users\" as direct-execution DDL")
+			assert.Contains(t, err.Error(), "runs table \"orders\" as direct-execution DDL")
+			assert.Contains(t, err.Error(), "shown only the reviewed plan plan-primary")
+			applies, ok := svc.storage.Applies().(*capturingApplyStore)
+			require.True(t, ok)
+			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
+		})
+	}
+}
+
+// Every entry point that creates an apply without a pull request apply-confirm
+// refuses another target's direct-execution change: the HTTP API that the CLI
+// and direct callers post to, ExecuteApply, which a rollback-confirm also calls
+// without the flag, and the trusted EnqueueAuthorizedApply. Each was shown the
+// reviewed plan alone, and none can assert the confirmation, including through
+// the JSON body of POST /api/apply, which rejects the field as unknown.
+func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
+	direct := storage.TableChange{
+		Namespace:     "testapp",
+		Table:         "orders",
+		Operation:     "alter",
+		DDL:           "ALTER TABLE `orders` ADD COLUMN `region` varchar(16)",
+		ExecutionMode: "direct",
+		ModeReason:    "table is 12 MiB, within the direct execution bound",
+	}
+	newService := func(t *testing.T) *Service {
+		t.Helper()
+		reviewed := primaryPlanRow("testapp-001")
+		reviewed.Environment = "production"
+		svc := multiTargetApplyService(t, &listingPlanStore{
+			mockPlanLookupStore: mockPlanLookupStore{plan: reviewed},
+			plans:               []*storage.Plan{memberPlanWithChange(direct)},
+		})
+		svc.ternClients["eu/production"] = &mockTernClient{isRemote: true}
+		return svc
+	}
+	// postApply posts the body to the apply endpoint and returns the status and
+	// the error message it answered with.
+	postApply := func(t *testing.T, svc *Service, body string) (int, string) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		svc.handleApply(rec, req)
+		var resp struct {
+			Error string `json:"error"`
+		}
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		return rec.Code, resp.Error
+	}
+	request := ApplyRequest{PlanID: "plan-primary", Environment: "production"}
+	const refused = "runs table \"orders\" as direct-execution DDL"
+
+	for _, tc := range []struct {
+		name  string
+		apply func(t *testing.T, svc *Service) string
+		want  string
+	}{
+		{"POST /api/apply", func(t *testing.T, svc *Service) string {
+			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production"}`)
+			assert.Equal(t, http.StatusInternalServerError, code)
+			return msg
+		}, refused},
+		{"POST /api/apply asserting the confirmation", func(t *testing.T, svc *Service) string {
+			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","ConfirmedMemberWork":true}`)
+			assert.Equal(t, http.StatusBadRequest, code)
+			return msg
+		}, `unknown field "ConfirmedMemberWork"`},
+		{"ExecuteApply", func(t *testing.T, svc *Service) string {
+			_, _, err := svc.ExecuteApply(t.Context(), request)
+			require.Error(t, err)
+			return err.Error()
+		}, refused},
+		{"EnqueueAuthorizedApply", func(t *testing.T, svc *Service) string {
+			_, _, err := svc.EnqueueAuthorizedApply(t.Context(), request)
+			require.Error(t, err)
+			return err.Error()
+		}, refused},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newService(t)
+			assert.Contains(t, tc.apply(t, svc), tc.want)
 			applies, ok := svc.storage.Applies().(*capturingApplyStore)
 			require.True(t, ok)
 			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")

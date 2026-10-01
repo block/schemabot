@@ -951,8 +951,12 @@ The apply is refused instead, with nothing run and the record left
 `action_required` (or `failure` for drift), when a target could not be
 confirmed, when the comment cannot render every target's plan, or when a
 target's plan carries work that comment cannot disclose for confirmation: an
-unsafe or direct-execution change, per-shard or finalizer work, a change its
-engine refuses, or an unfinished copy it would discard. A target whose data
+unsafe change, per-shard or finalizer work, a change its engine refuses, or an
+unfinished copy it would discard. A target's direct-execution change is not
+refused: the comment discloses it under that target, and confirming runs it
+there as native DDL that blocks writes to the table until it finishes. It runs
+only from that apply-confirm; an apply created any other way, such as a
+`POST /api/apply` of the reviewed plan, refuses it. A target whose data
 plane could not say whether it holds an unfinished copy, because it does not
 look or its lookup failed, is refused the same way. Apply-confirm asks all of
 this again against the rollout as it is at confirm, and also refuses when a

@@ -201,20 +201,26 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 			byPlan[e.PlanFingerprint] = at
 		}
 		groups[at].Members = append(groups[at].Members, names[i])
-		for _, bc := range memberBlockedChanges(e.ChangeSet) {
-			addBlockedTarget(&groups[at], bc, names[i])
+		for _, bc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeBlocked) {
+			addModeTarget(&groups[at].BlockedChanges, bc, names[i])
+		}
+		// A direct verdict is read per member for the same reason a refusal is:
+		// the policy judges each target's own table, so members that run the same
+		// DDL can differ in how it runs. That write-blocking DDL is disclosed
+		// under the targets that run it, the way a refusal is.
+		for _, dc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeDirect) {
+			addModeTarget(&groups[at].DirectChanges, templates.DirectChangeData(dc), names[i])
 		}
 	}
-	// A change every target in the group refuses needs no names beside it: the
+	// A change every target in the group carries needs no names beside it: the
 	// group heading already lists them.
 	for gi := range groups {
+		members := len(groups[gi].Members)
 		for bi := range groups[gi].BlockedChanges {
-			bc := &groups[gi].BlockedChanges[bi]
-			if len(bc.Targets) == len(groups[gi].Members) {
-				bc.Targets = nil
-				continue
-			}
-			bc.TotalTargets = len(groups[gi].Members)
+			trimModeTargets(&groups[gi].BlockedChanges[bi].Targets, &groups[gi].BlockedChanges[bi].TotalTargets, members)
+		}
+		for di := range groups[gi].DirectChanges {
+			trimModeTargets(&groups[gi].DirectChanges[di].Targets, &groups[gi].DirectChanges[di].TotalTargets, members)
 		}
 	}
 	// The primary is the first member, so its group is already first. Ordering is
@@ -298,12 +304,24 @@ func memberShardDDLByTable(shards []*ternv1.ShardPlan) map[planTableRef][]string
 	return byTable
 }
 
-// memberBlockedChanges lists the changes in one member's plan that its engine
-// will refuse at apply. Grouping keys members on the work they would run, not on
-// whether their engines accept it, so each member's verdict is read from its own
-// plan. A sharded namespace is read per shard, the way the reviewed plan's
-// blocked changes are, so a change refused on some shards names them.
-func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
+// trimModeTargets drops the target names from a group's disclosure when every
+// target in the group carries it, and otherwise records the group's size so a
+// subset too wide to name reads as coverage.
+func trimModeTargets(targets *[]string, totalTargets *int, members int) {
+	if len(*targets) == members {
+		*targets = nil
+		return
+	}
+	*totalTargets = members
+}
+
+// memberModeChanges lists the changes in one member's plan that its engine
+// judged to run in the given execution mode. Grouping keys members on the work
+// they would run, not on how their engines run it, so each member's verdict is
+// read from its own plan. A sharded namespace is read per shard, the way the
+// reviewed plan's verdicts are, so a change judged that way on some shards
+// names them.
+func memberModeChanges(cs tern.ChangeSet, mode string) []templates.BlockedChangeData {
 	if len(cs.Shards) > 0 {
 		total := 0
 		var out []templates.BlockedChangeData
@@ -313,10 +331,10 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 			}
 			total++
 			for _, tc := range sp.GetChanges() {
-				if tc.GetExecutionMode() != engine.ExecutionModeBlocked {
+				if !strings.EqualFold(tc.GetExecutionMode(), mode) {
 					continue
 				}
-				out = mergeBlockedShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
+				out = mergeModeShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
 			}
 		}
 		for i := range out {
@@ -327,7 +345,7 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 	var out []templates.BlockedChangeData
 	for _, sc := range cs.Changes {
 		for _, tc := range sc.GetTableChanges() {
-			if tc.GetExecutionMode() == engine.ExecutionModeBlocked {
+			if strings.EqualFold(tc.GetExecutionMode(), mode) {
 				out = append(out, templates.BlockedChangeData{Table: tc.GetTableName(), Reason: tc.GetModeReason()})
 			}
 		}
@@ -335,9 +353,9 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 	return out
 }
 
-// mergeBlockedShard records that a shard refuses a table change, folding it into
+// mergeModeShard records a shard's verdict on a table change, folding it into
 // the entry for the same table and reason when one exists.
-func mergeBlockedShard(out []templates.BlockedChangeData, table, reason, shard string) []templates.BlockedChangeData {
+func mergeModeShard(out []templates.BlockedChangeData, table, reason, shard string) []templates.BlockedChangeData {
 	for i := range out {
 		if out[i].Table == table && out[i].Reason == reason {
 			out[i].Shards = append(out[i].Shards, shard)
@@ -347,19 +365,35 @@ func mergeBlockedShard(out []templates.BlockedChangeData, table, reason, shard s
 	return append(out, templates.BlockedChangeData{Table: table, Reason: reason, Shards: []string{shard}})
 }
 
-// addBlockedTarget records that a target refuses one of its group's changes,
+// modeChange is a disclosure of how a target's engine runs one of its changes,
+// refused or direct, keyed the same way whichever verdict it discloses.
+type modeChange interface {
+	templates.BlockedChangeData | templates.DirectChangeData
+}
+
+// addModeTarget records that a target carries one of its group's verdicts,
 // folding it into the group's entry for the same change when another target
-// already refuses it.
-func addBlockedTarget(g *templates.DeploymentPlanGroup, bc templates.BlockedChangeData, target string) {
-	for i := range g.BlockedChanges {
-		existing := &g.BlockedChanges[i]
+// already carries it. A target is listed once however many of its changes
+// fold into the entry, such as the same table in two namespaces: the list is
+// compared against the group's size to decide whether every target carries
+// the verdict, so a repeated name would credit it to targets that do not.
+func addModeTarget[T modeChange](list *[]T, change T, target string) {
+	bc := templates.BlockedChangeData(change)
+	for i := range *list {
+		existing := templates.BlockedChangeData((*list)[i])
 		if existing.Table == bc.Table && existing.Reason == bc.Reason && slices.Equal(existing.Shards, bc.Shards) {
+			if slices.Contains(existing.Targets, target) {
+				slog.Debug("target already carries this verdict in its group; not listing it twice",
+					"target", target, "table", bc.Table)
+				return
+			}
 			existing.Targets = append(existing.Targets, target)
+			(*list)[i] = T(existing)
 			return
 		}
 	}
 	bc.Targets = []string{target}
-	g.BlockedChanges = append(g.BlockedChanges, bc)
+	*list = append(*list, T(bc))
 }
 
 // memberPlanChanges renders one member's plan into the shape the comment renders
