@@ -24,6 +24,7 @@
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Agent Hint](#agent-hint)
+- [CLI Name](#cli-name)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
@@ -323,6 +324,22 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
             target: payments-003
 ```
 
+### Selecting namespaces per target
+
+When a database's namespaces are spread across its targets, an entry can be a mapping that names which namespaces live on that target. A bare string and a mapping without `namespaces` both mean the target holds every namespace the schema files declare.
+
+```yaml
+      production:
+        deployment: payments-a
+        targets:
+          - target: payments-001
+            namespaces: [payments_0, payments_1]
+          - target: payments-002
+            namespaces: [payments_2, payments_3]
+```
+
+The schema directory declares the namespace set; `namespaces` only selects from it and can never add one. Each target's plan, stored plan, and apply cover only its selected namespaces. A pull of the whole environment asks each target for its selected namespaces by name rather than discovering them on the cluster, and an explicitly requested namespace a target does not select is left out of that target's pull.
+
 Rules:
 
 - `targets` requires `type: mysql`. Configuring it on a `vitess`, `strata`, or `postgres` database fails validation at startup.
@@ -333,8 +350,16 @@ Rules:
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
+- A mapping entry accepts only `target` and `namespaces`; any other key, including a misspelling such as `namespace`, fails validation at startup.
+- `namespaces` is an enumerated list of names, not a pattern. When present it MUST contain at least one entry; each entry must be non-empty, listed once within the entry, and free of `/`. A `namespaces` key with no list (no value, `~`, `null`, or items that are all commented out) fails validation at startup rather than reading as every namespace.
+- The target is still the rollout member, so a target may not be listed twice even with different `namespaces`.
+- A selected namespace the schema files do not declare, or one `ignore_namespaces` withholds, is an error at plan time that names the target and the namespace. For the primary target it fails the plan; for any other target it blocks the review.
+- Every declared namespace must be selected by some target; a target without `namespaces` selects all of them. A declared namespace no entry selects fails every plan of the environment, whether from a pull request or the CLI, since no target would plan or apply it. On a pull request that environment's check fails; the API answers `400 Bad Request` naming the namespaces. To keep one out of the rollout on purpose, list it in `ignore_namespaces`.
+- Selecting namespaces needs a target whose DSN does not name a database. A database-scoped DSN is diffed as one unit, so the namespaces an entry does not select would have their live tables planned as `DROP TABLE`; the plan refuses instead, as it does for `ignore_namespaces`.
 
-`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the same schema. What differs is what a difference between members means when one is found.
+Rollout order: upgrade the Tern deployments serving an environment before adding `namespaces` to its entries. SchemaBot tells the Tern deployment which declared namespaces a target's entry leaves out, and the refusal above for a database-scoped DSN happens there. There is no version check between the two, so a Tern deployment from an earlier release drops that list without error and plans the left-out namespaces' live tables as `DROP TABLE` instead of refusing. Those drops are still unsafe changes that an apply refuses without `--allow-unsafe`, but the plan is wrong until the upgrade lands.
+
+`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the schema the files describe for it: every declared namespace, or, for a target whose entry selects namespaces, only those. What differs is what a difference between members means when one is found.
 
 The deployments of one environment are mirrors, so a difference between them is a fault: the plan under review was not written for the member that disagrees, and the check blocks rather than apply it.
 
@@ -771,9 +796,11 @@ statement has waited 90% of the bound for the lock, it kills the transactions
 blocking it and tries again, up to 3 attempts, as Spirit does for its own
 DDL. It never kills while it holds the lock and runs, so traffic to a table
 being rebuilt is left alone. A session holding an explicit `LOCK TABLES`, or a
-transaction too large to roll back safely, is never killed; while one holds
-the lock the apply fails with a retryable "table is busy" error, after one
-attempt for an explicit table lock. Every attempt runs the statement from the
+transaction too large to roll back safely, is never killed, and a session the
+user is not allowed to kill survives the kill too. No later attempt can end
+such a blocker, so the statement stops after the attempt that met it, and the
+apply fails with a retryable "table is busy" error. The full 3 attempts go only
+to blockers the kill ends. Every attempt runs the statement from the
 start, so a rebuild that times out waiting to upgrade its lock at the end is
 rolled back and runs again. Traffic to the table can stall for up to one bound
 per attempt, and between attempts the statement waits up to 30 seconds for
@@ -782,11 +809,10 @@ and gives a blocker less time to finish before it is killed; the value must
 be a whole number of seconds (at least `1s`).
 
 The kill reads `performance_schema` and `information_schema.innodb_trx` to
-find the blocking sessions, so the SchemaBot user needs `SELECT` on
-`performance_schema.*` and `PROCESS` for a statement to run directly; without
-either the statement is blocked at plan time. Killing
-another user's session also needs `CONNECTION_ADMIN` (or `SUPER`); without it
-the kill fails and a blocked apply fails as busy.
+find the blocking sessions and ends other users' sessions, so the SchemaBot
+user needs `SELECT` on `performance_schema.*`, `PROCESS`, and
+`CONNECTION_ADMIN` (or `SUPER`) for a statement to run directly; without any
+of them the statement is blocked at plan time.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
@@ -1032,6 +1058,18 @@ database's entry wins.
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
+
+### MySQL server settings Spirit refuses
+
+Spirit checks the target server before every run, including a resumed one,
+and refuses to start on a setting it cannot run safely under. One of them,
+`partial_revokes=ON`, is a server-wide security setting an operator may have
+chosen on purpose. With it on, a `REVOKE` can remove a grant for one schema
+while `SHOW GRANTS` still lists the global grant, so a privilege check passes
+and the schema change fails at cutover. `partial_revokes` is `OFF` by default.
+A target with it `ON` fails every schema change, and an apply already in
+flight fails on its next drive. Turning it off is a server-wide security
+change, so plan it before upgrading rather than after.
 
 ## Postgres
 
@@ -1298,6 +1336,37 @@ The hint must be a single bounded line and must not contain an HTML comment
 terminator (`-->` or `--!>`), which would end the comment early and render the
 rest of the hint on the PR page. When omitted, plan comments are unchanged.
 
+## CLI Name
+
+PR comments name CLI commands an operator runs in a terminal, such as the
+command that prints a stored plan in full when a comment cuts its DDL. When
+operators run the CLI through a wrapper, set `cli_name` to the wrapper's
+invocation so a pasted hint reaches the wrapper instead of an unconfigured
+binary:
+
+```yaml
+cli_name: "acme schemabot"
+```
+
+This is the server-side counterpart of the CLI's `--cli-name` flag (see
+[Wrap the CLI for your team](cli.md#wrap-the-cli-for-your-team)); set the same
+value in both places. Each hint is also scoped to its environment, so a
+wrapper that routes by environment reaches the server that wrote it:
+
+```text
+_DDL truncated to fit GitHub's comment size limit; the full plan is available from the CLI with `acme schemabot list-plans -e staging plan_abc`._
+```
+
+Only terminal commands take the name. Commands a PR author comments on the
+PR, such as `schemabot plan` and `schemabot apply -e staging`, keep
+`schemabot`, the word the bot answers to. Terminal commands also never
+carry `--tenant`: the tenant routes PR comments, and the CLI reaches a
+tenant deployment through its endpoint or profile, so a tenant deployment's
+`cli_name` names the wrapper that points there. When omitted, hints start with
+`schemabot`. The name must be a single line of at most 100 characters with no
+backtick and no leading or trailing whitespace, because it renders inside
+inline code.
+
 ## Repository Allowlist
 
 By default, any repository with the GitHub App installed can use SchemaBot. Adding a `repos` section creates an allowlist — only listed repositories are permitted.
@@ -1364,7 +1433,7 @@ By default, SchemaBot blocks `apply` and `apply-confirm` when non-SchemaBot PR c
 require_passing_checks: true
 ```
 
-Apply is blocked in two cases: completed checks that did not **pass** and checks that are **still running** (`in_progress`, `queued`, `pending`). A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
+Apply is blocked in two cases: completed checks that did not **pass** and checks that have **not finished**. Any status other than `completed` (such as `in_progress`, `queued`, `pending`, `waiting`, or `requested`) counts as not finished, so unrecognized statuses fail closed. A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
 
 For repositories with many optional checks, `required_checks` can narrow the gate to specific check names:
 

@@ -21,6 +21,12 @@ type ExecutionTarget struct {
 	DatabaseType string
 	Deployment   string
 	Target       string
+
+	// Namespaces is the subset of the declared namespaces this target holds,
+	// in configured order. Empty means the target holds every namespace the
+	// schema files declare. It narrows what the member plans and pulls and is
+	// not part of its identity: MemberID stays the deployment and target.
+	Namespaces []string
 }
 
 // MemberID is the rollout-member identity of this execution target: the

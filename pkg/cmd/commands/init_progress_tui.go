@@ -21,6 +21,7 @@ type initFinishedMsg struct {
 	err    error
 }
 type initProgress struct {
+	heading  string
 	spinner  spinner.Model
 	stages   []string
 	run      tea.Cmd
@@ -55,7 +56,7 @@ func (m *initProgress) View() string {
 		return ""
 	}
 	var b strings.Builder
-	b.WriteString("SchemaBot  /  connect and verify\n\n")
+	b.WriteString("SchemaBot  /  " + m.heading + "\n\n")
 	for i, s := range m.stages {
 		marker := "✓"
 		if i == len(m.stages)-1 {
@@ -74,7 +75,7 @@ func (cmd *InitCmd) initializeWithUI(ctx context.Context, g *Globals) (*initResu
 	if !cmd.interactive {
 		return cmd.initialize(ctx, g)
 	}
-	return runInitProgress(ctx, func(runCtx context.Context, report func(string)) (*initResult, error) {
+	return runInitProgress(ctx, "connect and verify", func(runCtx context.Context, report func(string)) (*initResult, error) {
 		cmd.progress = report
 		defer func() { cmd.progress = nil }()
 		return cmd.initialize(runCtx, g)
@@ -87,9 +88,10 @@ type initProgressProgram interface {
 	Kill()
 }
 
-func runInitProgress(ctx context.Context, initialize func(context.Context, func(string)) (*initResult, error), options ...tea.ProgramOption) (*initResult, error) {
+func runInitProgress(ctx context.Context, heading string, initialize func(context.Context, func(string)) (*initResult, error), options ...tea.ProgramOption) (*initResult, error) {
 	options = append(options, tea.WithoutSignalHandler())
 	return runInitProgressProgram(ctx, initialize, func(model tea.Model) initProgressProgram {
+		model.(*initProgress).heading = heading
 		return tea.NewProgram(model, options...)
 	})
 }

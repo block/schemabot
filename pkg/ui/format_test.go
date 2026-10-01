@@ -56,6 +56,16 @@ func TestFormatApproxBytes(t *testing.T) {
 	}
 }
 
+// A copy line carries the table's planned size after its row counts, and
+// nothing when the plan had no estimate.
+func TestFormatTableSizeClause(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	assert.Equal(t, " · ~23.4 GB", FormatTableSizeClause(&bytes))
+	zero := int64(0)
+	assert.Equal(t, " · ~0 B", FormatTableSizeClause(&zero))
+	assert.Empty(t, FormatTableSizeClause(nil))
+}
+
 func TestTableStatePriority(t *testing.T) {
 	tests := []struct {
 		state    string

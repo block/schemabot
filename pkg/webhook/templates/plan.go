@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"cmp"
 	"fmt"
 	"html"
 	"log/slog"
@@ -78,6 +79,14 @@ type DirectChangeData struct {
 	// rendering too wide to name every shard can state coverage ("12 of 32
 	// shards") instead of a bare count. Zero when unknown.
 	TotalShards int
+	// Targets names the rollout targets that run this change directly, for a
+	// target plan group in which only some targets do: the direct execution
+	// policy judges each target's own table. Empty when every target in the
+	// group runs it directly.
+	Targets []string
+	// TotalTargets is how many targets the group holds, so a subset too wide
+	// to name reads as coverage ("3 of 12 targets").
+	TotalTargets int
 }
 
 // AttributedChangeData is a table carrying a planned destructive change that
@@ -130,6 +139,10 @@ type PlanCommentData struct {
 	// Empty when the plan was not stored, which leaves a cut block pointing at
 	// the PR's schema files.
 	PlanID string
+
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
 
 	// AgentHint is the deployment's configured guidance for AI agents reading
 	// the plan. Empty on deployments that configure none, which render an
@@ -216,6 +229,14 @@ type PlanCommentData struct {
 	// deployment compares to the reviewed primary plan. Nil for a single-target
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
+
+	// MemberApplyRefusal says why a PR apply cannot run the other targets'
+	// plans this comment renders, whether or not the reviewed target has work
+	// of its own, naming only targets, tables, and namespaces. Such an apply is
+	// refused whatever its flags, so the comment offers no apply command in its
+	// place. Empty when the apply can run them, or when the comment renders the
+	// reviewed plan alone.
+	MemberApplyRefusal string
 }
 
 // ExemptTablesData describes live tables exempt from a plan verdict.
@@ -252,6 +273,23 @@ type DeploymentDriftData struct {
 	// members — members expected to match each other say nothing by matching,
 	// and a blocked rollup describes each member on its own instead.
 	Plans []DeploymentPlanGroup
+	// TableSizes is every target's size estimate for each table its own plan
+	// changes with a statement whose cost scales with the table's size, in
+	// rollout order, primary first. Each target applies to its own data, so
+	// the size section ranks a table by its largest target rather than by the
+	// reviewed plan alone. Set only for a clean rollup, where every target was
+	// planned: a target missing from the list would read as one with nothing
+	// to copy.
+	TableSizes []TargetTableSize
+}
+
+// TargetTableSize is one rollout target's size estimate for one table its plan
+// changes.
+type TargetTableSize struct {
+	// Target names the target the way an operator addresses it.
+	Target   string
+	Keyspace string
+	Size     TableSizeData
 }
 
 // DeploymentPlanGroup is the members of a rollout that would run the same plan.
@@ -291,6 +329,10 @@ type DeploymentPlanGroup struct {
 	// reviewed plan and points at PlanCommentData.PlanID. Empty when the
 	// member's plan was not stored.
 	PlanID string
+	// DirectChanges are the group's changes the direct execution policy routes
+	// to native DDL, each naming the targets that run it that way when that is
+	// not all of them.
+	DirectChanges []DirectChangeData
 }
 
 // Empty reports that the group's members are already at the desired schema and
@@ -377,12 +419,35 @@ type KeyspaceChangeData struct {
 	// keyspace's only work, which keeps such a plan from reading as having no
 	// changes.
 	Finalize bool
+	// TableSizes carries plan-time size estimates for the existing tables this
+	// keyspace's changes copy, rebuild, or scan, rendered in the size section
+	// after the DDL. Tables being created have no size and are omitted. An
+	// entry without a byte estimate renders an explicit "unavailable" so a
+	// failed size probe never reads as a small table, unless no table in the
+	// plan has an estimate, in which case the section is omitted (see
+	// writeTableSizesSection).
+	TableSizes []TableSizeData
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
 	// set, the DDL is rendered per shard-group ("what applies where") instead of
 	// the single Statements block — so a keyspace whose shards diverge is shown
 	// faithfully. Empty for a non-sharded keyspace.
 	Shards []KeyspaceShardChange
+}
+
+// TableSizeData is one existing table's plan-time size estimate for display.
+// The estimate is approximate — sourced from engine statistics that may be
+// stale — and is rendered as such.
+type TableSizeData struct {
+	Table string
+	// ShardCount is the number of shards the change spans. Zero when the
+	// target is not sharded or the topology is unknown, which omits the shard
+	// clause entirely.
+	ShardCount int
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes), summed across shards for a sharded target. Nil renders as
+	// explicitly unavailable.
+	EstimatedBytes *int64
 }
 
 // KeyspaceShardChange is one shard's planned statements within a keyspace.
@@ -431,7 +496,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// the no-changes short-circuit — because a non-primary deployment can drift
 	// even when the reviewed primary plan is a clean no-op.
 	writeDeploymentDrift(&sb, data.DeploymentDrift, data.Changes)
-	targetPlans := rendersTargetPlans(data.DeploymentDrift)
+	targetPlans := RendersTargetPlans(data.DeploymentDrift)
 	summary := data
 	if targetPlans {
 		writeTargetPlans(&sb, data, budget, false)
@@ -449,14 +514,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// genuinely unchanged one.
 	//
 	// A reviewed target with nothing to run while other targets still have work
-	// summarizes their plans instead, without the apply footer: a PR apply runs
-	// from the reviewed plan, and an empty one does not run the other targets'
-	// plans.
-	if totalChanges == 0 {
-		if targetPlans {
-			writePlanSummary(&sb, summary, summaryStatements, summaryKeyspaceUpdates)
-			return appendAgentHint(sb.String(), data.AgentHint)
-		}
+	// is not a no-op: the comment goes on to summarize their plans and offer the
+	// apply, which runs each of those targets' own plans.
+	if totalChanges == 0 && !targetPlans {
 		writeNoChangesDetected(&sb, data)
 		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
 			sb.WriteString("\n")
@@ -491,7 +551,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// Direct-execution changes — statements the policy routes to native DDL.
 	// The policy approves them, so the plan only discloses how they run; the
 	// locked apply comment repeats it so the apply shows what it is running.
-	if len(data.DirectChanges) > 0 {
+	if len(data.DirectChanges) > 0 && !targetPlansDiscloseDirect(data) {
 		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 	}
 
@@ -570,6 +630,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
+	case data.MemberApplyRefusal != "":
+		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal, !hasChanges(data.Changes))
 	default:
 		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
@@ -579,6 +641,22 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	}
 
 	return appendAgentHint(sb.String(), data.AgentHint)
+}
+
+// writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
+// apply cannot run the other targets' plans the comment renders. Offering the
+// command there would coach an apply that is refused whatever its flags.
+// reviewedTargetConverged says whether the reviewed target is already at the
+// desired schema, which decides what the reader is told about it.
+func writeMemberApplyRefusal(sb *strings.Builder, refusal string, reviewedTargetConverged bool) {
+	refusal = escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " "))
+	if reviewedTargetConverged {
+		fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but %s.\n\n", refusal)
+		sb.WriteString("A PR apply whose reviewed target is already at the desired schema cannot run that or disclose it for confirmation. The schema check keeps blocking merge until every target has the change.\n")
+		return
+	}
+	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: targets other than the reviewed one have plans of their own, but %s.\n\n", refusal)
+	sb.WriteString("A PR apply cannot run that or disclose it for confirmation, so it cannot run the reviewed target's plan either. The schema check keeps blocking merge until every target has the change.\n")
 }
 
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
@@ -764,6 +842,10 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		writeExemptTables(sb, data.ExemptTables)
 		return
 	}
+
+	// Size context precedes the summary: how big the tables the plan will
+	// copy, rebuild, or scan are, then what the plan does.
+	writeTableSizesSection(sb, data)
 
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements))
 
@@ -1112,7 +1194,7 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 // writeKeyspaceChanges renders each keyspace's DDL and VSchema changes, with
 // the DDL blocks drawing on the comment's shared budget.
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget) {
-	defer budget.pointAt(data.PlanID)()
+	defer budget.pointAt(storedPlanRef{cliName: data.CLIName, environment: data.Environment, id: data.PlanID})()
 
 	// The DDL blocks below format statements under the plan's own dialect so
 	// they are never reformatted under another family's grammar.
@@ -1204,6 +1286,331 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 	return count
 }
 
+// tableSizesInlineLimit caps how many tables the size section lists in the
+// open. A plan that changes more tables would otherwise stand a wall of sizes
+// above the summary it introduces, so past the limit the whole section folds
+// into a collapsed block.
+const tableSizesInlineLimit = 5
+
+// tableSizesShown caps how many tables a collapsed size section lists: the
+// largest, since they bound how long the apply runs. The rest are counted in a
+// closing line, since collapsed lines still count toward GitHub's comment size
+// limit and a plan that indexes thousands of tables would otherwise spend on
+// sizes the room its DDL needs.
+const tableSizesShown = 64
+
+// tableSizeEntry is one line of the size section: the table's display name,
+// qualified with its keyspace when the plan spans several, and its sizes.
+type tableSizeEntry struct {
+	name string
+	// size is the table's estimate on a single-target plan.
+	size TableSizeData
+	// perTarget is each rollout target's estimate for the table, in rollout
+	// order, on a multi-target plan. Nil on a single-target plan, which names
+	// no target.
+	perTarget []TargetTableSize
+}
+
+// multiTarget reports that the line is for a table a rollout changes.
+func (e tableSizeEntry) multiTarget() bool {
+	return e.perTarget != nil
+}
+
+// totalBytes sums the table's byte estimates across the targets that report
+// one, and counts those targets.
+func (e tableSizeEntry) totalBytes() (total int64, sized int) {
+	for _, ts := range e.perTarget {
+		if !hasSizeEstimate(ts.Size) {
+			continue
+		}
+		total += *ts.Size.EstimatedBytes
+		sized++
+	}
+	return total, sized
+}
+
+// rankBytes is the figure the section ranks the table by: its estimate, or on
+// a multi-target plan the total across the targets that report one. Nil when
+// no estimate is known.
+func (e tableSizeEntry) rankBytes() *int64 {
+	if !e.multiTarget() {
+		return e.size.EstimatedBytes
+	}
+	total, sized := e.totalBytes()
+	if sized == 0 {
+		return nil
+	}
+	return &total
+}
+
+// hasAnyEstimate reports whether the line carries a byte estimate for at
+// least one target.
+func (e tableSizeEntry) hasAnyEstimate() bool {
+	if !e.multiTarget() {
+		return hasSizeEstimate(e.size)
+	}
+	_, sized := e.totalBytes()
+	return sized > 0
+}
+
+// writeTableSizesSection renders the plan's table-size info section: one line
+// per table the plan will copy, rebuild, or scan (the comment builder
+// attaches sizes only to statements whose cost scales with table size),
+// across every keyspace, placed above the plan summary. A plan of only
+// metadata-only statements renders no section at all, and neither does a plan
+// where no table has an estimate: an engine that does not estimate sizes
+// would otherwise show "unavailable" on every line, which reads as a failed
+// probe when none ran. Table names carry
+// their keyspace when the plan spans more than one keyspace with sizes, so a
+// shared table name stays unambiguous.
+//
+// Up to tableSizesInlineLimit tables are listed in plan order; past that the
+// section collapses and lists the largest tables first. A rollout whose
+// targets were all planned shows each table across every target that changes
+// it. A rollout without per-target sizes shows the reviewed plan's sizes, and
+// the heading names the reviewed target so they are not read as the whole
+// rollout's.
+func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
+	entries := tableSizeEntries(data.Changes)
+	var drift *DeploymentDriftData
+	switch {
+	case data.DeploymentDrift != nil && len(data.DeploymentDrift.TableSizes) > 0:
+		entries = targetTableSizeEntries(data.DeploymentDrift.TableSizes)
+	case data.DeploymentDrift != nil:
+		drift = data.DeploymentDrift
+	}
+	if !slices.ContainsFunc(entries, tableSizeEntry.hasAnyEstimate) {
+		return
+	}
+	if len(entries) <= tableSizesInlineLimit {
+		sb.WriteString("📊 **Table sizes**")
+		if scope := reviewedTargetSizeScope(drift, inlineCode); scope != "" {
+			fmt.Fprintf(sb, " (%s)", scope)
+		}
+		sb.WriteString(":\n")
+		writeTableSizeLines(sb, entries)
+		sb.WriteString("\n")
+		return
+	}
+	writeCollapsedTableSizes(sb, entries, reviewedTargetSizeScope(drift, summaryCode))
+}
+
+// writeCollapsedTableSizes renders the size section for a plan with more
+// tables than tableSizesInlineLimit as one collapsed block, its tables largest
+// first. Past tableSizesShown the smallest tables are counted in a closing
+// line rather than listed.
+func writeCollapsedTableSizes(sb *strings.Builder, entries []tableSizeEntry, scope string) {
+	sorted := slices.Clone(entries)
+	slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
+	sb.WriteString("<details>\n<summary>📊 <b>Table sizes</b>")
+	if scope != "" {
+		fmt.Fprintf(sb, " (%s)", scope)
+	}
+	sb.WriteString("</summary>\n\n")
+	listed := min(len(sorted), tableSizesShown)
+	writeTableSizeLines(sb, sorted[:listed])
+	if unlisted := len(sorted) - listed; unlisted > 0 {
+		fmt.Fprintf(sb, "- …and %d more %s\n", unlisted, pluralize("table", unlisted))
+	}
+	sb.WriteString("\n</details>\n\n")
+}
+
+// summaryCode renders a name inside a <summary>, which GitHub reads as HTML
+// rather than markdown: the name is escaped and set in a <code> tag, and
+// flattened first so it cannot carry a line break out of the tag.
+func summaryCode(name string) string {
+	return "<code>" + html.EscapeString(flattenIdentifier(name)) + "</code>"
+}
+
+// reviewedTargetSizeScope names the target whose sizes a rollout's section
+// shows when the rollout carries no per-target sizes: the sizes come from the
+// reviewed plan alone, and a reader would otherwise take them for every
+// target's. The reviewed target is named, with code, when the rollup
+// identifies it. A plan with no rollup, or a rollup of one member, has no
+// other target, so its sizes need no scope. A rollup that could not be
+// computed names no members, so it cannot say whether other targets exist and
+// claims none.
+func reviewedTargetSizeScope(drift *DeploymentDriftData, code func(string) string) string {
+	if drift == nil {
+		return ""
+	}
+	if !drift.Computed || len(drift.Deployments) == 0 {
+		return "reviewed target only; targets could not be listed"
+	}
+	if len(drift.Deployments) == 1 {
+		return ""
+	}
+	names := driftMemberNames(drift.Deployments)
+	for i, d := range drift.Deployments {
+		if d.Primary {
+			return fmt.Sprintf("reviewed target %s only; other targets not shown", code(names[i]))
+		}
+	}
+	return "reviewed target only; other targets not shown"
+}
+
+// tableSizeEntries flattens every keyspace's sized tables into section lines,
+// in plan order.
+func tableSizeEntries(changes []KeyspaceChangeData) []tableSizeEntry {
+	keyspacesWithSizes := 0
+	for _, ks := range changes {
+		if len(ks.TableSizes) > 0 {
+			keyspacesWithSizes++
+		}
+	}
+	qualify := keyspacesWithSizes > 1
+	var entries []tableSizeEntry
+	for _, ks := range changes {
+		for _, ts := range ks.TableSizes {
+			name := ts.Table
+			if qualify {
+				name = ks.Keyspace + "." + ts.Table
+			}
+			entries = append(entries, tableSizeEntry{name: name, size: ts})
+		}
+	}
+	return entries
+}
+
+// targetTableSizeEntries groups every target's sizes into one section line per
+// table, in the order the tables first appear in rollout order, each line
+// carrying the table's estimate on every target that changes it.
+func targetTableSizeEntries(sizes []TargetTableSize) []tableSizeEntry {
+	keyspaces := make(map[string]struct{})
+	for _, ts := range sizes {
+		keyspaces[ts.Keyspace] = struct{}{}
+	}
+	qualify := len(keyspaces) > 1
+	type tableKey struct{ keyspace, table string }
+	at := make(map[tableKey]int)
+	var entries []tableSizeEntry
+	for _, ts := range sizes {
+		key := tableKey{ts.Keyspace, ts.Size.Table}
+		i, seen := at[key]
+		if !seen {
+			name := ts.Size.Table
+			if qualify {
+				name = ts.Keyspace + "." + ts.Size.Table
+			}
+			i = len(entries)
+			at[key] = i
+			entries = append(entries, tableSizeEntry{name: name, perTarget: []TargetTableSize{}})
+		}
+		entries[i].perTarget = append(entries[i].perTarget, ts)
+	}
+	return entries
+}
+
+// targetSizesLargestFirst orders a table's per-target sizes by bytes, largest
+// first, keeping rollout order among equal sizes. A target with no estimate
+// sorts last: its size is unknown, not small.
+func targetSizesLargestFirst(perTarget []TargetTableSize) []TargetTableSize {
+	sorted := slices.Clone(perTarget)
+	slices.SortStableFunc(sorted, func(a, b TargetTableSize) int {
+		return compareBytesLargestFirst(a.Size.EstimatedBytes, b.Size.EstimatedBytes)
+	})
+	return sorted
+}
+
+func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
+	for _, e := range entries {
+		fmt.Fprintf(sb, "- %s: %s\n", inlineCode(e.name), formatTableSizeEntry(e))
+	}
+}
+
+// formatTableSizeEntry renders a section line's size clause. On a multi-target
+// plan a table one target changes names that target. A table several targets
+// change gives the total, then the largest size with its target named, since
+// copy time scales with size and the largest target bounds the rollout, then
+// the smallest size. A target with no estimate is named, or counted when
+// there are several, since the total then understates the table.
+func formatTableSizeEntry(e tableSizeEntry) string {
+	if !e.multiTarget() {
+		return formatTableSize(e.size)
+	}
+	targets := len(e.perTarget)
+	total, sized := e.totalBytes()
+	switch {
+	case sized == 0 && targets == 1:
+		return fmt.Sprintf("size estimate unavailable on %s", inlineCode(e.perTarget[0].Target))
+	case sized == 0:
+		return fmt.Sprintf("size estimate unavailable on all %d targets", targets)
+	case targets == 1:
+		return fmt.Sprintf("%s on %s", ui.FormatApproxBytes(total), inlineCode(e.perTarget[0].Target))
+	}
+	ordered := targetSizesLargestFirst(e.perTarget)
+	largest, smallest := ordered[0], ordered[sized-1]
+	var parts []string
+	switch sized {
+	case 1:
+		parts = append(parts, fmt.Sprintf("%s on %s", ui.FormatApproxBytes(total), inlineCode(largest.Target)))
+	case targets:
+		parts = append(parts, fmt.Sprintf("%s across %d targets", ui.FormatApproxBytes(total), targets))
+	default:
+		parts = append(parts, fmt.Sprintf("%s across %d of %d targets", ui.FormatApproxBytes(total), sized, targets))
+	}
+	if sized > 1 {
+		parts = append(parts,
+			fmt.Sprintf("largest %s on %s", ui.FormatApproxBytes(*largest.Size.EstimatedBytes), inlineCode(largest.Target)),
+			fmt.Sprintf("smallest %s", ui.FormatApproxBytes(*smallest.Size.EstimatedBytes)))
+	}
+	switch unsized := ordered[sized:]; len(unsized) {
+	case 0:
+	case 1:
+		parts = append(parts, fmt.Sprintf("size estimate unavailable on %s", inlineCode(unsized[0].Target)))
+	default:
+		parts = append(parts, fmt.Sprintf("size estimate unavailable on %d targets", len(unsized)))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// hasSizeEstimate reports that the table's on-disk footprint is known. The
+// section shows bytes alone: they track how long a copy or index build runs
+// on every engine that reports a size.
+func hasSizeEstimate(ts TableSizeData) bool {
+	return ts.EstimatedBytes != nil
+}
+
+// compareTableSizesLargestFirst orders two section lines for the collapsed
+// size section, by bytes. A table with no estimate sorts after every table
+// with one: its size is unknown, not small.
+func compareTableSizesLargestFirst(a, b tableSizeEntry) int {
+	return compareBytesLargestFirst(a.rankBytes(), b.rankBytes())
+}
+
+// compareBytesLargestFirst orders two byte estimates largest first, with an
+// unknown estimate after every known one.
+func compareBytesLargestFirst(ab, bb *int64) int {
+	switch {
+	case ab == nil && bb == nil:
+		return 0
+	case ab == nil:
+		return 1
+	case bb == nil:
+		return -1
+	default:
+		return cmp.Compare(*bb, *ab)
+	}
+}
+
+// formatTableSize renders one table's size clause: the estimated bytes and,
+// for a sharded target, the shard span. A table with no estimate is stated
+// explicitly — operators must never mistake a failed size probe for a small
+// table.
+func formatTableSize(ts TableSizeData) string {
+	if !hasSizeEstimate(ts) {
+		if ts.ShardCount > 0 {
+			return fmt.Sprintf("size estimate unavailable · %d %s", ts.ShardCount, pluralize("shard", ts.ShardCount))
+		}
+		return "size estimate unavailable"
+	}
+	size := ui.FormatApproxBytes(*ts.EstimatedBytes)
+	if ts.ShardCount > 0 {
+		size += fmt.Sprintf(" across %d %s", ts.ShardCount, pluralize("shard", ts.ShardCount))
+	}
+	return size
+}
+
 // writePlanDDLBlocks writes one fenced SQL block per statement, in plan
 // order, so a reviewer reads each table's change on its own instead of
 // picking it out of one run of every statement in the plan. Each statement is
@@ -1215,10 +1622,17 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 // statement that is neither a single statement nor a valid create set is
 // still rendered as written, and the reason is logged for triage.
 func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema.Dialect, budget *ddlBlockBudget) {
+	writeSQLFencedBlocks(sb, formatDDLBlocks(statements, dialect), budget)
+	sb.WriteString("\n")
+}
+
+// formatDDLBlocks formats each statement as the content of its own SQL block,
+// as writePlanDDLBlocks describes.
+func formatDDLBlocks(statements []string, dialect schema.Dialect) []string {
 	blocks := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
 	if parserErr != nil {
-		slog.Warn("plan DDL block cannot split create sets; multi-statement DDL will be rendered as written",
+		slog.Warn("DDL block cannot split create sets; multi-statement DDL will be rendered as written",
 			"dialect", dialect, "error", parserErr)
 	}
 	for _, stmt := range statements {
@@ -1227,7 +1641,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 			if _, _, classifyErr := parser.Classify(stmt); classifyErr != nil {
 				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
 				if createSetErr != nil {
-					slog.Warn("plan DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
+					slog.Warn("DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
 						"dialect", dialect, "classify_error", classifyErr, "create_set_error", createSetErr)
 				} else {
 					statementsToFormat = createSet.Statements
@@ -1240,8 +1654,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 		}
 		blocks = append(blocks, strings.Join(formattedCreateSet, "\n"))
 	}
-	writeSQLFencedBlocks(sb, blocks, budget)
-	sb.WriteString("\n")
+	return blocks
 }
 
 // writeShardedPlanDDL renders a sharded keyspace's DDL grouped by change: shards
@@ -1451,7 +1864,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 		// targets that run it, with any change a target will refuse disclosed
 		// under that plan, which says everything this line and the per-target
 		// list would.
-		if rendersTargetPlans(drift) {
+		if RendersTargetPlans(drift) {
 			return
 		}
 		// Independent members were deliberately never compared to each other, so
@@ -1591,14 +2004,14 @@ func rolloutAtThisSchema(drift *DeploymentDriftData, reviewed []KeyspaceChangeDa
 	return true
 }
 
-// rendersTargetPlans reports whether the comment renders the rollout's plans one
+// RendersTargetPlans reports whether the comment renders the rollout's plans one
 // group of targets at a time instead of the reviewed plan alone: a clean
 // rollout of independent targets in which some target still has work.
 //
 // Each such target applies its own plan, so the reviewed plan describes only
 // the targets that share it. Rendering it alone would leave a reviewer to
 // approve statements the comment never showed.
-func rendersTargetPlans(drift *DeploymentDriftData) bool {
+func RendersTargetPlans(drift *DeploymentDriftData) bool {
 	return drift != nil && drift.Computed && drift.Clean && drift.Independent && changingTargetCount(drift) > 0
 }
 
@@ -1663,7 +2076,29 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if len(g.BlockedChanges) > 0 {
 			writeBlockedChanges(sb, g.BlockedChanges)
 		}
+		// A direct change is disclosed the same way, naming the targets that
+		// run its write-blocking DDL.
+		if len(g.DirectChanges) > 0 {
+			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
+		}
 	}
+}
+
+// targetPlansDiscloseDirect reports whether the rendered target plans carry
+// the reviewed plan's direct changes under the reviewed target's own group, so
+// the plan-wide section would only repeat them. A reviewed plan whose group
+// carries none keeps the plan-wide section, so the comment never leaves a direct
+// statement unsaid because the two sources disagree.
+func targetPlansDiscloseDirect(data PlanCommentData) bool {
+	if !RendersTargetPlans(data.DeploymentDrift) {
+		return false
+	}
+	for _, g := range data.DeploymentDrift.Plans {
+		if g.Primary {
+			return len(g.DirectChanges) > 0
+		}
+	}
+	return false
 }
 
 // targetPlansDiscloseBlocked reports whether the rendered target plans carry
@@ -1672,7 +2107,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 // carries keeps the plan-wide section: a refused change is never left unsaid
 // because the two sources disagree.
 func targetPlansDiscloseBlocked(data PlanCommentData) bool {
-	if !rendersTargetPlans(data.DeploymentDrift) {
+	if !RendersTargetPlans(data.DeploymentDrift) {
 		return false
 	}
 	for _, g := range data.DeploymentDrift.Plans {
@@ -1738,7 +2173,7 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 // countCommentDDLBlocks counts the DDL sections a plan's comment renders: the
 // reviewed plan's, or every target plan's when the rollout renders them.
 func countCommentDDLBlocks(data PlanCommentData) int {
-	if !rendersTargetPlans(data.DeploymentDrift) {
+	if !RendersTargetPlans(data.DeploymentDrift) {
 		return countPlanDDLBlocks(data.Changes)
 	}
 	count := 0
@@ -1837,6 +2272,9 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 		table := inlineCode(c.Table)
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
+		}
+		if len(c.Targets) > 0 {
+			table = fmt.Sprintf("%s on %s", table, planGroupList(targetNoun, c.Targets, c.TotalTargets))
 		}
 		writeEngineReasonItem(sb, table, c.Reason)
 	}
@@ -2369,7 +2807,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// short-circuit: a non-primary deployment can drift even when this
 	// environment's reviewed primary plan is a clean no-op.
 	writeDeploymentDrift(sb, plan.DeploymentDrift, plan.Changes)
-	targetPlans := rendersTargetPlans(plan.DeploymentDrift)
+	targetPlans := RendersTargetPlans(plan.DeploymentDrift)
 	summary := *plan
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
@@ -2387,6 +2825,10 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	if totalChanges == 0 {
 		if targetPlans {
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
+			if plan.MemberApplyRefusal != "" {
+				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal, true)
+				sb.WriteString("\n")
+			}
 			return
 		}
 		sb.WriteString(noChangesDetected + "\n\n")
@@ -2421,7 +2863,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 
 	// Direct-execution changes — each environment's section discloses its own,
 	// since the policy is configured per environment.
-	if len(plan.DirectChanges) > 0 {
+	if len(plan.DirectChanges) > 0 && !targetPlansDiscloseDirect(*plan) {
 		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL, plan.DeferCutover)
 	}
 
@@ -2455,6 +2897,13 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Summary (after DDL, matching CLI layout). Target plans are summarized
 	// together, as a sharded keyspace's shards are.
 	writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
+
+	// An apply this section's other targets' plans would refuse is not offered
+	// in the footer, so the section says why.
+	if plan.MemberApplyRefusal != "" {
+		writeMemberApplyRefusal(sb, plan.MemberApplyRefusal, false)
+		sb.WriteString("\n")
+	}
 }
 
 // writeCollapsibleKeyspaceChanges renders a plan's changes — DDL, plus VSchema
@@ -2476,11 +2925,25 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// Categorize environments
 	var envsWithChanges []string
 	var envsWithErrors []string
+	// An environment whose apply would be refused says why in its own section,
+	// so the footer neither offers its apply nor calls the PR done. The
+	// environments after it wait on it: an apply of a later environment is
+	// refused until every earlier one has succeeded, so offering one would
+	// coach an apply the promotion order refuses.
+	var envsRefused []string
+	var envsBehindRefused []string
 	for _, env := range data.Environments {
 		if _, hasErr := data.Errors[env]; hasErr {
 			envsWithErrors = append(envsWithErrors, env)
-		} else if plan, ok := data.Plans[env]; ok && plan != nil && hasChanges(plan.Changes) {
-			envsWithChanges = append(envsWithChanges, env)
+		} else if plan, ok := data.Plans[env]; ok && plan != nil {
+			switch {
+			case environmentHasWork(plan) && len(envsRefused) > 0:
+				envsBehindRefused = append(envsBehindRefused, env)
+			case environmentHasWork(plan):
+				envsWithChanges = append(envsWithChanges, env)
+			case plan.MemberApplyRefusal != "":
+				envsRefused = append(envsRefused, env)
+			}
 		}
 	}
 
@@ -2500,8 +2963,13 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	case len(envsWithChanges) == 1:
 		sb.WriteString("▶️ **To apply** these changes, comment:\n")
 		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
-	case len(envsWithErrors) == 0:
+	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
+	}
+
+	for _, env := range envsBehindRefused {
+		fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and this PR cannot apply %s's other targets' plans (see above).\n",
+			capitalizeFirst(env), envsRefused[0], envsRefused[0])
 	}
 
 	// Error guidance for failed environments
@@ -2739,6 +3207,21 @@ func capitalizeEnvNames(envs []string) string {
 		caps[i] = capitalizeFirst(env)
 	}
 	return strings.Join(caps, " & ")
+}
+
+// environmentHasWork reports whether an environment's plan section offers an
+// apply: a PR apply can run the other targets' plans the section renders, and
+// its reviewed plan has changes, or its reviewed target is already at the
+// desired schema while those other targets' plans do. A section whose apply
+// would be refused says why in the section itself.
+func environmentHasWork(plan *PlanCommentData) bool {
+	if plan.MemberApplyRefusal != "" {
+		return false
+	}
+	if hasChanges(plan.Changes) {
+		return true
+	}
+	return RendersTargetPlans(plan.DeploymentDrift)
 }
 
 // hasChanges returns true if there are any schema changes.

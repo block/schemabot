@@ -239,11 +239,22 @@ type PlanExclusions struct {
 // predicts about work already on the target; a caller that has not chosen yet
 // passes false, the shape an apply runs without asking for anything else.
 func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
-	return CallPlanAPIWithContext(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution)
+	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "")
+}
+
+// CallPlanAPIForTarget is CallPlanAPI narrowed to the one rollout member target
+// names, by its target or by deployment/target. An empty target plans the
+// whole rollout.
+func CallPlanAPIForTarget(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, target)
 }
 
 // CallPlanAPIWithContext cancels baseline planning with its caller.
 func CallPlanAPIWithContext(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(ctx, endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "")
+}
+
+func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string) (*apitypes.PlanResponse, []string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -257,7 +268,7 @@ func CallPlanAPIWithContext(ctx context.Context, endpoint, database, dbType, env
 		}
 		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution)
+	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution, target)
 	if err != nil {
 		return nil, ignored, err
 	}
@@ -273,10 +284,10 @@ func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schema
 // namespaces removed from schemaFiles before the call — the server needs
 // them to refuse engine shapes that cannot honor the exclusion.
 func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
-	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, ignoredNamespaces, ignoreTables, groupedExecution)
+	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, ignoredNamespaces, ignoreTables, groupedExecution, "")
 }
 
-func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
+func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool, target string) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:          database,
 		Type:              dbType,
@@ -286,6 +297,7 @@ func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType,
 		IgnoredNamespaces: ignoredNamespaces,
 		IgnoreTables:      ignoreTables,
 		GroupedExecution:  groupedExecution,
+		Target:            target,
 	}
 	if pr != 0 {
 		prVal := int32(pr)
@@ -314,11 +326,18 @@ func CallRollbackPlanAPI(endpoint, applyID, environment string) (*apitypes.PlanR
 
 // CallApplyAPI calls the apply API and returns the typed result.
 func CallApplyAPI(endpoint, planID, environment, caller string, options map[string]string) (*apitypes.ApplyResponse, error) {
+	return CallApplyAPIForTarget(endpoint, planID, environment, caller, "", options)
+}
+
+// CallApplyAPIForTarget is CallApplyAPI narrowed to the one rollout member
+// target names. An empty target applies the whole rollout.
+func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string, options map[string]string) (*apitypes.ApplyResponse, error) {
 	req := apitypes.ApplyRequest{
 		PlanID:      planID,
 		Environment: environment,
 		Caller:      caller,
 		Options:     options,
+		Target:      target,
 	}
 	var result apitypes.ApplyResponse
 	if err := doPostInto(endpoint, "/api/apply", req, &result); err != nil {
@@ -379,9 +398,31 @@ type ActiveSchemaChange struct {
 }
 
 func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSchemaChange, error) {
+	return findActiveSchemaChange(endpoint, database, environment, "", func(*apitypes.ActiveApplyResponse) bool { return true })
+}
+
+// CheckActiveSchemaChangeOnDeployment is CheckActiveSchemaChange limited to
+// the active schema changes that hold the given deployment, for an apply that
+// reserves only that deployment. The server is asked for that deployment's
+// applies, since it reports an apply's deployment only when a status request
+// names one. An active apply whose deployment is still not reported is counted
+// as holding it, since nothing shows it does not. So is an apply whose
+// operation on the deployment has finished while the apply itself is still
+// running elsewhere: the apply keeps the deployment until it is terminal.
+func CheckActiveSchemaChangeOnDeployment(endpoint, database, environment, deployment string) (*ActiveSchemaChange, error) {
+	deployment = storage.CanonicalKey(deployment)
+	return findActiveSchemaChange(endpoint, database, environment, deployment, func(apply *apitypes.ActiveApplyResponse) bool {
+		return apply.Deployment == "" || storage.CanonicalKey(apply.Deployment) == deployment
+	})
+}
+
+func findActiveSchemaChange(endpoint, database, environment, deployment string, holds func(*apitypes.ActiveApplyResponse) bool) (*ActiveSchemaChange, error) {
 	var result apitypes.StatusResponse
 	query := url.Values{}
 	query.Set("environment", environment)
+	if deployment != "" {
+		query.Set("deployment", deployment)
+	}
 	query.Set("limit", "1000")
 	// Ask only for applies still holding a target. This runs on every apply and
 	// rollback preflight, and the answer never depends on settled history, so
@@ -408,12 +449,32 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 		}
 		// The server already excluded terminal states; re-checking here keeps the
 		// answer correct if this ever reads a response that was not filtered.
-		if state.IsTerminalApplyState(apply.State) {
+		activeState, active := activeStateOf(apply)
+		if !active {
 			continue
 		}
-		return &ActiveSchemaChange{State: apply.State, ApplyID: apply.ApplyID}, nil
+		if !holds(apply) {
+			continue
+		}
+		return &ActiveSchemaChange{State: activeState, ApplyID: apply.ApplyID}, nil
 	}
 	return nil, nil
+}
+
+// activeStateOf reports whether a listed apply still holds its targets, and
+// the state to show for it. A deployment-filtered status row reports the
+// deployment's operation state, but the apply keeps every deployment it
+// touches reserved until the apply itself is terminal, so a finished
+// operation under an apply still running elsewhere counts as active, under
+// the apply's state.
+func activeStateOf(apply *apitypes.ActiveApplyResponse) (string, bool) {
+	if !state.IsTerminalApplyState(apply.State) {
+		return apply.State, true
+	}
+	if apply.ApplyState != "" && !state.IsTerminalApplyState(apply.ApplyState) {
+		return apply.ApplyState, true
+	}
+	return "", false
 }
 
 // ReadSchemaFiles reads .sql files from a directory and groups them by namespace.
