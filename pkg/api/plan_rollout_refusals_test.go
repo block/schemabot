@@ -276,3 +276,29 @@ func TestHandleApply_RefusesARolloutWideApplyFromACallerThatDoesNotRenderTheRoll
 		})
 	}
 }
+
+// A member paired with the reviewed plan runs exactly what the caller was
+// shown, so it is never refused, even when the pairing hands back a copy of
+// the reviewed plan rather than the same value: the plan is recognized by its
+// identifier. A member with a plan of its own is still held to the rule, and
+// its direct-execution change needs its own narrowed apply.
+func TestMemberWorkARolloutWideAPIApplyCannotRun_RecognizesTheReviewedPlanByItsIdentifier(t *testing.T) {
+	reviewed := memberPlanWithChange(storage.TableChange{
+		Namespace:     "testapp",
+		Table:         "users",
+		Operation:     "alter",
+		DDL:           "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		ExecutionMode: "direct",
+		ModeReason:    "table is 12 MiB, within the direct execution bound",
+	})
+
+	copied := *reviewed
+	reason, detail := memberWorkARolloutWideAPIApplyCannotRun(reviewed, &copied)
+	assert.Empty(t, reason, "a copy of the reviewed plan is the reviewed plan: %s", detail)
+
+	own := *reviewed
+	own.PlanIdentifier = "plan-own"
+	reason, detail = memberWorkARolloutWideAPIApplyCannotRun(reviewed, &own)
+	assert.Equal(t, apitypes.PlanMemberNeedsTarget, reason)
+	assert.Contains(t, detail, `runs table "users" as direct-execution DDL`)
+}

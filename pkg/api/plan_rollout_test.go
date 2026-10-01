@@ -287,14 +287,15 @@ func TestPlanRollout_ListsTheOtherMembersAsNotPlannedBesideAPrimaryPlanWithError
 }
 
 // Once every member is planned, the plan reads its stored rows back to list
-// what a rollout-wide apply refuses. A failure there is a storage failure
-// after planning succeeded, so it is marked as such, and the handler reports
-// it under its own message rather than as a member that could not be planned.
-func TestPlanRollout_RefusalCheckFailureIsNotAMemberPlanningFailure(t *testing.T) {
+// what a rollout-wide apply refuses. A failure there fails the plan rather
+// than returning an empty refusal list, and its error says that planning
+// succeeded and the read-back is what failed.
+func TestPlanRollout_RefusalCheckFailureFailsThePlanAndSaysWhatFailed(t *testing.T) {
 	svc := multiTargetService(t, &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)")}, &recordingPlanStore{})
 
 	_, err := svc.planRollout(t.Context(), planDiffReq(t), reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
 		&apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
-	require.ErrorIs(t, err, errRolloutApplyRefusals)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "every rollout member of plan plan_eu was planned, but the members a rollout-wide apply of it refuses could not be listed")
 	assert.Contains(t, err.Error(), "plan plan_eu was stored, but no row carries its identifier")
 }

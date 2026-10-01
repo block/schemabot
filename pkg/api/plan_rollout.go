@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -87,7 +86,7 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 	if len(rollout.Attention) == 0 {
 		refused, err := s.rolloutApplyRefusals(ctx, req.Environment, primaryPlan.GetPlanId(), targets)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", errRolloutApplyRefusals, err)
+			return nil, fmt.Errorf("every rollout member of plan %s was planned, but the members a rollout-wide apply of it refuses could not be listed: %w", primaryPlan.GetPlanId(), err)
 		}
 		rollout.Refused = refused
 	} else {
@@ -298,12 +297,6 @@ func refuseApplyRolloutUnrenderedByCaller(plan *storage.Plan, req ApplyRequest, 
 	return &RolloutUnrenderedError{Database: plan.Database, Environment: req.Environment, Members: len(targets)}
 }
 
-// errRolloutApplyRefusals marks a plan that failed after every member was
-// planned, while reading back the stored plans to list what a rollout-wide
-// apply of it refuses, so the failure is reported as that and not as a member
-// that could not be planned.
-var errRolloutApplyRefusals = errors.New("list the rollout members a rollout-wide apply refuses")
-
 // rolloutApplyRefusals lists the members whose own plans apply creation
 // refuses when the primary's plan is applied rollout-wide through the API, so
 // a caller can refuse before it takes a lock and prompts, and name the
@@ -370,8 +363,14 @@ func (s *Service) rolloutApplyRefusals(ctx context.Context, environment, planID 
 // one, which carries its own unsafe changes and direct verdicts. Work that
 // apply refuses as well is refused as blocked, since no apply runs it
 // (memberWorkANarrowedApplyCannotRun).
+//
+// A member running the reviewed plan is recognized by the plan's identifier,
+// not by the pointer it was paired with, so a copy of the reviewed plan still
+// reads as the plan the caller was shown, and the primary never lands on its
+// own refusal list. Every member planned on its own is stored under an
+// identifier of its own.
 func memberWorkARolloutWideAPIApplyCannotRun(reviewed, member *storage.Plan) (reason, detail string) {
-	if member == reviewed {
+	if member.PlanIdentifier == reviewed.PlanIdentifier {
 		return "", ""
 	}
 	if detail := memberWorkANarrowedApplyCannotRun(member); detail != "" {

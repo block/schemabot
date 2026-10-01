@@ -667,14 +667,12 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 
 	// An apply of a rollout runs on every member, so the plan an operator
 	// reviews before it describes every member, not only the primary.
+	// A plan that cannot say what an apply of it refuses fails, rather than
+	// returning an empty refusal list that reads as nothing being refused. The
+	// error says which step failed.
 	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
-	if errors.Is(err, errRolloutApplyRefusals) {
-		s.logger.Error("plan failed: every rollout member was planned, but the stored plans could not be read back to list what a rollout-wide apply refuses", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
-		return
-	}
 	if err != nil {
-		s.logger.Error("plan failed: rollout members could not be planned", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+		s.logger.Error("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}

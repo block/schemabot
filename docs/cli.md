@@ -551,7 +551,10 @@ before it takes a lock or prompts. For each target it prints the
 `--allow-unsafe` when that plan is unsafe; once those have landed, apply the
 rollout again for the rest. A target whose plan no apply runs, because its
 engine refuses a change or its own plan's work has no operation to run from,
-gets no such command: change the schema files instead.
+gets no such command: change the schema files instead. These refused targets
+are listed only once no target needs attention, since a target needing
+attention refuses the apply first. So after you fix a target that needed
+attention and plan again, the plan can still list a target the apply refuses.
 
 A database lock can also block a new apply. Inspect the owner and ongoing
 work before releasing it. Locks span the database's environments; forcing
