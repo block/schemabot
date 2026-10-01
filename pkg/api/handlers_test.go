@@ -69,20 +69,27 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
-func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string) error { return nil }
-func (m *mockPlanLookupStore) Delete(context.Context, int64) error                       { return nil }
-func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error             { return nil }
+func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string, string) error {
+	return nil
+}
+func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
+func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
 type capturingPlanStore struct {
 	mockPlanLookupStore
 	created   *storage.Plan
 	createErr error
-	// routed records each UpdateRoute call as "plan_id deployment/target".
+	// routed records each UpdateRoute call as "plan_id deployment/target",
+	// followed by " narrowed to <member>" for a narrowed plan.
 	routed []string
 }
 
-func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target string) error {
-	s.routed = append(s.routed, planIdentifier+" "+deployment+"/"+target)
+func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target, narrowedTo string) error {
+	call := planIdentifier + " " + deployment + "/" + target
+	if narrowedTo != "" {
+		call += " narrowed to " + narrowedTo
+	}
+	s.routed = append(s.routed, call)
 	return nil
 }
 
@@ -3465,7 +3472,11 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
+	// A rollout-wide apply runs from the rollout primary's plan.
+	plan := executeApplyTestPlan()
+	plan.Deployment = "default-a"
+	plan.Target = "testdb-a"
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -5380,6 +5391,7 @@ func TestHandleStatusDeploymentFilterProjectsMatchingOperation(t *testing.T) {
 	assert.Equal(t, "remote-operation-202", resp.Applies[0].ExternalOperationID)
 	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
 	assert.Equal(t, state.Apply.Completed, resp.Applies[0].State)
+	assert.Equal(t, state.Apply.Running, resp.Applies[0].ApplyState, "the parent's state is reported beside the operation's, since the apply still holds the deployment")
 }
 
 // A deployment applied per shard has exactly one data-plane apply, so the

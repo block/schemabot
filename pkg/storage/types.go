@@ -733,6 +733,12 @@ type Plan struct {
 	// admission the way it always was.
 	DirectExecution *DirectExecutionPolicy
 
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed plan was made for, in an environment of several members.
+	// Empty for a plan of the whole rollout. A narrowed plan says nothing
+	// about the other members, so an apply of it runs on that member alone.
+	NarrowedTo string
+
 	// CreatedAt is when the plan was generated.
 	CreatedAt time.Time
 }
@@ -1397,6 +1403,12 @@ type ApplyOptions struct {
 	// leave the required check action_required (the PR's change has been reverted
 	// and must not merge as-is), not success.
 	Rollback bool `json:"rollback,omitempty"`
+
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed apply ran on. Empty for an apply of the whole rollout. It is
+	// recorded at creation and never read from caller options, so a rollback
+	// can tell an apply that changed one member from one that changed them all.
+	NarrowedTo string `json:"narrowed_to,omitempty"`
 }
 
 // DirectExecutionPolicy is an apply's durable record of the direct execution

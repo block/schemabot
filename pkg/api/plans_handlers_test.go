@@ -237,6 +237,37 @@ func TestPlanGetHandler(t *testing.T) {
 	assert.Equal(t, "carts", resp.Plan.Shards[0].Changes[0].TableName)
 }
 
+// A stored plan narrowed to one rollout member reads back as narrowed, so it
+// is never mistaken for a plan of the whole rollout; a plan of the whole
+// rollout reads back with no narrowing.
+func TestPlanGetHandlerCarriesNarrowing(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	cases := []struct {
+		name       string
+		narrowedTo string
+	}{
+		{name: "narrowed to one member", narrowedTo: "commerce-a/commerce-001"},
+		{name: "whole rollout", narrowedTo: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := storedTestPlans(now)[1]
+			plan.NarrowedTo = tc.narrowedTo
+			mux := newPlansTestServer(t, &mockPlanLookupStore{plan: plan})
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/plans/plan-100", nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var resp apitypes.StoredPlanResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			require.NotNil(t, resp.Plan)
+			assert.Equal(t, tc.narrowedTo, resp.Plan.NarrowedTo)
+		})
+	}
+}
+
 // A stored plan's per-table size estimates survive the read path, so a plan
 // fetched later reports the same sizes as the response that planned it.
 func TestPlanGetHandlerCarriesStoredSizeEstimates(t *testing.T) {

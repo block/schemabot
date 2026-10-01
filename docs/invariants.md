@@ -661,7 +661,8 @@ primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); 
 refusing member work the apply's operation shape cannot carry, rather than settling that member as
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
-(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`).
+(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`);
+the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`).
 
 ## Apply state machine (ST)
 
@@ -1591,6 +1592,18 @@ A namespace the plan withholds, through `ignore_namespaces` or a targets entry's
 refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
 `pkg/tern/local_client.go`).
 
+### RV-9: A rollout member runs only a plan made for it
+
+Each member of an apply runs the plan made against that member, or, where the environment's
+members mirror each other, the rollout primary's plan. A plan made for one member never runs on
+another: an apply narrowed to one member runs only on the member its plan was made for, and an
+apply of the whole rollout runs from the rollout primary's plan. An apply that ran on one member
+is never rolled back across the rollout. *Enforced:* member pairing at apply creation
+(`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
+`pkg/api/plan_handlers.go`), which holds a plan to the narrowing recorded on its stored row
+(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply
+and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`).
+
 ## Routing and authorization (AZ)
 
 ### AZ-1: The server decides where a change runs
@@ -1599,11 +1612,15 @@ A request names a database and an environment. It never names the place those re
 target and which deployment stand behind that name, and therefore which physical database is
 changed and with whose credentials, comes from configuration the server owns. A plan request and
 an apply request have no field for it, so a caller cannot supply one, and a caller who is wrong
-about the topology cannot be wrong in a way that lands anywhere.
+about the topology cannot be wrong in a way that lands anywhere. A request may select one rollout
+member of the environment by name, but the server resolves that name against the members its own
+configuration defines, and a name it does not define is refused.
 
 That route is resolved once, when the plan is made, and stored on the plan. The apply reads it
 back off the plan rather than resolving the name a second time, so configuration that changes
-between review and apply cannot quietly move the change to a different database. A plan missing
+between review and apply cannot quietly move the change to a different database. An apply that
+selects a member resolves the selection only to hold it against the plan's stored route, and is
+refused when the two differ. A plan missing
 its stored route is not re-resolved as a convenience: the apply is refused and asks for a fresh
 plan, because re-resolving is exactly the step that could produce a different answer than the one
 the operator reviewed.
@@ -1613,7 +1630,8 @@ it count as a source for a database only because server config says so, verified
 made and verified again before the apply runs. Config that cannot answer the question is a
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
 to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
-allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), the PostgreSQL
+allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), rollout member
+selection (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
 apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 

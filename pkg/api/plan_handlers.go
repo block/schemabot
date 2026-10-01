@@ -76,6 +76,12 @@ type PlanRequest struct {
 	// an apply will do to unfinished work already on the target need the
 	// grouping the apply will actually run under; see engine.PlanRequest.
 	GroupedExecution bool `json:"grouped_execution,omitempty"`
+
+	// Target narrows the plan to one rollout member of the environment, named
+	// by its target or by deployment/target. Empty plans the rollout primary,
+	// the way every plan did before members could be selected. A narrowed plan
+	// speaks for its one member only, so it never records stored check state.
+	Target string `json:"target,omitempty"`
 }
 
 type unsupportedPullSchemaError struct {
@@ -539,6 +545,9 @@ type ApplyRequest struct {
 	Options        map[string]string `json:"options,omitempty"`
 	Caller         string            `json:"caller,omitempty"`          // Identity of the caller (e.g., "cli:user@host")
 	InstallationID int64             `json:"installation_id,omitempty"` // GitHub App installation ID (for PR comment tracking)
+	// Target narrows the apply to one rollout member, named by its target or
+	// by deployment/target. Empty applies the whole rollout.
+	Target string `json:"target,omitempty"`
 	// ExpectedLockOwner and ExpectedPendingPlanID are internal webhook guards;
 	// direct API callers cannot assert a lock intent through JSON.
 	ExpectedLockOwner     string `json:"-"`
@@ -591,7 +600,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.ExecutePlan(r.Context(), req)
+	planProto, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
@@ -608,6 +617,11 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if _, ok := errors.AsType[*RolloutMemberSelectionError](err); ok {
+			s.logger.Warn("plan rejected for a target that names no single rollout member", "database", req.Database, "environment", req.Environment, "selector", req.Target, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*SourcePolicyError](err); ok {
 			s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeSourcePolicyDenied, "plan failed: "+err.Error())
 			return
@@ -617,7 +631,95 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.refuseUpToDateForUnconvergedMembers(r.Context(), req, planProto, resp); err != nil {
+		s.logger.Error("plan failed: the other rollout members could not be planned to check the plan's coverage", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		return
+	}
+
 	s.writeJSON(w, http.StatusOK, resp)
+}
+
+// refuseUpToDateForUnconvergedMembers keeps a plan of a whole rollout from
+// reading as "up to date" while another member still needs a change.
+//
+// A plan requested through the API is made against the rollout primary, and
+// the other members run the primary's plan. A primary with nothing to change
+// says nothing about the other members: one can still lack the change, for
+// instance after an apply narrowed to the primary landed it there alone. So
+// when the primary is clean, every other member is diffed against its own live
+// schema, without storing a plan for it. The plan reads as up to date only when
+// every member is: a member that still has work, or whose diff failed, turns
+// the plan into an error naming it and how to plan it. A plan with changes is
+// left as it is: applying it runs on every member, each verified against the
+// plan it runs.
+func (s *Service) refuseUpToDateForUnconvergedMembers(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, resp *apitypes.PlanResponse) error {
+	if req.Target != "" || len(resp.Errors) > 0 || resp.HasChanges() {
+		return nil
+	}
+	members, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		return fmt.Errorf("resolve rollout members for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if len(members) <= 1 {
+		return nil
+	}
+	primary := routing.ExecutionTarget{Deployment: resp.Deployment, Target: resp.Target, Namespaces: resp.SelectedNamespaces}
+	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primary, members)
+	if err != nil {
+		return fmt.Errorf("plan the other rollout members of %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if len(diffs) != len(members) {
+		return fmt.Errorf("plan the other rollout members of %s/%s: %d member diffs for %d members", req.Database, req.Environment, len(diffs), len(members))
+	}
+
+	selectors := rolloutMemberSelectors(members)
+	var withWork, unplanned []string
+	for i := 1; i < len(diffs); i++ {
+		diff := diffs[i]
+		if diff.Err != nil {
+			s.logger.Warn("rollout member could not be planned; the plan of the whole rollout is not reported as up to date",
+				"database", req.Database,
+				"environment", req.Environment,
+				"repository", req.Repository,
+				"plan_id", resp.PlanID,
+				"member", members[i].MemberID(),
+				"error", diff.Err)
+			unplanned = append(unplanned, selectors[i])
+			continue
+		}
+		if (tern.ChangeSet{Changes: diff.Changes, Shards: diff.Shards}).HasWork() {
+			withWork = append(withWork, selectors[i])
+		}
+	}
+	if len(withWork) == 0 && len(unplanned) == 0 {
+		s.logger.Info("plan of a whole rollout is up to date: the primary and every other member are at the desired schema",
+			"database", req.Database,
+			"environment", req.Environment,
+			"repository", req.Repository,
+			"plan_id", resp.PlanID,
+			"members", len(members))
+		return nil
+	}
+	s.logger.Warn("plan of a whole rollout refused as up to date: the primary has no changes, but other members are not at the desired schema",
+		"database", req.Database,
+		"environment", req.Environment,
+		"repository", req.Repository,
+		"plan_id", resp.PlanID,
+		"primary", members[0].MemberID(),
+		"members_with_changes", len(withWork),
+		"members_not_planned", len(unplanned))
+	if len(withWork) > 0 {
+		resp.Errors = append(resp.Errors, fmt.Sprintf(
+			"rollout primary %s is at the desired schema, but %d other rollout members still need changes: %s. The rollout is not up to date; plan and apply each of them with its target",
+			members[0].MemberID(), len(withWork), listSelectors(withWork)))
+	}
+	if len(unplanned) > 0 {
+		resp.Errors = append(resp.Errors, fmt.Sprintf(
+			"rollout primary %s is at the desired schema, but %d other rollout members could not be planned: %s. The rollout is not reported as up to date until each of them is planned; see the server logs for why",
+			members[0].MemberID(), len(unplanned), listSelectors(unplanned)))
+	}
+	return nil
 }
 
 // ExecutePlan executes a plan request via the Tern client, stores the result,
@@ -631,7 +733,8 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	return resp, nil
 }
 
-// ExecutePlanProto runs a plan and returns both the reviewed primary plan proto
+// ExecutePlanProto runs a plan and returns both the reviewed plan proto of the
+// member it plans (the primary, or for a narrowed plan the member it names)
 // and its API projection. The proto is the reviewed baseline the review-time
 // drift rollup compares deployments against, so it is exposed alongside the API
 // response rather than reconstructed from storage.
@@ -656,7 +759,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	planStart := time.Now()
 	deployment := ""
 
-	resolvedTarget, err := s.config.ResolvePrimaryDatabaseTarget(req.Database, req.Environment)
+	resolvedTarget, narrowedTo, err := s.planMember(req)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "resolve target")
@@ -692,11 +795,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, err
 	}
-	// The primary plans, and its plan row records, only the namespaces its
-	// targets entry selects. req is this call's copy, so narrowing it here
-	// leaves the caller's request, which the other members are planned from,
-	// untouched.
-	primarySchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
+	// The planned member (the primary, or for a narrowed plan the member it
+	// names) plans, and its plan row records, only the namespaces its targets
+	// entry selects. req is this call's copy, so narrowing it here leaves the
+	// caller's request, which the other members are planned from, untouched.
+	plannedSchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "select namespaces")
@@ -705,17 +808,18 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		return nil, nil, err
 	}
 	if len(resolvedTarget.Namespaces) > 0 {
-		s.logger.Info("plan covers only the namespaces the primary target's entry selects",
+		s.logger.Info("plan covers only the namespaces its rollout member's targets entry selects: the primary's, or for a narrowed plan the named member's",
 			"database", req.Database,
 			"environment", req.Environment,
 			"deployment", deployment,
 			"target", resolvedTarget.Target,
+			"narrowed_to", narrowedTo,
 			"repository", req.Repository,
 			"namespaces", resolvedTarget.Namespaces,
 			"declared_namespace_count", len(req.SchemaFiles))
 	}
 	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
-	req.SchemaFiles = primarySchemaFiles
+	req.SchemaFiles = plannedSchemaFiles
 
 	prInt := 0
 	if req.PullRequest != nil {
@@ -785,7 +889,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Target:            resolvedTarget.Target,
 		SchemaPath:        trustedSchemaPath,
 		IgnoredNamespaces: req.IgnoredNamespaces,
-		// The namespaces the primary's entry leaves to other targets, so an
+		// The namespaces the planned member's entry (the primary's, or for a
+		// narrowed plan the named member's) leaves to other targets, so an
 		// engine that diffs the whole target as one unit refuses rather than
 		// planning their live tables as drops.
 		UnselectedNamespaces: unselected,
@@ -896,20 +1001,56 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Deployment:      deployment,
 		Target:          resolvedTarget.Target,
 		DirectExecution: resolvedDirectExecution(directExecution),
+		NarrowedTo:      narrowedTo,
 	}
 	if err := s.storePlanResponse(ctx, req, resp, route); err != nil {
 		return nil, nil, err
 	}
 
 	planResp := planResponseFromProto(resp)
-	// Record the primary rollout member this plan was created against so the
-	// review-time drift rollup can verify the baseline still maps to the primary
-	// at rollup time. Both halves are needed: one deployment can address several
+	// Record the rollout member this plan was created against (the primary, or
+	// for a narrowed plan the member it names) so the review-time drift rollup
+	// can verify the baseline still maps to that member at rollup time. Both halves are needed: one deployment can address several
 	// targets, so the deployment alone does not identify the member.
 	planResp.Deployment = deployment
 	planResp.Target = resolvedTarget.Target
 	planResp.SelectedNamespaces = slices.Clone(resolvedTarget.Namespaces)
+	planResp.NarrowedTo = narrowedTo
 	return resp, planResp, nil
+}
+
+// planMember resolves the rollout member a plan is made against: the member
+// the request's target selector names, or the rollout primary when it names
+// none. narrowedTo is the member's MemberID when the selection leaves other
+// members of the rollout out, and empty when the plan speaks for the whole
+// rollout.
+func (s *Service) planMember(req PlanRequest) (member routing.ExecutionTarget, narrowedTo string, err error) {
+	if req.Target == "" {
+		member, err = s.config.ResolvePrimaryDatabaseTarget(req.Database, req.Environment)
+		return member, "", err
+	}
+	member, narrows, err := s.resolveRolloutMember(req.Database, req.Environment, req.Target)
+	if err != nil {
+		return routing.ExecutionTarget{}, "", err
+	}
+	if !narrows {
+		s.logger.Info("plan target names the environment's only rollout member; the plan speaks for the whole rollout",
+			"database", req.Database,
+			"environment", req.Environment,
+			"repository", req.Repository,
+			"selector", req.Target,
+			"deployment", member.Deployment,
+			"target", member.Target)
+		return member, "", nil
+	}
+	s.logger.Info("plan narrowed to one rollout member; the plan speaks for that member only",
+		"database", req.Database,
+		"environment", req.Environment,
+		"repository", req.Repository,
+		"selector", req.Target,
+		"deployment", member.Deployment,
+		"target", member.Target)
+	return member, member.MemberID(), nil
 }
 
 // normalizeExecutionVerdicts normalizes a whole plan response, for the paths
@@ -999,6 +1140,11 @@ type storedPlanRoute struct {
 	// resolved an answer states it, disabled included, and only a producer
 	// with no answer to give leaves this unset.
 	DirectExecution *storage.DirectExecutionPolicy
+
+	// NarrowedTo is the MemberID of the one rollout member a narrowed plan was
+	// made for, stamped on the row so apply creation can hold the plan to that
+	// member. Empty for a plan of the whole rollout.
+	NarrowedTo string
 }
 
 // refuseDropsOfWithheldTables refuses a plan that proposes dropping a table the
@@ -1142,6 +1288,7 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 		HeadSHA:               headSHA,
 		PrimaryPlanIdentifier: route.PrimaryPlanIdentifier,
 		DirectExecution:       route.DirectExecution,
+		NarrowedTo:            route.NarrowedTo,
 		CreatedAt:             time.Now(),
 	}
 	storedPlan.RecordIgnoreTables(req.IgnoreTables)
@@ -1167,13 +1314,18 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 // A planner sharing this storage, such as a local client or a target router
 // serving this server's own requests, stores the row for a plan with changes
 // before the service does, stamped with the route it knows: the database it was
-// configured with as the deployment, and the target it resolved. The service
-// keeps that row, so the row has to name the member: an apply finds the
-// reviewed target among the rollout's members by the plan's deployment and
+// configured with as the deployment, the target it resolved, and no narrowing.
+// The service keeps that row, so the row has to name the member: an apply finds
+// the reviewed target among the rollout's members by the plan's deployment and
 // target, and a row stamped with anything else reads as a member with no stored
-// plan, refused after the operator has confirmed. A row for another database or
-// environment is not this plan at all, and fails the plan rather than being
-// taken for it.
+// plan, refused after the operator has confirmed. The row of a plan narrowed to
+// one member also has to record the narrowing, since that is what holds an
+// apply of the plan to that member rather than letting it run across the
+// rollout.
+//
+// A row for another database or environment is not this plan at all, and a row
+// that already records a different narrowing was held to other members; either
+// fails the plan rather than being taken for it.
 func (s *Service) keepStoredPlanOnRoute(ctx context.Context, plan *storage.Plan) error {
 	plans := s.storage.Plans()
 	existing, err := plans.Get(ctx, plan.PlanIdentifier)
@@ -1187,17 +1339,32 @@ func (s *Service) keepStoredPlanOnRoute(ctx context.Context, plan *storage.Plan)
 		return fmt.Errorf("plan %s for database %q environment %q collides with a stored plan for database %q environment %q",
 			plan.PlanIdentifier, plan.Database, plan.Environment, existing.Database, existing.Environment)
 	}
-	if existing.Deployment == plan.Deployment && existing.Target == plan.Target {
+	if storedNarrowingConflicts(existing.NarrowedTo, plan.NarrowedTo) {
+		s.logger.Error("plan refused: the row already stored under its identifier records a different narrowing, so it is not this plan",
+			"plan_id", plan.PlanIdentifier, "database", plan.Database, "environment", plan.Environment,
+			"narrowed_to", plan.NarrowedTo, "stored_narrowed_to", existing.NarrowedTo)
+		return fmt.Errorf("plan %s narrowed to %q collides with a stored plan narrowed to %q; plan again", plan.PlanIdentifier, plan.NarrowedTo, existing.NarrowedTo)
+	}
+	if existing.Deployment == plan.Deployment && existing.Target == plan.Target && existing.NarrowedTo == plan.NarrowedTo {
 		return nil
 	}
 	s.logger.Info("plan row stored by the planner names a different route; restamping it with the rollout member it was planned for",
 		"plan_id", plan.PlanIdentifier, "database", plan.Database, "environment", plan.Environment,
-		"stored_deployment", existing.Deployment, "stored_target", existing.Target,
-		"deployment", plan.Deployment, "target", plan.Target)
-	if err := plans.UpdateRoute(ctx, plan.PlanIdentifier, plan.Deployment, plan.Target); err != nil {
+		"stored_deployment", existing.Deployment, "stored_target", existing.Target, "stored_narrowed_to", existing.NarrowedTo,
+		"deployment", plan.Deployment, "target", plan.Target, "narrowed_to", plan.NarrowedTo)
+	if err := plans.UpdateRoute(ctx, plan.PlanIdentifier, plan.Deployment, plan.Target, plan.NarrowedTo); err != nil {
 		return fmt.Errorf("restamp plan %s with its rollout member: %w", plan.PlanIdentifier, err)
 	}
 	return nil
+}
+
+// storedNarrowingConflicts reports whether a row already stored under a plan's
+// identifier records a narrowing other than the one the plan was made under. A
+// row with no narrowing is the planner's own write and takes the plan's. A row
+// with one was already held to a member, and neither widening it to the whole
+// rollout nor moving it to another member leaves it the same plan.
+func storedNarrowingConflicts(stored, planned string) bool {
+	return stored != "" && stored != planned
 }
 
 // handleApply handles POST /api/apply requests.
@@ -1258,6 +1425,16 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*UnsupportedFeatureError](err); ok {
 			s.logger.Warn("apply rejected because the database type does not support a requested feature", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*RolloutMemberSelectionError](err); ok {
+			s.logger.Warn("apply rejected for a target that names no single rollout member", "plan_id", req.PlanID, "environment", req.Environment, "selector", req.Target, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*PlanMemberMismatchError](err); ok {
+			s.logger.Warn("apply rejected because its plan was made for a different rollout member than the apply would run on", "plan_id", req.PlanID, "environment", req.Environment, "selector", req.Target, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
@@ -1659,24 +1836,13 @@ func (s *Service) createStoredApply(
 		return nil, 0, err
 	}
 
-	// The plan already carries the resolved primary (deployment, target) from
-	// plan time, and is authoritative for single-deployment applies and the
-	// config-light trusted control-plane enqueue path. Multi-deployment fan-out
-	// additionally needs the full ordered target set, which only the server
-	// config knows; use it only when it defines more than one deployment so
-	// single-deployment creation stays unchanged and does not depend on
-	// database config being present.
-	targets := []routing.ExecutionTarget{{
-		DatabaseType: plan.DatabaseType,
-		Deployment:   plan.Deployment,
-		Target:       plan.Target,
-	}}
-	if resolved, err := s.config.ResolveDatabaseTargets(plan.Database, req.Environment); err != nil {
-		s.logger.Debug("createStoredApply: using plan's stored target; config did not resolve database targets",
-			"database", plan.Database, "environment", req.Environment, "error", err)
-	} else if len(resolved) > 1 {
-		targets = resolved
+	targets, narrowedTo, err := s.applyTargets(plan, req)
+	if err != nil {
+		return nil, 0, err
 	}
+	// A narrowed apply records the member it ran on, so a later rollback can
+	// tell it changed that member alone and not the whole rollout.
+	applyOpts.NarrowedTo = narrowedTo
 
 	var lockID int64
 	lock, err := s.storage.Locks().Get(ctx, plan.Database, plan.DatabaseType)
@@ -1838,6 +2004,152 @@ func applyMemberDisplayNames(members []applyMember) []string {
 		targets[i] = m.Target
 	}
 	return routing.DisplayNames(targets)
+}
+
+// applyTargets resolves the rollout members an apply creates operations for.
+//
+// A narrowed apply runs on the one member its target selector names. Narrowing
+// needs the configured member set to select from, so a config that cannot
+// resolve the environment fails the apply rather than falling back to the
+// plan's stored route, which could be a different member than the one named.
+//
+// A rollout-wide apply runs from the rollout primary's plan: the plan the
+// other members are verified against, or that they mirror. A plan made for any
+// other member (a narrowed plan, or one stranded by a deployment_order change)
+// describes a schema no other member was planned against, so running it
+// rollout-wide is refused. So is a plan narrowed to the primary itself: it was
+// made to speak for the primary alone, and the operator who reviewed it was
+// told it covers that one member.
+//
+// narrowedTo is the MemberID of the one member a narrowed apply runs on, and
+// empty when the apply runs on the whole rollout, including when the target
+// names the only member of a single-member environment.
+func (s *Service) applyTargets(plan *storage.Plan, req ApplyRequest) (targets []routing.ExecutionTarget, narrowedTo string, err error) {
+	if req.Target != "" {
+		member, narrows, err := s.resolveRolloutMember(plan.Database, req.Environment, req.Target)
+		if err != nil {
+			return nil, "", err
+		}
+		if !planIsForMember(plan, member) {
+			return nil, "", &PlanMemberMismatchError{
+				Database:    plan.Database,
+				Environment: req.Environment,
+				PlanID:      plan.PlanIdentifier,
+				PlanMember:  planMemberID(plan),
+				ApplyMember: member.MemberID(),
+				Narrowed:    true,
+			}
+		}
+		if !narrows {
+			s.logger.Info("apply target names the environment's only rollout member; the apply runs on the whole rollout",
+				"plan_id", plan.PlanIdentifier,
+				"database", plan.Database,
+				"environment", req.Environment,
+				"selector", req.Target,
+				"deployment", member.Deployment,
+				"target", member.Target)
+			return []routing.ExecutionTarget{member}, "", nil
+		}
+		s.logger.Info("apply narrowed to one rollout member; the rest of the rollout is not touched",
+			"plan_id", plan.PlanIdentifier,
+			"database", plan.Database,
+			"environment", req.Environment,
+			"repository", plan.Repository,
+			"pull_request", plan.PullRequest,
+			"selector", req.Target,
+			"deployment", member.Deployment,
+			"target", member.Target)
+		return []routing.ExecutionTarget{member}, member.MemberID(), nil
+	}
+
+	if plan.NarrowedTo != "" {
+		return nil, "", &PlanMemberMismatchError{
+			Database:     plan.Database,
+			Environment:  req.Environment,
+			PlanID:       plan.PlanIdentifier,
+			PlanMember:   plan.NarrowedTo,
+			PlanNarrowed: true,
+		}
+	}
+
+	// The plan already carries the resolved primary (deployment, target) from
+	// plan time, and is authoritative for single-deployment applies and the
+	// config-light trusted control-plane enqueue path. Multi-deployment fan-out
+	// additionally needs the full ordered target set, which only the server
+	// config knows; use it only when it defines more than one deployment so
+	// single-deployment creation stays unchanged and does not depend on
+	// database config being present.
+	targets = []routing.ExecutionTarget{{
+		DatabaseType: plan.DatabaseType,
+		Deployment:   plan.Deployment,
+		Target:       plan.Target,
+	}}
+	resolved, err := s.config.ResolveDatabaseTargets(plan.Database, req.Environment)
+	if err != nil {
+		s.logger.Debug("createStoredApply: using plan's stored target; config did not resolve database targets",
+			"database", plan.Database, "environment", req.Environment, "error", err)
+		return targets, "", nil
+	}
+	if len(resolved) <= 1 {
+		return targets, "", nil
+	}
+	if !planIsForMember(plan, resolved[0]) {
+		return nil, "", &PlanMemberMismatchError{
+			Database:    plan.Database,
+			Environment: req.Environment,
+			PlanID:      plan.PlanIdentifier,
+			PlanMember:  planMemberID(plan),
+			ApplyMember: resolved[0].MemberID(),
+		}
+	}
+	return resolved, "", nil
+}
+
+// PlanMemberMismatchError reports an apply whose plan was made for a different
+// rollout member than the one the apply would run it on: a narrowed apply that
+// names a member other than its plan's, a rollout-wide apply of a plan made
+// for a member other than the rollout primary, or a rollout-wide apply of a
+// plan narrowed to one member. It is the caller's request that pairs the two,
+// not a server failure, and the message names the selector that would pair
+// them.
+type PlanMemberMismatchError struct {
+	Database    string
+	Environment string
+	PlanID      string
+	// PlanMember is the MemberID the plan was made for.
+	PlanMember string
+	// ApplyMember is the MemberID the apply would run the plan on: the named
+	// member for a narrowed apply, the rollout primary otherwise.
+	ApplyMember string
+	// Narrowed is true when the apply named a member.
+	Narrowed bool
+	// PlanNarrowed is true when the plan was narrowed to PlanMember and the
+	// apply runs the whole rollout. ApplyMember is empty then: the plan is
+	// refused rollout-wide whichever member it was made for.
+	PlanNarrowed bool
+}
+
+func (e *PlanMemberMismatchError) Error() string {
+	if e.PlanNarrowed {
+		return fmt.Sprintf("apply for %s/%s runs the whole rollout, but plan %s was narrowed to rollout member %s and speaks for that member only; apply it with target %s, or plan the whole environment",
+			e.Database, e.Environment, e.PlanID, e.PlanMember, e.PlanMember)
+	}
+	if e.Narrowed {
+		return fmt.Sprintf("apply for %s/%s names rollout member %s, but plan %s was made for %s; re-plan with target %s, or apply the plan with target %s",
+			e.Database, e.Environment, e.ApplyMember, e.PlanID, e.PlanMember, e.ApplyMember, e.PlanMember)
+	}
+	return fmt.Sprintf("apply for %s/%s runs the whole rollout, but plan %s was made for rollout member %s, not the rollout primary %s; apply it with target %s, or plan the whole environment",
+		e.Database, e.Environment, e.PlanID, e.PlanMember, e.ApplyMember, e.PlanMember)
+}
+
+// planIsForMember reports whether a plan was made against the given member.
+func planIsForMember(plan *storage.Plan, member routing.ExecutionTarget) bool {
+	return plan.Deployment == member.Deployment && plan.Target == member.Target
+}
+
+// planMemberID names the rollout member a plan was made for.
+func planMemberID(plan *storage.Plan) string {
+	return routing.ExecutionTarget{Deployment: plan.Deployment, Target: plan.Target}.MemberID()
 }
 
 // rejectUnapplyableMemberPlan runs a rollout member's own plan through the same
@@ -2674,6 +2986,16 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if !state.IsState(apply.State, state.Apply.Completed) {
 		return nil, controlConflictf("apply %s is in state %q; only completed applies can be rolled back", apply.ApplyIdentifier, apply.State)
 	}
+	// A rollback plan is applied to the whole rollout, and a narrowed apply
+	// changed one member. Reverting it everywhere would run the reversal on
+	// members that never received the change, so it is refused until rollback
+	// can be narrowed the same way.
+	if member := apply.GetOptions().NarrowedTo; member != "" {
+		s.logger.Warn("rollback refused for an apply narrowed to one rollout member",
+			append(apply.LogAttrs(), "narrowed_to", member)...)
+		return nil, controlConflictf("apply %s ran on rollout member %s only; rollback of a narrowed apply is not supported, so restore that target by planning and applying the previous schema with target %s",
+			apply.ApplyIdentifier, member, member)
+	}
 
 	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
@@ -2698,6 +3020,9 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	}
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
+	}
+	if err := s.refuseRollbackAfterPrimaryMoved(apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
+		return nil, err
 	}
 	// Client resolution is a config lookup: a deployment that cannot resolve a
 	// Tern client resolves the same way on every attempt, so the failure is
@@ -2778,6 +3103,35 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	}
 
 	return planResponseFromProto(resp), nil
+}
+
+// refuseRollbackAfterPrimaryMoved refuses a rollback of a rollout-wide apply
+// whose rollout primary is no longer the environment's first member.
+//
+// A rollback plan is made against the member the forward apply ran its plan
+// from, and a rollout-wide apply runs only from the current primary's plan
+// (RV-9). Once a reorder moves another member to the front, the
+// rollback plan can no longer be applied to the rollout, and applying it to its
+// own member alone would revert that member and leave the others on the
+// forward schema. The rollback is refused here, before a plan is made, with
+// the one remedy that reverts every member: restore the rollout order the
+// apply ran under. A configuration that cannot resolve the environment is left to apply
+// creation, which then runs the plan on its stored member only when the
+// rollout has no other.
+func (s *Service) refuseRollbackAfterPrimaryMoved(apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
+	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
+	if err != nil {
+		s.logger.Debug("rollback primary check skipped: config did not resolve the rollout members; apply creation holds the plan to its stored member",
+			append(apply.LogAttrs(), "error", err)...)
+		return nil
+	}
+	if len(members) <= 1 || (members[0].Deployment == applyPrimary.Deployment && members[0].Target == applyPrimary.Target) {
+		return nil
+	}
+	s.logger.Warn("rollback refused: the rollout primary changed since the apply ran",
+		append(apply.LogAttrs(), "apply_primary", applyPrimary.MemberID(), "rollout_primary", members[0].MemberID())...)
+	return controlConflictf("apply %s ran across the rollout from rollout primary %s, but the rollout primary is now %s; a rollback made against %s cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. Restore the rollout order the apply ran under (deployment_order, or the order of the targets list) so %s is first, then retry the rollback",
+		apply.ApplyIdentifier, applyPrimary.MemberID(), members[0].MemberID(), applyPrimary.MemberID(), applyPrimary.MemberID())
 }
 
 func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bool {

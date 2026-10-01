@@ -728,6 +728,9 @@ type PlanRequest struct {
 	// an apply will do to unfinished work already on the target need the
 	// grouping the apply will actually run under.
 	GroupedExecution bool `json:"grouped_execution,omitempty"`
+	// Target narrows the plan to one rollout member of the environment, named
+	// by its target or by deployment/target. Empty plans the rollout primary.
+	Target string `json:"target,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -736,6 +739,9 @@ type ApplyRequest struct {
 	Environment string            `json:"environment"`
 	Caller      string            `json:"caller,omitempty"`
 	Options     map[string]string `json:"options,omitempty"`
+	// Target narrows the apply to one rollout member, named by its target or
+	// by deployment/target. Empty applies the whole rollout.
+	Target string `json:"target,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations
@@ -756,8 +762,9 @@ type PlanResponse struct {
 	Database     string `json:"database,omitempty"`
 	DatabaseType string `json:"database_type,omitempty"`
 	Environment  string `json:"environment,omitempty"`
-	// Deployment and Target together identify the primary rollout member this
-	// plan was created against (rollout index 0 at plan time). The review-time
+	// Deployment and Target together identify the rollout member this plan was
+	// created against: the primary (rollout index 0 at plan time), or for a
+	// narrowed plan the member it names. The review-time
 	// drift rollup carries both forward so it can verify the plan's baseline
 	// still maps to the primary at rollup time, rather than trusting that
 	// current config re-resolves the same primary. The deployment alone is not
@@ -765,16 +772,22 @@ type PlanResponse struct {
 	// identified by the pair.
 	Deployment string `json:"deployment,omitempty"`
 	Target     string `json:"target,omitempty"`
-	// SelectedNamespaces is the namespace selection of the primary's targets
-	// entry this plan was created under, empty when the entry selects every
-	// declared namespace. The rollup checks it against the primary's selection
-	// at rollup time alongside Deployment and Target, so a reloaded placement
-	// cannot pair this plan with members resolved under a different one.
-	SelectedNamespaces []string                 `json:"selected_namespaces,omitempty"`
-	Engine             string                   `json:"engine"`
-	Changes            []*SchemaChangeResponse  `json:"changes"`
-	LintResults        []*LintViolationResponse `json:"lint_violations"`
-	Errors             []string                 `json:"errors"`
+	// SelectedNamespaces is the namespace selection of the targets entry this
+	// plan was created under (the primary's, or for a narrowed plan the named
+	// member's), empty when the entry selects every declared namespace. The
+	// rollup checks it against the primary's selection at rollup time alongside
+	// Deployment and Target, so a reloaded placement cannot pair this plan with
+	// members resolved under a different one.
+	SelectedNamespaces []string `json:"selected_namespaces,omitempty"`
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed plan was made for. Empty for a plan of the whole rollout. A
+	// narrowed plan says nothing about the environment's other members, so it
+	// is applied to that member alone and never passes a check.
+	NarrowedTo  string                   `json:"narrowed_to,omitempty"`
+	Engine      string                   `json:"engine"`
+	Changes     []*SchemaChangeResponse  `json:"changes"`
+	LintResults []*LintViolationResponse `json:"lint_violations"`
+	Errors      []string                 `json:"errors"`
 	// Shards carries the per-shard plan for a sharded engine: each changing shard
 	// and the changes it needs. The namespace-level Changes above collapse a
 	// keyspace to one entry, so a keyspace whose shards diverge is represented
@@ -1518,13 +1531,20 @@ type ActiveApplyResponse struct {
 	Database            string `json:"database"`
 	Environment         string `json:"environment"`
 	Deployment          string `json:"deployment,omitempty"`
-	State               string `json:"state"`
-	Engine              string `json:"engine"`
-	Caller              string `json:"caller"`
-	ErrorMessage        string `json:"error_message,omitempty"`
-	StartedAt           string `json:"started_at,omitempty"`
-	CompletedAt         string `json:"completed_at,omitempty"`
-	UpdatedAt           string `json:"updated_at"`
+	// State is the apply's state, or the named deployment's operation state
+	// when the status request filters by deployment.
+	State string `json:"state"`
+	// ApplyState is the parent apply's own state, set only when State reports
+	// a deployment's operation. An apply holds every deployment it touches
+	// until the apply itself is terminal, so a deployment whose operation has
+	// finished stays reserved while ApplyState is not terminal.
+	ApplyState   string `json:"apply_state,omitempty"`
+	Engine       string `json:"engine"`
+	Caller       string `json:"caller"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 // StatusResponse is the HTTP response for GET /api/status.

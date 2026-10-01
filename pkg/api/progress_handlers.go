@@ -1032,6 +1032,7 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 		}
 		active.ExternalOperationID = op.ExternalOperationID
 		active.State = op.State
+		active.ApplyState = apply.State
 		active.ErrorMessage = op.ErrorMessage
 		active.UpdatedAt = op.UpdatedAt.Format("2006-01-02T15:04:05Z07:00")
 		if op.StartedAt != nil {

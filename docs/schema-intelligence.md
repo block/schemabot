@@ -841,8 +841,50 @@ follow, most recently active first.
 Each row carries the apply ID, database, environment, state, engine, caller,
 error message, and started, completed, and updated timestamps. A row carries
 `deployment` only when the request is deployment-filtered; an unfiltered list
-omits the field on every row. `schemabot status` renders it;
-`schemabot status --json` returns it raw.
+omits the field on every row. On a deployment-filtered row, `state` is that
+deployment's operation state, and `apply_state` is the parent apply's own
+state. An apply holds every deployment it touches until the apply itself
+finishes, so a row whose `state` is `completed` while `apply_state` is still
+`running` means the deployment is still reserved by a rollout running
+elsewhere. `schemabot status` renders it; `schemabot status --json` returns it
+raw.
+
+<details>
+<summary>Deployment-filtered request and response example</summary>
+
+```http
+GET /api/status?environment=production&deployment=us&active=true
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "active_count": 0,
+  "limit": 20,
+  "max_limit": 1000,
+  "state_counts": {
+    "running": 1
+  },
+  "applies": [
+    {
+      "apply_id": "apply-example-74",
+      "database": "orders",
+      "environment": "production",
+      "deployment": "us",
+      "state": "completed",
+      "apply_state": "running",
+      "engine": "spirit",
+      "caller": "example/orders#91",
+      "started_at": "2026-09-01T02:10:00Z",
+      "completed_at": "2026-09-01T02:52:00Z",
+      "updated_at": "2026-09-01T02:52:00Z"
+    }
+  ]
+}
+```
+
+</details>
 
 <details>
 <summary>Request and response example</summary>
@@ -992,7 +1034,11 @@ primary deployment the plan was computed against, when one was recorded.
 DDL that was computed, the change type, whether it was classified unsafe and
 why, and whether it was classified for direct execution. The plan also names
 the rollout member it was computed against, as `deployment` and `target`
-together: one deployment can address several targets, so read the pair. Because a plan is
+together: one deployment can address several targets, so read the pair. A plan
+made for one member with a target selector (`schemabot plan --target`) carries
+that member's `deployment/target` as `narrowed_to`; it says nothing about the
+environment's other members and is applied to that member alone. A plan of the
+whole rollout omits the field. Because a plan is
 stamped with the commit it was computed from, a caller can join it back to the
 repository to inspect the proposed change at that commit. To establish what
 actually ran, inspect the apply's task DDL and outcome through progress.
@@ -1022,6 +1068,54 @@ apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
 engine generates the namespace's whole VSchema change from the plan's DDL, so
 there is no VSchema diff to review; plans show such a namespace by its DDL
 alone.
+
+<details>
+<summary>Stored plan narrowed to one rollout member</summary>
+
+```http
+GET /api/plans/plan-example-50
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-50",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "deployment": "us",
+  "created_at": "2026-09-01T04:40:00Z",
+  "change_counts": {
+    "alter": 1
+  },
+  "target": "payments-002",
+  "plan": {
+    "plan_id": "plan-example-50",
+    "database": "orders",
+    "environment": "production",
+    "deployment": "us",
+    "target": "payments-002",
+    "narrowed_to": "us/payments-002",
+    "engine": "spirit",
+    "changes": [
+      {
+        "namespace": "orders",
+        "table_changes": [
+          {
+            "table_name": "invoices",
+            "namespace": "orders",
+            "ddl": "ALTER TABLE `invoices` ADD COLUMN `memo` varchar(255)",
+            "change_type": "alter"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
 
 <details>
 <summary>Stored plan whose only work is a finalize</summary>

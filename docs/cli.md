@@ -465,6 +465,53 @@ This confirms that the live schema matches your files. Commit the files so
 your repository records the schema you now run. If your team uses GitHub
 merge gates, follow the [PR workflow](pre-merge-workflow.md) instead.
 
+### Apply to one target of a rollout
+
+An environment can fan out to several targets, from a `targets:` list or a
+`deployments:` map. `plan` and `apply` cover the whole rollout by default.
+Pass `--target` to plan and apply one member only, for example to land a
+change on one target before the rest:
+
+```console
+$ schemabot apply -s ./schema -e production --target payments-002
+...
+Target: prod/payments-002 (this plan covers only this rollout member)
+
+Do you want to apply these changes? Only 'yes' will be accepted: yes
+```
+
+`--target` takes the target's name, or `deployment/target` when two
+deployments address a target of the same name; an ambiguous bare name is
+refused. An unknown name is refused with the list of valid targets. `plan`
+takes the same flag and needs `-e` with it.
+
+A narrowed plan speaks for its one target. It never records a GitHub check
+result, so a narrowed plan or apply cannot pass a PR merge gate while other
+targets still need the change. The server records the narrowing on the stored
+plan and refuses to apply it anywhere but the target it was made for, and a
+narrowed apply cannot be rolled back with `rollback`: restore that target by
+planning and applying the previous schema with the same `--target`. In an
+environment with a single target, `--target` names the whole rollout, so the
+plan and apply are not narrowed.
+
+A plan of the whole rollout is made against its first target, and the other
+targets run that plan. When the first target is already at the desired schema,
+the server also diffs every other target against its own live schema. The plan
+reports no changes only when every target is converged, so a re-run of an
+`apply` that already landed, or the verification step of `onboard`, reads as up
+to date. When a target still needs the change, for example after an apply
+narrowed to the first target, or a target cannot be diffed, the plan fails with
+an error that lists those targets. Plan and apply each of them with `--target`.
+
+A targeted apply checks for a schema change already in progress on its
+target's deployment, which every target of a `targets:` list shares, and
+refuses to start while one is queued or running there.
+
+A rollback of a rollout-wide apply is made against the first target the apply
+ran from. If the rollout order changed since, the rollback is refused rather
+than reverting that one target alone: restore the order the apply ran under,
+then retry it.
+
 ### Understand a refusal
 
 Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
