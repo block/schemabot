@@ -271,6 +271,113 @@ func TestWritePlanBody_ConvergedRolloutEndsOnNoChanges(t *testing.T) {
 	assert.Equal(t, "▸ targets prod/payments-001, prod/payments-002, prod/payments-003\n\n✓ No schema changes detected.\n\n", out)
 }
 
+// A rollout whose planned targets are all at the desired schema is not
+// settled while another target could not be planned: that target's work is
+// unknown, never none. So the plan names it first, says under the planned
+// group's heading that it has nothing to run, and does not close on the "✓ No
+// schema changes detected." verdict that would read as the whole rollout done.
+func TestWritePlanBody_ConvergedGroupsBesideAnUnplannedTargetGetNoVerdict(t *testing.T) {
+	plan := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  []*apitypes.SchemaChangeResponse{},
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 2), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}}},
+			Attention: []*apitypes.PlanMemberAttentionResponse{
+				{Member: "prod/payments-003", Reason: apitypes.PlanMemberUnplanned, Detail: "could not be planned; see server logs for the cause, then plan again"},
+			},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assertBefore(t, out, "• prod/payments-003 — could not be planned", "▸ targets prod/payments-001, prod/payments-002")
+	assert.Contains(t, out, "▸ targets prod/payments-001, prod/payments-002\n\n  No schema changes detected\n", "%s", out)
+	assert.NotContains(t, out, "✓", "no rollout-wide verdict while a target's work is unknown:\n%s", out)
+}
+
+// A schema-per-namespace plan can run the same ALTER directly in two
+// namespaces for the same reason: refunds is empty in both ns_0 and ns_1.
+// Those are two write-blocking statements on two tables, so the notice names
+// each, qualified by its namespace. The shard rows repeating a namespace's
+// change are that one change, named once.
+func TestWritePlanBody_DirectExecutionNoticeNamesEachNamespace(t *testing.T) {
+	const reason = "the table has ~0 rows"
+	directIn := func(namespace string) *apitypes.TableChangeResponse {
+		return &apitypes.TableChangeResponse{
+			TableName: "refunds", Namespace: namespace, ChangeType: "alter",
+			DDL:           "ALTER TABLE `refunds` ADD COLUMN `region` varchar(32)",
+			ExecutionMode: "direct", ModeReason: reason,
+		}
+	}
+	plan := &apitypes.PlanResponse{
+		Database: "payments",
+		Engine:   "spirit",
+		Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "ns_0", TableChanges: []*apitypes.TableChangeResponse{directIn("ns_0")}},
+			{Namespace: "ns_1", TableChanges: []*apitypes.TableChangeResponse{directIn("ns_1")}},
+		},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "ns_0", Shard: "-80", Changes: []*apitypes.TableChangeResponse{directIn("")}},
+			{Namespace: "ns_0", Shard: "80-", Changes: []*apitypes.TableChangeResponse{directIn("")}},
+			{Namespace: "ns_1", Shard: "-80", Changes: []*apitypes.TableChangeResponse{directIn("")}},
+		},
+	}
+
+	notices := directChangeNotices(plan)
+	require.Len(t, notices, 2, "one notice per namespace, however many shards run it: %+v", notices)
+	assert.Equal(t, "ns_0.refunds", notices[0].Table)
+	assert.Equal(t, "ns_1.refunds", notices[1].Table)
+	for _, n := range notices {
+		assert.Equal(t, reason, n.Reason)
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Contains(t, out, "1. ns_0.refunds: "+reason+"\n  2. ns_1.refunds: "+reason+"\n", "%s", out)
+}
+
+// Staging and production can share a primary plan while production's other
+// target runs something staging's do not: here prod/payments-002 adds zone.
+// A rollout's plan names its members, so the two never collapse into one
+// "Staging & Production" section, which would render staging's groups only
+// and never show production's zone column.
+func TestOutputMultiEnvPlanResult_RolloutsWithTheSamePrimaryRenderTheirOwnSections(t *testing.T) {
+	staging := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     2,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: []string{"staging/payments-001", "staging/payments-002"}, Primary: true, Changes: addColumnTo("region")},
+			},
+		},
+	}
+	production := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     2,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: []string{"prod/payments-001"}, Primary: true, Changes: addColumnTo("region")},
+				{Members: []string{"prod/payments-002"}, Changes: addColumnTo("zone")},
+			},
+		},
+	}
+	require.Equal(t, planFingerprint(staging), planFingerprint(production), "the primaries alone read as the same plan")
+
+	out := stripAnsi(captureStdout(func() {
+		outputMultiEnvPlanResult(map[string]*apitypes.PlanResponse{"staging": staging, "production": production}, "orders", "orders")
+	}))
+	assert.NotContains(t, out, "Staging & Production", "%s", out)
+	assertBefore(t, out, "▸ targets staging/payments-001, staging/payments-002", "▸ target prod/payments-002")
+	assertBefore(t, out, "▸ target prod/payments-002", "ADD COLUMN `zone`")
+}
+
 // A 64-target rollout that splits 40/24 names each group by its share of the
 // rollout, so a subset never reads like the whole.
 func TestWritePlanBody_SixtyFourTargetRolloutSplitStatesCoverage(t *testing.T) {

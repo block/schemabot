@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -279,15 +280,18 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	slices.SortStableFunc(order, func(a, b int) int {
 		return compareWorkFirst(!work[a].empty(), !work[b].empty())
 	})
-	// A rollout with no work anywhere closes on the one no-changes line a
-	// single plan does, so its groups carry no line of their own.
-	anyWork := slices.ContainsFunc(work, func(w planWork) bool { return !w.empty() })
+	// A rollout known to have no work anywhere closes on the one no-changes
+	// line a single plan does, so its groups carry no line of their own. A
+	// member that needs attention has unknown work, never none (MG-12), so
+	// while one does the rollout gets no such verdict and each settled group
+	// says so under its own heading instead.
+	settled := !slices.ContainsFunc(work, func(w planWork) bool { return !w.empty() }) && len(rollout.Attention) == 0
 	var rolloutWork []planWork
 	for _, i := range order {
 		opensOnHeader := !work[i].empty() && opensOnNamespaceHeader(plans[i], work[i])
 		templates.WriteRolloutGroupHeading(noun, rollout.Groups[i].Members, rollout.Members, opensOnHeader)
 		if work[i].empty() {
-			if anyWork {
+			if !settled {
 				templates.WriteRolloutGroupNoChanges()
 			}
 			continue
@@ -301,11 +305,12 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// The summary counts what the rollout runs the way the PR comment does,
 	// each table once however many groups change it. The group headings
 	// already say which members run what.
-	if len(rolloutWork) == 0 {
-		templates.WriteNoChanges()
-	} else {
+	switch {
+	case len(rolloutWork) > 0:
 		total := combinePlanWork(rolloutWork)
 		templates.WritePlanSummaryWithKeyspaceUpdates(total.allChanges, total.vschemaChanges, total.finalizes())
+	case settled:
+		templates.WriteNoChanges()
 	}
 	templates.WriteExemptTables(result.ExemptTables)
 }
@@ -545,19 +550,55 @@ func writeChangeDetail(result *apitypes.PlanResponse, w planWork, isApply bool) 
 	}
 }
 
-// directChangeNotices lists the plan's direct-execution changes one per table
-// and reason, so a statement that runs the same way on every shard is named
-// once.
+// directChangeNotices lists the plan's direct-execution changes one per
+// namespace, table and reason, so a statement that runs the same way on every
+// shard of a namespace is named once, and the same table run directly in two
+// namespaces is named in each. When the notices span more than one namespace,
+// each table is qualified with its namespace so the two entries read apart.
 func directChangeNotices(result *apitypes.PlanResponse) []templates.UnsafeChange {
-	var notices []templates.UnsafeChange
-	seen := make(map[string]bool)
-	for _, tc := range result.DirectChanges() {
-		key := tc.TableName + "\x00" + tc.ModeReason
+	type notice struct {
+		namespace string
+		change    *apitypes.TableChangeResponse
+	}
+	var found []notice
+	seen := make(map[[3]string]bool)
+	namespaces := make(map[string]bool)
+	add := func(namespace string, tc *apitypes.TableChangeResponse) {
+		if !tc.DirectExecution() {
+			return
+		}
+		ns := renderedNamespace(cmp.Or(namespace, tc.Namespace), result.Database)
+		key := [3]string{ns, tc.TableName, tc.ModeReason}
 		if seen[key] {
-			continue
+			return
 		}
 		seen[key] = true
-		notices = append(notices, templates.UnsafeChange{Table: tc.TableName, Reason: tc.ModeReason, ChangeType: tc.ChangeType})
+		namespaces[ns] = true
+		found = append(found, notice{namespace: ns, change: tc})
+	}
+	for _, sc := range result.Changes {
+		if sc == nil {
+			continue
+		}
+		for _, tc := range sc.TableChanges {
+			add(sc.Namespace, tc)
+		}
+	}
+	for _, sp := range result.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			add(sp.Namespace, tc)
+		}
+	}
+	notices := make([]templates.UnsafeChange, 0, len(found))
+	for _, n := range found {
+		table := n.change.TableName
+		if len(namespaces) > 1 {
+			table = n.namespace + "." + table
+		}
+		notices = append(notices, templates.UnsafeChange{Table: table, Reason: n.change.ModeReason, ChangeType: n.change.ChangeType})
 	}
 	return notices
 }
