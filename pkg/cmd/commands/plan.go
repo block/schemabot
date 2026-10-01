@@ -261,19 +261,19 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 // writeRolloutPlanBody writes the plan of every member of a rollout the way
 // the PR comment does: the members that need attention first, then one
 // heading per distinct plan naming the members that run it, with that plan's
-// changes under it. How big each table the rollout copies, rebuilds, or
-// scans is on its members comes before the groups, since the groups can split
-// one table across several headings. Groups with work lead; a group already at
-// the desired schema says so in one line in place of DDL. Lint results, the
+// changes under it. Groups with work lead; a group already at the desired
+// schema says so in one line in place of DDL. Lint results, table sizes, the
 // plan summary, and exempt tables are written once, after every group: lint
 // and exempt tables describe the schema files and the primary's live schema,
-// and the summary counts what the whole rollout runs and on how many members,
-// so the output closes on one summary as a single plan's does.
+// the sizes say how big each table the rollout copies, rebuilds, or scans is
+// across every member that changes it, which no one group can, and the
+// summary counts what the whole rollout runs and on how many members, so the
+// output closes on one summary as a single plan's does. Sizes sit directly
+// above the summary, where the PR comment places them.
 func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	rollout := result.WholeRollout()
 	noun := templates.RolloutNoun(rollout)
 	templates.WriteRolloutAttention(noun, rollout.Attention)
-	fmt.Print(templates.FormatRolloutTableSizes(noun, rollout.TableSizes))
 	// plans, work, and rollout.Groups are index-parallel. A rollout with no
 	// groups has no plan of its own to render, so the response's own changes,
 	// which are the primary's, are never read as the rollout's.
@@ -320,6 +320,7 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	switch {
 	case len(rolloutWork) > 0:
 		total := combinePlanWork(rolloutWork)
+		fmt.Print(templates.FormatRolloutTableSizes(noun, rollout.TableSizes))
 		templates.WritePlanSummaryWithKeyspaceUpdates(total.changes, total.vschemaChanges, total.finalizes)
 	case settled:
 		templates.WriteNoChanges()

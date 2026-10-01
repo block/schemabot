@@ -1,7 +1,6 @@
 package templates
 
 import (
-	"cmp"
 	"fmt"
 	"html"
 	"log/slog"
@@ -1275,19 +1274,6 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 	return count
 }
 
-// tableSizesInlineLimit caps how many tables the size section lists in the
-// open. A plan that changes more tables would otherwise stand a wall of sizes
-// above the summary it introduces, so past the limit the whole section folds
-// into a collapsed block.
-const tableSizesInlineLimit = 5
-
-// tableSizesShown caps how many tables a collapsed size section lists: the
-// largest, since they bound how long the apply runs. The rest are counted in a
-// closing line, since collapsed lines still count toward GitHub's comment size
-// limit and a plan that indexes thousands of tables would otherwise spend on
-// sizes the room its DDL needs.
-const tableSizesShown = 64
-
 // tableSizeEntry is one line of the size section: the table's display name,
 // qualified with its keyspace when the plan spans several, and its sizes.
 type tableSizeEntry struct {
@@ -1305,17 +1291,14 @@ func (e tableSizeEntry) multiTarget() bool {
 	return e.perTarget != nil
 }
 
-// totalBytes sums the table's byte estimates across the targets that report
-// one, and counts those targets.
-func (e tableSizeEntry) totalBytes() (total int64, sized int) {
-	for _, ts := range e.perTarget {
-		if !hasSizeEstimate(ts.Size) {
-			continue
-		}
-		total += *ts.Size.EstimatedBytes
-		sized++
+// memberSizes is each target's estimate for the table, in rollout order, in
+// the shape the shared size formatter takes.
+func (e tableSizeEntry) memberSizes() []presentation.MemberTableSize {
+	sizes := make([]presentation.MemberTableSize, len(e.perTarget))
+	for i, ts := range e.perTarget {
+		sizes[i] = presentation.MemberTableSize{Member: ts.Target, EstimatedBytes: ts.Size.EstimatedBytes}
 	}
-	return total, sized
+	return sizes
 }
 
 // rankBytes is the figure the section ranks the table by: its estimate, or on
@@ -1325,7 +1308,7 @@ func (e tableSizeEntry) rankBytes() *int64 {
 	if !e.multiTarget() {
 		return e.size.EstimatedBytes
 	}
-	total, sized := e.totalBytes()
+	total, sized := presentation.SumTableSizeBytes(e.memberSizes())
 	if sized == 0 {
 		return nil
 	}
@@ -1338,7 +1321,7 @@ func (e tableSizeEntry) hasAnyEstimate() bool {
 	if !e.multiTarget() {
 		return hasSizeEstimate(e.size)
 	}
-	_, sized := e.totalBytes()
+	_, sized := presentation.SumTableSizeBytes(e.memberSizes())
 	return sized > 0
 }
 
@@ -1353,8 +1336,8 @@ func (e tableSizeEntry) hasAnyEstimate() bool {
 // their keyspace when the plan spans more than one keyspace with sizes, so a
 // shared table name stays unambiguous.
 //
-// Up to tableSizesInlineLimit tables are listed in plan order; past that the
-// section collapses and lists the largest tables first. A rollout whose
+// Up to presentation.TableSizesInlineLimit tables are listed in plan order;
+// past that the section collapses and lists the largest tables first. A rollout whose
 // targets were all planned shows each table across every target that changes
 // it. A rollout without per-target sizes shows the reviewed plan's sizes, and
 // the heading names the reviewed target so they are not read as the whole
@@ -1381,7 +1364,7 @@ func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
 	if !slices.ContainsFunc(entries, tableSizeEntry.hasAnyEstimate) {
 		return
 	}
-	if len(entries) <= tableSizesInlineLimit {
+	if len(entries) <= presentation.TableSizesInlineLimit {
 		sb.WriteString("📊 **Table sizes**")
 		if scope := reviewedTargetSizeScope(drift, inlineCode); scope != "" {
 			fmt.Fprintf(sb, " (%s)", scope)
@@ -1395,20 +1378,20 @@ func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
 }
 
 // writeCollapsedTableSizes renders the size section for a plan with more
-// tables than tableSizesInlineLimit as one collapsed block, its tables largest
-// first. Past tableSizesShown the smallest tables are counted in a closing
-// line rather than listed.
+// tables than presentation.TableSizesInlineLimit as one collapsed block, its
+// tables largest first. Past presentation.TableSizesShown the smallest tables
+// are counted in a closing line rather than listed, since collapsed lines
+// still count toward GitHub's comment size limit and a plan that indexes
+// thousands of tables would otherwise spend on sizes the room its DDL needs.
 func writeCollapsedTableSizes(sb *strings.Builder, entries []tableSizeEntry, scope string) {
-	sorted := slices.Clone(entries)
-	slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
+	listed, unlisted := presentation.ListTableSizes(entries, tableSizeEntry.rankBytes)
 	sb.WriteString("<details>\n<summary>📊 <b>Table sizes</b>")
 	if scope != "" {
 		fmt.Fprintf(sb, " (%s)", scope)
 	}
 	sb.WriteString("</summary>\n\n")
-	listed := min(len(sorted), tableSizesShown)
-	writeTableSizeLines(sb, sorted[:listed])
-	if unlisted := len(sorted) - listed; unlisted > 0 {
+	writeTableSizeLines(sb, listed)
+	if unlisted > 0 {
 		fmt.Fprintf(sb, "- …and %d more %s\n", unlisted, pluralize("table", unlisted))
 	}
 	sb.WriteString("\n</details>\n\n")
@@ -1500,17 +1483,6 @@ func targetTableSizeEntries(sizes []TargetTableSize) []tableSizeEntry {
 	return entries
 }
 
-// targetSizesLargestFirst orders a table's per-target sizes by bytes, largest
-// first, keeping rollout order among equal sizes. A target with no estimate
-// sorts last: its size is unknown, not small.
-func targetSizesLargestFirst(perTarget []TargetTableSize) []TargetTableSize {
-	sorted := slices.Clone(perTarget)
-	slices.SortStableFunc(sorted, func(a, b TargetTableSize) int {
-		return compareBytesLargestFirst(a.Size.EstimatedBytes, b.Size.EstimatedBytes)
-	})
-	return sorted
-}
-
 func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
 	for _, e := range entries {
 		fmt.Fprintf(sb, "- %s: %s\n", inlineCode(e.name), formatTableSizeEntry(e))
@@ -1518,49 +1490,12 @@ func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
 }
 
 // formatTableSizeEntry renders a section line's size clause. On a multi-target
-// plan a table one target changes names that target. A table several targets
-// change gives the total, then the largest size with its target named, since
-// copy time scales with size and the largest target bounds the rollout, then
-// the smallest size. A target with no estimate is named, or counted when
-// there are several, since the total then understates the table.
+// plan the clause is the shared rollout size clause, with each target in code.
 func formatTableSizeEntry(e tableSizeEntry) string {
 	if !e.multiTarget() {
 		return formatTableSize(e.size)
 	}
-	targets := len(e.perTarget)
-	total, sized := e.totalBytes()
-	switch {
-	case sized == 0 && targets == 1:
-		return fmt.Sprintf("size estimate unavailable on %s", inlineCode(e.perTarget[0].Target))
-	case sized == 0:
-		return fmt.Sprintf("size estimate unavailable on all %d targets", targets)
-	case targets == 1:
-		return fmt.Sprintf("%s on %s", ui.FormatApproxBytes(total), inlineCode(e.perTarget[0].Target))
-	}
-	ordered := targetSizesLargestFirst(e.perTarget)
-	largest, smallest := ordered[0], ordered[sized-1]
-	var parts []string
-	switch sized {
-	case 1:
-		parts = append(parts, fmt.Sprintf("%s on %s", ui.FormatApproxBytes(total), inlineCode(largest.Target)))
-	case targets:
-		parts = append(parts, fmt.Sprintf("%s across %d targets", ui.FormatApproxBytes(total), targets))
-	default:
-		parts = append(parts, fmt.Sprintf("%s across %d of %d targets", ui.FormatApproxBytes(total), sized, targets))
-	}
-	if sized > 1 {
-		parts = append(parts,
-			fmt.Sprintf("largest %s on %s", ui.FormatApproxBytes(*largest.Size.EstimatedBytes), inlineCode(largest.Target)),
-			fmt.Sprintf("smallest %s", ui.FormatApproxBytes(*smallest.Size.EstimatedBytes)))
-	}
-	switch unsized := ordered[sized:]; len(unsized) {
-	case 0:
-	case 1:
-		parts = append(parts, fmt.Sprintf("size estimate unavailable on %s", inlineCode(unsized[0].Target)))
-	default:
-		parts = append(parts, fmt.Sprintf("size estimate unavailable on %d targets", len(unsized)))
-	}
-	return strings.Join(parts, " · ")
+	return presentation.FormatMemberTableSize(presentation.TargetNoun, e.memberSizes(), inlineCode)
 }
 
 // hasSizeEstimate reports that the table's on-disk footprint is known. The
@@ -1568,28 +1503,6 @@ func formatTableSizeEntry(e tableSizeEntry) string {
 // on every engine that reports a size.
 func hasSizeEstimate(ts TableSizeData) bool {
 	return ts.EstimatedBytes != nil
-}
-
-// compareTableSizesLargestFirst orders two section lines for the collapsed
-// size section, by bytes. A table with no estimate sorts after every table
-// with one: its size is unknown, not small.
-func compareTableSizesLargestFirst(a, b tableSizeEntry) int {
-	return compareBytesLargestFirst(a.rankBytes(), b.rankBytes())
-}
-
-// compareBytesLargestFirst orders two byte estimates largest first, with an
-// unknown estimate after every known one.
-func compareBytesLargestFirst(ab, bb *int64) int {
-	switch {
-	case ab == nil && bb == nil:
-		return 0
-	case ab == nil:
-		return 1
-	case bb == nil:
-		return -1
-	default:
-		return cmp.Compare(*bb, *ab)
-	}
 }
 
 // formatTableSize renders one table's size clause: the estimated bytes and,
