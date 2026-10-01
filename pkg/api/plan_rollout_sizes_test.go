@@ -52,3 +52,27 @@ func TestPlanRolloutResponse_ListsEachMembersOwnTableSizes(t *testing.T) {
 		{Member: "prod/orders-002", Namespace: "ns_0", Table: "orders", EstimatedBytes: &small},
 	}, resp.TableSizes)
 }
+
+// A mirrored member whose plan diverged from the primary's is listed for
+// attention, not grouped, so its sizes stay out of the rollout's table sizes
+// even though it keeps a plan of its own: the sizes describe only the members
+// an apply would run as planned.
+func TestPlanRolloutResponse_LeavesDivergedMemberOutOfTableSizes(t *testing.T) {
+	rollup := PlanRollup{
+		Planning: PlanMirrored,
+		Entries: []DeploymentRollupEntry{
+			{DatabaseType: "mysql", Deployment: "prod", Target: "orders-001", Class: DeploymentMatch, PlanFingerprint: "fp", ChangeSet: ordersMemberPlan(310_000_000_000)},
+			{DatabaseType: "mysql", Deployment: "prod", Target: "orders-002", Class: DeploymentDiverged, ChangeSet: ordersMemberPlan(41_000_000_000)},
+		},
+	}
+
+	resp := planRolloutResponse(rollup)
+
+	require.Len(t, resp.Attention, 1)
+	assert.Equal(t, "prod/orders-002", resp.Attention[0].Member)
+	assert.Equal(t, apitypes.PlanMemberDiverged, resp.Attention[0].Reason)
+	primary := int64(310_000_000_000)
+	assert.Equal(t, []*apitypes.PlanMemberTableSizeResponse{
+		{Member: "prod/orders-001", Namespace: "ns_0", Table: "orders", EstimatedBytes: &primary},
+	}, resp.TableSizes)
+}

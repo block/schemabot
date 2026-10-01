@@ -84,7 +84,7 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 	if err != nil {
 		return nil, err
 	}
-	rollout := planRolloutResponse(rollup)
+	rollout := planRolloutResponse(rollup, "database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
 	if len(rollout.Attention) == 0 {
 		refused, err := s.rolloutApplyRefusals(ctx, req.Environment, primaryPlan.GetPlanId(), targets)
 		if err != nil {
@@ -168,8 +168,9 @@ func unplannedMemberApplyOutcome(planning MemberPlanning) string {
 // the primary's plan, so neither joins a group: each is listed for attention.
 //
 // Each grouped member's table sizes are read from its own plan, not from its
-// group's, since a group's changes are its first member's.
-func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
+// group's, since a group's changes are its first member's. logAttrs identify
+// the plan in logs.
+func planRolloutResponse(rollup PlanRollup, logAttrs ...any) *apitypes.PlanRolloutResponse {
 	members := make([]routing.ExecutionTarget, len(rollup.Entries))
 	for i, e := range rollup.Entries {
 		members[i] = routing.ExecutionTarget{Deployment: e.Deployment, Target: e.Target}
@@ -205,7 +206,7 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 			resp.Groups = append(resp.Groups, group)
 		}
 		group.Members = append(group.Members, names[i])
-		resp.TableSizes = append(resp.TableSizes, memberTableSizes(names[i], e)...)
+		resp.TableSizes = append(resp.TableSizes, memberTableSizes(names[i], e, logAttrs...)...)
 	}
 	// The primary is the first member, so its group is already first unless
 	// the primary itself needs attention. Ordering is stated as a property of
@@ -226,15 +227,25 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 // memberTableRef names a table within one member's plan namespace.
 type memberTableRef struct{ namespace, table string }
 
-// memberTableSizes lists one rollout member's size estimate for each existing
-// table its own plan copies, rebuilds, or scans. Sizes are read from the
-// member's own plan, since each member applies to its own data. A table is
-// listed once however many statements change it, since each statement carries
-// the whole table's estimate, and tables the member creates are left out,
-// having no data yet. The namespace view carries the estimate, which for a
-// sharded namespace is summed across its shards, while every shard's DDL
-// decides whether the table's cost grows with its size.
-func memberTableSizes(member string, e DeploymentRollupEntry) []*apitypes.PlanMemberTableSizeResponse {
+// SizedTableChange is an existing table a rollout member's plan copies,
+// rebuilds, or scans, with the namespace-view change that carries its size
+// estimate.
+type SizedTableChange struct {
+	Namespace string
+	Change    *ternv1.TableChange
+}
+
+// MemberSizedTables lists each existing table one rollout member's own plan
+// copies, rebuilds, or scans, in plan order. It is the one rule both the CLI's
+// rollout plan and the PR comment's size section show sizes by, so the two
+// list the same tables. Sizes are read from the member's own plan, since each
+// member applies to its own data. A table is listed once however many
+// statements change it, since each statement carries the whole table's
+// estimate, and tables the member creates are left out, having no data yet.
+// The namespace view carries the estimate, which for a sharded namespace is
+// summed across its shards, while every shard's DDL decides whether the
+// table's cost grows with its size. logAttrs identify the plan in logs.
+func MemberSizedTables(e DeploymentRollupEntry, logAttrs ...any) []SizedTableChange {
 	shardDDL := make(map[memberTableRef][]string)
 	for _, sp := range e.ChangeSet.Shards {
 		for _, tc := range sp.GetChanges() {
@@ -245,12 +256,12 @@ func memberTableSizes(member string, e DeploymentRollupEntry) []*apitypes.PlanMe
 			shardDDL[ref] = append(shardDDL[ref], tc.GetDdl())
 		}
 	}
-	var sizes []*apitypes.PlanMemberTableSizeResponse
+	var sized []SizedTableChange
 	listed := make(map[memberTableRef]bool)
 	for _, sc := range e.ChangeSet.Changes {
 		for _, tc := range sc.GetTableChanges() {
 			ref := memberTableRef{sc.GetNamespace(), tc.GetTableName()}
-			attrs := []any{"deployment", e.Deployment, "target", e.Target, "namespace", ref.namespace, "table", ref.table}
+			attrs := slices.Concat(logAttrs, []any{"deployment", e.Deployment, "target", e.Target, "namespace", ref.namespace, "table", ref.table})
 			if listed[ref] {
 				slog.Debug("table already has a size on this rollout member; skipping its further statements", attrs...)
 				continue
@@ -265,13 +276,23 @@ func memberTableSizes(member string, e DeploymentRollupEntry) []*apitypes.PlanMe
 				continue
 			}
 			listed[ref] = true
-			sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{
-				Member:         member,
-				Namespace:      ref.namespace,
-				Table:          ref.table,
-				EstimatedBytes: tc.EstimatedBytes,
-			})
+			sized = append(sized, SizedTableChange{Namespace: ref.namespace, Change: tc})
 		}
+	}
+	return sized
+}
+
+// memberTableSizes lists one rollout member's size estimate for each table
+// MemberSizedTables names for it. logAttrs identify the plan in logs.
+func memberTableSizes(member string, e DeploymentRollupEntry, logAttrs ...any) []*apitypes.PlanMemberTableSizeResponse {
+	var sizes []*apitypes.PlanMemberTableSizeResponse
+	for _, st := range MemberSizedTables(e, logAttrs...) {
+		sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{
+			Member:         member,
+			Namespace:      st.Namespace,
+			Table:          st.Change.GetTableName(),
+			EstimatedBytes: st.Change.EstimatedBytes,
+		})
 	}
 	return sizes
 }

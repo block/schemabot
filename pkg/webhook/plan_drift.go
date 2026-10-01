@@ -11,7 +11,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/tern"
@@ -240,69 +239,27 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 	return groups
 }
 
-// targetTableSizes lists every rollout target's size estimate for each
-// existing table its own plan copies, rebuilds, or scans, in rollout order,
-// primary first. Sizes are read from each target's own plan, since each target
-// applies to its own data. A table is listed once per target however many
-// statements change it, since each statement carries the whole table's
-// estimate, and tables a target creates are left out, having no data yet. The
-// namespace view is read for the estimate, which for a sharded namespace is
-// summed across its shards, while every shard's DDL decides whether the table
-// gets a size line. logAttrs identify the plan in logs.
+// targetTableSizes lists every rollout target's size estimate for each table
+// api.MemberSizedTables names for it, in rollout order, primary first, so the
+// PR comment sizes the same tables the CLI's rollout plan does. logAttrs
+// identify the plan in logs.
 func targetTableSizes(rollup api.PlanRollup, logAttrs ...any) []templates.TargetTableSize {
 	names := rollupMemberNames(rollup)
 	var sizes []templates.TargetTableSize
 	for i, e := range rollup.Entries {
-		listed := make(map[planTableRef]bool)
-		shardDDL := memberShardDDLByTable(e.ChangeSet.Shards)
-		for _, sc := range e.ChangeSet.Changes {
-			for _, tc := range sc.GetTableChanges() {
-				ref := planTableRef{sc.GetNamespace(), tc.GetTableName()}
-				tableAttrs := slices.Concat(logAttrs, []any{"target", names[i], "namespace", ref.namespace, "table", ref.table})
-				if listed[ref] {
-					slog.Debug("table already has a size line on this target; skipping its further statements", tableAttrs...)
-					continue
-				}
-				if tc.GetChangeType() == ternv1.ChangeType_CHANGE_TYPE_CREATE {
-					slog.Debug("table is created by this target's plan; it has no size to show", tableAttrs...)
-					continue
-				}
-				ddls := append([]string{tc.GetDdl()}, shardDDL[ref]...)
-				if !ddl.TableCostScalesWithSize(e.DatabaseType, ddls, tableAttrs...) {
-					slog.Debug("table's changes on this target are metadata-only; it gets no size line", tableAttrs...)
-					continue
-				}
-				listed[ref] = true
-				sizes = append(sizes, templates.TargetTableSize{
-					Target:   names[i],
-					Keyspace: ref.namespace,
-					Size: templates.TableSizeData{
-						Table:          ref.table,
-						ShardCount:     int(tc.GetShardCount()),
-						EstimatedBytes: tc.EstimatedBytes,
-					},
-				})
-			}
+		for _, st := range api.MemberSizedTables(e, logAttrs...) {
+			sizes = append(sizes, templates.TargetTableSize{
+				Target:   names[i],
+				Keyspace: st.Namespace,
+				Size: templates.TableSizeData{
+					Table:          st.Change.GetTableName(),
+					ShardCount:     int(st.Change.GetShardCount()),
+					EstimatedBytes: st.Change.EstimatedBytes,
+				},
+			})
 		}
 	}
 	return sizes
-}
-
-// memberShardDDLByTable collects every shard's DDL for each table of one
-// rollout member's plan, so a sharded namespace's size lines are decided from
-// what each shard runs.
-func memberShardDDLByTable(shards []*ternv1.ShardPlan) map[planTableRef][]string {
-	byTable := make(map[planTableRef][]string)
-	for _, sp := range shards {
-		for _, tc := range sp.GetChanges() {
-			if tc.GetDdl() == "" {
-				continue
-			}
-			ref := planTableRef{sp.GetNamespace(), tc.GetTableName()}
-			byTable[ref] = append(byTable[ref], tc.GetDdl())
-		}
-	}
-	return byTable
 }
 
 // trimModeTargets drops the target names from a group's disclosure when every
