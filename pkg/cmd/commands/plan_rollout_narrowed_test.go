@@ -49,6 +49,19 @@ func TestPlanResponse_NarrowedPlanIsNotTheRollout(t *testing.T) {
 	assert.Same(t, plan, plan.MemberPlans()[0])
 }
 
+// A narrowed plan is rendered as its one member's plan: no divergence heading
+// and no group naming the other targets, so it never reads as what applies
+// across the rollout.
+func TestWritePlanBody_NarrowedPlanIsNotPresentedAsTheRollout(t *testing.T) {
+	out := stripAnsi(captureStdout(func() { writePlanBody(narrowedPlanWithRollout(), false) }))
+
+	assert.Contains(t, out, "ADD COLUMN `region`", "%s", out)
+	assert.NotContains(t, out, "ADD COLUMN `tier`", "another member's plan is not shown:\n%s", out)
+	assert.NotContains(t, out, "Targets diverge", "%s", out)
+	assert.NotContains(t, out, "▸", "no rollout group heading:\n%s", out)
+	assert.NotContains(t, out, "prod/payments-003", "%s", out)
+}
+
 // applyRecordingServer answers /api/plan with plan and /api/status with an
 // environment with no active schema change, and records the body of the
 // /api/apply request, answering it with a server error so the command stops

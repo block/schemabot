@@ -170,15 +170,6 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return blockRolloutApplyRefused(planResult, rollout, cfg.Database, cmd.Environment, cfg.SchemaDir)
 	}
 
-	// The plan shown before the prompt is the primary's, which is what every
-	// member runs only when the rollout has one group. Asking for consent to
-	// other members' plans that were never shown would consent to work the
-	// operator did not see, so the apply is refused and each member is left
-	// to an apply narrowed to it, which shows that member's own plan.
-	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Groups) > 1 {
-		return fmt.Errorf("the %d %s of this rollout run %d different plans, and only the first one's plan can be shown before consent; apply each %s on its own with --target, then apply the rollout again", rollout.Members, templates.RolloutNoun(rollout).Plural, len(rollout.Groups), templates.RolloutNoun(rollout).Singular)
-	}
-
 	// Check for unsafe changes
 	if len(planResult.RolloutUnsafeChanges()) > 0 && !cmd.AllowUnsafe {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Output)

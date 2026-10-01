@@ -2,6 +2,8 @@ package templates
 
 import (
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/cliname"
@@ -13,6 +15,18 @@ import (
 // inline, as the PR comment does. A wider group leads with its coverage and
 // lists the names on their own lines below.
 const memberNamesInlineLimit = 8
+
+// memberNamesListLimit caps a wide group's folded name list, so a group of
+// hundreds of targets does not wall the terminal. The coverage phrase in the
+// heading carries the total.
+const memberNamesListLimit = 24
+
+// memberNamesLineWidth is the widest a group heading or a line of its folded
+// name list runs, indent included.
+const memberNamesLineWidth = 76
+
+// memberNamesIndent indents a wide group's folded name list under its heading.
+const memberNamesIndent = "  "
 
 // RolloutNoun is what a plan calls its rollout's members: targets when each
 // was planned against its own schema, deployments when they mirror the
@@ -40,6 +54,82 @@ func WriteRolloutAttention(noun presentation.Noun, attention []*apitypes.PlanMem
 		fmt.Printf("  • %s — %s\n", a.Member, a.Detail)
 	}
 	fmt.Println()
+}
+
+// WriteRolloutGroupHeading names the members that run the plan below it. Few
+// members whose names fit on the heading's line are named inline; any other
+// group leads with how much of the rollout it covers — "all 64 targets",
+// "40 of 64 targets" — and folds its names onto wrapped lines below, capped so
+// the heading stays one screen.
+//
+// One blank line separates the heading from what follows. A plan that opens
+// on a namespace header brings that line itself, so opensOnNamespaceHeader
+// leaves it to the header rather than stacking a second one above it.
+func WriteRolloutGroupHeading(noun presentation.Noun, members []string, total int, opensOnNamespaceHeader bool) {
+	if heading, ok := inlineGroupHeading(noun, members); ok {
+		fmt.Printf("%s%s%s\n", ANSIBold, heading, ANSIReset)
+	} else {
+		fmt.Printf("%s▸ %s%s\n", ANSIBold, presentation.CoveragePhrase(noun, len(members), total), ANSIReset)
+		shown := members[:min(len(members), memberNamesListLimit)]
+		for _, line := range wrapNames(shown, len(members)-len(shown), utf8.RuneCountInString(memberNamesIndent)) {
+			fmt.Printf("%s%s%s%s\n", memberNamesIndent, ANSIDim, line, ANSIReset)
+		}
+	}
+	if !opensOnNamespaceHeader {
+		fmt.Println()
+	}
+}
+
+// WriteRolloutGroupNoChanges says, under a group's heading, that its members
+// are already at the desired schema. Such a group renders beside groups with
+// work, so it carries no ✓: the rollout is not done, and the plan's one
+// summary closes the output after every group.
+func WriteRolloutGroupNoChanges() {
+	fmt.Println("  No schema changes detected")
+	fmt.Println()
+}
+
+// inlineGroupHeading is the heading naming members on its own line, and
+// whether there are few enough of them, short enough, to fit there.
+func inlineGroupHeading(noun presentation.Noun, members []string) (string, bool) {
+	if len(members) > memberNamesInlineLimit {
+		return "", false
+	}
+	label := noun.Plural
+	if len(members) == 1 {
+		label = noun.Singular
+	}
+	heading := "▸ " + label + " " + strings.Join(members, ", ")
+	return heading, utf8.RuneCountInString(heading) <= memberNamesLineWidth
+}
+
+// wrapNames joins names into lines that, printed after indent columns, run no
+// wider than memberNamesLineWidth, closing with how many more were left out.
+func wrapNames(names []string, more, indent int) []string {
+	width := memberNamesLineWidth - indent
+	items := append([]string(nil), names...)
+	if more > 0 {
+		items = append(items, fmt.Sprintf("and %d more", more))
+	}
+	var lines []string
+	var line strings.Builder
+	for i, item := range items {
+		if i < len(items)-1 {
+			item += ","
+		}
+		if line.Len() > 0 && line.Len()+1+len(item) > width {
+			lines = append(lines, line.String())
+			line.Reset()
+		}
+		if line.Len() > 0 {
+			line.WriteString(" ")
+		}
+		line.WriteString(item)
+	}
+	if line.Len() > 0 {
+		lines = append(lines, line.String())
+	}
+	return lines
 }
 
 // WriteRolloutApplyRefused writes why an apply of a whole rollout was refused

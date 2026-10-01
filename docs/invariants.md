@@ -1542,7 +1542,8 @@ direct-execution size bound ([direct-execution.md](direct-execution.md)); the po
 verdicts were judged under recorded on the plan row and read at admission in place of a second
 resolution (`storage.Plan.DirectExecution`, `pkg/api/plan_handlers.go`); in a rollout, each
 member's own direct changes disclosed under that member's plan (`deploymentPlanGroups` in
-`pkg/webhook/plan_drift.go`), with apply-confirm refusing a member whose execution modes differ
+`pkg/webhook/plan_drift.go`; in the CLI, under each group's plan by `directChangeNotices` in
+`pkg/cmd/commands/plan.go`), with apply-confirm refusing a member whose execution modes differ
 from the confirmed round's (`roundCoversWork` in `pkg/webhook/apply_member_work.go`), and apply
 creation refusing a member's own direct change for any caller other than that confirmed
 apply-confirm (`rejectUnconfirmedMemberDirectExecution` in `pkg/api/plan_handlers.go`).
