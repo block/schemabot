@@ -958,7 +958,7 @@ func TestGRPCMultiDeploy_BarrierReleaseBounded(t *testing.T) {
 // against its own live schema. The two targets hold different versions of the
 // same table, so the plan says what applies where: eu adds one column, us adds
 // two. The CLI applies the environment as one rollout, each target runs its
-// own plan, and progress reports the rollout per member with both completed.
+// own plan, and progress reports one completed section per deployment.
 func TestGRPCMultiDeploy_TargetsRolloutThroughCLI(t *testing.T) {
 	requireMultiDeploy(t)
 	bin := grpcCLIBuildOrFind(t)
@@ -1008,10 +1008,13 @@ func TestGRPCMultiDeploy_TargetsRolloutThroughCLI(t *testing.T) {
 		"--endpoint", endpoint,
 		"--watch=false",
 	)
-	e2eutil.AssertContains(t, out, "2 completed")
-	e2eutil.AssertContains(t, out, "eu")
-	e2eutil.AssertContains(t, out, "us")
-	e2eutil.AssertContains(t, out, tableName)
+	// Each deployment addresses one target, so each is its own section naming
+	// that target; a deployment of several targets rolls up instead, which
+	// TestProgressCmd_MultiTargetDeploymentsRenderAsRollups covers.
+	e2eutil.AssertContains(t, out, "Deployments:  2 completed")
+	e2eutil.AssertContains(t, out, "✅ eu — completed (testapp)")
+	e2eutil.AssertContains(t, out, "✅ us — completed (testapp)")
+	e2eutil.AssertContains(t, out, "~ "+tableName+":")
 
 	for _, deployment := range []string{"eu", "us"} {
 		for _, column := range []string{"name", "email"} {
