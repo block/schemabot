@@ -73,6 +73,15 @@ type targetWork struct {
 // the number of targets.
 func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 	var b strings.Builder
+	if !operationsPairWithDeployments(v) {
+		// Every target's tables, errors and identifiers are read by pairing
+		// Operations[i] with Model.Deployments[i]. Without that pairing a
+		// target would be shown with another target's apply ID, so the
+		// section says it cannot be shown instead.
+		fmt.Fprintf(&b, "%s %s — progress cannot be shown: the apply's operations (%d) and targets (%d) do not pair one to one\n\n",
+			glyph.Failed, g.Deployment, len(v.Operations), len(v.Model.Deployments))
+		return b.String()
+	}
 	fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, FormatStateCounts(g.Counts), len(g.Members))
 	if !v.SetupPhase {
 		writeTargetTables(&b, v, g)
@@ -151,6 +160,42 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	if silent > 0 {
 		fmt.Fprintf(b, "  %s%d of %d targets have not reported progress yet.%s\n", ANSIDim, silent, len(g.Members), ANSIReset)
 	}
+}
+
+// operationsPairWithDeployments reports whether the view's model projects its
+// operations one to one, as Derive returns it.
+func operationsPairWithDeployments(v RolloutView) bool {
+	return len(v.Operations) == len(v.Model.Deployments)
+}
+
+// acrossTargetsCounts is the target counts that close a rolled-up table's
+// line: how many of the targets running the change have completed it, and
+// how many failed. A table every target completed carries no count, since its
+// line already reads complete, and neither does a table one target runs,
+// whose line is that target's state. The counts sit on the table line itself, so a
+// bar that sums only the targets that have started, or a table still copying
+// on one target while the rest failed, is not read as the rollout's state.
+func acrossTargetsCounts(t TableProgress) string {
+	if !t.AcrossTargets || len(t.Shards) < 2 {
+		return ""
+	}
+	completed, failed := 0, 0
+	for _, target := range t.Shards {
+		switch {
+		case state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow):
+			completed++
+		case state.IsState(target.Status, state.Task.Failed):
+			failed++
+		}
+	}
+	var counts string
+	if completed < len(t.Shards) {
+		counts = fmt.Sprintf(" · %d of %d targets complete", completed, len(t.Shards))
+	}
+	if failed > 0 {
+		counts += fmt.Sprintf(" · %d failed", failed)
+	}
+	return counts
 }
 
 // rolloutMemberKey is the routing pair that names one rollout member.
@@ -266,7 +311,7 @@ func isHaltedAcrossTargets(t TableProgress) bool {
 // each target's line beneath says where that target finished or halted.
 func formatHaltedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s\n", t.TableName, haltedAcrossTargetsPhrase(t))
+	writeTableLine(&b, t, "%s", haltedAcrossTargetsPhrase(t))
 	if t.DDL != "" {
 		b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 	}

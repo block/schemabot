@@ -9473,7 +9473,7 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
 ❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72%
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72% · 40 of 60 targets complete · 1 failed
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 4,093,000 / 4,720,000 · ETA: 10m 0s
        • Targets: 60 (40 complete, 19 copying, 1 failed)
@@ -9518,7 +9518,7 @@ To stop this schema change:
 
 ▸ targets payments-001, payments-002
 
-     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover · 0 of 2 targets complete
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
        • Targets: 2 (2 waiting for cutover)
@@ -9557,7 +9557,7 @@ To cut over prod/payments-001:
 
 ⏹️ prod — 1 completed · 2 stopped (3 targets)
 
-     ~ orders: ⏹️ Stopped
+     ~ orders: ⏹️ Stopped · 1 of 3 targets complete
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
        • Targets: 3 (1 complete, 2 stopped)

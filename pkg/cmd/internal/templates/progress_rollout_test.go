@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -13,9 +12,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -430,27 +431,27 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 	}{
 		"two targets stopped part-way": {
 			targets:  []rolloutTarget{stoppedAt(400), stoppedAt(400)},
-			headline: "~ orders: ⏹️ Stopped\n",
+			headline: "~ orders: ⏹️ Stopped · 0 of 2 targets complete\n",
 			lines:    []string{"○ payments-001: stopped at 40.00% (400/1,000 rows)", "○ payments-002: stopped at 40.00% (400/1,000 rows)"},
 		},
 		"one target done and one stopped part-way": {
 			targets:  []rolloutTarget{completedTarget(), stoppedAt(400)},
-			headline: "~ orders: ⏹️ Stopped\n",
+			headline: "~ orders: ⏹️ Stopped · 1 of 2 targets complete\n",
 			lines:    []string{"✓ payments-001: 1,000 rows", "○ payments-002: stopped at 40.00% (400/1,000 rows)"},
 		},
 		"one target done and one failed part-way": {
 			targets:  []rolloutTarget{completedTarget(), failedAt(300)},
-			headline: "~ orders: ❌ Failed\n",
+			headline: "~ orders: ❌ Failed · 1 of 2 targets complete · 1 failed\n",
 			lines:    []string{"✓ payments-001: 1,000 rows", "✗ payments-002: failed"},
 		},
 		"one target done and one cancelled before copying": {
 			targets:  []rolloutTarget{completedTarget(), cancelledBeforeCopying},
-			headline: "~ orders: 🚫 Cancelled\n",
+			headline: "~ orders: 🚫 Cancelled · 1 of 2 targets complete\n",
 			lines:    []string{"✓ payments-001: 1,000 rows", "○ payments-002: cancelled"},
 		},
 		"every target cancelled before copying": {
 			targets:  []rolloutTarget{cancelledBeforeCopying, cancelledBeforeCopying},
-			headline: "~ orders: 🚫 Cancelled (not started)\n",
+			headline: "~ orders: 🚫 Cancelled (not started) · 0 of 2 targets complete\n",
 			lines:    []string{"○ payments-001: cancelled", "○ payments-002: cancelled"},
 		},
 	} {
@@ -537,12 +538,85 @@ func TestFormatTargetRollup_AllocationDoesNotScaleWithTargetsTimesTables(t *test
 	require.Len(t, groups, 1)
 	view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Operations: data.Operations, Model: model, Tables: data.Tables}
 
-	var before, after runtime.MemStats
-	runtime.ReadMemStats(&before)
-	FormatTargetRollup(view, groups[0])
-	runtime.ReadMemStats(&after)
+	// Measured as a benchmark's bytes per render, averaged over many renders,
+	// so an allocation elsewhere in the process during one render does not
+	// count against it.
+	result := testing.Benchmark(func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			FormatTargetRollup(view, groups[0])
+		}
+	})
 	tablesBytes := uint64(len(tables)) * uint64(unsafe.Sizeof(TableProgress{}))
-	allocated := after.TotalAlloc - before.TotalAlloc
+	allocated := uint64(result.AllocedBytesPerOp())
 	t.Logf("allocated %d bytes for %d bytes of tables", allocated, tablesBytes)
 	assert.Less(t, allocated, 20*tablesBytes, "a render allocates in proportion to the tables, not to targets times tables")
+}
+
+// A rolled-up table's line carries its target counts, so the bar, which sums
+// only the targets that have started, never reads as the rollout's progress:
+// one target half copied out of 64 reads as 0 of 64 complete beside its 50%,
+// a table still copying on one target while 63 failed says so on the line,
+// and a table every started target finished but one still queued reads as
+// queued with 63 of 64 complete. A table every target finished carries no
+// count.
+func TestFormatTargetRollup_TableLineCarriesTargetCounts(t *testing.T) {
+	queuedWithRow := rolloutTarget{opState: state.ApplyOperation.Pending, status: state.Task.Pending, rowsTotal: 1000}
+	failed := rolloutTarget{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: 300, rowsTotal: 1000, err: "Error 1062: Duplicate entry"}
+	repeat := func(target rolloutTarget, n int) []rolloutTarget {
+		targets := make([]rolloutTarget, n)
+		for i := range targets {
+			targets[i] = target
+		}
+		return targets
+	}
+	for name, tc := range map[string]struct {
+		targets []rolloutTarget
+		line    string
+	}{
+		"one of 64 started": {
+			targets: append([]rolloutTarget{copyingTarget(500)}, repeat(queuedWithRow, 63)...),
+			line:    "~ orders: " + ui.ProgressBarRowCopy(50) + " 50.00% · 0 of 64 targets complete\n",
+		},
+		"one copying beside 63 failed": {
+			targets: append([]rolloutTarget{copyingTarget(500)}, repeat(failed, 63)...),
+			line:    "~ orders: " + ui.ProgressBarRowCopy(50) + " 50.00% · 0 of 64 targets complete · 63 failed\n",
+		},
+		"63 complete and one queued": {
+			targets: append(repeat(completedTarget(), 63), queuedWithRow),
+			line:    "~ orders: ⏳ Queued · 63 of 64 targets complete\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := renderRollout(t, targetRolloutData(tc.targets))
+			assert.Contains(t, out, tc.line, "%s", out)
+		})
+	}
+
+	t.Run("every target complete", func(t *testing.T) {
+		data := targetRolloutData(repeat(completedTarget(), 3))
+		data.State = state.Apply.Completed
+		out := renderRollout(t, data)
+		assert.Contains(t, out, "~ orders: "+ui.ProgressBarComplete()+" ✓ Complete\n", "%s", out)
+		assert.NotContains(t, out, "targets complete", "%s", out)
+	})
+}
+
+// Every target's tables, errors and identifiers are read by pairing an
+// operation with the deployment derived from it. A view whose model does not
+// project its operations one to one cannot be paired, so the section says
+// its progress cannot be shown rather than naming one target beside another
+// target's apply ID.
+func TestFormatTargetRollup_UnpairedOperationsSayProgressCannotBeShown(t *testing.T) {
+	data := targetRolloutData([]rolloutTarget{
+		{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsTotal: 1000, err: "Error 1062: Duplicate entry", externalID: "ext-001"},
+		{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsTotal: 1000, err: "Error 1062: Duplicate entry", externalID: "ext-002"},
+	})
+	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+	groups := model.Groups()
+	require.Len(t, groups, 1)
+	view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Operations: data.Operations[:1], Model: model, Tables: data.Tables}
+
+	out := FormatTargetRollup(view, groups[0])
+	assert.Equal(t, glyph.Failed+" prod — progress cannot be shown: the apply's operations (1) and targets (2) do not pair one to one\n\n", out)
 }
