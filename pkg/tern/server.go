@@ -201,34 +201,25 @@ func pullSchemaErrorCode(err error) codes.Code {
 }
 
 func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
-	if err := s.refuseUnboundedStatedPolicy(ctx, "Plan", req.GetDirectExecution(), req.GetDatabase(), req.GetEnvironment()); err != nil {
-		return nil, err
-	}
 	resp, err := s.client.Plan(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, s.withUnknownFieldNote(ctx, "Plan", req, err.Error()))
 	}
 	return resp, nil
 }
 
 func (s *Server) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
-	if err := s.refuseUnboundedStatedPolicy(ctx, "PlanDiff", req.GetDirectExecution(), req.GetDatabase(), req.GetEnvironment()); err != nil {
-		return nil, err
-	}
 	resp, err := s.client.PlanDiff(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, s.withUnknownFieldNote(ctx, "PlanDiff", req, err.Error()))
 	}
 	return resp, nil
 }
 
 func (s *Server) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
-	if err := s.refuseUnboundedStatedPolicy(ctx, "Apply", req.GetDirectExecution(), req.GetDatabase(), req.GetEnvironment()); err != nil {
-		return nil, err
-	}
 	resp, err := s.client.Apply(ctx, req)
 	if err != nil {
-		return nil, status.Error(applyErrorCode(err), err.Error())
+		return nil, status.Error(applyErrorCode(err), s.withUnknownFieldNote(ctx, "Apply", req, err.Error()))
 	}
 	return resp, nil
 }

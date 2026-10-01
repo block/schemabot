@@ -141,13 +141,9 @@ var grpcStoppedAfterStartGracePeriod = 30 * time.Second
 type GRPCClient struct {
 	conn    *grpc.ClientConn
 	client  ternv1.TernClient
-	address string // dial address for logging/debugging
-	// deployment is the control plane's name for the data plane this client
-	// reaches, for refusals an operator reads. Empty when the caller did not
-	// name one.
-	deployment string
-	storage    storage.Storage // SchemaBot's storage for apply/task management
-	logger     *slog.Logger    // base logger; drives bind apply identity via applyLogger
+	address string          // dial address for logging/debugging
+	storage storage.Storage // SchemaBot's storage for apply/task management
+	logger  *slog.Logger    // base logger; drives bind apply identity via applyLogger
 
 	// Observer support — same pattern as LocalClient.
 	// For GRPCClient, the observer is notified by the local progress poller,
@@ -345,19 +341,21 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		grpc.WithAuthority(host),
 		grpc.WithDefaultServiceConfig(retryServiceConfig),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes)),
-		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(grpcMethodDeadline)),
+		grpc.WithChainUnaryInterceptor(
+			defaultRPCDeadlineInterceptor(grpcMethodDeadline),
+			capabilityGateInterceptor(config.Deployment, config.Address, loggerOrDefault(config.Logger)),
+		),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)
 	}
 
 	return &GRPCClient{
-		conn:       conn,
-		client:     ternv1.NewTernClient(conn),
-		address:    config.Address,
-		deployment: config.Deployment,
-		storage:    config.Storage,
-		logger:     config.Logger,
+		conn:    conn,
+		client:  ternv1.NewTernClient(conn),
+		address: config.Address,
+		storage: config.Storage,
+		logger:  config.Logger,
 	}, nil
 }
 
@@ -375,10 +373,15 @@ func (c *GRPCClient) applyLogger(apply *storage.Apply) *slog.Logger {
 // slog.Default() when none was configured. It is for sites that must log
 // before an apply row is loaded, where no identity can be bound yet.
 func (c *GRPCClient) baseLogger() *slog.Logger {
-	if c.logger == nil {
+	return loggerOrDefault(c.logger)
+}
+
+// loggerOrDefault returns logger, or slog.Default() when it is nil.
+func loggerOrDefault(logger *slog.Logger) *slog.Logger {
+	if logger == nil {
 		return slog.Default()
 	}
-	return c.logger
+	return logger
 }
 
 // IsRemote returns true — GRPCClient delegates to a separate Tern service
@@ -423,30 +426,11 @@ func (c *GRPCClient) Close() error {
 }
 
 func (c *GRPCClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
-	if err := c.refuseUnreadableDirectExecution(ctx, c.planRequestLogger("Plan", req), req.GetDirectExecution()); err != nil {
-		return nil, err
-	}
 	return c.client.Plan(ctx, req)
 }
 
 func (c *GRPCClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
-	if err := c.refuseUnreadableDirectExecution(ctx, c.planRequestLogger("PlanDiff", req), req.GetDirectExecution()); err != nil {
-		return nil, err
-	}
 	return c.client.PlanDiff(ctx, req)
-}
-
-// planRequestLogger binds the identifiers a refused plan request is triaged
-// by. No apply exists yet, so they come from the request.
-func (c *GRPCClient) planRequestLogger(rpc string, req *ternv1.PlanRequest) *slog.Logger {
-	return c.baseLogger().With(
-		"rpc", rpc,
-		"database", req.GetDatabase(),
-		"database_type", req.GetType(),
-		"environment", req.GetEnvironment(),
-		"target", req.GetTarget(),
-		"repository", req.GetRepository(),
-		"pull_request", req.GetPullRequest())
 }
 
 func (c *GRPCClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -473,17 +457,6 @@ func remotePullSchemaUnsupported(err error) bool {
 }
 
 func (c *GRPCClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
-	logger := c.baseLogger().With(
-		"rpc", "Apply",
-		"plan_id", req.GetPlanId(),
-		"database", req.GetDatabase(),
-		"database_type", req.GetType(),
-		"environment", req.GetEnvironment(),
-		"target", req.GetTarget(),
-		"caller", req.GetCaller())
-	if err := c.refuseUnreadableDirectExecution(ctx, logger, req.GetDirectExecution()); err != nil {
-		return nil, err
-	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
 		return nil, err
@@ -2719,9 +2692,6 @@ func (c *GRPCClient) dispatchRemoteVSchemaOnly(ctx context.Context, apply *stora
 			DirectExecution:         DirectExecutionPolicyProto(driveOptions.DirectExecution),
 		}
 		scope.stampMemberTarget(req)
-		if err := c.refuseUnreadableDispatchPolicy(ctx, apply, scope, nil, req.GetDirectExecution()); err != nil {
-			return err
-		}
 		resp, err := c.client.Apply(ctx, req)
 		if err != nil {
 			if isAmbiguousRemoteCallError(err) {
@@ -3559,9 +3529,6 @@ func (c *GRPCClient) dispatchPendingApply(ctx context.Context, apply *storage.Ap
 		DirectExecution: DirectExecutionPolicyProto(driveOptions.DirectExecution),
 	}
 	scope.stampMemberTarget(req)
-	if err := c.refuseUnreadableDispatchPolicy(ctx, apply, scope, tasks, req.GetDirectExecution()); err != nil {
-		return err
-	}
 	resp, err := c.client.Apply(ctx, req)
 	if err != nil {
 		if isAmbiguousRemoteCallError(err) {

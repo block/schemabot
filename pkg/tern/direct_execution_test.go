@@ -238,3 +238,16 @@ func TestDirectExecutionPolicyRoundTripsThroughTheWire(t *testing.T) {
 	assert.Nil(t, DirectExecutionPolicyProto(nil))
 	assert.Nil(t, DirectExecutionPolicyFromProto(nil))
 }
+
+// A disabled policy grants nothing, so it travels without bounds and does not
+// make the request depend on the data plane reading a bound.
+func TestDisabledDirectExecutionPolicyTravelsWithoutBounds(t *testing.T) {
+	wire := DirectExecutionPolicyProto(&storage.DirectExecutionPolicy{
+		Enabled:                       false,
+		MaxTableRows:                  10000,
+		MaxTableBytes:                 100 << 20,
+		LockAcquisitionTimeoutSeconds: 5,
+	})
+	assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, DirectExecutionPolicyFromProto(wire))
+	assert.Empty(t, requiredCapabilities(&ternv1.PlanRequest{DirectExecution: wire}))
+}

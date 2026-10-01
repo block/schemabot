@@ -74,9 +74,10 @@ func planAgainstDataPlane(t *testing.T, address string, policy *DirectExecutionC
 // in front of a data plane that predates the byte bound. That data plane
 // would drop max_table_bytes off the request, read an enabled policy with no
 // bound, and fail every plan with an error about a row bound nobody set. The
-// control plane reads the data plane's capabilities first and refuses the
-// plan itself, naming the deployment and the remedy, so the request never
-// reaches the data plane and the plan fails closed for a stated reason.
+// field is annotated as requiring a capability, so the control plane reads
+// the data plane's capabilities first and refuses the plan itself, naming the
+// deployment, the capability, and the remedy. The request never reaches the
+// data plane, and the plan fails closed for a stated reason.
 func TestPlanWithByteBoundIsRefusedBeforeReachingADataPlaneThatCannotReadIt(t *testing.T) {
 	dataPlane := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-direct"}}
 	address := serveDataPlane(t, predatesCapabilityReporting{tern.NewServer(dataPlane, nil)})
@@ -84,19 +85,21 @@ func TestPlanWithByteBoundIsRefusedBeforeReachingADataPlaneThatCannotReadIt(t *t
 	err := planAgainstDataPlane(t, address, &DirectExecutionConfig{Enabled: true, MaxTableBytes: "100MiB"})
 	require.Error(t, err)
 
-	var refusal *tern.UnsupportedDirectExecutionError
+	var refusal *tern.MissingCapabilityError
 	require.ErrorAs(t, err, &refusal)
 	assert.Equal(t, "west", refusal.Deployment)
 	assert.Empty(t, refusal.Version, "a data plane that predates capability reporting reports no version")
-	assert.Contains(t, err.Error(), `the data plane for deployment "west" (a SchemaBot release that predates capability reporting) does not advertise support for it`)
-	assert.Contains(t, err.Error(), "Upgrade the data plane before using max_table_bytes, or bound the policy with max_table_rows until then")
+	assert.Equal(t, []string{"direct_execution.max_table_bytes"}, refusal.Missing)
+	assert.Contains(t, err.Error(), `the data plane for deployment "west" (a SchemaBot release that predates capability reporting) `+
+		`does not advertise direct_execution.max_table_bytes, which this request depends on, so the request was not sent`)
+	assert.Contains(t, err.Error(), "Upgrade the data plane before using direct_execution.max_table_bytes")
 	assert.NotContains(t, err.Error(), address, "the refusal is rendered on pull requests and must not carry the data plane's address")
 	assert.Nil(t, dataPlane.planReq, "the plan request must not be sent to a data plane that would misread its policy")
 }
 
 // The same old data plane still serves a row-bound policy, which every
 // release since forwarding began reads correctly: the capability check costs
-// only the policies that depend on it.
+// only the requests that set a field the data plane would misread.
 func TestPlanWithRowBoundStillReachesADataPlaneThatPredatesCapabilities(t *testing.T) {
 	dataPlane := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-direct"}}
 	address := serveDataPlane(t, predatesCapabilityReporting{tern.NewServer(dataPlane, nil)})

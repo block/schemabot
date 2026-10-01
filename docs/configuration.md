@@ -782,17 +782,18 @@ the row bound. Choosing one keeps the configured limit the one that decides.
 
 A data plane running a build that predates `max_table_bytes` ignores the byte
 bound when it arrives on a request or an apply record, and would reject a
-byte-bound policy as one with no size bound. So before a control plane states
-a byte bound to a remote data plane, it reads the capabilities that data
-plane advertises on its health check, and refuses the plan or apply itself
-when the byte bound is not among them. The refusal names the deployment and,
-when the data plane reports one, its version, and says to upgrade the data
-plane or use `max_table_rows` until then. A data plane that advertises nothing
-is treated as unable to read the bound, including one on a build that reads
-`max_table_bytes` but predates capability reporting, because the two cannot be
-told apart. Switch a database to `max_table_bytes` once every data plane that
-executes statements for it runs a build that advertises it. A row-bound policy
-needs no capability and reaches every data plane as before.
+byte-bound policy as one with no size bound. The byte bound is therefore a
+request feature a remote data plane has to advertise, under the capability
+`direct_execution.max_table_bytes`, before a control plane sends a plan or
+apply that states it. When the data plane does not advertise it, the control
+plane refuses the plan or apply itself, naming the deployment, the capability,
+and, when the data plane reports one, its version, and saying to upgrade the
+data plane. A data plane that advertises nothing is treated as lacking every
+capability, including one on a build that reads `max_table_bytes` but predates
+capability reporting, because the two cannot be told apart. Switch a database
+to `max_table_bytes` once every data plane that executes statements for it
+runs a build that advertises it. A disabled policy states no bound and needs no
+capability.
 
 `lock_acquisition_timeout` bounds how long each attempt of a direct statement
 waits to acquire its locks. Each engine maps it to its native session lock

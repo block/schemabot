@@ -272,9 +272,10 @@ Tolerance stops at the wire, deliberately. The HTTP JSON API and the server conf
 fields they do not recognize, because there an unknown field is a caller's mistake or an
 operator's typo rather than a peer on a different release, and ignoring it would swallow intent.
 *Enforced:* the additive-only proto and storage-schema rules, checked before a tag
-([release.md](release.md)); the capability list a data plane advertises on its health check,
-which a control plane reads before stating a direct execution byte bound an older data plane
-would misread, refusing the request itself when the list lacks it (`pkg/tern/capabilities.go`);
+([release.md](release.md)); for a field an older receiver would misread rather than ignore, the
+`requires_remote_capability` annotation in `pkg/proto/tern.proto`, which the client interceptor
+in `pkg/tern/capabilities.go` checks against the capabilities the receiver advertises on its
+health check, refusing a request that sets the field before sending it;
 strict decoding on the HTTP API handlers
 (`pkg/api/control_handlers.go`, `pkg/api/plan_handlers.go`) and on config load
 (`pkg/api/config.go`).

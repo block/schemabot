@@ -3,8 +3,25 @@ syntax = "proto3";
 package tern.v1;
 
 import "google/api/annotations.proto";
+import "google/protobuf/descriptor.proto";
 
 option go_package = "github.com/block/schemabot/pkg/proto/ternv1";
+
+extend google.protobuf.FieldOptions {
+  // Names the capability the receiving server must advertise before a caller
+  // sets this field. A field carries it when a server that predates the
+  // field would misread a request that sets it, rather than merely ignore
+  // it: proto3 drops a field the receiver does not know without a trace, so
+  // the rest of the request can then say something the caller never meant.
+  //
+  // A caller sends a request that sets an annotated field only to a server
+  // whose HealthResponse.capabilities lists the name, and refuses the
+  // request itself otherwise. A server advertises every name its compiled
+  // schema declares, so the annotation lands in the same change as the
+  // server code that reads the field. Name a capability after the feature
+  // an operator configures, since refusals show it to them.
+  string requires_remote_capability = 50001;
+}
 
 // Tern provides schema change planning and execution.
 //
@@ -522,8 +539,9 @@ message DirectExecutionPolicy {
   // A size bound on the target table's data plus index footprint, in bytes;
   // zero states no byte bound. A refused statement runs directly when the
   // table is within the policy's bound. A negative value is an unusable
-  // bound, which the engine refuses.
-  int64 max_table_bytes = 4;
+  // bound, which the engine refuses. A data plane that predates the field
+  // reads a byte-bound policy as one with no bound at all.
+  int64 max_table_bytes = 4 [(requires_remote_capability) = "direct_execution.max_table_bytes"];
 }
 
 // TableChange represents a DDL change to a table.
@@ -1000,11 +1018,10 @@ message HealthResponse {
   // A caller decides what the data plane supports from capabilities, never
   // from this.
   string version = 2;
-  // Request features this data plane understands beyond the ones every
-  // release has, named by stable strings. A caller that is about to state
-  // one of them on a request reads this first: a data plane that predates a
-  // feature drops its field silently, so absence here means the feature is
-  // unsupported. A data plane that predates this field reports nothing.
+  // Every requires_remote_capability name this server's schema declares. A
+  // caller about to send a request that sets an annotated field reads this
+  // first. Absence means unsupported, and a server that predates this
+  // field reports nothing.
   repeated string capabilities = 3;
 }
 
