@@ -2973,7 +2973,7 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
 	}
-	if err := s.refuseRollbackOfIndependentRollout(apply); err != nil {
+	if err := s.refuseRollbackOfIndependentRollout(ctx, plan, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
 	if err := s.refuseRollbackAfterPrimaryMoved(apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
@@ -3067,13 +3067,36 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 // rollout runs no member from another member's plan (RV-9): apply creation
 // pairs each member with a plan stored for it, and a rollback stores none. The
 // rollback is refused here, before a plan is made, with the remedy that does
-// restore each member: an apply narrowed to it of the previous schema. A
-// configuration that cannot resolve the environment is left to apply
-// creation, which fails closed on the same pairing.
-func (s *Service) refuseRollbackOfIndependentRollout(apply *storage.Apply) error {
+// restore each member: an apply narrowed to it of the previous schema.
+//
+// The apply's own review round decides, not the configuration as it reads now.
+// A round that planned its members on their own stored a plan for each, bound
+// to the source plan, and the apply ran each member from its own plan however
+// the environment has been respelled since: as mirrored deployments, or with
+// fewer targets. A round that cannot be read refuses the rollback, since it is
+// the only record of how the apply ran. A round that stored no member plan ran
+// one plan on every member, and the configuration is still read for the one
+// case that rollback cannot reach either: an environment respelled since as
+// targets planned on their own, whose apply creation would find no plan for
+// any member but the primary.
+func (s *Service) refuseRollbackOfIndependentRollout(ctx context.Context, plan *storage.Plan, apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
+	memberPlans, err := s.MemberPlansForReviewRound(ctx, plan, apply.Environment)
+	if err != nil {
+		s.logger.Error("rollback refused: the source plan's review round could not be read to tell whether its targets were each planned against their own schema",
+			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "error", err)...)
+		return fmt.Errorf("rollback of apply %s: read the review round of its plan %s: %w", apply.ApplyIdentifier, plan.PlanIdentifier, err)
+	}
+	if len(memberPlans) > 0 {
+		targets := len(memberPlans) + 1
+		s.logger.Warn("rollback refused: the apply ran each of the rollout's targets from a plan of its own, and a rollback has one plan",
+			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "targets", targets)...)
+		return controlConflictf("apply %s ran across the %d targets of %s/%s, which were each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+			apply.ApplyIdentifier, targets, apply.Database, apply.Environment, applyPrimary.MemberID())
+	}
+
 	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
 	if err != nil {
-		s.logger.Debug("rollback member planning check skipped: config did not resolve the rollout members; apply creation pairs each member with its own plan",
+		s.logger.Debug("rollback member planning check skipped: the apply's round planned no target on its own, and config did not resolve the rollout members; apply creation pairs each member with its own plan",
 			append(apply.LogAttrs(), "error", err)...)
 		return nil
 	}
@@ -3082,17 +3105,17 @@ func (s *Service) refuseRollbackOfIndependentRollout(apply *storage.Apply) error
 	}
 	planning, err := s.config.MemberPlanningFor(apply.Database, apply.Environment)
 	if err != nil {
-		s.logger.Debug("rollback member planning check skipped: config did not resolve member planning; apply creation pairs each member with its own plan",
+		s.logger.Debug("rollback member planning check skipped: the apply's round planned no target on its own, and config did not resolve member planning; apply creation pairs each member with its own plan",
 			append(apply.LogAttrs(), "error", err)...)
 		return nil
 	}
 	if planning != PlanIndependent {
 		return nil
 	}
-	s.logger.Warn("rollback refused: the rollout's members are each planned against their own schema, and a rollback has one plan",
-		append(apply.LogAttrs(), "members", len(members))...)
-	return controlConflictf("apply %s ran across the %d targets of %s/%s, which are each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
-		apply.ApplyIdentifier, len(members), apply.Database, apply.Environment, members[0].MemberID())
+	s.logger.Warn("rollback refused: the rollout's targets are now each planned against their own schema, and a rollback has one plan",
+		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "members", len(members))...)
+	return controlConflictf("apply %s ran one plan across %s/%s, whose %d targets are now each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+		apply.ApplyIdentifier, apply.Database, apply.Environment, len(members), applyPrimary.MemberID())
 }
 
 // refuseRollbackAfterPrimaryMoved refuses a rollback of a rollout-wide apply

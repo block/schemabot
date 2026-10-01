@@ -527,7 +527,11 @@ than reverting that one target alone: restore the order the apply ran under,
 then retry it. A rollout of a `targets:` list plans each target against its own
 schema, and a rollback is one plan, so its rollback is refused before anything
 is planned: restore each target by planning and applying the previous schema
-with `--target`.
+with `--target`. The refusal follows how the apply ran, as recorded with its
+plan, not how the environment is configured now, so respelling the targets as
+mirrored deployments, or removing all but the first, does not let the rollback
+through. An apply that ran one plan on every target is refused only if its
+targets are now each planned against their own schema.
 
 ### Understand a refusal
 

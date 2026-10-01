@@ -608,36 +608,101 @@ func TestExecuteRollbackPlan_RefusedAfterTheRolloutPrimaryMoved(t *testing.T) {
 	}
 }
 
-// A rollout-wide apply ran across payments-001, 002 and 003, which are each
-// planned against their own schema. A rollback is one plan made against
-// payments-001, and no member of such a rollout runs another member's plan, so
-// the rollback is refused before anything is planned, naming the narrowed
-// applies that do restore each target. A single-target environment rolls back
-// as before.
+// rollbackRoundPlanStore is rollbackSourcePlanStore with the member plans the
+// source plan's review round stored, served to List by the round they are
+// bound to.
+type rollbackRoundPlanStore struct {
+	rollbackSourcePlanStore
+	round   []*storage.Plan
+	listErr error
+}
+
+func (s *rollbackRoundPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	var matched []*storage.Plan
+	for _, plan := range s.round {
+		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
+			matched = append(matched, plan)
+		}
+	}
+	return matched, nil
+}
+
+// A rollout-wide apply ran across payments-001, 002 and 003, each planned
+// against its own schema, so its review round stored a plan for 002 and 003. A
+// rollback is one plan made against payments-001, and no member of such a
+// rollout runs another member's plan, so the rollback is refused before
+// anything is planned, naming the narrowed applies that do restore each
+// target. The round decides, whatever the configuration says now: the refusal
+// holds after the environment is respelled as mirrored deployments, or cut to
+// payments-001 alone, either of which would otherwise run payments-001's
+// rollback DDL on a target it was never planned for, or revert payments-001
+// and leave the others on the applied schema. A round that cannot be read
+// refuses the rollback. An apply whose round planned no target on its own ran
+// one plan everywhere, and rolls back unless the environment has since been
+// respelled as targets planned on their own, which apply creation could not
+// pair with one plan either. A single-target environment rolls back as before.
 func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *testing.T) {
 	source, apply := rollbackSourceApply(DefaultDeployment)
+	roundMember := func(target string) *storage.Plan {
+		plan := memberPlan(target)
+		plan.PrimaryPlanIdentifier = source.PlanIdentifier
+		return plan
+	}
+	independentRound := []*storage.Plan{roundMember("payments-002"), roundMember("payments-003")}
+	targetsEnv := func(targets ...string) EnvironmentConfig {
+		return EnvironmentConfig{Deployment: DefaultDeployment, Targets: targetNames(targets...)}
+	}
+	const plannedOnTheirOwn = "apply apply-rollout ran across the 3 targets of payments/production, which were each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
+		"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target"
 	cases := []struct {
-		name    string
-		targets []string
-		wantErr string
+		name     string
+		env      EnvironmentConfig
+		round    []*storage.Plan
+		listErr  error
+		wantErr  string
+		wantCode int
 	}{
 		{
-			name:    "three targets",
-			targets: []string{"payments-001", "payments-002", "payments-003"},
-			wantErr: "apply apply-rollout ran across the 3 targets of payments/production, which are each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
-				"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+			name: "three targets planned on their own", env: targetsEnv("payments-001", "payments-002", "payments-003"),
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
 		},
-		{name: "one target", targets: []string{"payments-001"}},
+		{
+			name: "three targets planned on their own, since respelled as mirrored deployments",
+			env: EnvironmentConfig{
+				Deployments:     map[string]DeploymentTarget{DefaultDeployment: {Target: "payments-001"}, "us": {Target: "payments-002"}},
+				DeploymentOrder: []string{DefaultDeployment, "us"},
+			},
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
+		},
+		{
+			name: "three targets planned on their own, since cut to the primary", env: targetsEnv("payments-001"),
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
+		},
+		{
+			name: "one plan across the rollout, since respelled as targets planned on their own", env: targetsEnv("payments-001", "payments-002"),
+			wantErr: "apply apply-rollout ran one plan across payments/production, whose 2 targets are now each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
+				"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+			wantCode: http.StatusConflict,
+		},
+		{
+			name: "review round unreadable", env: targetsEnv("payments-001"), listErr: errors.New("connection refused"),
+			wantErr:  "rollback of apply apply-rollout: read the review round of its plan plan-payments-001: list member plans for payments/production round plan-payments-001: connection refused",
+			wantCode: http.StatusInternalServerError,
+		},
+		{name: "one target", env: targetsEnv("payments-001")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := narrowingServerConfig()
-			env := cfg.Databases["payments"].Environments["production"]
-			env.Targets = targetNames(tc.targets...)
-			cfg.Databases["payments"].Environments["production"] = env
+			cfg.Databases["payments"].Environments["production"] = tc.env
 			mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-rollback"}}
-			svc := New(&mockStorageWithPlanLookup{plans: &rollbackSourcePlanStore{source: source}}, cfg, map[string]tern.Client{
+			plans := &rollbackRoundPlanStore{rollbackSourcePlanStore: rollbackSourcePlanStore{source: source}, round: tc.round, listErr: tc.listErr}
+			svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
 				DefaultDeployment + "/production": mockClient,
+				"us/production":                   &mockTernClient{isRemote: true},
 			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 			_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
@@ -649,7 +714,7 @@ func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *
 			}
 			require.Error(t, err)
 			assert.Equal(t, tc.wantErr, err.Error())
-			assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
+			assert.Equal(t, tc.wantCode, controlOperationHTTPStatus(err))
 			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback no member could run")
 		})
 	}
