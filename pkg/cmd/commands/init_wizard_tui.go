@@ -503,7 +503,7 @@ func (m *initWizard) contentView() string {
 		if m.step == stepAPIToken {
 			b.WriteString(bold.Render(f.label) + "\n\n")
 			if m.connectionEditor.mode == "menu" {
-				b.WriteString(blue.Render("1. Create a token in PlanetScale") + "\n")
+				b.WriteString(blue.Render("1. "+ui.Link("Create a PlanetScale service token ↗", "https://planetscale.com/docs/api/service-tokens#service-tokens")) + "\n")
 				b.WriteString(wrap.Render("Settings → Service tokens → New service token.\nAdd access to this database with these permissions:") + "\n")
 				b.WriteString(muted.Render("  read_branch · create_branch · connect_branch · delete_branch\n  read_deploy_request · create_deploy_request\n  write_branch_vschema") + "\n\n")
 				b.WriteString(blue.Render("2. Connect the token") + "\n")
