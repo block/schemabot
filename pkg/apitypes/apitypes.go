@@ -804,6 +804,181 @@ type PlanResponse struct {
 	// on the response to the plan request only; a stored plan does not retain
 	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+	// Rollout describes the plan of every member of the rollout when the
+	// environment fans out to more than one: the members grouped by the plan
+	// each runs, and the members that need attention before an apply can run
+	// on them. Nil when the environment has a single member. The top-level
+	// Changes and Shards are the primary member's plan.
+	Rollout *PlanRolloutResponse `json:"rollout,omitempty"`
+}
+
+// PlanRolloutResponse is the plan of every member of a rollout.
+type PlanRolloutResponse struct {
+	// Members is how many members the rollout has.
+	Members int `json:"members"`
+	// Independent is true when each member was planned against its own live
+	// schema, so members are expected to differ. False means every member is
+	// expected to run the primary's plan.
+	Independent bool `json:"independent,omitempty"`
+	// Groups holds one entry per distinct plan, naming the members that run
+	// it, with the primary's group first.
+	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
+	// Attention lists the members an apply cannot run on as planned: a member
+	// that could not be planned, or one that diverged from the plan it is
+	// expected to mirror.
+	Attention []*PlanMemberAttentionResponse `json:"attention,omitempty"`
+	// Refused lists the members whose own plans apply creation refuses when
+	// this plan is applied rollout-wide through the API, which refuses the
+	// whole apply. Set only when no member needs attention.
+	Refused []*PlanMemberRefusalResponse `json:"refused,omitempty"`
+}
+
+// PlanMemberRefusalResponse is a rollout member whose own plan a rollout-wide
+// apply through the API refuses, and how to run it instead.
+type PlanMemberRefusalResponse struct {
+	// Member is the member's operator-facing name, as in Groups.
+	Member string `json:"member"`
+	// Target is the selector that names the member in a plan or apply
+	// request's target, and in the CLI's --target. It can differ from Member:
+	// a deployment with one target is named by its deployment, and selected by
+	// its target.
+	Target string `json:"target"`
+	// Reason is PlanMemberNeedsTarget or PlanMemberBlocked.
+	Reason string `json:"reason"`
+	// Detail is a short description of the refused change, naming only
+	// tables and namespaces.
+	Detail string `json:"detail"`
+	// AllowUnsafe is true when the member's own plan carries an unsafe
+	// change, so an apply narrowed to it needs the unsafe opt-in.
+	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
+}
+
+// Rollout member refusal reasons.
+const (
+	// PlanMemberNeedsTarget is a member whose own plan runs when the apply is
+	// narrowed to it, where its own plan is the one the operator reviews and
+	// consents to.
+	PlanMemberNeedsTarget = "needs_target"
+	// PlanMemberBlocked is a member whose own plan carries a change its
+	// engine refuses, which no apply runs.
+	PlanMemberBlocked = "blocked"
+)
+
+// PlanMemberGroupResponse is the rollout members that run one plan.
+type PlanMemberGroupResponse struct {
+	// Members are the members' operator-facing names, in rollout order.
+	Members []string `json:"members"`
+	// Primary is true for the group holding the rollout's primary member,
+	// whose plan is the response's own.
+	Primary bool                    `json:"primary,omitempty"`
+	Changes []*SchemaChangeResponse `json:"changes"`
+	Shards  []*ShardPlanResponse    `json:"shards,omitempty"`
+}
+
+// PlanMemberAttentionResponse is a rollout member an apply cannot run on as
+// planned, and why.
+type PlanMemberAttentionResponse struct {
+	Member string `json:"member"`
+	// Reason is PlanMemberDiverged or PlanMemberUnplanned.
+	Reason string `json:"reason"`
+	// Detail is a short, sanitized description of the reason.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Rollout member attention reasons.
+const (
+	PlanMemberDiverged  = "diverged"
+	PlanMemberUnplanned = "unplanned"
+)
+
+// UnmarshalJSON refuses a rollout block that lists a null group, attention
+// entry or refusal. Each list is read as the members an apply runs on, needs
+// attention for, or refuses, so a null entry is a malformed response rather
+// than an empty one, and decoding it fails instead of handing a reader an
+// entry it would have to guess the meaning of.
+func (r *PlanRolloutResponse) UnmarshalJSON(data []byte) error {
+	type plain PlanRolloutResponse
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("decode rollout block: %w", err)
+	}
+	if i := slices.Index(decoded.Groups, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: group %d is null", i)
+	}
+	if i := slices.Index(decoded.Attention, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: attention entry %d is null", i)
+	}
+	if i := slices.Index(decoded.Refused, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: refusal %d is null", i)
+	}
+	*r = PlanRolloutResponse(decoded)
+	return nil
+}
+
+// WholeRollout returns the plan of every rollout member the response
+// describes, or nil when it describes one member: an environment with a single
+// member, or a plan narrowed to one member. A narrowed plan says nothing about
+// the other members, so it is never read as the rollout's plan even if it
+// carries a rollout block.
+func (r *PlanResponse) WholeRollout() *PlanRolloutResponse {
+	if r == nil || r.NarrowedTo != "" {
+		return nil
+	}
+	return r.Rollout
+}
+
+// MemberPlans returns the plan of each group of rollout members, in the
+// order of Rollout.Groups, or the response itself when it covers one member.
+// Each group's plan carries the response's identity and engine with the
+// group's own changes; lint results and errors describe the schema files and
+// stay on the response.
+func (r *PlanResponse) MemberPlans() []*PlanResponse {
+	if r == nil {
+		return nil
+	}
+	rollout := r.WholeRollout()
+	if rollout == nil || len(rollout.Groups) == 0 {
+		return []*PlanResponse{r}
+	}
+	plans := make([]*PlanResponse, 0, len(rollout.Groups))
+	for _, g := range rollout.Groups {
+		plans = append(plans, &PlanResponse{
+			PlanID:       r.PlanID,
+			Database:     r.Database,
+			DatabaseType: r.DatabaseType,
+			Environment:  r.Environment,
+			Engine:       r.Engine,
+			Changes:      g.Changes,
+			Shards:       g.Shards,
+		})
+	}
+	return plans
+}
+
+// RolloutHasChanges reports whether an apply of the rollout would run work on
+// any member, not only the primary.
+func (r *PlanResponse) RolloutHasChanges() bool {
+	return slices.ContainsFunc(r.MemberPlans(), (*PlanResponse).HasChanges)
+}
+
+// RolloutUnsafeChanges returns the unsafe changes of every plan in the
+// rollout, each once however many groups of members run it. A change is the
+// same when it is the same namespace's table, statement and reason, so one
+// table dropped in two namespaces is two changes.
+func (r *PlanResponse) RolloutUnsafeChanges() []UnsafeChange {
+	var result []UnsafeChange
+	seen := make(map[string]bool)
+	for _, plan := range r.MemberPlans() {
+		plan.eachUnsafeChange(func(namespace string, c UnsafeChange) {
+			key := strings.Join([]string{namespace, c.Table, c.DDL, c.Reason}, "\x00")
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			result = append(result, c)
+		})
+	}
+	return result
 }
 
 // ExemptTablesResponse describes live tables in one namespace that no schema
@@ -983,6 +1158,19 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 		return nil
 	}
 	var result []UnsafeChange
+	r.eachUnsafeChange(func(_ string, c UnsafeChange) {
+		result = append(result, c)
+	})
+	return result
+}
+
+// eachUnsafeChange calls fn with each unsafe change in the plan and the
+// namespace it is in, in plan order: the namespace-level changes, then the
+// per-shard changes that do not repeat one of them.
+func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange)) {
+	if r == nil {
+		return
+	}
 	type statement struct{ namespace, table, ddl string }
 	seen := make(map[statement]struct{})
 	add := func(namespace string, t *TableChangeResponse) {
@@ -995,7 +1183,7 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 			return
 		}
 		seen[key] = struct{}{}
-		result = append(result, unsafeChange)
+		fn(namespace, unsafeChange)
 	}
 	for _, sc := range r.Changes {
 		if sc == nil {
@@ -1004,7 +1192,9 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 		for _, t := range sc.TableChanges {
 			add(sc.Namespace, t)
 		}
-		result = append(result, sc.VSchemaUnsafeChanges()...)
+		for _, c := range sc.VSchemaUnsafeChanges() {
+			fn(sc.Namespace, c)
+		}
 	}
 	for _, sp := range r.Shards {
 		if sp == nil {
@@ -1014,7 +1204,6 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 			add(sp.Namespace, t)
 		}
 	}
-	return result
 }
 
 // HasBlockedChanges reports whether any planned change carries the blocked
@@ -1241,10 +1430,12 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 }
 
 // HasChanges reports whether the plan carries any work an apply would execute:
-// table DDL in any namespace, a VSchema update, or a finalizer the engine asked
-// for. Gates that decide whether a plan is actionable must use this rather than
-// counting table changes alone — a VSchema-only or finalizer-only plan has zero
-// table changes but still requires an apply.
+// table DDL in any namespace or on any shard, a VSchema update, or a finalizer
+// the engine asked for. Gates that decide whether a plan is actionable must use
+// this rather than counting table changes alone — a VSchema-only or
+// finalizer-only plan has zero table changes but still requires an apply. A
+// shard row's DDL is work even when the namespace view carries none, since the
+// shard rows are the authoritative representation of a sharded namespace.
 func (r *PlanResponse) HasChanges() bool {
 	for _, sc := range r.Changes {
 		if sc == nil {
@@ -1254,7 +1445,9 @@ func (r *PlanResponse) HasChanges() bool {
 			return true
 		}
 	}
-	return false
+	return slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && len(sp.Changes) > 0
+	})
 }
 
 // SchemaChangeResponse groups changes for a single namespace.
