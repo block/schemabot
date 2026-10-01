@@ -8,6 +8,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Table-size rendering in the plan comment: an info section above the plan
@@ -191,7 +193,7 @@ func rankedTables(n int) ([]string, map[string]int64) {
 func sizeLines(bytes map[string]int64, tables []string) string {
 	var sb strings.Builder
 	for _, name := range tables {
-		fmt.Fprintf(&sb, "- `%s`: ~%d MB\n", name, bytes[name]/1_000_000)
+		fmt.Fprintf(&sb, "- `%s`: %s\n", name, ui.FormatApproxBytes(bytes[name]))
 	}
 	return sb.String()
 }
@@ -210,11 +212,11 @@ func TestRenderPlanComment_TableSizesAtInlineLimitStayInPlanOrder(t *testing.T) 
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "📊 **Table sizes**:\n"+
-		"- `t001`: ~1 MB\n"+
-		"- `t002`: ~2 MB\n"+
-		"- `t003`: ~3 MB\n"+
-		"- `t004`: ~4 MB\n"+
-		"- `t005`: ~5 MB\n"+
+		"- `t001`: ~1.0 MB\n"+
+		"- `t002`: ~2.0 MB\n"+
+		"- `t003`: ~3.0 MB\n"+
+		"- `t004`: ~4.0 MB\n"+
+		"- `t005`: ~5.0 MB\n"+
 		"\n", tableSizesSection(t, out))
 }
 
@@ -234,11 +236,11 @@ func TestRenderPlanComment_TableSizesOverInlineLimitCollapseLargestFirst(t *test
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
-		"- `audit_events`: ~90 MB\n"+
-		"- `ledger`: ~80 MB\n"+
-		"- `orders`: ~50 MB\n"+
-		"- `accounts`: ~6 MB\n"+
-		"- `carts`: ~3 MB\n"+
+		"- `audit_events`: ~90.0 MB\n"+
+		"- `ledger`: ~80.0 MB\n"+
+		"- `orders`: ~50.0 MB\n"+
+		"- `accounts`: ~6.0 MB\n"+
+		"- `carts`: ~3.0 MB\n"+
 		"- `events_raw`: size estimate unavailable\n"+
 		"\n</details>\n\n", tableSizesSection(t, out))
 }
@@ -484,7 +486,7 @@ func TestRenderPlanComment_TableSizeNamesStayInCodeSpans(t *testing.T) {
 		targetSize("primary/g`h", "us`ers", 1_000_000),
 	}))
 	assert.Contains(t, out, "- `` ord`ers ``: ~24.5 GB across 2 of 3 targets · largest ~23.4 GB on `` primary/a`b `` · smallest ~1.1 GB · size estimate unavailable on `` primary/e`f ``\n")
-	assert.Contains(t, out, "- `` us`ers ``: ~1 MB on `` primary/g`h ``\n")
+	assert.Contains(t, out, "- `` us`ers ``: ~1.0 MB on `` primary/g`h ``\n")
 }
 
 // A collapsed section on the reviewed-target fallback keeps the target scope

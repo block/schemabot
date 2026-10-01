@@ -823,7 +823,7 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTableSizeTotalsTheTargets(t *
 		sized(targetDetail("testapp_002", state.Task.Running, addNote, 250), 1_500_000_000),
 		sized(targetDetail("testapp_003", state.Task.Failed, addNote, 0), 2_000_000_000),
 	)
-	assert.Contains(t, out, "- Rows: 750 / 2,000 across 2 of 3 targets · ~5 GB across all 3 targets · ETA: "+ui.FormatETA(500)+"\n")
+	assert.Contains(t, out, "- Rows: 750 / 2,000 across 2 of 3 targets · ~5.0 GB across all 3 targets · ETA: "+ui.FormatETA(500)+"\n")
 }
 
 func TestTargetsTableBytes(t *testing.T) {
