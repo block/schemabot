@@ -156,10 +156,13 @@ var reviewTimeDeploymentDriftBlock = checkBlockReason{
 // its targets entries and the schema files disagree on where a namespace lives,
 // or its plan proposed dropping tables in a namespace the target's entry does
 // not select. The environment has no plan, so its check fails closed until a
-// plan whose placement agrees clears it. The plan comment names the fix.
+// plan whose placement agrees clears it. The plan comment names the fix. On the
+// environment's stored check row, any plan of the environment clears it; on an
+// aggregate, where it lands only when that row could not be stored, only a
+// re-run of the check or a new commit does (namespacePlacementUnstoredSummary).
 var namespacePlacementRefusedBlock = checkBlockReason{
 	blockingReason: checkstate.BlockNamespacePlacementRefused,
-	message:        "SchemaBot could not plan this environment because its targets entries and the schema files disagree on where a namespace lives, or its plan proposed dropping tables in a namespace the target's entry does not select; make the fix the plan comment names, then re-run plan before this check can pass.",
+	message:        "SchemaBot could not plan this environment because its targets entries and the schema files disagree on where a namespace lives, or its plan proposed dropping tables in a namespace the target's entry does not select; make the fix the plan comment names, then re-run plan, or re-run this check if the refusal could not be recorded, before this check can pass.",
 }
 
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but

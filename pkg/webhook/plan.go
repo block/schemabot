@@ -220,15 +220,17 @@ func planRefusedByNamespacePlacement(err error) bool {
 // namespace placement refused its plan. The refusal is stored as the
 // environment's check row, so a later fold from stored check state, from any
 // plan of any environment, reads it rather than an older passing row (MG-12).
-// A row that cannot be stored is posted as a failing aggregate from memory
-// instead, which keeps the gate closed until the next fold.
+// A row that cannot be stored is posted as a failing aggregate carrying the
+// placement block instead, so no later fold reads an older passing row in the
+// refusal's place; that block lifts when the check is re-run or a new commit
+// re-plans every environment (namespacePlacementUnstoredSummary).
 func (h *Handler) failClosedOnNamespacePlacement(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schemaResult *ghclient.SchemaRequestResult, environment string) {
 	headSHA, err := h.storeNamespacePlacementCheck(ctx, client, repo, pr, schemaResult, environment)
 	if err != nil {
-		h.logger.Error("failed to store namespace placement check record; posting a failing aggregate for the environment instead",
+		h.logger.Error("failed to store namespace placement check record; posting a failing aggregate carrying the placement block instead, which holds the gate closed until the check is re-run or a commit is pushed",
 			"repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
 		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, schemaResult.HeadSHA,
-			map[string]string{environment: namespacePlacementCheckSummary}, namespacePlacementRefusedBlock)
+			map[string]string{environment: namespacePlacementUnstoredSummary}, namespacePlacementRefusedBlock)
 		return
 	}
 	h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
@@ -505,9 +507,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			multiEnvData.Errors[env] = userFacingError(err)
 			sha, checkErr := h.storeNamespacePlacementCheck(ctx, client, repo, pr, schemaResult, env)
 			if checkErr != nil {
-				h.logger.Error("failed to store namespace placement check record; posting a failing aggregate for the environment instead",
+				h.logger.Error("failed to store namespace placement check record; posting a failing aggregate carrying the placement block instead, which holds the gate closed until the check is re-run or a commit is pushed",
 					"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", checkErr)
-				placementBlockUnstored[env] = namespacePlacementCheckSummary
+				placementBlockUnstored[env] = namespacePlacementUnstoredSummary
 			}
 			if sha != "" {
 				headSHA = sha

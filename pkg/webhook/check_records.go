@@ -155,6 +155,17 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 // refusal in full.
 const namespacePlacementCheckSummary = "namespace placement refused the plan; see the plan comment"
 
+// namespacePlacementUnstoredSummary is the failing aggregate's summary when an
+// environment's namespace placement refusal could not be stored. The aggregate
+// then carries the placement block itself, and a stored aggregate block is
+// released only by the auto-plan guards re-verifying the whole PR, never by a
+// plan command: the block does not record which database and environment set
+// it, so a plan of one of them cannot prove the refusal no longer stands
+// anywhere. A re-run of the check or a new commit re-plans every environment,
+// which clears the block once the placement agrees and stores the refusal
+// again where it does not.
+const namespacePlacementUnstoredSummary = "namespace placement refused the plan and SchemaBot could not record it; see the plan comment, then re-run this check or push a commit to re-plan every environment"
+
 // storeNamespacePlacementCheck stores a failing check for an environment whose
 // plan was refused because its targets entries and the schema files disagree on
 // namespace placement (api.NamespacePlacementRefused). That environment has no
