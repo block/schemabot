@@ -191,7 +191,7 @@ var previewManyTableSizes = []struct {
 
 // PreviewCommentPlanManyTables renders a plan that adds a tenant index to every
 // table in the schema, so the size section carries more tables than it lists
-// inline: the count and the largest tables stay visible and the rest fold.
+// inline and collapses, listing the tables largest first.
 func PreviewCommentPlanManyTables() string {
 	statements := make([]string, 0, len(previewManyTableSizes))
 	sizes := make([]TableSizeData, 0, len(previewManyTableSizes))
@@ -819,8 +819,7 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 // PreviewCommentPlanRolloutTwoTargetTableSizes renders a plan comment for a
 // rollout of two independent targets that run the same index builds. Each
 // size line gives the total and names the target with the largest size, since
-// the reviewed target is not always the one the build takes longest on, and a
-// collapsed breakdown lists both targets' sizes.
+// the reviewed target is not always the one the build takes longest on.
 func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 	members := previewRolloutMembers()[:2]
 	return previewRolloutTableSizes(members, []TargetTableSize{
@@ -835,7 +834,7 @@ func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 // three independent targets that run the same index builds. Each size line
 // gives the total, the largest size with its target named, and the smallest,
 // and names a target that reported no estimate, since the total then
-// understates the table. A collapsed breakdown lists every target's size.
+// understates the table.
 func PreviewCommentPlanRolloutTableSizes() string {
 	return previewRolloutTableSizes(previewRolloutMembers(), []TargetTableSize{
 		previewTargetSize("primary/testapp_1", "orders", 610_000_000),

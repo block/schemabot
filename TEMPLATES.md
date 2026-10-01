@@ -239,16 +239,14 @@ ALTER TABLE `users` ADD INDEX `idx_tenant_id`(`tenant_id`);
 ALTER TABLE `webhooks` ADD INDEX `idx_tenant_id`(`tenant_id`);
 ```
 
-📊 **Table sizes** (34 tables, largest first; 2 without a size estimate):
+<details>
+<summary>📊 <b>Table sizes</b></summary>
+
 - `audit_events`: ~186 GB
 - `ledger_entries`: ~121 GB
 - `line_items`: ~58 GB
 - `notifications`: ~44 GB
 - `orders`: ~26.5 GB
-
-<details>
-<summary>29 more tables</summary>
-
 - `payments`: ~23.1 GB
 - `invoices`: ~17.4 GB
 - `fulfillments`: ~11.8 GB
@@ -1668,16 +1666,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 📊 **Table sizes**:
 - `products`: ~10.2 GB across 3 targets · largest ~8.7 GB on `us` · smallest ~412 MB
 
-<details>
-<summary>Size on each target</summary>
-
-- `products`
-  - `us`: ~8.7 GB
-  - `eu`: ~1.1 GB
-  - `au`: ~412 MB
-
-</details>
-
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -1737,16 +1725,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 📊 **Table sizes**:
 - `products`: ~10.2 GB across 3 targets · largest ~8.7 GB on `us` · smallest ~412 MB
-
-<details>
-<summary>Size on each target</summary>
-
-- `products`
-  - `us`: ~8.7 GB
-  - `eu`: ~1.1 GB
-  - `au`: ~412 MB
-
-</details>
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2051,18 +2029,6 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 - `orders`: ~24 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
 - `users`: ~193 MB across 2 targets · largest ~98 MB on `primary/testapp_2` · smallest ~95 MB
 
-<details>
-<summary>Size on each target</summary>
-
-- `orders`
-  - `primary/testapp_2`: ~23.4 GB
-  - `primary/testapp_1`: ~610 MB
-- `users`
-  - `primary/testapp_2`: ~98 MB
-  - `primary/testapp_1`: ~95 MB
-
-</details>
-
 📋 **Plan**: **2** tables to alter
 
 
@@ -2098,20 +2064,6 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 📊 **Table sizes**:
 - `orders`: ~24 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
 - `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95 MB
-
-<details>
-<summary>Size on each target</summary>
-
-- `orders`
-  - `primary/testapp_2`: ~23.4 GB
-  - `primary/testapp_1`: ~610 MB
-  - `primary/testapp_3`: size estimate unavailable
-- `users`
-  - `primary/testapp_3`: ~104 MB
-  - `primary/testapp_2`: ~98 MB
-  - `primary/testapp_1`: ~95 MB
-
-</details>
 
 📋 **Plan**: **2** tables to alter
 
