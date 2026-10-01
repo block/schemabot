@@ -19,7 +19,6 @@ func (m WatchModel) multiDeploymentProgressView() string {
 		ApplyID:      m.applyID,
 		Environment:  m.environment,
 		Engine:       m.engine,
-		Operations:   m.operations,
 		Model:        model,
 		Tables:       m.tables,
 		SetupPhase:   state.IsSetupPhase(m.state),

@@ -19,7 +19,6 @@ func writeMultiDeploymentProgress(data ProgressData) {
 		ApplyID:      data.ApplyID,
 		Environment:  data.Environment,
 		Engine:       data.Engine,
-		Operations:   data.Operations,
 		Model:        model,
 		Tables:       data.Tables,
 		SetupPhase:   state.IsSetupPhase(data.State),
@@ -59,19 +58,21 @@ func ProgressOperationsForPresentation(ops []ProgressOperation, released bool) [
 	presentationOps := make([]presentation.Operation, 0, len(ops))
 	for _, op := range ops {
 		presentationOps = append(presentationOps, presentation.Operation{
-			Deployment:        op.Deployment,
-			Target:            op.Target,
-			State:             op.State,
-			OperationKey:      op.OperationKey,
-			Work:              op.OperationKind == storage.ApplyOperationKindWork,
-			Finalizer:         op.OperationKind == storage.ApplyOperationKindGroupFinalizer,
-			NeverStarted:      op.StartedAt == "",
-			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
-			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
-			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
-			PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
-			Released:          released,
-			Error:             op.ErrorMessage,
+			Deployment:          op.Deployment,
+			Target:              op.Target,
+			State:               op.State,
+			OperationKey:        op.OperationKey,
+			Work:                op.OperationKind == storage.ApplyOperationKindWork,
+			Finalizer:           op.OperationKind == storage.ApplyOperationKindGroupFinalizer,
+			NeverStarted:        op.StartedAt == "",
+			Barrier:             op.CutoverPolicy == storage.CutoverPolicyBarrier,
+			Parallel:            op.CutoverPolicy == storage.CutoverPolicyParallel,
+			ContinueOnFailure:   op.OnFailure == storage.OnFailureContinue,
+			PauseOnFailure:      op.OnFailure == storage.OnFailurePause,
+			Released:            released,
+			Error:               op.ErrorMessage,
+			ExternalID:          op.ExternalID,
+			ExternalOperationID: op.ExternalOperationID,
 		})
 	}
 	return presentationOps

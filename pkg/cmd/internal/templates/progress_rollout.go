@@ -24,11 +24,11 @@ type RolloutView struct {
 	ApplyID     string
 	Environment string
 	Engine      string
-	// Operations are the apply's operations in resolved order. Model is
-	// derived from them, and Model.Deployments[i] projects Operations[i].
-	Operations []ProgressOperation
-	Model      presentation.Apply
-	Tables     []TableProgress
+	// Model is the apply's members as presentation.Derive projects them.
+	// Each member carries its own state, error and data-plane identifiers,
+	// so the rollup reads every target from one row.
+	Model  presentation.Apply
+	Tables []TableProgress
 	// SetupPhase hides table progress while the apply is still in an engine
 	// setup phase, where every table reads as queued.
 	SetupPhase bool
@@ -73,15 +73,6 @@ type targetWork struct {
 // the number of targets.
 func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 	var b strings.Builder
-	if !operationsPairWithDeployments(v) {
-		// Every target's tables, errors and identifiers are read by pairing
-		// Operations[i] with Model.Deployments[i]. Without that pairing a
-		// target would be shown with another target's apply ID, so the
-		// section says it cannot be shown instead.
-		fmt.Fprintf(&b, "%s %s — progress cannot be shown: the apply's operations (%d) and targets (%d) do not pair one to one\n\n",
-			glyph.Failed, g.Deployment, len(v.Operations), len(v.Model.Deployments))
-		return b.String()
-	}
 	fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, FormatStateCounts(g.Counts), len(g.Members))
 	if !v.SetupPhase {
 		writeTargetTables(&b, v, g)
@@ -110,9 +101,9 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 		tables := byMember[rolloutMemberKey{d.Deployment, d.Target}]
 		if len(tables) == 0 {
 			switch {
-			case targetAlreadyConverged(v.Operations[i]):
+			case targetAlreadyConverged(d):
 				converged++
-			case !state.IsApplyOperationTerminal(v.Operations[i].State):
+			case !state.IsApplyOperationTerminal(d.State):
 				silent++
 			}
 			continue
@@ -160,12 +151,6 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	if silent > 0 {
 		fmt.Fprintf(b, "  %s%d of %d targets have not reported progress yet.%s\n", ANSIDim, silent, len(g.Members), ANSIReset)
 	}
-}
-
-// operationsPairWithDeployments reports whether the view's model projects its
-// operations one to one, as Derive returns it.
-func operationsPairWithDeployments(v RolloutView) bool {
-	return len(v.Operations) == len(v.Model.Deployments)
 }
 
 // acrossTargetsCounts is the target counts that close a rolled-up table's
@@ -224,8 +209,8 @@ func tablesByMember(tables []TableProgress) map[rolloutMemberKey][]TableProgress
 // when the apply was created: its operation was recorded completed without a
 // driver ever starting it, which is how an apply settles a target with
 // nothing left to run.
-func targetAlreadyConverged(op ProgressOperation) bool {
-	return state.IsState(op.State, state.ApplyOperation.Completed) && op.StartedAt == ""
+func targetAlreadyConverged(d presentation.Deployment) bool {
+	return state.IsState(d.State, state.ApplyOperation.Completed) && d.NeverStarted
 }
 
 // tableChangeSignature keys the change a target runs by its tables and their
@@ -430,10 +415,10 @@ func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Grou
 			line += ": " + d.Error
 		}
 		fmt.Fprintf(b, "%s%s%s\n", ANSIRed, line, ANSIReset)
-		if externalOperationID := v.Operations[i].ExternalOperationID; externalOperationID != "" {
+		if externalOperationID := d.ExternalOperationID; externalOperationID != "" {
 			fmt.Fprintf(b, "      %sExternal operation ID: %s%s\n", ANSIDim, externalOperationID, ANSIReset)
 		}
-		if externalID := v.Operations[i].ExternalID; externalID != "" {
+		if externalID := d.ExternalID; externalID != "" {
 			fmt.Fprintf(b, "      %sExternal apply ID: %s%s\n", ANSIDim, externalID, ANSIReset)
 		}
 	}

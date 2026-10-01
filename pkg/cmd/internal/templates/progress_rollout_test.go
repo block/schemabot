@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -536,7 +535,7 @@ func TestFormatTargetRollup_AllocationDoesNotScaleWithTargetsTimesTables(t *test
 	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
 	groups := model.Groups()
 	require.Len(t, groups, 1)
-	view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Operations: data.Operations, Model: model, Tables: data.Tables}
+	view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Model: model, Tables: data.Tables}
 
 	// Measured as a benchmark's bytes per render, averaged over many renders,
 	// so an allocation elsewhere in the process during one render does not
@@ -602,21 +601,24 @@ func TestFormatTargetRollup_TableLineCarriesTargetCounts(t *testing.T) {
 	})
 }
 
-// Every target's tables, errors and identifiers are read by pairing an
-// operation with the deployment derived from it. A view whose model does not
-// project its operations one to one cannot be paired, so the section says
-// its progress cannot be shown rather than naming one target beside another
-// target's apply ID.
-func TestFormatTargetRollup_UnpairedOperationsSayProgressCannotBeShown(t *testing.T) {
-	data := targetRolloutData([]rolloutTarget{
-		{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsTotal: 1000, err: "Error 1062: Duplicate entry", externalID: "ext-001"},
-		{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsTotal: 1000, err: "Error 1062: Duplicate entry", externalID: "ext-002"},
-	})
-	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
-	groups := model.Groups()
-	require.Len(t, groups, 1)
-	view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Operations: data.Operations[:1], Model: model, Tables: data.Tables}
+// A failed target is named with its own data-plane identifiers, read from the
+// same member as its state and error. A target that already held the change
+// sits ahead of it here, so a lookup that paired the failure with another
+// row by position would name the converged target's apply instead.
+func TestFormatTargetRollup_FailedTargetNamesItsOwnIdentifiers(t *testing.T) {
+	converged := completedTarget()
+	converged.externalID, converged.externalOperationID = "spirit-001", "spirit-op-001"
+	failed := rolloutTarget{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: 300, rowsTotal: 1000,
+		err: "Error 1062: Duplicate entry", externalID: "spirit-002", externalOperationID: "spirit-op-002", startedAt: "2026-09-30T12:00:00Z"}
+	running := copyingTarget(500)
+	running.externalID, running.externalOperationID, running.startedAt = "spirit-003", "spirit-op-003", "2026-09-30T12:00:00Z"
 
-	out := FormatTargetRollup(view, groups[0])
-	assert.Equal(t, glyph.Failed+" prod — progress cannot be shown: the apply's operations (1) and targets (2) do not pair one to one\n\n", out)
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{converged, failed, running}))
+	_, attention, found := strings.Cut(out, "Targets needing attention:")
+	require.True(t, found, "%s", out)
+	assert.Contains(t, attention, "❌ payments-002 — failed: Error 1062: Duplicate entry\n"+
+		"      External operation ID: spirit-op-002\n"+
+		"      External apply ID: spirit-002\n", "%s", out)
+	assert.NotContains(t, attention, "spirit-001", "%s", out)
+	assert.NotContains(t, attention, "spirit-003", "%s", out)
 }
