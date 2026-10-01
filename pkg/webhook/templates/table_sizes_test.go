@@ -293,6 +293,21 @@ func TestRenderPlanComment_TableSizesOnePastListedCap(t *testing.T) {
 		"\n</details>\n\n", tableSizesSection(t, out))
 }
 
+// A table with no estimate ranks last, so past the listed cap it is among the
+// tables the closing line counts. The line says how many of them have no
+// estimate, so a table whose size probe failed is never read as one of the
+// smallest.
+func TestRenderPlanComment_TableSizesPastListedCapCountTablesWithoutEstimate(t *testing.T) {
+	order, bytes := rankedTables(presentation.TableSizesShown + 1)
+	order = append([]string{"ledger"}, order...)
+	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
+
+	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
+		sizeLines(bytes, largestFirst(order[1:])[:presentation.TableSizesShown])+
+		"- …and 2 more tables (1 without a size estimate)\n"+
+		"\n</details>\n\n", tableSizesSection(t, out))
+}
+
 // The collapsed section ranks tables by bytes, largest first, and tables with
 // no estimate last, so the order is the same whatever order the plan listed
 // them in. A multi-target line ranks by its total across targets.

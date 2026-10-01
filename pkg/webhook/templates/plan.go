@@ -1380,11 +1380,12 @@ func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
 // writeCollapsedTableSizes renders the size section for a plan with more
 // tables than presentation.TableSizesInlineLimit as one collapsed block, its
 // tables largest first. Past presentation.TableSizesShown the smallest tables
-// are counted in a closing line rather than listed, since collapsed lines
-// still count toward GitHub's comment size limit and a plan that indexes
-// thousands of tables would otherwise spend on sizes the room its DDL needs.
+// are counted in a closing line rather than listed, and those of them with no
+// estimate counted apart, since collapsed lines still count toward GitHub's
+// comment size limit and a plan that indexes thousands of tables would
+// otherwise spend on sizes the room its DDL needs.
 func writeCollapsedTableSizes(sb *strings.Builder, entries []tableSizeEntry, scope string) {
-	listed, unlisted := presentation.ListTableSizes(entries, tableSizeEntry.rankBytes)
+	listed, unlisted, unlistedUnsized := presentation.ListTableSizes(entries, tableSizeEntry.rankBytes)
 	sb.WriteString("<details>\n<summary>📊 <b>Table sizes</b>")
 	if scope != "" {
 		fmt.Fprintf(sb, " (%s)", scope)
@@ -1392,7 +1393,7 @@ func writeCollapsedTableSizes(sb *strings.Builder, entries []tableSizeEntry, sco
 	sb.WriteString("</summary>\n\n")
 	writeTableSizeLines(sb, listed)
 	if unlisted > 0 {
-		fmt.Fprintf(sb, "- …and %d more %s\n", unlisted, pluralize("table", unlisted))
+		fmt.Fprintf(sb, "- %s\n", presentation.UnlistedTables(unlisted, unlistedUnsized))
 	}
 	sb.WriteString("\n</details>\n\n")
 }

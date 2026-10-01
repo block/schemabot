@@ -44,19 +44,41 @@ func SumTableSizeBytes(sizes []MemberTableSize) (total int64, sized int) {
 }
 
 // ListTableSizes returns the tables a size section lists, in the order it
-// lists them, and how many it leaves out: every table in plan order up to
-// TableSizesInlineLimit, otherwise the TableSizesShown largest by bytes. A
-// table with no estimate sorts after every table with one.
-func ListTableSizes[T any](tables []T, bytes func(T) *int64) (listed []T, unlisted int) {
+// lists them, how many it leaves out, and how many of those have no estimate:
+// every table in plan order up to TableSizesInlineLimit, otherwise the
+// TableSizesShown largest by bytes. A table with no estimate sorts after every
+// table with one, so it is the first to be left out, and it is counted
+// separately so the section never hides a table whose size is unknown behind a
+// count that reads as the smallest tables.
+func ListTableSizes[T any](tables []T, bytes func(T) *int64) (listed []T, unlisted, unlistedUnsized int) {
 	if len(tables) <= TableSizesInlineLimit {
-		return tables, 0
+		return tables, 0, 0
 	}
 	sorted := slices.Clone(tables)
 	slices.SortStableFunc(sorted, func(a, b T) int {
 		return CompareBytesLargestFirst(bytes(a), bytes(b))
 	})
 	listed = sorted[:min(len(sorted), TableSizesShown)]
-	return listed, len(sorted) - len(listed)
+	for _, t := range sorted[len(listed):] {
+		if bytes(t) == nil {
+			unlistedUnsized++
+		}
+	}
+	return listed, len(sorted) - len(listed), unlistedUnsized
+}
+
+// UnlistedTables renders the closing line's count of the tables a size
+// section leaves out, naming how many of them have no size estimate.
+func UnlistedTables(unlisted, unlistedUnsized int) string {
+	word := "tables"
+	if unlisted == 1 {
+		word = "table"
+	}
+	line := fmt.Sprintf("…and %d more %s", unlisted, word)
+	if unlistedUnsized > 0 {
+		line += fmt.Sprintf(" (%d without a size estimate)", unlistedUnsized)
+	}
+	return line
 }
 
 // FormatMemberTableSize renders one table's size clause across the rollout

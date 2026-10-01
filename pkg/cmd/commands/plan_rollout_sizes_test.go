@@ -129,3 +129,19 @@ func TestWritePlanBody_RolloutTableSizesListLargestFirstPastFive(t *testing.T) {
 	assert.Contains(t, out, "  • t03: ~3 GB on orders-001\n  …and 2 more tables\n\n📋 Plan: ")
 	assert.NotContains(t, out, "  • t02:")
 }
+
+// A table no member reported an estimate for ranks last, so past the cap it is
+// among the tables the closing line counts, and the line says how many of them
+// have no estimate, as the PR comment's does.
+func TestWritePlanBody_RolloutTableSizesCountTablesWithoutEstimatePastCap(t *testing.T) {
+	var sizes []*apitypes.PlanMemberTableSizeResponse
+	sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{Member: "orders-001", Namespace: "ns_0", Table: "ledger"})
+	for i := range presentation.TableSizesShown + 1 {
+		bytes := int64(i+1) * 1_000_000_000
+		sizes = append(sizes, &apitypes.PlanMemberTableSizeResponse{Member: "orders-001", Namespace: "ns_0", Table: fmt.Sprintf("t%02d", i+1), EstimatedBytes: &bytes})
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(sizedRolloutPlan([]string{"orders-001"}, sizes), false) }))
+	assert.Contains(t, out, "  • t02: ~2 GB on orders-001\n  …and 2 more tables (1 without a size estimate)\n\n📋 Plan: ")
+	assert.NotContains(t, out, "  • ledger:")
+}

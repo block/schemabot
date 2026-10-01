@@ -30,10 +30,11 @@ func (t rolloutTableSize) rankBytes() *int64 {
 // rebuilds, or scans is, across every member that changes it, with the PR
 // comment's wording, naming, and limits: up to
 // presentation.TableSizesInlineLimit tables in rollout order, otherwise the
-// largest first, capped at presentation.TableSizesShown with the rest counted.
-// A terminal cannot fold a long section the way the comment does, so it is
-// capped the same way and listed in the open. Table names carry their
-// namespace only when the sizes span several namespaces. It returns "" when
+// largest first, capped at presentation.TableSizesShown with the rest counted
+// and those of them with no estimate counted apart. A terminal cannot fold a
+// long section the way the comment does, so it is capped the same way and
+// listed in the open. Table names carry their namespace only when the sizes
+// span several namespaces. It returns "" when
 // no member reported an estimate for any table: an engine that does not
 // estimate sizes would otherwise print "unavailable" on every line, which
 // reads as a failed probe when none ran.
@@ -42,7 +43,7 @@ func FormatRolloutTableSizes(noun presentation.Noun, sizes []*apitypes.PlanMembe
 	if !slices.ContainsFunc(tables, func(t rolloutTableSize) bool { return t.rankBytes() != nil }) {
 		return ""
 	}
-	listed, unlisted := presentation.ListTableSizes(tables, rolloutTableSize.rankBytes)
+	listed, unlisted, unlistedUnsized := presentation.ListTableSizes(tables, rolloutTableSize.rankBytes)
 
 	var b strings.Builder
 	b.WriteString("📊 Table sizes:\n")
@@ -50,11 +51,7 @@ func FormatRolloutTableSizes(noun presentation.Noun, sizes []*apitypes.PlanMembe
 		fmt.Fprintf(&b, "  • %s: %s\n", t.name, presentation.FormatMemberTableSize(noun, t.perMember, plainName))
 	}
 	if unlisted > 0 {
-		word := "tables"
-		if unlisted == 1 {
-			word = "table"
-		}
-		fmt.Fprintf(&b, "  %s…and %d more %s%s\n", ANSIDim, unlisted, word, ANSIReset)
+		fmt.Fprintf(&b, "  %s%s%s\n", ANSIDim, presentation.UnlistedTables(unlisted, unlistedUnsized), ANSIReset)
 	}
 	b.WriteString("\n")
 	return b.String()
