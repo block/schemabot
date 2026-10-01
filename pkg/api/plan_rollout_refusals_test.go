@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"io"
@@ -45,6 +46,17 @@ func TestRolloutApplyRefusals_ListWhatApplyCreationRefuses(t *testing.T) {
 		plan.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: changes}}
 		return plan
 	}
+	// Shard work in orders_a beside table statements in testapp alone: outside
+	// the per-shard shape, orders_a's shard changes have no operation to run
+	// from, whichever plan the apply runs.
+	shardWorkElsewhere := memberWith(alter)
+	shardWorkElsewhere.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "orders_a", Changes: []storage.TableChange{
+		{Namespace: "orders_a", Table: "orders", Operation: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `region` varchar(32)"},
+	}}}
+	// A finalize the engine asked for beside table statements and no per-shard
+	// plan has nowhere to run in one work operation per target.
+	finalizeUnsharded := memberWith(alter)
+	finalizeUnsharded.Namespaces["testapp"].Finalize = true
 
 	for _, tc := range []struct {
 		name     string
@@ -52,6 +64,12 @@ func TestRolloutApplyRefusals_ListWhatApplyCreationRefuses(t *testing.T) {
 		member   *storage.Plan
 		// want is the refusal listed for testapp-002, nil when none is.
 		want *apitypes.PlanMemberRefusalResponse
+		// applyRefusal is what apply creation's refusal names, the member
+		// when empty.
+		applyRefusal string
+		// narrowedRefusal is what an apply narrowed to a blocked target
+		// refuses it for.
+		narrowedRefusal string
 	}{
 		{name: "same work as the reviewed plan", reviewed: reviewedWith(alter), member: memberWith(alter)},
 		{name: "unsafe change the reviewed plan with work does not carry", reviewed: reviewedWith(alter), member: memberWith(alter, drop),
@@ -68,7 +86,16 @@ func TestRolloutApplyRefusals_ListWhatApplyCreationRefuses(t *testing.T) {
 				Detail: `runs table "users" as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target`}},
 		{name: "blocked change", reviewed: reviewedWith(alter), member: memberWith(blocked),
 			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberBlocked,
-				Detail: "carries changes its target's engine refuses"}},
+				Detail: "carries changes its target's engine refuses"},
+			narrowedRefusal: `contains a blocked change for table "users"`},
+		{name: "shard work in a namespace with no table statements", reviewed: reviewedWith(alter), member: shardWorkElsewhere,
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberBlocked,
+				Detail: "has per-shard changes in namespaces [orders_a] with no table statements to run them from, and this apply runs " + operationShapePerMember.String()},
+			narrowedRefusal: "has per-shard changes in namespaces [orders_a]"},
+		{name: "engine finalize with no per-shard plan", reviewed: reviewedWith(alter), member: finalizeUnsharded,
+			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberBlocked,
+				Detail: "asks to finalize namespaces [testapp] with no per-shard plan to schedule the finalize behind"},
+			applyRefusal: "plan plan-second asks to finalize namespaces [testapp]", narrowedRefusal: "asks to finalize namespaces [testapp]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := multiTargetApplyService(t, &listingPlanStore{
@@ -89,7 +116,15 @@ func TestRolloutApplyRefusals_ListWhatApplyCreationRefuses(t *testing.T) {
 			require.Len(t, refused, 1)
 			assert.Equal(t, tc.want, refused[0])
 			require.Error(t, applyErr, "apply creation refuses the target the rollout lists")
-			assert.Contains(t, applyErr.Error(), "rollout member eu/testapp-002")
+			assert.Contains(t, applyErr.Error(), cmp.Or(tc.applyRefusal, "rollout member eu/testapp-002"))
+			if tc.want.Reason == apitypes.PlanMemberBlocked {
+				// No apply runs a blocked target's plan, the one narrowed to it
+				// included, so the CLI offers it no --target rerun.
+				_, _, narrowedErr := svc.createStoredApply(t.Context(), tc.member, ApplyRequest{Environment: "production", Target: "testapp-002"},
+					map[string]string{"allow_unsafe": "true"}, "apply-rollout-refusals-narrowed")
+				require.Error(t, narrowedErr, "an apply narrowed to the blocked target refuses it too")
+				assert.Contains(t, narrowedErr.Error(), tc.narrowedRefusal)
+			}
 		})
 	}
 }

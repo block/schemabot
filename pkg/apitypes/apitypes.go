@@ -880,8 +880,9 @@ const (
 	// narrowed to it, where its own plan is the one the operator reviews and
 	// consents to.
 	PlanMemberNeedsTarget = "needs_target"
-	// PlanMemberBlocked is a member whose own plan carries a change its
-	// engine refuses, which no apply runs.
+	// PlanMemberBlocked is a member whose own plan carries work no apply
+	// runs, the one narrowed to it included: a change its engine refuses, or
+	// work the apply has no operation to run from.
 	PlanMemberBlocked = "blocked"
 )
 

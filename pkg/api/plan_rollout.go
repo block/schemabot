@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -86,7 +87,7 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 	if len(rollout.Attention) == 0 {
 		refused, err := s.rolloutApplyRefusals(ctx, req.Environment, primaryPlan.GetPlanId(), targets)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", errRolloutApplyRefusals, err)
 		}
 		rollout.Refused = refused
 	} else {
@@ -297,6 +298,12 @@ func refuseApplyRolloutUnrenderedByCaller(plan *storage.Plan, req ApplyRequest, 
 	return &RolloutUnrenderedError{Database: plan.Database, Environment: req.Environment, Members: len(targets)}
 }
 
+// errRolloutApplyRefusals marks a plan that failed after every member was
+// planned, while reading back the stored plans to list what a rollout-wide
+// apply of it refuses, so the failure is reported as that and not as a member
+// that could not be planned.
+var errRolloutApplyRefusals = errors.New("list the rollout members a rollout-wide apply refuses")
+
 // rolloutApplyRefusals lists the members whose own plans apply creation
 // refuses when the primary's plan is applied rollout-wide through the API, so
 // a caller can refuse before it takes a lock and prompts, and name the
@@ -330,6 +337,9 @@ func (s *Service) rolloutApplyRefusals(ctx context.Context, environment, planID 
 		}
 		reason, detail := memberWorkARolloutWideAPIApplyCannotRun(plan, member.Plan)
 		if reason == "" {
+			s.logger.Debug("rollout member admitted to a rollout-wide apply of the plan",
+				"database", plan.Database, "environment", environment, "plan_id", planID,
+				"member", member.MemberID(), "member_plan_id", member.Plan.PlanIdentifier)
 			continue
 		}
 		refusals = append(refusals, &apitypes.PlanMemberRefusalResponse{
@@ -355,15 +365,17 @@ func (s *Service) rolloutApplyRefusals(ctx context.Context, environment, planID 
 // MemberWorkAConvergedReviewedPlanCannotRun when the reviewed plan is empty),
 // and its direct-execution change is refused as well: only a pull request
 // comment disclosed it under the target that runs it
-// (rejectUnconfirmedMemberDirectExecution). An apply narrowed to the member
-// runs its own plan as the reviewed one, so everything but a blocked change
-// runs there.
+// (rejectUnconfirmedMemberDirectExecution). Those are refused as needing a
+// target: an apply narrowed to the member runs its own plan as the reviewed
+// one, which carries its own unsafe changes and direct verdicts. Work that
+// apply refuses as well is refused as blocked, since no apply runs it
+// (memberWorkANarrowedApplyCannotRun).
 func memberWorkARolloutWideAPIApplyCannotRun(reviewed, member *storage.Plan) (reason, detail string) {
 	if member == reviewed {
 		return "", ""
 	}
-	if member.BlockedApplyError() != nil {
-		return apitypes.PlanMemberBlocked, "carries changes its target's engine refuses"
+	if detail := memberWorkANarrowedApplyCannotRun(member); detail != "" {
+		return apitypes.PlanMemberBlocked, detail
 	}
 	if detail := MemberWorkTheReviewedPlanCannotRun(reviewed, member); detail != "" {
 		return apitypes.PlanMemberNeedsTarget, detail
@@ -377,4 +389,28 @@ func memberWorkARolloutWideAPIApplyCannotRun(reviewed, member *storage.Plan) (re
 		return apitypes.PlanMemberNeedsTarget, fmt.Sprintf("runs table %q as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target", table)
 	}
 	return "", ""
+}
+
+// memberWorkANarrowedApplyCannotRun describes the first thing in a member's
+// plan that apply creation refuses even when the apply is narrowed to the
+// member, which runs that plan as the reviewed one, or returns "" when there
+// is none. Its shape is then chosen from its own plan, so what remains is what
+// no apply runs: a change its engine refuses, per-shard changes in a
+// namespace the plan carries no table statement for outside the per-shard
+// shape (memberWorkOutsideShape), and a finalize the engine asked for that the
+// one-operation-per-target shape has nowhere to run (buildApplyOperationGroups).
+func memberWorkANarrowedApplyCannotRun(member *storage.Plan) string {
+	if member.BlockedApplyError() != nil {
+		return "carries changes its target's engine refuses"
+	}
+	shape := operationShapeOf(member, applyTaskChanges(member))
+	if reason := memberWorkOutsideShape(member, member, shape); reason != "" {
+		return reason
+	}
+	if shape == operationShapePerMember {
+		if namespaces := member.EngineFinalizedNamespaces(); len(namespaces) > 0 {
+			return fmt.Sprintf("asks to finalize namespaces %v with no per-shard plan to schedule the finalize behind", namespaces)
+		}
+	}
+	return ""
 }
