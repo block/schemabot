@@ -1864,8 +1864,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-**Targets diverge**: what applies where.
-
 #### 2 of 3 targets
 
 `primary/testapp_1`, `primary/testapp_2`
@@ -1925,8 +1923,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-**Targets diverge**: what applies where.
-
 #### 2 of 3 targets
 
 `primary/testapp_2`, `primary/testapp_3`
@@ -1985,8 +1981,6 @@ schemabot apply -e production
 **Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
-
-**Targets diverge**: what applies where.
 
 #### 2 of 3 targets
 
@@ -8125,8 +8119,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <details open>
 <summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
 <dl><dd>
-
-**Targets diverge**: what applies where.
 
 #### 56 of 64 targets
 

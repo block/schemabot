@@ -449,7 +449,6 @@ func TestRenderPlanComment_OneTargetPlanNamesEveryTarget(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "\n`primary/testapp-001`, `primary/testapp-002`, `eu-west`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-	assert.NotContains(t, out, "Targets diverge", "one plan is not divergence")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 }
 
@@ -482,13 +481,13 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 
 	t.Run("some targets are already there", func(t *testing.T) {
 		out := render(group(1, "a", "c"), group(0, "b"))
-		assert.Contains(t, out, "**Targets diverge**: what applies where.\n\n#### 2 of 3 targets\n\n`a`, `c`\n\n```sql\n")
+		assert.Contains(t, out, "#### 2 of 3 targets\n\n`a`, `c`\n\n```sql\n")
 		assert.Contains(t, out, "#### `b`\n\nNo schema changes detected\n\n")
 		assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 	})
 	t.Run("targets need different changes", func(t *testing.T) {
 		out := render(group(1, "a"), group(2, "b", "c"))
-		assert.Contains(t, out, "**Targets diverge**: what applies where.\n\n#### `a`\n\n```sql\n")
+		assert.Contains(t, out, "#### `a`\n\n```sql\n")
 		assert.Contains(t, out, "`b`, `c`\n\n```sql\n")
 		assert.NotContains(t, out, "_Already applied")
 		assert.Equal(t, 1, strings.Count(out, "📋 **Plan**: "), "the plans are summarized once, together")
@@ -884,7 +883,6 @@ func TestRenderPlanComment_EachTargetPlanRendersUnderItsTargets(t *testing.T) {
 
 	positions := map[string]int{}
 	for _, want := range []string{
-		"**Targets diverge**: what applies where.",
 		"`primary/testapp_1`, `primary/testapp_2`",
 		"ADD COLUMN `email`",
 		"#### `primary/testapp_4`",
@@ -921,7 +919,7 @@ func TestRenderMultiEnvPlanComment_EachTargetPlanRendersUnderItsTargets(t *testi
 
 	_, production, found := strings.Cut(out, "Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "**Targets diverge**: what applies where.\n\n#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`")
+	assert.Contains(t, production, "#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`")
 	otherHeader := strings.Index(production, "#### `primary/testapp_4`")
 	details := strings.Index(production, "<details>\n<summary>Show SQL (2 statements)</summary>")
 	assert.GreaterOrEqual(t, otherHeader, 0)

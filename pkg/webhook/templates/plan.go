@@ -1735,10 +1735,6 @@ func writeNamespaceLabel(sb *strings.Builder, data PlanCommentData, label, value
 	}
 }
 
-// targetsDivergeIntro introduces a rollout whose targets run different
-// changes, ahead of one heading per group of targets that run the same.
-const targetsDivergeIntro = "**Targets diverge**: what applies where.\n\n"
-
 // writeTargetGroupHeading heads the targets of a rollout that run one plan. A
 // lone target is the heading; a group is headed by how many targets it holds,
 // and how many the rollout has when it holds only some, with the names on
@@ -1987,15 +1983,11 @@ func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
 // writeTargetPlans renders the rollout's plans the way a sharded keyspace
 // renders its shards: one heading per group naming the targets that run it,
 // with the group's DDL under it, and a group already at the desired schema
-// saying so in place of DDL. More than one group is introduced as divergence,
-// and a single group still names its targets, so every target is shown with
-// the plan it runs. collapse folds a plan with more than one change into a
+// saying so in place of DDL. A single group still names its targets, so every
+// target is shown with the plan it runs. collapse folds a plan with more than one change into a
 // details block, as a multi-environment section does for its own plan.
 func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget, collapse bool) {
 	drift := data.DeploymentDrift
-	if len(drift.Plans) > 1 {
-		sb.WriteString(targetsDivergeIntro)
-	}
 	// Targets with work lead, as changing shards do: they are what the apply
 	// will run, and the targets already at the schema follow them.
 	plans := slices.Clone(drift.Plans)

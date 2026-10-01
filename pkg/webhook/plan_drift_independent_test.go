@@ -89,7 +89,6 @@ func TestReviewDriftComment_IndependentCleanDoesNotClaimAgreement(t *testing.T) 
 		assert.Equal(t, api.DeploymentPlanned, e.Class, "target %q", e.Target)
 	}
 
-	assert.Contains(t, out, "**Targets diverge**: what applies where.")
 	for _, target := range []string{"orders-001", "orders-002", "orders-003"} {
 		assert.Contains(t, out, "#### `commerce/"+target+"`\n\n```sql\n",
 			"each target's plan renders under it alone, not as one shared plan")

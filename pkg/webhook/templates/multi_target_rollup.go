@@ -26,7 +26,7 @@ type targetWork struct {
 
 // writeTargetRollup writes a multi-target deployment's body the way the
 // sharded apply comment writes a keyspace: one line per table across the
-// targets, each change's DDL once, a "what applies where" split when targets
+// targets, each change's DDL once, a heading per group of targets when they
 // diverge, and a row per failed target. Its size grows with distinct changes
 // and failures, not with the number of targets.
 func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
@@ -40,7 +40,6 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	// targets and the silent ones are counted once, for the deployment.
 	lineSilent := silent
 	if len(work) > 1 {
-		sb.WriteString(targetsDivergeIntro)
 		lineSilent = 0
 	}
 	for _, w := range work {

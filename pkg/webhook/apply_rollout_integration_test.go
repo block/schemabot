@@ -395,9 +395,8 @@ func TestE2EAutoPlanPostsCommentWhenOnlyAnotherTargetHasWork(t *testing.T) {
 		action: "opened", headSHA: "abc123", headRef: "feature-branch",
 	}, nil))
 
-	body := awaitCommentContaining(t, result, "**Targets diverge**: what applies where.")
+	body := awaitCommentContaining(t, result, "#### `us`\n\n```sql\n")
 	assert.Contains(t, body, "#### `eu`\n\nNo schema changes detected\n\n")
-	assert.Contains(t, body, "#### `us`\n\n```sql\n")
 	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 }
 

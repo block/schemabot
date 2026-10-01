@@ -686,7 +686,6 @@ func TestRenderMultiDeploymentApplyComment_RollsUpADeploymentsTargets(t *testing
 	assert.Contains(t, out, "- 🔄 `primary` — 1 completed, 2 running (3 targets)\n- 🔄 `eu-west` — running table copy\n")
 	assert.Contains(t, out, "<details open>\n<summary>🔄 primary — 1 completed, 2 running (3 targets)</summary>\n<dl><dd>\n\n")
 	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(53)+" 53% · 1 complete, 2 running\n- Rows: 1,600 / 3,000 · ETA: "+ui.FormatETA(420)+"\n- Running: `testapp-002`, `testapp-003`\n")
-	assert.NotContains(t, out, "Targets diverge", "the targets run one change")
 
 	// The shared DDL renders once for primary's three targets and once in
 	// eu-west's own body; no target gets a body of its own.
@@ -713,7 +712,7 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetsDivergeByChange(t *tes
 		nil,
 	)
 
-	assert.Contains(t, out, "**Targets diverge**: what applies where.\n\n#### 2 of 4 targets\n\n`testapp-001`, `testapp-003`\n\n**`orders`**: ")
+	assert.Contains(t, out, "#### 2 of 4 targets\n\n`testapp-001`, `testapp-003`\n\n**`orders`**: ")
 	assert.Contains(t, out, "#### `testapp-002`\n\n**`orders`**: ")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `note`"))
 	assert.Equal(t, 1, strings.Count(out, "ADD INDEX `idx_note`"))
@@ -956,7 +955,6 @@ func TestRenderMultiDeploymentApplyComment_DivergedTargetsCountSilentTargetsOnce
 		nil,
 	)
 
-	assert.Contains(t, out, "**Targets diverge**: what applies where.")
 	assert.Contains(t, out, "- Rows: 1,000 / 2,000 · ETA: "+ui.FormatETA(600)+"\n")
 	assert.Contains(t, out, "- Rows: 300 / 1,000 · ETA: "+ui.FormatETA(300)+"\n")
 	assert.NotContains(t, out, "across")
