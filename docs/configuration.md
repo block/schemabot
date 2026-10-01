@@ -796,9 +796,11 @@ statement has waited 90% of the bound for the lock, it kills the transactions
 blocking it and tries again, up to 3 attempts, as Spirit does for its own
 DDL. It never kills while it holds the lock and runs, so traffic to a table
 being rebuilt is left alone. A session holding an explicit `LOCK TABLES`, or a
-transaction too large to roll back safely, is never killed; while one holds
-the lock the apply fails with a retryable "table is busy" error, after one
-attempt for an explicit table lock. Every attempt runs the statement from the
+transaction too large to roll back safely, is never killed, and a session the
+user is not allowed to kill survives the kill too. No later attempt can end
+such a blocker, so the statement stops after the attempt that met it, and the
+apply fails with a retryable "table is busy" error. The full 3 attempts go only
+to blockers the kill ends. Every attempt runs the statement from the
 start, so a rebuild that times out waiting to upgrade its lock at the end is
 rolled back and runs again. Traffic to the table can stall for up to one bound
 per attempt, and between attempts the statement waits up to 30 seconds for
@@ -1056,6 +1058,18 @@ database's entry wins.
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
+
+### MySQL server settings Spirit refuses
+
+Spirit checks the target server before every run, including a resumed one,
+and refuses to start on a setting it cannot run safely under. One of them,
+`partial_revokes=ON`, is a server-wide security setting an operator may have
+chosen on purpose. With it on, a `REVOKE` can remove a grant for one schema
+while `SHOW GRANTS` still lists the global grant, so a privilege check passes
+and the schema change fails at cutover. `partial_revokes` is `OFF` by default.
+A target with it `ON` fails every schema change, and an apply already in
+flight fails on its next drive. Turning it off is a server-wide security
+change, so plan it before upgrading rather than after.
 
 ## Postgres
 
