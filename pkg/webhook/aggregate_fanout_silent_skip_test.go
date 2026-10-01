@@ -359,11 +359,13 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabase(t *testing.T) {
 
 // Auto-plan on an aggregate repo leaves a schema config it does not manage to
 // the deployment that does, so the unmanaged-config notice stays a log line
-// there — except on the leader, for a config no deployment manages: under no
-// expected participant's directory and declaring a database the leader has
-// not registered, that config would otherwise be as invisible on the PR as on
-// a single-deployment repo. The leader notices exactly those configs, and a
-// participant, which cannot see the fleet, never notices any.
+// there — except on the leader, for a config no deployment manages: a config
+// the leader dropped and no expected participant's directory covers would
+// otherwise be as invisible on the PR as on a single-deployment repo. That
+// holds whether the leader dropped it for an unregistered database or for a
+// registered one placed outside its allowed_dirs. The leader notices exactly
+// those configs, and a participant, which cannot see the fleet, never notices
+// any.
 func TestNotifyUnmanagedDiscoveredConfigsOnAggregateRepo(t *testing.T) {
 	discovered := func(dirs ...string) []ghclient.DiscoveredConfig {
 		configs := make([]ghclient.DiscoveredConfig, 0, len(dirs))
@@ -398,6 +400,20 @@ func TestNotifyUnmanagedDiscoveredConfigsOnAggregateRepo(t *testing.T) {
 		body := requireComment(t, comments, "unmanaged schema config notice")
 		assert.Contains(t, body, "`orders/schema`")
 		assert.NotContains(t, body, "`tenant-b/schema`", "a config under a participant's directory is that participant's to plan")
+	})
+
+	t.Run("leader notices its own database placed outside its allowed_dirs", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateLeaderWithAllowlistConfig())
+
+		notify(h, []ghclient.DiscoveredConfig{{
+			Config:    &ghclient.SchemabotConfig{Database: "billing", Type: "mysql"},
+			SchemaDir: "rogue/schema",
+		}})
+
+		body := requireComment(t, comments, "unmanaged schema config notice")
+		assert.Contains(t, body, "`rogue/schema`")
+		assert.Contains(t, body, "declares database `billing`",
+			"the leader registers billing, but not here, and no participant covers this directory")
 	})
 
 	t.Run("leader stays silent for a config under a participant's directory", func(t *testing.T) {
@@ -1029,6 +1045,10 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 			"apply": func(h *Handler) {
 				h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
 					CommandResult{Action: action.Apply, CommentID: 42})
+			},
+			"apply-confirm": func(h *Handler) {
+				h.handleApplyConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+					CommandResult{Action: action.ApplyConfirm, CommentID: 42})
 			},
 			"multi-env plan": func(h *Handler) {
 				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42)

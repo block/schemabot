@@ -686,12 +686,15 @@ func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installa
 }
 
 // configsManagedByNoDeployment narrows dropped configs to the ones no
-// deployment on repo manages (schemaManagedByNoDeployment). Only the aggregate
+// deployment on repo manages. A dropped config is one this deployment has
+// already rejected, whether its database is unregistered here or registered
+// but placed outside its allowed_dirs, so only participant path coverage is
+// left to decide whether another deployment plans it. Only the aggregate
 // leader can establish that, so on any other deployment the result is empty.
 func (h *Handler) configsManagedByNoDeployment(config *api.ServerConfig, repo string, dropped []ghclient.DiscoveredConfig) []ghclient.DiscoveredConfig {
 	var unmanaged []ghclient.DiscoveredConfig
 	for _, cfg := range dropped {
-		if h.schemaManagedByNoDeployment(config, repo, cfg.Config.Database, cfg.SchemaDir) {
+		if !h.schemaManagedByAnotherDeployment(config, repo, cfg.SchemaDir) {
 			unmanaged = append(unmanaged, cfg)
 		}
 	}

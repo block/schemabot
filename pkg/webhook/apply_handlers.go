@@ -771,6 +771,9 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
+		// Answering the failure is acting on the command: the deployment that
+		// posts the answer is the one that acknowledges.
+		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err, result.SuppressRetryComments) {
 			return false, nil
 		}
