@@ -14,6 +14,12 @@
 // before sending any request that sets an annotated field, refusing the
 // request itself when a capability is missing. Neither side keeps a list: the
 // annotation is the whole registration.
+//
+// The read and the request are separate calls, so a request routed to an
+// older replica mid-rollout still reaches it. What keeps that safe is that an
+// annotated field is one whose misread still fails closed on the older
+// server; the gate turns the common case into a refusal that names the
+// upgrade.
 package tern
 
 import (

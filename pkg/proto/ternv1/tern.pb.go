@@ -4856,6 +4856,14 @@ var (
 	// server code that reads the field. Name a capability after the feature
 	// an operator configures, since refusals show it to them.
 	//
+	// The capability read is a call of its own ahead of the request, so it
+	// cannot bind the request to the server that answered it: during a
+	// rollout behind a per-request load balancer, the request can still reach
+	// a replica that does not advertise the name. Annotate a field only when
+	// an older server that misreads it still fails closed. The annotation
+	// turns that failure into a refusal that names the upgrade; it does not
+	// make an unsafe misread safe.
+	//
 	// optional string requires_remote_capability = 50001;
 	E_RequiresRemoteCapability = &file_tern_proto_extTypes[0]
 )

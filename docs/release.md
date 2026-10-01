@@ -356,7 +356,11 @@ fields with new numbers, no removals, no renumbering, no type changes. Diff the
 `.proto` sources rather than the generated code, where regeneration noise buries
 the field-level change. For each new request field, ask what an older data plane
 does with a request that sets it: if dropping the field changes what the rest of
-the request means, the field needs a `requires_remote_capability` annotation.
+the request means, the field needs a `requires_remote_capability` annotation,
+and an older data plane that misreads it must still fail closed. The control
+plane checks capabilities in a call ahead of the request, so a request can
+still reach an older replica mid-rollout; the annotation makes the skew legible
+but is not what keeps it safe.
 
 ### 6. Error baseline
 
