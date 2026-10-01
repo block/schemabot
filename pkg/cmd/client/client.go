@@ -449,11 +449,12 @@ func ReadSchemaFiles(dir string, environment string, ignoreNamespaces []string) 
 	return result, ignored, nil
 }
 
-// ReadSchemaFilesByPath reads the schema files in dir using the same layout
-// rules as ReadSchemaFiles — flat files in dir, or one level of namespace
-// subdirectories (symlinked directories included) — and returns them keyed by
+// ReadSchemaFilesByPath collects schema files from dir and one level of
+// subdirectories (symlinked directories included), returning them keyed by
 // their slash-separated path relative to dir, e.g. "users.sql" or
-// "orders/users.sql". Callers that must write a file back join the key onto dir.
+// "orders/users.sql". It does not validate whether the collected paths form a
+// supported layout; GroupFilesByNamespace performs that validation. Callers
+// that must write a file back join the key onto dir.
 func ReadSchemaFilesByPath(dir string) (map[string]string, error) {
 	rawFiles := make(map[string]string)
 
