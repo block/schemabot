@@ -291,8 +291,9 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	fmt.Println("\nApplying changes...")
 
 	// The plan shown above is the plan of every rollout member, grouped by
-	// what each runs, and the members needing attention or refused were
-	// turned away before the prompt.
+	// what each runs. Members the server listed as refused were turned away
+	// before the prompt; a member whose own plan apply creation refuses
+	// without having listed it is refused by POST /api/apply instead.
 	applyID, err := applyAndWatch(ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if cmd.Yield && !cmd.NoLock && applyID != "" {

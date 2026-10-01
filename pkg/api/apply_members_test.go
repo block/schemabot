@@ -1033,7 +1033,7 @@ func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
 	}{
 		{"POST /api/apply", func(t *testing.T, svc *Service) string {
 			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
-			assert.Equal(t, http.StatusInternalServerError, code)
+			assert.Equal(t, http.StatusBadRequest, code)
 			return msg
 		}, refused},
 		{"POST /api/apply asserting the confirmation", func(t *testing.T, svc *Service) string {
@@ -1123,4 +1123,23 @@ func TestBuildShardedApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t
 	assert.Equal(t, now, *settled.Operation.CompletedAt)
 	assert.Nil(t, settled.Operation.StartedAt, "nothing ran on the converged member")
 	assert.Equal(t, int64(11), settled.Operation.PlanID)
+}
+
+// A review round is selected by its stamp. The pull request narrows the scan
+// only beside its repository: a CLI plan can carry a pull request number with
+// no repository, and storage refuses a pull request filter without one.
+func TestReviewRoundListing_PullRequestOnlyWithItsRepository(t *testing.T) {
+	webhook := primaryPlanRow("testapp-001")
+	assert.Equal(t, storage.ListPlansOptions{
+		Database: "testapp", Environment: "production",
+		Repository: "org/repo", PullRequest: 7,
+		PrimaryPlanIdentifier: "plan-primary",
+	}, reviewRoundListing(webhook, "production"))
+
+	cli := primaryPlanRow("testapp-001")
+	cli.Repository = ""
+	assert.Equal(t, storage.ListPlansOptions{
+		Database: "testapp", Environment: "production",
+		PrimaryPlanIdentifier: "plan-primary",
+	}, reviewRoundListing(cli, "production"))
 }

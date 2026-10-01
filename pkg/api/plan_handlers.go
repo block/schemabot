@@ -1382,6 +1382,16 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
+		if refused, ok := errors.AsType[*MemberPlanRefusedError](err); ok {
+			s.logger.Warn("apply rejected: a rollout member's own plan cannot run in an apply created from the primary's plan", "plan_id", req.PlanID, "environment", req.Environment, "member", refused.MemberID, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*MemberWorkRefusedError](err); ok {
+			s.logger.Warn("apply rejected: a rollout member's own plan carries work an apply of the whole rollout cannot run", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*RolloutUnrenderedError](err); ok {
 			s.logger.Warn("apply rejected: the caller does not render the plan of every rollout member", "plan_id", req.PlanID, "environment", req.Environment, "caller", req.Caller, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
@@ -1949,6 +1959,24 @@ func (e *MemberPlanRefusedError) Unwrap() error {
 	return e.Err
 }
 
+// MemberWorkRefusedError is apply creation refusing an apply of the whole
+// rollout because one member's own plan carries work that apply cannot run as
+// planned: another target's direct-execution change, work an apply from an
+// already converged reviewed plan cannot carry, or work outside the apply's
+// shape. The remedy is the operator's, an apply narrowed to that member, so it
+// is a refused request rather than a server failure.
+type MemberWorkRefusedError struct {
+	Err error
+}
+
+func (e *MemberWorkRefusedError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *MemberWorkRefusedError) Unwrap() error {
+	return e.Err
+}
+
 // applyMemberDisplayNames names each member the way the plan comment does, so a
 // refusal names the target the operator already read it under.
 func applyMemberDisplayNames(members []applyMember) []string {
@@ -2150,8 +2178,8 @@ func rejectUnconfirmedMemberDirectExecution(member applyMember, applyPlan *stora
 		return nil
 	}
 	if table := firstDirectExecutionTable(member.Plan); table != "" {
-		return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, and an apply of the whole rollout from plan %s runs another target's direct-execution DDL only from a pull request apply-confirm on the comment that discloses it under that target; plan and apply the member with its target to run its own plan",
-			member.MemberID(), member.Plan.PlanIdentifier, table, applyPlan.PlanIdentifier)
+		return &MemberWorkRefusedError{Err: fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, and an apply of the whole rollout from plan %s runs another target's direct-execution DDL only from a pull request apply-confirm on the comment that discloses it under that target; plan and apply the member with its target to run its own plan",
+			member.MemberID(), member.Plan.PlanIdentifier, table, applyPlan.PlanIdentifier)}
 	}
 	return nil
 }
@@ -2181,8 +2209,8 @@ func firstDirectExecutionTable(plan *storage.Plan) string {
 // check every caller creating such an apply passes through.
 func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 	if reason := MemberWorkAConvergedReviewedPlanCannotRun(member.Plan); reason != "" {
-		return fmt.Errorf("rollout member %s: plan %s %s, which an apply whose reviewed target is already at the desired schema cannot run",
-			member.MemberID(), member.Plan.PlanIdentifier, reason)
+		return &MemberWorkRefusedError{Err: fmt.Errorf("rollout member %s: plan %s %s, which an apply whose reviewed target is already at the desired schema cannot run",
+			member.MemberID(), member.Plan.PlanIdentifier, reason)}
 	}
 	return nil
 }
@@ -2563,8 +2591,8 @@ func operationShapeOf(plan *storage.Plan, taskChanges []storage.TableChange) ope
 // being checked against it. A member with no work fits every shape.
 func rejectMemberWorkOutsideShape(member applyMember, applyPlan *storage.Plan, shape operationShape) error {
 	if reason := memberWorkOutsideShape(member.Plan, applyPlan, shape); reason != "" {
-		return fmt.Errorf("rollout member %s: plan %s %s, so the apply was not created rather than mark the target done without its change",
-			member.MemberID(), member.Plan.PlanIdentifier, reason)
+		return &MemberWorkRefusedError{Err: fmt.Errorf("rollout member %s: plan %s %s, so the apply was not created rather than mark the target done without its change",
+			member.MemberID(), member.Plan.PlanIdentifier, reason)}
 	}
 	return nil
 }
