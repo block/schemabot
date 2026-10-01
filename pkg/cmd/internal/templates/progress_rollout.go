@@ -95,9 +95,10 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	var work []targetWork
 	bySignature := make(map[string]int)
 	silent, converged := 0, 0
+	byMember := tablesByMember(v.Tables)
 	for _, i := range g.Members {
 		d := v.Model.Deployments[i]
-		tables := activeTablesForMember(v.Tables, d.Deployment, d.Target)
+		tables := byMember[rolloutMemberKey{d.Deployment, d.Target}]
 		if len(tables) == 0 {
 			switch {
 			case targetAlreadyConverged(v.Operations[i]):
@@ -112,6 +113,8 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 		if !seen {
 			wi = len(work)
 			bySignature[signature] = wi
+			// Sorted as a copy: the index is read again for every table below.
+			tables = slices.Clone(tables)
 			sortActiveTables(tables)
 			work = append(work, targetWork{tables: tables})
 		}
@@ -123,7 +126,7 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	for _, w := range work {
 		rolled := make([]TableProgress, 0, len(w.tables))
 		for _, t := range w.tables {
-			rolled = append(rolled, tableAcrossTargets(v, w.members, t))
+			rolled = append(rolled, tableAcrossTargets(v, byMember, w.members, t))
 		}
 		// Tables are grouped under their namespace whenever they carry one,
 		// so the same table changed in two schemas reads as two changes.
@@ -148,6 +151,28 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	if silent > 0 {
 		fmt.Fprintf(b, "  %s%d of %d targets have not reported progress yet.%s\n", ANSIDim, silent, len(g.Members), ANSIReset)
 	}
+}
+
+// rolloutMemberKey is the routing pair that names one rollout member.
+type rolloutMemberKey struct {
+	deployment, target string
+}
+
+// tablesByMember indexes the tables each rollout member copies, by both
+// halves of the routing pair, as activeTablesForMember selects them. The
+// rollup reads one member's tables once per table it rolls up, and the watch
+// view renders on every frame, so the tables are walked once per render
+// rather than once per lookup.
+func tablesByMember(tables []TableProgress) map[rolloutMemberKey][]TableProgress {
+	byMember := make(map[rolloutMemberKey][]TableProgress)
+	for _, table := range tables {
+		if table.TableName == "" {
+			continue
+		}
+		key := rolloutMemberKey{table.Deployment, table.Target}
+		byMember[key] = append(byMember[key], table)
+	}
+	return byMember
 }
 
 // targetAlreadyConverged reports whether a target already held the change
@@ -178,7 +203,7 @@ func tableChangeSignature(tables []TableProgress) string {
 // target's instant ALTER says nothing about how another applied it. Once no
 // target is working on the change and one has halted, those rows no longer
 // speak for the table, which renders as its halt (formatHaltedAcrossTargets).
-func tableAcrossTargets(v RolloutView, members []int, table TableProgress) TableProgress {
+func tableAcrossTargets(v RolloutView, byMember map[rolloutMemberKey][]TableProgress, members []int, table TableProgress) TableProgress {
 	rolled := TableProgress{
 		TableName:     table.TableName,
 		Namespace:     table.Namespace,
@@ -191,7 +216,7 @@ func tableAcrossTargets(v RolloutView, members []int, table TableProgress) Table
 	allInstant := true
 	for _, i := range members {
 		d := v.Model.Deployments[i]
-		for _, t := range activeTablesForMember(v.Tables, d.Deployment, d.Target) {
+		for _, t := range byMember[rolloutMemberKey{d.Deployment, d.Target}] {
 			if t.Namespace != table.Namespace || t.TableName != table.TableName || t.DDL != table.DDL {
 				continue
 			}

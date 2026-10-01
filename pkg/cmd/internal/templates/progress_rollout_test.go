@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -508,4 +510,39 @@ func TestFormatRolloutFooter_TerminalFailureOffersRetryThatResumes(t *testing.T)
 		"the retry closes the footer:\n%s", out)
 	assert.NotContains(t, out, "schemabot stop")
 	assert.NotContains(t, out, presentation.RetryOnceSettledNote)
+}
+
+// The watch view renders a rollout on every frame, so the rollup reads each
+// target's tables from one index built per render rather than walking and
+// copying every table of the apply once per target and table it rolls up: a
+// render allocates in proportion to the apply's tables, not to targets times
+// tables.
+func TestFormatTargetRollup_AllocationDoesNotScaleWithTargetsTimesTables(t *testing.T) {
+	const targetCount, tableCount = 200, 10
+	var targets []rolloutTarget
+	for range targetCount {
+		targets = append(targets, copyingTarget(400))
+	}
+	data := targetRolloutData(targets)
+	var tables []TableProgress
+	for _, table := range data.Tables {
+		for n := range tableCount {
+			table.TableName = fmt.Sprintf("orders_%02d", n)
+			tables = append(tables, table)
+		}
+	}
+	data.Tables = tables
+	model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+	groups := model.Groups()
+	require.Len(t, groups, 1)
+	view := RolloutView{ApplyID: data.ApplyID, Environment: data.Environment, Engine: data.Engine, Operations: data.Operations, Model: model, Tables: data.Tables}
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	FormatTargetRollup(view, groups[0])
+	runtime.ReadMemStats(&after)
+	tablesBytes := uint64(len(tables)) * uint64(unsafe.Sizeof(TableProgress{}))
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("allocated %d bytes for %d bytes of tables", allocated, tablesBytes)
+	assert.Less(t, allocated, 20*tablesBytes, "a render allocates in proportion to the tables, not to targets times tables")
 }
