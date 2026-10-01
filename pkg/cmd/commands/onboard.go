@@ -604,6 +604,13 @@ func validateOnboardPlanResult(result *apitypes.PlanResponse, database, environm
 	if len(result.Errors) > 0 {
 		return fmt.Errorf("verify pulled schema for database %s environment %s: plan returned errors:\n  %s", database, environment, strings.Join(result.Errors, "\n  "))
 	}
+	if rollout := result.WholeRollout(); rollout != nil && len(rollout.Attention) > 0 {
+		lines := make([]string, 0, len(rollout.Attention))
+		for _, a := range rollout.Attention {
+			lines = append(lines, fmt.Sprintf("%s: %s", a.Member, a.Detail))
+		}
+		return fmt.Errorf("verify pulled schema for database %s environment %s: %d of %d rollout members could not be verified:\n  %s", database, environment, len(rollout.Attention), rollout.Members, strings.Join(lines, "\n  "))
+	}
 	if hasResultChanges(result) {
 		return fmt.Errorf("verify pulled schema for database %s environment %s: pulled files still produce schema changes:\n  %s", database, environment, strings.Join(describeOnboardPlanChanges(result), "\n  "))
 	}
@@ -617,9 +624,35 @@ const onboardVerifyDDLPreviewLimit = 120
 
 // describeOnboardPlanChanges renders one line per planned change so a failed
 // verification names the offending tables and DDL without a separate plan run.
+// When a rollout's members run different plans, each line names the members
+// that run it, since the primary can be converged while another member is not.
 func describeOnboardPlanChanges(result *apitypes.PlanResponse) []string {
+	rollout := result.WholeRollout()
 	var lines []string
-	for _, change := range result.Changes {
+	for i, plan := range result.MemberPlans() {
+		prefix := ""
+		if rollout != nil && len(rollout.Groups) > 1 {
+			prefix = onboardGroupLabel(rollout.Groups[i].Members) + ": "
+		}
+		for _, line := range describeOnboardChanges(plan.Changes) {
+			lines = append(lines, prefix+line)
+		}
+	}
+	return lines
+}
+
+// onboardGroupLabel names the members of a rollout plan group, folding a wide
+// group so a verification line stays one line.
+func onboardGroupLabel(members []string) string {
+	if len(members) <= 2 {
+		return strings.Join(members, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", members[0], len(members)-1)
+}
+
+func describeOnboardChanges(changes []*apitypes.SchemaChangeResponse) []string {
+	var lines []string
+	for _, change := range changes {
 		if change == nil {
 			continue
 		}

@@ -132,3 +132,22 @@ func TestStoredPlanShowsGeneratedVSchemaChangeWithDeletion(t *testing.T) {
 	require.Len(t, resp.Changes, 1)
 	assert.True(t, resp.Changes[0].ShowsVSchemaChange())
 }
+
+// A planner can record the blocked verdict in any case. The summary counts it
+// the way apply admission reads it, so GET /api/plans never lists a plan whose
+// apply is refused as having nothing blocked.
+func TestPlanSummaryFromStorageCountsBlockedVerdictInAnyCase(t *testing.T) {
+	summary := planSummaryFromStorage(&storage.Plan{
+		PlanIdentifier: "plan-blocked-upper",
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {Tables: []storage.TableChange{
+				{Table: "orders", Operation: "alter", ExecutionMode: "BLOCKED"},
+				{Table: "refunds", Operation: "alter", ExecutionMode: "direct"},
+			}},
+		},
+	})
+
+	assert.Equal(t, 1, summary.BlockedCount)
+}

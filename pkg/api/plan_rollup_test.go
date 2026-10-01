@@ -676,3 +676,19 @@ func TestDeploymentClassificationsAreKnownToTheDriftMetric(t *testing.T) {
 	// otherwise pass by covering nothing.
 	assert.Equal(t, []string{"match", "diverged", "errored", "planned"}, walked)
 }
+
+// A planner can record the blocked verdict in any case. The rollup counts it
+// the way apply admission and the plan comment's per-target disclosure read it,
+// so a target whose apply is refused never folds as quiet.
+func TestCountBlockedChanges_ReadsTheVerdictInAnyCase(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		TableChanges: []*ternv1.TableChange{
+			{Namespace: "testapp", TableName: "users", ExecutionMode: "BLOCKED"},
+			{Namespace: "testapp", TableName: "orders", ExecutionMode: engine.ExecutionModeBlocked},
+			{Namespace: "testapp", TableName: "refunds", ExecutionMode: engine.ExecutionModeDirect},
+		},
+	}}}
+
+	assert.Equal(t, 2, countBlockedChanges(cs))
+}

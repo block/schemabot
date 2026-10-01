@@ -656,10 +656,13 @@ every path that records a check from a plan plans the other members first. A mem
 be planned is unknown work, never none. *Breaks if violated:* a PR merges green while a target still
 lacks its schema change. *Enforced:* member work counted into the stored check state
 (`upsertPlanCheckRecord` in `pkg/webhook/check_records.go`, read from `PlanRollup.MembersWithWork`
-in `pkg/api`); the rollout round the apply command and apply-confirm run before answering an empty
-primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); the failing
+in `pkg/api`); the rollout round the apply command and apply-confirm run before answering any
+primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); apply creation
+refusing member work the apply's operation shape cannot carry, rather than settling that member as
+done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
-(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`).
+(`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`);
+the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`).
 
 ## Apply state machine (ST)
 
@@ -829,15 +832,20 @@ without completing the request would refuse the start the hold exists to preserv
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate, and `FindNextApplyOperationCutover`
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
-storage parity suite (`pkg/storage/storagetest/apply_operations.go`); for a manually deferred cutover, the turn
-check `CutoverBlocker` (same file, sharing the automatic cutover claim's
+storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
+dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), and each member's progress and cutover are scoped to its own operation
+(`progressScopeOperation` in `pkg/tern/local_client.go`, `boundCutoverRequestTurn` in
+`pkg/tern/local_control.go`); for a manually deferred cutover, the turn
+check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sharing the automatic cutover claim's
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`), through which every
-projection builds its children, with `completeLandedStopForHeldOpenApply` and `RolloutHeldByResumableChild` keeping a held-open
-rollout's stop resolved and its recovery claim quiet (`pkg/api/operator.go`).
+projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
+`updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
+`completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`).
 
 ## Ownership and leases (OW)
 
@@ -1100,8 +1108,14 @@ control paths (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`).
 Stop is the highest-priority intent. Once accepted, no actor may knowingly advance the apply
 toward deploy, cutover, or completion until the stop is processed: forward-progress commands are
 rejected while a stop pends, and contradictory intents are rejected at acceptance rather than
-resolved by drive ordering. *Enforced:* pending-stop checks in pollers and the cutover paths
-(`pkg/tern/cutover_barrier.go`, `pkg/tern/local_control.go`); conflict rejection at request intake
+resolved by drive ordering. Cancel is not forward progress: it halts at least as far as stop, so it
+is accepted while a stop pends and every drive consumes it ahead of the stop, as an escalation.
+*Enforced:* pending-stop checks in pollers and the cutover paths
+(`pkg/tern/cutover_barrier.go`, `pkg/tern/local_control.go`), and in the group_finalizer drive
+before it hands a VSchema to the engine (`finalizerStandsDownForPendingControl`,
+`pkg/tern/local_control_resume.go`); cancel-before-stop consumption on both clients
+(`processPendingCancelOrStopControlRequest`, `pkg/tern/local_control.go`,
+`pkg/tern/grpc_client.go`); conflict rejection at request intake
 (`pkg/api/control_handlers.go`).
 
 ### CO-5: The revert phase owns the outcome
@@ -1488,9 +1502,21 @@ Unsafe changes (error-severity lint findings such as table and column drops) blo
 unfinished row copy, require the operator to confirm the specific consequences disclosed to
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`), plus rollback confirmation's transactional lock-intent check
-(`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
-`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
+`pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
+reviewed target's included, is what the confirmation was given against and carries no consequence
+it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversReviewedTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
+`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), and apply creation refusing, whatever the flags,
+unsafe changes that the disclosure never named in a plan it did not come from
+(`rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
+when `--allow-unsafe` is passed, judged against every unsafe change the plan carries, a divergent
+shard's included (`pkg/cmd/commands/apply.go`, `pkg/cmd/commands/rollback.go`, over
+`PlanResponse.UnsafeChanges` in `pkg/apitypes/apitypes.go`). On the PR-comment rollback path the
+consent is the `rollback-confirm` comment itself: it is accepted only from an authorized
+admin/operator, after the rollback plan comment has warned that the rollback may include
+destructive changes, and it is pinned to that plan by rollback confirmation's transactional
+lock-intent check (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
+`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`); the apply it submits
+carries `allow_unsafe` on that basis rather than from a flag.
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
@@ -1514,7 +1540,12 @@ drives refusing blocked rows before engine hand-off, a resumed drive first tight
 its own re-plan's verdict (`pkg/tern/local_apply.go`, `pkg/tern/local_control_resume.go`); the
 direct-execution size bound ([direct-execution.md](direct-execution.md)); the policy those
 verdicts were judged under recorded on the plan row and read at admission in place of a second
-resolution (`storage.Plan.DirectExecution`, `pkg/api/plan_handlers.go`).
+resolution (`storage.Plan.DirectExecution`, `pkg/api/plan_handlers.go`); in a rollout, each
+member's own direct changes disclosed under that member's plan (`deploymentPlanGroups` in
+`pkg/webhook/plan_drift.go`), with apply-confirm refusing a member whose execution modes differ
+from the confirmed round's (`roundCoversWork` in `pkg/webhook/apply_member_work.go`), and apply
+creation refusing a member's own direct change for any caller other than that confirmed
+apply-confirm (`rejectUnconfirmedMemberDirectExecution` in `pkg/api/plan_handlers.go`).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
 
@@ -1545,7 +1576,10 @@ Reading one dialect's DDL under another's grammar is the same class of failure a
 at all, because a statement that misparses can also misclassify, and classification is what
 destructive gating reads. A classifier refuses ambiguity, so a compound statement never classifies
 as its first verb and rides past that gate. *Enforced:* dialect resolution at the parser seam
-(`pkg/ddl/parser.go`); the Spirit `statement` and libpg_query boundaries.
+(`pkg/ddl/parser.go`); the Spirit `statement` and libpg_query boundaries; the `fix-lint`
+database-type gate (`pkg/cmd/commands/fixlint.go`), which refuses a schema directory whose
+`schemabot.yaml` declares a type outside the MySQL family because the fixer has only the MySQL
+grammar.
 
 ### RV-7: Rollback needs the originals
 
@@ -1568,6 +1602,24 @@ feed a plan end it on any table they cannot read (`fetchCurrentSchema` in
 a table declared by two desired schema files fails planning on every engine through one rule
 (`ddl.TableDeclarations` in `pkg/ddl/table_declarations.go`, applied by `pkg/engine/spirit/spirit.go`,
 `pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
+A namespace the plan withholds, through `ignore_namespaces` or a targets entry's selection, is
+refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
+`pkg/tern/local_client.go`).
+
+### RV-9: A rollout member runs only a plan made for it
+
+Each member of an apply runs the plan made against that member, or, where the environment's
+members mirror each other, the rollout primary's plan. A plan made for one member never runs on
+another: an apply narrowed to one member runs only on the member its plan was made for, and an
+apply of the whole rollout runs from the rollout primary's plan. An apply that ran on one member
+is never rolled back across the rollout. *Enforced:* member pairing at apply creation
+(`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
+`pkg/api/plan_handlers.go`), which holds a plan to the narrowing recorded on its stored row
+(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply
+and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`); on a data plane, the plan each
+member target's operation records as it attaches to the deployment's apply
+(`attachDispatchOperation`, `pkg/tern/local_client.go`), which its drive runs (`drivePlanID`) and
+its lost-work verification re-plans from (`planIDForTasks`, `pkg/tern/local_control_resume.go`).
 
 ## Routing and authorization (AZ)
 
@@ -1577,11 +1629,15 @@ A request names a database and an environment. It never names the place those re
 target and which deployment stand behind that name, and therefore which physical database is
 changed and with whose credentials, comes from configuration the server owns. A plan request and
 an apply request have no field for it, so a caller cannot supply one, and a caller who is wrong
-about the topology cannot be wrong in a way that lands anywhere.
+about the topology cannot be wrong in a way that lands anywhere. A request may select one rollout
+member of the environment by name, but the server resolves that name against the members its own
+configuration defines, and a name it does not define is refused.
 
 That route is resolved once, when the plan is made, and stored on the plan. The apply reads it
 back off the plan rather than resolving the name a second time, so configuration that changes
-between review and apply cannot quietly move the change to a different database. A plan missing
+between review and apply cannot quietly move the change to a different database. An apply that
+selects a member resolves the selection only to hold it against the plan's stored route, and is
+refused when the two differ. A plan missing
 its stored route is not re-resolved as a convenience: the apply is refused and asks for a fresh
 plan, because re-resolving is exactly the step that could produce a different answer than the one
 the operator reviewed.
@@ -1591,7 +1647,8 @@ it count as a source for a database only because server config says so, verified
 made and verified again before the apply runs. Config that cannot answer the question is a
 refusal, never a default. *Breaks if violated:* a change reviewed against one database is applied
 to another. *Enforced:* server-side routing (`pkg/tern/target_router.go`), the schema override
-allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), the PostgreSQL
+allowlist (`pkg/tern/local_client.go`, validated by `pkg/inventory/static.go`), rollout member
+selection (`pkg/api/rollout_member_selector.go`, `applyTargets` in `pkg/api/plan_handlers.go`), the PostgreSQL
 apply's check that planned DDL names the schema it targets (`pkg/engine/postgres/apply.go`), and
 source policy (`pkg/webhook/schema_source_policy.go`).
 
@@ -1628,8 +1685,10 @@ their own review requirement. *Enforced:* the review gate and actor authorizatio
 An unscoped PR command resolves to exactly one unambiguous database or is rejected with guidance,
 never resolved by an arbitrary pick. A malformed command is rejected rather than "helpfully"
 corrected into something executable, especially one carrying `--allow-unsafe`. Every command
-receives a response, and silence only ever means another instance owns the reply. *Enforced:*
-command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
+receives a response, and silence only ever means another instance owns the reply or the comment
+issues no command: a line that opens with the product name but reads as a sentence about it, not a
+command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
+unowned-command policy (`pkg/webhook/commands.go`).
 
 ### AZ-6: Local hosting preserves its boundaries
 
@@ -1657,20 +1716,22 @@ published. Secret references remain references on disk.
 
 ### AZ-8: Profile registration preserves connection identity
 
-Registering a local profile must not replace a different connection, change the default profile,
+Registering a local profile must not replace a different connection, change an existing default profile,
 or overwrite a concurrent configuration update. Retrying an identical registration is safe.
 
 *Enforced:* `pkg/cmd/client/local_profile.go` and `pkg/cmd/client/config.go`.
 
 ### AZ-9: Initialization preserves the target and existing files
 
-Initialization verifies the imported schema before publishing it and never applies changes to the
-target. It must not overwrite existing schema files or redirect an existing profile to another
-connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
+Initialization verifies the imported schema before publishing it and never applies changes to an
+existing target. An explicitly requested sample is created and seeded separately before entering
+the same import-and-verify workflow. It must not overwrite existing schema files or redirect
+an existing profile to another connection. A retry may reuse identical imported files. Failed setup preserves the runtime and
 its state so the retry uses the same execution authority.
 
 *Enforced:* `pkg/cmd/commands/init.go`, `pkg/cmd/commands/init_publish_darwin.go`,
-`pkg/cmd/commands/init_publish_linux.go`, and `pkg/cmd/commands/init_publish_other.go`.
+`pkg/cmd/commands/init_publish_linux.go`, `pkg/cmd/commands/init_publish_other.go`,
+`pkg/cmd/commands/init_sample.go`, and `pkg/localdemo/database.go`.
 
 ## Structural enforcement
 

@@ -107,3 +107,6 @@ terraform.rc
 # Python tooling caches
 __pycache__/
 *.pyc
+
+# Reusable sample projects created by make demo
+.schemabot-demo/

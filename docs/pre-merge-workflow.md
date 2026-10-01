@@ -182,6 +182,17 @@ next command from SchemaBot's own comment rather than typing it: the comment
 always renders the exact next command with the apply ID, the environment, and
 any other required flags filled in.
 
+A command runs only from a line that holds nothing else: `schemabot`, the
+command, and its flags and apply ID. A line with any other word on it, such as
+"SchemaBot apply -e staging succeeded", is a sentence about SchemaBot and is
+ignored, as are commands inside code blocks, quotes, and HTML comments, so a
+quote-reply to a command never runs it. Each flag and apply ID has to be
+written exactly: a command line with a mistyped flag or a stray character, such
+as `--allow-unsafe.`, gets the invalid-command reply and runs nothing, rather
+than running with the token trimmed. Anyone posting status updates on a PR, an
+agent included, can describe SchemaBot freely; to show a command without
+running it, put it in a code block or a quote.
+
 ### Applies happen before merge
 
 You apply while the PR is open. Once the required schema checks pass, merging

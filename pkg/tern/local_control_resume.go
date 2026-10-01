@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -1740,28 +1742,102 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 }
 
 // finalizerOperationKeySuffix is the trailing segment of a namespace-scoped
-// group_finalizer operation key (namespace + "/" + segment), assigned at apply
-// creation. The drive parses the namespace back out to reconstruct the VSchema
-// change.
-const finalizerOperationKeySuffix = "/group_finalizer"
+// group_finalizer operation key within one target (namespace + "/" + segment),
+// assigned at apply creation. The drive parses the namespace back out to
+// reconstruct the VSchema change.
+const finalizerOperationKeySuffix = state.OperationKeyDelimiter + state.GroupFinalizerKeySegment
 
 // finalizerDeploymentScopedKey is the operation key of a deployment-scoped
 // group_finalizer — the single operation a VSchema-only apply is shaped as. It
 // carries no namespace: the drive applies every VSchema-changed namespace in
 // the plan in one engine apply, because the engine treats the deployment (one
 // branch, one deploy) as the unit of change.
-const finalizerDeploymentScopedKey = "group_finalizer"
+const finalizerDeploymentScopedKey = state.GroupFinalizerKeySegment
 
-// namespaceFromFinalizerKey recovers the namespace a group_finalizer operation
-// targets from its operation key. Returns empty for any key without a
-// namespace prefix — callers must distinguish the deployment-scoped key
-// (finalizerDeploymentScopedKey, where empty means "all VSchema namespaces")
-// from a malformed key, which is a fail-closed condition.
-func namespaceFromFinalizerKey(operationKey string) string {
-	if !strings.HasSuffix(operationKey, finalizerOperationKeySuffix) {
-		return ""
+// resolveFinalizerNamespace returns the namespace a group_finalizer operation
+// finalizes, or empty for a deployment-scoped finalizer, which finalizes every
+// namespace its plan asks to. It reads the operation's key in the shape the key
+// writer gave it (see finalizerNamespaceFromKey). A data-plane apply shared by
+// a deployment's targets records that its keys lead with a target, since the
+// first target's finalizer can drive before any sibling target has attached;
+// every other apply's operation rows say which shape its keys have.
+func resolveFinalizerNamespace(ctx context.Context, store storage.Storage, apply *storage.Apply, op *storage.ApplyOperation) (string, error) {
+	ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("list operations of apply %s to resolve group_finalizer apply_operation %d scope: %w", apply.ApplyIdentifier, op.ID, err)
 	}
-	return strings.TrimSuffix(operationKey, finalizerOperationKeySuffix)
+	targetQualified := apply.GetOptions().OperationKeysLeadWithTarget || operationKeysLeadWithTarget(ops, op)
+	namespace, err := finalizerNamespaceFromKey(op.OperationKey, op.Target, targetQualified)
+	if err != nil {
+		return "", fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q: %w", op.ID, apply.ApplyIdentifier, op.OperationKey, err)
+	}
+	return namespace, nil
+}
+
+// operationKeysLeadWithTarget reports whether op's key leads with its target.
+// The key writer puts the target in front of every key of a deployment that
+// addresses more than one target (routing.MultiTargetDeployments over the
+// apply's members), so the reader applies that rule to the apply's operation
+// rows, op's own included.
+func operationKeysLeadWithTarget(ops []*storage.ApplyOperation, op *storage.ApplyOperation) bool {
+	members := make([]routing.ExecutionTarget, 0, len(ops)+1)
+	members = append(members, routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target})
+	for _, sibling := range ops {
+		members = append(members, routing.ExecutionTarget{Deployment: sibling.Deployment, Target: sibling.Target})
+	}
+	return routing.MultiTargetDeployments(members)[op.Deployment]
+}
+
+// finalizerNamespaceFromKey reads the namespace out of a group_finalizer
+// operation key, or empty for a deployment-scoped finalizer. target is the
+// operation's own target, and targetQualified says whether the writer put it in
+// front of the key.
+//
+// A deployment that addresses one target keys its finalizers within that
+// target: "ns_0/group_finalizer", or the bare "group_finalizer" when
+// deployment-scoped. A deployment that addresses several targets leads each key
+// with the operation's target: "orders-001/ns_0/group_finalizer", or
+// "orders-001/group_finalizer" when deployment-scoped. The key alone cannot
+// tell a namespace from a target in "orders/group_finalizer", since a target
+// can share a namespace's name, so targetQualified decides it. Two components
+// in front of the segment are always a target and a namespace, because a
+// namespace cannot contain the delimiter; that key must still lead with the
+// operation's own target.
+//
+// Any other key, or a qualified key led by another target, is an error: the
+// drive must not finalize a scope it cannot name.
+func finalizerNamespaceFromKey(operationKey, target string, targetQualified bool) (string, error) {
+	if operationKey == state.GroupFinalizerKeySegment {
+		if targetQualified {
+			return "", fmt.Errorf("deployment addresses several targets, so the key must lead with target %q", target)
+		}
+		return "", nil
+	}
+	scope, ok := state.FinalizerScope(operationKey)
+	if !ok {
+		return "", fmt.Errorf("key does not end in %q after a scope", finalizerOperationKeySuffix)
+	}
+	parts := strings.Split(scope, state.OperationKeyDelimiter)
+	if slices.Contains(parts, "") {
+		return "", fmt.Errorf("scope %q has an empty component", scope)
+	}
+	switch len(parts) {
+	case 1:
+		if !targetQualified {
+			return parts[0], nil
+		}
+		if parts[0] != target {
+			return "", fmt.Errorf("deployment addresses several targets, so the key must lead with target %q", target)
+		}
+		return "", nil
+	case 2:
+		if target == "" || parts[0] != target {
+			return "", fmt.Errorf("scope %q names target %q, not the operation's target %q", scope, parts[0], target)
+		}
+		return parts[1], nil
+	default:
+		return "", fmt.Errorf("scope %q has more components than a target and a namespace", scope)
+	}
 }
 
 // driveGroupFinalizer drives a task-less group_finalizer operation: it applies
@@ -1791,9 +1867,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	if plan == nil {
 		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
-	namespace := namespaceFromFinalizerKey(op.OperationKey)
-	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
-		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
+	namespace, err := resolveFinalizerNamespace(ctx, c.storage, apply, op)
+	if err != nil {
+		return err
 	}
 	changes, err := finalizerVSchemaChanges(plan, namespace)
 	if err != nil {
@@ -1809,19 +1885,6 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	}
 
 	work := finalizerWork(changes)
-	c.logger.Info("driving group_finalizer",
-		"work", work,
-		"apply_id", apply.ApplyIdentifier,
-		"apply_operation_id", op.ID,
-		"deployment", op.Deployment,
-		"namespace", namespace,
-		"namespace_count", len(changes),
-		"database", apply.Database,
-	)
-	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
-		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
-	}
-
 	failClosed := func(cause error) error {
 		if markErr := c.storage.ApplyOperations().MarkFailed(ctx, op.ID, cause.Error()); markErr != nil {
 			c.logger.Error("group_finalizer: failed to mark operation failed",
@@ -1844,20 +1907,63 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	}
 
 	var resumeState *engine.ResumeState
+	handedToEngine := false
 	stored, getErr := c.storage.ApplyOperations().GetEngineResumeState(ctx, op.ID)
 	switch {
 	case errors.Is(getErr, storage.ErrEngineResumeStateNotFound):
-		// No persisted resume state yet — this is the finalizer's first drive, so
-		// start fresh.
+		// No drive has recorded handing this finalizer's work to the engine, so
+		// this drive is the first to reach it and starts fresh.
 	case getErr != nil:
 		// A storage read failure must not be treated as "fresh": proceeding would
 		// risk the engine restarting or duplicating in-flight VSchema work after a
 		// transient DB error. Fail closed for the operator to retry.
 		return failClosed(fmt.Errorf("load engine resume state for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, getErr))
 	case stored != nil:
-		resumeState = &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
+		handedToEngine = true
+		resumeState = finalizerEngineResumeState(stored)
 	}
 
+	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
+		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+
+	// An operator's pending cancel or stop decides whether this finalizer may
+	// hand its VSchema to the engine at all, the same way a work operation's
+	// drive consumes pending commands before it resumes its tasks. The read is
+	// the drive's last read before the engine call, after the start is durable,
+	// so every command committed before the engine is reached is seen here. A
+	// command committed after it arrives while the finalizer is already handing
+	// its work to the engine: that is the in-flight case, and the apply's
+	// terminal settlement resolves it as outrun rather than dropping it.
+	if standDown, err := c.finalizerStandsDownForPendingControl(ctx, apply, op, namespace, handedToEngine); standDown || err != nil {
+		return err
+	}
+
+	// Record the handoff before the engine is reached, so a later drive of this
+	// row knows the VSchema may already be live even when the engine reports no
+	// resume state of its own (a synchronous apply, or a deploy that has not yet
+	// produced one) or a later save of that state fails. The record is what
+	// keeps a re-drive from settling the row cancelled or stopped over work the
+	// engine already carried out, so a failure to write it stops the drive
+	// before the engine call; the row stays running for a later drive to retry.
+	if !handedToEngine {
+		if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
+			ApplyOperationID: op.ID,
+			Metadata:         finalizerEngineHandoffMetadata,
+		}); err != nil {
+			return fmt.Errorf("record engine handoff for group_finalizer apply_operation %d (apply %s) before applying its VSchema: %w", op.ID, apply.ApplyIdentifier, err)
+		}
+	}
+
+	c.logger.Info("driving group_finalizer",
+		"work", work,
+		"apply_id", apply.ApplyIdentifier,
+		"apply_operation_id", op.ID,
+		"deployment", op.Deployment,
+		"namespace", namespace,
+		"namespace_count", len(changes),
+		"database", apply.Database,
+	)
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
 		Database:      apply.Database,
 		PlanID:        plan.PlanIdentifier,
@@ -1897,6 +2003,136 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	c.logger.Info("group_finalizer completed",
 		"work", work, "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
 	return nil
+}
+
+// finalizerStandsDownForPendingControl answers an operator's pending cancel or
+// stop for a group_finalizer before the finalizer hands anything to the engine.
+// Cancel is consulted first, in the order every drive consumes the two
+// (processPendingCancelOrStopControlRequest): a cancel is not forward progress
+// but an escalation of a pending stop, and the finalizer must settle the way
+// the apply's other operations do, since a finalizer left stopped under a
+// cancelled rollout would be resumable into publishing a VSchema for shard work
+// the operator threw away. A finalizer whose work has not reached the engine
+// settles its own operation row: cancelled for a cancel, and for a stop the
+// state the database type's stop settles to (stopped, or cancelled where a stop
+// cannot pause). The drive then stands down without applying the VSchema.
+//
+// The request itself stays pending. A finalizer owns only its own row, while
+// the command belongs to the whole apply: sibling operations still have to
+// consume it, and the rollout projection completes it once the apply resolves.
+//
+// inFlight reports that an earlier drive already handed the finalizer's work
+// to the engine (engine resume state, or the handoff record written before the
+// engine call, is stored). The engine may have published the VSchema or still
+// be deploying it, so settling storage would record a cancel or stop over work
+// that is live. The drive instead re-applies or reattaches and records the
+// outcome the engine reports.
+func (c *LocalClient) finalizerStandsDownForPendingControl(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, namespace string, inFlight bool) (bool, error) {
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
+		controlReq, err := pendingControlRequest(ctx, c.storage, apply, operation)
+		if err != nil {
+			return false, fmt.Errorf("check pending %s before group_finalizer apply_operation %d (apply %s): %w", operation, op.ID, apply.ApplyIdentifier, err)
+		}
+		if controlReq == nil {
+			continue
+		}
+		caller := controlRequestCaller(controlReq)
+		logAttrs := append(apply.LogAttrs(),
+			"apply_operation_id", op.ID, "operation_deployment", op.Deployment, "operation_key", op.OperationKey,
+			"namespace", namespace, "control_operation", operation, "requested_by", caller)
+		if inFlight {
+			c.logger.Warn("group_finalizer has VSchema work in flight on the engine; the drive follows it to the engine's outcome and leaves the pending command to the rest of the apply",
+				logAttrs...)
+			return false, nil
+		}
+		settledState := finalizerSettledStateForControl(operation, apply.DatabaseType)
+		if err := c.settleFinalizerOperation(ctx, op, settledState); err != nil {
+			return true, fmt.Errorf("settle group_finalizer apply_operation %d (apply %s) %s for pending %s: %w", op.ID, apply.ApplyIdentifier, settledState, operation, err)
+		}
+		// The drive's MarkStarted already moved the row to running, so running is
+		// the state this settle writes over, whatever the claim loaded.
+		previousState := state.ApplyOperation.Running
+		c.logger.Info("group_finalizer settled for a pending command before it applied anything; the rollout projection completes the command",
+			append(logAttrs, "previous_operation_state", previousState, "operation_state", settledState)...)
+		logEvent := storage.LogEventCancelRequested
+		if operation == storage.ControlOperationStop {
+			logEvent = storage.LogEventStopRequested
+		}
+		eventMsg := fmt.Sprintf("%s requested: VSchema finalizer for %s %s before it applied anything",
+			capitalizeControlVerb(string(operation)), finalizerScopeLabel(namespace), settledState)
+		if caller != "" {
+			eventMsg += callerApplyLogSuffix(caller)
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, logEvent, storage.LogSourceSchemaBot,
+			eventMsg, previousState, settledState)
+		return true, nil
+	}
+	return false, nil
+}
+
+// finalizerEngineHandoffMetadata is the engine resume state a group_finalizer
+// drive records immediately before its first engine call. It marks the row as
+// handed to the engine until the engine reports resume state of its own, which
+// replaces it.
+const finalizerEngineHandoffMetadata = `{"` + finalizerEngineHandoffKey + `":"true"}`
+
+// finalizerEngineHandoffKey is the one field of the handoff record.
+const finalizerEngineHandoffKey = "group_finalizer_engine_handoff"
+
+// finalizerEngineResumeState is the resume state a re-drive hands the engine,
+// from what an earlier drive of the finalizer stored. A bare handoff record
+// carries nothing the engine can resume from, so the drive re-applies the
+// VSchema from the plan, which is idempotent; anything else is the engine's own
+// state and is passed back unchanged.
+func finalizerEngineResumeState(stored *storage.EngineResumeState) *engine.ResumeState {
+	if isFinalizerHandoffRecordOnly(stored) {
+		return nil
+	}
+	return &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
+}
+
+// isFinalizerHandoffRecordOnly reports that the stored resume state is the
+// drive's own handoff record, with nothing the engine reported since. The
+// metadata is compared as JSON, not as text: a JSON storage column returns it
+// re-serialized, so the stored bytes need not match what the drive wrote.
+func isFinalizerHandoffRecordOnly(stored *storage.EngineResumeState) bool {
+	if stored.MigrationContext != "" {
+		return false
+	}
+	var fields map[string]string
+	if err := json.Unmarshal([]byte(stored.Metadata), &fields); err != nil {
+		return false
+	}
+	return len(fields) == 1 && fields[finalizerEngineHandoffKey] == "true"
+}
+
+// finalizerSettledStateForControl is the operation state a never-started
+// finalizer settles to for a pending command. A stop settles to stopped so a
+// later start resumes the finalizer, except on an engine whose stop is
+// permanent, where the single stop-terminality decision makes it cancelled.
+func finalizerSettledStateForControl(operation storage.ControlOperation, databaseType string) string {
+	if operation == storage.ControlOperationStop && !stopTerminatesChange(databaseType) {
+		return state.ApplyOperation.Stopped
+	}
+	return state.ApplyOperation.Cancelled
+}
+
+// settleFinalizerOperation moves the finalizer's own row to settledState under
+// the drive's lease. stopped is resumable and keeps completed_at nil.
+func (c *LocalClient) settleFinalizerOperation(ctx context.Context, op *storage.ApplyOperation, settledState string) error {
+	if state.IsState(settledState, state.ApplyOperation.Stopped) {
+		return c.storage.ApplyOperations().UpdateState(ctx, op.ID, settledState)
+	}
+	return c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, settledState)
+}
+
+// finalizerScopeLabel names what a finalizer covers in the apply log: its one
+// namespace, or every VSchema namespace for a deployment-scoped finalizer.
+func finalizerScopeLabel(namespace string) string {
+	if namespace == "" {
+		return "every namespace"
+	}
+	return "namespace " + namespace
 }
 
 // finalizerVSchemaChanges reconstructs the change(s) a group_finalizer applies,
@@ -2024,6 +2260,35 @@ func (c *LocalClient) drivePlanID(apply *storage.Apply, op *storage.ApplyOperati
 		return apply.PlanID, nil
 	}
 	return storage.PlanIDForOperation(apply, op)
+}
+
+// planIDForTasks resolves the plan a drive's tasks were built from, for the
+// paths that judge those tasks against their reviewed schema without an
+// operation in hand. Each task records its plan, and the rollout member
+// targets sharing one apply were each planned against their own live schema,
+// so the apply's plan, which is the plan of the dispatch that created it,
+// would judge a sibling target's tasks against another target's schema set.
+// Tasks naming different plans are refused rather than judged against one of
+// them. Tasks that record no plan fall back to the apply's.
+func planIDForTasks(apply *storage.Apply, tasks []*storage.Task) (int64, error) {
+	var planID int64
+	for _, task := range tasks {
+		switch {
+		case task.PlanID == 0:
+			// Judged against the plan its siblings name, or the apply's.
+		case planID == 0:
+			planID = task.PlanID
+		case task.PlanID != planID:
+			return 0, fmt.Errorf("tasks of apply %s were built from different plans (%d and %d); refusing to judge them against one", apply.ApplyIdentifier, planID, task.PlanID)
+		}
+	}
+	if planID != 0 {
+		return planID, nil
+	}
+	if apply.PlanID == 0 {
+		return 0, fmt.Errorf("neither the tasks nor apply %s name a plan", apply.ApplyIdentifier)
+	}
+	return apply.PlanID, nil
 }
 
 // resumeApplyWithTasks drives an apply (or one of its operations) from the set

@@ -517,3 +517,28 @@ func FormatAvailableDatabases(errMsg string) string {
 	}
 	return result.String()
 }
+
+// MemberPlanBlockedDetail is the error line for an apply whose creation refused
+// one rollout target's own plan for a change its engine refuses. It is built
+// from the target's name and the table rather than from the refusal's error
+// text, and it names the target so the operator looks for the change under
+// that target's plan instead of in the reviewed one.
+func MemberPlanBlockedDetail(target, table string) string {
+	return fmt.Sprintf("Target %s has a change on table %s that its engine refuses to execute, so nothing was applied. Fix what that target's plan names as the reason, then run the command again.",
+		inlineCode(target), inlineCode(table))
+}
+
+// MemberPlanUndisclosedUnsafeDetail is the error line for an apply whose
+// creation refused one rollout target's own plan for an unsafe change the
+// reviewed plan does not carry. The comment's unsafe disclosure names only the
+// reviewed plan's changes, so no `--allow-unsafe` covers it, and the line does
+// not suggest one. Like MemberPlanBlockedDetail, it is built from names
+// SchemaBot controls; table is empty for a VSchema change in namespace.
+func MemberPlanUndisclosedUnsafeDetail(target, table, namespace string) string {
+	subject := "table " + inlineCode(table)
+	if table == "" {
+		subject = "the VSchema of namespace " + inlineCode(namespace)
+	}
+	return fmt.Sprintf("Target %s has an unsafe change on %s that the reviewed plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the reviewed plan carries the same change.",
+		inlineCode(target), subject)
+}

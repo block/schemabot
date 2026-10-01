@@ -45,7 +45,7 @@ func multiTargetService(t *testing.T, client *mockTernClient, plans storage.Plan
 				Environments: map[string]EnvironmentConfig{
 					"production": {
 						Deployment: "eu",
-						Targets:    []string{"testapp-001", "testapp-002"},
+						Targets:    targetNames("testapp-001", "testapp-002"),
 					},
 				},
 			},

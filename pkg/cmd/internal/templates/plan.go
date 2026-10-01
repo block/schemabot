@@ -559,6 +559,16 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	fmt.Println()
 }
 
+// UnsafeChangesBlockedSummary is WriteUnsafeChangesBlocked on one line, for a
+// refusal with nowhere to print the list, such as JSON output: the same count
+// and findings, and the command that permits them, starting with the binary
+// name so it runs as pasted. rerun is built as for WriteUnsafeChangesBlocked.
+func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun string) string {
+	findings := unsafeFindingLines(changes)
+	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s %s",
+		len(findings), strings.Join(findings, "; "), cliname.Name(), rerun)
+}
+
 // WriteUnsafeWarningAllowed writes a warning when destructive changes are
 // permitted and will run.
 //
@@ -587,19 +597,26 @@ const UnsafeConsentAllowFlag = "--allow-unsafe enabled"
 // always equals the number of lines below it and a finding can be referenced
 // by its number.
 func writeUnsafeChangesList(changes []UnsafeChange) {
-	n := 0
+	for i, finding := range unsafeFindingLines(changes) {
+		fmt.Printf("  %d. %s\n", i+1, finding)
+	}
+}
+
+// unsafeFindingLines is each unsafe finding as "table: finding", in the order
+// the list numbers them.
+func unsafeFindingLines(changes []UnsafeChange) []string {
+	var lines []string
 	for _, c := range changes {
 		reasons := unsafeChangeFindings(c)
 		if len(reasons) == 0 {
-			n++
-			fmt.Printf("  %d. %s: %s\n", n, c.Table, c.ChangeType)
+			lines = append(lines, c.Table+": "+c.ChangeType)
 			continue
 		}
 		for _, r := range reasons {
-			n++
-			fmt.Printf("  %d. %s: %s\n", n, c.Table, r)
+			lines = append(lines, c.Table+": "+r)
 		}
 	}
+	return lines
 }
 
 // countUnsafeFindings sums the individual findings across changes so the
