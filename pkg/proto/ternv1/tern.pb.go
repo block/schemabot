@@ -4834,9 +4834,9 @@ var file_tern_proto_extTypes = []protoimpl.ExtensionInfo{
 	{
 		ExtendedType:  (*descriptorpb.FieldOptions)(nil),
 		ExtensionType: (*string)(nil),
-		Field:         50001,
+		Field:         78241,
 		Name:          "tern.v1.requires_remote_capability",
-		Tag:           "bytes,50001,opt,name=requires_remote_capability",
+		Tag:           "bytes,78241,opt,name=requires_remote_capability",
 		Filename:      "tern.proto",
 	},
 }
@@ -4864,7 +4864,13 @@ var (
 	// turns that failure into a refusal that names the upgrade; it does not
 	// make an unsafe misread safe.
 	//
-	// optional string requires_remote_capability = 50001;
+	// The number is process-wide: the protobuf runtime refuses to start a
+	// binary in which two linked schemas extend FieldOptions with the same
+	// number, and a host that embeds SchemaBot links whatever else it links.
+	// The low end of the in-house range is crowded (etcd, which Vitess links,
+	// takes 50000 through 50003), so this sits well away from it.
+	//
+	// optional string requires_remote_capability = 78241;
 	E_RequiresRemoteCapability = &file_tern_proto_extTypes[0]
 )
 
@@ -4974,7 +4980,7 @@ const file_tern_proto_rawDesc = "" +
 	"\aenabled\x18\x01 \x01(\bR\aenabled\x12$\n" +
 	"\x0emax_table_rows\x18\x02 \x01(\x03R\fmaxTableRows\x12G\n" +
 	" lock_acquisition_timeout_seconds\x18\x03 \x01(\x03R\x1dlockAcquisitionTimeoutSeconds\x12L\n" +
-	"\x0fmax_table_bytes\x18\x04 \x01(\x03B$\x8a\xb5\x18 direct_execution.max_table_bytesR\rmaxTableBytes\"\x85\x05\n" +
+	"\x0fmax_table_bytes\x18\x04 \x01(\x03B$\x8a\x9a& direct_execution.max_table_bytesR\rmaxTableBytes\"\x85\x05\n" +
 	"\vTableChange\x12\x1d\n" +
 	"\n" +
 	"table_name\x18\x01 \x01(\tR\ttableName\x12\x10\n" +
@@ -5350,7 +5356,7 @@ const file_tern_proto_rawDesc = "" +
 	"\x05Start\x12\x15.tern.v1.StartRequest\x1a\x16.tern.v1.StartResponse\"\x14\x82\xd3\xe4\x93\x02\x0e:\x01*\"\t/v1/start\x12~\n" +
 	"\x11StorageSchemaPlan\x12!.tern.v1.StorageSchemaPlanRequest\x1a\".tern.v1.StorageSchemaPlanResponse\"\"\x82\xd3\xe4\x93\x02\x1c:\x01*\"\x17/v1/storage-schema/plan\x12\x82\x01\n" +
 	"\x12StorageSchemaApply\x12\".tern.v1.StorageSchemaApplyRequest\x1a#.tern.v1.StorageSchemaApplyResponse\"#\x82\xd3\xe4\x93\x02\x1d:\x01*\"\x18/v1/storage-schema/apply:]\n" +
-	"\x1arequires_remote_capability\x12\x1d.google.protobuf.FieldOptions\x18ц\x03 \x01(\tR\x18requiresRemoteCapabilityB-Z+github.com/block/schemabot/pkg/proto/ternv1b\x06proto3"
+	"\x1arequires_remote_capability\x12\x1d.google.protobuf.FieldOptions\x18\xa1\xe3\x04 \x01(\tR\x18requiresRemoteCapabilityB-Z+github.com/block/schemabot/pkg/proto/ternv1b\x06proto3"
 
 var (
 	file_tern_proto_rawDescOnce sync.Once

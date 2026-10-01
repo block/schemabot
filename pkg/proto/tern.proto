@@ -28,7 +28,13 @@ extend google.protobuf.FieldOptions {
   // an older server that misreads it still fails closed. The annotation
   // turns that failure into a refusal that names the upgrade; it does not
   // make an unsafe misread safe.
-  string requires_remote_capability = 50001;
+  //
+  // The number is process-wide: the protobuf runtime refuses to start a
+  // binary in which two linked schemas extend FieldOptions with the same
+  // number, and a host that embeds SchemaBot links whatever else it links.
+  // The low end of the in-house range is crowded (etcd, which Vitess links,
+  // takes 50000 through 50003), so this sits well away from it.
+  string requires_remote_capability = 78241;
 }
 
 // Tern provides schema change planning and execution.
