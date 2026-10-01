@@ -162,6 +162,14 @@ func formatShardLine(s ShardProgress) string {
 		return fmt.Sprintf(indentShardLine+"%s○ %s: queued%s\n", ANSIDim, s.Shard, ANSIReset)
 	case state.Task.Failed:
 		return fmt.Sprintf(indentShardLine+"%s✗ %s%s: failed\n", ANSIRed, s.Shard, ANSIReset)
+	case state.Task.Stopped, state.Task.Cancelled:
+		// A part that had copied rows says how far it got before it halted.
+		if s.RowsCopied > 0 && s.RowsTotal > 0 {
+			return fmt.Sprintf(indentShardLine+"%s○ %s: %s at %s (%s/%s rows)%s\n", ANSIDim, s.Shard, s.Status,
+				ui.FormatRowCopyPercent(s.PercentComplete, s.RowsCopied, s.RowsTotal),
+				ui.FormatNumber(ui.ClampRows(s.RowsCopied, s.RowsTotal)), ui.FormatNumber(s.RowsTotal), ANSIReset)
+		}
+		return fmt.Sprintf(indentShardLine+"%s○ %s: %s%s\n", ANSIDim, s.Shard, partStatusLabel(s.Status), ANSIReset)
 	default:
 		return fmt.Sprintf(indentShardLine+"%s○ %s: %s%s\n", ANSIDim, s.Shard, partStatusLabel(s.Status), ANSIReset)
 	}

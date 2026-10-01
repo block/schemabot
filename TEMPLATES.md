@@ -7179,8 +7179,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
        • Shards: 2 (2 cancelled)
-           ○ -80: cancelled
-           ○ 80-: cancelled
+           ○ -80: cancelled at 38.10% (800,000/2,100,000 rows)
+           ○ 80-: cancelled at 21.05% (400,000/1,900,000 rows)
 
 ```
 </details>
@@ -9535,6 +9535,38 @@ To stop this schema change:
 
 To cut over prod/payments-001:
   schemabot cutover apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-stopped"></a><strong>Multi-target Rollout Stopped</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        stopped                                │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Targets:      1 completed · 2 stopped                │
+└───────────────────────────────────────────────────────┘
+
+⏹️ prod — 1 completed · 2 stopped (3 targets)
+
+     ~ orders: ⏹️ Stopped
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+       • Targets: 3 (1 complete, 2 stopped)
+           ✓ payments-001: 80,000 rows
+           ○ payments-002: stopped at 40.00% (32,000/80,000 rows)
+           ○ payments-003: stopped at 25.00% (20,000/80,000 rows)
+
+To resume from where it stopped:
+  schemabot start apply-multi-a1b2c3d4 -e production
 ```
 </details>
 

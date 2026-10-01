@@ -455,6 +455,10 @@ func isInstantAlter(t TableProgress) bool {
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
+	if isHaltedAcrossTargets(t) {
+		return formatHaltedAcrossTargets(t)
+	}
+
 	var b strings.Builder
 
 	// Handle special states first - all use format: tablename: [bar] [status]

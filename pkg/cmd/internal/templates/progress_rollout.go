@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/cmd/cliname"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -174,7 +175,9 @@ func tableChangeSignature(tables []TableProgress) string {
 // matches on DDL as well as table, so a table changed by two statements rolls
 // up once per statement. The change reads as instant only when every target
 // that ran it reports it instant: an engine decides that per target, so one
-// target's instant ALTER says nothing about how another applied it.
+// target's instant ALTER says nothing about how another applied it. Once no
+// target is working on the change and one has halted, those rows no longer
+// speak for the table, which renders as its halt (formatHaltedAcrossTargets).
 func tableAcrossTargets(v RolloutView, members []int, table TableProgress) TableProgress {
 	rolled := TableProgress{
 		TableName:     table.TableName,
@@ -222,6 +225,63 @@ func tableAcrossTargets(v RolloutView, members []int, table TableProgress) Table
 		rolled.PercentComplete = int(min(rolled.RowsCopied, rolled.RowsTotal) * 100 / rolled.RowsTotal)
 	}
 	return rolled
+}
+
+// isHaltedAcrossTargets reports whether a table rolled up across targets has
+// halted: no target is still working on the change, and one failed, is
+// retrying, was stopped or was cancelled. Its rolled-up rows cover only the
+// targets that finished, so no one bar or percentage speaks for the table.
+func isHaltedAcrossTargets(t TableProgress) bool {
+	return t.AcrossTargets && state.IsState(t.Status,
+		state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled)
+}
+
+// formatHaltedAcrossTargets renders a halted table across targets the way the
+// PR comment's table line does: the table reads as its halt, with no bar, and
+// each target's line beneath says where that target finished or halted.
+func formatHaltedAcrossTargets(t TableProgress) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s\n", t.TableName, haltedAcrossTargetsPhrase(t))
+	if t.DDL != "" {
+		b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
+	}
+	b.WriteString("\n")
+	b.WriteString(formatTableParts(t))
+	return b.String()
+}
+
+// haltedAcrossTargetsPhrase names a halted table's state across its targets.
+// A stop or cancel reads "not started" only when no target got as far as
+// copying a row or completing the change: once one has, the change is
+// partly or wholly live, and "not started" would be false.
+func haltedAcrossTargetsPhrase(t TableProgress) string {
+	notStarted := ""
+	if !anyTargetStarted(t.Shards) {
+		notStarted = " (not started)"
+	}
+	switch t.Status {
+	case state.Task.Failed:
+		return glyph.Failed + " Failed"
+	case state.Task.FailedRetryable:
+		return "Retrying"
+	case state.Task.Stopped:
+		return "⏹️ Stopped" + notStarted
+	case state.Task.Cancelled:
+		return "🚫 Cancelled" + notStarted
+	default:
+		return t.Status
+	}
+}
+
+// anyTargetStarted reports whether any target completed the change or copied
+// at least one row of it.
+func anyTargetStarted(targets []ShardProgress) bool {
+	for _, target := range targets {
+		if target.Status == state.Task.Completed || target.RowsCopied > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // countsTowardRolledRows reports whether a target's rows join the table's

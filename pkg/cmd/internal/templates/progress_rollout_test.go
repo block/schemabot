@@ -408,6 +408,64 @@ func TestInFlightRollupOrder_CoversEveryInFlightTaskState(t *testing.T) {
 	assert.ElementsMatch(t, inFlight, inFlightRollupOrder)
 }
 
+// A table on which no target is still working and one has halted reads as
+// its halt, the way the PR comment's table line does. Its summed rows would
+// cover only the targets that finished, so no bar or rows line speaks for the
+// table; each target's line says where that target finished or halted, and
+// "not started" is said only when no target got as far as a row.
+func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
+	stoppedAt := func(copied int64) rolloutTarget {
+		return rolloutTarget{opState: state.ApplyOperation.Stopped, status: state.Task.Stopped, rowsCopied: copied, rowsTotal: 1000, startedAt: "2026-09-30T12:00:00Z"}
+	}
+	failedAt := func(copied int64) rolloutTarget {
+		return rolloutTarget{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: copied, rowsTotal: 1000, err: "Error 1062: Duplicate entry"}
+	}
+	cancelledBeforeCopying := rolloutTarget{opState: state.ApplyOperation.Cancelled, status: state.Task.Cancelled, rowsTotal: 1000}
+	for name, tc := range map[string]struct {
+		targets  []rolloutTarget
+		headline string
+		lines    []string
+	}{
+		"two targets stopped part-way": {
+			targets:  []rolloutTarget{stoppedAt(400), stoppedAt(400)},
+			headline: "~ orders: ⏹️ Stopped\n",
+			lines:    []string{"○ payments-001: stopped at 40.00% (400/1,000 rows)", "○ payments-002: stopped at 40.00% (400/1,000 rows)"},
+		},
+		"one target done and one stopped part-way": {
+			targets:  []rolloutTarget{completedTarget(), stoppedAt(400)},
+			headline: "~ orders: ⏹️ Stopped\n",
+			lines:    []string{"✓ payments-001: 1,000 rows", "○ payments-002: stopped at 40.00% (400/1,000 rows)"},
+		},
+		"one target done and one failed part-way": {
+			targets:  []rolloutTarget{completedTarget(), failedAt(300)},
+			headline: "~ orders: ❌ Failed\n",
+			lines:    []string{"✓ payments-001: 1,000 rows", "✗ payments-002: failed"},
+		},
+		"one target done and one cancelled before copying": {
+			targets:  []rolloutTarget{completedTarget(), cancelledBeforeCopying},
+			headline: "~ orders: 🚫 Cancelled\n",
+			lines:    []string{"✓ payments-001: 1,000 rows", "○ payments-002: cancelled"},
+		},
+		"every target cancelled before copying": {
+			targets:  []rolloutTarget{cancelledBeforeCopying, cancelledBeforeCopying},
+			headline: "~ orders: 🚫 Cancelled (not started)\n",
+			lines:    []string{"○ payments-001: cancelled", "○ payments-002: cancelled"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := renderRollout(t, targetRolloutData(tc.targets))
+			assert.Contains(t, out, tc.headline, "the table reads as its halt, with no bar:\n%s", out)
+			assertLess(t, out, tc.headline, tc.lines[0])
+			assertLess(t, out, tc.lines[0], tc.lines[1])
+			assert.NotContains(t, out, "Rows:", "no summed rows speak for a halted table:\n%s", out)
+			assert.NotContains(t, out, "was waiting for cutover")
+			if !strings.Contains(tc.headline, "not started") {
+				assert.NotContains(t, out, "not started")
+			}
+		})
+	}
+}
+
 // A halting failure beside a target a driver already started leaves the
 // rollout active, and a new apply is refused until it settles: the footer
 // offers stop first and says retry opens once the apply finishes or is

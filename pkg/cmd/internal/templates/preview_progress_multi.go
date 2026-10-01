@@ -70,6 +70,7 @@ func previewCLIMultiDeployAllOutput() {
 		{"ALL DEPLOYMENTS COMPLETED", previewCLIMultiDeploymentApplyCompleted},
 		{"MULTI-TARGET ROLLOUT PAST A FAILED TARGET", previewCLIMultiTargetRolloutInProgress},
 		{"MULTI-TARGET ROLLOUT WAITING FOR CUTOVER", previewCLIMultiTargetRolloutWaitingForCutover},
+		{"MULTI-TARGET ROLLOUT STOPPED", previewCLIMultiTargetRolloutStopped},
 	}
 	for i, section := range sections {
 		if i > 0 {
@@ -129,6 +130,26 @@ func previewCLIMultiTargetRolloutWaitingForCutover() {
 	data := multiDeploymentProgressData(ops, tables)
 	data.State = state.Apply.WaitingForCutover
 	data.Options = map[string]string{"defer_cutover": "true"}
+	WriteProgress(data)
+}
+
+// previewCLIMultiTargetRolloutStopped is three targets stopped part-way: one
+// had already finished, the other two stopped mid-copy.
+func previewCLIMultiTargetRolloutStopped() {
+	var ops []ProgressOperation
+	var tables []TableProgress
+	for i, copied := range []int64{80000, 32000, 20000} {
+		target := fmt.Sprintf("payments-%03d", i+1)
+		op := ProgressOperation{Deployment: "prod", Target: target, State: state.ApplyOperation.Stopped, StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339), CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt}
+		table := TableProgress{Deployment: "prod", Target: target, TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Stopped, RowsCopied: copied, RowsTotal: 80000, PercentComplete: int(copied * 100 / 80000)}
+		if copied == 80000 {
+			op.State, table.Status = state.ApplyOperation.Completed, state.Task.Completed
+		}
+		ops = append(ops, op)
+		tables = append(tables, table)
+	}
+	data := multiDeploymentProgressData(ops, tables)
+	data.State = state.Apply.Stopped
 	WriteProgress(data)
 }
 
