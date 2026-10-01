@@ -88,6 +88,7 @@ parser.add_argument('--binary', required=True)
 parser.add_argument('--output', required=True)
 parser.add_argument('--paste-connection', action='store_true')
 parser.add_argument('--integrated', action='store_true')
+parser.add_argument('--local-storage', action='store_true')
 parser.add_argument('--api-url', default='')
 parser.add_argument('--organization', default='demo')
 parser.add_argument('--engine', choices=['mysql', 'postgres', 'vitess'], default='postgres')
@@ -121,7 +122,11 @@ if args.paste_connection:
 else:
     steps.extend([('Connect to your Vitess database' if args.engine == 'vitess' else 'Connect your database', [(2.5, '\r')])])
 if args.engine == 'vitess':
-    steps.extend([('PlanetScale organization', [(0.25, c) for c in args.organization] + [(0.7, '\r')]), ('Connect the PlanetScale API', [(3.7, '\r')]), ('Token ID', [(0.15, c) for c in token_parts[0]] + [(0.7, '\r')]), ('Token secret (hidden)', [(0.12, c) for c in token_parts[1]] + [(0.7, '\r')]), ('Store SchemaBot’s plans and progress', [(3.0, '\r')])])
+    storage_keys = [(2.5, '\r')] if args.local_storage else [(1.5, '\x1b[B'), (0.8, '\r')]
+    steps.append(('Where should SchemaBot store its own data?', storage_keys))
+    if not args.local_storage:
+        steps.append(('Store SchemaBot’s plans and progress', [(2.0, '\r')]))
+    steps.extend([('PlanetScale organization', [(0.25, c) for c in args.organization] + [(0.7, '\r')]), ('Connect the PlanetScale API', [(3.7, '\r')]), ('Token ID', [(0.15, c) for c in token_parts[0]] + [(0.7, '\r')]), ('Token secret (hidden)', [(0.12, c) for c in token_parts[1]] + [(0.7, '\r')])])
 elif args.integrated:
     steps.append(('Where should SchemaBot store its own data?', [(3.0, '\r')]))
 else:
@@ -142,7 +147,7 @@ decoder = codecs.getincrementaldecoder('utf-8')('replace')
 seen = 0
 start = time.monotonic()
 try:
-    while time.monotonic() - start < 90:
+    while time.monotonic() - start < 180:
         if pending and time.monotonic() >= pending[0][0]:
             _, key = pending.pop(0)
             os.write(master, key.encode())

@@ -381,13 +381,14 @@ func TestInitCopyBackPreservesConnectionsAndDoesNotInitialize(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: shop\ntype: postgres\n"), 0600))
 	original := InitCmd{Namespaces: []string{"sales", "west"}, StorageDSN: "env:STATE"}
 	m := newInitWizard(&original, "default", io.Discard)
-	values := []string{"postgres", "shop", "development", "env:APP", "", "", "env:STATE", "sales, west", root, "chosen"}
+	values := []string{"postgres", "shop", "development", "env:APP", "env:STATE", "", "", "sales, west", root, "chosen"}
 	for i, v := range values {
 		m.fields[i].value = v
 	}
 	g := Globals{}
 	require.ErrorIs(t, m.copyToCommand(&original, &g), ErrSilent)
 	require.Empty(t, original.DSN)
+	m.localStorage = false
 	m.confirmed = true
 	require.NoError(t, m.copyToCommand(&original, &g))
 	require.Equal(t, "postgres", original.Type)
@@ -613,6 +614,18 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	wizardKey(m, tea.KeyEnter)
 	m.Update(initConnectionMsg{generation: m.generation})
 	wizardKey(m, tea.KeyEnter)
+	require.Equal(t, stepStorageDSN, m.step)
+	require.Contains(t, m.View(), "Where should SchemaBot store its own data?")
+	wizardKey(m, tea.KeyDown) // Standalone
+	wizardKey(m, tea.KeyEnter)
+	require.Contains(t, m.View(), "Store SchemaBot’s plans and progress")
+	require.NotContains(t, m.View(), "create_password")
+	m.connectionEditor.mode = "reference"
+	var storageEngine string
+	m.check = func(_ context.Context, engine, _ string) error { storageEngine = engine; return nil }
+	m.Update(m.checkConnection()())
+	require.Equal(t, "mysql", storageEngine)
+	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, stepOrganization, m.step)
 	m.input.SetValue("Acme")
 	wizardKey(m, tea.KeyEnter)
@@ -634,16 +647,6 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	require.Equal(t, localsetup.Target{Engine: "vitess", Database: "shop", Organization: "acme", Token: "tok-name:tok-secret", APIURL: "http://localscale"}, checked)
 	m.Update(result)
 	require.True(t, m.connectionChecked)
-	wizardKey(m, tea.KeyEnter)
-	require.Equal(t, stepStorageDSN, m.step)
-	require.Contains(t, m.View(), "separate MySQL database")
-	require.Contains(t, m.View(), "Store SchemaBot’s plans and progress")
-	require.NotContains(t, m.View(), "create_password")
-	m.connectionEditor.mode = "reference"
-	var storageEngine string
-	m.check = func(_ context.Context, engine, _ string) error { storageEngine = engine; return nil }
-	m.Update(m.checkConnection()())
-	require.Equal(t, "mysql", storageEngine)
 	wizardKey(m, tea.KeyEnter)
 	require.Equal(t, len(m.fields), m.step)
 	view := m.View()

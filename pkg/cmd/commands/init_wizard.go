@@ -25,7 +25,7 @@ func (cmd *InitCmd) missingInputs() []string {
 			missing = append(missing, field.name)
 		}
 	}
-	if cmd.StorageDSN == "" && !cmd.Integrated {
+	if cmd.StorageDSN == "" && !cmd.Integrated && !cmd.LocalStorage {
 		missing = append(missing, "storage-dsn")
 	}
 	if cmd.Type == "vitess" {
