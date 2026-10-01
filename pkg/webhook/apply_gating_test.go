@@ -1188,7 +1188,7 @@ func TestEnforcePassingChecks(t *testing.T) {
 				assert.Contains(t, body, "| `Deploy / production-approval` | "+status+" |")
 				assert.NotContains(t, body, "CI / tests")
 			case <-time.After(2 * time.Second):
-				t.Fatal("timed out waiting for in-progress-checks comment")
+				require.FailNow(t, "timed out waiting for in-progress-checks comment")
 			}
 		})
 	}
