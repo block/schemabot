@@ -74,6 +74,7 @@ wizard toggle: drain in-flight work, stop the runtime, transfer the complete sta
 update its connection configuration, and verify it before restarting. Keep the original state
 until the new connection is verified. Re-running `init` never replaces existing state storage.
 
+The Vitess connection screen links to PlanetScale’s [database password setup guide](https://planetscale.com/docs/vitess/connecting/connection-strings).
 For Vitess, the connection-details form reuses the PlanetScale database name you already entered.
 The application connection is your vtgate address, and the wizard also asks for the
 PlanetScale organization and a [service token](#configure-the-planetscale-service-token).

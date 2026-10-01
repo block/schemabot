@@ -610,7 +610,7 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	require.Equal(t, stepDSN, m.step)
 	require.Contains(t, m.View(), "vtgate:3306")
 	require.Contains(t, m.View(), "Connect to your Vitess database")
-	require.Contains(t, m.View(), "create_password")
+	require.Contains(t, m.View(), "vitess/connecting/connection-strings")
 	wizardKey(m, tea.KeyEnter)
 	m.Update(initConnectionMsg{generation: m.generation})
 	wizardKey(m, tea.KeyEnter)
@@ -619,7 +619,7 @@ func TestInitWizardVitessStepsAndReview(t *testing.T) {
 	wizardKey(m, tea.KeyDown) // Standalone
 	wizardKey(m, tea.KeyEnter)
 	require.Contains(t, m.View(), "Store SchemaBot’s plans and progress")
-	require.NotContains(t, m.View(), "create_password")
+	require.NotContains(t, m.View(), "vitess/connecting/connection-strings")
 	m.connectionEditor.mode = "reference"
 	var storageEngine string
 	m.check = func(_ context.Context, engine, _ string) error { storageEngine = engine; return nil }
