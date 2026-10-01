@@ -43,6 +43,19 @@ window.renderFrame=(t,dt)=>{
    [1,s=>s.includes('/  sample database')],
    [.8,s=>s.includes('/  connect and verify')],
    [2.2,s=>s.includes('Your schema is ready')]
+  ]):recording.engine==='vitess'?pacedFrame(frames,localTime-commandTime,[
+   [1,s=>s.includes('What would you like to try?')],
+   [1.5,s=>s.includes('Database engine')],
+   [1,s=>s.includes('Database name')],
+   [2,s=>s.includes('Connect to your Vitess database')],
+   [4,s=>s.includes('Where should SchemaBot store its own data?')&&s.includes('Data stays in a Docker volume')&&s.includes('esc cancel')],
+   [1.5,s=>s.includes('PlanetScale organization')],
+   [4,s=>s.includes('Enter token ID and secret')&&s.includes('esc cancel')],
+   [2,s=>s.includes('Token ID')&&!s.includes('Enter token ID')],
+   [1,s=>s.includes('Token secret (hidden)')],
+   [3,s=>s.includes('Review your setup')],
+   [3,s=>s.includes('/  connect and verify')],
+   [4,s=>s.includes('Your schema is ready')]
   ]):frames.filter(f=>f.time<=recordedTime).at(-1)||frames[0];
   const colors={default:'#1f2328',black:'#1f2328',red:'#cf222e',green:'#1a7f37',brown:'#9a6700',blue:'#0969da',magenta:'#8250df',cyan:'#0550ae',white:'#59636e',brightblack:'#59636e'};
   const content=document.getElementById('content');
