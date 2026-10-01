@@ -1132,22 +1132,7 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 // owes nothing here. A failure write that did not land is returned with
 // nothing settled.
 func (c *LocalClient) refuseBlockedTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, refusal error) error {
-	if err := c.failApplyWithTasks(ctx, apply, tasks, refusal.Error()); err != nil {
-		return err
-	}
-	if suppressParentApplyWrites(ctx) {
-		return nil
-	}
-	if !state.IsTerminalApplyState(apply.State) {
-		return nil
-	}
-	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
-		c.logger.Warn("failed to settle pending control requests after refusing blocked task rows",
-			append(apply.LogAttrs(), "error", err)...)
-		return nil
-	}
-	c.notifyTerminalObserver(apply, tasks)
-	return nil
+	return c.failApplyAndNotify(ctx, apply, tasks, refusal.Error())
 }
 
 // blockedTaskError returns the operator-facing refusal for a task row the

@@ -2080,7 +2080,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	// tasks fail with it, and it owes the same terminal side effects as the
 	// drive that failed it; re-planning instead would read the failed tasks as
 	// work to settle or re-run.
-	if failed := failedTaskDecidingOutcome(tasks, c.usesGroupedApply(apply, options)); failed != nil {
+	if failed := failedTaskDecidingOutcome(tasks, c.usesGroupedApply(apply, options)); failed != nil && !state.IsState(apply.State, state.Apply.Stopped) {
 		logger.Warn("a failed task decides the outcome of an apply that is still active; recording the apply failed from its tasks",
 			append(apply.MutableLogAttrs(), "failed_task_id", failed.TaskIdentifier)...)
 		return c.failApplyAndNotify(ctx, apply, tasks, settledTaskFailureMessage(failed))
@@ -2137,11 +2137,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if plan == nil {
 		logger.Warn("plan row does not exist for apply; recovery cannot rebuild the reviewed DDL, marking apply failed",
 			apply.MutableLogAttrs()...)
-		if err := c.failApplyWithTasks(ctx, apply, tasks, "plan not found during recovery"); err != nil {
-			return err
-		}
-		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, "plan not found during recovery")
 	}
 	if len(tasks) == 0 && !isTasklessVSchemaOnlyPlan(tasks, plan) {
 		// A task-less apply has no per-table work to drive — e.g. a sharded
@@ -2460,11 +2456,19 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	if suppressParentApplyWrites(ctx) {
 		return nil
 	}
+	// The failure is stored, so the drive owes every terminal side effect: the
+	// start that admitted this claim fails with the engine's reason, the
+	// requests the outcome moots are swept, and the summary posts. A settlement
+	// write that does not land is logged rather than returned (RC-5): the
+	// request stays pending for the operator's post-drive settlement, while a
+	// summary that never posts has no such recovery.
 	if startRequested {
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
-			return failErr
+			logger.Warn("failed to fail the pending start request for the stored terminal outcome; it stays pending for the operator's post-drive settlement and the terminal summary still posts",
+				"error", failErr)
 		}
 	}
+	c.settleRequestsForStoredOutcome(ctx, logger, apply)
 	c.notifyTerminalObserver(apply, tasks)
 	return err
 }

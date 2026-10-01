@@ -560,6 +560,80 @@ func TestStoredOutcome_SettlementFailureStillPostsTheTerminalSummary(t *testing.
 	}
 }
 
+func TestRefuseBlockedTasks_SettlementFailureStillNotifies(t *testing.T) {
+	apply := failureLogTestApply(state.Apply.Running, 0)
+	task := &storage.Task{ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-1", State: state.Task.Pending}
+	client, _ := newFailureLogTestClient(apply, []*storage.Task{task})
+	store := client.storage.(*controlTestStorage)
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+	store.controlRequests = &settleRefusingControlRequestStore{
+		testControlRequestStore: requests,
+		err:                     errors.New("control request store unavailable"),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	err := client.refuseBlockedTasks(t.Context(), apply, []*storage.Task{task}, errors.New("engine refused task"))
+
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, store.applies.(*controlTestApplyStore).apply.State)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status)
+	require.Len(t, observer.terminal, 1, "the stored refusal still owes its terminal summary")
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
+// An operator's start admitted this grouped resume and the engine refused it
+// permanently. The start request is answered with the engine's reason — the
+// operator reads that their command did not take effect — and the stored
+// failure still posts its terminal summary.
+func TestHandleGroupedResumeFailure_FailsTheAdmittingStartWithTheEngineReason(t *testing.T) {
+	apply := failureLogTestApply(state.Apply.Resuming, 0)
+	task := &storage.Task{ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-1", State: state.Task.Running}
+	client, _ := newFailureLogTestClient(apply, []*storage.Task{task})
+	store := client.storage.(*controlTestStorage)
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	store.controlRequests = requests
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+	engineErr := engine.NewPermanentError("engine rejected resume")
+
+	err := client.handleGroupedResumeFailure(t.Context(), apply, []*storage.Task{task}, engineErr, true)
+
+	require.ErrorIs(t, err, engineErr)
+	assert.Equal(t, state.Apply.Failed, store.applies.(*controlTestApplyStore).apply.State)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+		"the start that admitted the claim is answered, not left pending or reported completed")
+	assert.Contains(t, requests.requests[0].ErrorMessage, "engine rejected resume")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
+func TestHandleGroupedResumeFailure_SettlementFailureStillNotifies(t *testing.T) {
+	apply := failureLogTestApply(state.Apply.Resuming, 0)
+	task := &storage.Task{ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-1", State: state.Task.Running}
+	client, _ := newFailureLogTestClient(apply, []*storage.Task{task})
+	store := client.storage.(*controlTestStorage)
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	store.controlRequests = &settleRefusingControlRequestStore{
+		testControlRequestStore: requests,
+		err:                     errors.New("control request store unavailable"),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(apply.ID, observer)
+	engineErr := engine.NewPermanentError("engine rejected resume")
+
+	err := client.handleGroupedResumeFailure(t.Context(), apply, []*storage.Task{task}, engineErr, true)
+
+	require.ErrorIs(t, err, engineErr)
+	assert.Equal(t, state.Apply.Failed, store.applies.(*controlTestApplyStore).apply.State)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status)
+	require.Len(t, observer.terminal, 1, "the stored failure still owes its terminal summary")
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
 // A panic inside a drive is contained to that apply and surfaces as a
 // *panicsafe.Error, so the operator routes it through its drive-panic handling
 // (AV-5) instead of treating it as a transient drive failure to retry. The
