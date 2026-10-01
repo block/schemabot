@@ -733,7 +733,8 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	return resp, nil
 }
 
-// ExecutePlanProto runs a plan and returns both the reviewed primary plan proto
+// ExecutePlanProto runs a plan and returns both the reviewed plan proto of the
+// member it plans (the primary, or for a narrowed plan the member it names)
 // and its API projection. The proto is the reviewed baseline the review-time
 // drift rollup compares deployments against, so it is exposed alongside the API
 // response rather than reconstructed from storage.
@@ -794,11 +795,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, err
 	}
-	// The primary plans, and its plan row records, only the namespaces its
-	// targets entry selects. req is this call's copy, so narrowing it here
-	// leaves the caller's request, which the other members are planned from,
-	// untouched.
-	primarySchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
+	// The planned member (the primary, or for a narrowed plan the member it
+	// names) plans, and its plan row records, only the namespaces its targets
+	// entry selects. req is this call's copy, so narrowing it here leaves the
+	// caller's request, which the other members are planned from, untouched.
+	plannedSchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "select namespaces")
@@ -807,17 +808,18 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		return nil, nil, err
 	}
 	if len(resolvedTarget.Namespaces) > 0 {
-		s.logger.Info("plan covers only the namespaces the primary target's entry selects",
+		s.logger.Info("plan covers only the namespaces its rollout member's targets entry selects: the primary's, or for a narrowed plan the named member's",
 			"database", req.Database,
 			"environment", req.Environment,
 			"deployment", deployment,
 			"target", resolvedTarget.Target,
+			"narrowed_to", narrowedTo,
 			"repository", req.Repository,
 			"namespaces", resolvedTarget.Namespaces,
 			"declared_namespace_count", len(req.SchemaFiles))
 	}
 	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
-	req.SchemaFiles = primarySchemaFiles
+	req.SchemaFiles = plannedSchemaFiles
 
 	prInt := 0
 	if req.PullRequest != nil {
@@ -887,7 +889,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		Target:            resolvedTarget.Target,
 		SchemaPath:        trustedSchemaPath,
 		IgnoredNamespaces: req.IgnoredNamespaces,
-		// The namespaces the primary's entry leaves to other targets, so an
+		// The namespaces the planned member's entry (the primary's, or for a
+		// narrowed plan the named member's) leaves to other targets, so an
 		// engine that diffs the whole target as one unit refuses rather than
 		// planning their live tables as drops.
 		UnselectedNamespaces: unselected,
@@ -1005,9 +1008,9 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	}
 
 	planResp := planResponseFromProto(resp)
-	// Record the primary rollout member this plan was created against so the
-	// review-time drift rollup can verify the baseline still maps to the primary
-	// at rollup time. Both halves are needed: one deployment can address several
+	// Record the rollout member this plan was created against (the primary, or
+	// for a narrowed plan the member it names) so the review-time drift rollup
+	// can verify the baseline still maps to that member at rollup time. Both halves are needed: one deployment can address several
 	// targets, so the deployment alone does not identify the member.
 	planResp.Deployment = deployment
 	planResp.Target = resolvedTarget.Target
