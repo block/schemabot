@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,7 +62,6 @@ func TestWritePlanBody_ThreeTargetRolloutGroupsTargetsByPlan(t *testing.T) {
 	}
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
-	assert.Contains(t, out, "Targets diverge — what applies where:", "%s", out)
 	assert.Contains(t, out, "▸ targets prod/payments-001, prod/payments-002", "%s", out)
 	assert.Contains(t, out, "▸ target prod/payments-003", "%s", out)
 	assertBefore(t, out, "▸ targets prod/payments-001, prod/payments-002", "ADD COLUMN `region`")
@@ -91,12 +91,61 @@ func TestWritePlanBody_SixtyFourTargetRolloutFoldsItsMembers(t *testing.T) {
 	assert.NotContains(t, out, "diverge", "one plan across the rollout is not divergence")
 	assert.Contains(t, out, "▸ all 64 targets", "%s", out)
 	assert.Contains(t, out, "prod/payments-001, prod/payments-002,", "%s", out)
-	assert.Contains(t, out, "prod/payments-024,\n  and 40 more", "%s", out)
+	assert.Contains(t, out, "prod/payments-024, and 40 more", "%s", out)
 	assert.NotContains(t, out, "prod/payments-025", "names past the cap are counted, not listed")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `region`"), "the DDL is shown once for the whole group")
 	for line := range strings.SplitSeq(out, "\n") {
-		assert.LessOrEqual(t, len(line), 80, "a folded name line fits the terminal: %q", line)
+		assert.LessOrEqual(t, utf8.RuneCountInString(line), 76, "a folded name line fits the terminal, indent included: %q", line)
 	}
+}
+
+// A group of a few targets whose names do not fit on the heading's line reads
+// like a wide group: the heading states its coverage and the names fold
+// beneath it, so no line runs past the terminal width.
+func TestWritePlanBody_LongTargetNamesFoldUnderTheHeading(t *testing.T) {
+	members := []string{"prod/payments-ledger-primary-001", "prod/payments-ledger-primary-002", "prod/payments-ledger-primary-003"}
+	plan := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: members, Primary: true, Changes: addColumnTo("region")}},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Contains(t, out, "▸ all 3 targets\n  prod/payments-ledger-primary-001, prod/payments-ledger-primary-002,\n  prod/payments-ledger-primary-003\n", "%s", out)
+	for line := range strings.SplitSeq(out, "\n") {
+		assert.LessOrEqual(t, utf8.RuneCountInString(line), 76, "every line fits the terminal: %q", line)
+	}
+}
+
+// A rollout whose every member needs attention has no group to show. It lists
+// those members and stops: the primary's own changes are not shown as the
+// rollout's plan, and the output never says the rollout has no changes, since
+// what the unplanned members would run is unknown.
+func TestWritePlanBody_RolloutWithNoGroupsShowsOnlyItsAttention(t *testing.T) {
+	plan := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Changes:  addColumnTo("region"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     2,
+			Independent: true,
+			Attention: []*apitypes.PlanMemberAttentionResponse{
+				{Member: "prod/payments-001", Reason: apitypes.PlanMemberUnplanned, Detail: "plan failed; see server logs"},
+				{Member: "prod/payments-002", Reason: apitypes.PlanMemberUnplanned, Detail: "plan failed; see server logs"},
+			},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Contains(t, out, "2 targets need attention before an apply can run on them", "%s", out)
+	assert.NotContains(t, out, "ADD COLUMN `region`", "the primary's changes are not the rollout's plan")
+	assert.NotContains(t, out, "No schema changes detected", "unknown work is never reported as none")
+	assert.NotContains(t, out, "📋 Plan:")
 }
 
 // A 64-target rollout in which 61 targets still need a column and 3 already
@@ -122,16 +171,15 @@ func TestWritePlanBody_DivergingRolloutEndsOnOneSummary(t *testing.T) {
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
 	want := strings.Join([]string{
-		"Targets diverge — what applies where:",
-		"",
 		"▸ 61 of 64 targets",
-		"  prod/payments-001, prod/payments-002, prod/payments-003, prod/payments-004,",
-		"  prod/payments-005, prod/payments-006, prod/payments-007, prod/payments-008,",
-		"  prod/payments-009, prod/payments-010, prod/payments-011, prod/payments-012,",
-		"  prod/payments-013, prod/payments-014, prod/payments-015, prod/payments-016,",
-		"  prod/payments-017, prod/payments-018, prod/payments-019, prod/payments-020,",
-		"  prod/payments-021, prod/payments-022, prod/payments-023, prod/payments-024,",
-		"  and 37 more",
+		"  prod/payments-001, prod/payments-002, prod/payments-003,",
+		"  prod/payments-004, prod/payments-005, prod/payments-006,",
+		"  prod/payments-007, prod/payments-008, prod/payments-009,",
+		"  prod/payments-010, prod/payments-011, prod/payments-012,",
+		"  prod/payments-013, prod/payments-014, prod/payments-015,",
+		"  prod/payments-016, prod/payments-017, prod/payments-018,",
+		"  prod/payments-019, prod/payments-020, prod/payments-021,",
+		"  prod/payments-022, prod/payments-023, prod/payments-024, and 37 more",
 		"",
 		"     ~ orders",
 		"       ALTER TABLE `orders` ADD COLUMN `region` varchar(32);",
@@ -396,7 +444,6 @@ func TestWritePlanBody_SixtyFourTargetRolloutSplitStatesCoverage(t *testing.T) {
 	}
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
-	assert.Contains(t, out, "Targets diverge — what applies where:")
 	assertBefore(t, out, "▸ 40 of 64 targets", "ADD COLUMN `region`")
 	assertBefore(t, out, "ADD COLUMN `region`", "▸ 24 of 64 targets")
 	assertBefore(t, out, "▸ 24 of 64 targets", "ADD COLUMN `zone`")

@@ -265,10 +265,13 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	rollout := result.WholeRollout()
 	noun := templates.RolloutNoun(rollout)
 	templates.WriteRolloutAttention(noun, rollout.Attention)
-	if len(rollout.Groups) > 1 {
-		templates.WriteRolloutDivergence(noun)
+	// plans, work, and rollout.Groups are index-parallel. A rollout with no
+	// groups has no plan of its own to render, so the response's own changes,
+	// which are the primary's, are never read as the rollout's.
+	var plans []*apitypes.PlanResponse
+	if len(rollout.Groups) > 0 {
+		plans = result.MemberPlans()
 	}
-	plans := result.MemberPlans()
 	work := make([]planWork, len(plans))
 	for i, plan := range plans {
 		work[i] = collectPlanWork(plan)
@@ -285,7 +288,7 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// member that needs attention has unknown work, never none (MG-12), so
 	// while one does the rollout gets no such verdict and each settled group
 	// says so under its own heading instead.
-	settled := !slices.ContainsFunc(work, func(w planWork) bool { return !w.empty() }) && len(rollout.Attention) == 0
+	settled := len(work) > 0 && !slices.ContainsFunc(work, func(w planWork) bool { return !w.empty() }) && len(rollout.Attention) == 0
 	var rolloutWork []planWork
 	for _, i := range order {
 		opensOnHeader := !work[i].empty() && opensOnNamespaceHeader(plans[i], work[i])
@@ -308,7 +311,7 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	switch {
 	case len(rolloutWork) > 0:
 		total := combinePlanWork(rolloutWork)
-		templates.WritePlanSummaryWithKeyspaceUpdates(total.allChanges, total.vschemaChanges, total.finalizes())
+		templates.WritePlanSummaryWithKeyspaceUpdates(total.changes, total.vschemaChanges, total.finalizes)
 	case settled:
 		templates.WriteNoChanges()
 	}
@@ -436,28 +439,33 @@ func (w planWork) finalizes() int {
 	return n
 }
 
+// planSummary is what a rollout's one plan summary counts across its groups.
+type planSummary struct {
+	changes        []templates.DDLChange
+	vschemaChanges []templates.VSchemaChange
+	// finalizes counts the namespaces whose only work, on some group, is a
+	// finalize.
+	finalizes int
+}
+
 // combinePlanWork merges the work of a rollout's groups into what the summary
 // counts, as the PR comment summarizes target plans together: a statement run
 // by several groups is counted once, as is a keyspace's VSchema change, and a
 // namespace whose only work is a finalize on some members is counted as a
 // finalize even where another group also runs DDL in it.
-func combinePlanWork(groups []planWork) planWork {
-	combined := planWork{
-		namespaceMap: make(map[string][]templates.DDLChange),
-		finalize:     map[string]bool{},
-		finalizeOnly: map[string]bool{},
-	}
+func combinePlanWork(groups []planWork) planSummary {
+	var combined planSummary
 	seenStatements := make(map[[2]string]bool)
 	seenVSchema := make(map[string]bool)
+	finalizeOnly := make(map[string]bool)
 	for _, g := range groups {
-		combined.renderedTables += g.renderedTables
 		for _, c := range g.allChanges {
 			key := [2]string{c.Namespace, c.DDL}
 			if seenStatements[key] {
 				continue
 			}
 			seenStatements[key] = true
-			combined.allChanges = append(combined.allChanges, c)
+			combined.changes = append(combined.changes, c)
 		}
 		for _, vc := range g.vschemaChanges {
 			if seenVSchema[vc.Keyspace] {
@@ -468,12 +476,11 @@ func combinePlanWork(groups []planWork) planWork {
 		}
 		for ns := range g.finalizeOnly {
 			if len(g.namespaceMap[ns]) == 0 {
-				combined.finalizeOnly[ns] = true
+				finalizeOnly[ns] = true
 			}
 		}
 	}
-	// namespaceMap stays empty, so finalizes() counts every finalize-only
-	// namespace once.
+	combined.finalizes = len(finalizeOnly)
 	return combined
 }
 
