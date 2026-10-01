@@ -189,3 +189,21 @@ func TestRefuseDropsOfUnselectedTables(t *testing.T) {
 	assert.True(t, UnselectedTableDropRefused(err), "a check failure fails the environment's check closed like a refused drop")
 	assert.False(t, NamespacePlacementRefused(err), "a check failure is not a placement defect the API answers 400 for")
 }
+
+// A plan the control plane refuses after the data plane answered is counted
+// once, as an error, so the plan counter never reports a refused plan as a
+// success.
+func TestExecutePlan_RefusedDropIsCountedOnlyAsAnError(t *testing.T) {
+	reader := installManualMetricReader(t)
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-primary", Changes: dropsPlan("ns_1", "legacy")}}
+	_, err := namespaceSelectionService(t, client, &capturingPlanStore{}).ExecutePlan(t.Context(), placedNamespacesRequest())
+	require.ErrorAs(t, err, new(*UnselectedTableDropError))
+
+	var statuses []string
+	for _, dp := range collectCounterPoints(t, reader, "schemabot.plans.total") {
+		for range dp.Value {
+			statuses = append(statuses, attributeValue(t, dp, "status"))
+		}
+	}
+	assert.Equal(t, []string{"error"}, statuses)
+}
