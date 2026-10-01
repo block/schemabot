@@ -66,23 +66,34 @@ func TestRenderPlanComment_TableSizesRenderUnderDDL(t *testing.T) {
 	assert.Less(t, sizesAt, summaryAt, "sizes render above the plan summary")
 }
 
-// The locked apply comment follows a plan comment that already showed the
-// sizes, so it leaves them out whether it applies automatically or waits for
-// apply-confirm.
-func TestRenderPlanComment_LockedApplyOmitsTableSizes(t *testing.T) {
-	for _, pending := range []bool{false, true} {
-		data := tableSizePlanData([]TableSizeData{
-			{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)},
-		})
-		data.IsLocked = true
-		data.LockOwner = "octocat/hello-world#1"
-		data.PendingManualConfirmation = pending
-		out := RenderPlanComment(data)
+// The locked comment that applies automatically follows a plan comment that
+// already showed the sizes, so it leaves them out.
+func TestRenderPlanComment_AutomaticApplyOmitsTableSizes(t *testing.T) {
+	out := RenderPlanComment(lockedTableSizePlanData(false))
 
-		assert.Contains(t, out, "## Schema Change Apply", "pending confirmation %v", pending)
-		assert.Contains(t, out, "📋 **Plan**:", "pending confirmation %v", pending)
-		assert.NotContains(t, out, "Table sizes", "pending confirmation %v", pending)
-	}
+	assert.Contains(t, out, "**Applying automatically**")
+	assert.Contains(t, out, "📋 **Plan**:")
+	assert.NotContains(t, out, "Table sizes")
+}
+
+// A locked comment paused for apply-confirm can carry a re-planned statement
+// the reviewed plan did not, so it keeps the sizes of what the operator is
+// about to confirm.
+func TestRenderPlanComment_PausedApplyKeepsTableSizes(t *testing.T) {
+	out := RenderPlanComment(lockedTableSizePlanData(true))
+
+	assert.NotContains(t, out, "**Applying automatically**")
+	assert.Contains(t, out, "📊 **Table sizes**:\n- `mutes`: ~1.1 GB\n")
+}
+
+func lockedTableSizePlanData(pendingConfirmation bool) PlanCommentData {
+	data := tableSizePlanData([]TableSizeData{
+		{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)},
+	})
+	data.IsLocked = true
+	data.LockOwner = "octocat/hello-world#1"
+	data.PendingManualConfirmation = pendingConfirmation
+	return data
 }
 
 func TestRenderPlanComment_TableSizesSharded(t *testing.T) {

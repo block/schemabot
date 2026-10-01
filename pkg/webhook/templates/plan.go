@@ -528,9 +528,11 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	}
 
 	// Sizes of the tables the DDL above copies, rebuilds, or scans. Omitted on
-	// the locked apply comment: the operator already saw them on the plan they
-	// chose to apply.
-	if !data.IsLocked {
+	// the locked comment that applies automatically: the operator already saw
+	// them on the plan they chose to apply. Kept on a locked comment paused for
+	// apply-confirm, whose re-plan can carry statements the reviewed plan did
+	// not, so the operator sees what they are confirming.
+	if !data.applyingWithoutConfirmation() {
 		writeTableSizesSection(&sb, summary)
 	}
 
