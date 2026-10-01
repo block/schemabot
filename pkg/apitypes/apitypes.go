@@ -731,6 +731,13 @@ type PlanRequest struct {
 	// Target narrows the plan to one rollout member of the environment, named
 	// by its target or by deployment/target. Empty plans the rollout primary.
 	Target string `json:"target,omitempty"`
+	// RendersRollout says the caller reads the plan's rollout block: it shows
+	// the operator what applies on every member, and refuses an apply for the
+	// members the rollout lists as needing attention or as refused. The server
+	// refuses a rollout-wide plan of an environment with more than one member
+	// from a caller that does not set it, since such a caller would present
+	// the primary's plan as the whole rollout's.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -742,6 +749,11 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
+	// RendersRollout says the caller showed the operator the plan of every
+	// rollout member before applying; see PlanRequest.RendersRollout. The
+	// server refuses a rollout-wide apply of an environment with more than one
+	// member from a caller that does not set it.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations

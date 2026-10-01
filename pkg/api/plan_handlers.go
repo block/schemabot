@@ -82,6 +82,13 @@ type PlanRequest struct {
 	// the way every plan did before members could be selected. A narrowed plan
 	// speaks for its one member only, so it never records stored check state.
 	Target string `json:"target,omitempty"`
+
+	// RendersRollout says the HTTP caller reads the response's rollout block
+	// and shows the operator what applies on every member. POST /api/plan
+	// refuses a rollout-wide plan of an environment with more than one member
+	// without it (refuseRolloutUnrenderedByCaller). The webhook calls the
+	// service in process and renders the rollout itself, so it never sets it.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 type unsupportedPullSchemaError struct {
@@ -548,6 +555,13 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
+	// RendersRollout says the HTTP caller showed the operator the plan of
+	// every rollout member; see PlanRequest.RendersRollout.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
+	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
+	// to say it rendered the rollout. The webhook and the trusted enqueue path
+	// call the service in process and leave it unset.
+	viaHTTP bool
 	// ExpectedLockOwner and ExpectedPendingPlanID are internal webhook guards;
 	// direct API callers cannot assert a lock intent through JSON.
 	ExpectedLockOwner     string `json:"-"`
@@ -600,7 +614,14 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	planProto, resp, err := s.ExecutePlanProto(r.Context(), req)
+	if err := s.refusePlanRolloutUnrenderedByCaller(req); err != nil {
+		s.logger.Warn("plan rejected: the caller does not render the plan of every rollout member",
+			"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
+		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "plan rejected: "+err.Error())
+		return
+	}
+
+	primaryPlan, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
@@ -631,95 +652,17 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.refuseUpToDateForUnconvergedMembers(r.Context(), req, planProto, resp); err != nil {
-		s.logger.Error("plan failed: the other rollout members could not be planned to check the plan's coverage", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+	// An apply of a rollout runs on every member, so the plan an operator
+	// reviews before it describes every member, not only the primary.
+	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
+	if err != nil {
+		s.logger.Error("plan failed: rollout members could not be planned", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
+	resp.Rollout = rollout
 
 	s.writeJSON(w, http.StatusOK, resp)
-}
-
-// refuseUpToDateForUnconvergedMembers keeps a plan of a whole rollout from
-// reading as "up to date" while another member still needs a change.
-//
-// A plan requested through the API is made against the rollout primary, and
-// the other members run the primary's plan. A primary with nothing to change
-// says nothing about the other members: one can still lack the change, for
-// instance after an apply narrowed to the primary landed it there alone. So
-// when the primary is clean, every other member is diffed against its own live
-// schema, without storing a plan for it. The plan reads as up to date only when
-// every member is: a member that still has work, or whose diff failed, turns
-// the plan into an error naming it and how to plan it. A plan with changes is
-// left as it is: applying it runs on every member, each verified against the
-// plan it runs.
-func (s *Service) refuseUpToDateForUnconvergedMembers(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, resp *apitypes.PlanResponse) error {
-	if req.Target != "" || len(resp.Errors) > 0 || resp.HasChanges() {
-		return nil
-	}
-	members, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
-	if err != nil {
-		return fmt.Errorf("resolve rollout members for %s/%s: %w", req.Database, req.Environment, err)
-	}
-	if len(members) <= 1 {
-		return nil
-	}
-	primary := routing.ExecutionTarget{Deployment: resp.Deployment, Target: resp.Target, Namespaces: resp.SelectedNamespaces}
-	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primary, members)
-	if err != nil {
-		return fmt.Errorf("plan the other rollout members of %s/%s: %w", req.Database, req.Environment, err)
-	}
-	if len(diffs) != len(members) {
-		return fmt.Errorf("plan the other rollout members of %s/%s: %d member diffs for %d members", req.Database, req.Environment, len(diffs), len(members))
-	}
-
-	selectors := rolloutMemberSelectors(members)
-	var withWork, unplanned []string
-	for i := 1; i < len(diffs); i++ {
-		diff := diffs[i]
-		if diff.Err != nil {
-			s.logger.Warn("rollout member could not be planned; the plan of the whole rollout is not reported as up to date",
-				"database", req.Database,
-				"environment", req.Environment,
-				"repository", req.Repository,
-				"plan_id", resp.PlanID,
-				"member", members[i].MemberID(),
-				"error", diff.Err)
-			unplanned = append(unplanned, selectors[i])
-			continue
-		}
-		if (tern.ChangeSet{Changes: diff.Changes, Shards: diff.Shards}).HasWork() {
-			withWork = append(withWork, selectors[i])
-		}
-	}
-	if len(withWork) == 0 && len(unplanned) == 0 {
-		s.logger.Info("plan of a whole rollout is up to date: the primary and every other member are at the desired schema",
-			"database", req.Database,
-			"environment", req.Environment,
-			"repository", req.Repository,
-			"plan_id", resp.PlanID,
-			"members", len(members))
-		return nil
-	}
-	s.logger.Warn("plan of a whole rollout refused as up to date: the primary has no changes, but other members are not at the desired schema",
-		"database", req.Database,
-		"environment", req.Environment,
-		"repository", req.Repository,
-		"plan_id", resp.PlanID,
-		"primary", members[0].MemberID(),
-		"members_with_changes", len(withWork),
-		"members_not_planned", len(unplanned))
-	if len(withWork) > 0 {
-		resp.Errors = append(resp.Errors, fmt.Sprintf(
-			"rollout primary %s is at the desired schema, but %d other rollout members still need changes: %s. The rollout is not up to date; plan and apply each of them with its target",
-			members[0].MemberID(), len(withWork), listSelectors(withWork)))
-	}
-	if len(unplanned) > 0 {
-		resp.Errors = append(resp.Errors, fmt.Sprintf(
-			"rollout primary %s is at the desired schema, but %d other rollout members could not be planned: %s. The rollout is not reported as up to date until each of them is planned; see the server logs for why",
-			members[0].MemberID(), len(unplanned), listSelectors(unplanned)))
-	}
-	return nil
 }
 
 // ExecutePlan executes a plan request via the Tern client, stores the result,
@@ -1391,6 +1334,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.viaHTTP = true
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
 		if errors.Is(err, errPlanLookupFailed) {
@@ -1435,6 +1379,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*PlanMemberMismatchError](err); ok {
 			s.logger.Warn("apply rejected because its plan was made for a different rollout member than the apply would run on", "plan_id", req.PlanID, "environment", req.Environment, "selector", req.Target, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*RolloutUnrenderedError](err); ok {
+			s.logger.Warn("apply rejected: the caller does not render the plan of every rollout member", "plan_id", req.PlanID, "environment", req.Environment, "caller", req.Caller, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
@@ -1838,6 +1787,9 @@ func (s *Service) createStoredApply(
 
 	targets, narrowedTo, err := s.applyTargets(plan, req)
 	if err != nil {
+		return nil, 0, err
+	}
+	if err := refuseApplyRolloutUnrenderedByCaller(plan, req, targets, narrowedTo); err != nil {
 		return nil, 0, err
 	}
 	// A narrowed apply records the member it ran on, so a later rollback can
