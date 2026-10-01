@@ -867,7 +867,8 @@ a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
 `pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`,
-`pkg/storage/internal/sqlstore/apply_logs.go`, `pkg/storage/internal/sqlstore/checks.go`).
+`pkg/storage/internal/sqlstore/apply_logs.go`, `pkg/storage/internal/sqlstore/checks.go`,
+`pkg/storage/internal/sqlstore/control_requests.go`).
 
 ### OW-3: A driver stops before a peer may reclaim
 

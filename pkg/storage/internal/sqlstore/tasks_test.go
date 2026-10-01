@@ -871,6 +871,74 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	require.ErrorContains(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), crossApply), "belongs to apply")
 }
 
+// missingInsert reports every guarded insert as a miss without running it, so
+// a test can reach the branch where the fence let nothing through while the
+// lease still reads as current — a path real SQL cannot produce today.
+type missingInsert struct{ identityInserter }
+
+func (missingInsert) InsertGuardedID(context.Context, queryExecer, string, ...any) (int64, bool, error) {
+	return 0, false, nil
+}
+
+// A guarded shard insert that writes nothing while the lease is still current
+// must not report success: no row exists and task.ID is still zero, so the
+// caller would carry on as if its progress row were stored. Both lease paths
+// match ApplyLogs().Append and return an error that is not a lease loss.
+func TestTaskStore_UpsertShardProgressReportsMissUnderCurrentLease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	lock := createTestLock(t, store, "probe_shard_miss_db", "vitess")
+	apply := createTestApply(t, store, lock, "apply_probe_shard_miss", 939)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	store.tasks.identity = missingInsert{store.tasks.identity}
+
+	shardTask := func() *storage.Task {
+		now := time.Now()
+		return &storage.Task{
+			TaskIdentifier: "task_shard_miss", ApplyID: apply.ID, ApplyOperationID: &opID,
+			PlanID: apply.PlanID, Database: apply.Database, DatabaseType: apply.DatabaseType,
+			Engine: storage.EnginePlanetScale, Environment: apply.Environment,
+			State: state.Task.Running, Namespace: "payments", TableName: "users", Shard: "-80",
+			DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "ALTER",
+			ProgressPercent: 20, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+
+	t.Run("apply lease", func(t *testing.T) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
+		`, "driver-a", "apply-token", apply.ID)
+		require.NoError(t, err)
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "apply-token"})
+
+		task := shardTask()
+		err = store.Tasks().UpsertShardProgress(ownerCtx, task)
+		require.Error(t, err, "no shard row was written, yet UpsertShardProgress returned nil with task.ID=%d", task.ID)
+		assert.NotErrorIs(t, err, storage.ErrApplyLeaseLost, "a miss under a current lease is not a lease loss")
+		assert.ErrorContains(t, err, "matched no rows despite current lease")
+		assert.Zero(t, task.ID)
+	})
+
+	t.Run("operation lease", func(t *testing.T) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE apply_operations SET lease_owner = ?, lease_token = ? WHERE id = ?
+		`, "driver-a", "op-token", opID)
+		require.NoError(t, err)
+		ownerCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opID, Owner: "driver-a", Token: "op-token"})
+
+		task := shardTask()
+		err = store.Tasks().UpsertShardProgress(ownerCtx, task)
+		require.Error(t, err, "no shard row was written, yet UpsertShardProgress returned nil with task.ID=%d", task.ID)
+		assert.NotErrorIs(t, err, storage.ErrApplyLeaseLost, "a miss under a current lease is not a lease loss")
+		assert.ErrorContains(t, err, "matched no rows despite current lease")
+		assert.Zero(t, task.ID)
+	})
+}
+
 // The object-ownership lookup answers "which pull requests have changed this
 // object in this deployment target?" — the question the plan path asks before
 // rendering a drop. It is scoped to one database, database type, and

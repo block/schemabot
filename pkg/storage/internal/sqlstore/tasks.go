@@ -424,8 +424,14 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 			opLease.OperationID, task.Namespace, task.TableName, task.Shard, err)
 	}
 	if !inserted {
-		// Zero rows inserted means the operation lease is no longer current.
-		return ensureOperationLeaseStillOwned(ctx, s.db, opLease)
+		// Zero rows inserted means the operation lease is no longer current. A
+		// miss while the lease still reads as current wrote nothing, so it is an
+		// error rather than a success with no row behind it.
+		if err := ensureOperationLeaseStillOwned(ctx, s.db, opLease); err != nil {
+			return err
+		}
+		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q matched no rows despite current lease",
+			opLease.OperationID, task.Namespace, task.TableName, task.Shard)
 	}
 	task.ID = id
 	return nil
@@ -446,8 +452,14 @@ func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *sto
 			lease.ApplyID, task.Namespace, task.TableName, task.Shard, err)
 	}
 	if !inserted {
-		// Zero rows inserted means the apply lease is no longer current.
-		return ensureApplyLeaseStillOwned(ctx, s.db, lease)
+		// Zero rows inserted means the apply lease is no longer current. A miss
+		// while the lease still reads as current wrote nothing, so it is an
+		// error rather than a success with no row behind it.
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return err
+		}
+		return fmt.Errorf("insert shard task for apply %d %s.%s shard %q matched no rows despite current lease",
+			lease.ApplyID, task.Namespace, task.TableName, task.Shard)
 	}
 	task.ID = id
 	return nil
