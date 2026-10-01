@@ -7,12 +7,14 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/schemabot/pkg/localdocker"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/spirit/pkg/utils"
@@ -50,6 +52,12 @@ func TestManagedStoragePersistsAcrossRestart(t *testing.T) {
 	require.NoError(t, err)
 	_, err = localdocker.Run(ctx, nil, "stop", name)
 	require.NoError(t, err)
+	cfg, err := mysql.ParseDSN(string(data))
+	require.NoError(t, err)
+	occupied, err := new(net.ListenConfig).Listen(ctx, "tcp4", cfg.Addr)
+	require.NoError(t, err)
+	require.Error(t, Resume(ctx, dir))
+	require.NoError(t, occupied.Close())
 	require.NoError(t, Resume(ctx, dir))
 	var id int
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT id FROM history_test").Scan(&id))
