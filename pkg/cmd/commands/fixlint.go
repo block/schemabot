@@ -3,12 +3,15 @@ package commands
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
+	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/lint"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // FixLintCmd auto-fixes lint issues in schema files.
@@ -19,15 +22,17 @@ type FixLintCmd struct {
 
 // Run executes the fix-lint command.
 func (cmd *FixLintCmd) Run(g *Globals) error {
-	// Read all .sql files from the schema directory
+	// Read the .sql files with the same layout rules plan uses: flat files in
+	// the schema directory, or one level of namespace subdirectories.
 	files, err := readSchemaFiles(cmd.SchemaDir)
 	if err != nil {
 		return fmt.Errorf("read schema files: %w", err)
 	}
 
+	// A schema directory with nothing to fix is almost always a wrong path, so
+	// fail rather than report success on files that were never read.
 	if len(files) == 0 {
-		fmt.Println("No .sql files found in schema directory.")
-		return nil
+		return fmt.Errorf("no .sql files found in %s", cmd.SchemaDir)
 	}
 
 	// Run the fixer
@@ -59,7 +64,7 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 
 				// Write fixed file (unless dry-run)
 				if !cmd.DryRun {
-					filePath := filepath.Join(cmd.SchemaDir, fr.Filename)
+					filePath := filepath.Join(cmd.SchemaDir, filepath.FromSlash(fr.Filename))
 					if err := os.WriteFile(filePath, []byte(fr.FixedSQL), 0644); err != nil {
 						return fmt.Errorf("write %s: %w", fr.Filename, err)
 					}
@@ -96,30 +101,62 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 	return nil
 }
 
-// readSchemaFiles reads all .sql files from a directory.
+// readSchemaFiles reads the .sql files under dir that plan would read, keyed
+// by their slash-separated path relative to dir ("users.sql" for a flat
+// layout, "orders/users.sql" for a namespaced one).
+//
+// The fixer parses and restores with the MySQL grammar, so a schema directory
+// whose schemabot.yaml declares a database type outside the MySQL family is
+// refused before any file is read: simple PostgreSQL DDL parses under that
+// grammar and would be written back as backtick-quoted MySQL with a success
+// message. A directory without a schemabot.yaml is taken to be MySQL, as
+// LoadCLIConfig would.
+//
+// Which files to fix is decided by GroupFilesByNamespace, the same grouping
+// plan uses, so fix-lint sees exactly the .sql files plan sees: namespaces in
+// ignore_namespaces are left alone, the empty-namespace marker onboard writes
+// is skipped, and files such as vschema.json that are not SQL are not
+// rewritten. The layout checks that need no environment — flat files beside
+// namespace subdirectories — refuse here with plan's error. Checks that need
+// one, such as two directories resolving to the same namespace under
+// `plan -e`, are not run here because fix-lint has no environment.
 func readSchemaFiles(dir string) (map[string]string, error) {
-	files := make(map[string]string)
+	var ignoreNamespaces []string
+	if _, err := os.Stat(filepath.Join(dir, "schemabot.yaml")); err == nil {
+		cfg, err := LoadCLIConfig(dir)
+		if err != nil {
+			return nil, err
+		}
+		if schema.DialectForDatabaseType(cfg.Type) != schema.DialectMySQL {
+			return nil, fmt.Errorf("fix-lint supports MySQL-family schema directories only; %s declares type %q", dir, cfg.Type)
+		}
+		ignoreNamespaces = cfg.IgnoreNamespaces
+	}
 
-	entries, err := os.ReadDir(dir)
+	all, err := client.ReadSchemaFilesByPath(dir)
+	if err != nil {
+		return nil, err
+	}
+	defaultNamespace := filepath.Base(dir)
+	grouped, _, err := schema.GroupFilesByNamespace(all, defaultNamespace, "", ignoreNamespaces)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
+	files := make(map[string]string, len(all))
+	for relPath, content := range all {
+		if !strings.HasSuffix(relPath, ".sql") {
 			continue
 		}
-		if !strings.HasSuffix(entry.Name(), ".sql") {
+		namespace, _ := schema.NamespaceForRelativePath(relPath, defaultNamespace, "")
+		ns, ok := grouped[namespace]
+		if !ok {
 			continue
 		}
-
-		content, err := os.ReadFile(filepath.Join(dir, entry.Name()))
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", entry.Name(), err)
+		if _, ok := ns.Files[path.Base(relPath)]; !ok {
+			continue
 		}
-
-		files[entry.Name()] = string(content)
+		files[relPath] = content
 	}
-
 	return files, nil
 }
