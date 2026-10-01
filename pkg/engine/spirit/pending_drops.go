@@ -77,7 +77,10 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 	// landed the source table still exists and is quarantined again, which
 	// overwrites the record; if it landed the recorded copy exists and the
 	// replay skips the table.
-	moved := pendingdrops.Destinations(tables, time.Now())
+	moved, err := pendingdrops.Destinations(tables, time.Now())
+	if err != nil {
+		return fmt.Errorf("quarantine DROP TABLE targets: %w", err)
+	}
 	for _, table := range moved {
 		e.recordQuarantinedDrop(table)
 	}
@@ -92,10 +95,14 @@ func (e *Engine) quarantineDroppedTables(ctx context.Context, host, username, pa
 			"quarantine_table", table.QuarantineTable,
 		)
 		// Route the quarantine location to the apply log so operators can find
-		// the table for recovery without querying information_schema.
+		// the table for recovery without querying information_schema. The line
+		// names the source schema as well as the table: a shortened quarantine
+		// name cannot be mapped back to its source on its own, and the log is
+		// keyed by table name, so this is the one place that ties `schema`.`table`
+		// to the copy that holds its rows.
 		e.emitTableLog(table.TableName,
-			fmt.Sprintf("table quarantined as `%s`.`%s`; recoverable until the pending drops retention period expires",
-				table.QuarantineSchema, table.QuarantineTable))
+			fmt.Sprintf("table `%s`.`%s` quarantined as `%s`.`%s`; recoverable until the pending drops retention period expires",
+				table.SchemaName, table.TableName, table.QuarantineSchema, table.QuarantineTable))
 		metrics.RecordPendingDropMoved(ctx, table.SchemaName)
 	}
 	return nil

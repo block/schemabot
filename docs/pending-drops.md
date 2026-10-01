@@ -116,6 +116,16 @@ WHERE table_schema = '_pending_drops' ORDER BY table_name DESC;
 RENAME TABLE `_pending_drops`.`20260610143022123_users` TO `app`.`users`;
 ```
 
+A quarantined name does not record which schema the table came from, and a
+name that was shortened to fit the 64-character limit (one ending in `_<hash>`)
+does not carry the full table name either, so neither can be mapped back to
+its source from `information_schema` alone. The apply log is the map: for every
+table it quarantines, the apply writes a line of the form
+``table `app`.`users` quarantined as `_pending_drops`.`20260610143022123_users`; recoverable until the pending drops retention period expires``,
+and that line is the authoritative source-to-copy pairing. Look the table up
+there first; the query above only identifies a copy by its own (possibly
+shortened) name.
+
 Also restore the table's `.sql` file in the schema repository, otherwise the
 next plan will produce another `DROP TABLE` for it.
 

@@ -102,7 +102,8 @@ func TestDestinationsAreUniqueWithinOneMove(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			moved := Destinations(tt.tables, now)
+			moved, err := Destinations(tt.tables, now)
+			require.NoError(t, err)
 			require.Len(t, moved, len(tt.tables))
 
 			seen := make(map[string]string, len(moved))
@@ -120,18 +121,21 @@ func TestDestinationsAreUniqueWithinOneMove(t *testing.T) {
 				assert.Equal(t, now, parsed)
 			}
 
-			assert.Equal(t, moved, Destinations(tt.tables, now), "destinations must be deterministic")
+			again, err := Destinations(tt.tables, now)
+			require.NoError(t, err)
+			assert.Equal(t, moved, again, "destinations must be deterministic")
 		})
 	}
 }
 
 func TestDestinationsKeepPlainNameWhenNoCollision(t *testing.T) {
 	now := time.Date(2026, 6, 10, 14, 30, 22, 123*int(time.Millisecond), time.UTC)
-	moved := Destinations([]TableMove{
+	moved, err := Destinations([]TableMove{
 		{SchemaName: "app", TableName: "users"},
 		{SchemaName: "app", TableName: "orders"},
 		{SchemaName: "app", TableName: strings.Repeat("c", 46)},
 	}, now)
+	require.NoError(t, err)
 	require.Len(t, moved, 3)
 	assert.Equal(t, "20260610143022123_users", moved[0].QuarantineTable)
 	assert.Equal(t, "20260610143022123_orders", moved[1].QuarantineTable)
@@ -145,13 +149,54 @@ func TestDestinationsProgressPastHashPrefixCollision(t *testing.T) {
 		{SchemaName: "app", TableName: strings.Repeat("a", 55) + "029916"},
 	}
 
-	moved := Destinations(tables, now)
+	moved, err := Destinations(tables, now)
+	require.NoError(t, err)
 
 	require.Len(t, moved, 2)
 	assert.NotEqual(t, strings.ToLower(moved[0].QuarantineTable), strings.ToLower(moved[1].QuarantineTable))
 	assert.Equal(t, 64, len([]rune(moved[0].QuarantineTable)))
 	assert.Equal(t, 64, len([]rune(moved[1].QuarantineTable)))
-	assert.Equal(t, moved, Destinations(tables, now))
+	again, err := Destinations(tables, now)
+	require.NoError(t, err)
+	assert.Equal(t, moved, again)
+}
+
+// A candidate generator that repeats itself must surface as an error from the
+// move, not as a loop the drive goroutine never leaves. The bound scales with
+// the move, so a generator whose candidates are all distinct is never cut off:
+// a move of n tables can need at most n-1 retries for any one destination.
+func TestDestinationsFailInsteadOfLoopingWhenCandidatesRepeat(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 123*int(time.Millisecond), time.UTC)
+	tables := []TableMove{
+		{SchemaName: "s1", TableName: "users"},
+		{SchemaName: "s2", TableName: "users"},
+	}
+
+	t.Run("repeating candidates return an error", func(t *testing.T) {
+		calls := 0
+		_, err := destinations(tables, now, func(table TableMove, attempt int) string {
+			calls++
+			return TableName(table.SchemaName, table.TableName, now) // never changes
+		})
+		require.ErrorContains(t, err, "no unique quarantine name for s2.users")
+		assert.Equal(t, len(tables)+destinationAttemptSlack, calls, "the loop stops at the bound")
+	})
+
+	t.Run("a fresh candidate on the last permitted attempt is admitted", func(t *testing.T) {
+		// Every candidate repeats the first table's name until the last attempt
+		// the bound allows, which offers a fresh one. One attempt later would
+		// be the error above, so this pins the bound's edge.
+		lastAttempt := len(tables) + destinationAttemptSlack - 1
+		moved, err := destinations(tables, now, func(table TableMove, attempt int) string {
+			if attempt < lastAttempt {
+				return TableName("s1", "users", now)
+			}
+			return TableName(table.SchemaName, table.TableName, now) + "_fresh"
+		})
+		require.NoError(t, err)
+		require.Len(t, moved, 2)
+		assert.Equal(t, TableName("s2", "users", now)+"_fresh", moved[1].QuarantineTable)
+	})
 }
 
 // Every attempt stays within the identifier limit and yields a distinct name,
