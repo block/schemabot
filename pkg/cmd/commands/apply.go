@@ -84,7 +84,10 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
 		planResult, ignoredNamespaces, planErr = client.CallPlanAPIForTarget(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(),
-			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover), cmd.Target)
+			// The apply refuses the members its rollout lists as needing
+			// attention or as refused, and shows every member's plan before
+			// it prompts.
+			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover), cmd.Target, true)
 		return planErr
 	})
 	if err != nil {

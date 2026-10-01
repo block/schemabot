@@ -232,7 +232,9 @@ func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Man
 		}
 	}
 	cmd.reportProgress("Checking that your schema files match...")
-	baseline, _, err := client.CallPlanAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions, false)
+	// The baseline is verified on every rollout member's plan, the way
+	// onboarding verifies it (validateOnboardPlanResult).
+	baseline, _, err := client.CallPlanAPIWithContext(ctx, connection.Endpoint, cmd.Database, cmd.Type, cmd.Environment, stage, "", 0, exclusions, false, true)
 	if err != nil {
 		return nil, fmt.Errorf("verify baseline: %w", err)
 	}

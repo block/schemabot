@@ -98,7 +98,7 @@ func (cmd *PlanCmd) Run(g *Globals) error {
 		var result *apitypes.PlanResponse
 		err := withLoading("Generating schema change plan...", !cmd.JSON, func() error {
 			var planErr error
-			result, ignoredByEnv[env], planErr = client.CallPlanAPIForTarget(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(), false, cmd.Target)
+			result, ignoredByEnv[env], planErr = client.CallPlanAPIForTarget(ep, cfg.Database, cfg.Type, env, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(), false, cmd.Target, true)
 			return planErr
 		})
 		if err != nil {

@@ -447,6 +447,37 @@ func TestOnboardRejectsDiscoveredNamespacePlaceholders(t *testing.T) {
 	}
 }
 
+// Onboarding verifies the pulled files on every rollout member's plan, so its
+// plan says it reads the rollout, and the server answers it with every
+// member's plan rather than refusing a caller that would see only the
+// primary's.
+func TestVerifyOnboardPlan_SaysItReadsTheRollout(t *testing.T) {
+	var got apitypes.PlanRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/plan", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(&apitypes.PlanResponse{PlanID: "plan-verify"}))
+	}))
+	t.Cleanup(server.Close)
+
+	root := t.TempDir()
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+		},
+	}, client.PlanExclusions{})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	require.NoError(t, verifyOnboardPlan(server.URL, "orders", "production", plan))
+	assert.Equal(t, "orders", got.Database)
+	assert.True(t, got.RendersRollout, "onboarding's verification reads every rollout member's plan")
+}
+
 func TestOnboardWritePlanRefusesExistingFilesWithoutForce(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, "schemabot.yaml"), []byte("database: old\ntype: mysql\n"), 0o644))

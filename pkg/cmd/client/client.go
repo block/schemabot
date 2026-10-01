@@ -238,23 +238,29 @@ type PlanExclusions struct {
 // every ALTER at once or one table at a time. It only affects what the plan
 // predicts about work already on the target; a caller that has not chosen yet
 // passes false, the shape an apply runs without asking for anything else.
+//
+// CallPlanAPI does not say it renders the rollout, so the server refuses it a
+// rollout-wide plan of an environment with more than one member. A caller that
+// reads the rollout block uses CallPlanAPIForTarget and says so.
 func CallPlanAPI(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
-	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "")
+	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "", false)
 }
 
 // CallPlanAPIForTarget is CallPlanAPI narrowed to the one rollout member target
 // names, by its target or by deployment/target. An empty target plans the
-// whole rollout.
-func CallPlanAPIForTarget(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string) (*apitypes.PlanResponse, []string, error) {
-	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, target)
+// whole rollout. rendersRollout says the caller reads the response's rollout
+// block and acts on every member's plan; see apitypes.PlanRequest.RendersRollout.
+func CallPlanAPIForTarget(endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(context.Background(), endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, target, rendersRollout)
 }
 
 // CallPlanAPIWithContext cancels baseline planning with its caller.
-func CallPlanAPIWithContext(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool) (*apitypes.PlanResponse, []string, error) {
-	return callPlanAPI(ctx, endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "")
+// rendersRollout is as for CallPlanAPIForTarget.
+func CallPlanAPIWithContext(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution, rendersRollout bool) (*apitypes.PlanResponse, []string, error) {
+	return callPlanAPI(ctx, endpoint, database, dbType, environment, schemaDir, repo, pr, exclusions, groupedExecution, "", rendersRollout)
 }
 
-func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string) (*apitypes.PlanResponse, []string, error) {
+func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, schemaDir, repo string, pr int, exclusions PlanExclusions, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, []string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -268,26 +274,27 @@ func callPlanAPI(ctx context.Context, endpoint, database, dbType, environment, s
 		}
 		return nil, nil, fmt.Errorf("no .sql files found in %s", schemaDir)
 	}
-	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution, target)
+	resp, err := postPlanRequestWithContext(ctx, endpoint, database, dbType, environment, schemaFiles, repo, pr, ignored, exclusions.Tables, groupedExecution, target, rendersRollout)
 	if err != nil {
 		return nil, ignored, err
 	}
 	return resp, ignored, nil
 }
 
-// CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped schema files.
+// CallPlanAPIWithFiles calls the plan API with pre-loaded, namespace-grouped
+// schema files. It does not say it renders the rollout, so the server refuses
+// it a rollout-wide plan of an environment with more than one member.
 func CallPlanAPIWithFiles(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int) (*apitypes.PlanResponse, error) {
-	return postPlanRequest(endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, nil, false)
+	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, nil, nil, false, "", false)
 }
 
-// postPlanRequest posts a plan request. ignoredNamespaces names the
+// postPlanRequestWithContext posts a plan request. ignoredNamespaces names the
 // namespaces removed from schemaFiles before the call — the server needs
 // them to refuse engine shapes that cannot honor the exclusion.
-func postPlanRequest(endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool) (*apitypes.PlanResponse, error) {
-	return postPlanRequestWithContext(context.Background(), endpoint, database, dbType, environment, schemaFiles, repo, pr, ignoredNamespaces, ignoreTables, groupedExecution, "")
-}
-
-func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool, target string) (*apitypes.PlanResponse, error) {
+// rendersRollout is the caller's own statement, never a default: a caller
+// that does not read the rollout block would present the primary's plan as
+// every member's.
+func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType, environment string, schemaFiles map[string]*apitypes.SchemaFiles, repo string, pr int, ignoredNamespaces, ignoreTables []string, groupedExecution bool, target string, rendersRollout bool) (*apitypes.PlanResponse, error) {
 	req := apitypes.PlanRequest{
 		Database:          database,
 		Type:              dbType,
@@ -298,10 +305,7 @@ func postPlanRequestWithContext(ctx context.Context, endpoint, database, dbType,
 		IgnoreTables:      ignoreTables,
 		GroupedExecution:  groupedExecution,
 		Target:            target,
-		// The CLI renders the plan of every rollout member, and refuses an
-		// apply for the members its rollout lists as needing attention or
-		// as refused.
-		RendersRollout: true,
+		RendersRollout:    rendersRollout,
 	}
 	if pr != 0 {
 		prVal := int32(pr)
@@ -329,10 +333,12 @@ func CallRollbackPlanAPI(endpoint, applyID, environment string) (*apitypes.PlanR
 }
 
 // CallApplyAPI calls the apply API for the whole rollout and returns the typed
-// result, for a caller that reads the plan of every rollout member itself, as
-// the end-to-end suites do; see apitypes.ApplyRequest.RendersRollout.
+// result. It does not say it showed the operator every rollout member's plan,
+// so the server refuses it a rollout-wide apply of an environment with more
+// than one member; see apitypes.ApplyRequest.RendersRollout. A caller that
+// showed every member's plan uses CallApplyAPIForTarget and says so.
 func CallApplyAPI(endpoint, planID, environment, caller string, options map[string]string) (*apitypes.ApplyResponse, error) {
-	return CallApplyAPIForTarget(endpoint, planID, environment, caller, "", true, options)
+	return CallApplyAPIForTarget(endpoint, planID, environment, caller, "", false, options)
 }
 
 // CallApplyAPIForTarget is CallApplyAPI narrowed to the one rollout member
