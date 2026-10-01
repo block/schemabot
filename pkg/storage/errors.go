@@ -104,6 +104,13 @@ var (
 	// (apply_id, deployment, operation_key) is being inserted but already exists.
 	ErrApplyOperationExists = errors.New("apply operation already exists")
 
+	// ErrApplyOperationKeyingMismatch is returned when an attached operation is
+	// keyed by its target (see ApplyOperation.KeyedByTarget) and the
+	// deployment's existing operations of the apply are not, or the reverse.
+	// Mixing the two shapes would let one target's work attach twice under two
+	// keys, so the attach is refused.
+	ErrApplyOperationKeyingMismatch = errors.New("apply operation keying does not match the deployment's existing operations")
+
 	// ErrEngineResumeStateNotFound is returned when no opaque engine resume state exists for an operation.
 	ErrEngineResumeStateNotFound = errors.New("engine resume state not found")
 

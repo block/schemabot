@@ -832,8 +832,12 @@ without completing the request would refuse the start the hold exists to preserv
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate, and `FindNextApplyOperationCutover`
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
-storage parity suite (`pkg/storage/storagetest/apply_operations.go`); for a manually deferred cutover, the turn
-check `CutoverBlocker` (same file, sharing the automatic cutover claim's
+storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
+dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), and each member's progress and cutover are scoped to its own operation
+(`progressScopeOperation` in `pkg/tern/local_client.go`, `boundCutoverRequestTurn` in
+`pkg/tern/local_control.go`); for a manually deferred cutover, the turn
+check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sharing the automatic cutover claim's
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
@@ -1602,7 +1606,10 @@ is never rolled back across the rollout. *Enforced:* member pairing at apply cre
 (`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
 `pkg/api/plan_handlers.go`), which holds a plan to the narrowing recorded on its stored row
 (`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply
-and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`).
+and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`); on a data plane, the plan each
+member target's operation records as it attaches to the deployment's apply
+(`attachDispatchOperation`, `pkg/tern/local_client.go`), which its drive runs (`drivePlanID`) and
+its lost-work verification re-plans from (`planIDForTasks`, `pkg/tern/local_control_resume.go`).
 
 ## Routing and authorization (AZ)
 

@@ -500,28 +500,6 @@ func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newSta
 		}, newState)
 }
 
-// SaveExternalOperationID stores the remote data plane's apply_operation_id on
-// the operation row. It refuses empty IDs so callers do not convert a missing
-// remote field into an apparent successful correlation.
-func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error {
-	if externalOperationID == "" {
-		return fmt.Errorf("save external operation id for apply_operation %d: external operation id is empty", operationID)
-	}
-	guard, err := operationWriteGuardFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	args := append([]any{externalOperationID, operationID}, guard.args()...)
-	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
-		{Column: "external_operation_id", Expr: "?"},
-	})
-	result, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("save external operation id for apply_operation %d: %w", operationID, err)
-	}
-	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
-}
-
 // ApplyIdentifierForRemoteApply returns the identifier of the apply this control
 // plane dispatched as externalID, or "" when it dispatched no such thing.
 //
@@ -575,9 +553,13 @@ func (s *applyOperationStore) ApplyIdentifierForRemoteApply(ctx context.Context,
 	}
 }
 
-// SaveExternalID stores the remote data plane's apply_id on the operation row.
-// It refuses empty IDs so callers do not convert a missing remote field into an
-// apparent successful correlation.
+// SaveExternalID stores the remote data plane's apply_id on the operation row,
+// together with its apply_operation_id when externalOperationID is non-empty.
+// It refuses an empty apply id so callers do not convert a missing remote field
+// into an apparent successful correlation. Both ids are written by one UPDATE:
+// an operation that recorded its remote apply but not its remote operation
+// could never be dispatched again (it already has a remote apply) nor
+// addressed apart from its sibling operations (it has no remote operation).
 //
 // The write is atomic with the deployment's one-remote-apply invariant: in one
 // transaction it locks the apply's operation rows, verifies the operation's
@@ -588,7 +570,7 @@ func (s *applyOperationStore) ApplyIdentifierForRemoteApply(ctx context.Context,
 // divergent ids. Divergence — among the siblings themselves or between the
 // siblings and this id — returns an error wrapping
 // storage.ErrRemoteApplyDeploymentIDConflict.
-func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error {
+func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, operationID int64, externalID, externalOperationID string) error {
 	if externalID == "" {
 		return fmt.Errorf("save external id for apply_operation %d: external id is empty", operationID)
 	}
@@ -623,11 +605,18 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, opera
 	if sharedID != "" && sharedID != externalID {
 		return fmt.Errorf("deployment %q of apply %d already correlates to remote apply %q; refusing to store %q for apply_operation %d: %w", current.Deployment, applyID, sharedID, externalID, operationID, storage.ErrRemoteApplyDeploymentIDConflict)
 	}
+	if externalOperationID != "" && current.ExternalOperationID != "" && current.ExternalOperationID != externalOperationID {
+		return fmt.Errorf("apply_operation %d already records remote apply_operation id %q; refusing to overwrite it with %q", operationID, current.ExternalOperationID, externalOperationID)
+	}
 
-	args := append([]any{externalID, operationID}, guard.args()...)
-	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
-		{Column: "external_id", Expr: "?"},
-	})
+	assignments := []JoinedUpdateAssignment{{Column: "external_id", Expr: "?"}}
+	values := []any{externalID}
+	if externalOperationID != "" {
+		assignments = append(assignments, JoinedUpdateAssignment{Column: "external_operation_id", Expr: "?"})
+		values = append(values, externalOperationID)
+	}
+	args := append(append(values, operationID), guard.args()...)
+	query := guard.updateStatement(s.dialect, assignments)
 	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("save external id for apply_operation %d: %w", operationID, err)
@@ -854,6 +843,25 @@ const earlierRolloutMemberSQL = `(
 	OR earlier.target <> apply_operations.target
 )`
 
+// rolloutMembersOrderedHereSQL holds when this store is the plane that orders
+// the candidate's rollout members, which is every apply except one a remote
+// dispatch created. A dispatched apply carries the idempotency key its
+// dispatcher stamped, and every operation of it arrived as its own dispatch
+// that the dispatcher had already admitted under the rollout's cutover and
+// on_failure policy. Ordering those operations a second time here, under the
+// rolling and halt defaults their rows carry, would serialize a parallel
+// rollout and hold a later member pending behind an earlier one the
+// dispatcher already settled. The copy-start gate therefore leaves member
+// order to the dispatcher on such an apply; the cutovers it sends name the
+// operation they are for. The fragment references the apply_operations alias
+// and takes no placeholders.
+const rolloutMembersOrderedHereSQL = `NOT EXISTS (
+	SELECT 1
+	FROM applies AS dispatched
+	WHERE dispatched.id = apply_operations.apply_id
+		AND dispatched.idempotency_key IS NOT NULL
+)`
+
 // earlierSiblingHoldsCutoverSQL is the cutover-order rule: an earlier sibling
 // (lower created_at, id — deployment_order as materialized at apply-create)
 // holds a later operation's cutover until it has completed, unless
@@ -932,6 +940,7 @@ func finalizerStartGateSQL(d Dialect) string {
 		FROM apply_operations AS earlier
 		WHERE earlier.apply_id = apply_operations.apply_id
 			AND ` + earlierRolloutMemberSQL + `
+			AND ` + rolloutMembersOrderedHereSQL + `
 			AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 			AND earlier.state <> ?
 			AND ` + releasedFailureExemptionSQL(d) + `
@@ -968,6 +977,7 @@ func workStartGateSQL(d Dialect) string {
 	FROM apply_operations AS earlier
 	WHERE earlier.apply_id = apply_operations.apply_id
 		AND ` + earlierRolloutMemberSQL + `
+		AND ` + rolloutMembersOrderedHereSQL + `
 		AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 		AND (
 			(

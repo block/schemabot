@@ -453,6 +453,30 @@ func TestTargetOperationKey(t *testing.T) {
 	}
 }
 
+// TestApplyOperationKeyedByTarget covers which operation rows carry the key a
+// member target's whole-target work is stored under, the shape an attach may
+// not mix with any other within one deployment of an apply.
+func TestApplyOperationKeyedByTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		op   *ApplyOperation
+		want bool
+	}{
+		{"whole-target member work", &ApplyOperation{OperationKey: "orders-002", Target: "orders-002", OperationKind: ApplyOperationKindWork}, true},
+		{"unset kind is work", &ApplyOperation{OperationKey: "orders-002", Target: "orders-002"}, true},
+		{"whole-deployment work of a target", &ApplyOperation{OperationKey: "", Target: "orders-002"}, false},
+		{"shard work of a target", &ApplyOperation{OperationKey: ShardOperationKey("main", "-80", "customers"), Target: "orders-002"}, false},
+		{"work with no target", &ApplyOperation{OperationKey: ""}, false},
+		{"finalizer whose key matches its target", &ApplyOperation{OperationKey: "group_finalizer", Target: "group_finalizer", OperationKind: ApplyOperationKindGroupFinalizer}, false},
+		{"nil operation", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.op.KeyedByTarget())
+		})
+	}
+}
+
 // TestPlanIDForOperation covers which plan a member executes: members planned
 // together share their apply's plan, a member planned against its own live
 // schema carries its own, and a member with neither is not executable and must

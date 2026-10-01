@@ -1757,14 +1757,17 @@ const finalizerDeploymentScopedKey = state.GroupFinalizerKeySegment
 // resolveFinalizerNamespace returns the namespace a group_finalizer operation
 // finalizes, or empty for a deployment-scoped finalizer, which finalizes every
 // namespace its plan asks to. It reads the operation's key in the shape the key
-// writer gave it, and the apply's operation rows are what say which shape that
-// is (see finalizerNamespaceFromKey).
+// writer gave it (see finalizerNamespaceFromKey). A data-plane apply shared by
+// a deployment's targets records that its keys lead with a target, since the
+// first target's finalizer can drive before any sibling target has attached;
+// every other apply's operation rows say which shape its keys have.
 func resolveFinalizerNamespace(ctx context.Context, store storage.Storage, apply *storage.Apply, op *storage.ApplyOperation) (string, error) {
 	ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
 	if err != nil {
 		return "", fmt.Errorf("list operations of apply %s to resolve group_finalizer apply_operation %d scope: %w", apply.ApplyIdentifier, op.ID, err)
 	}
-	namespace, err := finalizerNamespaceFromKey(op.OperationKey, op.Target, operationKeysLeadWithTarget(ops, op))
+	targetQualified := apply.GetOptions().OperationKeysLeadWithTarget || operationKeysLeadWithTarget(ops, op)
+	namespace, err := finalizerNamespaceFromKey(op.OperationKey, op.Target, targetQualified)
 	if err != nil {
 		return "", fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q: %w", op.ID, apply.ApplyIdentifier, op.OperationKey, err)
 	}
@@ -2257,6 +2260,35 @@ func (c *LocalClient) drivePlanID(apply *storage.Apply, op *storage.ApplyOperati
 		return apply.PlanID, nil
 	}
 	return storage.PlanIDForOperation(apply, op)
+}
+
+// planIDForTasks resolves the plan a drive's tasks were built from, for the
+// paths that judge those tasks against their reviewed schema without an
+// operation in hand. Each task records its plan, and the rollout member
+// targets sharing one apply were each planned against their own live schema,
+// so the apply's plan, which is the plan of the dispatch that created it,
+// would judge a sibling target's tasks against another target's schema set.
+// Tasks naming different plans are refused rather than judged against one of
+// them. Tasks that record no plan fall back to the apply's.
+func planIDForTasks(apply *storage.Apply, tasks []*storage.Task) (int64, error) {
+	var planID int64
+	for _, task := range tasks {
+		switch {
+		case task.PlanID == 0:
+			// Judged against the plan its siblings name, or the apply's.
+		case planID == 0:
+			planID = task.PlanID
+		case task.PlanID != planID:
+			return 0, fmt.Errorf("tasks of apply %s were built from different plans (%d and %d); refusing to judge them against one", apply.ApplyIdentifier, planID, task.PlanID)
+		}
+	}
+	if planID != 0 {
+		return planID, nil
+	}
+	if apply.PlanID == 0 {
+		return 0, fmt.Errorf("neither the tasks nor apply %s name a plan", apply.ApplyIdentifier)
+	}
+	return apply.PlanID, nil
 }
 
 // resumeApplyWithTasks drives an apply (or one of its operations) from the set

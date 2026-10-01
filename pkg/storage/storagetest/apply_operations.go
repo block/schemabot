@@ -1495,9 +1495,9 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		siblingID := createOperation(t, store, apply.ID, "region-a", "shard/80-")
 		otherID := createOperation(t, store, apply.ID, "region-b", "shard/-80")
 
-		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, siblingID, "remote-a"))
-		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, otherID, "remote-b"))
-		err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, siblingID, "remote-conflict")
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, siblingID, "remote-a", ""))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, otherID, "remote-b", ""))
+		err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, siblingID, "remote-conflict", "")
 		require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
 
 		sibling, err := store.ApplyOperations().Get(ctx, siblingID)
@@ -1508,6 +1508,38 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, other)
 		assert.Equal(t, "remote-b", other.ExternalID)
+	})
+
+	// SaveExternalID_RecordsTheRemoteOperationInTheSameWrite verifies a
+	// dispatch's remote apply id and remote operation id land together: an
+	// operation never records its remote apply without the remote operation
+	// its progress and cutover address. A write whose remote operation id
+	// disagrees with the one already recorded is refused and writes neither.
+	t.Run("SaveExternalID_RecordsTheRemoteOperationInTheSameWrite", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_external_operation_id_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_external_operation_id", 906)
+		memberID := createOperation(t, store, apply.ID, "default", "payments-002")
+		recordedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-b", OperationKey: "payments-003", ExternalOperationID: "remote-operation-recorded",
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, memberID, "remote-default", "remote-operation-002"))
+		member, err := store.ApplyOperations().Get(ctx, memberID)
+		require.NoError(t, err)
+		require.NotNil(t, member)
+		assert.Equal(t, "remote-default", member.ExternalID)
+		assert.Equal(t, "remote-operation-002", member.ExternalOperationID)
+
+		err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, recordedID, "remote-region-b", "remote-operation-other")
+		require.ErrorContains(t, err, `"remote-operation-recorded"`)
+		recorded, err := store.ApplyOperations().Get(ctx, recordedID)
+		require.NoError(t, err)
+		require.NotNil(t, recorded)
+		assert.Empty(t, recorded.ExternalID, "a refused remote operation id must not leave its remote apply id behind")
+		assert.Equal(t, "remote-operation-recorded", recorded.ExternalOperationID)
 	})
 
 	// ApplyIdentifierForRemoteApply_NamesTheApplyThisPlaneDispatched verifies the
@@ -1523,8 +1555,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		apply := CreateApply(t, store, lock, "apply_operation_holder_lookup", 921)
 		first := createOperation(t, store, apply.ID, "region-a", "shard/-80")
 		sibling := createOperation(t, store, apply.ID, "region-a", "shard/80-")
-		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, first, "remote-holder"))
-		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, sibling, "remote-holder"))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, first, "remote-holder", ""))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, sibling, "remote-holder", ""))
 
 		identifier, err := store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "remote-holder")
 		require.NoError(t, err)
@@ -1565,8 +1597,8 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		second := CreateApply(t, store, secondLock, "apply_operation_holder_second", 924)
 		firstOp := createOperation(t, store, first.ID, "region-a", "shard/-80")
 		secondOp := createOperation(t, store, second.ID, "region-a", "shard/-80")
-		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, first.ID, firstOp, "remote-shared"))
-		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, second.ID, secondOp, "remote-shared"))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, first.ID, firstOp, "remote-shared", ""))
+		require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, second.ID, secondOp, "remote-shared", ""))
 
 		identifier, err := store.ApplyOperations().ApplyIdentifierForRemoteApply(ctx, "remote-shared")
 		require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
