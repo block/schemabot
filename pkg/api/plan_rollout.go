@@ -120,7 +120,7 @@ func unplannedMemberApplyOutcome(planning MemberPlanning) string {
 //
 // Members are grouped on the plan fingerprint, which two members share exactly
 // when their plans are the same work, together with the execution verdict each
-// change runs under (see planGroupKey). A member that errored has no
+// change runs under and its reason (see planGroupKey). A member that errored has no
 // fingerprint and no plan, and a mirrored member that diverged would still run
 // the primary's plan, so neither joins a group: each is listed for attention.
 func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
@@ -177,14 +177,14 @@ func planRolloutResponse(rollup PlanRollup) *apitypes.PlanRolloutResponse {
 }
 
 // planGroupKey is what two members share when one group describes both: the
-// same work, and the same execution verdict on every change. The fingerprint
-// alone is the work, and the direct execution policy judges each target's own
-// table, so two members can plan the same DDL while one runs it as native DDL
-// that blocks writes and the other through the engine. A group's changes carry
-// its first member's verdicts, so members whose verdicts differ are kept apart
-// rather than shown under verdicts that are not theirs. A verdict's reason is
-// not part of the key: it carries the member's own measurements, which differ
-// between members that run the same statement the same way.
+// same work, and the same execution verdict on every change, reason included.
+// The fingerprint alone is the work, and the direct execution policy judges
+// each target's own table, so two members can plan the same DDL while one runs
+// it as native DDL that blocks writes and the other through the engine. A
+// verdict's reason carries the member's own measurements, such as its table's
+// size. A group's changes carry its first member's verdicts and reasons, so
+// members whose verdicts or reasons differ are kept apart rather than shown
+// under a verdict or a measurement that is not theirs.
 func planGroupKey(e DeploymentRollupEntry) string {
 	var verdicts []string
 	record := func(namespace, shard string, changes []*ternv1.TableChange) {
@@ -192,7 +192,7 @@ func planGroupKey(e DeploymentRollupEntry) string {
 			if tc.GetExecutionMode() == "" {
 				continue
 			}
-			verdicts = append(verdicts, strings.Join([]string{namespace, shard, tc.GetTableName(), tc.GetExecutionMode()}, "\x00"))
+			verdicts = append(verdicts, strings.Join([]string{namespace, shard, tc.GetTableName(), tc.GetExecutionMode(), tc.GetModeReason()}, "\x00"))
 		}
 	}
 	for _, sc := range e.ChangeSet.Changes {

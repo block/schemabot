@@ -116,6 +116,42 @@ func TestPlanRollout_SameDDLUnderDifferentExecutionModesSplitsGroups(t *testing.
 	assert.Equal(t, "table is 12 MiB, within the direct execution bound", tc.ModeReason)
 }
 
+// Targets that run the same DDL directly are still separate groups when the
+// reasons for their verdicts differ: the reason carries the target's own table
+// size, and a group's changes carry one reason for every member it names. So
+// testapp-001's 12 MiB table and testapp-002's 40 MiB one are each shown with
+// their own size rather than both under the primary's.
+func TestPlanRollout_SameDirectDDLUnderDifferentReasonsSplitsGroups(t *testing.T) {
+	ddl := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	const primaryReason = "table is 12 MiB, within the direct execution bound"
+	const memberReason = "table is 40 MiB, within the direct execution bound"
+	reviewed := reviewedUsersPlan(ddl)
+	reviewed.Changes[0].TableChanges[0].ExecutionMode = "direct"
+	reviewed.Changes[0].TableChanges[0].ModeReason = primaryReason
+	member := alterUsersDiff(ddl)
+	member.Changes[0].TableChanges[0].ExecutionMode = "direct"
+	member.Changes[0].TableChanges[0].ModeReason = memberReason
+	svc := multiTargetService(t, &mockTernClient{planDiffResp: member}, reviewedPlanStore(t, reviewed, "testapp-001"))
+
+	rollout, err := svc.planRollout(t.Context(), planDiffReq(t), reviewed,
+		&apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
+	require.NoError(t, err)
+	require.NotNil(t, rollout)
+	require.Len(t, rollout.Groups, 2, "the same direct DDL under different reasons is two groups")
+
+	for i, want := range []struct {
+		member string
+		reason string
+	}{{"eu/testapp-001", primaryReason}, {"eu/testapp-002", memberReason}} {
+		group := rollout.Groups[i]
+		assert.Equal(t, []string{want.member}, group.Members)
+		require.Len(t, group.Changes, 1)
+		require.Len(t, group.Changes[0].TableChanges, 1)
+		assert.Equal(t, "direct", group.Changes[0].TableChanges[0].ExecutionMode)
+		assert.Equal(t, want.reason, group.Changes[0].TableChanges[0].ModeReason, "%s is shown with its own reason", want.member)
+	}
+}
+
 // A target that could not be planned joins no group: it is listed for
 // attention with a fixed detail, because the raw error can carry hostnames and
 // dial failures that do not belong in a response.

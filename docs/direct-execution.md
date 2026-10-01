@@ -320,7 +320,9 @@ policy's reason under a "Direct execution" notice. For an environment with
 several targets, the notice sits under the targets that run the change
 natively. Targets that plan the same statement but run it differently are
 shown as separate groups, so a target running the change through Spirit never
-appears under the notice.
+appears under the notice. So are targets that run it natively for different
+reasons, such as tables of different sizes, so each notice names its own
+target's measurement.
 
 ## Observability
 
