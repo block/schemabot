@@ -34,6 +34,9 @@ type rolloutTarget struct {
 	// externalOperationID is the target's own data-plane operation.
 	externalOperationID string
 	isInstant           bool
+	// startedAt is when a driver started the target; a completed target
+	// without one already held the change when the apply was created.
+	startedAt string
 }
 
 // targetRolloutData builds a running apply of orders to production whose prod
@@ -57,6 +60,7 @@ func targetRolloutData(targets []rolloutTarget) ProgressData {
 			ErrorMessage:        target.err,
 			ExternalID:          target.externalID,
 			ExternalOperationID: target.externalOperationID,
+			StartedAt:           target.startedAt,
 		})
 		if target.status == "" {
 			continue
@@ -140,6 +144,31 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 		"stop closes the output:\n%s", out)
 }
 
+// A target that already held the change is settled completed without a
+// driver ever starting it, so it reports no table progress. A finished apply
+// says so rather than claiming the target has yet to report, and a target
+// that failed before reporting is named in the attention list, not counted as
+// waiting.
+func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
+	ran := completedTarget()
+	ran.startedAt = "2026-09-30T12:00:00Z"
+	converged := rolloutTarget{opState: state.ApplyOperation.Completed}
+
+	finished := targetRolloutData([]rolloutTarget{ran, ran, converged})
+	finished.State = state.Apply.Completed
+	out := renderRollout(t, finished)
+	assert.Contains(t, out, "✅ prod — 3 completed (3 targets)")
+	assert.Contains(t, out, "1 of 3 targets already had this schema; nothing ran there.")
+	assert.NotContains(t, out, "have not reported progress yet", "a finished target is not waiting to report:\n%s", out)
+
+	failedEarly := rolloutTarget{opState: state.ApplyOperation.Failed, startedAt: "2026-09-30T12:00:00Z", err: "connection refused"}
+	running := targetRolloutData([]rolloutTarget{ran, copyingTarget(400), failedEarly, queuedTarget()})
+	out = renderRollout(t, running)
+	assert.Contains(t, out, "1 of 4 targets have not reported progress yet.", "only the queued target is waiting to report:\n%s", out)
+	assert.NotContains(t, out, "already had this schema")
+	assertLess(t, out, "Targets needing attention:", "payments-003 — failed: connection refused")
+}
+
 // Sixty-four targets stay one screen: copying targets are sampled with the
 // rest counted, the failed target is always named with its error and the
 // data-plane apply to look at, and the table keeps showing the rows still
@@ -160,6 +189,29 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 	assertLess(t, out, "payments-041 — failed", "External operation ID: spirit-op-041")
 	assertLess(t, out, "External operation ID: spirit-op-041", "External apply ID: spirit-041")
 	assert.True(t, strings.HasSuffix(out, "schemabot stop apply-7f3c -e production\n"), "%s", out)
+}
+
+// A change that failed on all 64 targets still stays short: the table names
+// the first failed targets and counts the rest, and the attention list caps
+// its own entries, so the output does not grow by a line per target.
+func TestWriteProgress_AllTargetsFailedStaysBounded(t *testing.T) {
+	var targets []rolloutTarget
+	for range 64 {
+		targets = append(targets, rolloutTarget{
+			opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: 300, rowsTotal: 1000,
+			err: "Error 1062: Duplicate entry",
+		})
+	}
+	data := targetRolloutData(targets)
+	data.State = state.Apply.Failed
+
+	out := renderRollout(t, data)
+	assert.Contains(t, out, "• Targets: 64 (64 failed)")
+	assert.Contains(t, out, "✗ payments-010: failed")
+	assert.NotContains(t, out, "✗ payments-011: failed", "failed targets past the cap are counted, not listed:\n%s", out)
+	assert.Contains(t, out, "... 54 more failed targets")
+	assert.Contains(t, out, "…and 44 more")
+	assert.Less(t, strings.Count(out, "\n"), 60, "the output does not grow by a line per failed target:\n%s", out)
 }
 
 // With no target copying, the table's line reads as its most urgent state.

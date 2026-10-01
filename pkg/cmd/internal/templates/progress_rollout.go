@@ -85,16 +85,25 @@ func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 // writeTargetTables writes each table's progress across the targets that run
 // it. A target that has reported no table progress joins no group: missing
 // detail is not a different change, and setting it apart would show a false
-// divergence, so such targets are counted once below instead.
+// divergence, so such targets are counted once below instead. Only a target
+// still to run is waiting to report; one that already held the change was
+// settled without running anything and is counted as such, and any other
+// finished target is accounted for by the deployment's counts and the
+// attention list.
 func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) {
 	var work []targetWork
 	bySignature := make(map[string]int)
-	silent := 0
+	silent, converged := 0, 0
 	for _, i := range g.Members {
 		d := v.Model.Deployments[i]
 		tables := activeTablesForMember(v.Tables, d.Deployment, d.Target)
 		if len(tables) == 0 {
-			silent++
+			switch {
+			case targetAlreadyConverged(v.Operations[i]):
+				converged++
+			case !state.IsApplyOperationTerminal(v.Operations[i].State):
+				silent++
+			}
 			continue
 		}
 		signature := tableChangeSignature(tables)
@@ -132,9 +141,20 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 			b.WriteString("\n")
 		}
 	}
+	if converged > 0 {
+		fmt.Fprintf(b, "  %s%d of %d targets already had this schema; nothing ran there.%s\n", ANSIDim, converged, len(g.Members), ANSIReset)
+	}
 	if silent > 0 {
 		fmt.Fprintf(b, "  %s%d of %d targets have not reported progress yet.%s\n", ANSIDim, silent, len(g.Members), ANSIReset)
 	}
+}
+
+// targetAlreadyConverged reports whether a target already held the change
+// when the apply was created: its operation was recorded completed without a
+// driver ever starting it, which is how an apply settles a target with
+// nothing left to run.
+func targetAlreadyConverged(op ProgressOperation) bool {
+	return state.IsState(op.State, state.ApplyOperation.Completed) && op.StartedAt == ""
 }
 
 // tableChangeSignature keys the change a target runs by its tables and their

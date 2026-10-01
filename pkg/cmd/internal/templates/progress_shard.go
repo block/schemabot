@@ -23,6 +23,11 @@ var (
 // with a collapsed summary for complete shards.
 const maxShardDetail = 8
 
+// maxFailedShown is the most failed parts a wide table names one per line:
+// enough that a handful of failures are each named, few enough that a change
+// that failed on every part does not print a line per part.
+const maxFailedShown = 10
+
 // FormatShardProgress returns per-shard progress for a Vitess table as a string.
 // For large shard counts (>maxShardDetail), only shows non-terminal shards
 // plus a collapsed count for complete/queued shards.
@@ -64,15 +69,25 @@ func formatPartProgress(shards []ShardProgress, noun presentation.Noun) string {
 	// of copying shards, then collapse the rest into a summary.
 	const maxCopyingShown = 5
 
-	// Always show failed shards (they need attention). Every other status
-	// that is neither copying, complete nor queued is sampled a few lines
-	// per status with the rest counted, so a wall of identical "waiting for
-	// cutover" lines stays short and no part in any phase goes unmentioned.
+	// Failed shards come first (they need attention), up to maxFailedShown
+	// with the rest counted, so a change that failed everywhere still fits on
+	// one screen; the header carries the total. Every other status that is
+	// neither copying, complete nor queued is sampled a few lines per status
+	// with the rest counted, so a wall of identical "waiting for cutover"
+	// lines stays short and no part in any phase goes unmentioned.
 	const maxNonCopyingShown = 3
+	failed := 0
 	for _, s := range shards {
-		if s.Status == state.Task.Failed {
+		if s.Status != state.Task.Failed {
+			continue
+		}
+		if failed < maxFailedShown {
 			b.WriteString(formatShardLine(s))
 		}
+		failed++
+	}
+	if more := failed - maxFailedShown; more > 0 {
+		fmt.Fprintf(&b, indentShardMore+"%s... %d more failed %s%s\n", ANSIDim, more, noun.Plural, ANSIReset)
 	}
 	sampled := make(map[string]int)
 	for _, s := range shards {

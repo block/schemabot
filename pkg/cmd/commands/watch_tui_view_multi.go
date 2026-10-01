@@ -125,20 +125,18 @@ func tablesForMember(tables []templates.TableProgress, deployment, target string
 	return memberTables
 }
 
+// writeMultiDeploymentFooter closes the view below the rollout footer. A
+// failed or stopped rollout ends on the footer's command, the way the progress
+// output does: the header already names the state, and a second banner would
+// repeat the recovery guidance beneath the command it describes.
 func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model presentation.Apply) {
 	switch {
 	case state.IsState(model.State, state.Apply.Completed):
 		b.WriteString("\n")
 		b.WriteString(templates.FormatApplyCompleteWithSummary(countTableProgressChanges(m.tables).summary(), m.applyID))
 		b.WriteString("\n")
-	case state.IsState(model.State, state.Apply.Failed):
-		b.WriteString("\n")
-		b.WriteString(templates.FormatApplyFailed())
-		b.WriteString("\n")
-	case state.IsState(model.State, state.Apply.Stopped):
-		b.WriteString("\n")
-		b.WriteString(templates.FormatApplyStopped())
-		b.WriteString("\n")
+	case state.IsState(model.State, state.Apply.Failed, state.Apply.Stopped):
+		// Nothing follows the rollout footer's command.
 	default:
 		dimStyle := lipgloss.NewStyle().Faint(true)
 		b.WriteString(dimStyle.Render("ESC to detach"))

@@ -383,6 +383,37 @@ func TestWatchModel_MultiDeploymentCutoverFollowsDeferCutover(t *testing.T) {
 	assert.Contains(t, deferred, "schemabot cutover apply-cutover-test -e production")
 }
 
+// A failed or stopped multi-target rollout ends the watch view on the one
+// command that recovers it, as the progress output does, with the recovery
+// guidance said once rather than repeated in a banner beneath the command.
+func TestWatchModel_MultiTargetRolloutEndsOnItsRecoveryCommand(t *testing.T) {
+	render := func(applyState, failedOpState string) string {
+		m := NewWatchModel("http://localhost:8080", "orders", "production", false)
+		m.applyID = "apply-rollout-end"
+		m.state = applyState
+		m.initialized = true
+		m.operations = []templates.ProgressOperation{
+			{Deployment: "prod", Target: "payments-001", State: state.ApplyOperation.Completed, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			{Deployment: "prod", Target: "payments-002", State: failedOpState, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate column"},
+		}
+		m.tables = []templates.TableProgress{
+			{Deployment: "prod", Target: "payments-001", TableName: "orders", ChangeType: "alter", Status: state.Task.Completed},
+			{Deployment: "prod", Target: "payments-002", TableName: "orders", ChangeType: "alter", Status: state.Task.Stopped},
+		}
+		return m.View()
+	}
+
+	failed := render(state.Apply.Failed, state.ApplyOperation.Failed)
+	assert.True(t, strings.HasSuffix(failed, "schemabot apply -s <schema_dir> -e production"+templates.ANSIReset+"\n\n"),
+		"the retry command closes the view:\n%s", failed)
+	assert.NotContains(t, failed, "run a new apply", "the retry guidance is not repeated beneath the command")
+
+	stopped := render(state.Apply.Stopped, state.ApplyOperation.Stopped)
+	assert.True(t, strings.HasSuffix(stopped, "schemabot start apply-rollout-end -e production"+templates.ANSIReset+"\n\n"),
+		"the resume command closes the view:\n%s", stopped)
+	assert.NotContains(t, stopped, "Apply stopped")
+}
+
 func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "orders", "production", false)
 	m.applyID = "apply-single-test"
