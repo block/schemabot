@@ -393,7 +393,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
 		}
 		if refusal != "" {
-			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, reviewedTargetConverged, memberWorkRefusalMessage(refusal, reviewedTargetConverged))
+			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, reviewedTargetConverged, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}
 		h.logger.Info("apply: other targets have plans of their own; they will run once confirmed",
@@ -452,13 +452,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// Block unsafe changes unless --allow-unsafe was specified
-	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
-		commentData.ScopedDatabase = result.Database
-		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
-		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+	// Block unsafe changes unless --allow-unsafe was specified, on every target
+	// the apply runs: one opt-in consents for all of them, as it does for one.
+	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview); blocked {
 		return false, nil
 	}
 

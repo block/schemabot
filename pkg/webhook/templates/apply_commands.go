@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -156,7 +157,18 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 // and --allow-unsafe was not specified. Shows the plan DDL plus a blocking message
 // instructing the user to re-run with --allow-unsafe.
 func RenderUnsafeChangesBlocked(data PlanCommentData) string {
-	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+	// Every target's plan renders when the apply runs other targets' plans, so
+	// the refusal shows what each would run. The refusal lists every unsafe
+	// change itself, naming its targets, so the groups do not repeat them.
+	if RendersTargetPlans(data.DeploymentDrift) {
+		drift := *data.DeploymentDrift
+		drift.Plans = slices.Clone(drift.Plans)
+		for i := range drift.Plans {
+			drift.Plans[i].UnsafeChanges = nil
+		}
+		data.DeploymentDrift = &drift
+	}
+	return renderWithinCommentLimit(countCommentDDLBlocks(data), 0, func(budget *ddlBlockBudget) string {
 		return renderUnsafeChangesBlocked(data, budget)
 	})
 }
@@ -172,16 +184,18 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	writePlanAttribution(&sb, data)
 	sb.WriteString("\n")
 
-	// Count and show changes
-	totalStatements, keyspaceUpdates := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspaceUpdates
-
-	if totalChanges > 0 {
+	// Count and show changes, every target's when the apply runs them.
+	summary := data
+	if RendersTargetPlans(data.DeploymentDrift) {
+		writeTargetPlans(&sb, data, budget, false)
+		summary.Changes = combinedTargetPlanChanges(data)
+	} else if statements, keyspaceUpdates := countChanges(data.Changes); statements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 	writeTableSizesSection(&sb, data)
+	totalStatements, keyspaceUpdates := countChanges(summary.Changes)
 
-	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
+	writePlanSummary(&sb, summary, totalStatements, keyspaceUpdates)
 
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
@@ -189,7 +203,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
 	item := 0
 	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(&sb, &item, inlineCode(c.Table), c.Reason, c.ChangeType)
+		writeUnsafeChangeItem(&sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)

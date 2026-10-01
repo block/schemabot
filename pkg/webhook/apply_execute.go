@@ -202,7 +202,7 @@ func (h *Handler) executeApply(
 		}
 		if refusal != "" {
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
-			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, reviewedTargetConverged, memberWorkRefusalMessage(refusal, reviewedTargetConverged))
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, reviewedTargetConverged, memberWorkRefusalMessage(refusal))
 			return
 		}
 		confirmedMemberWork = true
@@ -389,13 +389,9 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
-	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
-		commentData.ScopedDatabase = result.Database
-		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
-		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+	// Block unsafe changes on confirm (re-plan may have detected new unsafe
+	// changes), on every target the apply runs.
+	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview); blocked {
 		return
 	}
 
@@ -575,6 +571,8 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 			return templates.MemberPlanBlockedDetail(refused.Target, refused.Table)
 		case api.MemberPlanUndisclosedUnsafe:
 			return templates.MemberPlanUndisclosedUnsafeDetail(refused.Target, refused.Table, refused.Namespace)
+		case api.MemberPlanUnsafeWithoutOptIn:
+			return templates.MemberPlanUnsafeWithoutOptInDetail(refused.Target, refused.Table, refused.Namespace)
 		}
 		// A refusal kind with no line of its own takes the generic one below,
 		// never the error text.

@@ -190,7 +190,7 @@ func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 
 	single := templates.RenderPlanComment(data)
 	assert.Contains(t, single, "ALTER TABLE orders ADD COLUMN region varchar(16)", "the other target's plan is still shown")
-	assert.Contains(t, single, "**This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but target primary/payments-002: its data plane did not report")
+	assert.Contains(t, single, "**This PR cannot apply every target's plan**: target primary/payments-002: its data plane did not report")
 	assert.NotContains(t, single, "schemabot apply", "an apply that is refused whatever its flags is never offered")
 
 	staging := &templates.PlanCommentData{Database: "payments", DatabaseType: "postgres", Environment: "staging"}
@@ -199,7 +199,7 @@ func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*templates.PlanCommentData{"staging": staging, "production": &data},
 	})
-	assert.Contains(t, multi, "**This PR cannot apply the other targets' plans**")
+	assert.Contains(t, multi, "**This PR cannot apply every target's plan**")
 	assert.NotContains(t, multi, "schemabot apply")
 	assert.NotContains(t, multi, "No changes to apply", "a target still needs the change")
 }

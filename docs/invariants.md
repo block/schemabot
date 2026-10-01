@@ -1505,9 +1505,13 @@ after the confirmation stops rather than running something the operator never sa
 `pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
 reviewed target's included, is what the confirmation was given against and carries no consequence
 it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversReviewedTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
-`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), and apply creation refusing, whatever the flags,
-unsafe changes that the disclosure never named in a plan it did not come from
-(`rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
+`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
+member's unsafe change requiring the same opt-in as the reviewed plan's, both at the PR gate
+(`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
+`TargetPlanUnsafeChanges` in `pkg/webhook/templates/plan.go`) and at apply creation
+(`rejectUnapplyableMemberPlan` in `pkg/api/plan_handlers.go`), and apply creation refusing,
+whatever the flags, a caller that was not shown a member's plan any unsafe change of that member
+the reviewed plan's disclosure never named (`rejectMemberUndisclosedUnsafe`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
 when `--allow-unsafe` is passed, judged against every unsafe change the plan carries, a divergent
 shard's included (`pkg/cmd/commands/apply.go`, `pkg/cmd/commands/rollback.go`, over
 `PlanResponse.UnsafeChanges` in `pkg/apitypes/apitypes.go`). On the PR-comment rollback path the

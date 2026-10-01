@@ -528,6 +528,20 @@ func MemberPlanBlockedDetail(target, table string) string {
 		inlineCode(target), inlineCode(table))
 }
 
+// MemberPlanUnsafeWithoutOptInDetail is the error line for an apply whose
+// creation refused one rollout target's own plan for an unsafe change, on an
+// apply created without `--allow-unsafe`. Like MemberPlanBlockedDetail, it is
+// built from names SchemaBot controls; table is empty for a VSchema change in
+// namespace.
+func MemberPlanUnsafeWithoutOptInDetail(target, table, namespace string) string {
+	subject := "table " + inlineCode(table)
+	if table == "" {
+		subject = "the VSchema of namespace " + inlineCode(namespace)
+	}
+	return fmt.Sprintf("Target %s has an unsafe change on %s, so nothing was applied. Run the command again with `--allow-unsafe` to apply it.",
+		inlineCode(target), subject)
+}
+
 // MemberPlanUndisclosedUnsafeDetail is the error line for an apply whose
 // creation refused one rollout target's own plan for an unsafe change the
 // reviewed plan does not carry. The comment's unsafe disclosure names only the

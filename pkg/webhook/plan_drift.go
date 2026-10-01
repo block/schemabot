@@ -11,6 +11,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/tern"
@@ -211,6 +212,11 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		for _, dc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeDirect) {
 			addModeTarget(&groups[at].DirectChanges, templates.DirectChangeData(dc), names[i])
 		}
+		// An unsafe change is disclosed under the targets that carry it too, so
+		// one --allow-unsafe consents to it on every target the apply runs.
+		for _, uc := range memberUnsafeChanges(e.ChangeSet) {
+			addUnsafeTarget(&groups[at].UnsafeChanges, uc, names[i])
+		}
 	}
 	// A change every target in the group carries needs no names beside it: the
 	// group heading already lists them.
@@ -221,6 +227,9 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		}
 		for di := range groups[gi].DirectChanges {
 			trimModeTargets(&groups[gi].DirectChanges[di].Targets, &groups[gi].DirectChanges[di].TotalTargets, members)
+		}
+		for ui := range groups[gi].UnsafeChanges {
+			trimModeTargets(&groups[gi].UnsafeChanges[ui].Targets, &groups[gi].UnsafeChanges[ui].TotalTargets, members)
 		}
 	}
 	// The primary is the first member, so its group is already first. Ordering is
@@ -394,6 +403,82 @@ func addModeTarget[T modeChange](list *[]T, change T, target string) {
 	}
 	bc.Targets = []string{target}
 	*list = append(*list, T(bc))
+}
+
+// memberUnsafeChanges lists the table changes in one member's plan that need
+// the unsafe opt-in, read the way the reviewed plan's are: per shard for a
+// sharded namespace, so a change unsafe on some shards names them, and
+// otherwise from the namespace view. The unsafe verdict and the drop fallback
+// are apitypes.TableChangeResponse.UnsafeChange, the reviewed plan's own rule.
+// A member's VSchema unsafe change is not listed here; apply creation still
+// requires the opt-in for it.
+func memberUnsafeChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
+	unsafeOf := func(tc *ternv1.TableChange) (apitypes.UnsafeChange, bool) {
+		op, ok := ternconv.ChangeTypeToOp(tc.GetChangeType())
+		if !ok {
+			op = "other"
+		}
+		return (&apitypes.TableChangeResponse{
+			TableName:    tc.GetTableName(),
+			DDL:          tc.GetDdl(),
+			ChangeType:   op,
+			IsUnsafe:     tc.GetIsUnsafe(),
+			UnsafeReason: tc.GetUnsafeReason(),
+		}).UnsafeChange()
+	}
+	var out []templates.UnsafeChangeData
+	if len(cs.Shards) > 0 {
+		total := 0
+		for _, sp := range cs.Shards {
+			if sp == nil {
+				continue
+			}
+			total++
+			for _, tc := range sp.GetChanges() {
+				uc, ok := unsafeOf(tc)
+				if !ok {
+					continue
+				}
+				at := slices.IndexFunc(out, func(c templates.UnsafeChangeData) bool {
+					return c.Table == uc.Table && c.Reason == uc.Reason
+				})
+				if at < 0 {
+					out = append(out, templates.UnsafeChangeData{Table: uc.Table, Reason: uc.Reason, DDL: uc.DDL, ChangeType: uc.ChangeType})
+					at = len(out) - 1
+				}
+				out[at].Shards = append(out[at].Shards, sp.GetShard())
+			}
+		}
+		for i := range out {
+			out[i].TotalShards = total
+		}
+		return out
+	}
+	for _, sc := range cs.Changes {
+		for _, tc := range sc.GetTableChanges() {
+			if uc, ok := unsafeOf(tc); ok {
+				out = append(out, templates.UnsafeChangeData{Table: uc.Table, Reason: uc.Reason, DDL: uc.DDL, ChangeType: uc.ChangeType})
+			}
+		}
+	}
+	return out
+}
+
+// addUnsafeTarget records that a target carries one of its group's unsafe
+// changes, folding it into the group's entry for the same change when another
+// target already carries it, the way addModeTarget folds a verdict.
+func addUnsafeTarget(list *[]templates.UnsafeChangeData, change templates.UnsafeChangeData, target string) {
+	for i := range *list {
+		existing := &(*list)[i]
+		if existing.Table == change.Table && existing.Reason == change.Reason && slices.Equal(existing.Shards, change.Shards) {
+			if !slices.Contains(existing.Targets, target) {
+				existing.Targets = append(existing.Targets, target)
+			}
+			return
+		}
+	}
+	change.Targets = []string{target}
+	*list = append(*list, change)
 }
 
 // memberPlanChanges renders one member's plan into the shape the comment renders

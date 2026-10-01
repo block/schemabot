@@ -43,6 +43,15 @@ type UnsafeChangeData struct {
 	// rendering too wide to name every shard can state coverage ("12 of 32
 	// shards") instead of a bare count. Zero when unknown.
 	TotalShards int
+	// Targets names the rollout targets that carry this change, for a target
+	// plan group in which only some targets do, or for a refusal that lists
+	// other targets' changes beside the reviewed plan's. Empty when the change
+	// is the reviewed plan's, or every target in its group carries it.
+	Targets []string
+	// TotalTargets is how many targets the group holds, so a subset too wide
+	// to name reads as coverage ("3 of 12 targets"). Zero when Targets names
+	// the whole list.
+	TotalTargets int
 }
 
 // BlockedChangeData is a planned change the engine deterministically refuses:
@@ -319,6 +328,11 @@ type DeploymentPlanGroup struct {
 	// BlockedChanges are the group's changes the engine will refuse at apply,
 	// each naming the targets that refuse it when that is not all of them.
 	BlockedChanges []BlockedChangeData
+	// UnsafeChanges are the group's changes that need `--allow-unsafe`, each
+	// naming the targets that carry it when that is not all of them. The
+	// reviewed plan's own are disclosed plan-wide, so the primary group's are
+	// not rendered under it.
+	UnsafeChanges []UnsafeChangeData
 	// PlanID is the identifier of the stored plan the group's first member
 	// would run, so DDL cut to fit the comment names the command that prints
 	// the group's plan in full. Unused for the primary's group, which runs the
@@ -630,7 +644,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			sb.WriteString("**Applying automatically**\n")
 		}
 	case data.MemberApplyRefusal != "":
-		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal, !hasChanges(data.Changes))
+		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal)
 	default:
 		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
@@ -643,19 +657,12 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 }
 
 // writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
-// apply cannot run the other targets' plans the comment renders. Offering the
+// apply cannot run every target's plan the comment renders. Offering the
 // command there would coach an apply that is refused whatever its flags.
-// reviewedTargetConverged says whether the reviewed target is already at the
-// desired schema, which decides what the reader is told about it.
-func writeMemberApplyRefusal(sb *strings.Builder, refusal string, reviewedTargetConverged bool) {
+func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
 	refusal = escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " "))
-	if reviewedTargetConverged {
-		fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but %s.\n\n", refusal)
-		sb.WriteString("A PR apply whose reviewed target is already at the desired schema cannot run that or disclose it for confirmation. The schema check keeps blocking merge until every target has the change.\n")
-		return
-	}
-	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply the other targets' plans**: targets other than the reviewed one have plans of their own, but %s.\n\n", refusal)
-	sb.WriteString("A PR apply cannot run that or disclose it for confirmation, so it cannot run the reviewed target's plan either. The schema check keeps blocking merge until every target has the change.\n")
+	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: %s.\n\n", refusal)
+	sb.WriteString("An apply runs every target or none, so nothing runs until that plan can. The schema check keeps blocking merge until every target has the change.\n")
 }
 
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
@@ -2067,7 +2074,38 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if len(g.DirectChanges) > 0 {
 			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 		}
+		// So is an unsafe change, which `--allow-unsafe` consents to on every
+		// target. The reviewed plan's own are already disclosed plan-wide, and
+		// the locked comment omits them as it omits the reviewed plan's: the
+		// apply reached it only under the opt-in.
+		if !g.Primary && len(g.UnsafeChanges) > 0 && !data.IsLocked {
+			writeUnsafeWarning(sb, g.UnsafeChanges, data.DatabaseType, data.IsMySQL)
+		}
 	}
+}
+
+// TargetPlanUnsafeChanges lists the unsafe changes the rendered target plans
+// carry beyond the reviewed plan's own, each naming the targets that carry it,
+// so the unsafe gate and its refusal cover every target an apply runs. Empty
+// when the drift renders no target plans.
+func TargetPlanUnsafeChanges(drift *DeploymentDriftData) []UnsafeChangeData {
+	if !RendersTargetPlans(drift) {
+		return nil
+	}
+	var out []UnsafeChangeData
+	for _, g := range drift.Plans {
+		if g.Primary {
+			continue
+		}
+		for _, c := range g.UnsafeChanges {
+			if len(c.Targets) == 0 {
+				c.Targets = slices.Clone(g.Members)
+				c.TotalTargets = 0
+			}
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // targetPlansDiscloseDirect reports whether the rendered target plans carry
@@ -2294,14 +2332,23 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, databas
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	item := 0
 	for _, c := range changes {
-		table := inlineCode(c.Table)
-		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
-		}
-		writeUnsafeChangeItem(sb, &item, table, c.Reason, c.ChangeType)
+		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType)
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
+}
+
+// unsafeChangeLabel names an unsafe change's table, with the shards and the
+// targets that carry it when that is not all of them.
+func unsafeChangeLabel(c UnsafeChangeData) string {
+	table := inlineCode(c.Table)
+	if len(c.Shards) > 0 {
+		table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
+	}
+	if len(c.Targets) > 0 {
+		table = fmt.Sprintf("%s on %s", table, planGroupList(targetNoun, c.Targets, c.TotalTargets))
+	}
+	return table
 }
 
 // writeUnsafeChangeItem writes one table's unsafe findings, one numbered line
@@ -2813,7 +2860,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 			writeTableSizesSection(sb, summary)
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
 			if plan.MemberApplyRefusal != "" {
-				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal, true)
+				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
 				sb.WriteString("\n")
 			}
 			return
@@ -2889,7 +2936,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// An apply this section's other targets' plans would refuse is not offered
 	// in the footer, so the section says why.
 	if plan.MemberApplyRefusal != "" {
-		writeMemberApplyRefusal(sb, plan.MemberApplyRefusal, false)
+		writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
 		sb.WriteString("\n")
 	}
 }
