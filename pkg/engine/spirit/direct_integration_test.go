@@ -904,10 +904,11 @@ func TestEngine_ExecuteAlterPhase_KillsMetadataLockBlocker(t *testing.T) {
 
 // A session holding an explicit LOCK TABLES is never killed: it is not a
 // transaction that rolls back, so killing it could interrupt work that
-// depends on the lock being held. The direct statement leaves it alone, each
-// bounded attempt times out, and the apply fails with the operator-actionable
-// busy-table error — naming the kind of blocker it will not kill and asking
-// for a retry — rather than the driver's own words. The lock holder keeps its
+// depends on the lock being held. The direct statement leaves it alone, stops
+// after the bounded attempt that met it, and the apply fails with the
+// operator-actionable busy-table error — naming the kinds of blocker it will
+// not or cannot kill and asking for a retry — rather than the driver's own
+// words. The lock holder keeps its
 // session and the target is untouched.
 func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
@@ -926,10 +927,10 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 
 	assert.Equal(t, engine.StateFailed, state)
 	assert.Contains(t, errorMessage, `Table "direct_locked" is busy`)
-	assert.Contains(t, errorMessage, fmt.Sprintf("Each attempt waits up to %ds, and SchemaBot makes up to %d attempts.", lockWaitSeconds, directMaxAttempts))
-	assert.Contains(t, errorMessage, "not a session holding an explicit LOCK TABLES")
-	assert.Contains(t, errorMessage, "unless its database user has PROCESS and CONNECTION_ADMIN",
-		"a kill that fails for lack of privilege lands on this same message, so it names that remedy too")
+	assert.Contains(t, errorMessage, fmt.Sprintf("Each attempt waits up to %ds, and SchemaBot makes up to %d attempts,", lockWaitSeconds, directMaxAttempts))
+	assert.Contains(t, errorMessage, "It stops after the first attempt that meets a session it will not or cannot kill: a session holding an explicit LOCK TABLES")
+	assert.Contains(t, errorMessage, "a session of a SYSTEM_USER account, which only a user that also has SYSTEM_USER may kill",
+		"a KILL the target denies lands on this same message, so it names the session no grant routing checks can end")
 	assert.Contains(t, errorMessage, "Retry when those sessions have finished")
 	assert.NotContains(t, errorMessage, "Lock wait timeout exceeded",
 		"the driver's own words are for the server log, not the pull request")
