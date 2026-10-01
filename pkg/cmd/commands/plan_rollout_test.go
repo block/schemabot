@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 )
 
 // addColumnTo is one ALTER adding column to the orders table.
@@ -392,7 +393,7 @@ func TestApplyCmd_JSONOutputNamesTheRefusedTargets(t *testing.T) {
 	require.Error(t, runErr)
 	assert.Equal(t, "an apply of the whole rollout cannot run the plan of 2 of 3 rollout members: "+
 		"prod/payments-002 (carries changes its target's engine refuses; no apply runs it, so change the schema files); "+
-		`prod/payments-003 (carries an unsafe change for table "legacy" that the reviewed plan does not carry; run it with: apply -s `+schemaDir+" -e production --target payments-003 --allow-unsafe)",
+		`prod/payments-003 (carries an unsafe change for table "legacy" that the reviewed plan does not carry; run it with: `+cliname.Name()+" apply -s "+schemaDir+" -e production --target payments-003 --allow-unsafe)",
 		runErr.Error())
 	assert.NotContains(t, out, "Apply blocked", "the human refusal is not printed in JSON mode:\n%s", out)
 	assert.Equal(t, []string{"/api/status", "/api/plan"}, *paths, "no lock is checked or taken and no apply is requested")

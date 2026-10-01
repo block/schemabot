@@ -587,7 +587,7 @@ func rolloutRefusalSummary(refused []*apitypes.PlanMemberRefusalResponse, enviro
 			entries = append(entries, fmt.Sprintf("%s (%s; no apply runs it, so change the schema files)", r.Member, r.Detail))
 			continue
 		}
-		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s)", r.Member, r.Detail, narrowedApplyRerun(r, environment, schemaDir)))
+		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s %s)", r.Member, r.Detail, cliname.Name(), narrowedApplyRerun(r, environment, schemaDir)))
 	}
 	return strings.Join(entries, "; ")
 }
