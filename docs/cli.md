@@ -693,8 +693,10 @@ The preview and live progress format SQL using the target database dialect,
 preserving quoted names and values. If the server omits the database type or
 returns an unrecognized type, both views preserve the original SQL.
 
-Here is a rollback of the index added earlier. This example declines the
-confirmation, so nothing changes:
+Here is a rollback of the index added earlier. Dropping the index is an unsafe
+change, and rollback needs `--allow-unsafe` for unsafe changes exactly as
+`apply` does. Without the flag it stops before the confirmation prompt, with
+or without `-y`, and nothing changes:
 
 ```console
 $ schemabot rollback -e staging apply-example-73
@@ -709,7 +711,34 @@ The following changes will be applied to rollback:
 
   orders (alter):
     ALTER TABLE `orders` DROP INDEX `idx_status`;
-⚠️ Unsafe Changes Detected:
+⛔ Apply blocked: 1 unsafe change(s) detected
+  1. orders: Index "idx_status" should be made invisible before dropping to ensure it's not needed
+
+🚨 To proceed with these destructive changes, re-run with --allow-unsafe:
+
+  schemabot rollback apply-example-73 -e staging --allow-unsafe
+```
+
+With `--allow-unsafe`, the unsafe changes are listed again and the confirmation
+still follows. This example declines it, so nothing changes:
+
+```console
+$ schemabot rollback apply-example-73 -e staging --allow-unsafe
+Rollback Plan
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-73  │
+└───────────────────────────────────┘
+
+The following changes will be applied to rollback:
+
+  orders (alter):
+    ALTER TABLE `orders` DROP INDEX `idx_status`;
+
+🚨 Unsafe Changes (--allow-unsafe enabled)
+
+The following unsafe changes will be applied:
   1. orders: Index "idx_status" should be made invisible before dropping to ensure it's not needed
 
 Do you want to apply this rollback? Only 'yes' will be accepted: no

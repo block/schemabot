@@ -1507,9 +1507,16 @@ reviewed target's included, is what the confirmation was given against and carri
 it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversReviewedTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
 `pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), and apply creation refusing, whatever the flags,
 unsafe changes that the disclosure never named in a plan it did not come from
-(`rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`), plus rollback confirmation's transactional lock-intent check
-(`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
-`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
+(`rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
+when `--allow-unsafe` is passed, judged against every unsafe change the plan carries, a divergent
+shard's included (`pkg/cmd/commands/apply.go`, `pkg/cmd/commands/rollback.go`, over
+`PlanResponse.UnsafeChanges` in `pkg/apitypes/apitypes.go`). On the PR-comment rollback path the
+consent is the `rollback-confirm` comment itself: it is accepted only from an authorized
+admin/operator, after the rollback plan comment has warned that the rollback may include
+destructive changes, and it is pinned to that plan by rollback confirmation's transactional
+lock-intent check (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
+`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`); the apply it submits
+carries `allow_unsafe` on that basis rather than from a flag.
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 

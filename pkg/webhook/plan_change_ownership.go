@@ -43,7 +43,6 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 	if len(tables) == 0 {
 		return
 	}
-	gated := unsafeGateTables(planResp)
 	for _, table := range tables {
 		ref := storage.TableRef{
 			Database:     data.Database,
@@ -53,23 +52,9 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 		}
 		change, annotate := h.classifyDestructiveChange(ctx, client, ref, repo, pr, table)
 		if annotate {
-			_, consentSolicited := gated[table]
-			change.OutsideUnsafeGate = !consentSolicited
 			data.AttributedChanges = append(data.AttributedChanges, change)
 		}
 	}
-}
-
-// unsafeGateTables returns the tables the --allow-unsafe opt-in gate reads:
-// the namespace-level unsafe changes. A destructive change confined to
-// individual shards is not among them, so applying never solicits consent
-// for it — the attribution disclosure is then the operator's only notice.
-func unsafeGateTables(planResp *apitypes.PlanResponse) map[string]struct{} {
-	gated := map[string]struct{}{}
-	for _, unsafe := range planResp.UnsafeChanges() {
-		gated[unsafe.Table] = struct{}{}
-	}
-	return gated
 }
 
 // classifyDestructiveChange decides whether one table's destructive change must
