@@ -40,7 +40,9 @@ func TestRenderPlanComment_TableSizes(t *testing.T) {
 	assert.Contains(t, out, "- `mutes`: ~1.1 GB\n")
 }
 
-func TestRenderPlanComment_TableSizesRenderAbovePlanSummary(t *testing.T) {
+// The sizes describe the tables the DDL touches, so they sit directly under
+// the DDL rather than below the warnings, next to the plan summary.
+func TestRenderPlanComment_TableSizesRenderUnderDDL(t *testing.T) {
 	data := tableSizePlanData([]TableSizeData{
 		{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)},
 	})
@@ -49,13 +51,36 @@ func TestRenderPlanComment_TableSizesRenderAbovePlanSummary(t *testing.T) {
 	}
 	out := RenderPlanComment(data)
 
-	summaryAt := strings.Index(out, "📋 **Plan**:")
+	ddlAt := strings.Index(out, "```sql")
+	require.NotEqual(t, -1, ddlAt, "plan comment renders the DDL")
+	ddlEnd := ddlAt + strings.Index(out[ddlAt:], "\n```\n")
 	sizesAt := strings.Index(out, "📊 **Table sizes**")
 	lintAt := strings.Index(out, "💡 **Lint Warnings**")
-	ddlAt := strings.Index(out, "```sql")
-	assert.Greater(t, sizesAt, ddlAt, "sizes render after the DDL, not above it")
-	assert.Greater(t, sizesAt, lintAt, "sizes render below the lint warnings")
+	summaryAt := strings.Index(out, "📋 **Plan**:")
+	require.NotEqual(t, -1, sizesAt, "plan comment renders the size section")
+	require.NotEqual(t, -1, lintAt, "plan comment renders the lint warnings")
+	assert.Greater(t, sizesAt, ddlEnd, "sizes render after the DDL")
+	assert.Less(t, sizesAt, lintAt, "sizes render above the lint warnings")
 	assert.Less(t, sizesAt, summaryAt, "sizes render above the plan summary")
+}
+
+// The locked apply comment follows a plan comment that already showed the
+// sizes, so it leaves them out whether it applies automatically or waits for
+// apply-confirm.
+func TestRenderPlanComment_LockedApplyOmitsTableSizes(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		data := tableSizePlanData([]TableSizeData{
+			{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)},
+		})
+		data.IsLocked = true
+		data.LockOwner = "octocat/hello-world#1"
+		data.PendingManualConfirmation = pending
+		out := RenderPlanComment(data)
+
+		assert.Contains(t, out, "## Schema Change Apply", "pending confirmation %v", pending)
+		assert.Contains(t, out, "📋 **Plan**:", "pending confirmation %v", pending)
+		assert.NotContains(t, out, "Table sizes", "pending confirmation %v", pending)
+	}
 }
 
 func TestRenderPlanComment_TableSizesSharded(t *testing.T) {

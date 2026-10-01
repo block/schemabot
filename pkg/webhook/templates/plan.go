@@ -527,6 +527,13 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 
+	// Sizes of the tables the DDL above copies, rebuilds, or scans. Omitted on
+	// the locked apply comment: the operator already saw them on the plan they
+	// chose to apply.
+	if !data.IsLocked {
+		writeTableSizesSection(&sb, summary)
+	}
+
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
 	// the locked apply comment too, so the operator sees the guaranteed
@@ -832,10 +839,6 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		writeExemptTables(sb, data.ExemptTables)
 		return
 	}
-
-	// Size context precedes the summary: how big the tables the plan will
-	// copy, rebuild, or scan are, then what the plan does.
-	writeTableSizesSection(sb, data)
 
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements))
 
@@ -1346,7 +1349,7 @@ func (e tableSizeEntry) hasAnyEstimate() bool {
 // writeTableSizesSection renders the plan's table-size info section: one line
 // per table the plan will copy, rebuild, or scan (the comment builder
 // attaches sizes only to statements whose cost scales with table size),
-// across every keyspace, placed above the plan summary. A plan of only
+// across every keyspace, placed directly under the DDL. A plan of only
 // metadata-only statements renders no section at all, and neither does a plan
 // where no table has an estimate: an engine that does not estimate sizes
 // would otherwise show "unavailable" on every line, which reads as a failed
@@ -2801,6 +2804,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// run while other targets still have work summarizes their plans instead.
 	if totalChanges == 0 {
 		if targetPlans {
+			writeTableSizesSection(sb, summary)
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
 			if plan.MemberApplyRefusal != "" {
 				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal, true)
@@ -2824,6 +2828,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	default:
 		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements, budget)
 	}
+	writeTableSizesSection(sb, summary)
 
 	// Blocked changes — statements the engine refuses; the apply will fail on
 	// them, so each environment's section discloses its own.

@@ -48,12 +48,12 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1599,12 +1599,12 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2382,12 +2382,12 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -3250,9 +3250,6 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes**:
-- `products`: ~1.1 GB
-
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -3302,9 +3299,6 @@ CREATE TABLE `orders` (
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -3364,9 +3358,6 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `shipments` (create) was in the plan this apply was started from but is not in this one
 
 The statements above are what will run. Review them, then confirm to apply them.
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
