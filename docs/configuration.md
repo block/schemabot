@@ -780,11 +780,19 @@ weaker estimate veto the corroborated count, and letting either approve would
 make a table the gate measured far above the byte limit run directly through
 the row bound. Choosing one keeps the configured limit the one that decides.
 
-A server running a build that predates `max_table_bytes` ignores the byte
-bound when it arrives on a request or an apply record, so it rejects a
-byte-bound policy as missing its row bound, and its plans and applies for the
-database fail until it is upgraded. Switch a database to `max_table_bytes`
-once every server that executes statements for it runs a build that reads it.
+A data plane running a build that predates `max_table_bytes` ignores the byte
+bound when it arrives on a request or an apply record, and would reject a
+byte-bound policy as one with no size bound. So before a control plane states
+a byte bound to a remote data plane, it reads the capabilities that data
+plane advertises on its health check, and refuses the plan or apply itself
+when the byte bound is not among them. The refusal names the deployment and,
+when the data plane reports one, its version, and says to upgrade the data
+plane or use `max_table_rows` until then. A data plane that advertises nothing
+is treated as unable to read the bound, including one on a build that reads
+`max_table_bytes` but predates capability reporting, because the two cannot be
+told apart. Switch a database to `max_table_bytes` once every data plane that
+executes statements for it runs a build that advertises it. A row-bound policy
+needs no capability and reaches every data plane as before.
 
 `lock_acquisition_timeout` bounds how long each attempt of a direct statement
 waits to acquire its locks. Each engine maps it to its native session lock

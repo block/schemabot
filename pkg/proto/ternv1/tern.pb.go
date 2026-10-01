@@ -3789,8 +3789,19 @@ func (*HealthRequest) Descriptor() ([]byte, []int) {
 
 // HealthResponse is the health check response.
 type HealthResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Status string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
+	// SchemaBot version of the binary that answered, for attribution in a
+	// caller's messages only. Empty when the binary cannot name its version.
+	// A caller decides what the data plane supports from capabilities, never
+	// from this.
+	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	// Request features this data plane understands beyond the ones every
+	// release has, named by stable strings. A caller that is about to state
+	// one of them on a request reads this first: a data plane that predates a
+	// feature drops its field silently, so absence here means the feature is
+	// unsupported. A data plane that predates this field reports nothing.
+	Capabilities  []string `protobuf:"bytes,3,rep,name=capabilities,proto3" json:"capabilities,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3830,6 +3841,20 @@ func (x *HealthResponse) GetStatus() string {
 		return x.Status
 	}
 	return ""
+}
+
+func (x *HealthResponse) GetVersion() string {
+	if x != nil {
+		return x.Version
+	}
+	return ""
+}
+
+func (x *HealthResponse) GetCapabilities() []string {
+	if x != nil {
+		return x.Capabilities
+	}
+	return nil
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.
@@ -5143,9 +5168,11 @@ const file_tern_proto_rawDesc = "" +
 	"\x12SkipRevertResponse\x12\x1a\n" +
 	"\baccepted\x18\x01 \x01(\bR\baccepted\x12#\n" +
 	"\rerror_message\x18\x02 \x01(\tR\ferrorMessage\"\x0f\n" +
-	"\rHealthRequest\"(\n" +
+	"\rHealthRequest\"f\n" +
 	"\x0eHealthResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\tR\x06status\"b\n" +
+	"\x06status\x18\x01 \x01(\tR\x06status\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12\"\n" +
+	"\fcapabilities\x18\x03 \x03(\tR\fcapabilities\"b\n" +
 	"\vStopRequest\x12\x19\n" +
 	"\bapply_id\x18\x01 \x01(\tR\aapplyId\x12 \n" +
 	"\venvironment\x18\x02 \x01(\tR\venvironment\x12\x16\n" +

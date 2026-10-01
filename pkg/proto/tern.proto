@@ -995,6 +995,17 @@ message HealthRequest {}
 // HealthResponse is the health check response.
 message HealthResponse {
   string status = 1;
+  // SchemaBot version of the binary that answered, for attribution in a
+  // caller's messages only. Empty when the binary cannot name its version.
+  // A caller decides what the data plane supports from capabilities, never
+  // from this.
+  string version = 2;
+  // Request features this data plane understands beyond the ones every
+  // release has, named by stable strings. A caller that is about to state
+  // one of them on a request reads this first: a data plane that predates a
+  // feature drops its field silently, so absence here means the feature is
+  // unsupported. A data plane that predates this field reports nothing.
+  repeated string capabilities = 3;
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.
