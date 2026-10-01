@@ -1685,8 +1685,10 @@ their own review requirement. *Enforced:* the review gate and actor authorizatio
 An unscoped PR command resolves to exactly one unambiguous database or is rejected with guidance,
 never resolved by an arbitrary pick. A malformed command is rejected rather than "helpfully"
 corrected into something executable, especially one carrying `--allow-unsafe`. Every command
-receives a response, and silence only ever means another instance owns the reply. *Enforced:*
-command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
+receives a response, and silence only ever means another instance owns the reply or the comment
+issues no command: a line that opens with the product name but reads as a sentence about it, not a
+command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
+unowned-command policy (`pkg/webhook/commands.go`).
 
 ### AZ-6: Local hosting preserves its boundaries
 
