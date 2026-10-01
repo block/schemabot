@@ -853,7 +853,7 @@ func TestWebhookSentenceReportingAnApplyDoesNotApply(t *testing.T) {
 	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
 	select {
 	case body := <-comments:
-		t.Fatalf("unexpected comment posted: %s", body)
+		require.Failf(t, "unexpected comment posted", "%s", body)
 	default:
 	}
 }
@@ -905,7 +905,7 @@ func TestWebhookFlagInSentenceDoesNotReachTheCommand(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "is not supported for `rollback-confirm`")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for comment")
+			require.FailNow(t, "timed out waiting for comment")
 		}
 	})
 }
@@ -929,8 +929,34 @@ func TestWebhookQuoteReplyToCommandIsNotRun(t *testing.T) {
 	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
 	select {
 	case body := <-comments:
-		t.Fatalf("unexpected comment posted: %s", body)
+		require.Failf(t, "unexpected comment posted", "%s", body)
 	default:
+	}
+}
+
+// A command line with a token SchemaBot does not accept exactly, here an
+// unsafe flag with a full stop typed after it, is a botched command rather
+// than a sentence. SchemaBot runs nothing and answers with the invalid-command
+// help, so the commenter learns the apply did not start.
+func TestWebhookMalformedCommandIsRejected(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging --allow-unsafe.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid command")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Command")
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for comment")
 	}
 }
 
@@ -954,7 +980,7 @@ func TestWebhookProseMentionIsNotAnswered(t *testing.T) {
 	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
 	select {
 	case body := <-comments:
-		t.Fatalf("unexpected comment posted: %s", body)
+		require.Failf(t, "unexpected comment posted", "%s", body)
 	default:
 	}
 }

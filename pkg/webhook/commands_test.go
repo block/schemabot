@@ -346,7 +346,6 @@ func TestParseCommand(t *testing.T) {
 			expected: CommandResult{
 				Action:           "apply",
 				EnvironmentError: true,
-				AllowUnsafe:      true,
 				Found:            true,
 				IsMention:        true,
 			},
@@ -1047,6 +1046,98 @@ func TestFlagHelpers_ReadOnlyTheCommandLine(t *testing.T) {
 
 	assert.False(t, p.HasAutoConfirmFlag("SchemaBot apply -e staging -y is a CLI habit.\n\nschemabot apply -e staging"))
 	assert.True(t, p.HasAutoConfirmFlag("SchemaBot apply is a PR comment.\n\nschemabot apply -e staging --yes"))
+}
+
+// A line with no plain word on it is a command attempt, and every token on it
+// has to be one SchemaBot accepts exactly. A token that only nearly matches,
+// such as a flag with punctuation typed after it, or one that makes the
+// command ambiguous, rejects the whole line with the invalid-command answer:
+// the parser never trims a token into one it accepts. The rejected line is the
+// directive, so a command on a later line does not run in its place.
+func TestParseCommand_MalformedCommand(t *testing.T) {
+	parser := NewCommandParser()
+	rejected := CommandResult{IsMention: true}
+
+	tests := []struct {
+		name     string
+		body     string
+		expected CommandResult
+	}{
+		{name: "unsafe flag with a full stop", body: "schemabot apply -e staging --allow-unsafe.", expected: rejected},
+		{name: "unsafe flag with a comma", body: "schemabot apply -e staging --allow-unsafe,", expected: rejected},
+		{name: "flag with a value glued on", body: "schemabot apply -e staging --allow-unsafe=true", expected: rejected},
+		{name: "unknown flag", body: "schemabot apply -e staging --foo", expected: rejected},
+		{name: "auto-confirm flag with a full stop", body: "schemabot apply -e staging -y.", expected: rejected},
+		{name: "database with a full stop", body: "schemabot apply -e staging -d billing.", expected: rejected},
+		{name: "database flag without a value", body: "schemabot apply -e staging -d", expected: rejected},
+		{name: "database flag followed by another flag", body: "schemabot apply -e staging -d --allow-unsafe", expected: rejected},
+		{name: "apply ID with a full stop", body: "schemabot rollback apply-abc123. -e staging", expected: rejected},
+		{name: "apply ID with trailing letters", body: "schemabot rollback apply-abc123xyz -e staging", expected: rejected},
+		{name: "two apply IDs", body: "schemabot rollback apply-abc123 apply-def456 -e staging", expected: rejected},
+		{name: "environment given twice", body: "schemabot apply -e staging -e production", expected: rejected},
+		{
+			name:     "tenant given twice has no single routing target",
+			body:     "schemabot plan -e staging -t tenant-a --tenant tenant-b",
+			expected: CommandResult{TenantError: true, IsMention: true},
+		},
+		{
+			name:     "rejected line keeps its tenant so the right deployment answers",
+			body:     "schemabot apply -e staging -t tenant-a --allow-unsafe.",
+			expected: CommandResult{Tenant: "tenant-a", IsMention: true},
+		},
+		{
+			name:     "rejected line is the directive; a later command does not run",
+			body:     "schemabot apply -e staging --allow-unsafe.\n\nschemabot plan -e staging",
+			expected: rejected,
+		},
+		{
+			name:     "a plain word makes the line a sentence, not a rejected command",
+			body:     "SchemaBot apply --allow-unsafe. went fine",
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "environment with a full stop gets the environment usage answer",
+			body:     "schemabot apply -e staging.",
+			expected: CommandResult{Action: "apply", EnvironmentError: true, Found: true, IsMention: true},
+		},
+		{
+			name:     "flags match regardless of case",
+			body:     "schemabot apply -E staging --ALLOW-UNSAFE",
+			expected: CommandResult{Action: "apply", Environment: "staging", AllowUnsafe: true, Found: true, IsMention: true},
+		},
+		{
+			name:     "long tenant spelling",
+			body:     "schemabot plan -e staging --tenant tenant-a",
+			expected: CommandResult{Action: "plan", Environment: "staging", Tenant: "tenant-a", Found: true, IsMention: true},
+		},
+		{
+			name:     "apply ID with an underscore",
+			body:     "schemabot rollback apply_abc123 -e staging",
+			expected: CommandResult{Action: "rollback", ApplyID: "apply_abc123", Environment: "staging", Found: true, IsMention: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, parser.ParseCommand(tt.body))
+		})
+	}
+}
+
+// The usage gates read flags off a well-formed command only. A malformed line
+// carries no flags: it is answered as an invalid command, never as a command
+// with an unsupported flag.
+func TestFlagHelpers_IgnoreAMalformedCommand(t *testing.T) {
+	p := NewCommandParser()
+
+	assert.False(t, p.HasAutoConfirmFlag("schemabot apply -e staging -y --foo"))
+	assert.True(t, p.HasAutoConfirmFlag("schemabot apply -e staging -y"))
+
+	assert.False(t, p.HasDatabaseFlag("schemabot rollback-confirm -e staging -d billing --foo"))
+	assert.True(t, p.HasDatabaseFlag("schemabot rollback-confirm -e staging -d billing"))
+
+	assert.False(t, p.HasDeferCutoverFlag("schemabot plan -e staging --defer-cutover --foo"))
+	assert.True(t, p.HasDeferCutoverFlag("schemabot plan -e staging --defer-cutover"))
 }
 
 // Quoting a command, as GitHub's quote-reply does, shows it rather than
