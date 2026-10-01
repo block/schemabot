@@ -415,7 +415,7 @@ func TestRollbackPlanCommentData_CarriesPlanID(t *testing.T) {
 	// The body holds the whole cut statement, so the markers are checked by
 	// presence rather than dumped on failure.
 	body := templates.RenderRollbackPlanComment(data)
-	assert.True(t, strings.Contains(body, "the full plan is available from the CLI with `schemabot list-plans plan_rb_7c41f9`."),
+	assert.True(t, strings.Contains(body, "the full plan is available from the CLI with `schemabot list-plans -e production plan_rb_7c41f9`."),
 		"cut rollback DDL names the stored rollback plan")
 	assert.False(t, strings.Contains(body, "the desired schema is in this PR's schema files"),
 		"cut rollback DDL does not point at the schema files")

@@ -37,6 +37,10 @@ func TestMySQLDialectBinaryEquals(t *testing.T) {
 	assert.Equal(t, "owner COLLATE utf8mb4_0900_bin = ?", MySQLDialect{}.BinaryEquals("owner"))
 }
 
+func TestMySQLDialectBinaryCollation(t *testing.T) {
+	assert.Equal(t, "(LEFT(w.operation_key, 5)) COLLATE utf8mb4_0900_bin", MySQLDialect{}.BinaryCollation("LEFT(w.operation_key, 5)"))
+}
+
 func TestMySQLDialectJoinedUpdate(t *testing.T) {
 	assert.Equal(t,
 		"UPDATE apply_comments c JOIN applies a ON a.id = c.apply_id SET c.edit_count = c.edit_count + 1, c.updated_at = NOW() WHERE c.apply_id = ? AND a.lease_token = ?",
@@ -299,6 +303,10 @@ func TestPostgresDialect(t *testing.T) {
 
 func TestPostgresDialectBinaryEquals(t *testing.T) {
 	assert.Equal(t, "owner = ?", PostgresDialect{}.BinaryEquals("owner"))
+}
+
+func TestPostgresDialectBinaryCollation(t *testing.T) {
+	assert.Equal(t, "LEFT(w.operation_key, 5)", PostgresDialect{}.BinaryCollation("LEFT(w.operation_key, 5)"))
 }
 
 func TestPostgresDialectInsertIfAbsent(t *testing.T) {

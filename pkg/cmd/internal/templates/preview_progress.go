@@ -787,6 +787,7 @@ func previewProgressOutput() {
 				RowsTotal:       7200000,
 				PercentComplete: 48,
 				ETASeconds:      330, // 5m 30s
+				EstimatedBytes:  new(int64(2_150_000_000)),
 			},
 		},
 	}

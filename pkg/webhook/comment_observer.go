@@ -31,6 +31,7 @@ type CommentObserver struct {
 	applyLease     storage.ApplyLease
 	deferCutover   bool
 	supportChannel api.SupportChannelConfig
+	cliName        string
 	tenant         string
 	// engineLogs reads the engine's own lines back from the data planes that
 	// ran an apply, for the engine-logs fold on a failed apply's summary.
@@ -38,8 +39,12 @@ type CommentObserver struct {
 	engineLogs EngineLogReader
 	// plans remembers the plan rows this apply's members run, so the progress
 	// comment reads each once for the observer's life, not once per render.
-	plans  planIdentities
-	logger interface {
+	plans planIdentities
+	// shardedPlans remembers what each sharded apply's stored plan says about
+	// its finalizers and table sizes once it has been read; see
+	// shardedPlanCache.
+	shardedPlans *shardedPlanCache
+	logger       interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Warn(msg string, args ...any)
@@ -157,6 +162,11 @@ type CommentObserverConfig struct {
 	DeferCutover   bool
 	SupportChannel api.SupportChannelConfig
 
+	// CLIName is the tool name the CLI command hints in the observer's
+	// comments start with, the server's cli_name. Empty renders the CLI's own
+	// default.
+	CLIName string
+
 	// Tenant is the deployment's tenant identity, carried into every pasteable
 	// command hint the observer's comments render. Empty on single-tenant
 	// deployments.
@@ -167,6 +177,10 @@ type CommentObserverConfig struct {
 	// account of the failure alongside SchemaBot's. Optional — nil leaves the
 	// engine-logs fold off the summary.
 	EngineLogs EngineLogReader
+
+	// shardedPlans is the sharded plan cache shared with every other
+	// comment render in the process. Nil gives the observer a cache of its own.
+	shardedPlans *shardedPlanCache
 
 	Logger interface {
 		Debug(msg string, args ...any)
@@ -229,6 +243,10 @@ func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any)
 // NewCommentObserver creates a new CommentObserver for posting PR comments.
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 	clk := clock.Default(cfg.Clock)
+	shardedPlans := cfg.shardedPlans
+	if shardedPlans == nil {
+		shardedPlans = newShardedPlanCache()
+	}
 	return &CommentObserver{
 		ghClient:       cfg.GHClient,
 		stor:           cfg.Storage,
@@ -239,8 +257,10 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		applyLease:     cfg.ApplyLease,
 		deferCutover:   cfg.DeferCutover,
 		supportChannel: cfg.SupportChannel,
+		cliName:        cfg.CLIName,
 		tenant:         cfg.Tenant,
 		engineLogs:     cfg.EngineLogs,
+		shardedPlans:   shardedPlans,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
@@ -687,7 +707,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant)
 	} else {
-		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveFinalizerPlan(apply, ops), o.tenant)
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveShardedPlan(apply, ops), o.tenant, o.cliName)
 	}
 	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }
@@ -712,14 +732,15 @@ func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.A
 	return releasedForApply(ctx, o.stor, apply, ops, o.logger)
 }
 
-// resolveFinalizerPlan loads what the stored plan says about a sharded apply's
-// finalizers for its comment rendering. It uses a short, independent deadline
-// so a slow storage read degrades to a comment without diffs rather than
-// blocking the update.
-func (o *CommentObserver) resolveFinalizerPlan(apply *storage.Apply, ops []*storage.ApplyOperation) *shardedFinalizerPlan {
+// resolveShardedPlan loads what the stored plan says about a sharded apply's
+// finalizers and table sizes for its comment rendering, through the cache
+// shared with every other render of the apply (see shardedPlanCache). It uses
+// a short, independent deadline so a slow storage read degrades to a comment
+// without VSchema diffs or table sizes rather than blocking the update.
+func (o *CommentObserver) resolveShardedPlan(apply *storage.Apply, ops []*storage.ApplyOperation) *shardedPlanView {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveShardedFinalizerPlan(ctx, o.stor, apply, ops)
+	return o.shardedPlans.resolve(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -755,11 +776,11 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 	// the body actually posted.
 	var released bool
 	var display map[int64]operationDisplay
-	var finalizers *shardedFinalizerPlan
+	var view *shardedPlanView
 	if opsErr == nil {
 		released = o.resolveReleased(apply, ops)
 		display = o.resolveDisplay(apply, ops)
-		finalizers = o.resolveFinalizerPlan(apply, ops)
+		view = o.resolveShardedPlan(apply, ops)
 	}
 	rejections := loadControlRejections(ctx, o.stor, o.logger, apply)
 	renderBody := func(apply *storage.Apply) string {
@@ -767,7 +788,7 @@ func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *stor
 		if opsErr != nil {
 			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
 		} else {
-			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, finalizers, o.tenant)
+			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, view, o.tenant, o.cliName)
 		}
 		return body + renderControlRejections(rejections, o.logger, apply, body)
 	}
@@ -1050,7 +1071,7 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 		return
 	}
 
-	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(body)); err != nil {
+	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(apply, body)); err != nil {
 		o.logError(apply, "observer: failed to edit comment", "error", err, "comment_state", commentState)
 		return
 	}
@@ -1642,7 +1663,7 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 		return 0, false, false
 	}
 
-	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
+	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(apply, body))
 	if err != nil {
 		o.logError(apply, "observer: failed to post comment", "error", err, "comment_state", commentState)
 		return 0, false, false
@@ -1671,11 +1692,15 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 	return commentID, true, true
 }
 
-// renderPRComment finishes a comment body for posting on the observed PR: an
-// oversized body is replaced with the notice that fits, then the support
-// footer is appended.
-func (o *CommentObserver) renderPRComment(body string) string {
-	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, body), o.supportChannel)
+// renderPRComment finishes a comment body about apply for posting on the
+// observed PR: an oversized body is replaced with the notice that fits, its CLI
+// hint scoped to the apply's environment, then the support footer is appended.
+func (o *CommentObserver) renderPRComment(apply *storage.Apply, body string) string {
+	environment := ""
+	if apply != nil {
+		environment = apply.Environment
+	}
+	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, environment, body, o.cliName), o.supportChannel)
 }
 
 // publishClaimedSummary posts the separate apply-level terminal summary
@@ -1709,7 +1734,7 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 		o.releaseSummaryClaim(ctx, apply)
 		return
 	}
-	commentID, _, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
+	commentID, _, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(apply, body))
 	if err != nil {
 		o.logError(apply, "observer: failed to post claimed terminal summary; releasing claim",
 			"error", err)

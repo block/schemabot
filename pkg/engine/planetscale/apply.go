@@ -945,8 +945,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 // resumeExistingDeployRequest resumes an apply whose deploy request was already
 // created before the crash. It reattaches to the recovered deploy request,
 // deploys it when the driver crashed after creation but before the deploy was
-// started, and rediscovers the Vitess migration_context so per-shard progress
-// keeps working for the rest of the apply.
+// started, records the deferral when the operator deferred the deploy and the
+// driver stopped before recording it, and rediscovers the Vitess
+// migration_context so per-shard progress keeps working for the rest of the
+// apply.
 func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata) (*engine.ApplyResult, error) {
 	dr, err := e.getDeployRequest(ctx, client, org, req.Database, meta.DeployRequestID)
 	if err != nil {
@@ -965,6 +967,20 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		return nil, fmt.Errorf("get deploy request #%d on resume: %w", meta.DeployRequestID, err)
 	}
 
+	// The deploy request ID is persisted before PlanetScale finishes computing
+	// the schema diff, so a driver that stopped inside that window recovers a
+	// request still in "pending". Wait it out exactly as the fresh path does:
+	// every decision below is taken against the settled state, and a request
+	// left in "pending" is never deployed by anyone.
+	if dr.DeploymentState == deployState.Pending {
+		e.logger.Info("recovered deploy request is still computing its schema diff, waiting before resuming",
+			"database", req.Database, "deploy_request", dr.Number)
+		dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+		if err != nil {
+			return nil, fmt.Errorf("wait for recovered deploy request #%d on resume: %w", meta.DeployRequestID, err)
+		}
+	}
+
 	// If the deploy request failed, start fresh with a new branch rather
 	// than resuming a broken deploy.
 	if dr.DeploymentState == deployState.Error || dr.DeploymentState == deployState.CompleteError {
@@ -972,6 +988,16 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			"database", req.Database, "deploy_request", meta.DeployRequestID, "state", dr.DeploymentState)
 		req.ResumeState = nil
 		return e.Apply(ctx, req)
+	}
+
+	// A recovered request whose diff settled to no changes has nothing to
+	// deploy, reattach to, or record: the schema already matched. Return the
+	// same converged result the fresh and branch-resume paths return, instead of
+	// spending the context-discovery budget on a change that never ran.
+	if dr.DeploymentState == deployState.NoChanges {
+		e.logger.Info("recovered deploy request reports no changes on resume",
+			"database", req.Database, "deploy_request", dr.Number)
+		return noChangesApplyResult("no changes detected on resume"), nil
 	}
 
 	meta.DeployRequestURL = dr.HtmlURL
@@ -1030,34 +1056,23 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			}
 		}
 
-		// The instant decision is re-taken against the deferral this drive was
-		// given and the safety of the changes, rather than read straight out of
-		// recovered metadata. Instant DDL swaps the schema as the deploy runs, so
-		// running one while the operator holds the cutover hands them a gate with
-		// nothing left behind it, and running an unsafe one leaves no revert
-		// window to undo the change — and the metadata was written by a drive
-		// whose decision inputs this one cannot confirm. The stored decision is
-		// only ever narrowed here: a deploy that was never going to be instant
-		// stays that way.
-		unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
-		useInstant := meta.IsInstant && !deferCutover && !unsafe
-		if meta.IsInstant && !useInstant {
-			if unsafe {
-				e.logger.Info("declining instant DDL on the recovered deploy request because the change is unsafe — the row copy keeps a revert window",
-					"database", req.Database, "deploy_request", dr.Number, "reason", unsafeReason)
-			} else {
-				e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
-					"database", req.Database, "deploy_request", dr.Number)
-			}
-			e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
-			// Re-encode so stored state carries the narrowed decision: metadata
-			// persisted with the stale IsInstant would let a later consumer of the
-			// stored value (a deferred Start, a subsequent resume) widen back to
-			// instant after this drive declined it.
-			meta.IsInstant = useInstant
-			if updatedMeta, err = encodePSMetadata(meta); err != nil {
-				return nil, fmt.Errorf("encode narrowed metadata for deploy request #%d: %w", dr.Number, err)
-			}
+		// The instant decision is taken here, from the recovered request's own
+		// eligibility and this drive's inputs, exactly as the fresh path takes it
+		// once the request is ready. The record the stopped driver wrote carries
+		// no decision — the fresh path stores IsInstant only after the deploy
+		// starts — so there is nothing in stored metadata to inherit, and a
+		// decision read from it would always be "row copy". Re-taking it keeps
+		// the two recovered paths and the fresh path on one gate: instant DDL
+		// swaps the schema as the deploy runs, so it is declined while the
+		// operator holds the cutover and for an unsafe change that needs a
+		// revert window.
+		useInstant := e.decideRecoveredInstantDDL(req, dr, deferCutover, "deploy")
+		// Re-encode so stored state carries the decision this drive took:
+		// Progress reads IsInstant to shape per-table reporting, and a later
+		// consumer of the stored value must see what was actually deployed.
+		meta.IsInstant = useInstant
+		if updatedMeta, err = encodePSMetadata(meta); err != nil {
+			return nil, fmt.Errorf("encode metadata with the instant decision for deploy request #%d: %w", dr.Number, err)
 		}
 
 		e.logger.Info("deploying recovered deploy request that was never started",
@@ -1089,6 +1104,10 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 				Metadata:         updatedMeta,
 			},
 		}, nil
+	}
+
+	if deployRequestAwaitsDeferredDeployRecord(dr, meta, deferDeploy) {
+		return e.recordRecoveredDeferredDeploy(ctx, client, org, req, meta, dr, deferCutover)
 	}
 
 	// Reattach-only path: no deploy was started here. If the stored context is
@@ -1144,6 +1163,87 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 // yet say so, and the request the operator made is what settles it.
 func deployRequestNeedsResumeDeploy(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
 	return dr.DeploymentState == deployState.Ready && !meta.DeferredDeploy && !deferDeploy && dr.DeployedAt == nil
+}
+
+// deployRequestAwaitsDeferredDeployRecord reports whether a recovered deploy
+// request belongs to a deferred deploy whose stored metadata does not yet say
+// so. The deferral is recorded only once the deploy request is ready, so a
+// driver that stopped before then leaves a ready, undeployed request the
+// operator asked to hold with metadata that reads as non-deferred. Until the
+// deferral is recorded, progress reports the apply as pending rather than
+// waiting for deploy, and the operator-triggered deploy is refused.
+func deployRequestAwaitsDeferredDeployRecord(dr *ps.DeployRequest, meta *psMetadata, deferDeploy bool) bool {
+	return deferDeploy && !meta.DeferredDeploy && dr.DeploymentState == deployState.Ready && dr.DeployedAt == nil
+}
+
+// decideRecoveredInstantDDL takes the instant DDL decision for a deploy request
+// recovered on resume, through the same gate the fresh path uses once a request
+// is ready (useInstantDDL): instant only when PlanetScale reports the request
+// eligible, the operator did not defer the cutover, and the change is safe. When
+// an eligible request is declined, the reason is logged and announced on the
+// apply's timeline so the operator can see why the deploy took the row-copy
+// path. recoveredAs names the resume path in the log line.
+func (e *Engine) decideRecoveredInstantDDL(req *engine.ApplyRequest, dr *ps.DeployRequest, deferCutover bool, recoveredAs string) bool {
+	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
+	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+	useInstant := useInstantDDL(dr, deferCutover, unsafe)
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL on the recovered deploy request because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database, "deploy_request", dr.Number, "recovered_as", recoveredAs, "reason", unsafeReason)
+		} else {
+			e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
+				"database", req.Database, "deploy_request", dr.Number, "recovered_as", recoveredAs)
+		}
+		e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
+	}
+	return useInstant
+}
+
+// recordRecoveredDeferredDeploy finishes what the fresh deferred path does once
+// its deploy request is ready and the driver that created it did not: it
+// verifies a deferred cutover is held, takes the instant DDL decision, and
+// durably records the deferral so progress reports waiting_for_deploy and the
+// operator-triggered deploy is accepted. The deploy itself is left to the
+// operator.
+func (e *Engine) recordRecoveredDeferredDeploy(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest, meta *psMetadata, dr *ps.DeployRequest, deferCutover bool) (*engine.ApplyResult, error) {
+	if deferCutover {
+		if err := e.verifyCutoverHeld(ctx, client, org, req.Database, dr.Number); err != nil {
+			return nil, err
+		}
+	}
+
+	useInstant := e.decideRecoveredInstantDDL(req, dr, deferCutover, "deferred deploy")
+
+	meta.DeployRequestURL = dr.HtmlURL
+	meta.IsInstant = useInstant
+	meta.DeferredDeploy = true
+	persistMeta, err := encodePSMetadata(meta)
+	if err != nil {
+		return nil, fmt.Errorf("encode metadata for recovered deferred deploy request #%d: %w", dr.Number, err)
+	}
+	resumeState := &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         persistMeta,
+	}
+	if req.OnStateChange != nil {
+		req.OnStateChange(resumeState)
+	} else {
+		e.logger.Warn("recovered deferred deploy recorded only in the returned resume state: no OnStateChange callback",
+			"database", req.Database, "deploy_request", dr.Number)
+	}
+
+	e.logger.Info("recorded deferral on recovered deploy request — operator must trigger the deploy",
+		"database", req.Database, "deploy_request", dr.Number, "branch", meta.BranchName, "instant_ddl", useInstant)
+	suffix := ""
+	if useInstant {
+		suffix = " (instant DDL)"
+	}
+	return &engine.ApplyResult{
+		Accepted:    true,
+		Message:     fmt.Sprintf("Deploy request #%d ready%s — waiting for deploy", dr.Number, suffix),
+		ResumeState: resumeState,
+	}, nil
 }
 
 // resolveResumeSchemaChangeContext rediscovers the Vitess migration_context after a

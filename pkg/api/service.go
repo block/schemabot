@@ -124,6 +124,22 @@ type pendingObserverKey struct {
 	environment string
 }
 
+// pendingObserverEntry is one registration in the pending-observer slot. Its
+// address is the registration's identity, so the slot never compares observer
+// values: a ProgressObserver implementation need not be comparable.
+type pendingObserverEntry struct {
+	observer tern.ProgressObserver
+}
+
+// PendingObserverHandle names one SetPendingObserver registration so the
+// command that made it can withdraw exactly that registration. The zero
+// handle names nothing and is what SetPendingObserver returns when the
+// target cannot be resolved; clearing it is a no-op.
+type PendingObserverHandle struct {
+	key   pendingObserverKey
+	entry *pendingObserverEntry
+}
+
 type Service struct {
 	storage           storage.Storage
 	config            *ServerConfig
@@ -224,7 +240,7 @@ type Service struct {
 	OnApplyTerminalSummary ApplyTerminalSummaryCallback
 
 	pendingObserverMu sync.Mutex
-	pendingObservers  map[pendingObserverKey]tern.ProgressObserver
+	pendingObservers  map[pendingObserverKey]*pendingObserverEntry
 
 	// storageSchemaService answers the storage schema routes for this server's
 	// own storage database. An embedder registers it with
@@ -265,26 +281,57 @@ func (s *Service) SetApplyObserver(database, deployment, environment string, app
 
 // SetPendingObserver stores an observer for the next apply request for this
 // target. ExecuteApply registers it on the durable apply before operator
-// dispatch can start.
-func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) {
+// dispatch can start. The returned handle names this registration; a command
+// whose apply request fails withdraws it with ClearPendingObserver. When the
+// target cannot be resolved nothing is stored and the zero handle is returned.
+func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) PendingObserverHandle {
 	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
 	if err != nil {
 		s.logger.Error("failed to resolve tern deployment for pending observer",
 			"database", database, "deployment", deployment, "environment", environment, "error", err)
-		return
+		return PendingObserverHandle{}
 	}
 
 	key := pendingObserverKey{database: database, deployment: deployment, environment: environment}
+	entry := &pendingObserverEntry{observer: observer}
 	s.pendingObserverMu.Lock()
 	defer s.pendingObserverMu.Unlock()
 	if s.pendingObservers == nil {
-		s.pendingObservers = make(map[pendingObserverKey]tern.ProgressObserver)
+		s.pendingObservers = make(map[pendingObserverKey]*pendingObserverEntry)
 	}
-	if observer == nil {
-		delete(s.pendingObservers, key)
-	} else {
-		s.pendingObservers[key] = observer
+	s.pendingObservers[key] = entry
+	return PendingObserverHandle{key: key, entry: entry}
+}
+
+// ClearPendingObserver withdraws the registration named by handle when its
+// apply request will not produce an apply. The slot is keyed by target, so a
+// competing command on the same target may have registered its own observer
+// since; only the caller's registration is removed, never a later one whose
+// apply has yet to consume it, and a registration ExecuteApply already
+// consumed is left alone. The zero handle clears nothing.
+func (s *Service) ClearPendingObserver(handle PendingObserverHandle) {
+	if handle.entry == nil {
+		return
 	}
+	s.pendingObserverMu.Lock()
+	defer s.pendingObserverMu.Unlock()
+	if s.pendingObservers[handle.key] == handle.entry {
+		delete(s.pendingObservers, handle.key)
+	}
+}
+
+// HasPendingObserver reports whether an observer is registered for the next
+// apply on this target, without consuming it. A command that withdrew its
+// observer after a failed apply request leaves the slot empty; callers use
+// this to check that nothing stale is waiting to attach to an apply the failed
+// command did not create.
+func (s *Service) HasPendingObserver(database, deployment, environment string) bool {
+	key := pendingObserverKey{database: database, deployment: deployment, environment: environment}
+
+	s.pendingObserverMu.Lock()
+	defer s.pendingObserverMu.Unlock()
+	_, ok := s.pendingObservers[key]
+	return ok
 }
 
 func (s *Service) consumePendingObserver(database, deployment, environment string) tern.ProgressObserver {
@@ -292,9 +339,12 @@ func (s *Service) consumePendingObserver(database, deployment, environment strin
 
 	s.pendingObserverMu.Lock()
 	defer s.pendingObserverMu.Unlock()
-	observer := s.pendingObservers[key]
+	entry := s.pendingObservers[key]
 	delete(s.pendingObservers, key)
-	return observer
+	if entry == nil {
+		return nil
+	}
+	return entry.observer
 }
 
 // New creates a new SchemaBot service.
@@ -320,7 +370,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		retryableExpiryEvery: RetryableExpiryInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
-		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
+		pendingObservers:     make(map[pendingObserverKey]*pendingObserverEntry),
 		heldClaims:           make(map[int64]heldClaim),
 		heldOperationClaims:  make(map[int64]heldOperationClaim),
 	}

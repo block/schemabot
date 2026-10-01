@@ -43,10 +43,11 @@ to upgrade its lock to finish. While the statement holds the lock and runs,
 nothing is killed: the sessions reading and writing the table beside a rebuild
 are not blocking it. Two kinds of blocker are never killed, because killing
 them is unsafe: a session holding an explicit `LOCK TABLES`, and a transaction
-too large to roll back without harming the database. An explicit table lock
-fails the apply after the first attempt; a large transaction fails it once
-the attempts run out. Either way the apply fails with a retryable "table is
-busy" error instead of stalling. Every attempt runs the statement from the
+too large to roll back without harming the database. A session the
+SchemaBot user is not allowed to kill also survives the kill. No later attempt
+can end any of these, so the statement stops after the attempt that met one,
+and the apply fails with a retryable "table is busy" error instead of stalling
+again. The remaining attempts go only to blockers the kill ends. Every attempt runs the statement from the
 start: when a rebuild times out waiting to upgrade its lock at the end, MySQL
 rolls the rebuild back, and the next attempt rebuilds the table again. Between
 attempts the statement waits up to 30 seconds for killed sessions to finish
@@ -60,11 +61,10 @@ when it is not set.
 The kill needs `SELECT` on `performance_schema` and `PROCESS` to find the
 blockers (`PROCESS` covers `information_schema.innodb_trx`, which it reads to
 spare large transactions), and `CONNECTION_ADMIN` (or `SUPER`) to kill
-sessions of other users. A target whose SchemaBot user is denied either of
-the first two blocks the statement at plan time rather than running it
-without the kill. A missing kill privilege
-surfaces only when a blocker is found: the kill fails, the attempts time out,
-and the apply fails as busy.
+sessions of other users. A target whose SchemaBot user lacks any of them
+blocks the statement at plan time rather than running it without the kill.
+`CONNECTION_ADMIN` is read from `SHOW GRANTS`; on RDS, holding
+`rds_superuser_role` counts when `activate_all_roles_on_login` is on.
 
 ## Routing
 
@@ -300,7 +300,12 @@ confirmation step:
   `apply` or at `apply-confirm`, that routes a statement to direct execution
   that the comment the operator was shown ran through Spirit pauses for
   `apply-confirm` against a comment that discloses it, the same way a
-  re-plan whose DDL changed does.
+  re-plan whose DDL changed does. An `apply-confirm` given on a comment that
+  rendered several targets' plans does not pause again: a statement on the
+  reviewed target that now runs differently, as direct execution or blocked,
+  refuses the apply and releases the lock, because how each statement runs
+  is part of the plan that confirmation covers. A fresh `schemabot apply`
+  reviews the rollout as it is now.
 - Other gates still apply: a direct statement that is also an unsafe change,
   such as dropping a primary key, still needs `--allow-unsafe`.
 - `--defer-cutover` is rejected on an all-direct plan — a direct statement has
@@ -324,6 +329,6 @@ are rare, policy-approved events — a spike in
 the statement and MySQL error), a spike in `blocked_size_unknown` means table
 size statistics are unavailable (check target connectivity and
 `information_schema` access), `blocked_force_kill_unavailable` means the
-SchemaBot user is denied a table the kill reads on the target (grant `SELECT`
-on `performance_schema.*` and `PROCESS`), and `blocked_force_kill_unknown`
+SchemaBot user lacks a grant the kill needs on the target (grant `SELECT`
+on `performance_schema.*`, `PROCESS`, and `CONNECTION_ADMIN` or `SUPER`), and `blocked_force_kill_unknown`
 means checking those grants failed (check target connectivity).

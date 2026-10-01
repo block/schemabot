@@ -57,6 +57,13 @@ type memberWork struct {
 	// names are the members with work, the way an operator addresses them, in
 	// rollout order.
 	names []string
+	// copyAtStake names a member other than the primary whose apply would
+	// discard an unfinished copy, or could not say whether it would, and why.
+	// Empty when no member with work puts a copy at stake.
+	copyAtStake string
+	// others counts the members with work other than the reviewed primary,
+	// whose work runs from plans of their own rather than the reviewed plan.
+	others int
 }
 
 // memberWorkOf counts the work in a rollup. A nil rollup is one that was not
@@ -76,9 +83,15 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	for i, entry := range rollup.Entries {
 		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
 			work.names = append(work.names, names[i])
+			if i > 0 {
+				work.others++
+			}
 		}
 	}
 	work.pending = len(work.names)
+	if at, reason := rollup.MemberCopyAtStake(); at >= 0 {
+		work.copyAtStake = fmt.Sprintf("target %s: %s", names[at], reason)
+	}
 	return work
 }
 
@@ -122,6 +135,25 @@ func (o reviewDriftOutcome) planDriftState() storage.PlanDriftState {
 // Returns the commit SHA used for the plan. Failures are non-fatal.
 func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome) (string, error) {
 	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, drift)
+	return headSHA, err
+}
+
+// namespacePlacementCheckSummary is the stored Change column for an environment
+// whose plan was refused by namespace placement. The plan comment carries the
+// refusal in full.
+const namespacePlacementCheckSummary = "namespace placement refused the plan; see the plan comment"
+
+// storeNamespacePlacementCheck stores a failing check for an environment whose
+// plan was refused because its targets entries and the schema files disagree on
+// namespace placement (api.NamespacePlacementRefused). That environment has no
+// plan, so without this row the aggregate folds only the environments that did
+// plan and can pass while a namespace is planned and applied nowhere (MG-12).
+// The row carries the review-time drift block: the rollout cannot be confirmed
+// to converge, and a later plan whose placement agrees clears it the way a
+// clean rollup clears drift.
+func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) (string, error) {
+	blocked := reviewDriftOutcome{state: driftBlocked, summary: namespacePlacementCheckSummary}
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
 	return headSHA, err
 }
 
@@ -219,6 +251,27 @@ func planRefusalFailsCheck(databaseType string, planResp *apitypes.PlanResponse)
 }
 
 func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome) (string, *storage.Check, error) {
+	// A plan narrowed to one rollout member says nothing about the others, so
+	// recording it would let one member's result stand for the whole rollout
+	// (MG-12). Refusing the write leaves the stored check state as the last
+	// rollout-wide round recorded it, so a narrowed plan can never move it
+	// toward passing.
+	if planResp != nil && planResp.NarrowedTo != "" {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		h.logger.Warn("stored check state not written: the plan was narrowed to one rollout member and cannot speak for the rollout",
+			"repo", repo, "pr", pr, "head_sha", schema.HeadSHA,
+			"environment", environment, "database_type", schema.Type, "database", schema.Database,
+			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+		return "", nil, fmt.Errorf("plan %s for repo %s pr %d environment %s database %s was narrowed to rollout member %s; a narrowed plan never records stored check state",
+			planResp.PlanID, repo, pr, environment, schema.Database, planResp.NarrowedTo)
+	}
 	headSHA := schema.HeadSHA
 	if headSHA == "" {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -367,7 +420,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 // (e.g. "5 created, 3 altered · 2 vschema updates") always agrees with the plan
 // comment's summary line. Returns "" when the plan has no changes.
 func summarizePlanChanges(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) string {
-	commentData := buildPlanCommentData(schema, planResp, environment, "", "", "")
+	commentData := buildPlanCommentData(schema, planResp, environment, "", "", "", "")
 	return templates.SummarizeChanges(commentData)
 }
 

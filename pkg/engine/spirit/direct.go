@@ -218,16 +218,16 @@ type refusedModeDecision struct {
 const blockedSizeUnknownReason = "; direct execution is enabled but the table's size is unavailable"
 
 // blockedForceKillUnavailableReason is the mode-reason suffix when the target
-// denies SchemaBot the tables it reads to find the sessions blocking a direct
-// statement's metadata lock: the performance_schema lock tables, and
-// information_schema.innodb_trx, which needs PROCESS. The denial itself stays
-// in the server log; the reason names the grants that fix it and the fresh
-// plan that picks them up.
-const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot cannot read the lock and transaction tables it uses to end sessions blocking the statement: grant its database user SELECT on performance_schema and PROCESS, then plan again"
+// denies SchemaBot a grant the kill needs to end the sessions blocking a direct
+// statement's metadata lock: SELECT on the performance_schema lock tables,
+// PROCESS for information_schema.innodb_trx, or CONNECTION_ADMIN (or SUPER) to
+// kill another user's session. The denial itself stays in the server log; the
+// reason names the grants that fix it and the fresh plan that picks them up.
+const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and CONNECTION_ADMIN (or SUPER), then plan again"
 
 // blockedForceKillUnknownReason is the mode-reason suffix when checking those
-// tables failed for a reason other than a denied grant, such as a lost
-// connection or a deadline. Nothing is known to be missing, so the reason asks
+// grants failed for a reason other than a denial, such as a lost connection, a
+// deadline, or a failed read of the server's role settings. Nothing is known to be missing, so the reason asks
 // for a fresh plan rather than naming a grant.
 const blockedForceKillUnknownReason = "; direct execution is enabled but SchemaBot could not check that it can end sessions blocking the statement: plan again"
 
@@ -249,28 +249,13 @@ func isAccessDenied(err error) bool {
 	return mysqlerr.Is(err, erDBAccessDenied, erTableAccessDenied, erColumnAccessDenied, erSpecificAccessDenied)
 }
 
-// innodbTrxProbe reads information_schema.innodb_trx, which the kill joins to
-// spare heavy transactions. MySQL checks PROCESS for that table only when it
-// fills it, and it skips the fill for a query that can return no rows, so the
-// LIMIT 0 probe in dbconn.CheckForceKillPrivileges passes for a user without
-// PROCESS. LIMIT 1 forces the fill. This retires once Spirit's own probe
-// forces it.
-const innodbTrxProbe = "SELECT 1 FROM information_schema.innodb_trx LIMIT 1"
-
-// checkInnodbTrxAccess runs innodbTrxProbe and drains it, so a denied PROCESS
-// grant surfaces here rather than when the kill first runs.
-func checkInnodbTrxAccess(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx, innodbTrxProbe)
-	if err != nil {
-		return fmt.Errorf("read information_schema.innodb_trx: %w", err)
-	}
-	defer utils.CloseAndLog(rows)
-	for rows.Next() {
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("read information_schema.innodb_trx: %w", err)
-	}
-	return nil
+// deniesForceKillGrant reports whether the force-kill privilege check failed
+// because the target lacks a grant, as opposed to a check that could not run.
+// Spirit marks every grant it finds missing, including CONNECTION_ADMIN, which
+// it reads from SHOW GRANTS rather than from a denied query, so its marker is
+// the primary signal. A denial code Spirit does not mark is still a denial.
+func deniesForceKillGrant(err error) bool {
+	return errors.Is(err, dbconn.ErrForceKillPrivilegeMissing) || isAccessDenied(err)
 }
 
 // resolveRefusedMode decides whether the policy routes a refused statement to
@@ -307,8 +292,9 @@ func (e *Engine) resolveRefusedMode(ctx context.Context, target *lazyTargetDB, p
 }
 
 // requireForceKill blocks a statement the size gate approved when SchemaBot
-// cannot read the tables it uses to find the sessions blocking the
-// statement's metadata lock. Without them the kill could only fail at apply
+// lacks a grant the kill needs: reading the tables it uses to find the
+// sessions blocking the statement's metadata lock, or killing another user's
+// session. Without them the kill could only fail at apply
 // time, after the operator confirmed, leaving the statement queued on the lock
 // while table traffic stalls behind it. The statement is blocked rather than
 // run without the kill: as unavailable when the target denies a grant, and as
@@ -332,27 +318,18 @@ func (e *Engine) requireForceKill(ctx context.Context, target *lazyTargetDB, dat
 			"database", database, "table", tableName, "error", err)
 		return unknown
 	}
-	for _, probe := range []struct {
-		tables string
-		run    func(context.Context, *sql.DB) error
-	}{
-		{"performance_schema lock tables", dbconn.CheckForceKillPrivileges},
-		{"information_schema.innodb_trx", checkInnodbTrxAccess},
-	} {
-		err := probe.run(ctx, db)
-		if err == nil {
-			continue
-		}
-		if isAccessDenied(err) {
-			e.logger.Warn("direct execution blocked: the target denies a grant the kill needs to end sessions blocking the statement",
-				"database", database, "table", tableName, "tables", probe.tables, "error", err)
-			return unavailable
-		}
-		e.logger.Warn("direct execution blocked: checking the grants the kill needs failed",
-			"database", database, "table", tableName, "tables", probe.tables, "error", err)
-		return unknown
+	err = dbconn.CheckForceKillPrivileges(ctx, db)
+	if err == nil {
+		return approved
 	}
-	return approved
+	if deniesForceKillGrant(err) {
+		e.logger.Warn("direct execution blocked: the target denies a grant the kill needs to end sessions blocking the statement",
+			"database", database, "table", tableName, "error", err)
+		return unavailable
+	}
+	e.logger.Warn("direct execution blocked: checking the grants the kill needs failed",
+		"database", database, "table", tableName, "error", err)
+	return unknown
 }
 
 // resolveSizeGate applies the policy's size bound to a refused statement whose
@@ -581,13 +558,14 @@ func (v *ExecutionVerdicts) record(ctx context.Context, change *engine.TableChan
 // DDL. It never kills while it holds the lock and runs, so traffic to the
 // table during a rebuild is left alone. A blocker it will not kill, an
 // explicit LOCK TABLES or a transaction heavier than
-// dbconn.TransactionWeightThreshold, makes the apply fail with a retryable
-// "table is busy" error.
+// dbconn.TransactionWeightThreshold, or one the target denies it the KILL of,
+// makes the apply fail with a retryable "table is busy" error.
 const defaultDirectLockAcquisitionTimeoutSeconds = 10
 
 // directMaxAttempts is how many times a direct statement tries to take its
-// lock before the apply fails as busy. An explicit LOCK TABLES ends the
-// attempts after the first, since the kill never ends one.
+// lock before the apply fails as busy. A blocker the kill does not end, an
+// explicit LOCK TABLES, a transaction too heavy to roll back, or a session the
+// target denies the KILL of, ends the attempts after the first.
 const directMaxAttempts = 3
 
 // directExecutionPoolSize caps the pool direct statements run on: one
@@ -771,8 +749,7 @@ func directForceExecConfig(lockWaitSeconds int64) *dbconn.DBConfig {
 // reported as explicit per-statement state transitions rather than row
 // counts. A statement that cannot take the table's metadata lock kills the
 // transactions blocking it, as Spirit does for its own DDL; routing has
-// already confirmed SchemaBot can read the performance_schema tables that
-// finds them. It returns false when execution must stop: a cancelled context
+// already confirmed SchemaBot holds the grants that find and kill them. It returns false when execution must stop: a cancelled context
 // leaves the engine state Stopped, a genuine failure transitions to
 // StateFailed.
 func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTargetDB, database string, stmts []directRouted, policy directPolicy) bool {
@@ -814,16 +791,18 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 			if isLockWaitTimeout(err) {
 				// The kill did not clear the blocker: an explicit LOCK TABLES
 				// and a transaction too heavy to roll back are never killed, and
-				// a KILL the target user is not privileged to issue fails. Spirit
-				// logs which of these it hit through the kill logger above.
-				logger.Error("direct execution failed: statement could not acquire the table's metadata lock on any attempt; the force-kill did not clear the blocker",
+				// a KILL of a SYSTEM_USER account's session fails without
+				// SYSTEM_USER, as does any KILL after a grant routing confirmed
+				// is revoked. Spirit logs which of these it hit through the kill
+				// logger above.
+				logger.Error("direct execution failed: statement could not acquire the table's metadata lock; the force-kill did not clear the blocker",
 					"database", database, "table", ds.table, "lock_wait_timeout_seconds", lockWaitSeconds,
 					"max_attempts", forceExecConfig.MaxRetries, "error", err)
 				// The table name comes from the plan and the timeout from this
 				// deployment's own configuration, so this sentence is safe to
 				// show on the pull request that asked for the change.
 				e.setSchemaChangeFailed(engine.OperatorErrorf(err,
-					"Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts. SchemaBot kills transactions blocking the lock, but not a session holding an explicit LOCK TABLES or a transaction too large to roll back safely, and it cannot find or kill another user's session unless its database user has PROCESS and CONNECTION_ADMIN. Retry when those sessions have finished, or grant PROCESS and CONNECTION_ADMIN if the server log shows the kill failed.",
+					"Table %q is busy: the change could not acquire the metadata lock. Each attempt waits up to %ds, and SchemaBot makes up to %d attempts, killing the transactions blocking the lock between them. It stops after the first attempt that meets a session it will not or cannot kill: a session holding an explicit LOCK TABLES, a transaction too large to roll back safely, or a session of a SYSTEM_USER account, which only a user that also has SYSTEM_USER may kill. Retry when those sessions have finished; the server log names the session that blocked the change.",
 					ds.table, lockWaitSeconds, forceExecConfig.MaxRetries))
 				return false
 			}
