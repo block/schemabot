@@ -990,6 +990,16 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		return e.Apply(ctx, req)
 	}
 
+	// A recovered request whose diff settled to no changes has nothing to
+	// deploy, reattach to, or record: the schema already matched. Return the
+	// same converged result the fresh and branch-resume paths return, instead of
+	// spending the context-discovery budget on a change that never ran.
+	if dr.DeploymentState == deployState.NoChanges {
+		e.logger.Info("recovered deploy request reports no changes on resume",
+			"database", req.Database, "deploy_request", dr.Number)
+		return noChangesApplyResult("no changes detected on resume"), nil
+	}
+
 	meta.DeployRequestURL = dr.HtmlURL
 	updatedMeta, err := encodePSMetadata(meta)
 	if err != nil {
@@ -1024,34 +1034,23 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 			}
 		}
 
-		// The instant decision is re-taken against the deferral this drive was
-		// given and the safety of the changes, rather than read straight out of
-		// recovered metadata. Instant DDL swaps the schema as the deploy runs, so
-		// running one while the operator holds the cutover hands them a gate with
-		// nothing left behind it, and running an unsafe one leaves no revert
-		// window to undo the change — and the metadata was written by a drive
-		// whose decision inputs this one cannot confirm. The stored decision is
-		// only ever narrowed here: a deploy that was never going to be instant
-		// stays that way.
-		unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
-		useInstant := meta.IsInstant && !deferCutover && !unsafe
-		if meta.IsInstant && !useInstant {
-			if unsafe {
-				e.logger.Info("declining instant DDL on the recovered deploy request because the change is unsafe — the row copy keeps a revert window",
-					"database", req.Database, "deploy_request", dr.Number, "reason", unsafeReason)
-			} else {
-				e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
-					"database", req.Database, "deploy_request", dr.Number)
-			}
-			e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
-			// Re-encode so stored state carries the narrowed decision: metadata
-			// persisted with the stale IsInstant would let a later consumer of the
-			// stored value (a deferred Start, a subsequent resume) widen back to
-			// instant after this drive declined it.
-			meta.IsInstant = useInstant
-			if updatedMeta, err = encodePSMetadata(meta); err != nil {
-				return nil, fmt.Errorf("encode narrowed metadata for deploy request #%d: %w", dr.Number, err)
-			}
+		// The instant decision is taken here, from the recovered request's own
+		// eligibility and this drive's inputs, exactly as the fresh path takes it
+		// once the request is ready. The record the stopped driver wrote carries
+		// no decision — the fresh path stores IsInstant only after the deploy
+		// starts — so there is nothing in stored metadata to inherit, and a
+		// decision read from it would always be "row copy". Re-taking it keeps
+		// the two recovered paths and the fresh path on one gate: instant DDL
+		// swaps the schema as the deploy runs, so it is declined while the
+		// operator holds the cutover and for an unsafe change that needs a
+		// revert window.
+		useInstant := e.decideRecoveredInstantDDL(req, dr, deferCutover, "deploy")
+		// Re-encode so stored state carries the decision this drive took:
+		// Progress reads IsInstant to shape per-table reporting, and a later
+		// consumer of the stored value must see what was actually deployed.
+		meta.IsInstant = useInstant
+		if updatedMeta, err = encodePSMetadata(meta); err != nil {
+			return nil, fmt.Errorf("encode metadata with the instant decision for deploy request #%d: %w", dr.Number, err)
 		}
 
 		e.logger.Info("deploying recovered deploy request that was never started",
@@ -1155,6 +1154,30 @@ func deployRequestAwaitsDeferredDeployRecord(dr *ps.DeployRequest, meta *psMetad
 	return deferDeploy && !meta.DeferredDeploy && dr.DeploymentState == deployState.Ready && dr.DeployedAt == nil
 }
 
+// decideRecoveredInstantDDL takes the instant DDL decision for a deploy request
+// recovered on resume, through the same gate the fresh path uses once a request
+// is ready (useInstantDDL): instant only when PlanetScale reports the request
+// eligible, the operator did not defer the cutover, and the change is safe. When
+// an eligible request is declined, the reason is logged and announced on the
+// apply's timeline so the operator can see why the deploy took the row-copy
+// path. recoveredAs names the resume path in the log line.
+func (e *Engine) decideRecoveredInstantDDL(req *engine.ApplyRequest, dr *ps.DeployRequest, deferCutover bool, recoveredAs string) bool {
+	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
+	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
+	useInstant := useInstantDDL(dr, deferCutover, unsafe)
+	if instantEligible && !useInstant {
+		if unsafe {
+			e.logger.Info("declining instant DDL on the recovered deploy request because the change is unsafe — the row copy keeps a revert window",
+				"database", req.Database, "deploy_request", dr.Number, "recovered_as", recoveredAs, "reason", unsafeReason)
+		} else {
+			e.logger.Info("declining instant DDL on the recovered deploy request so the deferred cutover has a gate to hold",
+				"database", req.Database, "deploy_request", dr.Number, "recovered_as", recoveredAs)
+		}
+		e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
+	}
+	return useInstant
+}
+
 // recordRecoveredDeferredDeploy finishes what the fresh deferred path does once
 // its deploy request is ready and the driver that created it did not: it
 // verifies a deferred cutover is held, takes the instant DDL decision, and
@@ -1168,19 +1191,7 @@ func (e *Engine) recordRecoveredDeferredDeploy(ctx context.Context, client pscli
 		}
 	}
 
-	instantEligible := dr.Deployment != nil && dr.Deployment.InstantDDLEligible
-	unsafe, unsafeReason := e.changesContainUnsafe(req.Changes, req.Database)
-	useInstant := useInstantDDL(dr, deferCutover, unsafe)
-	if instantEligible && !useInstant {
-		if unsafe {
-			e.logger.Info("declining instant DDL on the recovered deferred deploy request because the change is unsafe — the row copy keeps a revert window",
-				"database", req.Database, "deploy_request", dr.Number, "reason", unsafeReason)
-		} else {
-			e.logger.Info("declining instant DDL on the recovered deferred deploy request so the deferred cutover has a gate to hold",
-				"database", req.Database, "deploy_request", dr.Number)
-		}
-		e.eventEmitter(req)(rowCopyDeclineEvent(unsafe, unsafeReason))
-	}
+	useInstant := e.decideRecoveredInstantDDL(req, dr, deferCutover, "deferred deploy")
 
 	meta.DeployRequestURL = dr.HtmlURL
 	meta.IsInstant = useInstant
