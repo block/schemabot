@@ -179,6 +179,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	if totalChanges > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
+	writeTableSizesSection(&sb, data)
 
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
@@ -237,6 +238,7 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 	if totalStatements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
+	writeTableSizesSection(&sb, data)
 
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 

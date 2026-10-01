@@ -48,12 +48,12 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -244,8 +244,8 @@ ALTER TABLE `webhooks` ADD INDEX `idx_tenant_id`(`tenant_id`);
 
 - `audit_events`: ~186 GB
 - `ledger_entries`: ~121 GB
-- `line_items`: ~58 GB
-- `notifications`: ~44 GB
+- `line_items`: ~58.0 GB
+- `notifications`: ~44.0 GB
 - `orders`: ~26.5 GB
 - `payments`: ~23.1 GB
 - `invoices`: ~17.4 GB
@@ -268,7 +268,7 @@ ALTER TABLE `webhooks` ADD INDEX `idx_tenant_id`(`tenant_id`);
 - `subscriptions`: ~470 MB
 - `prices`: ~210 MB
 - `disputes`: ~150 MB
-- `coupons`: ~41 MB
+- `coupons`: ~41.0 MB
 - `api_keys`: ~6.1 MB
 - `locations`: ~4.2 MB
 - `tax_rates`: ~2.3 MB
@@ -1599,12 +1599,12 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -2033,8 +2033,8 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📊 **Table sizes**:
-- `orders`: ~24 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
-- `users`: ~193 MB across 2 targets · largest ~98 MB on `primary/testapp_2` · smallest ~95 MB
+- `orders`: ~24.0 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
+- `users`: ~193 MB across 2 targets · largest ~98.0 MB on `primary/testapp_2` · smallest ~95.0 MB
 
 📋 **Plan**: **2** tables to alter
 
@@ -2069,8 +2069,8 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📊 **Table sizes**:
-- `orders`: ~24 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
-- `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95 MB
+- `orders`: ~24.0 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
+- `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95.0 MB
 
 📋 **Plan**: **2** tables to alter
 
@@ -2110,7 +2110,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 📊 **Table sizes** (reviewed target `primary/testapp_1` only; other targets not shown):
 - `orders`: ~610 MB
-- `users`: ~95 MB
+- `users`: ~95.0 MB
 
 📋 **Plan**: **2** tables to alter
 
@@ -2382,12 +2382,12 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -3250,9 +3250,6 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes**:
-- `products`: ~1.1 GB
-
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
@@ -3302,9 +3299,6 @@ CREATE TABLE `orders` (
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -3358,15 +3352,15 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 ⚠️ **Schema changes differ from the plan this apply was started from**
 - `orders` (alter) runs a different statement than in the plan this apply was started from
 - `products` (alter) is in this plan but not in the one this apply was started from
 - `shipments` (create) was in the plan this apply was started from but is not in this one
 
 The statements above are what will run. Review them, then confirm to apply them.
-
-📊 **Table sizes**:
-- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
