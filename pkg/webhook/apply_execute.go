@@ -234,12 +234,13 @@ func (h *Handler) executeApply(
 		return
 	default:
 		// The reviewed target's re-plan runs from this confirmation even when
-		// no other target has work left, so in a rollout it must be the
-		// statements the confirmed comment showed.
-		if storedPlan == nil && rollout.work.members > 1 {
-			covered, coverErr := h.confirmationCoversReviewedTarget(ctx, expectedPendingPlanID, planResp)
+		// no other target has work left, so in a rollout it must be the work
+		// the confirmed comment showed. A rollout that has since shrunk to the
+		// reviewed target is still checked against its confirmed round.
+		if storedPlan == nil {
+			covered, coverErr := h.confirmationCoversReviewedTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
 			if coverErr != nil {
-				h.logger.Error("apply-confirm rejected: could not load the confirmed plan to compare with the reviewed target's re-plan; the pending confirmation is preserved",
+				h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its round, or the re-plan to compare the reviewed target's work; the pending confirmation is preserved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", coverErr)
 				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
@@ -247,7 +248,7 @@ func (h *Handler) executeApply(
 				return
 			}
 			if !covered {
-				h.logger.Info("apply-confirm refused: the reviewed target would run statements the confirmed plan did not show",
+				h.logger.Info("apply-confirm refused: the reviewed target would run work the confirmed plan did not show",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
 				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the reviewed target's statements are not what was confirmed")

@@ -365,24 +365,56 @@ func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanI
 }
 
 // confirmationCoversReviewedTarget reports whether the reviewed target's
-// confirm-time re-plan runs the same table changes as the plan the pending
-// confirmation was given against. A pinned plan that no longer loads is an
-// error: what its comment showed cannot be told.
-func (h *Handler) confirmationCoversReviewedTarget(ctx context.Context, pinnedPlanID string, planResp *apitypes.PlanResponse) (bool, error) {
-	pinned, err := h.service.Storage().Plans().Get(ctx, pinnedPlanID)
+// confirm-time re-plan, stored as currentPlanID, runs the same work as the plan
+// the pending confirmation was given against, when that confirmation was given
+// on a rollout's comment.
+//
+// Whether it was is read from the confirmed round as well as from the rollout
+// at confirm: rolloutAtConfirm says the environment still has several targets,
+// and a confirmed round that stored plans for other targets was a rollout's
+// even when the topology has since shrunk to the reviewed target alone. A
+// confirmation that neither marks as a rollout's was given for a single target,
+// whose re-plan runs under the single-target gates. A pinned or confirm-time
+// plan that no longer loads is an error: what the comment showed, or what the
+// apply would run, cannot be told.
+func (h *Handler) confirmationCoversReviewedTarget(ctx context.Context, pinnedPlanID, currentPlanID, environment string, rolloutAtConfirm bool) (bool, error) {
+	plans := h.service.Storage().Plans()
+	pinned, err := plans.Get(ctx, pinnedPlanID)
 	if err != nil {
 		return false, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
 	}
 	if pinned == nil {
 		return false, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
 	}
-	return ddlMatchesStoredPlan(planResp, pinned), nil
+	if !rolloutAtConfirm {
+		confirmedRound, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
+		if err != nil {
+			return false, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
+		}
+		if len(confirmedRound) == 0 {
+			h.logger.Debug("apply-confirm: the confirmed plan was reviewed for a single target, so its re-plan runs under the single-target gates",
+				"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID)
+			return true, nil
+		}
+		h.logger.Info("apply-confirm: the confirmed round planned other targets that the rollout no longer has; comparing the reviewed target's re-plan with the confirmed plan",
+			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID, "confirmed_member_plans", len(confirmedRound))
+	}
+	current, err := plans.Get(ctx, currentPlanID)
+	if err != nil {
+		return false, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
+	}
+	if current == nil {
+		return false, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
+	}
+	return sameMemberWork(pinned, current), nil
 }
 
-// sameMemberWork reports whether two plans for one member run the same
-// statements. It compares what the operator reads on the comment, the table
-// changes and each shard's own changes, byte for byte: a difference in spelling
-// alone refuses too, which only ever sends the operator back to review.
+// sameMemberWork reports whether two plans for one target run the same work.
+// It compares everything an apply created from the plan executes and the
+// comment shows: the table changes, which namespaces end with a finalizer, the
+// VSchema each of those writes and the record of what that VSchema change does,
+// and each shard's own changes, byte for byte. A difference in spelling alone
+// refuses too, which only ever sends the operator back to review.
 func sameMemberWork(a, b *storage.Plan) bool {
 	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameTableChange) {
 		return false
@@ -390,9 +422,21 @@ func sameMemberWork(a, b *storage.Plan) bool {
 	if !slices.Equal(a.FinalizerNamespaces(), b.FinalizerNamespaces()) {
 		return false
 	}
+	for _, namespace := range a.FinalizerNamespaces() {
+		if !sameVSchemaChange(a.Namespaces[namespace], b.Namespaces[namespace]) {
+			return false
+		}
+	}
 	return slices.EqualFunc(a.Shards, b.Shards, func(x, y storage.ShardPlan) bool {
 		return x.Namespace == y.Namespace && x.Shard == y.Shard && slices.EqualFunc(x.Changes, y.Changes, sameTableChange)
 	})
+}
+
+// sameVSchemaChange reports whether two plans of one namespace write the same
+// VSchema with the same recorded effect: the document the finalizer applies,
+// and the diff, removals and vindex mutations the comment rendered from it.
+func sameVSchemaChange(a, b *storage.NamespacePlanData) bool {
+	return a.Artifacts[storage.VSchemaArtifactName] == b.Artifacts[storage.VSchemaArtifactName] && maps.Equal(a.Metadata, b.Metadata)
 }
 
 func sameTableChange(a, b storage.TableChange) bool {

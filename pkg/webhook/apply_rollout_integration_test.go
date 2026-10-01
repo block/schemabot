@@ -29,6 +29,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -729,6 +730,177 @@ func TestE2EApplyConfirmRefusesWhenOnlyTheReviewedTargetsStatementsChange(t *tes
 	require.NoError(t, err)
 	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
 	_, err = eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
+	require.NoError(t, err)
+
+	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
+	body := awaitCommentContaining(t, confirm, "nothing was applied")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the reviewed target would run statements the confirmed plan did not show")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+}
+
+// rolloutServiceOver builds a service over svc's storage whose environment
+// routes dbName to the named deployments alone, as a server whose rollout
+// topology changed after a confirmation was given would. The deployments'
+// databases, the stored plans and the lock are left as svc's commands left them.
+func rolloutServiceOver(t *testing.T, svc *api.Service, dbName string, names ...string) *api.Service {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	deployments := make(map[string]api.DeploymentTarget, len(names))
+	ternClients := make(map[string]tern.Client, len(names))
+	for _, name := range names {
+		client, err := tern.NewLocalClient(tern.LocalConfig{
+			Database:  dbName,
+			Type:      "mysql",
+			TargetDSN: driftDSN(t, dbName+"_"+name),
+		}, svc.Storage(), logger)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = client.Close() })
+		deployments[name] = api.DeploymentTarget{Targets: []api.TargetEntry{{Target: dbName + "-" + name + "-target"}}}
+		ternClients[name+"/"+driftEnv] = client
+	}
+	serverConfig := &api.ServerConfig{
+		Databases: map[string]api.DatabaseConfig{
+			dbName: {
+				Type: "mysql",
+				Environments: map[string]api.EnvironmentConfig{
+					driftEnv: {Deployments: deployments, DeploymentOrder: names},
+				},
+			},
+		},
+		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
+	}
+	shrunk := api.New(svc.Storage(), serverConfig, ternClients, logger)
+	t.Cleanup(func() { _ = shrunk.Close() })
+	return shrunk
+}
+
+// awaitRolloutApply waits for the confirmation to create an apply for dbName,
+// failing the test if the confirm posts a refusal instead.
+func awaitRolloutApply(t *testing.T, svc *api.Service, dbName string, confirm *planFlowResult) *storage.Apply {
+	t.Helper()
+	var created *storage.Apply
+	require.Eventually(t, func() bool {
+		applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
+		if err != nil {
+			return false
+		}
+		for _, a := range applies {
+			if a.Database == dbName {
+				created = a
+				return true
+			}
+		}
+		select {
+		case posted := <-confirm.comments:
+			require.NotContains(t, posted, "nothing was applied", "the confirmation must create the apply")
+		default:
+		}
+		return false
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "the confirmation creates an apply")
+	return created
+}
+
+// The operator confirmed a round where eu (the reviewed target) and us both
+// needed the email column. Before the confirm, us is removed from the rollout,
+// so eu is the environment's only target, and eu gains a narrower email column
+// out of band, so its re-plan is now a `MODIFY COLUMN` the confirmed comment
+// never showed. The confirmation was given on a rollout's comment, so
+// apply-confirm still holds eu to it: it refuses, runs nothing, and releases
+// the pending confirmation.
+func TestE2EApplyConfirmRechecksTheReviewedTargetAfterTheRolloutShrinks(t *testing.T) {
+	dbName := "webhook_rollout_shrunk_changed"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "Confirmation required")
+	assert.Contains(t, body, "Each target runs its own plan")
+
+	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
+	_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
+	require.NoError(t, err)
+	shrunk := rolloutServiceOver(t, svc, dbName, "eu")
+
+	confirm := runRolloutCommand(t, shrunk, dbName, "schemabot apply-confirm -e "+driftEnv)
+	body = awaitCommentContaining(t, confirm, "nothing was applied")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the reviewed target would run statements the confirmed plan did not show")
+
+	requireNoApplies(t, shrunk, dbName)
+	requireNoApplyLock(t, shrunk, dbName)
+}
+
+// The same rollout shrinks to eu before the confirm, but eu's plan is still the
+// `ADD COLUMN` the confirmed comment showed, so the confirmation covers it and
+// apply-confirm runs it on eu.
+func TestE2EApplyConfirmRunsTheConfirmedPlanAfterTheRolloutShrinks(t *testing.T) {
+	dbName := "webhook_rollout_shrunk_unchanged"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	awaitCommentContaining(t, apply, "Confirmation required")
+	shrunk := rolloutServiceOver(t, svc, dbName, "eu")
+
+	confirm := runRolloutCommand(t, shrunk, dbName, "schemabot apply-confirm -e "+driftEnv)
+	created := awaitRolloutApply(t, shrunk, dbName, confirm)
+
+	tasks, err := shrunk.Storage().Tasks().GetByApplyID(t.Context(), created.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 1, "only eu is left in the rollout")
+	assert.Equal(t, "users", tasks[0].TableName)
+	assert.Contains(t, tasks[0].DDL, "ADD COLUMN `email`")
+}
+
+// The operator confirmed a round where eu (the reviewed target) and us both
+// needed the email column, and the confirmed plan also ended eu's namespace
+// with a finalizer. Before the confirm, us gains the column out of band, so no
+// other target has work left. eu's re-plan carries the same `ADD COLUMN` but no
+// finalizer, so it is not the work the confirmed comment showed: apply-confirm
+// compares every part of the plan, not only its table statements, and refuses.
+func TestE2EApplyConfirmComparesTheReviewedTargetsWholePlan(t *testing.T) {
+	dbName := "webhook_rollout_reviewed_finalizer"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	awaitCommentContaining(t, apply, "Confirmation required")
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the paused apply pins its plan")
+	confirmed, err := svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
+	require.NoError(t, err)
+	require.NotNil(t, confirmed)
+	require.NotEmpty(t, confirmed.Namespaces)
+	confirmed.ID = 0
+	confirmed.PlanIdentifier = "plan-with-finalizer-" + dbName
+	for _, namespace := range confirmed.Namespaces {
+		namespace.Finalize = true
+	}
+	_, err = svc.Storage().Plans().Create(t.Context(), confirmed)
+	require.NoError(t, err)
+	lock.PendingPlanID = confirmed.PlanIdentifier
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), lock))
+
+	us := openDriftDB(t, driftDSN(t, dbName+"_us"))
+	_, err = us.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL DEFAULT NULL")
 	require.NoError(t, err)
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)

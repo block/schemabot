@@ -95,6 +95,22 @@ func TestSameMemberWork(t *testing.T) {
 	finalized := plan(nil)
 	finalized.Namespaces["payments"].Finalize = true
 	assert.False(t, sameMemberWork(plan(nil), finalized), "a finalizer")
+
+	vschema := func(document, diff string) *storage.Plan {
+		p := plan(nil)
+		p.Namespaces["payments"].Artifacts = map[string]string{storage.VSchemaArtifactName: document}
+		p.Namespaces["payments"].Metadata = map[string]string{
+			storage.PlanMetadataVSchemaChanged: "true",
+			storage.PlanMetadataVSchemaDiff:    diff,
+		}
+		return p
+	}
+	const hashed = `{"vindexes":{"hash":{"type":"hash"}}}`
+	assert.True(t, sameMemberWork(vschema(hashed, "+ vindex hash"), vschema(hashed, "+ vindex hash")))
+	assert.False(t, sameMemberWork(vschema(hashed, "+ vindex hash"), vschema(`{"vindexes":{"xxhash":{"type":"xxhash"}}}`, "+ vindex hash")),
+		"a different VSchema document in a namespace that changes its VSchema either way")
+	assert.False(t, sameMemberWork(vschema(hashed, "+ vindex hash"), vschema(hashed, "- vindex lookup\n+ vindex hash")),
+		"the same document with a different recorded effect")
 }
 
 // A rollout member whose apply would discard an unfinished copy is named on the

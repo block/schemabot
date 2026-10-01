@@ -971,11 +971,16 @@ its lookup failed, is refused the same way. The plan comment offers no apply
 for a rollout it knows would be refused, and says why in its place.
 
 Apply-confirm asks all of this again against the rollout as it is at confirm,
-and also refuses when a target's statements differ from the ones the confirmed
-comment showed, the reviewed target's included, or when a reviewed target
-confirmed as already converged has since gained changes of its own. The refusal
-names the target whose plan changed. An automatic apply never runs other
-targets' work.
+and also refuses when a target's work differs from what the confirmed comment
+showed, the reviewed target's included, or when a reviewed target confirmed as
+already converged has since gained changes of its own. A target's work is its
+whole plan: its table statements and how each runs, each shard's own changes,
+which namespaces end with a finalizer, and the VSchema each of those writes.
+The reviewed target is held to the confirmed plan while the environment has
+several targets, and also when the confirmed round stored plans for other
+targets, even if the rollout has since shrunk to the reviewed target alone.
+The refusal names the target whose plan changed. An automatic apply never runs
+other targets' work.
 
 ### Apply confirmed
 
