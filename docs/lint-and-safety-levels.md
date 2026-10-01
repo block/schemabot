@@ -72,12 +72,19 @@ human decision. `--dry-run` previews the fixes without writing anything. Run it
 locally when a plan comes back with lint warnings you agree with — it edits
 your declarative files, so the fixes land in the same PR as the change.
 
-It reads the same layout `plan` does: `.sql` files directly in the schema
+It reads the same files `plan` does: `.sql` files directly in the schema
 directory, or one level of namespace subdirectories (`<schema-dir>/<namespace>/*.sql`),
-and writes each fix back to the file it came from. Like `plan`, it rejects a
-directory that mixes the two layouts without changing any file. It exits non-zero when
-the directory holds no `.sql` files, since that almost always means a wrong
-path, and when any finding needs a manual fix.
+and writes each fix back to the file it came from. Namespaces listed in
+`schemabot.yaml` `ignore_namespaces` are left alone, as is the empty-namespace
+marker `onboard` writes. Like `plan`, it rejects a directory that mixes the two
+layouts without changing any file. It exits non-zero when the directory holds
+no `.sql` files, since that almost always means a wrong path, and when any
+finding needs a manual fix.
+
+The fixer parses and rewrites with the MySQL grammar, so `fix-lint` is for
+MySQL-family databases (`mysql`, `vitess`, `strata`). A schema directory whose
+`schemabot.yaml` declares another type, such as `postgres`, is refused before
+any file is read; a directory with no `schemabot.yaml` is taken to be MySQL.
 
 ## Auditing a live schema (`pull --lint`)
 

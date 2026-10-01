@@ -3,6 +3,7 @@ package commands
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -100,25 +101,59 @@ func (cmd *FixLintCmd) Run(g *Globals) error {
 	return nil
 }
 
-// readSchemaFiles reads the .sql files under dir, keyed by their
-// slash-separated path relative to dir ("users.sql" for a flat layout,
-// "orders/users.sql" for a namespaced one). Other schema files such as
-// vschema.json are not SQL and have nothing for the fixer to rewrite. A layout
-// plan rejects, such as flat files beside namespace subdirectories, is
-// rejected here with the same error, so fix-lint never rewrites files plan
-// would refuse to read.
+// readSchemaFiles reads the .sql files under dir that plan would read, keyed
+// by their slash-separated path relative to dir ("users.sql" for a flat
+// layout, "orders/users.sql" for a namespaced one).
+//
+// The fixer parses and restores with the MySQL grammar, so a schema directory
+// whose schemabot.yaml declares a database type outside the MySQL family is
+// refused before any file is read: simple PostgreSQL DDL parses under that
+// grammar and would be written back as backtick-quoted MySQL with a success
+// message. A directory without a schemabot.yaml is taken to be MySQL, as
+// LoadCLIConfig would.
+//
+// Which files to fix is decided by GroupFilesByNamespace, the same grouping
+// plan uses, so fix-lint sees exactly the .sql files plan sees: namespaces in
+// ignore_namespaces are left alone, the empty-namespace marker onboard writes
+// is skipped, and files such as vschema.json that are not SQL are not
+// rewritten. The layout checks that need no environment — flat files beside
+// namespace subdirectories — refuse here with plan's error. Checks that need
+// one, such as two directories resolving to the same namespace under
+// `plan -e`, are not run here because fix-lint has no environment.
 func readSchemaFiles(dir string) (map[string]string, error) {
+	var ignoreNamespaces []string
+	if _, err := os.Stat(filepath.Join(dir, "schemabot.yaml")); err == nil {
+		cfg, err := LoadCLIConfig(dir)
+		if err != nil {
+			return nil, err
+		}
+		if schema.DialectForDatabaseType(cfg.Type) != schema.DialectMySQL {
+			return nil, fmt.Errorf("fix-lint supports MySQL-family schema directories only; %s declares type %q", dir, cfg.Type)
+		}
+		ignoreNamespaces = cfg.IgnoreNamespaces
+	}
+
 	all, err := client.ReadSchemaFilesByPath(dir)
 	if err != nil {
 		return nil, err
 	}
-	if _, _, err := schema.GroupFilesByNamespace(all, filepath.Base(dir), "", nil); err != nil {
+	defaultNamespace := filepath.Base(dir)
+	grouped, _, err := schema.GroupFilesByNamespace(all, defaultNamespace, "", ignoreNamespaces)
+	if err != nil {
 		return nil, err
 	}
 
 	files := make(map[string]string, len(all))
 	for relPath, content := range all {
 		if !strings.HasSuffix(relPath, ".sql") {
+			continue
+		}
+		namespace, _ := schema.NamespaceForRelativePath(relPath, defaultNamespace, "")
+		ns, ok := grouped[namespace]
+		if !ok {
+			continue
+		}
+		if _, ok := ns.Files[path.Base(relPath)]; !ok {
 			continue
 		}
 		files[relPath] = content

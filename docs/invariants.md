@@ -1545,7 +1545,10 @@ Reading one dialect's DDL under another's grammar is the same class of failure a
 at all, because a statement that misparses can also misclassify, and classification is what
 destructive gating reads. A classifier refuses ambiguity, so a compound statement never classifies
 as its first verb and rides past that gate. *Enforced:* dialect resolution at the parser seam
-(`pkg/ddl/parser.go`); the Spirit `statement` and libpg_query boundaries.
+(`pkg/ddl/parser.go`); the Spirit `statement` and libpg_query boundaries; the `fix-lint`
+database-type gate (`pkg/cmd/commands/fixlint.go`), which refuses a schema directory whose
+`schemabot.yaml` declares a type outside the MySQL family because the fixer has only the MySQL
+grammar.
 
 ### RV-7: Rollback needs the originals
 

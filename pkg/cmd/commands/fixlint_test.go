@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // fixableTable has an INT AUTO_INCREMENT primary key, which fix-lint rewrites
@@ -118,4 +119,89 @@ func TestFixLint_NoSQLFilesFails(t *testing.T) {
 	err := (&FixLintCmd{SchemaDir: dir}).Run(&Globals{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no .sql files found in "+dir)
+}
+
+// The fixer parses and restores with the MySQL grammar, under which simple
+// PostgreSQL DDL parses and would be written back as backtick-quoted MySQL. A
+// schema directory whose schemabot.yaml declares a non-MySQL type is refused
+// before any file is read, while every MySQL-family type is still fixed.
+func TestFixLint_DatabaseTypeGate(t *testing.T) {
+	const pg = "CREATE TABLE users (\n    id bigint PRIMARY KEY,\n    email text\n);\n"
+
+	t.Run("postgres directory is refused untouched", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "app")
+		usersPath := filepath.Join(dir, "public", "users.sql")
+		writeSchemaFile(t, filepath.Join(dir, "schemabot.yaml"), "database: app\ntype: postgres\n")
+		writeSchemaFile(t, usersPath, pg)
+
+		err := (&FixLintCmd{SchemaDir: dir}).Run(&Globals{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "MySQL-family schema directories only")
+		assert.Contains(t, err.Error(), `type "postgres"`)
+		assert.Equal(t, pg, readFile(t, usersPath))
+	})
+
+	for _, typ := range []string{"mysql", "vitess", "strata"} {
+		t.Run(typ+" directory is fixed", func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "app")
+			usersPath := filepath.Join(dir, "orders", "users.sql")
+			writeSchemaFile(t, filepath.Join(dir, "schemabot.yaml"), "database: app\ntype: "+typ+"\n")
+			writeSchemaFile(t, usersPath, fixableTable)
+
+			require.NoError(t, (&FixLintCmd{SchemaDir: dir}).Run(&Globals{}))
+
+			assert.Contains(t, strings.ToLower(readFile(t, usersPath)), "bigint")
+		})
+	}
+
+	t.Run("broken schemabot.yaml is refused untouched", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "app")
+		usersPath := filepath.Join(dir, "orders", "users.sql")
+		writeSchemaFile(t, filepath.Join(dir, "schemabot.yaml"), "type: mysql\n")
+		writeSchemaFile(t, usersPath, fixableTable)
+
+		err := (&FixLintCmd{SchemaDir: dir}).Run(&Globals{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "database is required")
+		assert.Equal(t, fixableTable, readFile(t, usersPath))
+	})
+}
+
+// onboard writes an empty-namespace marker for a namespace with no tables;
+// plan treats it as metadata, so fix-lint skips it and fixes the rest.
+func TestFixLint_EmptyNamespaceMarkerSkipped(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "app")
+	markerPath := filepath.Join(dir, "empty_ns", "schema.sql")
+	writeSchemaFile(t, markerPath, schema.EmptyNamespaceDeclaration)
+	usersPath := filepath.Join(dir, "orders", "users.sql")
+	writeSchemaFile(t, usersPath, fixableTable)
+
+	files, err := readSchemaFiles(dir)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"orders/users.sql": fixableTable}, files)
+
+	require.NoError(t, (&FixLintCmd{SchemaDir: dir}).Run(&Globals{}))
+
+	assert.NotEqual(t, fixableTable, readFile(t, usersPath))
+	assert.Equal(t, schema.EmptyNamespaceDeclaration, readFile(t, markerPath))
+}
+
+// A namespace listed in ignore_namespaces is one plan never reads, so fix-lint
+// leaves its files alone too.
+func TestFixLint_IgnoredNamespaceLeftUntouched(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "app")
+	writeSchemaFile(t, filepath.Join(dir, "schemabot.yaml"), "database: app\ntype: mysql\nignore_namespaces:\n  - localtest\n")
+	ordersPath := filepath.Join(dir, "orders", "users.sql")
+	writeSchemaFile(t, ordersPath, fixableTable)
+	ignoredPath := filepath.Join(dir, "localtest", "users.sql")
+	writeSchemaFile(t, ignoredPath, fixableTable)
+
+	files, err := readSchemaFiles(dir)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"orders/users.sql": fixableTable}, files)
+
+	require.NoError(t, (&FixLintCmd{SchemaDir: dir}).Run(&Globals{}))
+
+	assert.NotEqual(t, fixableTable, readFile(t, ordersPath))
+	assert.Equal(t, fixableTable, readFile(t, ignoredPath))
 }
