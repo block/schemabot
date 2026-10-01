@@ -527,14 +527,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 
-	// Sizes of the tables the DDL above copies, rebuilds, or scans. Omitted on
-	// the locked comment that applies automatically: the operator already saw
-	// them on the plan they chose to apply. Kept on a locked comment paused for
-	// apply-confirm, whose re-plan can carry statements the reviewed plan did
-	// not, so the operator sees what they are confirming.
-	if !data.applyingWithoutConfirmation() {
-		writeTableSizesSection(&sb, summary)
-	}
+	// Sizes of the tables the DDL above copies, rebuilds, or scans.
+	writeTableSizesSection(&sb, summary)
 
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
@@ -1365,7 +1359,17 @@ func (e tableSizeEntry) hasAnyEstimate() bool {
 // it. A rollout without per-target sizes shows the reviewed plan's sizes, and
 // the heading names the reviewed target so they are not read as the whole
 // rollout's.
+//
+// A locked comment that applies automatically renders no section: the
+// operator already saw the sizes on the plan they chose to apply. A locked
+// comment paused for apply-confirm keeps it, because its re-plan can carry
+// statements the reviewed plan did not, and the operator should see the size
+// of what they are confirming. The rule lives here so every renderer that
+// shows a plan applies it the same way.
 func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
+	if data.applyingWithoutConfirmation() {
+		return
+	}
 	entries := tableSizeEntries(data.Changes)
 	var drift *DeploymentDriftData
 	switch {
