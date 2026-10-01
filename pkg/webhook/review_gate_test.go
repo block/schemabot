@@ -204,14 +204,15 @@ func TestCheckReviewGate_ApprovalCommit(t *testing.T) {
 	compareRange := approvedSHA + "..." + reviewGateTestHeadSHA
 
 	tests := []struct {
-		name           string
-		schemaLinkPath string
-		reviewCommit   string
-		compareStatus  string
-		compareFiles   []string
-		compareFails   bool
-		wantApproved   bool
-		wantCompare    bool
+		name             string
+		schemaLinkPath   string
+		reviewCommit     string
+		compareStatus    string
+		compareFiles     []string
+		compareFileCount int
+		compareFails     bool
+		wantApproved     bool
+		wantCompare      bool
 	}{
 		{
 			name:         "approval on the head counts without a comparison",
@@ -262,6 +263,13 @@ func TestCheckReviewGate_ApprovalCommit(t *testing.T) {
 			wantCompare:  true,
 		},
 		{
+			name:             "approval does not count when the comparison file list is truncated",
+			reviewCommit:     approvedSHA,
+			compareStatus:    "ahead",
+			compareFileCount: 300,
+			wantCompare:      true,
+		},
+		{
 			name:         "approval without a recorded commit does not count",
 			reviewCommit: "",
 		},
@@ -291,9 +299,13 @@ func TestCheckReviewGate_ApprovalCommit(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(map[string]any{"message": "No commit found for SHA: " + approvedSHA})
 					return
 				}
-				files := make([]*gh.CommitFile, 0, len(tt.compareFiles))
+				files := make([]*gh.CommitFile, 0, len(tt.compareFiles)+tt.compareFileCount)
 				for _, f := range tt.compareFiles {
 					files = append(files, &gh.CommitFile{Filename: new(f), Status: new("modified")})
+				}
+				for i := range tt.compareFileCount {
+					filename := fmt.Sprintf("app/file-%d.go", i)
+					files = append(files, &gh.CommitFile{Filename: &filename, Status: new("modified")})
 				}
 				_ = json.NewEncoder(w).Encode(&gh.CommitsComparison{Status: new(tt.compareStatus), Files: files})
 			})
