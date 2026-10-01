@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -10,6 +11,7 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // refuseDropsOfUnselectedTables refuses a plan that proposes dropping a table in
@@ -21,22 +23,24 @@ import (
 // back rather than trusting the data plane to have refused, so it holds on every
 // data plane build.
 //
-// A drop is judged by the namespace the plan attributes it to, not by its table
-// name, because the namespaces of a sharded family all declare the same tables:
-// a drop the plan places in a selected namespace passes even when an unselected
-// namespace declares a table of that name, and a drop it places in any other
-// namespace is refused whatever the table. A drop the plan attributes to no
-// namespace cannot be placed, so it fails closed on its name: it is refused when
-// an unselected namespace declares that table.
+// A drop the plan attributes to a namespace the member does not select is
+// refused whatever the table. A drop the plan attributes to a selected
+// namespace passes on that attribution alone only where the engine located the
+// dropped table in the namespace it names (engineLocatesDroppedTables), because
+// the namespaces of a sharded family all declare the same tables and a name
+// match would refuse their legitimate drops. Every other drop, one the plan
+// attributes to no namespace or one whose attribution the engine inferred, is
+// judged by its name as well and fails closed: it is refused when an
+// unselected namespace declares that table.
 //
 // It is a refusal, not an unsafe change awaiting an opt-in: --allow-unsafe
 // accepts drops the schema files ask for, and these are drops they do not.
 //
 // declared is the request's full declared namespace set, before it was narrowed
 // to the member's selection. The unselected namespaces' files are parsed only
-// when the plan proposes a drop it does not attribute, so any other plan costs
-// nothing, and a file that cannot be parsed fails the plan rather than letting a
-// drop through unchecked.
+// when the plan proposes a drop judged by name, so any other plan costs nothing,
+// and a file that cannot be parsed fails the plan rather than letting a drop
+// through unchecked.
 func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[string]*ternv1.SchemaFiles, unselected []string, member routing.ExecutionTarget, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan) error {
 	if len(unselected) == 0 {
 		return nil
@@ -45,14 +49,11 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 	if len(drops) == 0 {
 		return nil
 	}
+	locatesDrops := engineLocatesDroppedTables(member.DatabaseType)
 	refused := map[string]bool{}
 	namespaces := map[string]bool{}
-	var unattributed []string
+	var judgedByName []string
 	for _, drop := range drops {
-		if len(drop.namespaces) == 0 {
-			unattributed = append(unattributed, drop.table)
-			continue
-		}
 		for _, namespace := range drop.namespaces {
 			if slices.Contains(member.Namespaces, namespace) {
 				continue
@@ -60,14 +61,20 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 			refused[drop.table] = true
 			namespaces[namespace] = true
 		}
+		// Only a located attribution clears a drop: one the plan attributes to
+		// no namespace, or whose namespace the engine inferred, is also judged
+		// by name.
+		attributionClears := locatesDrops && len(drop.namespaces) > 0
+		if !attributionClears {
+			judgedByName = append(judgedByName, drop.table)
+		}
 	}
-	if len(unattributed) > 0 {
+	if len(judgedByName) > 0 {
 		declaredBy, err := tablesDeclaredBy(declared, unselected, member.DatabaseType)
 		if err != nil {
-			return fmt.Errorf("check planned drops of database %q environment %q target %q against its unselected namespaces: %w",
-				req.Database, req.Environment, member.Target, err)
+			return &UnselectedTableDropCheckError{Database: req.Database, Environment: req.Environment, Target: member.Target, Err: err}
 		}
-		for _, table := range unattributed {
+		for _, table := range judgedByName {
 			namespace, ok := declaredBy[table]
 			if !ok {
 				continue
@@ -98,6 +105,24 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 	}
 }
 
+// engineLocatesDroppedTables reports whether an engine's plan attributes a
+// dropped table to the namespace it found that table in, so the attribution can
+// clear the drop on its own. A Vitess plan is diffed per keyspace and a
+// PostgreSQL plan per schema, so each names where the table lives. The MySQL
+// engine diffs a database-scoped target as one unit and attributes a dropped
+// table, which no file it was sent defines, to the only namespace it was sent:
+// a data plane that discarded the unselected namespaces attributes their live
+// tables to the selected one. Its attribution, and that of an engine not listed
+// here, is inferred, so those drops are judged by name as well.
+func engineLocatesDroppedTables(databaseType string) bool {
+	switch databaseType {
+	case storage.DatabaseTypeVitess, storage.DatabaseTypePostgres:
+		return true
+	default:
+		return false
+	}
+}
+
 // UnselectedTableDropError reports a plan that proposes dropping tables in
 // namespaces the member's targets entry does not select.
 type UnselectedTableDropError struct {
@@ -115,6 +140,39 @@ func (e *UnselectedTableDropError) Error() string {
 	return fmt.Sprintf(
 		"the plan from deployment %q target %q proposes dropping %s in namespaces [%s], which this target's entry does not select. The schema files do not ask for these drops, so the plan is refused, --allow-unsafe included. Upgrade that deployment to a build that supports selecting namespaces per target",
 		e.Deployment, e.Target, quotedTableList(e.Tables), strings.Join(e.Namespaces, ", "))
+}
+
+// UnselectedTableDropCheckError reports a plan whose drops could not be checked
+// against the namespaces the member's targets entry does not select, because an
+// unselected namespace's schema file could not be parsed. It is a check failure
+// rather than a verdict on the drops, and it fails the plan closed.
+type UnselectedTableDropCheckError struct {
+	Database    string
+	Environment string
+	Target      string
+	Err         error
+}
+
+func (e *UnselectedTableDropCheckError) Error() string {
+	return fmt.Sprintf("check planned drops of database %q environment %q target %q against its unselected namespaces: %v",
+		e.Database, e.Environment, e.Target, e.Err)
+}
+
+func (e *UnselectedTableDropCheckError) Unwrap() error { return e.Err }
+
+// UnselectedTableDropRefused reports whether a plan was refused because it
+// proposed dropping tables in namespaces the member's targets entry does not
+// select, or because those drops could not be checked. Like a namespace
+// placement refusal, every plan of the environment reproduces it until the
+// configuration, the schema files or the planning deployment changes, and the
+// refused environment has no plan to fold, so a caller that gates a merge on
+// the plan must fail that environment's check closed on it.
+func UnselectedTableDropRefused(err error) bool {
+	if _, ok := errors.AsType[*UnselectedTableDropError](err); ok {
+		return true
+	}
+	_, ok := errors.AsType[*UnselectedTableDropCheckError](err)
+	return ok
 }
 
 // plannedTableDrop is one table a plan proposes dropping, with every namespace

@@ -665,7 +665,8 @@ aggregate published from that round when the stored check state cannot be writte
 the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`); an environment whose
 namespace placement refuses its plan stored as a failing check on every plan command
 (`storeNamespacePlacementCheck` in `pkg/webhook/check_records.go`, called by the single- and
-multi-environment plans in `pkg/webhook/plan.go`).
+multi-environment plans in `pkg/webhook/plan.go` on each refusal `planRefusedByNamespacePlacement`
+names).
 
 ## Apply state machine (ST)
 

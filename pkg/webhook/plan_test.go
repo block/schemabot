@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -1421,4 +1422,21 @@ func TestBuildPlanCommentData_TableSizesReadEveryShard(t *testing.T) {
 	assert.Equal(t, 2, size.ShardCount)
 	require.NotNil(t, size.EstimatedBytes)
 	assert.Equal(t, bytes, *size.EstimatedBytes)
+}
+
+// Every refusal the environment's namespace placement owns stores a failing
+// check for the environment, so a later fold cannot read an older passing row
+// in its place: a namespace no targets entry selects, a plan proposing drops in
+// a namespace the target's entry does not select, and drops that could not be
+// checked. Any other plan failure is not stored as a placement block.
+func TestPlanRefusedByNamespacePlacement(t *testing.T) {
+	coverage := &api.NamespaceCoverageError{Database: "orders", Environment: "production", Uncovered: []string{"ns_1"}}
+	drop := &api.UnselectedTableDropError{Deployment: "eu", Target: "orders-001", Tables: []string{"payments"}, Namespaces: []string{"ns_1"}}
+	check := &api.UnselectedTableDropCheckError{Database: "orders", Environment: "production", Target: "orders-001", Err: errors.New("split schema file ns_1/payments.sql: syntax error")}
+
+	assert.True(t, planRefusedByNamespacePlacement(coverage), "a namespace no targets entry selects")
+	assert.True(t, planRefusedByNamespacePlacement(fmt.Errorf("plan: %w", drop)), "a drop in an unselected namespace, wrapped")
+	assert.True(t, planRefusedByNamespacePlacement(check), "drops that could not be checked")
+	assert.False(t, planRefusedByNamespacePlacement(errors.New("tern unavailable")), "an unrelated plan failure")
+	assert.False(t, planRefusedByNamespacePlacement(nil), "a plan that succeeded")
 }

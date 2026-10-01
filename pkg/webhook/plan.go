@@ -131,7 +131,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Execute plan via the service
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
-	if api.NamespacePlacementRefused(err) {
+	if planRefusedByNamespacePlacement(err) {
 		h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
 			"repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "head_sha", schemaResult.HeadSHA, "error", err)
 		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
@@ -198,6 +198,22 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		"message": "plan generated successfully",
 		"plan_id": planResp.PlanID,
 	})
+}
+
+// planRefusedByNamespacePlacement reports whether an environment's plan was
+// refused for a reason its namespace placement owns: the targets entries and
+// the schema files disagree on where a namespace lives, or the plan proposed
+// dropping tables in a namespace the target's entry does not select (or those
+// drops could not be checked). Each reproduces on every plan until the server
+// config, the schema files or the planning deployment changes, not when the PR
+// head moves, and leaves the environment with no plan to fold. So its stored
+// check must fail closed rather than keep an older passing row a later fold
+// would read (MG-12).
+func planRefusedByNamespacePlacement(err error) bool {
+	if api.NamespacePlacementRefused(err) {
+		return true
+	}
+	return api.UnselectedTableDropRefused(err)
 }
 
 // failClosedOnNamespacePlacement fails one environment's check closed after
@@ -483,7 +499,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
-		if api.NamespacePlacementRefused(err) {
+		if planRefusedByNamespacePlacement(err) {
 			h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
 				"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)

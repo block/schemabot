@@ -19,6 +19,7 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -218,4 +219,41 @@ func TestE2ESingleEnvPlanNamespacePlacementFailsStoredCheck(t *testing.T) {
 	aggregate = p.lastAggregate()
 	require.NotNil(t, aggregate, "the aggregate check run is published")
 	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "staging's plan must not pass the aggregate over production's refusal")
+}
+
+// A pull request's production check passed on an earlier plan. Production's
+// primary selects ns_0 and another target holds ns_1, and the primary's data
+// plane discards the unselected namespaces, so it plans ns_1's live orders
+// table as a drop, attributed to ns_0, the one namespace it was sent. The
+// refusal of that drop replaces production's stored row like any placement
+// refusal, so a later plan of staging cannot fold the old success row into a
+// passing aggregate.
+func TestE2ESingleEnvPlanUnselectedNamespaceDropFailsStoredCheck(t *testing.T) {
+	p := newNamespacePlacementHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	})
+	p.production.planChanges = []*ternv1.SchemaChange{{Namespace: "ns_0", TableChanges: []*ternv1.TableChange{{
+		TableName: "orders", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP, Ddl: "DROP TABLE `orders`", IsUnsafe: true,
+	}}}}
+	for _, env := range []string{"staging", "production"} {
+		require.NoError(t, p.store.Checks().Upsert(t.Context(), &storage.Check{
+			Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "abc123",
+			Environment: env, DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: p.dbName,
+			CheckRunID: 1, Status: checkStatusCompleted, Conclusion: checkConclusionSuccess,
+		}))
+	}
+
+	assert.Contains(t, p.comment(t, "schemabot plan -e production"), `proposes dropping "orders" in namespaces [ns_1], which this target's entry does not select`)
+
+	byEnv := p.checksByEnv(t)
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionFailure, byEnv["production"].Conclusion, "the old success row is replaced by the refusal")
+	assert.Equal(t, storage.NamespacePlacementRefusedBlockingReason, byEnv["production"].BlockingReason)
+	assert.Equal(t, namespacePlacementCheckSummary, byEnv["production"].ChangeSummary)
+
+	assert.NotEmpty(t, p.comment(t, "schemabot plan -e staging"))
+	aggregate := p.lastAggregate()
+	require.NotNil(t, aggregate, "the aggregate check run is published")
+	assert.Equal(t, checkConclusionFailure, aggregate.Conclusion, "staging's plan must not pass the aggregate over production's refused drop")
 }

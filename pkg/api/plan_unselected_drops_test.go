@@ -44,14 +44,14 @@ func dropsPlan(namespace string, tables ...string) []*ternv1.SchemaChange {
 
 // The primary selects ns_0, and the other target holds ns_1 and ns_2. A data
 // plane that discards the unselected namespaces diffs the whole target and
-// proposes drops in ns_1. The schema files never asked for them, so the plan is
-// refused before it is stored, whatever the data plane build and whatever the
-// table, rather than reviewed as an unsafe drop an operator could accept with
-// --allow-unsafe. A drop the plan places in ns_0 is an ordinary drop and plans,
-// even when ns_1 declares a table of the same name, since the namespaces of a
-// sharded family all declare the same tables. A drop the plan places in no
-// namespace fails closed on its name: it is refused when an unselected namespace
-// declares that table.
+// proposes drops of ns_1's live tables. The schema files never asked for them,
+// so the plan is refused before it is stored, whatever the data plane build,
+// rather than reviewed as an unsafe drop an operator could accept with
+// --allow-unsafe. A drop the plan places in ns_1 is refused whatever the table.
+// The MySQL engine attributes such a drop to the one namespace it was sent,
+// ns_0, so on MySQL a drop placed in ns_0 is refused when an unselected
+// namespace declares that table, and plans when none does. A drop the plan
+// places in no namespace fails closed on its name the same way.
 func TestExecutePlan_RefusesDropOfTableAnUnselectedNamespaceDeclares(t *testing.T) {
 	plan := func(t *testing.T, changes []*ternv1.SchemaChange) (*capturingPlanStore, error) {
 		t.Helper()
@@ -69,11 +69,21 @@ func TestExecutePlan_RefusesDropOfTableAnUnselectedNamespaceDeclares(t *testing.
 		assert.Equal(t, []string{"ns_1"}, dropErr.Namespaces)
 		assert.Contains(t, err.Error(), `target "orders-001" proposes dropping "legacy" in namespaces [ns_1], which this target's entry does not select`)
 		assert.Contains(t, err.Error(), "--allow-unsafe included")
+		assert.True(t, UnselectedTableDropRefused(err), "the refusal is typed so a merge gate fails the environment's check closed on it")
 		assert.Nil(t, plans.created, "a refused plan is never stored")
 	})
 
-	t.Run("drop in the selected namespace of a table an unselected namespace declares", func(t *testing.T) {
-		plans, err := plan(t, dropsPlan("ns_0", "payments"))
+	t.Run("unselected namespace's live table attributed to the selected namespace", func(t *testing.T) {
+		plans, err := plan(t, dropsPlan("ns_0", "payments", "refunds"))
+		var dropErr *UnselectedTableDropError
+		require.ErrorAs(t, err, &dropErr, "the MySQL engine infers a drop's namespace, so the attribution cannot clear it")
+		assert.Equal(t, []string{"payments", "refunds"}, dropErr.Tables)
+		assert.Equal(t, []string{"ns_1", "ns_2"}, dropErr.Namespaces)
+		assert.Nil(t, plans.created, "a refused plan is never stored")
+	})
+
+	t.Run("drop in the selected namespace of a table no unselected namespace declares", func(t *testing.T) {
+		plans, err := plan(t, dropsPlan("ns_0", "legacy"))
 		require.NoError(t, err)
 		require.NotNil(t, plans.created)
 	})
@@ -118,13 +128,19 @@ func TestRollupReviewTimeDrift_MemberDropOfUnselectedNamespaceTableBlocks(t *tes
 }
 
 // A shard plan's drops are placed by the shard's namespace or the table
-// change's own, and any unselected attribution refuses the drop. A shard drop
-// with no attribution falls back to the name match, and a schema file the
-// dialect's parser rejects fails that fallback rather than letting a drop
-// through unchecked. Attributed drops never parse the files.
+// change's own, and any unselected attribution refuses the drop. An engine that
+// locates a dropped table, such as Vitess, clears a drop it places in a selected
+// namespace on that attribution alone, even when an unselected namespace
+// declares a table of that name, as the namespaces of a sharded family all do,
+// and never parses the files for it. The MySQL engine infers its attribution,
+// so its drops are judged by name as well, the same as a drop with no
+// attribution. A schema file the dialect's parser rejects fails that name match
+// rather than letting a drop through unchecked.
 func TestRefuseDropsOfUnselectedTables(t *testing.T) {
 	svc := namespaceSelectionService(t, &mockTernClient{}, &capturingPlanStore{})
 	member := routing.ExecutionTarget{DatabaseType: storage.DatabaseTypeMySQL, Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0"}}
+	locating := member
+	locating.DatabaseType = storage.DatabaseTypeVitess
 	req := placedNamespacesRequest()
 	unselected := []string{"ns_1", "ns_2"}
 	shardDrops := func(shardNamespace, tableNamespace, table string) []*ternv1.ShardPlan {
@@ -144,17 +160,32 @@ func TestRefuseDropsOfUnselectedTables(t *testing.T) {
 	assert.Equal(t, []string{"legacy"}, dropErr.Tables)
 	assert.Equal(t, []string{"ns_2"}, dropErr.Namespaces)
 
-	assert.NoError(t, svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, nil, shardDrops("ns_0", "", "refunds")),
-		"a shard drop placed in the selected namespace passes")
+	assert.NoError(t, svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, locating, nil, shardDrops("ns_0", "", "refunds")),
+		"a located shard drop placed in the selected namespace passes")
+	assert.NoError(t, svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, locating, dropsPlan("ns_0", "payments"), nil),
+		"a located drop placed in the selected namespace passes even when an unselected namespace declares that table")
+
+	err = svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, nil, shardDrops("ns_0", "", "refunds"))
+	require.ErrorAs(t, err, &dropErr, "an inferred attribution to the selected namespace does not clear a drop an unselected namespace declares")
+	assert.Equal(t, []string{"refunds"}, dropErr.Tables)
+	assert.Equal(t, []string{"ns_2"}, dropErr.Namespaces)
 
 	assert.NoError(t, svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, nil, member, dropsPlan("", "payments"), nil),
 		"a member selecting nothing has no unselected namespaces to protect")
 
 	req.SchemaFiles["ns_1"] = &ternv1.SchemaFiles{Files: map[string]string{"payments.sql": "CREATE TABLE `payments` ("}}
-	assert.NoError(t, svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, []string{"ns_1"}, member, dropsPlan("ns_0", "payments"), nil),
-		"an attributed drop is judged by its namespace without parsing the files")
+	assert.NoError(t, svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, []string{"ns_1"}, locating, dropsPlan("ns_0", "payments"), nil),
+		"a located drop is judged by its namespace without parsing the files")
+	err = svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, []string{"ns_1"}, member, dropsPlan("ns_0", "payments"), nil)
+	require.ErrorAs(t, err, new(*UnselectedTableDropCheckError), "an inferred attribution parses the files, and a file that cannot be parsed fails the check")
 	err = svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, []string{"ns_1"}, member, dropsPlan("", "payments"), nil)
 	require.Error(t, err)
 	assert.False(t, errors.As(err, &dropErr), "an unparseable file is a check failure, not a verdict on the drop")
+	var checkErr *UnselectedTableDropCheckError
+	require.ErrorAs(t, err, &checkErr)
+	assert.Equal(t, "orders-001", checkErr.Target)
+	assert.Contains(t, err.Error(), `check planned drops of database "orders" environment "production" target "orders-001" against its unselected namespaces`)
 	assert.Contains(t, err.Error(), "ns_1/payments.sql")
+	assert.True(t, UnselectedTableDropRefused(err), "a check failure fails the environment's check closed like a refused drop")
+	assert.False(t, NamespacePlacementRefused(err), "a check failure is not a placement defect the API answers 400 for")
 }

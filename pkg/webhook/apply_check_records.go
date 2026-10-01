@@ -109,7 +109,7 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 			"repo", repo, "pr", pr, "environment", environment,
 			"database_type", schema.Type, "database", schema.Database,
 			"apply_id", apply.ApplyIdentifier, "head_sha", check.HeadSHA)
-		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: namespace placement refused this environment's plan; fix the namespace placement in the server config or the schema files and re-run plan",
+		return fmt.Errorf("apply start refused for repo %s pr %d environment %s database_type %s database %s apply_id %s: namespace placement refused this environment's plan; fix the namespace placement in the server config or the schema files, or upgrade the deployment the plan comment names, and re-run plan",
 			repo, pr, environment, schema.Type, schema.Database, apply.ApplyIdentifier)
 	}
 
