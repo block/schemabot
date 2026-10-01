@@ -39,7 +39,7 @@ func TestWritePlanBody_TwelveTargetRolloutShowsTableSizes(t *testing.T) {
 	out := stripAnsi(captureStdout(func() { writePlanBody(sizedRolloutPlan(members, sizes), false) }))
 
 	assert.Contains(t, out, "\n📊 Table sizes:\n"+
-		"  • orders: ~1.4 TB across 12 targets · largest ~310 GB on orders-007 · smallest ~41 GB\n"+
+		"  • orders: ~1.4 TB across 12 targets · largest ~310 GB on orders-007 · smallest ~41.0 GB\n"+
 		"  • refunds: ~2.5 GB on orders-003\n"+
 		"\n📋 Plan: ")
 	ddlAt := strings.Index(out, "ADD COLUMN `region`")
@@ -78,7 +78,7 @@ func TestWritePlanBody_RolloutTableSizesNameMissingEstimates(t *testing.T) {
 	})
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
-	assert.Contains(t, out, "  • orders: ~351 GB across 2 of 3 targets · largest ~310 GB on orders-002 · smallest ~41 GB · size estimate unavailable on orders-003\n")
+	assert.Contains(t, out, "  • orders: ~351 GB across 2 of 3 targets · largest ~310 GB on orders-002 · smallest ~41.0 GB · size estimate unavailable on orders-003\n")
 
 	for _, s := range plan.Rollout.TableSizes {
 		s.EstimatedBytes = nil
@@ -99,7 +99,7 @@ func TestWritePlanBody_RolloutTableSizesQualifyAcrossNamespaces(t *testing.T) {
 	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
 	assert.Contains(t, out, "📊 Table sizes:\n"+
 		"  • ns_0.orders: ~2.5 GB on orders-001\n"+
-		"  • ns_1.orders: ~41 GB on orders-001\n")
+		"  • ns_1.orders: ~41.0 GB on orders-001\n")
 }
 
 // Up to five tables are listed in rollout order, as the PR comment lists them
@@ -117,16 +117,16 @@ func TestWritePlanBody_RolloutTableSizesListLargestFirstPastFive(t *testing.T) {
 	}
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(sizedRolloutPlan([]string{"orders-001"}, sizesFor(5)), false) }))
-	assert.Contains(t, out, "📊 Table sizes:\n  • t01: ~1 GB on orders-001\n", "five tables keep rollout order")
+	assert.Contains(t, out, "📊 Table sizes:\n  • t01: ~1.0 GB on orders-001\n", "five tables keep rollout order")
 
 	out = stripAnsi(captureStdout(func() { writePlanBody(sizedRolloutPlan([]string{"orders-001"}, sizesFor(6)), false) }))
-	assert.Contains(t, out, "📊 Table sizes:\n  • t06: ~6 GB on orders-001\n  • t05: ~5 GB on orders-001\n", "six tables list the largest first")
+	assert.Contains(t, out, "📊 Table sizes:\n  • t06: ~6.0 GB on orders-001\n  • t05: ~5.0 GB on orders-001\n", "six tables list the largest first")
 
 	out = stripAnsi(captureStdout(func() {
 		writePlanBody(sizedRolloutPlan([]string{"orders-001"}, sizesFor(presentation.TableSizesShown+2)), false)
 	}))
 	assert.Equal(t, presentation.TableSizesShown, strings.Count(out, "  • t"), "the section lists only the cap")
-	assert.Contains(t, out, "  • t03: ~3 GB on orders-001\n  …and 2 more tables\n\n📋 Plan: ")
+	assert.Contains(t, out, "  • t03: ~3.0 GB on orders-001\n  …and 2 more tables\n\n📋 Plan: ")
 	assert.NotContains(t, out, "  • t02:")
 }
 
@@ -142,6 +142,6 @@ func TestWritePlanBody_RolloutTableSizesCountTablesWithoutEstimatePastCap(t *tes
 	}
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(sizedRolloutPlan([]string{"orders-001"}, sizes), false) }))
-	assert.Contains(t, out, "  • t02: ~2 GB on orders-001\n  …and 2 more tables (1 without a size estimate)\n\n📋 Plan: ")
+	assert.Contains(t, out, "  • t02: ~2.0 GB on orders-001\n  …and 2 more tables (1 without a size estimate)\n\n📋 Plan: ")
 	assert.NotContains(t, out, "  • ledger:")
 }
