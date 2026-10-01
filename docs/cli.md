@@ -496,16 +496,15 @@ target by planning and applying the previous schema with the same `--target`.
 In an environment with a single target, `--target` names the whole rollout,
 so the plan and apply are not narrowed.
 
-A plan of the whole rollout is made against its first target, and the other
-targets run that plan. The plan also plans every target beside the first one
-and shows what applies where. When the first target is already at the desired
-schema, the server also diffs every other target against its own live schema.
-The plan reports no changes only when every target is converged, so a re-run
-of an `apply` that already landed, or the verification step of `onboard`,
-reads as up to date. When a target still needs the change, for example after an
-apply narrowed to the first target, or a target cannot be diffed, the plan
-fails with an error that lists those targets. Plan and apply each of them with
-`--target`.
+A plan of the whole rollout plans every target beside the first one and shows
+what applies where. It reports no changes only when every target is at the
+desired schema, so a re-run of an `apply` that already landed, or the
+verification step of `onboard`, reads as up to date. When the first target is
+already at the desired schema, for example after an apply narrowed to it,
+another target can still need the change, so the plan reports that target's
+work rather than reading as up to date from the first target alone. A target
+that cannot be planned is listed as needing attention: `apply` refuses until
+it is planned, and `onboard` fails its verification.
 
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
