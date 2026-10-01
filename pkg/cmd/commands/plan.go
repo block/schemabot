@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -18,7 +19,6 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
-	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
@@ -282,9 +282,9 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// single plan does, so its groups carry no line of their own.
 	anyWork := slices.ContainsFunc(work, func(w planWork) bool { return !w.empty() })
 	var rolloutWork []planWork
-	changingMembers := 0
 	for _, i := range order {
-		templates.WriteRolloutGroupHeading(noun, rollout.Groups[i].Members, rollout.Members)
+		opensOnHeader := !work[i].empty() && opensOnNamespaceHeader(plans[i], work[i])
+		templates.WriteRolloutGroupHeading(noun, rollout.Groups[i].Members, rollout.Members, opensOnHeader)
 		if work[i].empty() {
 			if anyWork {
 				templates.WriteRolloutGroupNoChanges()
@@ -293,18 +293,52 @@ func writeRolloutPlanBody(result *apitypes.PlanResponse, isApply bool) {
 		}
 		writeChangeDetail(plans[i], work[i], isApply)
 		rolloutWork = append(rolloutWork, work[i])
-		changingMembers += len(rollout.Groups[i].Members)
 	}
 	if lint := result.LintNonErrors(); len(lint) > 0 {
 		templates.WriteLintViolations(lint)
 	}
+	// The summary counts what the rollout runs the way the PR comment does,
+	// each table once however many groups change it. The group headings
+	// already say which members run what.
 	if len(rolloutWork) == 0 {
 		templates.WriteNoChanges()
 	} else {
 		total := combinePlanWork(rolloutWork)
-		templates.WriteRolloutPlanSummary(total.allChanges, total.vschemaChanges, total.finalizes(), presentation.CoveragePhrase(noun, changingMembers, rollout.Members))
+		templates.WritePlanSummaryWithKeyspaceUpdates(total.allChanges, total.vschemaChanges, total.finalizes())
 	}
 	templates.WriteExemptTables(result.ExemptTables)
+}
+
+// rendersNamespaceChanges reports whether the plan has DDL, a VSchema change,
+// or a finalize to write under its namespaces.
+func (w planWork) rendersNamespaceChanges() bool {
+	return len(w.allChanges) > 0 || len(w.vschemaChanges) > 0 || len(w.finalizeOnly) > 0
+}
+
+// namespaces returns every namespace the plan writes changes under: its DDL,
+// its VSchema changes, and its finalizes, sorted.
+func (w planWork) namespaces() []string {
+	set := make(map[string]bool)
+	for ns := range w.namespaceMap {
+		set[ns] = true
+	}
+	for _, vc := range w.vschemaChanges {
+		set[vc.Keyspace] = true
+	}
+	for ns := range w.finalizeOnly {
+		set[ns] = true
+	}
+	return slices.Sorted(maps.Keys(set))
+}
+
+// opensOnNamespaceHeader reports whether writeChangeDetail opens the plan on a
+// namespace header, which writes its own blank line above itself.
+func opensOnNamespaceHeader(result *apitypes.PlanResponse, w planWork) bool {
+	if !w.rendersNamespaceChanges() {
+		return false
+	}
+	isMySQL := !state.IsPlanetScaleEngine(result.Engine)
+	return !templates.OmitsNamespaceHeader(w.namespaces(), isMySQL, result.Database)
 }
 
 // compareWorkFirst orders a plan with work ahead of one without.
@@ -480,21 +514,9 @@ func writeChangeDetail(result *apitypes.PlanResponse, w planWork, isApply bool) 
 
 	// Render DDL + VSchema changes grouped by namespace/keyspace
 	isVitess := state.IsPlanetScaleEngine(result.Engine)
-	if len(w.allChanges) > 0 || len(w.vschemaChanges) > 0 || len(w.finalizeOnly) > 0 {
-		// Collect all namespaces (from DDL, VSchema, and finalizes)
-		allNamespaces := make(map[string]bool)
-		for ns := range w.namespaceMap {
-			allNamespaces[ns] = true
-		}
-		for _, vc := range w.vschemaChanges {
-			allNamespaces[vc.Keyspace] = true
-		}
-		for ns := range w.finalizeOnly {
-			allNamespaces[ns] = true
-		}
-
+	if w.rendersNamespaceChanges() {
 		var nsChanges []templates.NamespaceChange
-		for ns := range allNamespaces {
+		for _, ns := range w.namespaces() {
 			nc := templates.NamespaceChange{
 				Namespace: ns,
 				Changes:   w.namespaceMap[ns],

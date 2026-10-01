@@ -99,7 +99,7 @@ func TestWritePlanBody_SixtyFourTargetRolloutFoldsItsMembers(t *testing.T) {
 // A 64-target rollout in which 61 targets still need a column and 3 already
 // have it reads like one plan: each group shows only its heading and its DDL,
 // the settled group says so in one line, and a single summary at the bottom
-// counts what the rollout runs and on how many of its targets. No group closes
+// counts what the rollout runs, worded as the PR comment words it. No group closes
 // on a summary or a "✓ No schema changes detected." of its own, which would
 // read as the end of the plan part-way through it.
 func TestWritePlanBody_DivergingRolloutEndsOnOneSummary(t *testing.T) {
@@ -137,7 +137,7 @@ func TestWritePlanBody_DivergingRolloutEndsOnOneSummary(t *testing.T) {
 		"",
 		"  No schema changes detected",
 		"",
-		"📋 Plan: 1 table to alter on 61 of 64 targets",
+		"📋 Plan: 1 table to alter",
 		"",
 		"",
 	}, "\n")
@@ -146,9 +146,9 @@ func TestWritePlanBody_DivergingRolloutEndsOnOneSummary(t *testing.T) {
 	assert.NotContains(t, out, "✓ No schema changes detected.", "a settled group beside groups with work does not close the plan")
 }
 
-// A statement several groups run is one change of the rollout, and the
-// summary names how much of the rollout runs any work at all. Two groups that
-// alter orders differently but build the same index create one index, not two.
+// A statement several groups run is one change of the rollout, and a table
+// several groups alter is one table to alter. Two groups that alter orders
+// differently but build the same index alter one table and create one index.
 func TestWritePlanBody_RolloutSummaryCountsEachChangeOnce(t *testing.T) {
 	withIndex := func(column string) []*apitypes.SchemaChangeResponse {
 		changes := addColumnTo(column)
@@ -176,7 +176,78 @@ func TestWritePlanBody_RolloutSummaryCountsEachChangeOnce(t *testing.T) {
 
 	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
 	assert.Equal(t, 1, strings.Count(out, "📋 Plan:"), "%s", out)
-	assert.True(t, strings.HasSuffix(out, "📋 Plan: 1 table to alter, 1 index to create on all 64 targets\n\n"), "the one summary closes the plan:\n%s", out)
+	assert.True(t, strings.HasSuffix(out, "📋 Plan: 1 table to alter, 1 index to create\n\n"), "the one summary closes the plan:\n%s", out)
+}
+
+// The PR comment's distinct-plans rollout: testapp_1 and testapp_2 add an
+// email column to users, and testapp_3 adds the column and an index on it.
+// users is the one table either plan alters, so the CLI closes on the line the
+// comment does, "1 table to alter", with no count of targets beside it.
+func TestWritePlanBody_RolloutSummaryCountsATableEveryGroupAltersOnce(t *testing.T) {
+	alter := func(ddl ...string) []*apitypes.SchemaChangeResponse {
+		sc := &apitypes.SchemaChangeResponse{Namespace: "testapp"}
+		for _, d := range ddl {
+			sc.TableChanges = append(sc.TableChanges, &apitypes.TableChangeResponse{TableName: "users", Namespace: "testapp", DDL: d, ChangeType: "alter"})
+		}
+		return []*apitypes.SchemaChangeResponse{sc}
+	}
+	const addEmail = "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL"
+	const indexEmail = "ALTER TABLE `users` ADD INDEX `idx_email`(`email`)"
+	plan := &apitypes.PlanResponse{
+		Database: "testapp",
+		Engine:   "spirit",
+		Changes:  alter(addEmail),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: alter(addEmail)},
+				{Members: []string{"primary/testapp_3"}, Changes: alter(addEmail, indexEmail)},
+			},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Contains(t, out, "▸ targets primary/testapp_1, primary/testapp_2\n", "%s", out)
+	assert.Contains(t, out, "▸ target primary/testapp_3\n", "%s", out)
+	assert.True(t, strings.HasSuffix(out, "\n📋 Plan: 1 table to alter\n\n"), "the one summary closes the plan as the comment's does:\n%s", out)
+}
+
+// A sharded rollout's plans open on a header per namespace, which brings its
+// own blank line. The group heading leaves that line to the header, so one
+// blank line separates the heading from "── ns_0 ──", as one does everywhere
+// else in the plan.
+func TestWritePlanBody_RolloutGroupHeadingAndNamespaceHeaderAreOneBlankLineApart(t *testing.T) {
+	inNamespaces := func(namespaces ...string) []*apitypes.SchemaChangeResponse {
+		var changes []*apitypes.SchemaChangeResponse
+		for _, ns := range namespaces {
+			changes = append(changes, &apitypes.SchemaChangeResponse{
+				Namespace: ns,
+				TableChanges: []*apitypes.TableChangeResponse{{
+					TableName: "refunds", Namespace: ns, DDL: "ALTER TABLE `refunds` ADD COLUMN `region` varchar(32)", ChangeType: "alter",
+				}},
+			})
+		}
+		return changes
+	}
+	plan := &apitypes.PlanResponse{
+		Database: "payments",
+		Engine:   "spirit",
+		Changes:  inNamespaces("ns_0", "ns_1"),
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Groups: []*apitypes.PlanMemberGroupResponse{
+				{Members: paymentsTargets(1, 2), Primary: true, Changes: inNamespaces("ns_0", "ns_1")},
+				{Members: paymentsTargets(3, 3), Changes: []*apitypes.SchemaChangeResponse{}},
+			},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Contains(t, out, "▸ targets prod/payments-001, prod/payments-002\n\n  ── ns_0 ──\n", "%s", out)
+	assert.NotContains(t, out, "prod/payments-002\n\n\n", "no second blank line under the heading:\n%s", out)
+	assert.Contains(t, out, "▸ target prod/payments-003\n\n  No schema changes detected\n", "%s", out)
 }
 
 // A rollout already at the desired schema everywhere closes as a single

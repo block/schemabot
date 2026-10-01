@@ -122,7 +122,11 @@ type NamespaceChange struct {
 // For Vitess, each keyspace gets a header, and a keyspace whose VSchema
 // changes shows that change whatever engine reported the plan.
 func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string, dialect schema.Dialect) {
-	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
+	names := make([]string, len(namespaces))
+	for i, ns := range namespaces {
+		names[i] = ns.Namespace
+	}
+	singleNamespace := OmitsNamespaceHeader(names, isMySQL, database)
 
 	// Sort a copy so callers aren't affected by reordering. This keeps output
 	// stable and groups similarly named namespaces together, but collapsing
@@ -191,6 +195,14 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 			}
 		}
 	}
+}
+
+// OmitsNamespaceHeader reports whether WriteNamespaceChanges writes the
+// changes of these namespaces without a header above each: a MySQL plan of
+// the one namespace named for its database. Every other plan opens on a
+// namespace header, which brings its own blank line above it.
+func OmitsNamespaceHeader(namespaces []string, isMySQL bool, database string) bool {
+	return len(namespaces) == 1 && isMySQL && namespaces[0] == database
 }
 
 // collapsible reports whether a namespace renders as its DDL alone, so it can
@@ -371,16 +383,6 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) {
 	if parts := planSummaryParts(ddlChanges, vschemaChanges, finalizes); len(parts) > 0 {
 		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
-		fmt.Println()
-	}
-}
-
-// WriteRolloutPlanSummary writes the one summary line that closes a rollout's
-// plan: what the rollout runs across every group, and on how much of it —
-// "📋 Plan: 1 table to alter on 61 of 64 targets".
-func WriteRolloutPlanSummary(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int, coverage string) {
-	if parts := planSummaryParts(ddlChanges, vschemaChanges, finalizes); len(parts) > 0 {
-		fmt.Printf("📋 Plan: %s on %s\n", strings.Join(parts, ", "), coverage)
 		fmt.Println()
 	}
 }
