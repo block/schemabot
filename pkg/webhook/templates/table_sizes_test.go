@@ -352,24 +352,111 @@ func TestRenderPlanComment_ThreeTargetSizesNameTargetsWithoutEstimate(t *testing
 	assert.Contains(t, two, "- `orders`: ~23.4 GB on `primary/testapp_3` · size estimate unavailable on 2 targets\n")
 }
 
-// The per-target breakdown lists at most tableSizesListedLimit target sizes,
-// largest first, since collapsed lines still count toward the comment size
-// limit, and counts the rest: the targets of the table it stopped in, then
-// the tables it did not reach.
+// The per-target breakdown lists at most tableSizesListedLimit tables, since
+// collapsed lines still count toward the comment size limit, and counts the
+// tables it did not reach.
 func TestRenderPlanComment_TableSizesByTargetIsCapped(t *testing.T) {
-	const targets = tableSizesListedLimit + 10
+	const tables = tableSizesListedLimit + 2
 	var sizes []TargetTableSize
-	for _, table := range []string{"orders", "users", "carts"} {
-		for i := range targets {
-			sizes = append(sizes, targetSize(fmt.Sprintf("primary/orders-%03d", i+1), table, int64(i+1)*1_000_000))
-		}
+	for i := range tables {
+		table := fmt.Sprintf("t%03d", i)
+		bytes := int64(tables-i) * 1_000_000
+		sizes = append(sizes, targetSize("primary/orders-001", table, bytes), targetSize("primary/orders-002", table, bytes+500_000))
 	}
 	out := RenderPlanComment(multiTargetSizePlanData(sizes))
 
-	assert.Contains(t, out, fmt.Sprintf("- `orders`: ~1.8 GB across %d targets · largest ~60 MB on `primary/orders-%03d` · smallest ~1 MB\n", targets, targets))
-	assert.Contains(t, out, fmt.Sprintf("- `orders`\n  - `primary/orders-%03d`: ~60 MB\n", targets), "the breakdown leads with the largest target")
-	assert.Contains(t, out, "  - `primary/orders-011`: ~11 MB\n  - …and 10 more targets\n- …and 2 more tables\n\n</details>")
-	assert.NotContains(t, out, "  - `primary/orders-010`:", "targets past the cap are not listed")
+	assert.Contains(t, out, "<summary>Size on each target</summary>\n\n- `t000`\n", "the breakdown leads with the largest table")
+	assert.Contains(t, out, fmt.Sprintf("- `t%03d`\n  - `primary/orders-002`: ~3.5 MB\n  - `primary/orders-001`: ~3 MB\n- …and 2 more tables\n\n</details>", tableSizesListedLimit-1))
+	assert.NotContains(t, out, fmt.Sprintf("- `t%03d`\n", tableSizesListedLimit), "tables past the cap are not listed")
+}
+
+// A rollout of many targets lists only each table's largest targets, which
+// bound how long the copy runs, and sums up the rest in one line with their
+// size range. A target with no estimate is named after the sized ones, so an
+// unknown size never reads as a small one.
+func TestRenderPlanComment_TableSizesByTargetListsLargestTargets(t *testing.T) {
+	const targets = 256
+	var sizes []TargetTableSize
+	for i := 1; i <= targets; i++ {
+		target := fmt.Sprintf("primary/orders_%03d", i)
+		if i == 42 || i == 211 {
+			sizes = append(sizes, unsizedTarget(target, "orders"))
+			continue
+		}
+		sizes = append(sizes, targetSize(target, "orders", int64(i)*100_000_000))
+	}
+	out := RenderPlanComment(multiTargetSizePlanData(sizes))
+
+	assert.Contains(t, out, "<details>\n<summary>Size on each target</summary>\n\n"+
+		"- `orders`\n"+
+		"  - `primary/orders_256`: ~25.6 GB\n"+
+		"  - `primary/orders_255`: ~25.5 GB\n"+
+		"  - `primary/orders_254`: ~25.4 GB\n"+
+		"  - `primary/orders_253`: ~25.3 GB\n"+
+		"  - `primary/orders_252`: ~25.2 GB\n"+
+		"  - `primary/orders_042`: size estimate unavailable\n"+
+		"  - `primary/orders_211`: size estimate unavailable\n"+
+		"  - …and 249 more targets, ~100 MB to ~25.1 GB\n"+
+		"\n</details>\n\n📋 **Plan**:")
+}
+
+// Past a few targets with no estimate the breakdown counts them in its
+// closing line instead of naming each. A single sized target left over is
+// listed rather than summed up, a table no target estimated says so, and a
+// range whose ends round to the same size renders that size once.
+func TestRenderPlanComment_TableSizesByTargetCountsTargetsWithoutEstimate(t *testing.T) {
+	var sizes []TargetTableSize
+	for i := 1; i <= 10; i++ {
+		target := fmt.Sprintf("primary/orders_%02d", i)
+		switch {
+		case i <= 4:
+			sizes = append(sizes, unsizedTarget(target, "orders"), unsizedTarget(target, "users"))
+		case i <= 6:
+			sizes = append(sizes, targetSize(target, "orders", int64(i)*1_000_000), unsizedTarget(target, "users"))
+		default:
+			sizes = append(sizes, targetSize(target, "orders", int64(i)*1_000_000), targetSize(target, "users", int64(i)*1_000_000))
+		}
+		sizes = append(sizes, unsizedTarget(target, "carts"))
+	}
+	sizes = append(sizes, targetSize("primary/orders_01", "accounts", 1_000_000))
+	out := RenderPlanComment(multiTargetSizePlanData(sizes))
+
+	assert.Contains(t, out, "- `orders`\n"+
+		"  - `primary/orders_10`: ~10 MB\n"+
+		"  - `primary/orders_09`: ~9 MB\n"+
+		"  - `primary/orders_08`: ~8 MB\n"+
+		"  - `primary/orders_07`: ~7 MB\n"+
+		"  - `primary/orders_06`: ~6 MB\n"+
+		"  - `primary/orders_05`: ~5 MB\n"+
+		"  - …and 4 more targets with no size estimate\n"+
+		"- `users`\n"+
+		"  - `primary/orders_10`: ~10 MB\n"+
+		"  - `primary/orders_09`: ~9 MB\n"+
+		"  - `primary/orders_08`: ~8 MB\n"+
+		"  - `primary/orders_07`: ~7 MB\n"+
+		"  - …and 6 more targets with no size estimate\n"+
+		"- `carts`\n"+
+		"  - size estimate unavailable on all 10 targets\n")
+
+	var many []TargetTableSize
+	for i := 1; i <= 12; i++ {
+		target := fmt.Sprintf("primary/orders_%02d", i)
+		if i > 8 {
+			many = append(many, unsizedTarget(target, "orders"))
+			continue
+		}
+		many = append(many, targetSize(target, "orders", int64(i)*1_000_000))
+	}
+	assert.Contains(t, RenderPlanComment(multiTargetSizePlanData(many)),
+		"  - `primary/orders_04`: ~4 MB\n  - …and 7 more targets, ~1 MB to ~3 MB; 4 with no size estimate\n\n</details>")
+
+	var even []TargetTableSize
+	for i := 1; i <= 8; i++ {
+		even = append(even, targetSize(fmt.Sprintf("primary/orders_%02d", i), "orders", 1_000_000))
+	}
+	assert.Contains(t, RenderPlanComment(multiTargetSizePlanData(even)),
+		"  - `primary/orders_05`: ~1 MB\n  - …and 3 more targets, ~1 MB\n\n</details>",
+		"a range whose ends round to the same size renders that size once")
 }
 
 // A table only one target changes is left out of the breakdown, since its

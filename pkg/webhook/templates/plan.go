@@ -1264,12 +1264,25 @@ const tableSizesInlineLimit = 10
 const tableSizesLargestShown = 5
 
 // tableSizesListedLimit caps how many tables a folded size section lists in
-// total, visible and collapsed, and how many target sizes the per-target
-// breakdown lists. Collapsed lines still count toward GitHub's comment size
-// limit, and a plan that indexes thousands of tables, or a rollout of many
-// targets, would otherwise spend on sizes the room its DDL needs. Entries
-// past the cap are counted in a closing line instead.
+// total, visible and collapsed, and how many tables the per-target breakdown
+// lists. Collapsed lines still count toward GitHub's comment size limit, and
+// a plan that indexes thousands of tables would otherwise spend on sizes the
+// room its DDL needs. Tables past the cap are counted in a closing line
+// instead.
 const tableSizesListedLimit = 50
+
+// tableSizesTargetsShown is how many of a table's targets the per-target
+// breakdown lists by name: the largest, since they bound how long the
+// rollout's copy runs. The rest are summed up in one line with their size
+// range, so a rollout of many targets adds a few lines per table rather than
+// one per target.
+const tableSizesTargetsShown = 5
+
+// tableSizesUnestimatedNamed is how many targets with no size estimate the
+// per-target breakdown names on their own lines. A missing estimate is a
+// failed probe an operator should be able to find, but past this many the
+// breakdown counts them instead.
+const tableSizesUnestimatedNamed = 3
 
 // tableSizeEntry is one line of the size section: the table's display name,
 // qualified with its keyspace when the plan spans several, and its sizes.
@@ -1491,37 +1504,77 @@ func writeFoldedTableSizes(sb *strings.Builder, sorted []tableSizeEntry, multiTa
 }
 
 // writeTableSizesByTarget renders a collapsed breakdown of each table's size on
-// every target that changes it, largest first, in the order the section lists
-// the tables. Each target copies its own data, so the breakdown is where an
-// operator finds which targets an apply will take longest on. Tables a single
-// target changes are left out, since their line already names that target.
-// At most tableSizesListedLimit target sizes are listed across all tables; the
-// rest are counted in closing lines.
+// the targets that change it, in the order the section lists the tables.
+// Each target copies its own data, so the breakdown is where an operator
+// finds which targets an apply will take longest on. Tables a single target
+// changes are left out, since their line already names that target. Past
+// tableSizesListedLimit tables the rest are counted in a closing line.
 func writeTableSizesByTarget(sb *strings.Builder, entries []tableSizeEntry) {
 	spread := slices.DeleteFunc(slices.Clone(entries), func(e tableSizeEntry) bool { return len(e.perTarget) < 2 })
 	if len(spread) == 0 {
 		return
 	}
 	sb.WriteString("<details>\n<summary>Size on each target</summary>\n\n")
-	remaining := tableSizesListedLimit
-	for i, e := range spread {
-		if remaining == 0 {
-			unlisted := len(spread) - i
-			fmt.Fprintf(sb, "- …and %d more %s\n", unlisted, pluralize("table", unlisted))
-			break
-		}
+	listed := min(len(spread), tableSizesListedLimit)
+	for _, e := range spread[:listed] {
 		fmt.Fprintf(sb, "- `%s`\n", e.name)
-		targets := targetSizesLargestFirst(e.perTarget)
-		shown := min(len(targets), remaining)
-		for _, ts := range targets[:shown] {
-			fmt.Fprintf(sb, "  - `%s`: %s\n", ts.Target, formatTableSize(ts.Size))
-		}
-		if unlisted := len(targets) - shown; unlisted > 0 {
-			fmt.Fprintf(sb, "  - …and %d more %s\n", unlisted, pluralize("target", unlisted))
-		}
-		remaining -= shown
+		writeTargetSizeLines(sb, targetSizesLargestFirst(e.perTarget))
+	}
+	if unlisted := len(spread) - listed; unlisted > 0 {
+		fmt.Fprintf(sb, "- …and %d more %s\n", unlisted, pluralize("table", unlisted))
 	}
 	sb.WriteString("\n</details>\n\n")
+}
+
+// writeTargetSizeLines renders one table's targets in the per-target
+// breakdown, from sizes ordered largest first with unestimated targets last.
+// The largest targets are listed by name; a summary line never stands in for
+// a single target, so one left over is listed too. Targets with no estimate
+// are named when there are few, since an unknown size must never read as a
+// small one, and counted otherwise. The remaining sized targets close the
+// table in one line carrying their size range.
+func writeTargetSizeLines(sb *strings.Builder, sorted []TargetTableSize) {
+	sized := slices.IndexFunc(sorted, func(ts TargetTableSize) bool { return !hasSizeEstimate(ts.Size) })
+	if sized < 0 {
+		sized = len(sorted)
+	}
+	shown := min(sized, tableSizesTargetsShown)
+	if sized-shown == 1 {
+		shown = sized
+	}
+	for _, ts := range sorted[:shown] {
+		fmt.Fprintf(sb, "  - `%s`: %s\n", ts.Target, formatTableSize(ts.Size))
+	}
+	rest, unsized := sorted[shown:sized], sorted[sized:]
+	if len(unsized) <= tableSizesUnestimatedNamed {
+		for _, ts := range unsized {
+			fmt.Fprintf(sb, "  - `%s`: %s\n", ts.Target, formatTableSize(ts.Size))
+		}
+		unsized = nil
+	}
+	switch {
+	case len(rest) > 0 && len(unsized) > 0:
+		fmt.Fprintf(sb, "  - …and %d more %s, %s; %d with no size estimate\n",
+			len(rest)+len(unsized), pluralize("target", len(rest)+len(unsized)), targetSizeRange(rest), len(unsized))
+	case len(rest) > 0:
+		fmt.Fprintf(sb, "  - …and %d more %s, %s\n", len(rest), pluralize("target", len(rest)), targetSizeRange(rest))
+	case len(unsized) == len(sorted):
+		fmt.Fprintf(sb, "  - size estimate unavailable on all %d targets\n", len(unsized))
+	case len(unsized) > 0:
+		fmt.Fprintf(sb, "  - …and %d more %s with no size estimate\n", len(unsized), pluralize("target", len(unsized)))
+	}
+}
+
+// targetSizeRange renders the span of sizes, smallest to largest, of targets
+// ordered largest first that all carry an estimate. Sizes that round to the
+// same figure render as that figure alone.
+func targetSizeRange(sorted []TargetTableSize) string {
+	largest := ui.FormatApproxBytes(*sorted[0].Size.EstimatedBytes)
+	smallest := ui.FormatApproxBytes(*sorted[len(sorted)-1].Size.EstimatedBytes)
+	if smallest == largest {
+		return largest
+	}
+	return smallest + " to " + largest
 }
 
 // targetSizesLargestFirst orders a table's per-target sizes by bytes, largest
