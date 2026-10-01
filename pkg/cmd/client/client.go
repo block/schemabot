@@ -406,7 +406,9 @@ func CheckActiveSchemaChange(endpoint, database, environment string) (*ActiveSch
 // reserves only that deployment. The server is asked for that deployment's
 // applies, since it reports an apply's deployment only when a status request
 // names one. An active apply whose deployment is still not reported is counted
-// as holding it, since nothing shows it does not.
+// as holding it, since nothing shows it does not. So is an apply whose
+// operation on the deployment has finished while the apply itself is still
+// running elsewhere: the apply keeps the deployment until it is terminal.
 func CheckActiveSchemaChangeOnDeployment(endpoint, database, environment, deployment string) (*ActiveSchemaChange, error) {
 	deployment = storage.CanonicalKey(deployment)
 	return findActiveSchemaChange(endpoint, database, environment, deployment, func(apply *apitypes.ActiveApplyResponse) bool {
@@ -447,15 +449,32 @@ func findActiveSchemaChange(endpoint, database, environment, deployment string, 
 		}
 		// The server already excluded terminal states; re-checking here keeps the
 		// answer correct if this ever reads a response that was not filtered.
-		if state.IsTerminalApplyState(apply.State) {
+		activeState, active := activeStateOf(apply)
+		if !active {
 			continue
 		}
 		if !holds(apply) {
 			continue
 		}
-		return &ActiveSchemaChange{State: apply.State, ApplyID: apply.ApplyID}, nil
+		return &ActiveSchemaChange{State: activeState, ApplyID: apply.ApplyID}, nil
 	}
 	return nil, nil
+}
+
+// activeStateOf reports whether a listed apply still holds its targets, and
+// the state to show for it. A deployment-filtered status row reports the
+// deployment's operation state, but the apply keeps every deployment it
+// touches reserved until the apply itself is terminal, so a finished
+// operation under an apply still running elsewhere counts as active, under
+// the apply's state.
+func activeStateOf(apply *apitypes.ActiveApplyResponse) (string, bool) {
+	if !state.IsTerminalApplyState(apply.State) {
+		return apply.State, true
+	}
+	if apply.ApplyState != "" && !state.IsTerminalApplyState(apply.ApplyState) {
+		return apply.ApplyState, true
+	}
+	return "", false
 }
 
 // ReadSchemaFiles reads .sql files from a directory and groups them by namespace.

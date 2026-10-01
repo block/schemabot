@@ -1531,13 +1531,20 @@ type ActiveApplyResponse struct {
 	Database            string `json:"database"`
 	Environment         string `json:"environment"`
 	Deployment          string `json:"deployment,omitempty"`
-	State               string `json:"state"`
-	Engine              string `json:"engine"`
-	Caller              string `json:"caller"`
-	ErrorMessage        string `json:"error_message,omitempty"`
-	StartedAt           string `json:"started_at,omitempty"`
-	CompletedAt         string `json:"completed_at,omitempty"`
-	UpdatedAt           string `json:"updated_at"`
+	// State is the apply's state, or the named deployment's operation state
+	// when the status request filters by deployment.
+	State string `json:"state"`
+	// ApplyState is the parent apply's own state, set only when State reports
+	// a deployment's operation. An apply holds every deployment it touches
+	// until the apply itself is terminal, so a deployment whose operation has
+	// finished stays reserved while ApplyState is not terminal.
+	ApplyState   string `json:"apply_state,omitempty"`
+	Engine       string `json:"engine"`
+	Caller       string `json:"caller"`
+	ErrorMessage string `json:"error_message,omitempty"`
+	StartedAt    string `json:"started_at,omitempty"`
+	CompletedAt  string `json:"completed_at,omitempty"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 // StatusResponse is the HTTP response for GET /api/status.

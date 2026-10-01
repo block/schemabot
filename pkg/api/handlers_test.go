@@ -5391,6 +5391,7 @@ func TestHandleStatusDeploymentFilterProjectsMatchingOperation(t *testing.T) {
 	assert.Equal(t, "remote-operation-202", resp.Applies[0].ExternalOperationID)
 	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
 	assert.Equal(t, state.Apply.Completed, resp.Applies[0].State)
+	assert.Equal(t, state.Apply.Running, resp.Applies[0].ApplyState, "the parent's state is reported beside the operation's, since the apply still holds the deployment")
 }
 
 // A deployment applied per shard has exactly one data-plane apply, so the

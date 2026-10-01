@@ -841,8 +841,50 @@ follow, most recently active first.
 Each row carries the apply ID, database, environment, state, engine, caller,
 error message, and started, completed, and updated timestamps. A row carries
 `deployment` only when the request is deployment-filtered; an unfiltered list
-omits the field on every row. `schemabot status` renders it;
-`schemabot status --json` returns it raw.
+omits the field on every row. On a deployment-filtered row, `state` is that
+deployment's operation state, and `apply_state` is the parent apply's own
+state. An apply holds every deployment it touches until the apply itself
+finishes, so a row whose `state` is `completed` while `apply_state` is still
+`running` means the deployment is still reserved by a rollout running
+elsewhere. `schemabot status` renders it; `schemabot status --json` returns it
+raw.
+
+<details>
+<summary>Deployment-filtered request and response example</summary>
+
+```http
+GET /api/status?environment=production&deployment=us&active=true
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "active_count": 0,
+  "limit": 20,
+  "max_limit": 1000,
+  "state_counts": {
+    "running": 1
+  },
+  "applies": [
+    {
+      "apply_id": "apply-example-74",
+      "database": "orders",
+      "environment": "production",
+      "deployment": "us",
+      "state": "completed",
+      "apply_state": "running",
+      "engine": "spirit",
+      "caller": "example/orders#91",
+      "started_at": "2026-09-01T02:10:00Z",
+      "completed_at": "2026-09-01T02:52:00Z",
+      "updated_at": "2026-09-01T02:52:00Z"
+    }
+  ]
+}
+```
+
+</details>
 
 <details>
 <summary>Request and response example</summary>

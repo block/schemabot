@@ -57,13 +57,19 @@ type narrowedPlanServer struct {
 
 // statusAppliesFor lists active applies the way /api/status does: filtered by
 // deployment and reporting it when the request names one, and with no
-// deployment reported otherwise.
+// deployment reported otherwise. A fixture's State is the deployment's
+// operation state and its ApplyState, when set, the parent's: a request that
+// names no deployment reports the parent's state alone.
 func statusAppliesFor(deployment string, active []*apitypes.ActiveApplyResponse) []*apitypes.ActiveApplyResponse {
 	listed := make([]*apitypes.ActiveApplyResponse, 0, len(active))
 	for _, apply := range active {
 		reported := *apply
 		if deployment == "" {
 			reported.Deployment = ""
+			if reported.ApplyState != "" {
+				reported.State = reported.ApplyState
+				reported.ApplyState = ""
+			}
 		} else if apply.Deployment != deployment {
 			continue
 		}
@@ -229,4 +235,28 @@ func TestApplyCmd_TargetRefusedWhileItsDeploymentHasAnActiveSchemaChange(t *test
 			assert.Equal(t, []string{"/api/plan", "/api/status"}, recorded.paths, "nothing is locked or applied while the deployment is busy")
 		})
 	}
+}
+
+// A rollout that has finished on this member's deployment but is still running
+// on another still holds the deployment, so a targeted apply is refused before
+// the plan is shown, the lock taken, or anything submitted, even though the
+// deployment's own operation reads completed.
+func TestApplyCmd_TargetRefusedWhileRolloutRunsElsewhereAfterFinishingHere(t *testing.T) {
+	recorded, endpoint := newNarrowedPlanServer(t, narrowedPlan(createUsers()),
+		&apitypes.ActiveApplyResponse{ApplyID: "apply-rollout", Database: "testdb", Environment: "production", Deployment: "prod", State: "completed", ApplyState: "running"})
+
+	cmd := targetedApplyCmd(t)
+	cmd.NoLock = false
+	cmd.Output = OutputFormatInteractive
+	var runErr error
+	out := stripAnsi(captureStdout(func() {
+		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+	}))
+
+	require.Error(t, runErr)
+	assert.Equal(t, "schema change already in progress", runErr.Error())
+	assert.Contains(t, out, "status apply-rollout")
+	recorded.mu.Lock()
+	defer recorded.mu.Unlock()
+	assert.Equal(t, []string{"/api/plan", "/api/status"}, recorded.paths, "nothing is locked or applied while the rollout holds the deployment")
 }
