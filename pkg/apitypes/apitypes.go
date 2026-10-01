@@ -731,12 +731,14 @@ type PlanRequest struct {
 	// Target narrows the plan to one rollout member of the environment, named
 	// by its target or by deployment/target. Empty plans the rollout primary.
 	Target string `json:"target,omitempty"`
-	// RendersRollout says the caller reads the plan's rollout block: it shows
-	// the operator what applies on every member, and refuses an apply for the
-	// members the rollout lists as needing attention or as refused. The server
-	// refuses a rollout-wide plan of an environment with more than one member
-	// from a caller that does not set it, since such a caller would present
-	// the primary's plan as the whole rollout's.
+	// RendersRollout is a client capability flag: it says this client reads
+	// the plan's rollout block, shows the operator what applies on every
+	// member, and refuses an apply for the members the rollout lists as
+	// needing attention or as refused. It is not operator consent, since any
+	// caller can set it. The server refuses a rollout-wide plan of an
+	// environment with more than one member from a caller that does not set
+	// it, since such a caller would present the primary's plan as the whole
+	// rollout's.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
@@ -749,13 +751,16 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
-	// RendersRollout says the caller showed the operator the plan every
-	// rollout member runs before applying: each member's plan from the
-	// rollout block (see PlanRequest.RendersRollout), or for a rollback its
-	// one rollback plan, which every member of a mirrored environment runs and
-	// which the server refuses to run rollout-wide where members are planned
-	// on their own. The server refuses a rollout-wide apply of an environment
-	// with more than one member from a caller that does not set it.
+	// RendersRollout is a client capability flag: it says this client shows
+	// the plan every rollout member runs before applying, each member's plan
+	// from the rollout block (see PlanRequest.RendersRollout), or for a
+	// rollback its one rollback plan, which every member of a mirrored
+	// environment runs and which the server refuses to run rollout-wide where
+	// members are planned on their own. It is not operator consent: any
+	// caller can set it, so it only keeps a client that shows the primary's
+	// plan as the whole rollout's from applying one. The server refuses a
+	// rollout-wide apply of an environment with more than one member from a
+	// caller that does not set it.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
@@ -839,8 +844,9 @@ type PlanRolloutResponse struct {
 	// it, with the primary's group first.
 	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
 	// Attention lists the members an apply cannot run on as planned: a member
-	// that could not be planned, or one that diverged from the plan it is
-	// expected to mirror.
+	// that could not be planned, every member but the primary when the
+	// primary's plan reported errors and so no other member was planned, or
+	// one that diverged from the plan it is expected to mirror.
 	Attention []*PlanMemberAttentionResponse `json:"attention,omitempty"`
 	// Refused lists the members whose own plans apply creation refuses when
 	// this plan is applied rollout-wide through the API, which refuses the

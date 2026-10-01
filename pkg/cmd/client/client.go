@@ -333,8 +333,8 @@ func CallRollbackPlanAPI(endpoint, applyID, environment string) (*apitypes.PlanR
 }
 
 // CallApplyAPI calls the apply API for the whole rollout and returns the typed
-// result. It does not say it showed the operator every rollout member's plan,
-// so the server refuses it a rollout-wide apply of an environment with more
+// result. It does not declare that the client shows every rollout member's
+// plan, so the server refuses it a rollout-wide apply of an environment with more
 // than one member; see apitypes.ApplyRequest.RendersRollout. A caller that
 // showed every member's plan uses CallApplyAPIForTarget and says so.
 func CallApplyAPI(endpoint, planID, environment, caller string, options map[string]string) (*apitypes.ApplyResponse, error) {
@@ -342,8 +342,9 @@ func CallApplyAPI(endpoint, planID, environment, caller string, options map[stri
 }
 
 // CallApplyAPIForTarget is CallApplyAPI narrowed to the one rollout member
-// target names. An empty target applies the whole rollout. rendersRollout says
-// the caller showed the operator the plan every rollout member runs; see
+// target names. An empty target applies the whole rollout. rendersRollout
+// declares that the caller shows the operator the plan every rollout member
+// runs, a client capability rather than consent; see
 // apitypes.ApplyRequest.RendersRollout.
 func CallApplyAPIForTarget(endpoint, planID, environment, caller, target string, rendersRollout bool, options map[string]string) (*apitypes.ApplyResponse, error) {
 	req := apitypes.ApplyRequest{

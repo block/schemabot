@@ -243,6 +243,12 @@ func writePlanBody(result *apitypes.PlanResponse, isApply bool) {
 	// Check for errors
 	if len(result.Errors) > 0 {
 		templates.WriteErrors(result.Errors)
+		// Beside a primary plan that reported errors no other rollout member is
+		// planned, and the rollout says so, so the errors are not read as the
+		// whole rollout's verdict.
+		if rollout := result.WholeRollout(); rollout != nil {
+			templates.WriteRolloutAttention(templates.RolloutNoun(rollout), rollout.Attention)
+		}
 		return
 	}
 	if result.WholeRollout() != nil {

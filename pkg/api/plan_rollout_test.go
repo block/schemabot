@@ -249,9 +249,11 @@ func TestPlanRollout_UnplannedMemberLogSaysWhoRefusesTheApply(t *testing.T) {
 	assert.Contains(t, mirroredLogs.String(), `msg="rollout member could not be planned; the plan lists it as needing attention, and the CLI refuses a rollout-wide apply until it is planned"`)
 }
 
-// A primary plan that reported errors already fails the plan, so no member is
-// planned alongside it.
-func TestPlanRollout_SkipsAPrimaryPlanWithErrors(t *testing.T) {
+// A primary plan that reported errors already fails the plan, so no other
+// member is planned beside it. The rollout still says so, listing each other
+// member as not planned, so an operator reading the primary's errors can tell
+// the other targets were never looked at rather than found fine.
+func TestPlanRollout_ListsTheOtherMembersAsNotPlannedBesideAPrimaryPlanWithErrors(t *testing.T) {
 	client := &mockTernClient{planDiffResp: alterUsersDiff("ALTER TABLE `users` ADD COLUMN `phone` varchar(32)")}
 	svc := multiTargetService(t, client, &recordingPlanStore{})
 	reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
@@ -260,6 +262,14 @@ func TestPlanRollout_SkipsAPrimaryPlanWithErrors(t *testing.T) {
 	rollout, err := svc.planRollout(t.Context(), planDiffReq(t), reviewed,
 		&apitypes.PlanResponse{Deployment: "eu", Target: "testapp-001"})
 	require.NoError(t, err)
-	assert.Nil(t, rollout)
 	assert.Nil(t, client.planDiffReq, "no member is diffed beside a failed primary plan")
+	require.NotNil(t, rollout, "the rollout says the other members were not planned")
+	assert.Equal(t, 2, rollout.Members)
+	assert.True(t, rollout.Independent)
+	assert.Empty(t, rollout.Groups, "no member ran a plan to group")
+	assert.Empty(t, rollout.Refused)
+	assert.Equal(t, []*apitypes.PlanMemberAttentionResponse{{
+		Member: "eu/testapp-002", Reason: apitypes.PlanMemberUnplanned,
+		Detail: "not planned, because the primary's plan reported errors; fix them, then plan again",
+	}}, rollout.Attention)
 }

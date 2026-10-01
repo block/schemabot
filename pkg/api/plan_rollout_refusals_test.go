@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -63,6 +64,25 @@ func TestHandlePlan_RefusesARolloutWidePlanFromACallerThatDoesNotRenderTheRollou
 			assert.Empty(t, client.diffed, "no member is planned for a refused request")
 		})
 	}
+}
+
+// The rollout rendering check counts the environment's rollout members, so a
+// rollout-wide plan from a caller that does not render the rollout is refused
+// by the check itself when those members cannot be resolved, rather than let
+// through to whatever checks come after it.
+func TestRefusePlanRolloutUnrenderedByCaller_RefusesAnEnvironmentWhoseMembersDoNotResolve(t *testing.T) {
+	svc := New(&mockStorageWithPlanLookup{plans: &recordingPlanStore{}}, narrowingServerConfig(), map[string]tern.Client{},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	err := svc.refusePlanRolloutUnrenderedByCaller(PlanRequest{Database: "payments", Environment: "sandbox"})
+	require.Error(t, err)
+	envErr, ok := errors.AsType[*EnvironmentNotConfiguredError](err)
+	require.True(t, ok, "the resolution error is returned, not swallowed: %v", err)
+	assert.Equal(t, "sandbox", envErr.Environment)
+	assert.Contains(t, err.Error(), "resolve rollout members of payments/sandbox")
+
+	require.NoError(t, svc.refusePlanRolloutUnrenderedByCaller(PlanRequest{Database: "payments", Environment: "sandbox", RendersRollout: true}),
+		"a caller that renders the rollout is not checked")
 }
 
 // The apply side of the same rule: POST /api/apply of a reviewed plan across

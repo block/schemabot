@@ -483,6 +483,32 @@ func TestWritePlanBody_RolloutDisclosesDirectExecutionUnderTheTargetThatRunsIt(t
 	assert.NotContains(t, first, notice, "the target running it through Spirit carries no disclosure")
 }
 
+// A primary plan that reported errors is the only plan the server makes, so
+// the rollout lists every other target as not planned. Those targets follow
+// the errors, so the errors are not read as the verdict on every target.
+func TestWritePlanBody_ErroredPrimaryNamesTheTargetsThatWereNotPlanned(t *testing.T) {
+	const notPlanned = "not planned, because the primary's plan reported errors; fix them, then plan again"
+	plan := &apitypes.PlanResponse{
+		Database: "orders",
+		Engine:   "spirit",
+		Errors:   []string{"orders.sql: syntax error"},
+		Rollout: &apitypes.PlanRolloutResponse{
+			Members:     3,
+			Independent: true,
+			Attention: []*apitypes.PlanMemberAttentionResponse{
+				{Member: "prod/payments-002", Reason: apitypes.PlanMemberUnplanned, Detail: notPlanned},
+				{Member: "prod/payments-003", Reason: apitypes.PlanMemberUnplanned, Detail: notPlanned},
+			},
+		},
+	}
+
+	out := stripAnsi(captureStdout(func() { writePlanBody(plan, false) }))
+	assert.Equal(t, "Errors:\n  • orders.sql: syntax error\n\n"+
+		"⚠️ 2 targets need attention before an apply can run on them:\n"+
+		"  • prod/payments-002 — "+notPlanned+"\n"+
+		"  • prod/payments-003 — "+notPlanned+"\n\n", out)
+}
+
 // A member the server could not plan is named ahead of the plans, since no
 // plan below covers it and an apply will be refused until it is planned.
 func TestWritePlanBody_RolloutNamesUnplannedMembersFirst(t *testing.T) {

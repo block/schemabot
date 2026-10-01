@@ -18,6 +18,11 @@ import (
 // than returned.
 const unplannedMemberDetail = "could not be planned; see server logs for the cause, then plan again"
 
+// notPlannedBesideErroredPrimaryDetail is the detail a plan response gives
+// for a member that was not planned because the primary's plan reported
+// errors, which the response carries.
+const notPlannedBesideErroredPrimaryDetail = "not planned, because the primary's plan reported errors; fix them, then plan again"
+
 // divergedMemberDetail is the detail a plan response gives for a member whose
 // own plan differs from the primary plan it is expected to mirror, with what
 // to do next. A rollout-wide apply is refused while it diverges, so the way
@@ -31,9 +36,11 @@ func divergedMemberDetail(selector string) string {
 // through the API, so the response says what an apply would run on each
 // member, and an apply created from the primary's plan has a stored plan for
 // every member planned against its own schema. It returns nil for an
-// environment with a single member, for a plan narrowed to one member, and
-// for a primary plan that reported errors, which already fails the plan on its
-// own.
+// environment with a single member and for a plan narrowed to one member.
+// Beside a primary plan that reported errors no other member is planned, and
+// the rollout lists each of them as needing attention, so the operator reading
+// the primary's errors can tell the other members were not looked at rather
+// than found fine.
 //
 // A narrowed plan speaks for its one member only. Planning the other members
 // beside it would present that member's plan as the rollout's and store member
@@ -45,11 +52,6 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 			"selector", req.Target, "narrowed_to", planResp.NarrowedTo)
 		return nil, nil
 	}
-	if len(primaryPlan.GetErrors()) > 0 {
-		s.logger.Debug("skipping rollout member plans: the primary plan reported errors",
-			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
-		return nil, nil
-	}
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
 		return nil, fmt.Errorf("resolve rollout members for %s/%s: %w", req.Database, req.Environment, err)
@@ -58,6 +60,15 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 		s.logger.Debug("skipping rollout member plans: the environment has a single rollout member",
 			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
 		return nil, nil
+	}
+	if len(primaryPlan.GetErrors()) > 0 {
+		planning, err := s.config.MemberPlanningFor(req.Database, req.Environment)
+		if err != nil {
+			return nil, fmt.Errorf("member planning for %s/%s: %w", req.Database, req.Environment, err)
+		}
+		s.logger.Info("rollout members not planned: the primary plan reported errors; the plan lists every other member as needing attention",
+			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId(), "members", len(targets))
+		return primaryErroredRollout(planning, targets), nil
 	}
 	// The primary is held to the namespace selection it was planned under, so
 	// the rollup can tell a placement change since the plan from the plan
@@ -100,6 +111,25 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 		"distinct_plans", len(rollout.Groups),
 		"members_needing_attention", len(rollout.Attention))
 	return rollout, nil
+}
+
+// primaryErroredRollout is the rollout block of a plan whose primary reported
+// errors. No other member is planned beside a failed primary plan, so there is
+// no plan to group them under, and each is listed as needing attention instead
+// of being left out.
+func primaryErroredRollout(planning MemberPlanning, targets []routing.ExecutionTarget) *apitypes.PlanRolloutResponse {
+	members := make([]routing.ExecutionTarget, len(targets))
+	for i, t := range targets {
+		members[i] = routing.ExecutionTarget{Deployment: t.Deployment, Target: t.Target}
+	}
+	names := routing.DisplayNames(members)
+	resp := &apitypes.PlanRolloutResponse{Members: len(targets), Independent: planning == PlanIndependent}
+	for _, name := range names[1:] {
+		resp.Attention = append(resp.Attention, &apitypes.PlanMemberAttentionResponse{
+			Member: name, Reason: apitypes.PlanMemberUnplanned, Detail: notPlannedBesideErroredPrimaryDetail,
+		})
+	}
+	return resp
 }
 
 // unplannedMemberApplyOutcome says what becomes of a rollout-wide apply of a
@@ -226,17 +256,17 @@ func (e *RolloutUnrenderedError) Error() string {
 // one member. A plan narrowed to one member speaks for that member alone and
 // renders as one plan, so it is not refused.
 //
-// An environment the config cannot resolve is left to the planner, which
-// refuses it with the error that names what is missing.
+// An environment whose members the config cannot resolve is refused here too,
+// with the resolution error, rather than left to a later check: the members
+// are what this check counts, so it holds on its own only if it never lets a
+// plan through without knowing them.
 func (s *Service) refusePlanRolloutUnrenderedByCaller(req PlanRequest) error {
 	if req.RendersRollout || req.Target != "" {
 		return nil
 	}
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
-		s.logger.Debug("rollout rendering check deferred to the planner: the environment's rollout members did not resolve",
-			"database", req.Database, "environment", req.Environment, "error", err)
-		return nil
+		return fmt.Errorf("resolve rollout members of %s/%s to check the caller renders them: %w", req.Database, req.Environment, err)
 	}
 	if len(targets) <= 1 {
 		return nil

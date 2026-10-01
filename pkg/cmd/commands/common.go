@@ -470,10 +470,11 @@ func writeNarrowedTo(planResult *apitypes.PlanResponse) {
 // which is empty when the server accepted the apply without naming one. Used by
 // both RunApply and RunRollback.
 //
-// rendersRollout is the caller's statement that it showed the operator the
-// plan every rollout member runs (apitypes.ApplyRequest.RendersRollout). Each
-// caller makes it for its own reason, so a new caller has to decide it rather
-// than inherit it.
+// rendersRollout says whether this caller shows the operator the plan every
+// rollout member runs, the client capability the server checks before a
+// rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
+// decides it for its own output, so a new caller has to decide it rather than
+// inherit it.
 func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
 	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 

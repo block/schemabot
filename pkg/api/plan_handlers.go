@@ -83,8 +83,9 @@ type PlanRequest struct {
 	// speaks for its one member only, so it never records stored check state.
 	Target string `json:"target,omitempty"`
 
-	// RendersRollout says the HTTP caller reads the response's rollout block
-	// and shows the operator what applies on every member. POST /api/plan
+	// RendersRollout is the HTTP caller's capability flag: it reads the
+	// response's rollout block and shows the operator what applies on every
+	// member. It is not operator consent. POST /api/plan
 	// refuses a rollout-wide plan of an environment with more than one member
 	// without it (refusePlanRolloutUnrenderedByCaller). The webhook calls the
 	// service in process and renders the rollout itself, so it never sets it.
@@ -555,8 +556,9 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
-	// RendersRollout says the HTTP caller showed the operator the plan every
-	// rollout member runs; see apitypes.ApplyRequest.RendersRollout.
+	// RendersRollout is the HTTP caller's capability flag: it shows the
+	// operator the plan every rollout member runs. It is not operator consent;
+	// see apitypes.ApplyRequest.RendersRollout.
 	RendersRollout bool `json:"renders_rollout,omitempty"`
 	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
 	// to say it rendered the rollout. The webhook and the trusted enqueue path
@@ -615,9 +617,20 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.refusePlanRolloutUnrenderedByCaller(req); err != nil {
-		s.logger.Warn("plan rejected: the caller does not render the plan of every rollout member",
+		if _, ok := errors.AsType[*RolloutUnrenderedError](err); ok {
+			s.logger.Warn("plan rejected: the caller does not render the plan of every rollout member",
+				"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "plan rejected: "+err.Error())
+			return
+		}
+		if requestedRouteNotConfigured(err) {
+			s.logger.Warn("plan rejected for unconfigured database route", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.logger.Error("plan failed: the environment's rollout members did not resolve, so the rollout rendering check refuses the plan",
 			"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
-		s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "plan rejected: "+err.Error())
+		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
 
