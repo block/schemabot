@@ -567,11 +567,27 @@ func RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, actio
 // BlockingCheck represents a PR check that is blocking apply, either because
 // it completed without passing or because it is still running. State holds the
 // GitHub-reported conclusion (e.g. "failure", "timed_out", "cancelled") for
-// completed checks, or the status (e.g. "in_progress", "queued", "pending")
-// for in-progress checks.
+// completed checks, or the status for unfinished checks — any status other than
+// "completed" ("in_progress", "queued", "pending", "waiting", "requested", or
+// one GitHub adds later), rendered as GitHub reported it.
 type BlockingCheck struct {
 	Name  string
 	State string
+}
+
+// checkStatusWaiting is the GitHub check-run status of an Actions job paused on
+// an environment protection rule: it stays there until a deployment reviewer
+// approves or rejects the deployment, so waiting on it is not enough by itself.
+const checkStatusWaiting = "waiting"
+
+// anyCheckInState reports whether any of the checks carries the given State.
+func anyCheckInState(checks []BlockingCheck, state string) bool {
+	for _, c := range checks {
+		if c.State == state {
+			return true
+		}
+	}
+	return false
 }
 
 // RenderApplyBlockedByNonPassingChecks renders a comment when apply is blocked
@@ -686,6 +702,10 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 		sb.WriteString("|-------|--------|\n")
 		for _, c := range inProgress {
 			fmt.Fprintf(&sb, "| %s | %s |\n", inlineCodeCell(c.Name), c.State)
+		}
+		if anyCheckInState(inProgress, checkStatusWaiting) {
+			sb.WriteString("\nA check in `waiting` is paused for a deployment reviewer to approve or reject its environment and will not finish on its own. ")
+			sb.WriteString("If the apply should not depend on that approval, leave the check out of `required_checks`.\n")
 		}
 		sb.WriteString("\nWait for checks to complete and retry:\n")
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)
