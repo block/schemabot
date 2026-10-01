@@ -185,9 +185,10 @@ any other required flags filled in.
 A command runs only from a line that holds nothing else: `schemabot`, the
 command, and its flags and apply ID. A line with any other word on it, such as
 "SchemaBot apply -e staging succeeded", is a sentence about SchemaBot and is
-ignored, as are commands inside code blocks and quotes. Anyone posting status
-updates on a PR, an agent included, can describe SchemaBot freely; to show a
-command without running it, put it in a code block.
+ignored, as are commands inside code blocks and quotes, so a quote-reply to a
+command never runs it. Anyone posting status updates on a PR, an agent
+included, can describe SchemaBot freely; to show a command without running it,
+put it in a code block or a quote.
 
 ### Applies happen before merge
 

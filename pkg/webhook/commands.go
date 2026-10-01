@@ -278,21 +278,60 @@ func (p *CommandParser) extractTenant(body string) (string, bool) {
 	return match[1], false
 }
 
+// markdownDirectiveText returns the lines of body that render as the
+// commenter's own text, dropping everything that only shows a command: fenced
+// and indented code, and quotes. A quote covers its `>` lines, the lines that
+// continue its paragraph without a `>` (which Markdown renders inside the
+// quote), and an HTML <blockquote>. A quote-reply to a SchemaBot command
+// therefore never runs that command.
 func markdownDirectiveText(body string) string {
 	var b strings.Builder
-	inFence := false
+	inFence, inQuote, inHTMLQuote := false, false, false
 	for line := range strings.Lines(body) {
 		leadingSpaces := len(line) - len(strings.TrimLeft(line, " "))
-		if leadingSpaces <= 3 && isMarkdownFence(line[leadingSpaces:]) {
-			inFence = !inFence
+		rest := line[leadingSpaces:]
+		markdownIndent := leadingSpaces <= 3
+		if inHTMLQuote {
+			inHTMLQuote = !closesHTMLQuote(line)
 			continue
 		}
-		if inFence || strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "\t") {
+		if strings.TrimSpace(line) == "" {
+			inQuote = false
+			continue
+		}
+		if markdownIndent && isMarkdownFence(rest) {
+			inFence = !inFence
+			inQuote = false
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if markdownIndent && strings.HasPrefix(rest, ">") {
+			inQuote = true
+			continue
+		}
+		if inQuote {
+			continue
+		}
+		if markdownIndent && opensHTMLQuote(rest) {
+			inHTMLQuote = !closesHTMLQuote(rest)
+			continue
+		}
+		if strings.HasPrefix(line, "    ") || strings.HasPrefix(line, "\t") {
 			continue
 		}
 		b.WriteString(line)
 	}
 	return b.String()
+}
+
+func opensHTMLQuote(line string) bool {
+	return strings.HasPrefix(strings.ToLower(line), "<blockquote")
+}
+
+func closesHTMLQuote(line string) bool {
+	return strings.Contains(strings.ToLower(line), "</blockquote>")
 }
 
 func isMarkdownFence(line string) bool {
