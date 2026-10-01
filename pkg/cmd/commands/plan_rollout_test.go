@@ -399,6 +399,39 @@ func TestApplyCmd_JSONOutputNamesTheRefusedTargets(t *testing.T) {
 	assert.Equal(t, []string{"/api/status", "/api/plan"}, *paths, "no lock is checked or taken and no apply is requested")
 }
 
+// With --output json an unsafe plan's warning is not printed, so the error
+// names each unsafe change and the command that permits them, starting with
+// the binary name, and a narrowed apply's command keeps its target.
+func TestApplyCmd_JSONOutputNamesTheUnsafeChanges(t *testing.T) {
+	drop := []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders",
+		TableChanges: []*apitypes.TableChangeResponse{{
+			TableName: "legacy", Namespace: "orders", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
+		}},
+	}}
+	schemaDir := writeTestSchemaDir(t)
+
+	for _, tc := range []struct {
+		name, target, narrowedTo, rerun string
+	}{
+		{name: "rollout-wide", rerun: "apply -s " + schemaDir + " -e production --allow-unsafe"},
+		{name: "narrowed", target: "payments-002", narrowedTo: "prod/payments-002", rerun: "apply -s " + schemaDir + " -e production --target payments-002 --allow-unsafe"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{PlanID: "plan-orders-1", Engine: "mysql", Changes: drop, NarrowedTo: tc.narrowedTo})
+			cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", Target: tc.target, NoLock: true, AutoApprove: true, Output: OutputFormatJSON}
+			var runErr error
+			out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+			require.Error(t, runErr)
+			assert.NotErrorIs(t, runErr, ErrSilent, "nothing else reports the refusal in JSON mode")
+			assert.Equal(t, "apply blocked: 1 unsafe change(s) detected (legacy: drops a table); to proceed with these destructive changes, re-run with: "+cliname.Name()+" "+tc.rerun, runErr.Error())
+			assert.NotContains(t, out, "Apply blocked", "the human warning is not printed in JSON mode:\n%s", out)
+			assert.NotContains(t, *paths, "/api/apply")
+		})
+	}
+}
+
 // A suggested command is pasted into a shell, so a schema directory or
 // selector that the shell would split or interpret is quoted.
 func TestApplyCmd_SuggestedCommandsQuoteTheirArguments(t *testing.T) {

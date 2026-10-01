@@ -181,7 +181,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Check for unsafe changes
 	if len(planResult.RolloutUnsafeChanges()) > 0 && !cmd.AllowUnsafe {
-		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target)
+		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Output)
 	}
 
 	// Check lock availability before showing plan (unless --force will break it anyway or --no-lock skips locking)
@@ -552,18 +552,26 @@ func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*cl
 // A plan narrowed to one rollout member keeps its target in the retry command,
 // so following the advice re-runs the change on that member and not across the
 // whole rollout.
-func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string) error {
-	// First show the plan so user can see what changes are proposed
-	OutputPlanResult(planResult, database, environment, schemaDir, true)
-	writeNarrowedTo(planResult)
-
-	// Then show the unsafe changes warning
+//
+// JSON output prints neither the plan nor the warning, so the error itself
+// names each unsafe change and the command that permits them.
+func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string, output OutputFormat) error {
 	unsafeChanges := planResult.RolloutUnsafeChanges()
 	retry := fmt.Sprintf("apply -s %s -e %s", initShellArg(schemaDir), initShellArg(environment))
 	if target != "" {
 		retry += " --target " + initShellArg(target)
 	}
-	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry+" --allow-unsafe")
+	retry += " --allow-unsafe"
+	if output == OutputFormatJSON {
+		return errors.New(templates.UnsafeChangesBlockedSummary(unsafeChanges, retry))
+	}
+
+	// First show the plan so user can see what changes are proposed
+	OutputPlanResult(planResult, database, environment, schemaDir, true)
+	writeNarrowedTo(planResult)
+
+	// Then show the unsafe changes warning
+	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry)
 	return ErrSilent
 }
 
