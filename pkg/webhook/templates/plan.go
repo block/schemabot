@@ -579,8 +579,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// Sizes of the tables the DDL above copies, rebuilds, or scans.
 	writeTableSizesSection(&sb, summary)
 
-	// How the DDL above changes the way existing columns sort and compare.
-	writeCollationChangesSection(&sb, summary)
+	// How the DDL above changes the way existing columns sort and compare, on
+	// the primary target.
+	writeCollationChangesSection(&sb, data)
 
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
@@ -3280,6 +3281,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements, budget)
 	}
 	writeTableSizesSection(sb, summary)
+	writeCollationChangesSection(sb, *plan)
 
 	// Blocked changes — statements the engine refuses; the apply will fail on
 	// them, so each environment's section discloses its own.

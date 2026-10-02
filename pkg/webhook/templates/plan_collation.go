@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -23,6 +24,16 @@ type CollationChangeData struct {
 // collationColumnsShown caps the column names one collation line lists, so a
 // CONVERT TO CHARACTER SET on a wide table stays one readable line.
 const collationColumnsShown = 8
+
+// collationGroupsInlineLimit is how many collation moves the section lists
+// before it collapses, and collationGroupsShown caps how many a collapsed
+// section lists, with the rest counted in a closing line. Collapsed lines
+// still count toward GitHub's comment size limit, so a plan that converts
+// every table in a schema does not spend the room its DDL needs.
+const (
+	collationGroupsInlineLimit = 5
+	collationGroupsShown       = 32
+)
 
 // collationGroup is the columns of one table that make the same collation
 // move, rendered as one line.
@@ -67,15 +78,66 @@ func writeCollationChangesSection(sb *strings.Builder, data PlanCommentData) {
 	if len(groups) == 0 {
 		return
 	}
-	sb.WriteString("🔤 **Collation changes**")
-	if scope := primaryTargetSizeScope(data.DeploymentDrift, inlineCode); scope != "" {
+	if len(groups) <= collationGroupsInlineLimit {
+		sb.WriteString("🔤 **Collation changes**")
+		if scope := primaryTargetSizeScope(data.DeploymentDrift, inlineCode); scope != "" {
+			fmt.Fprintf(sb, " (%s)", scope)
+		}
+		sb.WriteString(": these columns sort and compare under a new collation after the apply.\n")
+		for _, g := range groups {
+			writeCollationGroup(sb, g)
+		}
+		sb.WriteString("\n")
+		return
+	}
+	writeCollapsedCollationChanges(sb, groups, primaryTargetSizeScope(data.DeploymentDrift, summaryCode))
+}
+
+// writeCollapsedCollationChanges renders a section with more moves than
+// collationGroupsInlineLimit as one collapsed block whose summary counts the
+// columns and tables. Moves a unique index covers are listed first, since
+// those are the ones that can fail the apply; past collationGroupsShown the
+// rest are counted rather than listed.
+func writeCollapsedCollationChanges(sb *strings.Builder, groups []collationGroup, scope string) {
+	columns, tables := collationTotals(groups)
+	sb.WriteString("<details>\n<summary>🔤 <b>Collation changes</b>")
+	if scope != "" {
 		fmt.Fprintf(sb, " (%s)", scope)
 	}
-	sb.WriteString(": these columns sort and compare under a new collation after the apply.\n")
-	for _, g := range groups {
+	fmt.Fprintf(sb, ": %d %s on %d %s sort and compare under a new collation after the apply</summary>\n\n",
+		columns, pluralize("column", columns), tables, pluralize("table", tables))
+	ordered := slices.Clone(groups)
+	slices.SortStableFunc(ordered, func(a, b collationGroup) int {
+		return cmp.Compare(a.listingRank(), b.listingRank())
+	})
+	listed := ordered[:min(len(ordered), collationGroupsShown)]
+	for _, g := range listed {
 		writeCollationGroup(sb, g)
 	}
-	sb.WriteString("\n")
+	if rest := ordered[len(listed):]; len(rest) > 0 {
+		columns, tables := collationTotals(rest)
+		fmt.Fprintf(sb, "- …and %d more %s on %d %s\n", columns, pluralize("column", columns), tables, pluralize("table", tables))
+	}
+	sb.WriteString("\n</details>\n\n")
+}
+
+// listingRank orders a collapsed section: moves a unique index covers first.
+func (g collationGroup) listingRank() int {
+	if len(g.unique) > 0 {
+		return 0
+	}
+	return 1
+}
+
+// collationTotals counts the columns the groups move and the distinct tables
+// they are on.
+func collationTotals(groups []collationGroup) (columns, tables int) {
+	seen := make(map[string]struct{})
+	for _, g := range groups {
+		columns += len(g.columns)
+		seen[g.table] = struct{}{}
+	}
+	return columns, len(seen)
 }
 
 func writeCollationGroup(sb *strings.Builder, g collationGroup) {
@@ -94,12 +156,12 @@ func writeCollationGroup(sb *strings.Builder, g collationGroup) {
 		}
 	}
 	for _, u := range g.unique {
-		noun := "unique index"
+		noun, collisionTarget := "unique index", "that index"
 		if len(u.indexes) > 1 {
-			noun = "unique indexes"
+			noun, collisionTarget = "unique indexes", "one of them"
 		}
-		fmt.Fprintf(sb, "  - %s is in %s %s: the apply fails if two existing values compare equal under the new collation.\n",
-			inlineCode(u.column), noun, strings.Join(inlineCodeList(u.indexes), ", "))
+		fmt.Fprintf(sb, "  - %s is in %s %s: the apply fails if two existing rows collide in %s under the new collation.\n",
+			inlineCode(u.column), noun, strings.Join(inlineCodeList(u.indexes), ", "), collisionTarget)
 	}
 }
 

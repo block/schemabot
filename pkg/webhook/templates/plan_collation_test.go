@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -60,7 +61,7 @@ func TestRenderPlanComment_CollationChanges(t *testing.T) {
 		"- `slug` on `notes`: `utf8mb4_bin` → `utf8mb4_0900_ai_ci`\n"+
 		"  - Comparisons become case-insensitive: `'abc'` and `'ABC'` start comparing equal.\n"+
 		"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
-		"  - `slug` is in unique indexes `uk_slug`, `uk_owner_slug`: the apply fails if two existing values compare equal under the new collation.\n",
+		"  - `slug` is in unique indexes `uk_slug`, `uk_owner_slug`: the apply fails if two existing rows collide in one of them under the new collation.\n",
 		collationSection(t, out))
 }
 
@@ -155,4 +156,69 @@ func TestRenderPlanComment_CollationChangesOnLockedComment(t *testing.T) {
 
 	data.PendingManualConfirmation = true
 	assert.Contains(t, RenderPlanComment(data), "🔤 **Collation changes**")
+}
+
+func collationMove(table, column string) CollationChangeData {
+	return CollationChangeData{
+		Table: table, Column: column, From: "utf8mb4_general_ci", To: "utf8mb4_bin",
+		Case: engine.ComparisonBecomesSensitive, TrailingSpaces: engine.ComparisonUnchanged,
+	}
+}
+
+// A plan that moves many tables collapses the section and counts the moves in
+// its summary. The moves a unique index covers are listed first, since they
+// are the ones that can fail the apply, and past the listing cap the rest are
+// counted rather than listed.
+func TestRenderPlanComment_CollationChangesCollapse(t *testing.T) {
+	var changes []CollationChangeData
+	for i := range collationGroupsShown + 3 {
+		changes = append(changes, collationMove(fmt.Sprintf("t%02d", i), "body"))
+	}
+	last := collationMove("t_last", "handle")
+	last.To, last.Case, last.TrailingSpaces = "utf8mb4_0900_ai_ci", engine.ComparisonUnchanged, engine.ComparisonBecomesSensitive
+	last.UniqueIndexes = []string{"uk_handle"}
+	changes = append(changes, last)
+	out := RenderPlanComment(collationPlanData(collationKeyspace("testapp", changes...)))
+
+	assert.NotContains(t, out, "🔤 **Collation changes**")
+	assert.Contains(t, out, "<details>\n<summary>🔤 <b>Collation changes</b>: 36 columns on 36 tables sort and compare under a new collation after the apply</summary>\n\n"+
+		"- `handle` on `t_last`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`\n")
+	assert.Contains(t, out, "  - `handle` is in unique index `uk_handle`: the apply fails if two existing rows collide in that index under the new collation.\n")
+	assert.Contains(t, out, "- `body` on `t30`: ")
+	assert.NotContains(t, out, "- `body` on `t31`: ")
+	assert.Contains(t, out, "- …and 4 more columns on 4 tables\n\n</details>\n\n")
+
+	inline := RenderPlanComment(collationPlanData(collationKeyspace("testapp", changes[:collationGroupsInlineLimit]...)))
+	assert.Contains(t, inline, "🔤 **Collation changes**: ")
+	assert.NotContains(t, inline, "<b>Collation changes</b>")
+}
+
+// Every comment that shows a plan shows its collation changes: each
+// environment's section of a multi-environment plan, and the plan an apply
+// rejection renders above the reason it refuses.
+func TestCollationChangesRenderOnEveryPlanComment(t *testing.T) {
+	plan := func(environment string) *PlanCommentData {
+		data := collationPlanData(collationKeyspace("testapp", collationMove("notes", "body")))
+		data.Environment = environment
+		return &data
+	}
+	line := "- `body` on `notes`: `utf8mb4_general_ci` → `utf8mb4_bin`\n"
+
+	staging, production := plan("staging"), plan("production")
+	production.Changes[0].CollationChanges[0].Column = "memo"
+	multi := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
+		Environments: []string{"staging", "production"},
+		Plans:        map[string]*PlanCommentData{"staging": staging, "production": production},
+	})
+	assert.Contains(t, multi, line, "staging section")
+	assert.Contains(t, multi, "- `memo` on `notes`: `utf8mb4_general_ci` → `utf8mb4_bin`\n", "production section")
+
+	unsafe := plan("staging")
+	unsafe.UnsafeChanges = []UnsafeChangeData{{Table: "notes", Reason: "DROP COLUMN"}}
+	assert.Contains(t, collationSection(t, RenderUnsafeChangesBlocked(*unsafe)), line, "unsafe changes blocked")
+
+	blocked := plan("staging")
+	blocked.BlockedChanges = []BlockedChangeData{{Table: "notes", Reason: "unsupported statement"}}
+	assert.Contains(t, collationSection(t, RenderBlockedChangesApplyRejected(*blocked)), line, "apply rejected")
 }
