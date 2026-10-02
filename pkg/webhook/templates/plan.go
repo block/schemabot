@@ -671,7 +671,7 @@ func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
 func writeApplyInstruction(sb *strings.Builder, command string, data PlanCommentData) {
 	if consent, ok := planUnsafeConsent(data); ok {
-		fmt.Fprintf(sb, "▶️ **To apply** all schema changes from this PR, %s:\n", consent.instruction())
+		fmt.Fprintf(sb, "▶️ **To apply**, %s:\n", consent.instruction())
 	} else {
 		sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
 	}
@@ -688,14 +688,11 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 type unsafeConsent struct {
 	findings int
 	tables   string
-	// owners links the open pull requests that applied some of the changes,
-	// each once. Merging them and re-planning is the expected path, so the
-	// instruction leads with it and offers consent as the exception.
+	// owners links the open pull requests whose applied changes this plan
+	// undoes, each once. The instruction names them as a fact and leaves the
+	// choice to the reader: merging one first is right when it will land,
+	// and undoing it is right when it was abandoned.
 	owners []string
-	// untraced is set when a change's ownership could not be established.
-	// Its table is tagged in the consent list rather than turned into a step,
-	// since the reader has no more to go on than SchemaBot does.
-	untraced bool
 }
 
 // planUnsafeConsent reports what the plan's apply would confirm with
@@ -709,13 +706,13 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	if len(data.BlockedChanges) > 0 {
 		return unsafeConsent{}, false
 	}
-	var c unsafeConsent
-	untraced := make(map[string]bool)
+	c := unsafeConsent{
+		findings: countUnsafeFindings(data.UnsafeChanges),
+		tables:   unsafeChangeTables(data.UnsafeChanges),
+	}
 	seen := make(map[string]bool)
 	for _, a := range data.AttributedChanges {
 		if a.Unresolved {
-			untraced[a.Table] = true
-			c.untraced = true
 			continue
 		}
 		link := caller.PullRequestMarkdownLink(a.Repository, a.PullRequest)
@@ -724,35 +721,25 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 			c.owners = append(c.owners, link)
 		}
 	}
-	c.findings = countUnsafeFindings(data.UnsafeChanges)
-	c.tables = unsafeChangeTables(data.UnsafeChanges, untraced)
 	return c, true
 }
 
 // instruction is the clause that tells the reader how to apply, lower-cased
 // to continue a sentence.
 func (c unsafeConsent) instruction() string {
-	confirm := "the unsafe change on " + c.tables
+	noun := "unsafe change"
 	if c.findings > 1 {
-		confirm = fmt.Sprintf("the %d unsafe changes on %s", c.findings, c.tables)
+		noun = "unsafe changes"
 	}
-	addFlag := "comment the command below with `--allow-unsafe` added"
-	if len(c.owners) == 0 {
-		return addFlag + " to confirm " + confirm
+	consent := fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s)", c.findings, noun, c.tables)
+	switch len(c.owners) {
+	case 0:
+		return consent
+	case 1:
+		return consent + ". This undoes open PR " + c.owners[0]
+	default:
+		return consent + ". This undoes open PRs " + englishList(c.owners)
 	}
-	replan := fmt.Sprintf("first merge %s or bring this PR up to date with %s, then re-plan", englishList(c.owners), itOrThem(len(c.owners)))
-	anyway := "To apply as planned anyway, " + addFlag
-	if c.untraced {
-		anyway += " to confirm " + confirm
-	}
-	return replan + ". " + anyway
-}
-
-func itOrThem(n int) string {
-	if n == 1 {
-		return "it"
-	}
-	return "them"
 }
 
 // englishList joins items as an English list: "a", "a and b", "a, b, and c".
@@ -770,40 +757,32 @@ func englishList(items []string) string {
 }
 
 // unsafeChangeTables names what the unsafe changes touch, each once in
-// first-appearance order, as an English list: a table by its code span, with
-// the shards it applies to when only some carry it, and a VSchema by its
-// namespace. The labels match the ones the unsafe findings list above uses,
-// so the reader can match one to the other. A table whose ownership could not
-// be established is tagged as not traced to any PR.
-func unsafeChangeTables(changes []UnsafeChangeData, untraced map[string]bool) string {
+// first-appearance order, comma-separated: a table by its code span, with the
+// shards it applies to when only some carry it, and a VSchema by its
+// namespace. The names match the ones the unsafe findings list above uses, so
+// the reader can match one to the other.
+func unsafeChangeTables(changes []UnsafeChangeData) string {
 	seen := make(map[string]bool, len(changes))
 	var targets []string
 	for _, c := range changes {
-		target := unsafeConsentTarget(c, untraced[c.Table])
+		target := unsafeConsentTarget(c)
 		if seen[target] {
 			continue
 		}
 		seen[target] = true
 		targets = append(targets, target)
 	}
-	return englishList(targets)
+	return strings.Join(targets, ", ")
 }
 
-func unsafeConsentTarget(c UnsafeChangeData, untraced bool) string {
+func unsafeConsentTarget(c UnsafeChangeData) string {
 	if c.VSchemaNamespace != "" {
-		return "the " + inlineCode(c.VSchemaNamespace) + " VSchema"
+		return inlineCode(c.VSchemaNamespace) + " VSchema"
 	}
-	var notes []string
 	if len(c.Shards) > 0 {
-		notes = append(notes, planShardList(c.Shards, c.TotalShards))
+		return inlineCode(c.Table) + " on " + planShardList(c.Shards, c.TotalShards)
 	}
-	if untraced {
-		notes = append(notes, "not traced to any PR")
-	}
-	if len(notes) == 0 {
-		return inlineCode(c.Table)
-	}
-	return fmt.Sprintf("%s (%s)", inlineCode(c.Table), strings.Join(notes, ", "))
+	return inlineCode(c.Table)
 }
 
 // attributionStillActionable reports whether the attributed-changes

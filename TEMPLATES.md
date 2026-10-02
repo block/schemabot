@@ -582,7 +582,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment the command below with `--allow-unsafe` added to confirm the unsafe change on `orders`:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`orders`):
 ```
 schemabot apply -e staging
 ```
@@ -626,7 +626,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply** all schema changes from this PR, first merge [block/schemabot#4820](https://github.com/block/schemabot/pull/4820) and [block/schemabot#4821](https://github.com/block/schemabot/pull/4821) or bring this PR up to date with them, then re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`orders`, `reconcile_state`). This undoes open PRs [block/schemabot#4820](https://github.com/block/schemabot/pull/4820) and [block/schemabot#4821](https://github.com/block/schemabot/pull/4821):
 ```
 schemabot apply -e staging
 ```
@@ -1205,7 +1205,7 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on the `commerce_sharded` VSchema:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`commerce_sharded` VSchema):
 ```
 schemabot apply -e staging
 ```
@@ -8999,7 +8999,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment the command below with `--allow-unsafe` added to confirm the unsafe change on `mutes` (shard `40-80`):
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`mutes` on shard `40-80`):
 ```
 schemabot apply -e production
 ```

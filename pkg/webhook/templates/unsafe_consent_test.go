@@ -53,7 +53,7 @@ func TestRenderPlanComment_UnsafeConsentLeadsIntoPlainCommand(t *testing.T) {
 	for _, block := range fencedCommands(t, out) {
 		assert.NotContains(t, block, "--allow-unsafe", "the pasteable command never carries the consent flag")
 	}
-	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```")
 	assert.NotContains(t, out, glyph.Attention+" This plan", "the footer adds no second warning glyph")
 }
 
@@ -67,11 +67,11 @@ func TestRenderPlanComment_UnsafeConsentNamesEachTableOnce(t *testing.T) {
 		{Table: "ledger", Reason: "DROP TABLE removes all data"},
 	}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "to confirm the 4 unsafe changes on `transfer_events`, `refunds`, and `ledger`:")
+	assert.Contains(t, out, "to confirm 4 unsafe changes (`transfer_events`, `refunds`, `ledger`):")
 
 	data.UnsafeChanges = data.UnsafeChanges[:1]
 	out = RenderPlanComment(*data)
-	assert.Contains(t, out, "to confirm the unsafe change on `transfer_events`:")
+	assert.Contains(t, out, "to confirm 1 unsafe change (`transfer_events`):")
 }
 
 // A sharded change that only some shards carry is named with its shards, and a
@@ -84,19 +84,23 @@ func TestRenderPlanComment_UnsafeConsentNamesShardsAndVSchema(t *testing.T) {
 		{Table: "commerce_sharded/vschema.json", VSchemaNamespace: "commerce_sharded", Reason: "table `customers` no longer uses vindex `customers_email_lookup`"},
 	}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "to confirm the 3 unsafe changes on `mutes` (shard `40-80`) and the `commerce_sharded` VSchema:")
+	assert.Contains(t, out, "to confirm 3 unsafe changes (`mutes` on shard `40-80`, `commerce_sharded` VSchema):")
 }
 
-// When the changes being removed were applied by another open pull request,
-// the instruction leads with re-planning, since that is the expected path, and
-// offers consent only as the exception. It names that pull request itself, so
-// the reader acts from the footer without scrolling back to the attribution.
-func TestRenderPlanComment_UnsafeConsentLeadsWithReplanForAttributedChanges(t *testing.T) {
+// When the plan undoes changes another open pull request applied, the
+// instruction names that pull request as a fact and leaves the choice to the
+// reader: merging it first is right when it will land, and undoing it is right
+// when it was abandoned. It never sends the reader back up to the attribution.
+func TestRenderPlanComment_UnsafeConsentNamesTheOpenPRItUndoes(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790}}
 	out := RenderPlanComment(*data)
 
-	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, first merge [acme/payments#4790](https://github.com/acme/payments/pull/4790) or bring this PR up to date with it, then re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added:\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`). This undoes open PR [acme/payments#4790](https://github.com/acme/payments/pull/4790):\n```\nschemabot apply -e staging\n```")
+	_, footer, found := strings.Cut(out, "▶️ **To apply**")
+	require.True(t, found, "the comment offers an apply")
+	assert.NotContains(t, footer, "merge", "an open PR may be abandoned, so the footer does not prescribe merging it")
+	assert.NotContains(t, footer, "Check before applying", "the footer stands on its own")
 	for _, block := range fencedCommands(t, out) {
 		assert.NotContains(t, block, "--allow-unsafe")
 	}
@@ -120,7 +124,7 @@ func TestRenderPlanComment_NoUnsafeConsentOnLockedApply(t *testing.T) {
 	data.AllowUnsafe = true
 	data.PendingManualConfirmation = true
 	out := RenderPlanComment(*data)
-	assert.NotContains(t, out, "to confirm the 2 unsafe changes")
+	assert.NotContains(t, out, "to confirm 2 unsafe changes")
 	assert.Contains(t, fencedCommands(t, out), "schemabot apply-confirm -e staging --allow-unsafe")
 }
 
@@ -140,26 +144,25 @@ func TestRenderMultiEnvPlanComment_UnsafeConsentPerEnvironment(t *testing.T) {
 
 	out := render(clean, unsafeConsentPlan("production"))
 	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n```\nschemabot apply -e staging\n```")
-	assert.Contains(t, out, "After verifying staging, apply to production. Comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e production\n```")
+	assert.Contains(t, out, "After verifying staging, apply to production. Add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e production\n```")
 	for _, block := range fencedCommands(t, out) {
 		assert.NotContains(t, block, "--allow-unsafe")
 	}
 
 	out = render(unsafeConsentPlan("staging"), unsafeConsentPlan("production"))
-	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment. Comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment. Add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```")
 
 	out = RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "payments", IsMySQL: true, DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*PlanCommentData{"staging": unsafeConsentPlan("staging"), "production": nil},
 	})
-	assert.Contains(t, out, "▶️ **To apply** these changes, comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply** these changes, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```")
 }
 
-// The instruction names every owning pull request once, and tags a table
-// whose ownership could not be established in the consent list, so it stays
-// accurate for several owners and for unknown ones without asking the reader
-// to investigate.
+// The instruction names each open pull request once, however many tables it
+// touched, and adds nothing for a table whose ownership could not be
+// established: the reader has no more to go on than SchemaBot does.
 func TestRenderPlanComment_UnsafeConsentAccurateForUnknownAndMultipleOwners(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.AttributedChanges = []AttributedChangeData{
@@ -168,26 +171,18 @@ func TestRenderPlanComment_UnsafeConsentAccurateForUnknownAndMultipleOwners(t *t
 		{Table: "refund_events", Repository: "acme/payments", PullRequest: 4790},
 	}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "first merge [acme/payments#4790](https://github.com/acme/payments/pull/4790) and [acme/payments#4791](https://github.com/acme/payments/pull/4791) or bring this PR up to date with them, then re-plan.")
+	assert.Contains(t, out, "This undoes open PRs [acme/payments#4790](https://github.com/acme/payments/pull/4790) and [acme/payments#4791](https://github.com/acme/payments/pull/4791):")
 
-	data.UnsafeChanges = append(data.UnsafeChanges,
-		UnsafeChangeData{Table: "ledger", Reason: "DROP COLUMN discards the column's data"},
-		UnsafeChangeData{Table: "mutes", Reason: "DROP COLUMN removes data and is irreversible", Shards: []string{"40-80"}, TotalShards: 4},
-	)
-	data.AttributedChanges = []AttributedChangeData{{Table: "ledger", Unresolved: true}, {Table: "mutes", Unresolved: true}}
+	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Unresolved: true}}
 	out = RenderPlanComment(*data)
-	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, comment the command below with `--allow-unsafe` added to confirm the 4 unsafe changes on `transfer_events`, `refund_backfill`, `ledger` (not traced to any PR), and `mutes` (shard `40-80`, not traced to any PR):")
+	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```")
 
 	data.AttributedChanges = []AttributedChangeData{
 		{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790},
-		{Table: "ledger", Unresolved: true},
+		{Table: "refund_backfill", Unresolved: true},
 	}
 	out = RenderPlanComment(*data)
-	assert.Contains(t, out, "first merge [acme/payments#4790](https://github.com/acme/payments/pull/4790) or bring this PR up to date with it, then re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added to confirm the 4 unsafe changes on `transfer_events`, `refund_backfill`, `ledger` (not traced to any PR), and `mutes` (shard `40-80`):")
-	_, footer, found := strings.Cut(out, "▶️ **To apply**")
-	require.True(t, found, "the comment offers an apply")
-	assert.NotContains(t, footer, "Check before applying", "the footer stands on its own")
-	assert.NotContains(t, footer, "check who", "the footer asks for no investigation SchemaBot could not do")
+	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`). This undoes open PR [acme/payments#4790](https://github.com/acme/payments/pull/4790):\n```")
 }
 
 // A plan that also carries a change the engine refuses fails its apply
