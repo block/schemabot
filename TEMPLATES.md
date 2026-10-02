@@ -626,7 +626,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply** all schema changes from this PR, first resolve **Check before applying** and re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added:
+▶️ **To apply** all schema changes from this PR, first merge [block/schemabot#4820](https://github.com/block/schemabot/pull/4820) and [block/schemabot#4821](https://github.com/block/schemabot/pull/4821) or bring this PR up to date with them, then re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added:
 ```
 schemabot apply -e staging
 ```

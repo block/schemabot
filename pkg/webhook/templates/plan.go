@@ -681,19 +681,21 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 // unsafeConsent is what an apply of one plan would confirm with
 // --allow-unsafe. The apply instruction states it in the sentence that leads
 // into the command, so the reader meets the requirement before copying the
-// command rather than after the gate rejects it. The flag is deliberately left
-// out of the pasteable command: consenting to destroy data takes typing it,
-// which a copy-paste of the plan's own command never does.
+// command rather than after the gate rejects it, and without scrolling back up
+// to the sections that explain it. The flag is deliberately left out of the
+// pasteable command: consenting to destroy data takes typing it, which a
+// copy-paste of the plan's own command never does.
 type unsafeConsent struct {
 	findings int
 	tables   string
-	// unattributed reports that some of the changes are listed in the
-	// attribution section: another open pull request applied them, or their
-	// ownership could not be established. Resolving those and re-planning is
-	// the expected path, so the instruction leads with it, points at that
-	// section rather than naming an owner it may not have, and offers consent
-	// as the exception.
-	unattributed bool
+	// owners links the open pull requests that applied some of the changes,
+	// each once. Merging them and re-planning is the expected path, so the
+	// instruction leads with it and offers consent as the exception.
+	owners []string
+	// untraced is set when a change's ownership could not be established.
+	// Its table is tagged in the consent list rather than turned into a step,
+	// since the reader has no more to go on than SchemaBot does.
+	untraced bool
 }
 
 // planUnsafeConsent reports what the plan's apply would confirm with
@@ -707,11 +709,24 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	if len(data.BlockedChanges) > 0 {
 		return unsafeConsent{}, false
 	}
-	return unsafeConsent{
-		findings:     countUnsafeFindings(data.UnsafeChanges),
-		tables:       unsafeChangeTables(data.UnsafeChanges),
-		unattributed: len(data.AttributedChanges) > 0,
-	}, true
+	var c unsafeConsent
+	untraced := make(map[string]bool)
+	seen := make(map[string]bool)
+	for _, a := range data.AttributedChanges {
+		if a.Unresolved {
+			untraced[a.Table] = true
+			c.untraced = true
+			continue
+		}
+		link := caller.PullRequestMarkdownLink(a.Repository, a.PullRequest)
+		if !seen[link] {
+			seen[link] = true
+			c.owners = append(c.owners, link)
+		}
+	}
+	c.findings = countUnsafeFindings(data.UnsafeChanges)
+	c.tables = unsafeChangeTables(data.UnsafeChanges, untraced)
+	return c, true
 }
 
 // instruction is the clause that tells the reader how to apply, lower-cased
@@ -721,50 +736,74 @@ func (c unsafeConsent) instruction() string {
 	if c.findings > 1 {
 		confirm = fmt.Sprintf("the %d unsafe changes on %s", c.findings, c.tables)
 	}
-	if c.unattributed {
-		// The attribution section and the unsafe findings sit just above and
-		// already list what the flag confirms, so the instruction only says
-		// what to do.
-		return "first resolve **Check before applying** and re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added"
+	addFlag := "comment the command below with `--allow-unsafe` added"
+	if len(c.owners) == 0 {
+		return addFlag + " to confirm " + confirm
 	}
-	return "comment the command below with `--allow-unsafe` added to confirm " + confirm
+	replan := fmt.Sprintf("first merge %s or bring this PR up to date with %s, then re-plan", englishList(c.owners), itOrThem(len(c.owners)))
+	anyway := "To apply as planned anyway, " + addFlag
+	if c.untraced {
+		anyway += " to confirm " + confirm
+	}
+	return replan + ". " + anyway
+}
+
+func itOrThem(n int) string {
+	if n == 1 {
+		return "it"
+	}
+	return "them"
+}
+
+// englishList joins items as an English list: "a", "a and b", "a, b, and c".
+func englishList(items []string) string {
+	switch len(items) {
+	case 0:
+		return ""
+	case 1:
+		return items[0]
+	case 2:
+		return items[0] + " and " + items[1]
+	default:
+		return strings.Join(items[:len(items)-1], ", ") + ", and " + items[len(items)-1]
+	}
 }
 
 // unsafeChangeTables names what the unsafe changes touch, each once in
 // first-appearance order, as an English list: a table by its code span, with
 // the shards it applies to when only some carry it, and a VSchema by its
 // namespace. The labels match the ones the unsafe findings list above uses,
-// so the reader can match one to the other.
-func unsafeChangeTables(changes []UnsafeChangeData) string {
+// so the reader can match one to the other. A table whose ownership could not
+// be established is tagged as not traced to any PR.
+func unsafeChangeTables(changes []UnsafeChangeData, untraced map[string]bool) string {
 	seen := make(map[string]bool, len(changes))
 	var targets []string
 	for _, c := range changes {
-		target := unsafeConsentTarget(c)
+		target := unsafeConsentTarget(c, untraced[c.Table])
 		if seen[target] {
 			continue
 		}
 		seen[target] = true
 		targets = append(targets, target)
 	}
-	switch len(targets) {
-	case 1:
-		return targets[0]
-	case 2:
-		return targets[0] + " and " + targets[1]
-	default:
-		return strings.Join(targets[:len(targets)-1], ", ") + ", and " + targets[len(targets)-1]
-	}
+	return englishList(targets)
 }
 
-func unsafeConsentTarget(c UnsafeChangeData) string {
+func unsafeConsentTarget(c UnsafeChangeData, untraced bool) string {
 	if c.VSchemaNamespace != "" {
 		return "the " + inlineCode(c.VSchemaNamespace) + " VSchema"
 	}
-	target := inlineCode(c.Table)
+	var notes []string
 	if len(c.Shards) > 0 {
-		target = fmt.Sprintf("%s (%s)", target, planShardList(c.Shards, c.TotalShards))
+		notes = append(notes, planShardList(c.Shards, c.TotalShards))
 	}
-	return target
+	if untraced {
+		notes = append(notes, "not traced to any PR")
+	}
+	if len(notes) == 0 {
+		return inlineCode(c.Table)
+	}
+	return fmt.Sprintf("%s (%s)", inlineCode(c.Table), strings.Join(notes, ", "))
 }
 
 // attributionStillActionable reports whether the attributed-changes
