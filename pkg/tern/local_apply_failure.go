@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -137,10 +138,11 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 }
 
 // failApplyAndNotify fails the apply and, once storage holds a terminal state
-// for it, runs the side effects that state owes: the pending control requests
-// it moots are settled, then the observer posts the terminal summary. Nothing
-// later re-claims a failed apply to do either, so a drive that fails an apply
-// and owes nothing more than that goes through here rather than calling
+// for it, runs the side effects that state owes: the start that admitted this
+// claim is answered with the failure, the pending control requests the outcome
+// moots are settled, then the observer posts the terminal summary. Nothing
+// later re-claims a failed apply to do any of these, so a drive that fails an
+// apply and owes nothing more than that goes through here rather than calling
 // failApplyWithTasks directly. A settlement failure is logged and the summary
 // still posts (see settleRequestsForStoredOutcome); the operator's post-drive
 // settlement retries the requests left pending.
@@ -162,9 +164,41 @@ func (c *LocalClient) failApplyAndNotify(ctx context.Context, apply *storage.App
 			apply.LogAttrs()...)
 		return nil
 	}
-	c.settleRequestsForStoredOutcome(ctx, c.logger.With(apply.IdentityLogAttrs()...), apply)
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	if state.IsState(apply.State, state.Apply.Failed) {
+		c.failPendingStartForFailedApply(ctx, logger, apply, errMsg)
+	}
+	c.settleRequestsForStoredOutcome(ctx, logger, apply)
 	c.notifyTerminalObserver(apply, tasks)
 	return nil
+}
+
+// failPendingStartForFailedApply answers the pending start of an apply whose
+// stored state is failed. The start admitted the claim that failed, and no
+// later claim of a failed apply will consume it, so it fails with the apply's
+// reason: the operator reads that their command did not take effect. An apply
+// adopted into another terminal state keeps its pending start — a stopped
+// apply's start stays deliverable to the claim that resumes it.
+//
+// A read or write that does not land is logged rather than returned (RC-5):
+// the request stays pending and nothing re-claims the apply to settle it,
+// which the log says, while the caller still posts the summary the stored
+// failure owes.
+func (c *LocalClient) failPendingStartForFailedApply(ctx context.Context, logger *slog.Logger, apply *storage.Apply, errMsg string) {
+	startReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
+	if err != nil {
+		logger.Warn("failed to read the pending start request for the stored failure; a pending start stays pending with nothing left to claim the failed apply, and the terminal summary still posts",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return
+	}
+	if startReq == nil {
+		logger.Debug("no pending start request to answer for the stored failure")
+		return
+	}
+	if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, errMsg); err != nil {
+		logger.Warn("failed to fail the pending start request for the stored failure; it stays pending with nothing left to claim the failed apply, and the terminal summary still posts",
+			append(apply.MutableLogAttrs(), "error", err)...)
+	}
 }
 
 // markApplyRetryableWithTasks pauses an apply after a retryable engine failure.
