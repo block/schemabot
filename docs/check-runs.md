@@ -974,7 +974,7 @@ Apply-confirm asks all of this again against the rollout as it is at confirm,
 and also refuses when a target's work differs from what the confirmed comment
 showed, the reviewed target's included, or when a reviewed target confirmed as
 already converged has since gained changes of its own. A target's work is its
-whole plan: its table statements and how each runs, each shard's own changes,
+whole plan: its table statements, how each runs and whether each is unsafe and why, each shard's own changes,
 which namespaces end with a finalizer, and the VSchema each of those writes.
 The reviewed target is held to the confirmed plan while the environment has
 several targets, and also when the confirmed round stored plans for other

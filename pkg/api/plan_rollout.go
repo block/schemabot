@@ -453,9 +453,10 @@ func (s *Service) rolloutApplyRefusals(ctx context.Context, environment, planID 
 // A member with a plan of its own is held to what the reviewed plan's apply
 // can run (MemberWorkTheReviewedPlanCannotRun, and
 // MemberWorkAConvergedReviewedPlanCannotRun when the reviewed plan is empty),
-// and its direct-execution change is refused as well: only a pull request
-// comment disclosed it under the target that runs it
-// (rejectUnconfirmedMemberDirectExecution). Those are refused as needing a
+// and its direct-execution change and any unsafe change the reviewed plan does
+// not carry are refused as well: only a pull request comment disclosed them
+// under the target that runs them (rejectUnconfirmedMemberDirectExecution,
+// rejectMemberUndisclosedUnsafe). Those are refused as needing a
 // target: an apply narrowed to the member runs its own plan as the reviewed
 // one, which carries its own unsafe changes and direct verdicts. Work that
 // apply refuses as well is refused as blocked, since no apply runs it
@@ -480,6 +481,9 @@ func memberWorkARolloutWideAPIApplyCannotRun(reviewed, member *storage.Plan) (re
 		if detail := MemberWorkAConvergedReviewedPlanCannotRun(member); detail != "" {
 			return apitypes.PlanMemberNeedsTarget, detail
 		}
+	}
+	if change, ok := firstUndisclosedMemberUnsafeChange(reviewed, member); ok {
+		return apitypes.PlanMemberNeedsTarget, change.description()
 	}
 	if table := firstDirectExecutionTable(member); table != "" {
 		return apitypes.PlanMemberNeedsTarget, fmt.Sprintf("runs table %q as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target", table)

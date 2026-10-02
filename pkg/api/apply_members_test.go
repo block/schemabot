@@ -526,6 +526,57 @@ func TestCreateStoredApply_UndisclosedUnsafeMemberChangeIsRefusedUnderTheOptIn(t
 	assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
 }
 
+// A pull request apply-confirm runs on a comment that discloses each target's
+// unsafe changes under that target, so a member's unsafe change runs whether
+// or not the reviewed plan carries it, and whether or not the reviewed plan has
+// work at all. It still needs the opt-in, as the reviewed plan's own does: one
+// --allow-unsafe consents for every target.
+func TestCreateStoredApply_ConfirmedMemberUnsafeChangeNeedsOnlyTheOptIn(t *testing.T) {
+	memberDrop := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` DROP COLUMN `legacy_id`",
+		IsUnsafe:  true,
+	}
+	alter := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+	withWork := primaryPlanRow("testapp-001")
+	withWork.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+	for _, tc := range []struct {
+		name     string
+		reviewed *storage.Plan
+	}{
+		{name: "reviewed target already at the schema", reviewed: primaryPlanRow("testapp-001")},
+		{name: "reviewed plan without the member's unsafe change", reviewed: withWork},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := ApplyRequest{Environment: "production", ConfirmedMemberWork: true}
+
+			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(memberDrop)}})
+			_, _, err := svc.createStoredApply(t.Context(), tc.reviewed, req, nil, "apply-member-unsafe-no-opt-in")
+			require.Error(t, err)
+			refused, ok := errors.AsType[*MemberPlanRefusedError](err)
+			require.True(t, ok, "the refusal is typed so a caller can name the target without rendering the error")
+			assert.Equal(t, MemberPlanUnsafeWithoutOptIn, refused.Refusal)
+			assert.Equal(t, "eu/testapp-002", refused.Target)
+			assert.Equal(t, "users", refused.Table)
+			assert.Contains(t, err.Error(), "retry with allow_unsafe=true")
+
+			svc = multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(memberDrop)}})
+			_, _, err = svc.createStoredApply(t.Context(), tc.reviewed, req, map[string]string{"allow_unsafe": "true"}, "apply-member-unsafe-opted-in")
+			require.NoError(t, err, "the opt-in consents to the member's disclosed unsafe change")
+			applies, ok := svc.storage.Applies().(*capturingApplyStore)
+			require.True(t, ok)
+			require.NotNil(t, applies.apply)
+		})
+	}
+}
+
 // The preflight a PR apply runs before it pauses asks of each member what apply
 // creation asks, so a confirmation is never pinned for work creation refuses.
 func TestMemberWorkTheReviewedPlanCannotRun(t *testing.T) {
@@ -551,7 +602,7 @@ func TestMemberWorkTheReviewedPlanCannotRun(t *testing.T) {
 	}{
 		{name: "same work", reviewed: planWith(alter), member: planWith(alter), want: ""},
 		{name: "disclosed unsafe change", reviewed: planWith(alter, drop), member: planWith(alter, drop), want: ""},
-		{name: "undisclosed unsafe change", reviewed: planWith(alter), member: planWith(alter, drop), want: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`},
+		{name: "an unsafe change only the member carries", reviewed: planWith(alter), member: planWith(alter, drop), want: ""},
 		{name: "disclosed direct execution", reviewed: planWith(alter), member: planWith(direct), want: ""},
 		{name: "disclosed direct execution the reviewed plan runs too", reviewed: planWith(direct), member: planWith(direct), want: ""},
 		{name: "blocked change", reviewed: planWith(alter), member: planWith(blocked), want: "carries changes its target's engine refuses"},
@@ -694,8 +745,8 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsAMembersDirectChange(t *testing.
 
 // An apply created from a reviewed plan with no work gives every member one work
 // operation, so member work that needs another shape is refused rather than
-// settled as done. So are unsafe changes, even under the opt-in, whose consent
-// is given against a disclosure the empty reviewed plan does not carry.
+// settled as done. So is an unsafe change, even under the opt-in, for a caller
+// that was shown only the empty reviewed plan's disclosure.
 func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
@@ -1068,7 +1119,7 @@ func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
 // so the member's copy runs under the opt-in. A drop of another column on the
 // same table is a different statement, and the refusal says the statements
 // differ.
-func TestUndisclosedMemberUnsafeChange_SchemaQualifierIsNotADifference(t *testing.T) {
+func TestFirstUndisclosedMemberUnsafeChange_SchemaQualifierIsNotADifference(t *testing.T) {
 	planWith := func(ddl string) *storage.Plan {
 		plan := primaryPlanRow("testapp-001")
 		plan.DatabaseType = storage.DatabaseTypePostgres
@@ -1079,10 +1130,11 @@ func TestUndisclosedMemberUnsafeChange_SchemaQualifierIsNotADifference(t *testin
 	}
 	reviewed := planWith(`ALTER TABLE "app_eu".users DROP COLUMN legacy`)
 
-	assert.Empty(t, UndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN legacy`)),
-		"the same drop rendered against another physical schema is the change the disclosure named")
-	assert.Equal(t, `carries an unsafe change for table "users" whose statement differs from the one the reviewed plan discloses for that table`,
-		UndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN nickname`)))
+	_, undisclosed := firstUndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN legacy`))
+	assert.False(t, undisclosed, "the same drop rendered against another physical schema is the change the disclosure named")
+	change, undisclosed := firstUndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN nickname`))
+	require.True(t, undisclosed)
+	assert.Equal(t, `carries an unsafe change for table "users" whose statement differs from the one the reviewed plan discloses for that table`, change.description())
 }
 
 // A sharded apply builds every member into per-shard operations. A member
