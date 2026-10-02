@@ -90,7 +90,7 @@ func TestReviewDriftComment_IndependentCleanDoesNotClaimAgreement(t *testing.T) 
 	}
 
 	for _, target := range []string{"orders-001", "orders-002", "orders-003"} {
-		assert.Contains(t, out, "### Target `commerce/"+target+"`\n\n```sql\n",
+		assert.Contains(t, out, "### Target `commerce/"+target+"`\n\n1 DDL statement\n\n```sql\n",
 			"each target's plan renders under it alone, not as one shared plan")
 	}
 	assert.NotContains(t, out, "Same plan on all",
@@ -122,7 +122,7 @@ func TestReviewDriftComment_IndependentSurfacesBlockedMember(t *testing.T) {
 	// Both members are addressed by one deployment, so the deployment name alone
 	// would leave the reviewer unable to tell which target holds the refused
 	// change.
-	assert.Contains(t, out, "### Target `commerce/orders-002`\n\n```sql\nALTER TABLE `orders` DROP COLUMN `legacy`;\n```\n\n"+glyph.Refused+" **Cannot apply**: 1 change the engine refuses to execute\n- `orders`\n",
+	assert.Contains(t, out, "### Target `commerce/orders-002`\n\n1 DDL statement\n\n```sql\nALTER TABLE `orders` DROP COLUMN `legacy`;\n```\n\n"+glyph.Refused+" **Cannot apply**: 1 change the engine refuses to execute\n- `orders`\n",
 		"the refused change is disclosed under the target and DDL that carry it")
 	assert.Equal(t, 1, strings.Count(out, "**Cannot apply**"), "the target that refuses nothing carries no disclosure")
 	assert.NotContains(t, out, "planned against its own schema", "every target is already named under the plan it runs")
@@ -141,7 +141,7 @@ func TestReviewDriftComment_BlockedChangeNamesOnlyTheTargetsThatRefuseIt(t *test
 
 	rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
 	require.True(t, rollup.Clean)
-	assert.Contains(t, out, "`commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`\n\n```sql\n", "one DDL, one group")
+	assert.Contains(t, out, "`commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`\n\n1 DDL statement\n\n```sql\n", "one DDL, one group")
 	assert.Contains(t, out, "- `orders` on target `commerce/orders-002`\n", "only the refusing target is named")
 
 	// When every target in the group refuses the change, the heading already
@@ -247,7 +247,7 @@ func TestReviewDriftComment_IndependentDisclosesDirectMember(t *testing.T) {
 
 			rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
 			require.True(t, rollup.Clean)
-			assert.Contains(t, out, "### Target `commerce/orders-002`\n\n```sql\nALTER TABLE `orders` ADD COLUMN `phone` varchar(32);\n```\n\n⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit\n- `orders`: table is 12 MiB, within the direct execution bound\n",
+			assert.Contains(t, out, "### Target `commerce/orders-002`\n\n1 DDL statement\n\n```sql\nALTER TABLE `orders` ADD COLUMN `phone` varchar(32);\n```\n\n⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit\n- `orders`: table is 12 MiB, within the direct execution bound\n",
 				"the direct change is disclosed under the target and DDL that carry it")
 			assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the target that runs nothing directly carries no disclosure")
 		})
@@ -304,4 +304,50 @@ func TestReviewDriftComment_VerdictInTwoNamespacesNamesItsTargetOnce(t *testing.
 			assert.Contains(t, out, tc.line, "the disclosure names only the target that carries the verdict")
 		})
 	}
+}
+
+// Lint reads each target's live schema beside the changes it would run, so two
+// targets running the same DDL can raise different findings, and a target with
+// different DDL raises its own. Each group's findings render under that group's
+// plan, every finding once however many of its targets raise it, and the
+// primary's findings are not repeated in a plan-wide section. Error-severity
+// findings are unsafe changes, disclosed and gated as such, so they stay out of
+// the advisory list.
+func TestReviewDriftComment_EachTargetGroupDisclosesItsOwnLint(t *testing.T) {
+	lint := func(table, message, severity string) *ternv1.LintViolation {
+		return &ternv1.LintViolation{Table: table, Message: message, Severity: severity, Linter: "test"}
+	}
+	primary := independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false)
+	primary.LintViolations = []*ternv1.LintViolation{lint("orders", "column `email` should not be nullable", "warning")}
+	second := independentMemberDiff("orders-002", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false)
+	second.LintViolations = []*ternv1.LintViolation{
+		lint("orders", "table has no index on `phone`", "warning"),
+		lint("orders", "column `phone` is unsafe", "error"),
+	}
+	third := independentMemberDiff("orders-003", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false)
+	third.LintViolations = []*ternv1.LintViolation{
+		lint("orders", "table has no index on `phone`", "warning"),
+		lint("orders", "table `orders` has no primary key", "warning"),
+	}
+	diffs := []api.DeploymentPlanDiff{primary, second, third}
+	rollup, err := api.RollupDeploymentDiffs(diffs, driftMembers(diffs), api.PlanIndependent)
+	require.NoError(t, err)
+
+	body := templates.RenderPlanComment(templates.PlanCommentData{
+		Database:        "orders",
+		Environment:     "production",
+		IsMySQL:         true,
+		DatabaseType:    "mysql",
+		LintViolations:  []templates.LintViolationData{{Table: "orders", Message: "column `email` should not be nullable"}},
+		DeploymentDrift: deploymentDriftPreview(rollup),
+	})
+	group, primarySection, found := strings.Cut(body, "### Target `commerce/orders-001`")
+	require.True(t, found, "the primary renders under its own heading")
+
+	assert.Contains(t, group, "💡 **Lint Warnings**: 2 advisory findings\n- `orders`: table has no index on `phone`\n- `orders`: table `orders` has no primary key\n",
+		"the group discloses each finding its targets raised, once")
+	assert.NotContains(t, body, "is unsafe", "an error-severity finding is an unsafe change, not advisory lint")
+	assert.Contains(t, primarySection, "💡 **Lint Warnings**: 1 advisory finding\n- `orders`: column `email` should not be nullable\n",
+		"the primary's findings render under the primary's plan")
+	assert.Equal(t, 2, strings.Count(body, "**Lint Warnings**"), "no plan-wide section repeats the primary's findings")
 }

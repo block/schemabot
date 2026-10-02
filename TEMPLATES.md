@@ -1868,6 +1868,8 @@ schemabot apply -e production
 
 `primary/testapp_1`, `primary/testapp_2`
 
+**2** tables to create, **1** table to alter
+
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -1926,6 +1928,8 @@ schemabot apply -e production
 ### 2 of 3 targets
 
 `primary/testapp_2`, `primary/testapp_3`
+
+**2** tables to create, **1** table to alter
 
 ```sql
 CREATE TABLE `users` (
@@ -1986,11 +1990,15 @@ schemabot apply -e production
 
 `primary/testapp_1`, `primary/testapp_2`
 
+**1** table to alter
+
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ```
 
 ### Target `primary/testapp_3`
+
+**1** table to alter
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
@@ -2025,6 +2033,8 @@ schemabot apply -e production
 ### 2 targets
 
 `primary/testapp_1`, `primary/testapp_2`
+
+**2** tables to alter
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -2063,6 +2073,8 @@ schemabot apply -e production
 ### 3 targets
 
 `primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`
+
+**2** tables to alter
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);

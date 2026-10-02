@@ -169,6 +169,24 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 	return data
 }
 
+// addMemberLint appends a member's advisory lint findings to its group's,
+// skipping any the group already carries. Error-severity findings are left out:
+// they are unsafe changes, which the plan discloses and gates as such, the way
+// a single plan's lint section leaves them out.
+func addMemberLint(group []templates.LintViolationData, member []*ternv1.LintViolation) []templates.LintViolationData {
+	for _, v := range member {
+		if v.GetSeverity() == "error" {
+			continue
+		}
+		finding := templates.LintViolationData{Message: v.GetMessage(), Table: v.GetTable()}
+		if slices.Contains(group, finding) {
+			continue
+		}
+		group = append(group, finding)
+	}
+	return group
+}
+
 // deploymentPlanGroups groups the rollout's members by the plan each would run,
 // one entry per distinct plan.
 //
@@ -211,6 +229,10 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		for _, dc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeDirect) {
 			addModeTarget(&groups[at].DirectChanges, templates.DirectChangeData(dc), names[i])
 		}
+		// Lint reads each member's live schema, so members that run the same
+		// DDL can still raise different findings. The group discloses every
+		// finding any of its members raised, each once.
+		groups[at].LintViolations = addMemberLint(groups[at].LintViolations, e.LintViolations)
 	}
 	// A change every target in the group carries needs no names beside it: the
 	// group heading already lists them.

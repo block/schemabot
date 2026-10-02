@@ -448,7 +448,7 @@ func TestRenderPlanComment_OneTargetPlanNamesEveryTarget(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "### 3 targets\n\n`primary/testapp-001`, `primary/testapp-002`, `eu-west`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "### 3 targets\n\n`primary/testapp-001`, `primary/testapp-002`, `eu-west`\n\n**1** table to alter\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 }
 
@@ -481,7 +481,7 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 
 	t.Run("some targets are already there", func(t *testing.T) {
 		out := render(group(1, "a", "c"), group(0, "b"))
-		assert.Contains(t, out, "### 2 of 3 targets\n\n`a`, `c`\n\n```sql\n")
+		assert.Contains(t, out, "### 2 of 3 targets\n\n`a`, `c`\n\n**1** table to alter\n\n```sql\n")
 		assert.Contains(t, out, "### Target `b`\n\nNo schema changes detected\n\n")
 		assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 	})
@@ -489,8 +489,8 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 		primary := group(1, "a")
 		primary.Primary = true
 		out := render(primary, group(2, "b", "c"))
-		assert.Contains(t, out, "### Target `a`\n\n```sql\n")
-		assert.Contains(t, out, "`b`, `c`\n\n```sql\n")
+		assert.Contains(t, out, "### Target `a`\n\n**1** table to alter\n\n```sql\n")
+		assert.Contains(t, out, "`b`, `c`\n\n**2** tables to alter\n\n```sql\n")
 		assert.Less(t, strings.Index(out, "### 2 of 3 targets"), strings.Index(out, "### Target `a`"),
 			"the group most targets run leads, whichever group holds the primary")
 		assert.NotContains(t, out, "_Already applied")
@@ -505,7 +505,7 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 		changes := planGroupChanges(1)
 		changes[0].Keyspace = "testapp_staging"
 		out := render(DeploymentPlanGroup{Members: []string{"a", "c"}, Changes: changes}, group(0, "b"))
-		assert.Contains(t, out, "### 2 of 3 targets\n\n`a`, `c`\n\n#### Schema Name: `testapp_staging`\n```sql\nALTER TABLE `t0`",
+		assert.Contains(t, out, "### 2 of 3 targets\n\n`a`, `c`\n\n**1** table to alter\n\n#### Schema Name: `testapp_staging`\n```sql\nALTER TABLE `t0`",
 			"each target group is a section with its schema heading under it")
 	})
 }
@@ -604,7 +604,7 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 	assert.Contains(t, out, "### Target `primary/testapp_1`\n\nNo schema changes detected\n\n")
 	assert.Less(t, strings.Index(out, "`primary/testapp_2`, `primary/testapp_3`"), strings.Index(out, "### Target `primary/testapp_1`"),
 		"the targets with work read first")
-	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n**1** table to alter\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e production\n```\n",
 		"the other targets converge through the apply, which runs each target's own plan")
@@ -624,7 +624,7 @@ func TestRenderPlanComment_ConvergedPrimaryApplyAsksForConfirmation(t *testing.T
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n**1** table to alter\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.Contains(t, out, "⚠️ **The reviewed target already has this schema**\n\nNothing has run.")
 	assert.Contains(t, out, "**Confirmation required** — review the plan above, then confirm manually:\n```\nschemabot apply-confirm -e production\n```\n")
 	assert.NotContains(t, out, "**Applying automatically**")
@@ -656,7 +656,7 @@ func TestRenderPlanComment_ConvergedPrimaryWithRefusedMemberWorkOffersNoApply(t 
 	data.MemberApplyRefusal = `target primary/testapp_2: its plan carries an unsafe change for table "users"`
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n**1** table to alter\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 		"the other targets' plans are still shown")
 	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but target primary/testapp\\_2: its plan carries an unsafe change for table \"users\".")
 	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
@@ -948,7 +948,7 @@ func TestRenderMultiEnvPlanComment_SchemaNameSitsUnderItsTargets(t *testing.T) {
 
 	_, production, found := strings.Cut(out, "### Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`\n\n**Schema Name**: `testapp_production`\n\n```sql\n")
+	assert.Contains(t, production, "#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`\n\n**1** table to alter\n\n**Schema Name**: `testapp_production`\n\n```sql\n")
 	assert.NotContains(t, production, "#### Schema Name")
 }
 

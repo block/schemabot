@@ -341,6 +341,10 @@ type DeploymentPlanGroup struct {
 	// to native DDL, each naming the targets that run it that way when that is
 	// not all of them.
 	DirectChanges []DirectChangeData
+	// LintViolations are the advisory lint findings the group's members' own
+	// plans raised, each once however many members raise it. Lint reads each
+	// target's live schema, so these are the group's, not the primary's.
+	LintViolations []LintViolationData
 }
 
 // Empty reports that the group's members are already at the desired schema and
@@ -601,7 +605,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// Lint violations — shown on the plan comment for review, omitted on the
 	// locked apply comment where they are noise (the operator already reviewed
 	// them at plan time).
-	if len(data.LintViolations) > 0 && !data.IsLocked {
+	// Target plans disclose each group's lint under its own plan, the
+	// primary's included, so the plan-wide section would repeat one group's.
+	if len(data.LintViolations) > 0 && !data.IsLocked && !targetPlans {
 		writeLintViolations(&sb, data.LintViolations)
 	}
 
@@ -2048,6 +2054,9 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		group.Changes = targetPlanChanges(g, data)
 		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)
+		// Groups run different work, so each states its own count; the plan
+		// summary below counts them together.
+		fmt.Fprintf(sb, "%s\n\n", planSummaryText(group.Changes, data.DatabaseType, data.IsMySQL, statements))
 		restore := budget.forTargetGroup(g.Members)
 		if collapse && statements+vschema > 1 {
 			writeCollapsibleKeyspaceChanges(sb, group, statements, budget)
@@ -2064,6 +2073,11 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		// run its write-blocking DDL.
 		if len(g.DirectChanges) > 0 {
 			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
+		}
+		// Lint reads each target's live schema, so a group's findings are
+		// disclosed under its own plan rather than once for the primary's.
+		if len(g.LintViolations) > 0 && !data.IsLocked {
+			writeLintViolations(sb, g.LintViolations)
 		}
 	}
 }
@@ -2871,8 +2885,8 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.DatabaseType, plan.IsMySQL)
 	}
 
-	// Lint violations
-	if len(plan.LintViolations) > 0 {
+	// Lint violations. Target plans disclose each group's under its own plan.
+	if len(plan.LintViolations) > 0 && !targetPlans {
 		writeLintViolations(sb, plan.LintViolations)
 	}
 
