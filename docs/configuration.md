@@ -648,6 +648,39 @@ Budgets are enforced per server process, so a deployment running N replicas
 admits up to N times the configured rate overall. Size the numbers as a
 per-replica ceiling.
 
+### Check inspection
+
+`GET /api/checks/inspect` (`schemabot checks inspect`) reads the pull request
+and each expected Check Run from GitHub on every call, uncached, through the
+same GitHub App installation SchemaBot publishes its Check Runs through. A
+caller polling it in a loop can spend the installation's hourly REST quota, and
+then SchemaBot's own Check Run writes start failing and the merge gate goes
+stale. The endpoint therefore has a per-caller budget, also **on by default**:
+
+```yaml
+rate_limits:
+  checks_inspect:
+    enabled: true             # default: true
+    per_caller:
+      requests_per_minute: 6  # default: 6
+      burst: 10               # default: 10
+```
+
+As an approximate sustained budget, each inspection costs one GitHub read for
+the pull request plus at least one per expected check name. The hourly estimate
+is `60 × requests_per_minute × (1 + N)`, where N is the number of check names.
+Check Run pagination multiplies those reads, and the initial burst permits
+additional inspections. A dashboard polling three pull requests every 30
+seconds fits the sustained default; poll at 30 seconds or longer. A deployment
+that publishes more check names or has deep Check Run histories should lower
+`requests_per_minute`.
+
+`per_caller` is keyed the same way as the pull endpoint's. With API auth
+disabled, every caller shares one budget. There is no `per_target` lane. A
+refusal is the same `429` with `error_code: rate_limited` and `Retry-After`, and
+it is returned before any GitHub call is made. Set `enabled: false` to turn
+enforcement off.
+
 ## Pending Drops
 
 For MySQL databases executed by the Spirit engine, `DROP TABLE` statements can

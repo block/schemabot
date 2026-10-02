@@ -270,6 +270,25 @@ type RateLimitsConfig struct {
 	// pull fans out to a catalog read per namespace on the target, so an
 	// unbounded caller loads the control plane and the database together.
 	Pull EndpointRateLimitConfig `yaml:"pull,omitempty"`
+
+	// ChecksInspect bounds GET /api/checks/inspect. Every inspection reads the
+	// pull request and each expected Check Run from GitHub uncached, on the
+	// same App installation SchemaBot publishes Check Runs through, so an
+	// unbounded caller spends the quota the merge gate's own writes need.
+	ChecksInspect CallerRateLimitConfig `yaml:"checks_inspect,omitempty"`
+}
+
+// CallerRateLimitConfig is the budget of an endpoint bounded per caller only.
+// It has no per-target lane because what it protects is shared by every
+// target, not owned by one.
+type CallerRateLimitConfig struct {
+	// Enabled controls enforcement for this endpoint. Defaults to true when
+	// not configured (nil = enabled); set false to admit every request.
+	Enabled *bool `yaml:"enabled"`
+
+	// PerCaller bounds a single caller, keyed the same way as the pull
+	// endpoint's per-caller lane.
+	PerCaller RateLimitBudgetConfig `yaml:"per_caller,omitempty"`
 }
 
 // EndpointRateLimitConfig is one endpoint's budget. Each lane is enforced
@@ -423,6 +442,38 @@ func (c *ServerConfig) PullPerTargetRateLimit() ratelimit.Config {
 	return c.RateLimits.Pull.PerTarget.resolve(defaultPullPerTargetRequestsPerMinute, defaultPullPerTargetBurst)
 }
 
+// The check inspection's default budget is sized against the GitHub App
+// installation's REST quota rather than against SchemaBot's own capacity: each
+// inspection costs one pull request read plus at least one Check Run read per
+// expected check name, all uncached, on the installation the merge gate writes
+// Check Runs through.
+//
+// The sustained per-caller inspection budget per hour is approximately
+//
+//	60 × requests_per_minute × (1 + N)
+//
+// GitHub calls when each lookup fits on one page, where N is the number of
+// check names the deployment publishes for the repository. Pagination
+// multiplies the Check Run reads, and the initial burst adds inspections above
+// the sustained rate. Deployments publishing more check names or observing
+// deep Check Run histories should lower requests_per_minute.
+const (
+	defaultChecksInspectPerCallerRequestsPerMinute = 6
+	defaultChecksInspectPerCallerBurst             = 10
+)
+
+// ChecksInspectRateLimitEnabled reports whether the check inspection enforces
+// its request budget. Defaults to true when not configured.
+func (c *ServerConfig) ChecksInspectRateLimitEnabled() bool {
+	return c.RateLimits.ChecksInspect.Enabled == nil || *c.RateLimits.ChecksInspect.Enabled
+}
+
+// ChecksInspectPerCallerRateLimit returns the per-caller budget for the check
+// inspection, with unset fields filled from the defaults.
+func (c *ServerConfig) ChecksInspectPerCallerRateLimit() ratelimit.Config {
+	return c.RateLimits.ChecksInspect.PerCaller.resolve(defaultChecksInspectPerCallerRequestsPerMinute, defaultChecksInspectPerCallerBurst)
+}
+
 // resolve fills unset fields from the given defaults. Validate rejects
 // negative values, so by the time a budget is resolved a zero means "unset".
 func (b RateLimitBudgetConfig) resolve(defaultRPM, defaultBurst int) ratelimit.Config {
@@ -448,6 +499,7 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 	}{
 		{"rate_limits.pull.per_caller", cfg.Pull.PerCaller},
 		{"rate_limits.pull.per_target", cfg.Pull.PerTarget},
+		{"rate_limits.checks_inspect.per_caller", cfg.ChecksInspect.PerCaller},
 	}
 	for _, lane := range lanes {
 		if lane.budget.RequestsPerMinute < 0 {
