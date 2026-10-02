@@ -761,7 +761,9 @@ assigns task state. That is a consequence of OW-8: every writer of a task row is
 elected reaper, so every write either goes through this resolution or is a reaper settling a row
 no driver is touching. *Enforced:* the forward-only state resolution
 the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
-`pkg/tern/local_client.go`).
+`pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
+outcome rather than as work to re-plan (`failedTaskDecidingOutcome`,
+`pkg/tern/local_control_resume.go`).
 
 ### ST-5: Unknown engine states are visible and blocking
 
@@ -880,7 +882,9 @@ re-asserted on the guarded write rather than trusted from the scan. Any new non-
 a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
-`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`).
+`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`,
+`pkg/storage/internal/sqlstore/apply_logs.go`, `pkg/storage/internal/sqlstore/checks.go`,
+`pkg/storage/internal/sqlstore/control_requests.go`).
 
 ### OW-3: A driver stops before a peer may reclaim
 
