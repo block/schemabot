@@ -44,9 +44,20 @@ func (s *Service) handleChecksInspect(w http.ResponseWriter, r *http.Request) {
 		s.writeWebhookOpsError(w, err)
 		return
 	}
+	if err := validateChecksInspectRequest(s.config, req); err != nil {
+		s.writeWebhookOpsError(w, err)
+		return
+	}
+	if !s.checkChecksInspectCallerBudget(w, r, req) {
+		return
+	}
 	ctx, cancel := s.extendWebhookOpsDeadline(w, r)
 	defer cancel()
-	response, err := executeChecksInspect(ctx, s.config, s.storage, req, s.logger)
+	resolve := s.checksInspectClientFor
+	if resolve == nil {
+		resolve = installationChecksInspectClient
+	}
+	response, err := executeChecksInspectWith(ctx, s.config, s.storage, req, s.logger, resolve)
 	if err != nil {
 		s.writeWebhookOpsError(w, err)
 		return
@@ -104,35 +115,60 @@ type checksInspectClient interface {
 	FindCheckRunByName(ctx context.Context, repo, headSHA, checkName string) (*ghclient.CheckRunResult, []string, error)
 }
 
+// checksInspectClientResolver returns the GitHub client an inspection of repo
+// reads through.
+type checksInspectClientResolver func(ctx context.Context, cfg *ServerConfig, repo string, logger *slog.Logger) (checksInspectClient, error)
+
+// installationChecksInspectClient reads through the repository's GitHub App
+// installation, the same one SchemaBot publishes its Check Runs through.
+func installationChecksInspectClient(ctx context.Context, cfg *ServerConfig, repo string, logger *slog.Logger) (checksInspectClient, error) {
+	client, _, err := resolveRepoInstallationClient(ctx, cfg, repo, logger)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
 func executeChecksInspect(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksInspectRequest, logger *slog.Logger) (*ChecksInspectResponse, error) {
+	return executeChecksInspectWith(ctx, cfg, store, req, logger, installationChecksInspectClient)
+}
+
+func executeChecksInspectWith(ctx context.Context, cfg *ServerConfig, store storage.Storage, req ChecksInspectRequest, logger *slog.Logger, resolve checksInspectClientResolver) (*ChecksInspectResponse, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
 	if store == nil {
 		return nil, fmt.Errorf("storage is not configured")
 	}
-	if err := requireRepoFullName(req.Repo); err != nil {
-		return nil, err
-	}
-	if req.PullRequest <= 0 {
-		return nil, webhookOpsRequestErrorf("pull_request must be positive")
-	}
-	// A mistyped environment would silently narrow the response to nothing and
-	// read as "this pull request has no check state", which is the opposite of
-	// what an operator is here to find out. On an instance that scopes nothing
-	// by environment the filter would also drop the one global aggregate.
-	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+	if err := validateChecksInspectRequest(cfg, req); err != nil {
 		return nil, err
 	}
 	if logger == nil {
 		logger = slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	}
 
-	client, _, err := resolveRepoInstallationClient(ctx, cfg, req.Repo, logger)
+	client, err := resolve(ctx, cfg, req.Repo, logger)
 	if err != nil {
 		return nil, err
 	}
 	return inspectChecks(ctx, cfg, store, client, req, logger)
+}
+
+func validateChecksInspectRequest(cfg *ServerConfig, req ChecksInspectRequest) error {
+	if err := requireRepoFullName(req.Repo); err != nil {
+		return err
+	}
+	if req.PullRequest <= 0 {
+		return webhookOpsRequestErrorf("pull_request must be positive")
+	}
+	// A mistyped environment would silently narrow the response to nothing and
+	// read as "this pull request has no check state", which is the opposite of
+	// what an operator is here to find out. On an instance that scopes nothing
+	// by environment the filter would also drop the one global aggregate.
+	if err := requireNarrowableEnvironment(cfg, req.Environment); err != nil {
+		return err
+	}
+	return nil
 }
 
 func inspectChecks(ctx context.Context, cfg *ServerConfig, store storage.Storage, client checksInspectClient, req ChecksInspectRequest, logger *slog.Logger) (*ChecksInspectResponse, error) {

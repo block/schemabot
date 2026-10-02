@@ -649,7 +649,7 @@ currency check on the terminal check refresh (`pkg/webhook/handler.go`,
 ### MG-12: A check passes only when no rollout member has work
 
 A plan check passes only when every rollout member of the database's environment is known to have
-nothing to apply. The reviewed primary's plan speaks for the primary alone: a member planned against
+nothing to apply. The primary's plan speaks for the primary alone: a member planned against
 a schema of its own can still need the change, and a member expected to mirror the primary can have
 drifted from it. A primary already at the desired schema is therefore not a converged rollout, and
 every path that records a check from a plan plans the other members first. A member that could not
@@ -761,7 +761,9 @@ assigns task state. That is a consequence of OW-8: every writer of a task row is
 elected reaper, so every write either goes through this resolution or is a reaper settling a row
 no driver is touching. *Enforced:* the forward-only state resolution
 the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
-`pkg/tern/local_client.go`).
+`pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
+outcome rather than as work to re-plan (`failedTaskDecidingOutcome`,
+`pkg/tern/local_control_resume.go`).
 
 ### ST-5: Unknown engine states are visible and blocking
 
@@ -880,7 +882,9 @@ re-asserted on the guarded write rather than trusted from the scan. Any new non-
 a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
-`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`).
+`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`,
+`pkg/storage/internal/sqlstore/apply_logs.go`, `pkg/storage/internal/sqlstore/checks.go`,
+`pkg/storage/internal/sqlstore/control_requests.go`).
 
 ### OW-3: A driver stops before a peer may reclaim
 
@@ -1509,15 +1513,15 @@ unfinished row copy, require the operator to confirm the specific consequences d
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
-reviewed target's included, is what the confirmation was given against and carries no consequence
-it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversReviewedTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
+primary target's included, is what the confirmation was given against and carries no consequence
+it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
 `pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
-member's unsafe change requiring the same opt-in as the reviewed plan's, both at the PR gate
+member's unsafe change requiring the same opt-in as the primary plan's, both at the PR gate
 (`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
 `TargetPlanUnsafeChanges` in `pkg/webhook/templates/plan.go`) and at apply creation
 (`rejectUnapplyableMemberPlan` in `pkg/api/plan_handlers.go`), and apply creation refusing,
 whatever the flags, a caller that was not shown a member's plan any unsafe change of that member
-the reviewed plan's disclosure never named (`rejectMemberUndisclosedUnsafe`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
+the primary plan's disclosure never named (`rejectMemberUndisclosedUnsafe`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
 when `--allow-unsafe` is passed, judged against every unsafe change the plan carries, a divergent
 shard's included (`pkg/cmd/commands/apply.go`, `pkg/cmd/commands/rollback.go`, over
 `PlanResponse.UnsafeChanges` in `pkg/apitypes/apitypes.go`). On the PR-comment rollback path the

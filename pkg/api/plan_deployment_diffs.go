@@ -48,7 +48,7 @@ type DeploymentPlanDiff struct {
 	// read the target for every one: one that predates the disclosure, does not
 	// look, or whose lookup failed leaves it unset, which is not the same as a
 	// clean target. The primary's entry leaves them unset too; its
-	// copies are disclosed on the reviewed plan itself.
+	// copies are disclosed on the primary plan itself.
 	ExistingCopies         []*ternv1.ExistingCopy
 	ExistingCopiesReported bool
 
@@ -63,14 +63,12 @@ type DeploymentPlanDiff struct {
 }
 
 // PlanDeploymentDiffs computes every configured deployment's desired-vs-live
-// diff for a database/environment at review time. Only the primary deployment
-// plans locally today; the non-primary deployments never do, so drift on them is
-// invisible until apply. This is the producer that closes that gap: each
-// non-primary deployment is diffed with the non-persisting PlanDiff RPC, and the
-// primary reuses the already-persisted reviewed plan (primaryPlan) so the rollup
-// compares against exactly what the user reviewed rather than re-reading the
-// primary's live schema — which could differ from the reviewed plan and trip a
-// spurious primary-vs-primary mismatch.
+// diff for a database/environment at review time, so every member is planned
+// before the review gates on it: each non-primary deployment is diffed with the
+// non-persisting PlanDiff RPC, and the primary reuses its already-persisted
+// plan (primaryPlan) so the rollup compares against exactly the plan the
+// comment shows rather than re-reading the primary's live schema, which could
+// differ from that plan and trip a spurious primary-vs-primary mismatch.
 //
 // Per-deployment failures are captured in each result's Err so one unreachable
 // deployment neither hides the others nor aborts the rollup. Results are
@@ -99,18 +97,18 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 	// members against a baseline built for a different one.
 	if primaryPlan != nil {
 		if primaryMember.Deployment == "" {
-			return nil, fmt.Errorf("plan diff for %s/%s: reviewed plan has no origin deployment to verify the primary against", req.Database, req.Environment)
+			return nil, fmt.Errorf("plan diff for %s/%s: primary target's plan has no origin deployment to verify the primary against", req.Database, req.Environment)
 		}
 		if targets[0].Deployment != primaryMember.Deployment || targets[0].Target != primaryMember.Target {
-			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the reviewed plan was created against %q", req.Database, req.Environment, targets[0].MemberID(), primaryMember.MemberID())
+			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout index 0 is %q but the primary target's plan was created against %q", req.Database, req.Environment, targets[0].MemberID(), primaryMember.MemberID())
 		}
-		// The reviewed plan covers only the namespaces the primary selected when
+		// The primary plan covers only the namespaces the primary selected when
 		// it was planned, as the caller reports them. A primary member whose
 		// selection differs from the placement resolved here would pair that plan
 		// with members planned under another placement, leaving a namespace in
 		// neither or in both, so it fails closed too.
 		if !slices.Equal(targets[0].Namespaces, primaryMember.Namespaces) {
-			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout member %s now selects namespaces [%s] but the reviewed plan was created for [%s]; the environment's placement changed since the plan, so re-run it",
+			return nil, fmt.Errorf("primary invariant violated for %s/%s: rollout member %s now selects namespaces [%s] but the primary target's plan was created for [%s]; the environment's placement changed since the plan, so re-run it",
 				req.Database, req.Environment, primaryMember.MemberID(), strings.Join(targets[0].Namespaces, ", "), strings.Join(primaryMember.Namespaces, ", "))
 		}
 	}
@@ -127,7 +125,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 		}
 
 		// Rollout index 0 is the primary (ResolveDatabaseTargets returns targets
-		// primary-first; the guard above enforces it). When its reviewed plan is
+		// primary-first; the guard above enforces it). When its primary plan is
 		// provided, reuse it so the rollup's primary member is exactly what was
 		// reviewed and no redundant live-schema read runs.
 		if i == 0 && primaryPlan != nil {
@@ -135,11 +133,11 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			results[i].Changes = primaryPlan.Changes
 			results[i].Shards = primaryPlan.Shards
 			results[i].LintViolations = primaryPlan.LintViolations
-			// A reviewed plan that reported planning errors is not a trustworthy
+			// The primary plan that reported planning errors is not a trustworthy
 			// baseline; record the error so the rollup fails closed rather than
 			// comparing deployments against a broken primary.
 			if len(primaryPlan.Errors) > 0 {
-				results[i].Err = fmt.Errorf("reviewed primary plan reported errors: %v", primaryPlan.Errors)
+				results[i].Err = fmt.Errorf("primary target's plan reported errors: %v", primaryPlan.Errors)
 			}
 			continue
 		}

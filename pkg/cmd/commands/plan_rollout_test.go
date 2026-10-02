@@ -385,7 +385,7 @@ func TestWritePlanBody_DirectExecutionNoticeNamesEachNamespace(t *testing.T) {
 	assert.Contains(t, out, "1. ns_0.refunds: "+reason+"\n  2. ns_1.refunds: "+reason+"\n", "%s", out)
 }
 
-// Staging and production can share a primary plan while production's other
+// Staging and production can share the primary plan while production's other
 // target runs something staging's do not: here prod/payments-002 adds zone.
 // A rollout's plan names its members, so the two never collapse into one
 // "Staging & Production" section, which would render staging's groups only
@@ -483,7 +483,7 @@ func TestWritePlanBody_RolloutDisclosesDirectExecutionUnderTheTargetThatRunsIt(t
 	assert.NotContains(t, first, notice, "the target running it through Spirit carries no disclosure")
 }
 
-// A primary plan that reported errors is the only plan the server makes, so
+// The primary plan that reported errors is the only plan the server makes, so
 // the rollout lists every other target as not planned. Those targets follow
 // the errors, so the errors are not read as the verdict on every target.
 func TestWritePlanBody_ErroredPrimaryNamesTheTargetsThatWereNotPlanned(t *testing.T) {
@@ -703,7 +703,7 @@ func TestApplyCmd_UnsafeChangeBesideAConvergedPrimaryNamesTheNarrowedApply(t *te
 			TableName: "legacy", Namespace: "orders", DDL: "DROP TABLE `legacy`", ChangeType: "drop", IsUnsafe: true, UnsafeReason: "drops a table",
 		}},
 	}}
-	const undisclosed = `carries an unsafe change for table "legacy" that the reviewed plan does not carry`
+	const undisclosed = `carries an unsafe change for table "legacy" that the primary target's plan does not carry`
 	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{
 		PlanID: "plan-orders-1",
 		Engine: "mysql",
@@ -760,7 +760,7 @@ func TestApplyCmd_RefusesTargetsARolloutWideApplyCannotRunBesidePrimaryWork(t *t
 			Refused: []*apitypes.PlanMemberRefusalResponse{
 				{Member: "prod/payments-002", Target: "payments-002", Reason: apitypes.PlanMemberBlocked, Detail: "carries changes its target's engine refuses"},
 				{Member: "prod/payments-003", Target: "payments-003", Reason: apitypes.PlanMemberNeedsTarget, Detail: `runs table "users" as direct-execution DDL`},
-				{Member: "us", Target: "us-main", Reason: apitypes.PlanMemberNeedsTarget, Detail: `carries an unsafe change for table "legacy" that the reviewed plan does not carry`, AllowUnsafe: true},
+				{Member: "us", Target: "us-main", Reason: apitypes.PlanMemberNeedsTarget, Detail: `carries an unsafe change for table "legacy" that the primary target's plan does not carry`, AllowUnsafe: true},
 			},
 		},
 	})
@@ -882,7 +882,7 @@ func TestApplyCmd_JSONOutputNamesTheRefusedTargets(t *testing.T) {
 			Groups:      []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 3), Primary: true, Changes: addColumnTo("region")}},
 			Refused: []*apitypes.PlanMemberRefusalResponse{
 				{Member: "prod/payments-002", Target: "payments-002", Reason: apitypes.PlanMemberBlocked, Detail: "carries changes its target's engine refuses"},
-				{Member: "prod/payments-003", Target: "payments-003", Reason: apitypes.PlanMemberNeedsTarget, Detail: `carries an unsafe change for table "legacy" that the reviewed plan does not carry`, AllowUnsafe: true},
+				{Member: "prod/payments-003", Target: "payments-003", Reason: apitypes.PlanMemberNeedsTarget, Detail: `carries an unsafe change for table "legacy" that the primary target's plan does not carry`, AllowUnsafe: true},
 			},
 		},
 	})
@@ -895,7 +895,7 @@ func TestApplyCmd_JSONOutputNamesTheRefusedTargets(t *testing.T) {
 	require.Error(t, runErr)
 	assert.Equal(t, "an apply of the whole rollout cannot run the plan of 2 of 3 rollout members: "+
 		"prod/payments-002 (carries changes its target's engine refuses; no apply runs it, so change the schema files); "+
-		`prod/payments-003 (carries an unsafe change for table "legacy" that the reviewed plan does not carry; run it with: `+cliname.Name()+" apply -s "+schemaDir+" -e production --target payments-003 --allow-unsafe)",
+		`prod/payments-003 (carries an unsafe change for table "legacy" that the primary target's plan does not carry; run it with: `+cliname.Name()+" apply -s "+schemaDir+" -e production --target payments-003 --allow-unsafe)",
 		runErr.Error())
 	assert.NotContains(t, out, "Apply blocked", "the human refusal is not printed in JSON mode:\n%s", out)
 	assert.Equal(t, []string{"/api/status", "/api/plan"}, *paths, "no lock is checked or taken and no apply is requested")

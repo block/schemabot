@@ -148,7 +148,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
-	// Roll up every deployment's diff against the reviewed plan so drift on a
+	// Roll up every deployment's diff against the primary plan so drift on a
 	// non-primary deployment fails the check closed at review time.
 	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 
@@ -516,7 +516,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			continue
 		}
 
-		// Roll up every deployment's diff against the reviewed plan so drift on a
+		// Roll up every deployment's diff against the primary plan so drift on a
 		// non-primary deployment fails the check closed at review time.
 		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 

@@ -404,7 +404,7 @@ func TestUncoveredNamespaces(t *testing.T) {
 	}))
 }
 
-// The reviewed primary plan covers the namespaces its entry selected when it
+// The primary plan covers the namespaces its entry selected when it
 // was planned. A primary member reported with a different selection for the
 // same target would pair that plan with members placed under another one, so
 // the rollup fails closed rather than trusting the target name alone.
@@ -417,7 +417,7 @@ func TestRollupReviewTimeDrift_PrimarySelectionChangedFailsClosed(t *testing.T) 
 
 	_, err := svc.RollupReviewTimeDrift(t.Context(), threeNamespaceRequest(), reviewed, plannedUnder)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "rollout member eu/orders-001 now selects namespaces [ns_0] but the reviewed plan was created for [ns_0, ns_1]")
+	assert.Contains(t, err.Error(), "rollout member eu/orders-001 now selects namespaces [ns_0] but the primary target's plan was created for [ns_0, ns_1]")
 	assert.Nil(t, client.planDiffReq)
 	assert.Empty(t, plans.created)
 }

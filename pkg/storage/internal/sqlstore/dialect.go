@@ -99,11 +99,12 @@ type Dialect interface {
 	// joined table may be the table the statement modifies.
 	LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string
 	// LeaseSourceFence is LeaseTokenFence for the WHERE clause of an
-	// INSERT … SELECT whose source is the lease row, reached through sourceAlias
-	// over sourceTable. It carries the same serialization contract, and it must
-	// hold at every isolation level the session may run at: a dialect that
-	// reads INSERT … SELECT source rows without locks under some isolation
-	// level must lock the row explicitly.
+	// INSERT … SELECT whose source is the lease row, or of a subquery that reads
+	// the lease row inside a statement that writes another table, reached
+	// through sourceAlias over sourceTable. It carries the same serialization
+	// contract, and it must hold at every isolation level the session may run
+	// at: a dialect that reads those source rows without locks under some
+	// isolation level must lock the row explicitly.
 	LeaseSourceFence(sourceTable, sourceAlias, idColumn, tokenColumn string) string
 }
 
@@ -571,13 +572,19 @@ func (PostgresDialect) JoinedDelete(targetTable, targetAlias, joinTable, joinAli
 // LeaseTokenFence locks the joined row while checking its token. UPDATE … FROM
 // and DELETE … USING read other tables from the MVCC snapshot without locks, so
 // a plain token equality could pass with a stale value after a concurrent
-// steal commits. The correlated FOR UPDATE subquery record-locks the joined
-// row instead: under READ COMMITTED a lock wait re-evaluates the subquery's
+// steal commits. The correlated FOR SHARE subquery row-locks the joined row
+// instead: under READ COMMITTED a lock wait re-evaluates the subquery's
 // predicate against the latest committed row version, so a steal that commits
 // first fails the fence, and a fence that locks first blocks the steal until
 // the guarded write commits — the serialization MySQL's row locking provides.
+//
+// A share lock is enough because the fence only reads the lease row: the
+// steal it must serialize against is an UPDATE of that row, which share locks
+// block. Two leased writers for the same apply then hold the fence together,
+// so the apply log, comment and task writes of one drive do not queue behind
+// each other; only a steal or the lease heartbeat's own UPDATE waits on them.
 func (PostgresDialect) LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColumn string) string {
-	return correlatedLeaseFence(joinTable, joinAlias, idColumn, tokenColumn, "FOR UPDATE")
+	return correlatedLeaseFence(joinTable, joinAlias, idColumn, tokenColumn, "FOR SHARE")
 }
 
 // LeaseSourceFence renders the same locking fence as LeaseTokenFence: the
@@ -585,7 +592,7 @@ func (PostgresDialect) LeaseTokenFence(joinTable, joinAlias, idColumn, tokenColu
 // without locks at every isolation level, so the source row needs the same
 // explicit lock as a joined row.
 func (PostgresDialect) LeaseSourceFence(sourceTable, sourceAlias, idColumn, tokenColumn string) string {
-	return correlatedLeaseFence(sourceTable, sourceAlias, idColumn, tokenColumn, "FOR UPDATE")
+	return correlatedLeaseFence(sourceTable, sourceAlias, idColumn, tokenColumn, "FOR SHARE")
 }
 
 // ExcludedValue returns the PostgreSQL reference to the proposed row value.

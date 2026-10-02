@@ -777,6 +777,27 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	assert.Empty(t, observer.terminal, "a transient plan-load failure must not notify the terminal observer")
 }
 
+func TestResumeStoppedGroupedApplyHandlesPendingStartBeforeFailedTasks(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: storageErr})
+	apply.State = state.Apply.Stopped
+	applyStore.apply = &storage.Apply{}
+	*applyStore.apply = *apply
+	applyStore.apply.State = state.Apply.Resuming
+	tasks[0].State = state.Task.Failed
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	client.storage.(*exactProgressStorage).controlRequests = requests
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State,
+		"the stopped snapshot must not overwrite the stored start transition")
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status,
+		"the start remains deliverable after a recoverable plan read failure")
+}
+
 // A resume claim that finds a pending cancel against a schema change already
 // holding its revert window refuses the cancel — and then keeps going. The
 // refusal resolved the operator's request but paused nothing, so the claim
@@ -811,6 +832,8 @@ func TestResumeApplyContinuesPastARefusedCancelInTheRevertWindow(t *testing.T) {
 // apply with an operator-facing reason and notifies its terminal observer.
 func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{})
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+	client.storage.(*exactProgressStorage).controlRequests = requests
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
@@ -824,6 +847,9 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	assert.True(t, state.IsState(tasks[0].State, state.Task.Failed),
 		"in-flight task must fail with its apply, got %s", tasks[0].State)
 	assert.Equal(t, "plan not found during recovery", tasks[0].ErrorMessage)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
+		"the terminal outcome moots the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }

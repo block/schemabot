@@ -54,14 +54,14 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Table: "legacy_orders", Err: cause,
 		})
 		msg = applyExecutionErrorMessage(action.Apply, "production", unsafe)
-		assert.Equal(t, "Target `payments-002` has an unsafe change on table `legacy_orders` that the reviewed plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the reviewed plan carries the same change.", msg)
+		assert.Equal(t, "Target `payments-002` has an unsafe change on table `legacy_orders` that the primary target's plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the primary target's plan carries the same change.", msg)
 		assert.NotContains(t, msg, "10.0.0.7")
 		assert.NotContains(t, msg, "plan-7f3a")
 
 		vschema := &api.MemberPlanRefusedError{
 			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Namespace: "ns_0", Err: cause,
 		}
-		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", vschema), "an unsafe change on the VSchema of namespace `ns_0` that the reviewed plan does not carry")
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", vschema), "an unsafe change on the VSchema of namespace `ns_0` that the primary target's plan does not carry")
 
 		unknown := &api.MemberPlanRefusedError{
 			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanRefusal(99), Table: "orders", Err: cause,

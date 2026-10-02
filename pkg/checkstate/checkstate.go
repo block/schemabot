@@ -102,7 +102,7 @@ const (
 // blockClasses classifies every durable blocking reason SchemaBot writes.
 //
 // Review-time deployment drift is a guard rather than a reconciliation: the
-// deployments may simply have moved on from the reviewed plan, and a re-plan
+// deployments may simply have moved on from the primary plan, and a re-plan
 // that re-evaluates the rollup lifts the block once they match. Reading it as
 // a reconciliation would deny the action that actually clears it.
 //

@@ -236,10 +236,9 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	}
 	taskCreds, err := c.credentialsForTask(task)
 	if err != nil {
-		c.markTaskFailed(ctx, task, err.Error())
 		logger.Error("task failed to resolve namespace credentials",
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "namespace", task.Namespace, "error", err)
-		return taskFailed
+		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, err.Error()))
 	}
 
 	// Sequential mode: one DDL per engine call. The task identifier is used as the
@@ -248,23 +247,19 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	request := sequentialEngineApplyRequest(task, options, taskCreds, logger)
 	needsFiles, err := c.taskNeedsRowSecurityFiles(task)
 	if err != nil {
-		c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err))
-		return taskFailed
+		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("resolve row security parser: %v", err)))
 	}
 	if needsFiles {
 		planID, err := planIDForTasks(apply, []*storage.Task{task})
 		if err != nil {
-			c.markTaskFailed(ctx, task, fmt.Sprintf("resolve desired schema plan for row security apply: %v", err))
-			return taskFailed
+			return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("resolve desired schema plan for row security apply: %v", err)))
 		}
 		plan, err := c.storage.Plans().GetByID(ctx, planID)
 		if err != nil {
-			c.markTaskFailed(ctx, task, fmt.Sprintf("load desired schema for row security apply: %v", err))
-			return taskFailed
+			return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("load desired schema for row security apply: %v", err)))
 		}
 		if plan == nil {
-			c.markTaskFailed(ctx, task, "row security apply has no stored desired schema plan")
-			return taskFailed
+			return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, "row security apply has no stored desired schema plan"))
 		}
 		request.PlanID = plan.PlanIdentifier
 		request.SchemaFiles = plan.SchemaFiles
@@ -272,20 +267,21 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	result, err := c.applyWithEngine(ctx, c.getEngine(), request)
 
 	if err != nil {
+		var verdictErr error
 		if c.shouldRetryEngineError(err) {
-			c.markTaskRetryable(ctx, task, err.Error())
+			verdictErr = c.markTaskRetryable(ctx, task, err.Error())
 		} else {
-			c.markTaskFailed(ctx, task, err.Error())
+			verdictErr = c.markTaskFailed(ctx, task, err.Error())
 		}
 		logger.Error("task failed",
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-		return taskFailed
+		return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr)
 	}
 	if !result.Accepted {
-		c.markTaskFailed(ctx, task, result.Message)
+		verdictErr := c.markTaskFailed(ctx, task, result.Message)
 		logger.Error("task rejected",
 			"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "engine_message", result.Message)
-		return taskFailed
+		return c.failureVerdictAction(apply.ApplyIdentifier, task, verdictErr)
 	}
 
 	// Mark task running
@@ -691,8 +687,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				if errors.As(err, &permanent) {
 					logger.Error("progress check failed with permanent error",
 						"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
-					c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed: %v", err))
-					return taskFailed
+					return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed: %v", err)))
 				}
 				// A transient poll that nonetheless never succeeds must not spin
 				// forever: an apply that cannot reach a terminal state holds the
@@ -703,11 +698,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					"task_id", task.TaskIdentifier, "table", task.TableName, "error", err, "consecutive_errors", consecutiveErrors)
 				if consecutiveErrors >= maxConsecutiveProgressPollErrors {
 					if c.shouldRetryEngineError(err) {
-						c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
-						return taskFailed
+						return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskRetryable(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err)))
 					}
-					c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err))
-					return taskFailed
+					return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", consecutiveErrors, err)))
 				}
 				continue
 			}
@@ -753,8 +746,7 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 					c.logger.Warn("engine reports no active schema change for an in-flight task and target verification failed; the drive re-verifies at the next poll",
 						append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", result.State, "consecutive_errors", consecutiveErrors, "error", settleErr)...)
 					if consecutiveErrors >= maxConsecutiveProgressPollErrors {
-						c.markTaskRetryable(ctx, task, fmt.Sprintf("engine reports no active schema change for an in-flight task and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", consecutiveErrors))
-						return taskFailed
+						return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskRetryable(ctx, task, fmt.Sprintf("engine reports no active schema change for an in-flight task and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", consecutiveErrors)))
 					}
 					continue
 				}
@@ -883,19 +875,55 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	}
 }
 
-// markTaskFailed sets a task to FAILED state with the given error message and persists it.
-func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, errMsg string) {
+// markTaskFailed sets a task to FAILED state with the given error message and
+// persists it. A write that does not land is returned with the task left as it
+// arrived, so no caller reads a failure verdict storage never recorded.
+func (c *LocalClient) markTaskFailed(ctx context.Context, task *storage.Task, errMsg string) error {
+	previous := *task
 	now := time.Now()
 	task.ErrorMessage = errMsg
 	task.CompletedAt = &now
-	c.transitionTaskState(ctx, task, 0, state.Task.Failed, "")
+	if err := c.persistTaskStateTransition(ctx, task, 0, state.Task.Failed, ""); err != nil {
+		*task = previous
+		return fmt.Errorf("persist failed verdict for task %s: %w", task.TaskIdentifier, err)
+	}
+	return nil
 }
 
 // markTaskRetryable records a task failure that operator recovery may retry.
-func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task, errMsg string) {
+// A write that does not land is returned with the task left as it arrived.
+func (c *LocalClient) markTaskRetryable(ctx context.Context, task *storage.Task, errMsg string) error {
+	previous := *task
 	task.ErrorMessage = errMsg
 	task.CompletedAt = nil
-	c.transitionTaskState(ctx, task, 0, state.Task.FailedRetryable, "")
+	if err := c.persistTaskStateTransition(ctx, task, 0, state.Task.FailedRetryable, ""); err != nil {
+		*task = previous
+		return fmt.Errorf("persist retryable verdict for task %s: %w", task.TaskIdentifier, err)
+	}
+	return nil
+}
+
+// failureVerdictAction returns the drive's next step after it tried to record a
+// task failure. Finalization derives the apply's outcome from the failed task,
+// so the drive finalizes only over a verdict that landed: a refused write leaves
+// the task row in its previous state, and finalizing over it would settle the
+// apply from a verdict storage never recorded, reading a retryable failure as
+// permanent and cancelling the tasks queued behind it. The drive exits instead,
+// with the apply still active for a later claim to re-drive the task.
+//
+// The decision depends only on whether the write landed; the apply identifier
+// is taken rather than the apply so the signature says so.
+func (c *LocalClient) failureVerdictAction(applyIdentifier string, task *storage.Task, verdictErr error) taskAction {
+	if verdictErr == nil {
+		return taskFailed
+	}
+	attrs := append(task.LogAttrs(), "apply_id", applyIdentifier, "error", verdictErr)
+	if errors.Is(verdictErr, storage.ErrApplyLeaseLost) {
+		c.logger.Warn("task failure verdict was refused because the drive's lease was lost; this driver exits and starts no further task", attrs...)
+		return taskAbort
+	}
+	c.logger.Error("task failure verdict could not be persisted; this driver exits without finalizing and leaves the apply active for a later drive", attrs...)
+	return taskAbort
 }
 
 // engineReportsLostWork reports whether a successful progress poll came back

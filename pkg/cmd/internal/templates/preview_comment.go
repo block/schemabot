@@ -96,7 +96,7 @@ func previewCommentAllOutput() {
 		{"ROLLOUT PLANS (TABLE SIZES, TWO TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTwoTargetTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, THREE TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, REVIEWED TARGET ONLY)", func() {
-			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutReviewedTargetTableSizes())
+			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutPrimaryTargetTableSizes())
 		}},
 		{"HELP COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentHelp()) }},
 		{"SUPPORT CHANNEL FOOTER", func() { fmt.Print(webhooktemplates.PreviewCommentSupportChannel()) }},
@@ -220,7 +220,7 @@ func previewCommentPlanAllOutput() {
 		{"ROLLOUT PLANS (TABLE SIZES, TWO TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTwoTargetTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, THREE TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, REVIEWED TARGET ONLY)", func() {
-			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutReviewedTargetTableSizes())
+			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutPrimaryTargetTableSizes())
 		}},
 		{"DROP COLUMN BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked()) }},
 		{"DROP INDEX BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked()) }},

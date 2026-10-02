@@ -415,7 +415,7 @@ func KnownReviewDriftClassification(classification string) bool {
 //
 // classification="planned" is the healthy outcome for a member that holds its
 // own schema: it was planned against that schema and never compared to the
-// reviewed plan, so it is the independent counterpart of "match" and not a
+// primary plan, so it is the independent counterpart of "match" and not a
 // signal to alert on. It has to be listed here rather than left to the unknown
 // bucket, which is reserved for a classification the code emits and this
 // contract does not know about — a coding gap, which normal independent
@@ -428,7 +428,7 @@ func RecordReviewDrift(ctx context.Context, database, environment, deployment, c
 		classification = "unknown"
 	}
 	addCounter(ctx, "schemabot.review_drift.total",
-		"review-time per-member classifications: against the reviewed primary plan where members mirror it, against the member's own schema where they do not", "{deployment}",
+		"review-time per-member classifications: against the primary target's plan where members mirror it, against the member's own schema where they do not", "{deployment}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("deployment", deployment),

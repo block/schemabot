@@ -234,7 +234,7 @@ A single environment can fan out to multiple Tern deployments by replacing the s
 
 `Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies. Control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment.
 
-Review does not fan out the same way. See [Review and the Primary Deployment](#review-and-the-primary-deployment).
+Planning fans out too, and every deployment is held to the same plan. See [Planning and the Primary Deployment](#planning-and-the-primary-deployment).
 
 ```yaml
 storage:
@@ -274,13 +274,13 @@ Rules:
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
 - `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
-### Review and the Primary Deployment
+### Planning and the Primary Deployment
 
-An apply fans out across every deployment. Review does not: the plan reviewers see, and the plan SchemaBot persists and later applies from, is computed against the **primary deployment** only, meaning the first entry in rollout order.
+Planning fans out like the apply. At review time SchemaBot plans every deployment against its own live schema, and the plan check covers all of them: approving the pull request approves the change on every deployment, not on one of them.
 
-The remaining deployments are diffed against that reviewed plan at review time, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose schema diverges from the reviewed plan, and a deployment that cannot be diffed at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
+The deployments of a `deployments` map are expected to hold the same schema, so they are expected to plan the same changes. The first deployment in rollout order is the **primary deployment**. Its plan is the one SchemaBot stores, and every deployment runs that plan at apply time. Each other deployment's plan is compared against it, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose plan differs from the primary deployment's, and a deployment that cannot be planned at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
 
-A multi-deployment environment is gated on every deployment agreeing with one reviewed plan, not on one reviewed plan per deployment.
+Being primary decides which plan is stored, not which deployment is reviewed. A multi-deployment environment is gated on every deployment planning the same changes, because every deployment runs the one stored plan.
 
 ### Deployment Order
 
@@ -647,6 +647,39 @@ enforcement off, set `enabled: false`.
 Budgets are enforced per server process, so a deployment running N replicas
 admits up to N times the configured rate overall. Size the numbers as a
 per-replica ceiling.
+
+### Check inspection
+
+`GET /api/checks/inspect` (`schemabot checks inspect`) reads the pull request
+and each expected Check Run from GitHub on every call, uncached, through the
+same GitHub App installation SchemaBot publishes its Check Runs through. A
+caller polling it in a loop can spend the installation's hourly REST quota, and
+then SchemaBot's own Check Run writes start failing and the merge gate goes
+stale. The endpoint therefore has a per-caller budget, also **on by default**:
+
+```yaml
+rate_limits:
+  checks_inspect:
+    enabled: true             # default: true
+    per_caller:
+      requests_per_minute: 6  # default: 6
+      burst: 10               # default: 10
+```
+
+As an approximate sustained budget, each inspection costs one GitHub read for
+the pull request plus at least one per expected check name. The hourly estimate
+is `60 × requests_per_minute × (1 + N)`, where N is the number of check names.
+Check Run pagination multiplies those reads, and the initial burst permits
+additional inspections. A dashboard polling three pull requests every 30
+seconds fits the sustained default; poll at 30 seconds or longer. A deployment
+that publishes more check names or has deep Check Run histories should lower
+`requests_per_minute`.
+
+`per_caller` is keyed the same way as the pull endpoint's. With API auth
+disabled, every caller shares one budget. There is no `per_target` lane. A
+refusal is the same `429` with `error_code: rate_limited` and `Retry-After`, and
+it is returned before any GitHub call is made. Set `enabled: false` to turn
+enforcement off.
 
 ## Pending Drops
 

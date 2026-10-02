@@ -14,7 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// reviewedPlanStore holds the reviewed plan of testapp/production the way its
+// reviewedPlanStore holds the primary plan of testapp/production the way its
 // planner stored it for the eu target named, so the rollout can pair each
 // member with the plan an apply of it would run.
 func reviewedPlanStore(t *testing.T, reviewed *ternv1.PlanResponse, target string) *recordingPlanStore {
@@ -261,7 +261,7 @@ func TestPlanRollout_UnplannedMemberLogSaysWhoRefusesTheApply(t *testing.T) {
 	assert.Contains(t, mirroredLogs.String(), `msg="rollout member could not be planned; the plan lists it as needing attention, and the CLI refuses a rollout-wide apply until it is planned"`)
 }
 
-// A primary plan that reported errors already fails the plan, so no other
+// The primary plan that reported errors already fails the plan, so no other
 // member is planned beside it. The rollout still says so, listing each other
 // member as not planned, so an operator reading the primary's errors can tell
 // the other targets were never looked at rather than found fine.
