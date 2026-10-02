@@ -244,6 +244,14 @@ const (
 // not-evaluated write instead of clearing it.
 const ReviewTimeDeploymentDriftBlockingReason = "review_time_deployment_drift"
 
+// NamespacePlacementRefusedBlockingReason is the stable Check.BlockingReason
+// value for an environment whose plan was refused because its targets entries
+// and the schema files disagree on where a namespace lives. It is written with
+// the review-time write intent (PlanDriftBlocked) and preserved on a
+// not-evaluated write exactly like a drift block, since only a plan that
+// re-evaluates placement can lift it.
+const NamespacePlacementRefusedBlockingReason = "namespace_placement_refused"
+
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64

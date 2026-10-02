@@ -11,7 +11,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
-| `schemabot.plans.total` | Counter | repository, database, environment, status | Total plan operations |
+| `schemabot.plans.total` | Counter | repository, database, deployment, environment, status | Plan attempts, each counted once by the API; `success` only once the plan is stored |
 | `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |
 | `schemabot.applies.total` | Counter | repository, database, environment, status | Total apply operations |
 | `schemabot.apply.duration_seconds` | Histogram | repository, database, environment, status | Apply API call time |

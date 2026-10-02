@@ -340,6 +340,8 @@ When a database's namespaces are spread across its targets, an entry can be a ma
 
 The schema directory declares the namespace set; `namespaces` only selects from it and can never add one. Each target's plan, stored plan, and apply cover only its selected namespaces. A pull of the whole environment asks each target for its selected namespaces by name rather than discovering them on the cluster, and an explicitly requested namespace a target does not select is left out of that target's pull.
 
+A namespace that the schema files declare but a target's entry does not select is an *unselected namespace* of that target. In the example above, `payments_2` and `payments_3` are unselected namespaces of `payments-001`. They still exist, on another target, so they are withheld from that target's plan rather than removed. SchemaBot sends the target's plan only the files of its selected namespaces. It names the rest in the plan request's `unselected_namespaces`, so the Tern deployment knows those namespaces are left out on purpose. Their live tables are never treated as tables to drop.
+
 Rules:
 
 - `targets` requires `type: mysql`. Configuring it on a `vitess`, `strata`, or `postgres` database fails validation at startup.
@@ -357,7 +359,10 @@ Rules:
 - Every declared namespace must be selected by some target; a target without `namespaces` selects all of them. A declared namespace no entry selects fails every plan of the environment, whether from a pull request or the CLI, since no target would plan or apply it. On a pull request that environment's check fails; the API answers `400 Bad Request` naming the namespaces. To keep one out of the rollout on purpose, list it in `ignore_namespaces`.
 - Selecting namespaces needs a target whose DSN does not name a database. A database-scoped DSN is diffed as one unit, so the namespaces an entry does not select would have their live tables planned as `DROP TABLE`; the plan refuses instead, as it does for `ignore_namespaces`.
 
-Rollout order: upgrade the Tern deployments serving an environment before adding `namespaces` to its entries. SchemaBot tells the Tern deployment which declared namespaces a target's entry leaves out, and the refusal above for a database-scoped DSN happens there. There is no version check between the two, so a Tern deployment from an earlier release drops that list without error and plans the left-out namespaces' live tables as `DROP TABLE` instead of refusing. Those drops are still unsafe changes that an apply refuses without `--allow-unsafe`, but the plan is wrong until the upgrade lands.
+Rollout order: upgrade the Tern deployments serving an environment before adding `namespaces` to its entries. The refusal above for a database-scoped DSN happens in the Tern deployment, which needs `unselected_namespaces` to make it. There is no version check between SchemaBot and Tern. A Tern deployment from an earlier release discards `unselected_namespaces` without error and plans the unselected namespaces' live tables as `DROP TABLE`. SchemaBot reads every plan that comes back and refuses one that drops an unselected namespace's tables, with or without `--allow-unsafe`, so such a plan fails rather than going to review:
+
+- A drop the plan places in an unselected namespace is refused, and the error asks for the Tern deployment to be upgraded.
+- A drop placed in a selected namespace, or in none, is refused when an unselected namespace declares a table of that name, ignoring case. This is the MySQL case, where the engine attributes every drop to the namespace it was sent. A live table that no schema file declares is not caught this way, and is reviewed like any other unsafe drop.
 
 `targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the schema the files describe for it: every declared namespace, or, for a target whose entry selects namespaces, only those. What differs is what a difference between members means when one is found.
 

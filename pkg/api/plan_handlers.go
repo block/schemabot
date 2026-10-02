@@ -248,6 +248,11 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if unselectedErr, ok := errors.AsType[*UnselectedPullNamespaceError](err); ok {
+			s.logger.Warn("pull schema rejected for namespaces no targets entry selects", "database", req.Database, "environment", req.Environment, "namespaces", unselectedErr.Namespaces, "selectable_namespaces", unselectedErr.Selectable)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if unsupportedErr, ok := errors.AsType[*unsupportedPullSchemaError](err); ok {
 			s.logger.Warn("pull schema rejected for unsupported database type", "database", req.Database, "environment", req.Environment, "type", unsupportedErr.DatabaseType)
 			s.writeError(w, http.StatusNotImplemented, err.Error())
@@ -321,6 +326,17 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid namespaces")
+		return nil, err
+	}
+	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve targets")
+		return nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if err := requireSelectablePullNamespaces(req, targets, namespaces); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "unselected namespaces")
 		return nil, err
 	}
 	catalogDetail, err := pullCatalogDetail(req.CatalogDetail)
@@ -651,6 +667,18 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// A plan proposing drops in namespaces the target's entry does not
+		// select is refused the same way on every retry until the configuration,
+		// the schema files or the planning deployment changes, so it is the
+		// request's answer rather than a server fault. Drops that could not be
+		// checked (UnselectedTableDropCheckError) stay a server error below:
+		// SchemaBot failed to perform the check, which says nothing about the
+		// request.
+		if _, ok := errors.AsType[*UnselectedTableDropError](err); ok {
+			s.logger.Warn("plan rejected for proposing drops in namespaces the target's entry does not select", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*RolloutMemberSelectionError](err); ok {
 			s.logger.Warn("plan rejected for a target that names no single rollout member", "database", req.Database, "environment", req.Environment, "selector", req.Target, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
@@ -707,6 +735,16 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	)
 	defer span.End()
 
+	// Every plan attempt is counted exactly once, here, whatever path it
+	// leaves by: it counts as a success only once its response is stored.
+	planStart := time.Now()
+	deployment := ""
+	status := "error"
+	defer func() {
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, status)
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, status)
+	}()
+
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid schema files")
@@ -715,15 +753,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
 	}
 
-	planStart := time.Now()
-	deployment := ""
-
 	resolvedTarget, narrowedTo, err := s.planMember(req)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "resolve target")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	deployment = resolvedTarget.Deployment
@@ -731,55 +764,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		typeErr := &databaseTypeMismatchError{Database: req.Database, RequestType: req.Type, ConfigType: resolvedTarget.DatabaseType}
 		span.RecordError(typeErr)
 		span.SetStatus(otelcodes.Error, "type mismatch")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, typeErr
 	}
-	// Every declared namespace must be held by some rollout member, on every
-	// plan of the environment and not only a pull request review, so a lone
-	// target selecting a subset cannot report a clean plan that leaves the rest
-	// planned nowhere.
-	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "resolve targets")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
-	}
-	if err := requireNamespaceCoverage(req, targets); err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "namespace coverage")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, nil, err
-	}
-	// The planned member (the primary, or for a narrowed plan the member it
-	// names) plans, and its plan row records, only the namespaces its targets
-	// entry selects. req is this call's copy, so narrowing it here leaves the
-	// caller's request, which the other members are planned from, untouched.
-	plannedSchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "select namespaces")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, nil, err
-	}
-	if len(resolvedTarget.Namespaces) > 0 {
-		s.logger.Info("plan covers only the namespaces its rollout member's targets entry selects: the primary's, or for a narrowed plan the named member's",
-			"database", req.Database,
-			"environment", req.Environment,
-			"deployment", deployment,
-			"target", resolvedTarget.Target,
-			"narrowed_to", narrowedTo,
-			"repository", req.Repository,
-			"namespaces", resolvedTarget.Namespaces,
-			"declared_namespace_count", len(req.SchemaFiles))
-	}
-	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
-	req.SchemaFiles = plannedSchemaFiles
-
 	prInt := 0
 	if req.PullRequest != nil {
 		prInt = int(*req.PullRequest)
@@ -790,7 +776,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	}
 	// Source policy checks only apply to SchemaBot-discovered PR sources. Direct
 	// operator/API plans remain available through the existing endpoint access
-	// model until the dedicated auth layer is added.
+	// model until the dedicated auth layer is added. The check runs before
+	// namespace placement, so a plan whose source the policy denies is
+	// reported, counted and logged as a source policy block rather than as
+	// whatever placement defect its files also carry.
 	if !req.SourceTrusted {
 		s.logger.Debug("skipping source policy for direct plan request",
 			"database", req.Database,
@@ -807,8 +796,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			reason := sourcePolicyReason(err)
 			span.RecordError(err)
 			span.SetStatus(otelcodes.Error, "source policy")
-			metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 			metrics.RecordSourcePolicyBlock(ctx, "plan", req.Database, req.Environment, reason)
 			s.logger.Warn("plan blocked by source policy",
 				"database", req.Database,
@@ -822,12 +809,50 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 	}
 
+	// Every declared namespace must be held by some rollout member, on every
+	// plan of the environment and not only a pull request review, so a lone
+	// target selecting a subset cannot report a clean plan that leaves the rest
+	// planned nowhere.
+	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve targets")
+		return nil, nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if err := requireNamespaceCoverage(req, targets); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "namespace coverage")
+		return nil, nil, err
+	}
+	// The planned member (the primary, or for a narrowed plan the member it
+	// names) plans, and its plan row records, only the namespaces its targets
+	// entry selects. req is this call's copy, so narrowing it here leaves the
+	// caller's request, which the other members are planned from, untouched.
+	plannedSchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "select namespaces")
+		return nil, nil, err
+	}
+	if len(resolvedTarget.Namespaces) > 0 {
+		s.logger.Info("plan covers only the namespaces its rollout member's targets entry selects: the primary's, or for a narrowed plan the named member's",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"target", resolvedTarget.Target,
+			"narrowed_to", narrowedTo,
+			"repository", req.Repository,
+			"namespaces", resolvedTarget.Namespaces,
+			"declared_namespace_count", len(req.SchemaFiles))
+	}
+	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
+	declaredSchemaFiles := req.SchemaFiles
+	req.SchemaFiles = plannedSchemaFiles
+
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "tern client")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
@@ -835,8 +860,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "direct execution policy")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", req.Database, req.Environment, err)
 	}
 	ternReq := &ternv1.PlanRequest{
@@ -908,8 +931,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "plan failed")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		s.logger.Error("ExecutePlan: client.Plan failed",
 			"database", req.Database,
 			"type", resolvedTarget.DatabaseType,
@@ -932,8 +953,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		return nil, nil, err
 	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
-	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
-	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "success")
 
 	s.logger.Info("ExecutePlan: plan response",
 		"plan_id", resp.PlanId,
@@ -949,7 +968,17 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 	}
 
+	// A plan the control plane refuses is counted as an error, never as a
+	// success, so the plan is recorded as a success only once both refusals
+	// have passed it.
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "withheld table drops")
+		return nil, nil, err
+	}
+	if err := s.refuseDropsOfUnselectedTables(req, declaredSchemaFiles, unselected, resolvedTarget, resp.Changes, resp.Shards); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "unselected namespace drops")
 		return nil, nil, err
 	}
 
@@ -975,6 +1004,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	planResp.Target = resolvedTarget.Target
 	planResp.SelectedNamespaces = slices.Clone(resolvedTarget.Namespaces)
 	planResp.NarrowedTo = narrowedTo
+	status = "success"
 	return resp, planResp, nil
 }
 

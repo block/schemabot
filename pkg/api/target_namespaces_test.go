@@ -474,6 +474,70 @@ func TestBuildApplyOperationGroups_SameTableInTwoNamespacesOfOneTarget(t *testin
 	assert.Equal(t, "ns_2", groups[1].Tasks[0].Namespace)
 }
 
+// A pull request whose source the database's policy denies is reported as a
+// source policy block even when its schema files also leave a namespace
+// unplaced, so the refusal, its metric and its log name the check that denied
+// it rather than the placement defect behind it.
+func TestExecutePlan_SourcePolicyDenialPrecedesNamespacePlacement(t *testing.T) {
+	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-primary"}}
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type:         storage.DatabaseTypeMySQL,
+				AllowedRepos: []string{"octocat/orders-schema"},
+				Environments: map[string]EnvironmentConfig{
+					"production": {Deployment: "eu", Targets: []TargetEntry{{Target: "orders-001", Namespaces: []string{"ns_0"}}}},
+				},
+			},
+		},
+		TernDeployments: TernConfig{"eu": {"production": "tern-eu:9090"}},
+	}
+	svc := New(&mockStorageWithPlanLookup{plans: &capturingPlanStore{}}, cfg, map[string]tern.Client{"eu/production": client},
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	req := threeNamespaceRequest()
+	req.SourceTrusted = true
+	req.Repository = "octocat/other-repo"
+	req.PullRequest = new(int32(7))
+	req.SchemaPath = "schema/orders"
+
+	_, err := svc.ExecutePlan(t.Context(), req)
+	require.Error(t, err)
+	var policyErr *SourcePolicyError
+	require.ErrorAs(t, err, &policyErr)
+	assert.Equal(t, SourcePolicyReasonUnauthorizedRepo, policyErr.Reason)
+	assert.False(t, NamespacePlacementRefused(err), "the denial is not reported as the placement defect the files also carry")
+	assert.Nil(t, client.planReq)
+}
+
+// When every targets entry selects namespaces, a pull naming one none of them
+// selects is a bad request naming it and the selectable ones, not an empty
+// schema that reads as a namespace holding no tables. An entry selecting
+// nothing holds every namespace, so there any name is pulled as requested.
+func TestPullHandler_UnselectedNamespaceIsBadRequest(t *testing.T) {
+	client := &mockTernClient{isRemote: true}
+	svc := namespaceSelectionService(t, client, &capturingPlanStore{})
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull",
+		bytes.NewReader([]byte(`{"database":"orders","environment":"production","namespaces":["ns_1","ns_l"]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), `has no targets entry selecting namespaces [ns_l]; the selectable namespaces are [ns_0, ns_1, ns_2]`)
+	assert.Empty(t, client.pullSchemaReqs, "nothing is pulled for a namespace no target holds")
+
+	assert.NoError(t, requireSelectablePullNamespaces(pullRequest(), []routing.ExecutionTarget{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002"},
+	}, []string{"ns_l"}), "an entry selecting nothing may hold any namespace")
+	assert.NoError(t, requireSelectablePullNamespaces(pullRequest(), []routing.ExecutionTarget{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+	}, []string{""}), "a pull of every namespace names none to check")
+}
+
 // A plan requested through the API for a rollout whose primary selects
 // namespaces plans the other members beside it: the primary is held to the
 // selection it was planned under, which the plan response records, so the
