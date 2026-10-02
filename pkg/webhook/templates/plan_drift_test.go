@@ -448,7 +448,7 @@ func TestRenderPlanComment_OneTargetPlanNamesEveryTarget(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "### 3 targets: `primary/testapp-001`, `primary/testapp-002`, `eu-west`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+	assert.Contains(t, out, "### 3 targets\n\n`primary/testapp-001`, `primary/testapp-002`, `eu-west`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 }
 
@@ -481,7 +481,7 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 
 	t.Run("some targets are already there", func(t *testing.T) {
 		out := render(group(1, "a", "c"), group(0, "b"))
-		assert.Contains(t, out, "### 2 of 3 targets: `a`, `c`\n\n```sql\n")
+		assert.Contains(t, out, "### 2 of 3 targets\n\n`a`, `c`\n\n```sql\n")
 		assert.Contains(t, out, "### Target `b`\n\nNo schema changes detected\n\n")
 		assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 	})
@@ -501,7 +501,7 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 		changes := planGroupChanges(1)
 		changes[0].Keyspace = "testapp_staging"
 		out := render(DeploymentPlanGroup{Members: []string{"a", "c"}, Changes: changes}, group(0, "b"))
-		assert.Contains(t, out, "### 2 of 3 targets: `a`, `c`\n\n#### Schema Name: `testapp_staging`\n```sql\nALTER TABLE `t0`",
+		assert.Contains(t, out, "### 2 of 3 targets\n\n`a`, `c`\n\n#### Schema Name: `testapp_staging`\n```sql\nALTER TABLE `t0`",
 			"each target group is a section with its schema heading under it")
 	})
 }
@@ -918,7 +918,7 @@ func TestRenderMultiEnvPlanComment_EachTargetPlanRendersUnderItsTargets(t *testi
 
 	_, production, found := strings.Cut(out, "Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "#### 2 of 4 targets: `primary/testapp_1`, `primary/testapp_2`")
+	assert.Contains(t, production, "#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`")
 	otherHeader := strings.Index(production, "#### Target `primary/testapp_4`")
 	details := strings.Index(production, "<details>\n<summary>Show SQL (2 statements)</summary>")
 	assert.GreaterOrEqual(t, otherHeader, 0)
@@ -944,7 +944,7 @@ func TestRenderMultiEnvPlanComment_SchemaNameSitsUnderItsTargets(t *testing.T) {
 
 	_, production, found := strings.Cut(out, "### Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "#### 2 of 4 targets: `primary/testapp_1`, `primary/testapp_2`\n\n**Schema Name**: `testapp_production`\n\n```sql\n")
+	assert.Contains(t, production, "#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`\n\n**Schema Name**: `testapp_production`\n\n```sql\n")
 	assert.NotContains(t, production, "#### Schema Name")
 }
 

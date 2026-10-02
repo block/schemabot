@@ -1739,9 +1739,10 @@ func writeNamespaceLabel(sb *strings.Builder, data PlanCommentData, label, value
 // writeTargetGroupHeading heads the targets of a rollout that run one plan, at
 // the given heading level: one level above the namespaces under it, so each
 // target group reads as its own section. A lone target is named in the
-// heading; a group is headed by how many targets it holds, and how many the
-// rollout has when it holds only some, followed by the names, collapsed under
-// the heading when too many to read in it. The names stay whole, as an
+// heading. A group is headed by how many targets it holds, and how many the
+// rollout has when it holds only some, so the heading stays one short line
+// however many targets the group holds; the names follow on their own line,
+// collapsed when too many to read inline. The names stay whole, as an
 // operator addresses each target.
 func writeTargetGroupHeading(sb *strings.Builder, level string, members []string, total int) {
 	if len(members) == 1 {
@@ -1752,12 +1753,13 @@ func writeTargetGroupHeading(sb *strings.Builder, level string, members []string
 	if len(members) == total {
 		count = fmt.Sprintf("%d %s", total, targetNoun.Plural)
 	}
+	fmt.Fprintf(sb, "%s %s\n\n", level, count)
 	names := strings.Join(inlineCodeList(members), ", ")
 	if len(members) <= shardNamesInlineLimit {
-		fmt.Fprintf(sb, "%s %s: %s\n\n", level, count, names)
+		fmt.Fprintf(sb, "%s\n\n", names)
 		return
 	}
-	fmt.Fprintf(sb, "%s %s\n\n<details>\n<summary>Target names</summary>\n\n%s\n\n</details>\n\n", level, count, names)
+	fmt.Fprintf(sb, "<details>\n<summary>Target names</summary>\n\n%s\n\n</details>\n\n", names)
 }
 
 func writeGroupHeading(sb *strings.Builder, noun presentation.Noun, members []string, total int) {
