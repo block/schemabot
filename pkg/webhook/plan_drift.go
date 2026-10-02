@@ -237,9 +237,9 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 			addModeTarget(&groups[at].DirectChanges, templates.DirectChangeData(dc), names[i])
 		}
 		// Lint reads each member's live schema, so members that run the same
-		// DDL can still raise different findings. The group discloses every
+		// DDL can still raise different findings. The group carries every
 		// finding any of its members raised, each once, naming the targets
-		// that raised it.
+		// that raised it, so the comment can say which targets each is on.
 		groups[at].LintViolations = addMemberLint(groups[at].LintViolations, e.LintViolations, names[i])
 		// An unsafe change is disclosed under the targets that carry it too, so
 		// one --allow-unsafe consents to it on every target the apply runs.

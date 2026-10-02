@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/glyph"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -308,12 +309,12 @@ func TestReviewDriftComment_VerdictInTwoNamespacesNamesItsTargetOnce(t *testing.
 
 // Lint reads each target's live schema beside the changes it would run, so two
 // targets running the same DDL can raise different findings, and a target with
-// different DDL raises its own. A finding not every target raised renders under
-// the group whose targets raised it, once however many of them did, and names
-// them when only some of the group's targets did. Error-severity findings are
-// unsafe changes, disclosed and gated as such, so they stay out of the advisory
-// list.
-func TestReviewDriftComment_EachTargetGroupDisclosesItsOwnLint(t *testing.T) {
+// different DDL raises its own. Every target's findings render in one section
+// after the target plans, each once however many targets raised it, naming
+// the targets that did when not every target with work did. Error-severity
+// findings are unsafe changes, disclosed and gated as such, so they stay out
+// of the advisory list.
+func TestReviewDriftComment_LintNamesTheTargetsThatRaisedIt(t *testing.T) {
 	primary := independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false)
 	primary.LintViolations = []*ternv1.LintViolation{memberLint("orders", "column `email` should not be nullable", "warning")}
 	second := independentMemberDiff("orders-002", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false)
@@ -327,24 +328,23 @@ func TestReviewDriftComment_EachTargetGroupDisclosesItsOwnLint(t *testing.T) {
 		memberLint("orders", "table `orders` has no primary key", "warning"),
 	}
 	body := renderLintComment(t, primary, second, third)
-	group, primarySection, found := strings.Cut(body, "### Target `commerce/orders-001`")
-	require.True(t, found, "the primary renders under its own heading")
 
-	assert.Contains(t, group, "💡 **Lint Warnings**: 2 advisory findings\n- `orders`: table has no index on `phone`\n- `orders` on target `commerce/orders-003`: table `orders` has no primary key\n",
-		"the group discloses each finding its targets raised once, naming the target when only one of them raised it")
+	assert.Contains(t, body, "💡 **Lint Warnings**: 3 advisory findings\n"+
+		"- `orders` on target `commerce/orders-001`: column `email` should not be nullable\n"+
+		"- `orders` on targets `commerce/orders-002`, `commerce/orders-003`: table has no index on `phone`\n"+
+		"- `orders` on target `commerce/orders-003`: table `orders` has no primary key\n",
+		"each finding renders once, naming the targets that raised it")
 	assert.NotContains(t, body, "is unsafe", "an error-severity finding is an unsafe change, not advisory lint")
-	assert.Contains(t, primarySection, "💡 **Lint Warnings**: 1 advisory finding\n- `orders`: column `email` should not be nullable\n",
-		"the primary's findings render under the primary's plan")
-	assert.Equal(t, 2, strings.Count(body, "**Lint Warnings**"), "no plan-wide section repeats a group's findings")
+	assertLintFollowsTargetPlans(t, body)
 }
 
 // A finding every target with work raises is about the schema they are all
-// brought to, so it renders once for the plan instead of under every group. A
-// target already at the schema has nothing to lint and does not keep it from
-// being shared. A finding one target raises from its own live state, such as
-// an auto-increment counter near its type's capacity, stays under that
-// target's group and names it.
-func TestReviewDriftComment_LintEveryTargetRaisesRendersOnce(t *testing.T) {
+// brought to, so it names no targets, as a single-target plan's would. A
+// target already at the schema has nothing to lint and does not make the
+// finding read as partial. A finding one target raises from its own live
+// state, such as an auto-increment counter near its type's capacity, names
+// that target.
+func TestReviewDriftComment_LintEveryTargetRaisesNamesNoTargets(t *testing.T) {
 	const shared = "table `orders` has no primary key"
 	const counter = "AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type"
 	primary := independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false)
@@ -357,14 +357,48 @@ func TestReviewDriftComment_LintEveryTargetRaisesRendersOnce(t *testing.T) {
 
 	body := renderLintComment(t, primary, second, third, converged)
 
-	assert.Equal(t, 1, strings.Count(body, shared), "a finding every target with work raises is disclosed once")
-	assert.Contains(t, body, "💡 **Lint Warnings**: 1 advisory finding across 3 of 4 targets\n- `orders`: "+shared+"\n",
-		"the shared finding renders plan-wide, naming no target")
-	group, _, found := strings.Cut(body, "### Target `commerce/orders-001`")
-	require.True(t, found, "the primary renders under its own heading")
-	assert.Contains(t, group, "- `orders` on target `commerce/orders-003`: AUTO_INCREMENT value 1932735283",
-		"a finding one target raises names it")
-	assert.Equal(t, 2, strings.Count(body, "**Lint Warnings**"), "one shared section and one for the group the counter finding is in")
+	assert.Contains(t, body, "💡 **Lint Warnings**: 2 advisory findings\n"+
+		"- `orders`: "+shared+"\n"+
+		"- `orders` on target `commerce/orders-003`: "+counter+"\n",
+		"the shared finding names no target; the counter finding names the one target that raised it")
+	assertLintFollowsTargetPlans(t, body)
+}
+
+// Findings sort by table so a table's findings sit together, whichever target
+// group raised them first. A finding raised by more targets than read inline
+// states its coverage on the line and collapses the names beneath it.
+func TestReviewDriftComment_LintSortsByTableAndCollapsesWideTargetLists(t *testing.T) {
+	const drift = "Column \"score\" in table \"riders\" uses \"float\" data type"
+	const shared = "table `docks` has no primary key"
+	var diffs []api.DeploymentPlanDiff
+	for n := 1; n <= 10; n++ {
+		d := independentMemberDiff(fmt.Sprintf("orders-%03d", n), "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false)
+		if n < 10 {
+			d.LintViolations = append(d.LintViolations, memberLint("riders", drift, "warning"))
+		}
+		d.LintViolations = append(d.LintViolations, memberLint("docks", shared, "warning"))
+		diffs = append(diffs, d)
+	}
+
+	body := renderLintComment(t, diffs...)
+
+	assert.Contains(t, body, "💡 **Lint Warnings**: 2 advisory findings\n"+
+		"- `docks`: "+shared+"\n"+
+		"- `riders` on 9 of 10 targets: "+ui.CodeQuoteIdentifiers(drift)+"\n"+
+		"  <details>\n  <summary>Target names</summary>\n\n"+
+		"  `commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`, `commerce/orders-004`, `commerce/orders-005`, "+
+		"`commerce/orders-006`, `commerce/orders-007`, `commerce/orders-008`, `commerce/orders-009`\n\n  </details>\n",
+		"findings sort by table, and a wide target list collapses under its coverage")
+}
+
+// assertLintFollowsTargetPlans asserts the plan carries one lint section, after
+// every target group and before the plan summary.
+func assertLintFollowsTargetPlans(t *testing.T, body string) {
+	t.Helper()
+	assert.Equal(t, 1, strings.Count(body, "**Lint Warnings**"), "every target's findings render in one section")
+	lint := strings.Index(body, "💡 **Lint Warnings**")
+	assert.Greater(t, lint, strings.LastIndex(body, "### "), "the lint section follows every target group")
+	assert.Less(t, lint, strings.Index(body, "📋 **Plan**"), "the lint section precedes the plan summary")
 }
 
 func memberLint(table, message, severity string) *ternv1.LintViolation {

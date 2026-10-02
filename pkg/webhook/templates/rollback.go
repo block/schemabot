@@ -44,7 +44,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 
 	// Lint violations
 	if len(data.LintViolations) > 0 {
-		writeLintViolations(&sb, data.LintViolations, "")
+		writeLintViolations(&sb, data.LintViolations)
 	}
 
 	// Errors
