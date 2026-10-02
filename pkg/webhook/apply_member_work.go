@@ -205,7 +205,7 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 // memberWorkRefusalMessage tells the operator why the other targets' work was
 // not run. The refusal names only targets, tables, and namespaces.
 func memberWorkRefusalMessage(refusal string) string {
-	return fmt.Sprintf("Nothing was applied: %s. An apply runs every target or none. The schema check keeps blocking merge until every target has the change.", refusal)
+	return fmt.Sprintf("This PR cannot apply every target's plan: %s, so nothing was applied. An apply runs every target or none. The schema check keeps blocking merge until every target has the change.", refusal)
 }
 
 // pauseForMemberWorkConfirmation holds the lock this apply acquired for an

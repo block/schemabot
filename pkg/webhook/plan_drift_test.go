@@ -735,3 +735,24 @@ func TestMemberUnsafeChanges_DropIsUnsafeWithoutAVerdict(t *testing.T) {
 	assert.Equal(t, []string{"eu", "us"}, list[0].Targets)
 	assert.Equal(t, 3, list[0].TotalTargets)
 }
+
+// A member's VSchema deletion is unsafe the way the reviewed plan's is, so it
+// is listed beside the member's table changes, and a record that cannot be
+// decoded is listed as unsafe rather than dropped.
+func TestMemberUnsafeChanges_ListsVSchemaChanges(t *testing.T) {
+	deletions, err := apitypes.EncodeVSchemaDeletions([]apitypes.VSchemaDeletion{
+		{Kind: "vindex", Name: "orders_lookup", Reason: "removes vindex orders_lookup, which routes queries on orders"},
+	})
+	require.NoError(t, err)
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{
+		{Namespace: "commerce", Metadata: map[string]string{apitypes.VSchemaDeletionsMetadataKey: deletions},
+			TableChanges: []*ternv1.TableChange{{TableName: "legacy", Ddl: "DROP TABLE `legacy`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP}}},
+		{Namespace: "customers", Metadata: map[string]string{apitypes.VSchemaDeletionsMetadataKey: "{not json"}},
+	}}
+
+	assert.Equal(t, []templates.UnsafeChangeData{
+		{Table: "legacy", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `legacy`", ChangeType: "drop"},
+		{Table: "commerce/vschema.json", Reason: "removes vindex orders_lookup, which routes queries on orders", ChangeType: apitypes.VSchemaChangeType},
+		{Table: "customers/vschema.json", Reason: "VSchema deletions were recorded on this plan but could not be decoded, so the VSchema change is treated as unsafe", ChangeType: apitypes.VSchemaChangeType},
+	}, memberUnsafeChanges(cs))
+}

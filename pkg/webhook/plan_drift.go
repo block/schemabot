@@ -410,9 +410,30 @@ func addModeTarget[T modeChange](list *[]T, change T, target string) {
 // sharded namespace, so a change unsafe on some shards names them, and
 // otherwise from the namespace view. The unsafe verdict and the drop fallback
 // are apitypes.TableChangeResponse.UnsafeChange, the reviewed plan's own rule.
-// A member's VSchema unsafe change is not listed here; apply creation still
-// requires the opt-in for it.
+// Each namespace's unsafe VSchema change follows its table changes, read by
+// apitypes.SchemaChangeResponse.VSchemaUnsafeChanges as the reviewed plan's
+// are, so an undecodable record is listed as unsafe rather than dropped.
 func memberUnsafeChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
+	return append(memberUnsafeTableChanges(cs), memberUnsafeVSchemaChanges(cs)...)
+}
+
+// memberUnsafeVSchemaChanges lists each namespace's unsafe VSchema change in
+// one member's plan, from the namespace view, where the plan records VSchema
+// work whether or not the namespace is sharded.
+func memberUnsafeVSchemaChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
+	var out []templates.UnsafeChangeData
+	for _, sc := range cs.Changes {
+		namespace := &apitypes.SchemaChangeResponse{Namespace: sc.GetNamespace(), Metadata: sc.GetMetadata()}
+		for _, uc := range namespace.VSchemaUnsafeChanges() {
+			out = append(out, templates.UnsafeChangeData{Table: uc.Table, Reason: uc.Reason, DDL: uc.DDL, ChangeType: uc.ChangeType})
+		}
+	}
+	return out
+}
+
+// memberUnsafeTableChanges lists the table changes in one member's plan that
+// need the unsafe opt-in, as memberUnsafeChanges describes.
+func memberUnsafeTableChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
 	unsafeOf := func(tc *ternv1.TableChange) (apitypes.UnsafeChange, bool) {
 		op, ok := ternconv.ChangeTypeToOp(tc.GetChangeType())
 		if !ok {

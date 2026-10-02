@@ -79,10 +79,6 @@ func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, r
 	return result
 }
 
-// awaitCapture returns the first value the command publishes on ch that
-// matches, failing the test if none arrives before the deadline. Values
-// published before it are skipped: a command can post an acknowledgment, or
-
 // awaitConfirmedApply waits for the apply an apply-confirm creates on the
 // rollout fixture's database, failing if the confirmation reports that it could
 // not create one.
@@ -110,6 +106,9 @@ func awaitConfirmedApply(t *testing.T, svc *api.Service, dbName string, confirm 
 	return created
 }
 
+// awaitCapture returns the first value the command publishes on ch that
+// matches, failing the test if none arrives before the deadline. Values
+// published before it are skipped: a command can post an acknowledgment, or
 // republish a stale check, first.
 func awaitCapture[T any](t *testing.T, ch <-chan T, what string, match func(T) bool) T {
 	t.Helper()
