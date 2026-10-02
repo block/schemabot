@@ -292,6 +292,50 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-collation-changes"></a><strong>MySQL Plan (Collation Changes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `products`
+    MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,
+    MODIFY COLUMN `title` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL, DEFAULT CHARACTER SET = utf8mb4, DEFAULT COLLATE = utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL;
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+- `customers`: ~2.9 GB
+
+🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.
+- `sku`, `title` on `products`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`
+  - ⚠️ Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.
+  - ⚠️ `sku` is in unique index `uk_sku`: the apply fails if two existing values compare equal under the new collation.
+- `handle` on `customers`: `utf8mb4_general_ci` → `utf8mb4_bin`
+  - ⚠️ Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.
+  - ⚠️ `handle` is in unique index `uk_handle`: the apply fails if two existing values compare equal under the new collation.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-ignored-namespaces"></a><strong>MySQL Plan (Ignored Namespaces)</strong></summary>
 
 
