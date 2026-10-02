@@ -687,23 +687,30 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 type unsafeConsent struct {
 	findings int
 	tables   string
-	// undoesOtherPR reports that some of the changes remove what another open
-	// pull request applied. Re-planning after that pull request merges is the
-	// expected path there, so the instruction leads with it and offers consent
+	// unattributed reports that some of the changes are listed in the
+	// attribution section: another open pull request applied them, or their
+	// ownership could not be established. Resolving those and re-planning is
+	// the expected path, so the instruction leads with it, points at that
+	// section rather than naming an owner it may not have, and offers consent
 	// as the exception.
-	undoesOtherPR bool
+	unattributed bool
 }
 
 // planUnsafeConsent reports what the plan's apply would confirm with
-// --allow-unsafe, and false when the apply needs no consent.
+// --allow-unsafe, and false when the flag would not make the apply run: the
+// apply needs no consent, or the plan carries a change the engine refuses,
+// which fails the apply whatever its flags.
 func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 	if !data.HasUnsafeChanges || len(data.UnsafeChanges) == 0 || data.AllowUnsafe {
 		return unsafeConsent{}, false
 	}
+	if len(data.BlockedChanges) > 0 {
+		return unsafeConsent{}, false
+	}
 	return unsafeConsent{
-		findings:      countUnsafeFindings(data.UnsafeChanges),
-		tables:        unsafeChangeTables(data.UnsafeChanges),
-		undoesOtherPR: len(data.AttributedChanges) > 0,
+		findings:     countUnsafeFindings(data.UnsafeChanges),
+		tables:       unsafeChangeTables(data.UnsafeChanges),
+		unattributed: len(data.AttributedChanges) > 0,
 	}, true
 }
 
@@ -715,8 +722,8 @@ func (c unsafeConsent) instruction() string {
 		confirm = fmt.Sprintf("the %d unsafe changes on %s", c.findings, c.tables)
 	}
 	add := "comment the command below with `--allow-unsafe` added to confirm " + confirm
-	if c.undoesOtherPR {
-		return "first resolve the other PR's changes this plan would undo (see above) and re-plan. If undoing them is intended, " + add
+	if c.unattributed {
+		return "first resolve the changes listed under **Check before applying**, then re-plan. If undoing them is intended, " + add
 	}
 	return add
 }
