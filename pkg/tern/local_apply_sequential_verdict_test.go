@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -189,4 +190,139 @@ func TestPollTaskToCompletion_RefusedFailureVerdictExits(t *testing.T) {
 			assert.Empty(t, recording.states, "no write landed")
 		})
 	}
+}
+
+// A row security task whose desired schema plan cannot be resolved is failed
+// before the engine runs. When storage refuses that failure verdict, the drive
+// exits with the apply active instead of finalizing over a task row that still
+// reads pending, so the next table is not cancelled.
+func TestExecuteApplySequential_RefusedRowSecurityPlanVerdictLeavesApplyActive(t *testing.T) {
+	first := &storage.Task{
+		ID: 1, ApplyID: 1, TaskIdentifier: "task-1",
+		Database: "orders", TableName: "documents", State: state.Task.Pending,
+		DDL: "ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY",
+	}
+	second := &storage.Task{
+		ID: 2, ApplyID: 1, TaskIdentifier: "task-2",
+		Database: "orders", TableName: "shipments", State: state.Task.Pending,
+		DDL: "ALTER TABLE public.shipments ADD COLUMN carrier text",
+	}
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-1", Database: "orders",
+		DatabaseType: storage.DatabaseTypePostgres, Environment: "staging", State: state.Apply.Pending,
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	tasks := newVerdictRefusingTaskStore(errors.New("storage down"), 1, first, second)
+	eng := &failingApplyEngine{message: "unreachable"}
+	client := &LocalClient{
+		config:            LocalConfig{Database: "orders", Type: storage.DatabaseTypePostgres},
+		postgresEngine:    eng,
+		heartbeatInterval: time.Hour,
+		storage: &exactProgressStorage{
+			applies:         applies,
+			tasks:           tasks,
+			controlRequests: &testControlRequestStore{},
+			logs:            &mockApplyLogStore{},
+		},
+		logger: slog.Default(),
+	}
+
+	require.NoError(t, client.executeApplySequential(t.Context(), apply, []*storage.Task{first, second}, &storage.Plan{}, nil),
+		"a refused failure verdict ends the drive as a hand-back, not a drive error")
+
+	storedApply, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	storedFirst, err := tasks.Get(t.Context(), first.TaskIdentifier)
+	require.NoError(t, err)
+	storedSecond, err := tasks.Get(t.Context(), second.TaskIdentifier)
+	require.NoError(t, err)
+	assert.Equal(t, 1, tasks.refused, "the drive attempted the failure verdict once")
+	assert.Equal(t, 0, eng.applyCalls, "the engine never runs for a task whose plan cannot be resolved")
+	assert.Equal(t, state.Apply.Running, storedApply.State, "the apply is not finalized over an unrecorded verdict")
+	assert.Nil(t, storedApply.CompletedAt)
+	assert.Equal(t, state.Task.Pending, storedFirst.State, "storage still records the row security task pending")
+	assert.Equal(t, state.Task.Pending, storedSecond.State, "the next table is not cancelled")
+	assert.Equal(t, state.Task.Pending, first.State, "the drive's own task does not claim a verdict storage refused")
+	assert.Empty(t, first.ErrorMessage)
+}
+
+// The sequential poll gives up on a progress outage after a bounded run of
+// transient errors and rests the task failed_retryable (or failed, where the
+// engine cannot resume from a checkpoint). When storage refuses that verdict
+// the poll hands the drive back rather than reporting a failure the caller
+// would finalize from.
+func TestPollTaskToCompletion_RefusedVerdictAfterPollOutageExits(t *testing.T) {
+	for name, dbType := range map[string]string{
+		"retryable verdict on a checkpointing engine":  storage.DatabaseTypeStrata,
+		"failed verdict on a non-checkpointing engine": "registered-engine",
+	} {
+		t.Run(name, func(t *testing.T) {
+			eng := &failingProgressEngine{err: errors.New("connection reset by peer")}
+			client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+			client.config.Type = dbType
+			refusing := &settlementRefusingTaskStore{
+				stateRecordingTaskStore: recording,
+				err:                     errors.New("storage down"),
+				refusals:                1,
+			}
+			client.storage.(*exactProgressStorage).tasks = refusing
+
+			action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+			assert.Equal(t, taskAbort, action, "an unrecorded failure verdict is not reported as a task failure")
+			assert.Equal(t, 1, refusing.refused)
+			assert.Equal(t, maxConsecutiveProgressPollErrors, eng.calls, "the poll spends its whole error budget before the verdict")
+			assert.Equal(t, state.Task.Running, task.State, "the in-memory task is left as stored")
+			assert.Empty(t, task.ErrorMessage)
+			assert.Empty(t, recording.states, "no write landed")
+		})
+	}
+}
+
+// The sequential resume fails a task closed when the re-plan no longer carries
+// its reviewed DDL. When storage refuses that failure verdict, the resume exits
+// with the apply still running instead of finalizing it failed over a task row
+// that never recorded the failure.
+func TestResumeApplySequential_RefusedReviewedDDLVerdictLeavesApplyActive(t *testing.T) {
+	const (
+		emailDDL = "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+		phoneDDL = "ALTER TABLE `users` ADD COLUMN `phone` varchar(255)"
+	)
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace:    "testapp",
+			TableChanges: []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: phoneDDL}},
+		}},
+	})
+	c.heartbeatInterval = time.Hour
+	c.taskPollIntervalOverride = time.Millisecond
+	apply := &storage.Apply{
+		ID: 21, ApplyIdentifier: "apply-sequential-unreviewed", Database: "testapp",
+		Environment: "staging", State: state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID: 1, ApplyID: apply.ID, TaskIdentifier: "task_email", Database: "testapp",
+		Namespace: "testapp", TableName: "users", DDLAction: "alter", DDL: emailDDL,
+		State: state.Task.Running,
+	}
+	taskStore := &updateFailingTaskStore{exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}}, updateErr: errors.New("storage down")}
+	applies := &snapshotApplyStore{stored: *apply}
+	c.storage = &exactProgressStorage{
+		plans:           store,
+		applies:         applies,
+		tasks:           taskStore,
+		controlRequests: &testControlRequestStore{},
+		logs:            &mockApplyLogStore{},
+	}
+
+	require.NoError(t, c.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{}, nil),
+		"a refused failure verdict ends the resume as a hand-back, not a drive error")
+
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, stored.State, "the resume is not finalized over an unrecorded verdict")
+	assert.Nil(t, stored.CompletedAt)
+	assert.Equal(t, state.Task.Running, task.State, "the in-memory task is left as stored")
+	assert.Empty(t, task.ErrorMessage)
 }

@@ -474,7 +474,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			// DDL.
 			logger.Error("resume aborting task: the re-plan no longer includes the task's reviewed DDL",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-			if verdictAction := c.failureVerdictAction(apply, task, c.markTaskFailed(ctx, task, err.Error())); verdictAction != taskFailed {
+			if verdictAction := c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, err.Error())); verdictAction != taskFailed {
 				return nil
 			}
 			failedTask = task
