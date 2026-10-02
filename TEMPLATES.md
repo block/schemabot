@@ -321,7 +321,6 @@ ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin N
   - `sku` is in unique index `uk_sku`: the apply fails if two existing values compare equal under the new collation.
 - `handle` on `customers`: `utf8mb4_general_ci` → `utf8mb4_bin`
   - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.
-  - `handle` is in unique index `uk_handle`: the apply fails if two existing values compare equal under the new collation.
 
 📋 **Plan**: **2** tables to alter
 

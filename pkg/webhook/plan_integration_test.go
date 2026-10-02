@@ -626,10 +626,11 @@ func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
 
 // A plan that moves a table onto a new default collation and makes a unique
 // column case-sensitive says, under the DDL, what each move does to how the
-// columns compare: the column the ALTER redeclares without a collation picks
-// up the new table default and starts treating trailing spaces as
-// significant, and the unique column starts treating letter case as
-// significant and names the unique index the apply can fail on.
+// columns compare. The column the ALTER redeclares without a collation picks
+// up the new table default, starts treating trailing spaces as significant,
+// and names its unique index, since other characters can start comparing
+// equal. The column moved onto the binary collation starts treating letter
+// case as significant and names no index: no two values can start colliding.
 func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 	dbName := "webhook_plan_collation_changes"
 	svc := setupE2EService(t, dbName)
@@ -649,7 +650,8 @@ func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 		"  `handle` varchar(64) NOT NULL,\n"+
 		"  `note` varchar(255) DEFAULT NULL,\n"+
 		"  PRIMARY KEY (`id`),\n"+
-		"  UNIQUE KEY `uk_handle` (`handle`)\n"+
+		"  UNIQUE KEY `uk_handle` (`handle`),\n"+
+		"  UNIQUE KEY `uk_note` (`note`)\n"+
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
 	require.NoError(t, err)
 
@@ -667,7 +669,8 @@ func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 			"  `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL,\n" +
 			"  `note` varchar(255) DEFAULT NULL,\n" +
 			"  PRIMARY KEY (`id`),\n" +
-			"  UNIQUE KEY `uk_handle` (`handle`)\n" +
+			"  UNIQUE KEY `uk_handle` (`handle`),\n" +
+			"  UNIQUE KEY `uk_note` (`note`)\n" +
 			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
 
@@ -695,9 +698,9 @@ func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 		assert.Contains(t, body, "🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.\n"+
 			"- `handle` on `handles`: `utf8mb4_general_ci` → `utf8mb4_bin`\n"+
 			"  - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
-			"  - `handle` is in unique index `uk_handle`: the apply fails if two existing values compare equal under the new collation.\n"+
 			"- `note` on `handles`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`\n"+
-			"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n", body)
+			"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
+			"  - `note` is in unique index `uk_note`: the apply fails if two existing values compare equal under the new collation.\n", body)
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for plan comment")
 	}
