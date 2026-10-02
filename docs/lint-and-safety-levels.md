@@ -219,7 +219,9 @@ execute the statement at all, so an apply is guaranteed to fail on it. There is
 no flag that lets a blocked change through — the guidance is to rewrite the
 statement as a supported schema change. Blocked changes render on the plan
 comment and again on the locked apply comment, and any apply command is
-rejected up front while they are present. Local apply admission re-checks the
+rejected up front while they are present. The plan comment offers no apply
+command for an environment with a blocked change; its footer offers the
+re-plan to run once the statement is rewritten. Local apply admission re-checks the
 whole stored plan before creating or attaching apply work, so a dispatch for
 one table or shard cannot partially apply a plan whose other step is blocked.
 A deployment that did not plan locally re-plans the dispatched changes against

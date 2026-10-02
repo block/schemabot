@@ -60,7 +60,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -86,7 +86,7 @@ ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -284,7 +284,7 @@ ALTER TABLE `webhooks` ADD INDEX `idx_tenant_id`(`tenant_id`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -340,7 +340,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -369,7 +369,7 @@ CREATE TABLE app.users (id bigint PRIMARY KEY);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -431,7 +431,7 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -473,9 +473,9 @@ An apply will fail on these statements. Fix what each reason names — rewrite a
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+The engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:
 ```
-schemabot apply -e staging
+schemabot plan -e staging
 ```
 
 </details>
@@ -509,9 +509,9 @@ An apply will fail on these statements. Fix what each reason names — rewrite a
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+The engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:
 ```
-schemabot apply -e staging
+schemabot plan -e staging
 ```
 
 </details>
@@ -553,6 +553,46 @@ Transactions blocking a table's metadata lock are killed so its statement can ta
 </details>
 
 <details>
+<summary><a name="mysql-plan-unsafe-change"></a><strong>MySQL Plan (Unsafe Change)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` DROP COLUMN `legacy_ref`;
+```
+
+```sql
+ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `orders`: DROP COLUMN discards the column's data
+
+<details>
+<summary>Destructive drop guidance</summary>
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`orders`):
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-change-attributed-to-another-pr"></a><strong>MySQL Plan (Change Attributed To Another PR)</strong></summary>
 
 
@@ -570,26 +610,25 @@ ALTER TABLE `orders` DROP COLUMN `notes`;
 DROP TABLE `reconcile_state`;
 ```
 
-⚠️ **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
-- `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
-- `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
-
-A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
-
 ⚠️ **Issues**: 2 unsafe changes detected
-1. `orders`: DROP COLUMN discards the column's data
-2. `reconcile_state`: DROP TABLE removes all data
+1. `orders`: DROP COLUMN discards the column's data (changed by open PR [#4820](https://github.com/block/schemabot/pull/4820))
+2. `reconcile_state`: DROP TABLE removes all data (changed by open PR [#4821](https://github.com/block/schemabot/pull/4821))
 
-**Destructive drop guidance:**
+A plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.
+
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
+
+</details>
 
 📋 **Plan**: **1** table to alter, **1** table to drop
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`orders`, `reconcile_state`):
 ```
 schemabot apply -e staging
 ```
@@ -620,7 +659,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -759,7 +798,7 @@ Applying picks up where the existing copy stopped rather than starting over.
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -794,7 +833,7 @@ Applying joins the copy already running rather than starting a new one: every ro
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -878,7 +917,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging --tenant alpha
 ```
@@ -1110,7 +1149,7 @@ ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -1168,7 +1207,7 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`commerce_sharded` VSchema):
 ```
 schemabot apply -e staging
 ```
@@ -1209,7 +1248,7 @@ CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at)
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -1347,7 +1386,7 @@ CREATE TABLE `metrics` (
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -1671,7 +1710,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1731,7 +1770,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1791,7 +1830,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1847,7 +1886,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1906,7 +1945,7 @@ No schema changes detected
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1965,7 +2004,7 @@ No schema changes detected
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2005,7 +2044,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2043,7 +2082,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2081,7 +2120,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2121,7 +2160,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2149,9 +2188,12 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -2182,9 +2224,12 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
+
+</details>
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -2398,7 +2443,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -8845,7 +8890,7 @@ ALTER TABLE `mutes`
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -8879,7 +8924,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -8922,7 +8967,7 @@ No schema changes detected
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -8959,16 +9004,19 @@ ALTER TABLE `mutes`
 ⚠️ **Issues**: 1 unsafe change detected
 1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 📋 **Plan**: **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`mutes` on shard `40-80`):
 ```
 schemabot apply -e production
 ```

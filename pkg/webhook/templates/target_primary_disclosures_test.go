@@ -39,7 +39,8 @@ func primaryDropsLegacyPlan(environment string) PlanCommentData {
 }
 
 // sectionOf returns the part of body from heading up to the next heading of
-// the same level, failing the test when the heading is missing.
+// the same level, or up to the rule above the comment's footer when it is the
+// last section, failing the test when the heading is missing.
 func sectionOf(t *testing.T, body, heading string) string {
 	t.Helper()
 	_, rest, found := strings.Cut(body, heading)
@@ -47,6 +48,9 @@ func sectionOf(t *testing.T, body, heading string) string {
 	level := heading[:strings.Index(heading, " ")+1]
 	if next := strings.Index(rest, "\n"+level); next >= 0 {
 		rest = rest[:next]
+	}
+	if footer := strings.Index(rest, "\n---\n"); footer >= 0 {
+		rest = rest[:footer]
 	}
 	return rest
 }
@@ -118,4 +122,18 @@ func TestRenderUnsafeChangesBlocked_PrimaryTargetGroupRepeatsNothing(t *testing.
 	assert.Equal(t, 1, strings.Count(body, "drops the table and all of its rows"), "the refusal lists the drop once")
 	assert.NotContains(t, sectionOf(t, body, "### Target `primary/orders_a`"), "unsafe change")
 	assert.NotContains(t, body, "work in progress")
+}
+
+// When every target's plan renders, an unsafe finding on a table another pull
+// request changed still names that pull request under the primary target's
+// heading, and the attribution does not also get a section of its own.
+func TestRenderPlanComment_PrimaryTargetUnsafeFindingCarriesAttribution(t *testing.T) {
+	data := primaryDropsLegacyPlan("production")
+	data.Repository = "acme/orders"
+	data.AttributedChanges = []AttributedChangeData{{Table: "legacy", Repository: "acme/orders", PullRequest: 4790}}
+	body := RenderPlanComment(data)
+
+	primary := sectionOf(t, body, "### Target `primary/orders_a`")
+	assert.Contains(t, primary, "`legacy`: drops the table and all of its rows (changed by open PR [#4790](https://github.com/acme/orders/pull/4790))")
+	assert.NotContains(t, body, "Check before applying")
 }

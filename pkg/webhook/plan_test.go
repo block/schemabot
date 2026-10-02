@@ -245,7 +245,7 @@ func TestBuildPlanCommentData_PostgresDropGuidanceClassifiedFromDDL(t *testing.T
 	assert.Equal(t, ddl, data.UnsafeChanges[0].DDL, "the DDL is threaded so the guidance can parse it")
 
 	rendered := templates.RenderPlanComment(data)
-	assert.Contains(t, rendered, "**Destructive drop guidance:**")
+	assert.Contains(t, rendered, "<summary>Destructive drop guidance</summary>")
 	assert.Contains(t, rendered, "no longer reads from or writes to the dropped column.")
 }
 
@@ -280,7 +280,7 @@ func TestRenderMultiEnvPlanComment_PostgresDropGuidanceClassifiedFromDDL(t *test
 
 	rendered := templates.RenderMultiEnvPlanComment(data)
 
-	assert.Contains(t, rendered, "**Destructive drop guidance:**")
+	assert.Contains(t, rendered, "<summary>Destructive drop guidance</summary>")
 	assert.Contains(t, rendered, "no longer reads from or writes to the dropped table.")
 }
 
@@ -444,6 +444,9 @@ func TestBuildPlanCommentData_VSchemaDeletionsAndMutationsPopulated(t *testing.T
 	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[1].Table)
 	assert.Contains(t, data.UnsafeChanges[1].Reason, "user_idx")
 	assert.Contains(t, data.UnsafeChanges[1].Reason, "changes type")
+	for _, uc := range data.UnsafeChanges {
+		assert.Equal(t, "testapp_sharded", uc.VSchemaNamespace, "the apply instruction names a VSchema change by its namespace")
+	}
 }
 
 func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {

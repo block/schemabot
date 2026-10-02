@@ -281,6 +281,35 @@ func PreviewCommentPlanBlockedPostgres() string {
 	})
 }
 
+// PreviewCommentPlanUnsafe renders a sample plan whose changes the unsafe gate
+// holds until the apply carries --allow-unsafe. The footer states that
+// requirement under the plain command, which never carries the flag itself.
+func PreviewCommentPlanUnsafe() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` DROP COLUMN `legacy_ref`;",
+					"ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
+		},
+	})
+}
+
 // PreviewCommentPlanAttributedChange renders a sample plan whose destructive
 // changes target tables another open pull request applied but has not merged
 // yet, so each entry is annotated with its owner. Attribution is table-grained,
@@ -1870,12 +1899,14 @@ func PreviewCommentVitessPlanVSchemaRemoval() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "commerce_sharded/vschema.json",
-				Reason: `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
 			},
 			{
-				Table:  "commerce_sharded/vschema.json",
-				Reason: `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
 			},
 		},
 	})
