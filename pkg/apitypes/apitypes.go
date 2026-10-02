@@ -1571,8 +1571,10 @@ type CollationChange struct {
 	Case           string `json:"case"`
 	TrailingSpaces string `json:"trailing_spaces"`
 	// UniqueIndexes names the primary key and unique indexes that cover the
-	// column once the change applies. Values that were distinct can compare
-	// equal under the new collation, and a unique index then rejects them.
+	// column when the move can make values that were distinct compare equal,
+	// which the index then rejects. It is empty for a move that cannot: one
+	// onto a binary collation of the same charset that does not start ignoring
+	// trailing spaces.
 	UniqueIndexes []string `json:"unique_indexes,omitempty"`
 }
 

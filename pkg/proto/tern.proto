@@ -584,9 +584,10 @@ message CollationChange {
   // are not known. Consumers treat "unknown" as a possible change.
   string case_comparison = 4;
   string trailing_space_comparison = 5;
-  // Primary key and unique indexes that cover the column once the change
-  // applies. Values that were distinct can compare equal under the new
-  // collation, and a unique index then rejects them.
+  // Primary key and unique indexes that cover the column when the move can
+  // make values that were distinct compare equal, which the index then
+  // rejects. Empty for a move that cannot: one onto a binary collation of the
+  // same charset that does not start ignoring trailing spaces.
   repeated string unique_indexes = 6;
 }
 

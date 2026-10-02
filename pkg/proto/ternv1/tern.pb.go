@@ -1567,9 +1567,10 @@ type CollationChange struct {
 	// are not known. Consumers treat "unknown" as a possible change.
 	CaseComparison          string `protobuf:"bytes,4,opt,name=case_comparison,json=caseComparison,proto3" json:"case_comparison,omitempty"`
 	TrailingSpaceComparison string `protobuf:"bytes,5,opt,name=trailing_space_comparison,json=trailingSpaceComparison,proto3" json:"trailing_space_comparison,omitempty"`
-	// Primary key and unique indexes that cover the column once the change
-	// applies. Values that were distinct can compare equal under the new
-	// collation, and a unique index then rejects them.
+	// Primary key and unique indexes that cover the column when the move can
+	// make values that were distinct compare equal, which the index then
+	// rejects. Empty for a move that cannot: one onto a binary collation of the
+	// same charset that does not start ignoring trailing spaces.
 	UniqueIndexes []string `protobuf:"bytes,6,rep,name=unique_indexes,json=uniqueIndexes,proto3" json:"unique_indexes,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

@@ -71,7 +71,7 @@ func plannedCollationChanges(logger *slog.Logger, alterSQL, currentCreate, desir
 			To:             to,
 			Case:           compareChange(before, after, caseSensitive),
 			TrailingSpaces: compareChange(before, after, trailingSpacesSensitive),
-			UniqueIndexes:  uniqueIndexesCovering(desired, col.Name),
+			UniqueIndexes:  uniqueIndexesAtRisk(desired, col.Name, change, before, after),
 		})
 	}
 	return changes, nil
@@ -113,6 +113,34 @@ func compareChange(before, after *statement.CollationProperties, sensitive func(
 	default:
 		return engine.ComparisonBecomesInsensitive
 	}
+}
+
+// uniqueIndexesAtRisk names the unique indexes covering column when the move
+// can make values that compared unequal start comparing equal, since those are
+// the indexes the apply fails on if existing rows collide. A move it cannot do
+// that for lists none, so the plan does not warn about a collision that cannot
+// happen.
+func uniqueIndexesAtRisk(table *statement.CreateTable, column string, change statement.ColumnCollationChange, before, after *statement.CollationProperties) []string {
+	if !canMergeValues(change, before, after) {
+		return nil
+	}
+	return uniqueIndexesCovering(table, column)
+}
+
+// canMergeValues reports whether a collation move can make two values that
+// compared unequal start comparing equal. Only a move onto a binary collation
+// of the same charset is known not to: it compares code points or bytes, so
+// it calls two values equal only when they are identical, apart from the
+// trailing spaces it ignores when it pads and the old collation did not. A
+// collation the plan cannot read can merge values.
+func canMergeValues(change statement.ColumnCollationChange, before, after *statement.CollationProperties) bool {
+	if before == nil || after == nil {
+		return true
+	}
+	if !after.Binary || !strings.EqualFold(change.Before.Charset, change.After.Charset) {
+		return true
+	}
+	return after.PadSpace && !before.PadSpace
 }
 
 // uniqueIndexesCovering names the primary key and unique indexes that include
