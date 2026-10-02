@@ -627,7 +627,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// locked apply comment where they are noise (the operator already reviewed
 	// them at plan time).
 	if !data.IsLocked {
-		writeLintViolations(&sb, planWideLint(data.LintViolations, data.DeploymentDrift, targetPlans))
+		writePlanWideLint(&sb, data.LintViolations, data.DeploymentDrift, targetPlans)
 	}
 
 	// Errors
@@ -2061,7 +2061,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if g.Empty() {
 			sb.WriteString(groupNoChanges + "\n\n")
 			if !data.IsLocked {
-				writeLintViolations(sb, groupOwnLint(g, shared))
+				writeLintViolations(sb, groupOwnLint(g, shared), "")
 			}
 			if g.Primary {
 				writePrimaryTargetDisclosures(sb, data, g)
@@ -2097,7 +2097,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		// raised is disclosed under the group whose targets raised it; the
 		// plan-wide section carries the ones every target shares.
 		if !data.IsLocked {
-			writeLintViolations(sb, groupOwnLint(g, shared))
+			writeLintViolations(sb, groupOwnLint(g, shared), "")
 		}
 		// So is an unsafe change, which `--allow-unsafe` consents to on every
 		// target. The primary's group discloses its own with the reviewed
@@ -2616,15 +2616,20 @@ const lintWarningsFoldThreshold = 5
 // writeLintViolations writes advisory lint findings. Lint warnings never block
 // an apply, so they render with a lighter marker than the unsafe-change Issues
 // section but share its visual language: a bold count in the header, backticked
-// table prefixes, and identifiers as inline code.
-func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
+// table prefixes, and identifiers as inline code. A non-empty scope names the
+// targets the findings cover, e.g. "39 of 40 targets".
+func writeLintViolations(sb *strings.Builder, warnings []LintViolationData, scope string) {
 	n := len(warnings)
 	if n == 0 {
 		return
 	}
+	count := fmt.Sprintf("%d advisory %s", n, pluralize("finding", n))
+	if scope != "" {
+		count += " across " + scope
+	}
 
 	if n <= lintWarningsFoldThreshold {
-		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: %d advisory %s\n", n, pluralize("finding", n))
+		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: %s\n", count)
 		for _, w := range warnings {
 			message := ui.CodeQuoteIdentifiers(w.Message)
 			if label := lintLabel(w.Table, w); label != "" {
@@ -2639,7 +2644,7 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 
 	// GitHub renders <summary> content as HTML, not markdown, so the folded
 	// header bolds with <b> tags instead of asterisks.
-	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: %d advisory %s</summary>\n\n", n, pluralize("finding", n))
+	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: %s</summary>\n\n", count)
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
 			fmt.Fprintf(sb, "**%s**\n", inlineCode(group.table))
@@ -2678,14 +2683,17 @@ func lintLabel(table string, w LintViolationData) string {
 	return label + " on " + targets
 }
 
-// planWideLint is the lint section a plan carries outside its target plans.
-// A plan that renders target plans carries only the findings every target
-// raised, since each group discloses the rest under its own plan.
-func planWideLint(own []LintViolationData, drift *DeploymentDriftData, targetPlans bool) []LintViolationData {
+// writePlanWideLint writes the lint section a plan carries outside its target
+// plans. A plan that renders target plans carries only the findings every
+// target with work raised, since each group discloses the rest under its own
+// plan. Those follow the last group, so the header names the targets they
+// cover rather than reading as that group's.
+func writePlanWideLint(sb *strings.Builder, own []LintViolationData, drift *DeploymentDriftData, targetPlans bool) {
 	if !targetPlans {
-		return own
+		writeLintViolations(sb, own, "")
+		return
 	}
-	return sharedTargetLint(drift.Plans)
+	writeLintViolations(sb, sharedTargetLint(drift.Plans), targetPlansScope(drift))
 }
 
 // sharedTargetLint lists the findings every target with work raised: each
@@ -3087,7 +3095,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	}
 
 	// Lint violations.
-	writeLintViolations(sb, planWideLint(plan.LintViolations, plan.DeploymentDrift, targetPlans))
+	writePlanWideLint(sb, plan.LintViolations, plan.DeploymentDrift, targetPlans)
 
 	// Errors
 	if len(plan.Errors) > 0 {

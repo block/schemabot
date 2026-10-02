@@ -358,7 +358,7 @@ func TestReviewDriftComment_LintEveryTargetRaisesRendersOnce(t *testing.T) {
 	body := renderLintComment(t, primary, second, third, converged)
 
 	assert.Equal(t, 1, strings.Count(body, shared), "a finding every target with work raises is disclosed once")
-	assert.Contains(t, body, "💡 **Lint Warnings**: 1 advisory finding\n- `orders`: "+shared+"\n",
+	assert.Contains(t, body, "💡 **Lint Warnings**: 1 advisory finding across 3 of 4 targets\n- `orders`: "+shared+"\n",
 		"the shared finding renders plan-wide, naming no target")
 	group, _, found := strings.Cut(body, "### Target `commerce/orders-001`")
 	require.True(t, found, "the primary renders under its own heading")
