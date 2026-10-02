@@ -51,6 +51,9 @@ type UnsafeChangeData struct {
 	// to name reads as coverage ("3 of 12 targets"). Zero when Targets names
 	// the whole list.
 	TotalTargets int
+	// VSchemaNamespace names the namespace whose VSchema this change alters.
+	// Empty for a change to a table.
+	VSchemaNamespace string
 }
 
 // BlockedChangeData is a planned change the engine deterministically refuses:
@@ -650,7 +653,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
-		writeApplyInstruction(&sb, applyCmd)
+		writeApplyInstruction(&sb, applyCmd, data)
 	}
 
 	return appendAgentHint(sb.String(), data.AgentHint)
@@ -666,9 +669,93 @@ func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
 }
 
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
-func writeApplyInstruction(sb *strings.Builder, command string) {
-	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
+func writeApplyInstruction(sb *strings.Builder, command string, data PlanCommentData) {
+	if consent, ok := planUnsafeConsent(data); ok {
+		fmt.Fprintf(sb, "▶️ **To apply** all schema changes from this PR, %s:\n", consent.instruction())
+	} else {
+		sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
+	}
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// unsafeConsent is what an apply of one plan would confirm with
+// --allow-unsafe. The apply instruction states it in the sentence that leads
+// into the command, so the reader meets the requirement before copying the
+// command rather than after the gate rejects it. The flag is deliberately left
+// out of the pasteable command: consenting to destroy data takes typing it,
+// which a copy-paste of the plan's own command never does.
+type unsafeConsent struct {
+	findings int
+	tables   string
+	// undoesOtherPR reports that some of the changes remove what another open
+	// pull request applied. Re-planning after that pull request merges is the
+	// expected path there, so the instruction leads with it and offers consent
+	// as the exception.
+	undoesOtherPR bool
+}
+
+// planUnsafeConsent reports what the plan's apply would confirm with
+// --allow-unsafe, and false when the apply needs no consent.
+func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
+	if !data.HasUnsafeChanges || len(data.UnsafeChanges) == 0 || data.AllowUnsafe {
+		return unsafeConsent{}, false
+	}
+	return unsafeConsent{
+		findings:      countUnsafeFindings(data.UnsafeChanges),
+		tables:        unsafeChangeTables(data.UnsafeChanges),
+		undoesOtherPR: len(data.AttributedChanges) > 0,
+	}, true
+}
+
+// instruction is the clause that tells the reader how to apply, lower-cased
+// to continue a sentence.
+func (c unsafeConsent) instruction() string {
+	confirm := "the unsafe change on " + c.tables
+	if c.findings > 1 {
+		confirm = fmt.Sprintf("the %d unsafe changes on %s", c.findings, c.tables)
+	}
+	add := "comment the command below with `--allow-unsafe` added to confirm " + confirm
+	if c.undoesOtherPR {
+		return "first resolve the other PR's changes this plan would undo (see above) and re-plan. If undoing them is intended, " + add
+	}
+	return add
+}
+
+// unsafeChangeTables names what the unsafe changes touch, each once in
+// first-appearance order, as an English list: a table by its code span, with
+// the shards it applies to when only some carry it, and a VSchema by its
+// namespace. The labels match the ones the unsafe findings list above uses,
+// so the reader can match one to the other.
+func unsafeChangeTables(changes []UnsafeChangeData) string {
+	seen := make(map[string]bool, len(changes))
+	var targets []string
+	for _, c := range changes {
+		target := unsafeConsentTarget(c)
+		if seen[target] {
+			continue
+		}
+		seen[target] = true
+		targets = append(targets, target)
+	}
+	switch len(targets) {
+	case 1:
+		return targets[0]
+	case 2:
+		return targets[0] + " and " + targets[1]
+	default:
+		return strings.Join(targets[:len(targets)-1], ", ") + ", and " + targets[len(targets)-1]
+	}
+}
+
+func unsafeConsentTarget(c UnsafeChangeData) string {
+	if c.VSchemaNamespace != "" {
+		return "the " + inlineCode(c.VSchemaNamespace) + " VSchema"
+	}
+	target := inlineCode(c.Table)
+	if len(c.Shards) > 0 {
+		target = fmt.Sprintf("%s (%s)", target, planShardList(c.Shards, c.TotalShards))
+	}
+	return target
 }
 
 // attributionStillActionable reports whether the attributed-changes
@@ -2928,14 +3015,18 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
-		sb.WriteString("▶️ **To apply** these changes, start with the first environment:\n")
+		writeEnvApplyLeadIn(sb, "▶️ **To apply** these changes, start with the first environment", data.Plans[envsWithChanges[0]])
 		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 		for i := 1; i < len(envsWithChanges); i++ {
-			fmt.Fprintf(sb, "\nAfter verifying %s, apply to %s:\n", envsWithChanges[i-1], envsWithChanges[i])
+			writeEnvApplyLeadIn(sb, fmt.Sprintf("\nAfter verifying %s, apply to %s", envsWithChanges[i-1], envsWithChanges[i]), data.Plans[envsWithChanges[i]])
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[i]))
 		}
 	case len(envsWithChanges) == 1:
-		sb.WriteString("▶️ **To apply** these changes, comment:\n")
+		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
+			fmt.Fprintf(sb, "▶️ **To apply** these changes, %s:\n", consent.instruction())
+		} else {
+			sb.WriteString("▶️ **To apply** these changes, comment:\n")
+		}
 		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
@@ -2954,6 +3045,17 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot plan", env))
 		}
 	}
+}
+
+// writeEnvApplyLeadIn writes the sentence above one environment's apply
+// command, with the environment's own unsafe consent appended when its plan
+// needs it.
+func writeEnvApplyLeadIn(sb *strings.Builder, sentence string, plan *PlanCommentData) {
+	if consent, ok := planUnsafeConsent(*plan); ok {
+		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(consent.instruction()))
+		return
+	}
+	sb.WriteString(sentence + ":\n")
 }
 
 func tenantCommand(baseCommand, environment, tenant string) string {

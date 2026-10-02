@@ -553,6 +553,43 @@ Transactions blocking a table's metadata lock are killed so its statement can ta
 </details>
 
 <details>
+<summary><a name="mysql-plan-unsafe-change"></a><strong>MySQL Plan (Unsafe Change)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` DROP COLUMN `legacy_ref`;
+```
+
+```sql
+ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `orders`: DROP COLUMN discards the column's data
+
+**Destructive drop guidance:**
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply** all schema changes from this PR, comment the command below with `--allow-unsafe` added to confirm the unsafe change on `orders`:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-change-attributed-to-another-pr"></a><strong>MySQL Plan (Change Attributed To Another PR)</strong></summary>
 
 
@@ -589,7 +626,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, first resolve the other PR's changes this plan would undo (see above) and re-plan. If undoing them is intended, comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on `orders` and `reconcile_state`:
 ```
 schemabot apply -e staging
 ```
@@ -1168,7 +1205,7 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on the `commerce_sharded` VSchema:
 ```
 schemabot apply -e staging
 ```
@@ -8962,7 +8999,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply** all schema changes from this PR, comment the command below with `--allow-unsafe` added to confirm the unsafe change on `mutes` (shard `40-80`):
 ```
 schemabot apply -e production
 ```

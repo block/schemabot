@@ -1191,10 +1191,11 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 		for _, uc := range sc.VSchemaUnsafeChanges() {
 			unsafe = append(unsafe, templates.UnsafeChangeData{
-				Table:      uc.Table,
-				Reason:     uc.Reason,
-				DDL:        uc.DDL,
-				ChangeType: uc.ChangeType,
+				Table:            uc.Table,
+				Reason:           uc.Reason,
+				DDL:              uc.DDL,
+				ChangeType:       uc.ChangeType,
+				VSchemaNamespace: sc.Namespace,
 			})
 		}
 	}
