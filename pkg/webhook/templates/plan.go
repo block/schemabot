@@ -144,6 +144,11 @@ type PlanCommentData struct {
 	// unchanged comment.
 	AgentHint string
 
+	// PlanSummaryScope names the targets a summary of several targets' plans
+	// covers, e.g. "39 of 40 targets", so a count combined across targets never
+	// reads as any one target's work. Empty when the summary is one plan's.
+	PlanSummaryScope string
+
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
 	Errors         []string
@@ -504,6 +509,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	if targetPlans {
 		writeTargetPlans(&sb, data, budget, false)
 		summary.Changes = combinedTargetPlanChanges(data)
+		summary.PlanSummaryScope = targetPlansScope(data.DeploymentDrift)
 	}
 
 	// Count changes
@@ -843,7 +849,11 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		return
 	}
 
-	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements))
+	text := planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements)
+	if data.PlanSummaryScope != "" {
+		text += " across " + data.PlanSummaryScope
+	}
+	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
 
 	// Disclosed directly under the plan summary so the exclusion reads as
 	// part of the plan result: what was counted, then what was withheld.
@@ -1087,6 +1097,19 @@ func changingTargetCount(drift *DeploymentDriftData) int {
 		}
 	}
 	return changing
+}
+
+// targetPlansScope states how many of the rollout's targets run the work a
+// combined target-plan summary counts: "39 of 40 targets" when some targets
+// are already at the desired schema, "40 targets" when none are, matching the
+// target group headings. The summary is the union of every group's changes, so
+// each target runs some of that work, not necessarily all of it.
+func targetPlansScope(drift *DeploymentDriftData) string {
+	changing, total := changingTargetCount(drift), len(drift.Deployments)
+	if changing == total {
+		return fmt.Sprintf("%d %s", total, targetNoun.Plural)
+	}
+	return presentation.CoveragePhrase(targetNoun, changing, total)
 }
 
 // writeNoChangesDetected closes a comment with nothing to apply. It is never
@@ -2773,6 +2796,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
 		summary.Changes = combinedTargetPlanChanges(*plan)
+		summary.PlanSummaryScope = targetPlansScope(plan.DeploymentDrift)
 	}
 
 	totalStatements, keyspaceUpdates := countChanges(plan.Changes)

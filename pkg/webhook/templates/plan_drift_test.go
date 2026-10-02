@@ -1115,7 +1115,7 @@ func TestRenderPlanComment_TargetPlanFinalizeIsCounted(t *testing.T) {
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, keyspaceFinalizeNote, out)
-	assert.Contains(t, out, "📋 **Plan**: **1** keyspace to finalize\n", out)
+	assert.Contains(t, out, "📋 **Plan**: **1** keyspace to finalize across 1 of 2 targets\n", out)
 }
 
 // The reviewed target creates a table in keyspace payments, and another
@@ -1142,5 +1142,5 @@ func TestRenderPlanComment_TargetPlanFinalizeBesideAnotherTargetsDDLIsCounted(t 
 
 	out := RenderPlanComment(data)
 	assert.Equal(t, 1, strings.Count(out, keyspaceFinalizeNote), out)
-	assert.Contains(t, out, "📋 **Plan**: **1** table to create, **1** keyspace to finalize\n", out)
+	assert.Contains(t, out, "📋 **Plan**: **1** table to create, **1** keyspace to finalize across 2 targets\n", out)
 }

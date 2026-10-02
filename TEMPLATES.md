@@ -1901,7 +1901,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 No schema changes detected
 
-📋 **Plan**: **2** tables to create, **1** table to alter
+📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
 
 
 ---
@@ -1960,7 +1960,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 No schema changes detected
 
-📋 **Plan**: **2** tables to create, **1** table to alter
+📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
 
 
 ---
@@ -2000,7 +2000,7 @@ ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **1** table to alter across 3 targets
 
 
 ---
@@ -2038,7 +2038,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 - `orders`: ~24.0 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
 - `users`: ~193 MB across 2 targets · largest ~98.0 MB on `primary/testapp_2` · smallest ~95.0 MB
 
-📋 **Plan**: **2** tables to alter
+📋 **Plan**: **2** tables to alter across 2 targets
 
 
 ---
@@ -2076,7 +2076,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 - `orders`: ~24.0 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
 - `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95.0 MB
 
-📋 **Plan**: **2** tables to alter
+📋 **Plan**: **2** tables to alter across 3 targets
 
 
 ---
