@@ -144,6 +144,7 @@ func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 		name      string
 		err       error
 		retryable bool
+		reason    string // the operator-facing reason, when the case pins one
 	}{
 		{
 			name: "ALTER whose checksum keeps finding differences is not retryable",
@@ -168,6 +169,14 @@ func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(
 				copyWarningError(1048, "Column 'c' cannot be null"))),
 			retryable: false,
+			reason:    "A row held NULL in a column that cannot be null",
+		},
+		{
+			name: "ALTER that would truncate a stored value is not retryable",
+			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(
+				copyWarningError(1265, "Data truncated for column 'nickname' at row 1"))),
+			retryable: false,
+			reason:    "An existing value would be truncated by the column's target type or length",
 		},
 		{
 			name: "ALTER that timed out on a lock wait stays retryable",
@@ -192,6 +201,9 @@ func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 			assert.Equal(t, engine.StateFailed, live.State)
 			assert.NotEmpty(t, live.ErrorMessage)
 			assert.Equal(t, tc.retryable, live.Retryable, "live progress")
+			if tc.reason != "" {
+				assert.Contains(t, live.ErrorMessage, tc.reason)
+			}
 
 			eng.Drain()
 
