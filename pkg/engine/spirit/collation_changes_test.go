@@ -62,6 +62,32 @@ func TestPlannedCollationChanges(t *testing.T) {
 			}},
 		},
 		{
+			name: "a case-sensitive unique column moving onto a case-insensitive collation can collide",
+			current: "CREATE TABLE `products` (`sku` varchar(64) COLLATE utf8mb4_bin NOT NULL, UNIQUE KEY `uk_sku` (`sku`)) " +
+				"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+			alter:   "ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_general_ci NOT NULL",
+			desired: "CREATE TABLE `products` (`sku` varchar(64) COLLATE utf8mb4_general_ci NOT NULL, UNIQUE KEY `uk_sku` (`sku`))",
+			want: []engine.CollationChange{{
+				Column: "sku", From: "utf8mb4_bin", To: "utf8mb4_general_ci",
+				Case:           engine.ComparisonBecomesInsensitive,
+				TrailingSpaces: engine.ComparisonUnchanged,
+				UniqueIndexes:  []string{"uk_sku"},
+			}},
+		},
+		{
+			name: "a NO PAD unique column moving onto a PAD SPACE collation can collide",
+			current: "CREATE TABLE `products` (`sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL, UNIQUE KEY `uk_sku` (`sku`)) " +
+				"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			alter:   "ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_general_ci NOT NULL",
+			desired: "CREATE TABLE `products` (`sku` varchar(64) COLLATE utf8mb4_general_ci NOT NULL, UNIQUE KEY `uk_sku` (`sku`))",
+			want: []engine.CollationChange{{
+				Column: "sku", From: "utf8mb4_0900_ai_ci", To: "utf8mb4_general_ci",
+				Case:           engine.ComparisonUnchanged,
+				TrailingSpaces: engine.ComparisonBecomesInsensitive,
+				UniqueIndexes:  []string{"uk_sku"},
+			}},
+		},
+		{
 			name: "a new table default reaches the columns the ALTER redeclares",
 			alter: "ALTER TABLE `products` MODIFY COLUMN `title` varchar(255) DEFAULT NULL, " +
 				"DEFAULT CHARSET=utf8mb4, COLLATE=utf8mb4_0900_ai_ci",
