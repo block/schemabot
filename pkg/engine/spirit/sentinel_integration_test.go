@@ -3,6 +3,7 @@
 package spirit
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -34,8 +35,9 @@ func TestEngine_PreexistingSentinelHoldsOnlyDeferredCutover(t *testing.T) {
 			require.NoError(t, err, "create table")
 			_, err = db.ExecContext(t.Context(), "CREATE TABLE `_spirit_sentinel` (id int NOT NULL PRIMARY KEY)")
 			require.NoError(t, err, "create sentinel")
+			// t.Context() is canceled by the time cleanup runs.
 			t.Cleanup(func() {
-				_, err := db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `_spirit_sentinel`")
+				_, err := db.ExecContext(context.WithoutCancel(t.Context()), "DROP TABLE IF EXISTS `_spirit_sentinel`")
 				assert.NoError(t, err, "drop sentinel")
 			})
 
