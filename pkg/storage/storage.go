@@ -624,8 +624,12 @@ type ApplyStore interface {
 	// land on an apply no drive will pick up again. The (apply_id, deployment,
 	// operation_key) unique index is the idempotency guard: a concurrent attach
 	// of the same operation loses with ErrApplyOperationExists, which the
-	// caller resolves by re-reading the winner's row. On success the operation's
-	// ID and every task's ID and ApplyOperationID are populated.
+	// caller resolves by re-reading the winner's row. Under the same lock, an
+	// operation keyed by its target is refused with
+	// ErrApplyOperationKeyingMismatch when the deployment's existing work
+	// operations of the apply are not keyed that way, and the reverse, so one
+	// target's work can never attach under two keys. On success the operation's ID and every
+	// task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
 	// Get returns an apply by ID, or nil if not found.
@@ -1354,20 +1358,20 @@ type ApplyOperationStore interface {
 	// completed / failed.
 	MarkTerminal(ctx context.Context, id int64, newState string) error
 
-	// SaveExternalOperationID stores the remote data plane's apply_operation_id
-	// on the operation that owns the dispatch.
-	SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error
-
-	// SaveExternalID stores the remote data plane's apply_id on the operation
-	// that owns the dispatch. The write is atomic with its deployment
-	// invariant: in one transaction the store locks the apply's operation
-	// rows, verifies the operation's deployment records no remote apply id
-	// other than the one being stored, and only then writes. Sibling
-	// operations of one deployment persist concurrently across the driver
-	// pool, so a check outside the writing transaction cannot stop two of
-	// them from recording divergent ids. Divergence returns an error wrapping
-	// ErrRemoteApplyDeploymentIDConflict.
-	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
+	// SaveExternalID stores the remote data plane's apply_id, and its
+	// apply_operation_id when the data plane named one (externalOperationID
+	// may be empty), on the operation that owns the dispatch. Both ids land in
+	// one write, so no reader ever sees an operation correlated to a remote
+	// apply without the remote operation its progress and cutover address.
+	// The write is atomic with its deployment invariant: in one transaction
+	// the store locks the apply's operation rows, verifies the operation's
+	// deployment records no remote apply id other than the one being stored
+	// and the operation records no other remote operation id, and only then
+	// writes. Sibling operations of one deployment persist concurrently across
+	// the driver pool, so a check outside the writing transaction cannot stop
+	// two of them from recording divergent ids. Deployment divergence returns
+	// an error wrapping ErrRemoteApplyDeploymentIDConflict.
+	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID, externalOperationID string) error
 
 	// ApplyIdentifierForRemoteApply returns the identifier of the apply this
 	// control plane dispatched as the given remote apply, or "" when it

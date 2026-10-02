@@ -132,16 +132,17 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 	data := templates.ParseProgressResponse(result)
 
 	return progressMsg{
-		state:       data.State,
-		tables:      data.Tables,
-		operations:  data.Operations,
-		released:    data.Released,
-		errorMsg:    data.ErrorMessage,
-		applyID:     result.ApplyID,
-		database:    result.Database,
-		environment: result.Environment,
-		engine:      result.Engine,
-		metadata:    result.Metadata,
+		state:        data.State,
+		tables:       data.Tables,
+		operations:   data.Operations,
+		released:     data.Released,
+		deferCutover: data.Options["defer_cutover"] == "true",
+		errorMsg:     data.ErrorMessage,
+		applyID:      result.ApplyID,
+		database:     result.Database,
+		environment:  result.Environment,
+		engine:       result.Engine,
+		metadata:     result.Metadata,
 	}
 }
 

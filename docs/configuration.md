@@ -796,9 +796,11 @@ statement has waited 90% of the bound for the lock, it kills the transactions
 blocking it and tries again, up to 3 attempts, as Spirit does for its own
 DDL. It never kills while it holds the lock and runs, so traffic to a table
 being rebuilt is left alone. A session holding an explicit `LOCK TABLES`, or a
-transaction too large to roll back safely, is never killed; while one holds
-the lock the apply fails with a retryable "table is busy" error, after one
-attempt for an explicit table lock. Every attempt runs the statement from the
+transaction too large to roll back safely, is never killed, and a session the
+user is not allowed to kill survives the kill too. No later attempt can end
+such a blocker, so the statement stops after the attempt that met it, and the
+apply fails with a retryable "table is busy" error. The full 3 attempts go only
+to blockers the kill ends. Every attempt runs the statement from the
 start, so a rebuild that times out waiting to upgrade its lock at the end is
 rolled back and runs again. Traffic to the table can stall for up to one bound
 per attempt, and between attempts the statement waits up to 30 seconds for
@@ -807,11 +809,10 @@ and gives a blocker less time to finish before it is killed; the value must
 be a whole number of seconds (at least `1s`).
 
 The kill reads `performance_schema` and `information_schema.innodb_trx` to
-find the blocking sessions, so the SchemaBot user needs `SELECT` on
-`performance_schema.*` and `PROCESS` for a statement to run directly; without
-either the statement is blocked at plan time. Killing
-another user's session also needs `CONNECTION_ADMIN` (or `SUPER`); without it
-the kill fails and a blocked apply fails as busy.
+find the blocking sessions and ends other users' sessions, so the SchemaBot
+user needs `SELECT` on `performance_schema.*`, `PROCESS`, and
+`CONNECTION_ADMIN` (or `SUPER`) for a statement to run directly; without any
+of them the statement is blocked at plan time.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
@@ -1057,6 +1058,18 @@ database's entry wins.
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
+
+### MySQL server settings Spirit refuses
+
+Spirit checks the target server before every run, including a resumed one,
+and refuses to start on a setting it cannot run safely under. One of them,
+`partial_revokes=ON`, is a server-wide security setting an operator may have
+chosen on purpose. With it on, a `REVOKE` can remove a grant for one schema
+while `SHOW GRANTS` still lists the global grant, so a privilege check passes
+and the schema change fails at cutover. `partial_revokes` is `OFF` by default.
+A target with it `ON` fails every schema change, and an apply already in
+flight fails on its next drive. Turning it off is a server-wide security
+change, so plan it before upgrading rather than after.
 
 ## Postgres
 
@@ -1420,7 +1433,7 @@ By default, SchemaBot blocks `apply` and `apply-confirm` when non-SchemaBot PR c
 require_passing_checks: true
 ```
 
-Apply is blocked in two cases: completed checks that did not **pass** and checks that are **still running** (`in_progress`, `queued`, `pending`). A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
+Apply is blocked in two cases: completed checks that did not **pass** and checks that have **not finished**. Any status other than `completed` (such as `in_progress`, `queued`, `pending`, `waiting`, or `requested`) counts as not finished, so unrecognized statuses fail closed. A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
 
 For repositories with many optional checks, `required_checks` can narrow the gate to specific check names:
 

@@ -82,6 +82,14 @@ type PlanRequest struct {
 	// the way every plan did before members could be selected. A narrowed plan
 	// speaks for its one member only, so it never records stored check state.
 	Target string `json:"target,omitempty"`
+
+	// RendersRollout is the HTTP caller's capability flag: it reads the
+	// response's rollout block and shows the operator what applies on every
+	// member. It is not operator consent. POST /api/plan
+	// refuses a rollout-wide plan of an environment with more than one member
+	// without it (refusePlanRolloutUnrenderedByCaller). The webhook calls the
+	// service in process and renders the rollout itself, so it never sets it.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 type unsupportedPullSchemaError struct {
@@ -564,6 +572,14 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
+	// RendersRollout is the HTTP caller's capability flag: it shows the
+	// operator the plan every rollout member runs. It is not operator consent;
+	// see apitypes.ApplyRequest.RendersRollout.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
+	// viaHTTP is set by POST /api/apply, the one entry point whose caller has
+	// to say it rendered the rollout. The webhook and the trusted enqueue path
+	// call the service in process and leave it unset.
+	viaHTTP bool
 	// ExpectedLockOwner and ExpectedPendingPlanID are internal webhook guards;
 	// direct API callers cannot assert a lock intent through JSON.
 	ExpectedLockOwner     string `json:"-"`
@@ -572,8 +588,8 @@ type ApplyRequest struct {
 	// request apply-confirm that checked the confirmation against every other
 	// target's statements and execution modes, on a comment disclosing each
 	// target's direct changes under that target. Without it, apply creation
-	// refuses another target's direct-execution change: no other caller was
-	// shown it. Direct API callers cannot assert it through JSON.
+	// refuses another target's direct-execution change: no other caller
+	// confirms one. Direct API callers cannot assert it through JSON.
 	ConfirmedMemberWork bool `json:"-"`
 }
 
@@ -616,7 +632,25 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	planProto, resp, err := s.ExecutePlanProto(r.Context(), req)
+	if err := s.refusePlanRolloutUnrenderedByCaller(req); err != nil {
+		if _, ok := errors.AsType[*RolloutUnrenderedError](err); ok {
+			s.logger.Warn("plan rejected: the caller does not render the plan of every rollout member",
+				"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "plan rejected: "+err.Error())
+			return
+		}
+		if requestedRouteNotConfigured(err) {
+			s.logger.Warn("plan rejected for unconfigured database route", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		s.logger.Error("plan failed: the environment's rollout members did not resolve, so the rollout rendering check refuses the plan",
+			"database", req.Database, "environment", req.Environment, "repository", req.Repository, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
+		return
+	}
+
+	primaryPlan, resp, err := s.ExecutePlanProto(r.Context(), req)
 	if err != nil {
 		if typeMismatchErr, ok := errors.AsType[*databaseTypeMismatchError](err); ok {
 			s.logger.Warn("plan rejected for mismatched database type", "database", req.Database, "environment", req.Environment, "request_type", typeMismatchErr.RequestType, "config_type", typeMismatchErr.ConfigType)
@@ -659,95 +693,20 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.refuseUpToDateForUnconvergedMembers(r.Context(), req, planProto, resp); err != nil {
-		s.logger.Error("plan failed: the other rollout members could not be planned to check the plan's coverage", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
+	// An apply of a rollout runs on every member, so the plan an operator
+	// reviews before it describes every member, not only the primary.
+	// A plan that cannot say what an apply of it refuses fails, rather than
+	// returning an empty refusal list that reads as nothing being refused. The
+	// error says which step failed.
+	rollout, err := s.planRollout(r.Context(), req, primaryPlan, resp)
+	if err != nil {
+		s.logger.Error("plan failed: the rollout's member plans could not be completed", "database", req.Database, "environment", req.Environment, "plan_id", resp.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "plan failed: "+err.Error())
 		return
 	}
+	resp.Rollout = rollout
 
 	s.writeJSON(w, http.StatusOK, resp)
-}
-
-// refuseUpToDateForUnconvergedMembers keeps a plan of a whole rollout from
-// reading as "up to date" while another member still needs a change.
-//
-// A plan requested through the API is made against the rollout primary, and
-// the other members run the primary's plan. A primary with nothing to change
-// says nothing about the other members: one can still lack the change, for
-// instance after an apply narrowed to the primary landed it there alone. So
-// when the primary is clean, every other member is diffed against its own live
-// schema, without storing a plan for it. The plan reads as up to date only when
-// every member is: a member that still has work, or whose diff failed, turns
-// the plan into an error naming it and how to plan it. A plan with changes is
-// left as it is: applying it runs on every member, each verified against the
-// plan it runs.
-func (s *Service) refuseUpToDateForUnconvergedMembers(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, resp *apitypes.PlanResponse) error {
-	if req.Target != "" || len(resp.Errors) > 0 || resp.HasChanges() {
-		return nil
-	}
-	members, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
-	if err != nil {
-		return fmt.Errorf("resolve rollout members for %s/%s: %w", req.Database, req.Environment, err)
-	}
-	if len(members) <= 1 {
-		return nil
-	}
-	primary := routing.ExecutionTarget{Deployment: resp.Deployment, Target: resp.Target, Namespaces: resp.SelectedNamespaces}
-	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primary, members)
-	if err != nil {
-		return fmt.Errorf("plan the other rollout members of %s/%s: %w", req.Database, req.Environment, err)
-	}
-	if len(diffs) != len(members) {
-		return fmt.Errorf("plan the other rollout members of %s/%s: %d member diffs for %d members", req.Database, req.Environment, len(diffs), len(members))
-	}
-
-	selectors := rolloutMemberSelectors(members)
-	var withWork, unplanned []string
-	for i := 1; i < len(diffs); i++ {
-		diff := diffs[i]
-		if diff.Err != nil {
-			s.logger.Warn("rollout member could not be planned; the plan of the whole rollout is not reported as up to date",
-				"database", req.Database,
-				"environment", req.Environment,
-				"repository", req.Repository,
-				"plan_id", resp.PlanID,
-				"member", members[i].MemberID(),
-				"error", diff.Err)
-			unplanned = append(unplanned, selectors[i])
-			continue
-		}
-		if (tern.ChangeSet{Changes: diff.Changes, Shards: diff.Shards}).HasWork() {
-			withWork = append(withWork, selectors[i])
-		}
-	}
-	if len(withWork) == 0 && len(unplanned) == 0 {
-		s.logger.Info("plan of a whole rollout is up to date: the primary and every other member are at the desired schema",
-			"database", req.Database,
-			"environment", req.Environment,
-			"repository", req.Repository,
-			"plan_id", resp.PlanID,
-			"members", len(members))
-		return nil
-	}
-	s.logger.Warn("plan of a whole rollout refused as up to date: the primary has no changes, but other members are not at the desired schema",
-		"database", req.Database,
-		"environment", req.Environment,
-		"repository", req.Repository,
-		"plan_id", resp.PlanID,
-		"primary", members[0].MemberID(),
-		"members_with_changes", len(withWork),
-		"members_not_planned", len(unplanned))
-	if len(withWork) > 0 {
-		resp.Errors = append(resp.Errors, fmt.Sprintf(
-			"rollout primary %s is at the desired schema, but %d other rollout members still need changes: %s. The rollout is not up to date; plan and apply each of them with its target",
-			members[0].MemberID(), len(withWork), listSelectors(withWork)))
-	}
-	if len(unplanned) > 0 {
-		resp.Errors = append(resp.Errors, fmt.Sprintf(
-			"rollout primary %s is at the desired schema, but %d other rollout members could not be planned: %s. The rollout is not reported as up to date until each of them is planned; see the server logs for why",
-			members[0].MemberID(), len(unplanned), listSelectors(unplanned)))
-	}
-	return nil
 }
 
 // ExecutePlan executes a plan request via the Tern client, stores the result,
@@ -1437,6 +1396,7 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.viaHTTP = true
 	resp, applyID, err := s.ExecuteApply(r.Context(), req)
 	if err != nil {
 		if errors.Is(err, errPlanLookupFailed) {
@@ -1481,6 +1441,21 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*PlanMemberMismatchError](err); ok {
 			s.logger.Warn("apply rejected because its plan was made for a different rollout member than the apply would run on", "plan_id", req.PlanID, "environment", req.Environment, "selector", req.Target, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if refused, ok := errors.AsType[*MemberPlanRefusedError](err); ok {
+			s.logger.Warn("apply rejected: a rollout member's own plan cannot run in an apply created from the primary's plan", "plan_id", req.PlanID, "environment", req.Environment, "member", refused.MemberID, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*MemberWorkRefusedError](err); ok {
+			s.logger.Warn("apply rejected: a rollout member's own plan carries work an apply of the whole rollout cannot run", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*RolloutUnrenderedError](err); ok {
+			s.logger.Warn("apply rejected: the caller does not render the plan of every rollout member", "plan_id", req.PlanID, "environment", req.Environment, "caller", req.Caller, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
@@ -1886,6 +1861,9 @@ func (s *Service) createStoredApply(
 	if err != nil {
 		return nil, 0, err
 	}
+	if err := refuseApplyRolloutUnrenderedByCaller(plan, req, targets, narrowedTo); err != nil {
+		return nil, 0, err
+	}
 	// A narrowed apply records the member it ran on, so a later rollback can
 	// tell it changed that member alone and not the whole rollout.
 	applyOpts.NarrowedTo = narrowedTo
@@ -1940,12 +1918,13 @@ func (s *Service) createStoredApply(
 	//
 	// A member's direct-execution verdict is the verdict of the target that
 	// runs the statement (RV-4), so its task carries it, whether or not the
-	// reviewed plan has work. Only a pull request apply-confirm has disclosed
-	// it: that comment names each target's direct changes under that target,
-	// and the confirm re-checks each target's statements and execution modes
-	// against the confirmed round before it creates the apply. Any other caller
-	// was shown the reviewed plan alone, so a member's direct change is refused
-	// for it.
+	// reviewed plan has work. Only a pull request apply-confirm confirms it:
+	// that comment names each target's direct changes under that target, and
+	// the confirm re-checks each target's statements and execution modes
+	// against the confirmed round before it creates the apply. No other caller
+	// confirms another target's direct change, the CLI included, though it
+	// shows each target's notice, so a member's direct change is refused for
+	// it, and runs from an apply narrowed to that member.
 	names := applyMemberDisplayNames(members)
 	for i, member := range members {
 		if err := rejectUnapplyableMemberPlan(member, names[i], plan); err != nil {
@@ -2039,6 +2018,24 @@ func (e *MemberPlanRefusedError) Error() string {
 }
 
 func (e *MemberPlanRefusedError) Unwrap() error {
+	return e.Err
+}
+
+// MemberWorkRefusedError is apply creation refusing an apply of the whole
+// rollout because one member's own plan carries work that apply cannot run as
+// planned: another target's direct-execution change, work an apply from an
+// already converged reviewed plan cannot carry, or work outside the apply's
+// shape. The remedy is the operator's, an apply narrowed to that member, so it
+// is a refused request rather than a server failure.
+type MemberWorkRefusedError struct {
+	Err error
+}
+
+func (e *MemberWorkRefusedError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *MemberWorkRefusedError) Unwrap() error {
 	return e.Err
 }
 
@@ -2221,9 +2218,9 @@ func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *s
 }
 
 // rejectUnconfirmedMemberDirectExecution refuses a member planned on its own
-// whose plan runs direct-execution DDL, for an apply whose caller was not
-// shown that member's plan. A member running the apply's plan runs exactly the
-// statements, and the verdicts, the caller was shown.
+// whose plan runs direct-execution DDL, for an apply that carries no
+// confirmation of that member's verdict. A member running the apply's plan
+// runs exactly the statements, and the verdicts, of the plan being applied.
 //
 // This holds even when the reviewed plan runs the identical statement directly,
 // unlike an unsafe change the reviewed plan also carries
@@ -2233,15 +2230,18 @@ func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *s
 // that table's writes for as long as the statement runs, and the reviewed plan
 // names the reviewed target's table with the size the planner measured there.
 // Another target's copy of the table was measured on its own and can be any
-// size under the bound. Only the pull request comment shows that target's
-// verdict, with its own measured reason, under that target.
+// size under the bound. Only a pull request apply-confirm confirms that
+// target's verdict, given on the comment that shows it with its own measured
+// reason under that target. A rollout-wide apply over the API confirms no
+// other target's verdict, so that target's direct change runs from an apply
+// narrowed to it, where its plan is the plan being applied.
 func rejectUnconfirmedMemberDirectExecution(member applyMember, applyPlan *storage.Plan) error {
 	if member.Plan == applyPlan {
 		return nil
 	}
 	if table := firstDirectExecutionTable(member.Plan); table != "" {
-		return fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, which runs only from a pull request apply-confirm on the comment that discloses it under that target; this apply's caller was shown only the reviewed plan %s",
-			member.MemberID(), member.Plan.PlanIdentifier, table, applyPlan.PlanIdentifier)
+		return &MemberWorkRefusedError{Err: fmt.Errorf("rollout member %s: plan %s runs table %q as direct-execution DDL, and an apply of the whole rollout from plan %s runs another target's direct-execution DDL only from a pull request apply-confirm on the comment that discloses it under that target; plan and apply the member with its target to run its own plan",
+			member.MemberID(), member.Plan.PlanIdentifier, table, applyPlan.PlanIdentifier)}
 	}
 	return nil
 }
@@ -2271,8 +2271,8 @@ func firstDirectExecutionTable(plan *storage.Plan) string {
 // check every caller creating such an apply passes through.
 func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 	if reason := MemberWorkAConvergedReviewedPlanCannotRun(member.Plan); reason != "" {
-		return fmt.Errorf("rollout member %s: plan %s %s, which an apply whose reviewed target is already at the desired schema cannot run",
-			member.MemberID(), member.Plan.PlanIdentifier, reason)
+		return &MemberWorkRefusedError{Err: fmt.Errorf("rollout member %s: plan %s %s, which an apply whose reviewed target is already at the desired schema cannot run",
+			member.MemberID(), member.Plan.PlanIdentifier, reason)}
 	}
 	return nil
 }
@@ -2653,8 +2653,8 @@ func operationShapeOf(plan *storage.Plan, taskChanges []storage.TableChange) ope
 // being checked against it. A member with no work fits every shape.
 func rejectMemberWorkOutsideShape(member applyMember, applyPlan *storage.Plan, shape operationShape) error {
 	if reason := memberWorkOutsideShape(member.Plan, applyPlan, shape); reason != "" {
-		return fmt.Errorf("rollout member %s: plan %s %s, so the apply was not created rather than mark the target done without its change",
-			member.MemberID(), member.Plan.PlanIdentifier, reason)
+		return &MemberWorkRefusedError{Err: fmt.Errorf("rollout member %s: plan %s %s, so the apply was not created rather than mark the target done without its change",
+			member.MemberID(), member.Plan.PlanIdentifier, reason)}
 	}
 	return nil
 }
@@ -3067,6 +3067,9 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	if plan.Target == "" {
 		return nil, terminalControlf("plan %s is missing server-side routing metadata field %q; create a new plan and retry rollback", plan.PlanIdentifier, "target")
 	}
+	if err := s.refuseRollbackOfIndependentRollout(ctx, plan, apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
+		return nil, err
+	}
 	if err := s.refuseRollbackAfterPrimaryMoved(apply, routing.ExecutionTarget{Deployment: deployment, Target: plan.Target}); err != nil {
 		return nil, err
 	}
@@ -3151,6 +3154,64 @@ func (s *Service) ExecuteRollbackPlanForApply(ctx context.Context, apply *storag
 	return planResponseFromProto(resp), nil
 }
 
+// refuseRollbackOfIndependentRollout refuses a rollback of an apply across a
+// rollout whose members are each planned against their own schema.
+//
+// A rollback is one plan, made against the rollout primary, and such a
+// rollout runs no member from another member's plan (RV-9): apply creation
+// pairs each member with a plan stored for it, and a rollback stores none. The
+// rollback is refused here, before a plan is made, with the remedy that does
+// restore each member: an apply narrowed to it of the previous schema.
+//
+// The apply's own review round decides, not the configuration as it reads now.
+// A round that planned its members on their own stored a plan for each, bound
+// to the source plan, and the apply ran each member from its own plan however
+// the environment has been respelled since: as mirrored deployments, or with
+// fewer targets. A round that cannot be read refuses the rollback, since it is
+// the only record of how the apply ran. A round that stored no member plan ran
+// one plan on every member, and the configuration is still read for the one
+// case that rollback cannot reach either: an environment respelled since as
+// targets planned on their own, whose apply creation would find no plan for
+// any member but the primary.
+func (s *Service) refuseRollbackOfIndependentRollout(ctx context.Context, plan *storage.Plan, apply *storage.Apply, applyPrimary routing.ExecutionTarget) error {
+	memberPlans, err := s.MemberPlansForReviewRound(ctx, plan, apply.Environment)
+	if err != nil {
+		s.logger.Error("rollback refused: the source plan's review round could not be read to tell whether its targets were each planned against their own schema",
+			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "error", err)...)
+		return fmt.Errorf("rollback of apply %s: read the review round of its plan %s: %w", apply.ApplyIdentifier, plan.PlanIdentifier, err)
+	}
+	if len(memberPlans) > 0 {
+		targets := len(memberPlans) + 1
+		s.logger.Warn("rollback refused: the apply ran each of the rollout's targets from a plan of its own, and a rollback has one plan",
+			append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "targets", targets)...)
+		return controlConflictf("apply %s ran across the %d targets of %s/%s, which were each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+			apply.ApplyIdentifier, targets, apply.Database, apply.Environment, applyPrimary.MemberID())
+	}
+
+	members, err := s.config.ResolveDatabaseTargets(apply.Database, apply.Environment)
+	if err != nil {
+		s.logger.Debug("rollback member planning check skipped: the apply's round planned no target on its own, and config did not resolve the rollout members; apply creation pairs each member with its own plan",
+			append(apply.LogAttrs(), "error", err)...)
+		return nil
+	}
+	if len(members) <= 1 {
+		return nil
+	}
+	planning, err := s.config.MemberPlanningFor(apply.Database, apply.Environment)
+	if err != nil {
+		s.logger.Debug("rollback member planning check skipped: the apply's round planned no target on its own, and config did not resolve member planning; apply creation pairs each member with its own plan",
+			append(apply.LogAttrs(), "error", err)...)
+		return nil
+	}
+	if planning != PlanIndependent {
+		return nil
+	}
+	s.logger.Warn("rollback refused: the rollout's targets are now each planned against their own schema, and a rollback has one plan",
+		append(apply.LogAttrs(), "plan_id", plan.PlanIdentifier, "members", len(members))...)
+	return controlConflictf("apply %s ran one plan across %s/%s, whose %d targets are now each planned against their own schema, and a rollback is one plan made against %s; rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+		apply.ApplyIdentifier, apply.Database, apply.Environment, len(members), applyPrimary.MemberID())
+}
+
 // refuseRollbackAfterPrimaryMoved refuses a rollback of a rollout-wide apply
 // whose rollout primary is no longer the environment's first member.
 //
@@ -3176,7 +3237,7 @@ func (s *Service) refuseRollbackAfterPrimaryMoved(apply *storage.Apply, applyPri
 	}
 	s.logger.Warn("rollback refused: the rollout primary changed since the apply ran",
 		append(apply.LogAttrs(), "apply_primary", applyPrimary.MemberID(), "rollout_primary", members[0].MemberID())...)
-	return controlConflictf("apply %s ran across the rollout from rollout primary %s, but the rollout primary is now %s; a rollback made against %s cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. Restore the rollout order the apply ran under (deployment_order, or the order of the targets list) so %s is first, then retry the rollback",
+	return controlConflictf("apply %s ran across the rollout from rollout primary %s, but the rollout primary is now %s; a rollback made against %s cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. Restore the rollout order the apply ran under (deployment_order) so %s is first, then retry the rollback",
 		apply.ApplyIdentifier, applyPrimary.MemberID(), members[0].MemberID(), applyPrimary.MemberID(), applyPrimary.MemberID())
 }
 

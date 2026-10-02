@@ -8,6 +8,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 // Table-size rendering in the plan comment: an info section above the plan
@@ -40,7 +43,9 @@ func TestRenderPlanComment_TableSizes(t *testing.T) {
 	assert.Contains(t, out, "- `mutes`: ~1.1 GB\n")
 }
 
-func TestRenderPlanComment_TableSizesRenderAbovePlanSummary(t *testing.T) {
+// The sizes describe the tables the DDL touches, so they sit directly under
+// the DDL rather than below the warnings, next to the plan summary.
+func TestRenderPlanComment_TableSizesRenderUnderDDL(t *testing.T) {
 	data := tableSizePlanData([]TableSizeData{
 		{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)},
 	})
@@ -49,13 +54,47 @@ func TestRenderPlanComment_TableSizesRenderAbovePlanSummary(t *testing.T) {
 	}
 	out := RenderPlanComment(data)
 
-	summaryAt := strings.Index(out, "📋 **Plan**:")
+	ddlAt := strings.Index(out, "```sql")
+	require.NotEqual(t, -1, ddlAt, "plan comment renders the DDL")
+	ddlEnd := ddlAt + strings.Index(out[ddlAt:], "\n```\n")
 	sizesAt := strings.Index(out, "📊 **Table sizes**")
 	lintAt := strings.Index(out, "💡 **Lint Warnings**")
-	ddlAt := strings.Index(out, "```sql")
-	assert.Greater(t, sizesAt, ddlAt, "sizes render after the DDL, not above it")
-	assert.Greater(t, sizesAt, lintAt, "sizes render below the lint warnings")
+	summaryAt := strings.Index(out, "📋 **Plan**:")
+	require.NotEqual(t, -1, sizesAt, "plan comment renders the size section")
+	require.NotEqual(t, -1, lintAt, "plan comment renders the lint warnings")
+	assert.Greater(t, sizesAt, ddlEnd, "sizes render after the DDL")
+	assert.Less(t, sizesAt, lintAt, "sizes render above the lint warnings")
 	assert.Less(t, sizesAt, summaryAt, "sizes render above the plan summary")
+}
+
+// The locked comment that applies automatically follows a plan comment that
+// already showed the sizes, so it leaves them out.
+func TestRenderPlanComment_AutomaticApplyOmitsTableSizes(t *testing.T) {
+	out := RenderPlanComment(lockedTableSizePlanData(false))
+
+	assert.Contains(t, out, "**Applying automatically**")
+	assert.Contains(t, out, "📋 **Plan**:")
+	assert.NotContains(t, out, "Table sizes")
+}
+
+// A locked comment paused for apply-confirm can carry a re-planned statement
+// the reviewed plan did not, so it keeps the sizes of what the operator is
+// about to confirm.
+func TestRenderPlanComment_PausedApplyKeepsTableSizes(t *testing.T) {
+	out := RenderPlanComment(lockedTableSizePlanData(true))
+
+	assert.NotContains(t, out, "**Applying automatically**")
+	assert.Contains(t, out, "📊 **Table sizes**:\n- `mutes`: ~1.1 GB\n")
+}
+
+func lockedTableSizePlanData(pendingConfirmation bool) PlanCommentData {
+	data := tableSizePlanData([]TableSizeData{
+		{Table: "mutes", EstimatedBytes: previewBytes(1_130_000_000)},
+	})
+	data.IsLocked = true
+	data.LockOwner = "octocat/hello-world#1"
+	data.PendingManualConfirmation = pendingConfirmation
+	return data
 }
 
 func TestRenderPlanComment_TableSizesSharded(t *testing.T) {
@@ -166,7 +205,7 @@ func rankedTables(n int) ([]string, map[string]int64) {
 func sizeLines(bytes map[string]int64, tables []string) string {
 	var sb strings.Builder
 	for _, name := range tables {
-		fmt.Fprintf(&sb, "- `%s`: ~%d MB\n", name, bytes[name]/1_000_000)
+		fmt.Fprintf(&sb, "- `%s`: %s\n", name, ui.FormatApproxBytes(bytes[name]))
 	}
 	return sb.String()
 }
@@ -181,15 +220,15 @@ func largestFirst(order []string) []string {
 
 // Up to the inline limit every table is listed in the open, in plan order.
 func TestRenderPlanComment_TableSizesAtInlineLimitStayInPlanOrder(t *testing.T) {
-	order, bytes := rankedTables(tableSizesInlineLimit)
+	order, bytes := rankedTables(presentation.TableSizesInlineLimit)
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "📊 **Table sizes**:\n"+
-		"- `t001`: ~1 MB\n"+
-		"- `t002`: ~2 MB\n"+
-		"- `t003`: ~3 MB\n"+
-		"- `t004`: ~4 MB\n"+
-		"- `t005`: ~5 MB\n"+
+		"- `t001`: ~1.0 MB\n"+
+		"- `t002`: ~2.0 MB\n"+
+		"- `t003`: ~3.0 MB\n"+
+		"- `t004`: ~4.0 MB\n"+
+		"- `t005`: ~5.0 MB\n"+
 		"\n", tableSizesSection(t, out))
 }
 
@@ -209,11 +248,11 @@ func TestRenderPlanComment_TableSizesOverInlineLimitCollapseLargestFirst(t *test
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
-		"- `audit_events`: ~90 MB\n"+
-		"- `ledger`: ~80 MB\n"+
-		"- `orders`: ~50 MB\n"+
-		"- `accounts`: ~6 MB\n"+
-		"- `carts`: ~3 MB\n"+
+		"- `audit_events`: ~90.0 MB\n"+
+		"- `ledger`: ~80.0 MB\n"+
+		"- `orders`: ~50.0 MB\n"+
+		"- `accounts`: ~6.0 MB\n"+
+		"- `carts`: ~3.0 MB\n"+
 		"- `events_raw`: size estimate unavailable\n"+
 		"\n</details>\n\n", tableSizesSection(t, out))
 }
@@ -221,7 +260,7 @@ func TestRenderPlanComment_TableSizesOverInlineLimitCollapseLargestFirst(t *test
 // A collapsed section lists every table up to the listed cap, with no line
 // counting tables left out.
 func TestRenderPlanComment_TableSizesAtListedCapListEveryTable(t *testing.T) {
-	order, bytes := rankedTables(tableSizesShown)
+	order, bytes := rankedTables(presentation.TableSizesShown)
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
@@ -237,7 +276,7 @@ func TestRenderPlanComment_TableSizesPastListedCapCountTheRest(t *testing.T) {
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
-		sizeLines(bytes, largestFirst(order)[:tableSizesShown])+
+		sizeLines(bytes, largestFirst(order)[:presentation.TableSizesShown])+
 		"- …and 36 more tables\n"+
 		"\n</details>\n\n", tableSizesSection(t, out))
 }
@@ -245,12 +284,27 @@ func TestRenderPlanComment_TableSizesPastListedCapCountTheRest(t *testing.T) {
 // One table past the listed cap is counted in the closing line, in the
 // singular.
 func TestRenderPlanComment_TableSizesOnePastListedCap(t *testing.T) {
-	order, bytes := rankedTables(tableSizesShown + 1)
+	order, bytes := rankedTables(presentation.TableSizesShown + 1)
 	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
 
 	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
-		sizeLines(bytes, largestFirst(order)[:tableSizesShown])+
+		sizeLines(bytes, largestFirst(order)[:presentation.TableSizesShown])+
 		"- …and 1 more table\n"+
+		"\n</details>\n\n", tableSizesSection(t, out))
+}
+
+// A table with no estimate ranks last, so past the listed cap it is among the
+// tables the closing line counts. The line says how many of them have no
+// estimate, so a table whose size probe failed is never read as one of the
+// smallest.
+func TestRenderPlanComment_TableSizesPastListedCapCountTablesWithoutEstimate(t *testing.T) {
+	order, bytes := rankedTables(presentation.TableSizesShown + 1)
+	order = append([]string{"ledger"}, order...)
+	out := RenderPlanComment(tableSizePlanData(sizedTables(bytes, order)))
+
+	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b></summary>\n\n"+
+		sizeLines(bytes, largestFirst(order[1:])[:presentation.TableSizesShown])+
+		"- …and 2 more tables (1 without a size estimate)\n"+
 		"\n</details>\n\n", tableSizesSection(t, out))
 }
 
@@ -277,7 +331,9 @@ func TestCompareTableSizesLargestFirst(t *testing.T) {
 	}
 	for _, in := range inputs {
 		sorted := slices.Clone(in)
-		slices.SortStableFunc(sorted, compareTableSizesLargestFirst)
+		slices.SortStableFunc(sorted, func(a, b tableSizeEntry) int {
+			return presentation.CompareBytesLargestFirst(a.rankBytes(), b.rankBytes())
+		})
 		got := make([]string, 0, len(sorted))
 		for _, e := range sorted {
 			got = append(got, e.name)
@@ -459,14 +515,14 @@ func TestRenderPlanComment_TableSizeNamesStayInCodeSpans(t *testing.T) {
 		targetSize("primary/g`h", "us`ers", 1_000_000),
 	}))
 	assert.Contains(t, out, "- `` ord`ers ``: ~24.5 GB across 2 of 3 targets · largest ~23.4 GB on `` primary/a`b `` · smallest ~1.1 GB · size estimate unavailable on `` primary/e`f ``\n")
-	assert.Contains(t, out, "- `` us`ers ``: ~1 MB on `` primary/g`h ``\n")
+	assert.Contains(t, out, "- `` us`ers ``: ~1.0 MB on `` primary/g`h ``\n")
 }
 
 // A collapsed section on the reviewed-target fallback keeps the target scope
 // in its summary, where GitHub reads HTML rather than markdown, so the
 // reviewed target's name is escaped and set in a <code> tag.
 func TestRenderPlanComment_CollapsedReviewedTargetSizesKeepScope(t *testing.T) {
-	order, bytes := rankedTables(tableSizesInlineLimit + 1)
+	order, bytes := rankedTables(presentation.TableSizesInlineLimit + 1)
 	data := tableSizePlanData(sizedTables(bytes, order))
 	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: previewRolloutMembers()}
 	out := RenderPlanComment(data)

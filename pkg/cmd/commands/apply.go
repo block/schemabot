@@ -84,7 +84,10 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
 		planResult, ignoredNamespaces, planErr = client.CallPlanAPIForTarget(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(),
-			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover), cmd.Target)
+			// The apply refuses the members its rollout lists as needing
+			// attention or as refused, and shows every member's plan before
+			// it prompts.
+			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover), cmd.Target, true)
 		return planErr
 	})
 	if err != nil {
@@ -118,8 +121,20 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return fmt.Errorf("plan has errors")
 	}
 
-	// Check if there are any changes (DDL or VSchema)
-	if !planResult.HasChanges() {
+	// An apply runs on every member of a rollout, and one the server could
+	// not plan has no plan to run, so the apply is refused before it starts.
+	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Attention) > 0 {
+		if cmd.Output == OutputFormatJSON {
+			// JSON output prints no member list, so the error itself names
+			// each member and what it needs.
+			return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one, then apply again: %s", len(rollout.Attention), rollout.Members, rolloutAttentionSummary(rollout.Attention))
+		}
+		templates.WriteRolloutAttention(templates.RolloutNoun(rollout), rollout.Attention)
+		return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one listed above, then apply again", len(rollout.Attention), rollout.Members)
+	}
+
+	// Check if there are any changes (DDL or VSchema) on any rollout member
+	if !planResult.RolloutHasChanges() {
 		fmt.Println("No changes. Your schema is up-to-date.")
 		writeNarrowedTo(planResult)
 		// Apply returns here without rendering a plan body, so this is the one
@@ -142,9 +157,25 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		}
 	}
 
+	// The server lists the members whose own plans apply creation refuses in
+	// an apply of the whole rollout from the API, whatever the flags: an
+	// unsafe change the primary's plan does not carry, a direct-execution
+	// change, or work an apply created from the primary's plan has no place
+	// for. Asking for consent here would ask for something the apply cannot
+	// act on, so the apply is refused before it locks or prompts, and each
+	// member is named with the narrowed apply that runs it under its own plan.
+	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Refused) > 0 {
+		if cmd.Output == OutputFormatJSON {
+			// JSON output prints no member list, so the error itself names
+			// each refused member, why, and the narrowed apply that runs it.
+			return fmt.Errorf("an apply of the whole rollout cannot run the plan of %d of %d rollout members: %s", len(rollout.Refused), rollout.Members, rolloutRefusalSummary(rollout.Refused, cmd.Environment, cfg.SchemaDir))
+		}
+		return blockRolloutApplyRefused(planResult, rollout, cfg.Database, cmd.Environment, cfg.SchemaDir)
+	}
+
 	// Check for unsafe changes
-	if len(planResult.UnsafeChanges()) > 0 && !cmd.AllowUnsafe {
-		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target)
+	if len(planResult.RolloutUnsafeChanges()) > 0 && !cmd.AllowUnsafe {
+		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Output)
 	}
 
 	// Check lock availability before showing plan (unless --force will break it anyway or --no-lock skips locking)
@@ -177,7 +208,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Show unsafe warning if --allow-unsafe was used
 	if cmd.AllowUnsafe {
-		templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges(), templates.UnsafeConsentAllowFlag)
+		templates.WriteUnsafeWarningAllowed(planResult.RolloutUnsafeChanges(), templates.UnsafeConsentAllowFlag)
 	}
 
 	// Show options if any flags are set
@@ -259,7 +290,11 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	applyID, err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	// The plan shown above is the plan of every rollout member, grouped by
+	// what each runs. Members the server listed as refused were turned away
+	// before the prompt; a member whose own plan apply creation refuses
+	// without having listed it is refused by POST /api/apply instead.
+	applyID, err := applyAndWatch(ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if cmd.Yield && !cmd.NoLock && applyID != "" {
 			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
@@ -515,18 +550,79 @@ func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*cl
 // A plan narrowed to one rollout member keeps its target in the retry command,
 // so following the advice re-runs the change on that member and not across the
 // whole rollout.
-func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string) error {
+//
+// JSON output prints neither the plan nor the warning, so the error itself
+// names each unsafe change and the command that permits them.
+func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string, output OutputFormat) error {
+	unsafeChanges := planResult.RolloutUnsafeChanges()
+	retry := fmt.Sprintf("apply -s %s -e %s", initShellArg(schemaDir), initShellArg(environment))
+	if target != "" {
+		retry += " --target " + initShellArg(target)
+	}
+	retry += " --allow-unsafe"
+	if output == OutputFormatJSON {
+		return errors.New(templates.UnsafeChangesBlockedSummary(unsafeChanges, retry))
+	}
+
 	// First show the plan so user can see what changes are proposed
 	OutputPlanResult(planResult, database, environment, schemaDir, true)
 	writeNarrowedTo(planResult)
 
 	// Then show the unsafe changes warning
-	unsafeChanges := planResult.UnsafeChanges()
-	retry := fmt.Sprintf("apply -s %s -e %s", schemaDir, environment)
-	if target != "" {
-		retry += " --target " + target
+	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry)
+	return ErrSilent
+}
+
+// rolloutAttentionSummary names each rollout member that needs attention with
+// the server's sanitized description of what it needs, on one line.
+func rolloutAttentionSummary(attention []*apitypes.PlanMemberAttentionResponse) string {
+	entries := make([]string, 0, len(attention))
+	for _, a := range attention {
+		entries = append(entries, fmt.Sprintf("%s (%s)", a.Member, a.Detail))
 	}
-	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry+" --allow-unsafe")
+	return strings.Join(entries, "; ")
+}
+
+// rolloutRefusalSummary names each refused rollout member with why, on one
+// line: the narrowed apply that runs it, or, for a change its engine refuses,
+// that no apply runs it.
+func rolloutRefusalSummary(refused []*apitypes.PlanMemberRefusalResponse, environment, schemaDir string) string {
+	entries := make([]string, 0, len(refused))
+	for _, r := range refused {
+		if r.Reason == apitypes.PlanMemberBlocked {
+			entries = append(entries, fmt.Sprintf("%s (%s; no apply runs it, so change the schema files)", r.Member, r.Detail))
+			continue
+		}
+		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s %s)", r.Member, r.Detail, cliname.Name(), narrowedApplyRerun(r, environment, schemaDir)))
+	}
+	return strings.Join(entries, "; ")
+}
+
+// narrowedApplyRerun is the apply narrowed to one refused member, without the
+// binary name. It names the member by the selector the server accepts, which
+// for a deployment with one target is its target rather than the deployment
+// name it is shown under.
+func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, schemaDir string) string {
+	rerun := fmt.Sprintf("apply -s %s -e %s --target %s", initShellArg(schemaDir), initShellArg(environment), initShellArg(r.Target))
+	if r.AllowUnsafe {
+		rerun += " --allow-unsafe"
+	}
+	return rerun
+}
+
+// blockRolloutApplyRefused displays the plan and refuses an apply of the
+// whole rollout that apply creation would refuse for the members the rollout
+// lists, naming the narrowed apply that runs each one.
+func blockRolloutApplyRefused(planResult *apitypes.PlanResponse, rollout *apitypes.PlanRolloutResponse, database, environment, schemaDir string) error {
+	OutputPlanResult(planResult, database, environment, schemaDir, true)
+	var reruns []string
+	for _, r := range rollout.Refused {
+		if r.Reason == apitypes.PlanMemberBlocked {
+			continue
+		}
+		reruns = append(reruns, narrowedApplyRerun(r, environment, schemaDir))
+	}
+	templates.WriteRolloutApplyRefused(templates.RolloutNoun(rollout), rollout.Refused, reruns)
 	return ErrSilent
 }
 

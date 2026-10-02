@@ -503,12 +503,14 @@ func TestEngine_ResolveRefusedMode_FailedRowCountBlocks(t *testing.T) {
 	_, err = db.ExecContext(t.Context(), "GRANT INSERT ON `testdb`.`direct_count_denied` TO '"+user+"'@'%'")
 	require.NoError(t, err, "grant insert on direct_count_denied")
 	// The kill that direct execution relies on reads performance_schema and
-	// innodb_trx; the grants keep the byte-bound control below from blocking
-	// on those instead.
+	// innodb_trx and ends other users' sessions; the grants keep the
+	// byte-bound control below from blocking on those instead.
 	_, err = db.ExecContext(t.Context(), "GRANT SELECT ON `performance_schema`.* TO '"+user+"'@'%'")
 	require.NoError(t, err, "grant select on performance_schema")
 	_, err = db.ExecContext(t.Context(), "GRANT PROCESS ON *.* TO '"+user+"'@'%'")
 	require.NoError(t, err, "grant process")
+	_, err = db.ExecContext(t.Context(), "GRANT CONNECTION_ADMIN ON *.* TO '"+user+"'@'%'")
+	require.NoError(t, err, "grant connection_admin")
 
 	host, _, _, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
@@ -902,10 +904,11 @@ func TestEngine_ExecuteAlterPhase_KillsMetadataLockBlocker(t *testing.T) {
 
 // A session holding an explicit LOCK TABLES is never killed: it is not a
 // transaction that rolls back, so killing it could interrupt work that
-// depends on the lock being held. The direct statement leaves it alone, each
-// bounded attempt times out, and the apply fails with the operator-actionable
-// busy-table error — naming the kind of blocker it will not kill and asking
-// for a retry — rather than the driver's own words. The lock holder keeps its
+// depends on the lock being held. The direct statement leaves it alone, stops
+// after the bounded attempt that met it, and the apply fails with the
+// operator-actionable busy-table error — naming the kinds of blocker it will
+// not or cannot kill and asking for a retry — rather than the driver's own
+// words. The lock holder keeps its
 // session and the target is untouched.
 func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
@@ -924,10 +927,10 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 
 	assert.Equal(t, engine.StateFailed, state)
 	assert.Contains(t, errorMessage, `Table "direct_locked" is busy`)
-	assert.Contains(t, errorMessage, fmt.Sprintf("Each attempt waits up to %ds, and SchemaBot makes up to %d attempts.", lockWaitSeconds, directMaxAttempts))
-	assert.Contains(t, errorMessage, "not a session holding an explicit LOCK TABLES")
-	assert.Contains(t, errorMessage, "unless its database user has PROCESS and CONNECTION_ADMIN",
-		"a kill that fails for lack of privilege lands on this same message, so it names that remedy too")
+	assert.Contains(t, errorMessage, fmt.Sprintf("Each attempt waits up to %ds, and SchemaBot makes up to %d attempts,", lockWaitSeconds, directMaxAttempts))
+	assert.Contains(t, errorMessage, "It stops after the first attempt that meets a session it will not or cannot kill: a session holding an explicit LOCK TABLES")
+	assert.Contains(t, errorMessage, "a session of a SYSTEM_USER account, which only a user that also has SYSTEM_USER may kill",
+		"a KILL the target denies lands on this same message, so it names the session no grant routing checks can end")
 	assert.Contains(t, errorMessage, "Retry when those sessions have finished")
 	assert.NotContains(t, errorMessage, "Lock wait timeout exceeded",
 		"the driver's own words are for the server log, not the pull request")
@@ -941,11 +944,11 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 }
 
 // A direct statement finds the sessions blocking it through
-// performance_schema. A target user that cannot read those tables would reach
-// apply time unable to kill anything, and the statement would queue on the
-// lock while table traffic stalls behind it. So the verdict fails closed to
-// blocked instead, and the reason says why without the database's own error
-// text.
+// performance_schema and innodb_trx, and kills them with CONNECTION_ADMIN. A
+// target user missing any of those grants would reach apply time unable to
+// kill anything, and the statement would queue on the lock while table traffic
+// stalls behind it. So the verdict fails closed to blocked instead, and the
+// reason names the grants without the database's own error text.
 func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	directReshapeTable(t, db, "direct_nokill")
@@ -970,16 +973,22 @@ func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
 			wantOutcome: "blocked_force_kill_unavailable",
 		},
 		{
-			// MySQL checks PROCESS for innodb_trx only when it fills the
-			// table, so a probe that can return no rows never asks for it.
 			name:        "no PROCESS",
 			grants:      []string{"SELECT ON performance_schema.*"},
 			wantMode:    engine.ExecutionModeBlocked,
 			wantOutcome: "blocked_force_kill_unavailable",
 		},
 		{
-			name:     "both grants",
-			grants:   []string{"SELECT ON performance_schema.*", "PROCESS ON *.*"},
+			// The table reads succeed, so only SHOW GRANTS reveals that the
+			// kill itself would be refused.
+			name:        "no CONNECTION_ADMIN",
+			grants:      []string{"SELECT ON performance_schema.*", "PROCESS ON *.*"},
+			wantMode:    engine.ExecutionModeBlocked,
+			wantOutcome: "blocked_force_kill_unavailable",
+		},
+		{
+			name:     "every grant",
+			grants:   []string{"SELECT ON performance_schema.*", "PROCESS ON *.*", "CONNECTION_ADMIN ON *.*"},
 			wantMode: engine.ExecutionModeDirect,
 		},
 	} {

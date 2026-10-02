@@ -57,10 +57,12 @@ func TestRolloutRunsMemberWork(t *testing.T) {
 	assert.False(t, rolloutRunsMemberWork(pending, diverged), "a diverged rollout renders no target plans")
 }
 
-// Confirming an apply covers the statements its comment showed. A member planned
-// again at confirm whose statements differ from the confirmed round's, by any
-// field an operator reads, is not covered.
-func TestSameMemberWork(t *testing.T) {
+// Confirming an apply covers the work its comment showed. A member planned
+// again at confirm whose work differs from the confirmed round's, by any field
+// an operator reads, is not covered, and the difference names the part of the
+// work that changed so the refusal never points the operator at statements
+// that did not.
+func TestMemberWorkDifference(t *testing.T) {
 	plan := func(mutate func(*storage.TableChange)) *storage.Plan {
 		change := storage.TableChange{
 			Namespace: "payments",
@@ -76,25 +78,50 @@ func TestSameMemberWork(t *testing.T) {
 		}}
 	}
 
-	assert.True(t, sameMemberWork(plan(nil), plan(nil)))
-	assert.False(t, sameMemberWork(plan(nil), plan(func(c *storage.TableChange) {
+	assert.Equal(t, workUnchanged, memberWorkDifference(plan(nil), plan(nil)))
+	assert.Equal(t, workStatements, memberWorkDifference(plan(nil), plan(func(c *storage.TableChange) {
 		c.DDL = "ALTER TABLE `orders` ADD COLUMN `region` varchar(32)"
 	})), "a different statement")
-	assert.False(t, sameMemberWork(plan(nil), plan(func(c *storage.TableChange) {
+	assert.Equal(t, workStatements, memberWorkDifference(plan(nil), plan(func(c *storage.TableChange) {
 		c.Table = "refunds"
 	})), "a different table")
-	assert.False(t, sameMemberWork(plan(nil), plan(func(c *storage.TableChange) {
+	assert.Equal(t, workExecutionMode, memberWorkDifference(plan(nil), plan(func(c *storage.TableChange) {
 		c.ExecutionMode = "direct"
-	})), "a different execution mode")
-	assert.False(t, sameMemberWork(plan(nil), &storage.Plan{}), "work the confirmed round did not plan")
+	})), "the same statement, now run as direct execution")
+	assert.Equal(t, workExecutionMode, memberWorkDifference(plan(func(c *storage.TableChange) {
+		c.ExecutionMode = "direct"
+	}), plan(func(c *storage.TableChange) {
+		c.ExecutionMode = "blocked"
+	})), "the same statement, now blocked")
+	assert.Equal(t, workStatements, memberWorkDifference(plan(nil), &storage.Plan{}), "work the confirmed round did not plan")
 
 	sharded := plan(nil)
 	sharded.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "payments", Changes: sharded.FlatDDLChanges()}}
-	assert.False(t, sameMemberWork(plan(nil), sharded), "a shard's own changes")
+	assert.Equal(t, workStatements, memberWorkDifference(plan(nil), sharded), "a shard's own changes")
+	directShard := plan(nil)
+	directShard.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "payments", Changes: directShard.FlatDDLChanges()}}
+	directShard.Shards[0].Changes[0].ExecutionMode = "direct"
+	assert.Equal(t, workExecutionMode, memberWorkDifference(sharded, directShard), "a shard's change that now runs as direct execution")
 
 	finalized := plan(nil)
 	finalized.Namespaces["payments"].Finalize = true
-	assert.False(t, sameMemberWork(plan(nil), finalized), "a finalizer")
+	assert.Equal(t, workFinalizer, memberWorkDifference(plan(nil), finalized), "a finalizer")
+
+	vschema := func(document, diff string) *storage.Plan {
+		p := plan(nil)
+		p.Namespaces["payments"].Artifacts = map[string]string{storage.VSchemaArtifactName: document}
+		p.Namespaces["payments"].Metadata = map[string]string{
+			storage.PlanMetadataVSchemaChanged: "true",
+			storage.PlanMetadataVSchemaDiff:    diff,
+		}
+		return p
+	}
+	const hashed = `{"vindexes":{"hash":{"type":"hash"}}}`
+	assert.Equal(t, workUnchanged, memberWorkDifference(vschema(hashed, "+ vindex hash"), vschema(hashed, "+ vindex hash")))
+	assert.Equal(t, workVSchema, memberWorkDifference(vschema(hashed, "+ vindex hash"), vschema(`{"vindexes":{"xxhash":{"type":"xxhash"}}}`, "+ vindex hash")),
+		"a different VSchema document in a namespace that changes its VSchema either way")
+	assert.Equal(t, workVSchema, memberWorkDifference(vschema(hashed, "+ vindex hash"), vschema(hashed, "- vindex lookup\n+ vindex hash")),
+		"the same document with a different recorded effect")
 }
 
 // A rollout member whose apply would discard an unfinished copy is named on the
@@ -203,15 +230,21 @@ func TestRoundCoversWork(t *testing.T) {
 
 	covered, reason = roundCoversWork(plan(region), plan(wider), members(region), members(region))
 	assert.False(t, covered)
-	assert.Equal(t, "the reviewed target would run statements the confirmed plan did not show", reason)
+	assert.Equal(t, "the re-plan of the reviewed target differs from the confirmed plan in its statements", reason)
 
 	covered, reason = roundCoversWork(&storage.Plan{}, plan(region), members(region), members(region))
 	assert.False(t, covered, "work on a reviewed target the confirmed plan showed as converged")
-	assert.Equal(t, "the reviewed target would run statements the confirmed plan did not show", reason)
+	assert.Equal(t, "the re-plan of the reviewed target differs from the confirmed plan in its statements", reason)
+
+	reviewedDirect := plan(region)
+	reviewedDirect.Namespaces["payments"].Tables[0].ExecutionMode = "direct"
+	covered, reason = roundCoversWork(plan(region), reviewedDirect, members(region), members(region))
+	assert.False(t, covered, "a reviewed-target statement that turned direct since the confirmed round is refused")
+	assert.Equal(t, "the re-plan of the reviewed target differs from the confirmed plan in how its statements run", reason)
 
 	covered, reason = roundCoversWork(plan(region), plan(region), members(region), members(wider))
 	assert.False(t, covered)
-	assert.Equal(t, "target eu/payments-002 would run statements the confirmed round did not plan", reason)
+	assert.Equal(t, "the plan of target eu/payments-002 differs from what the confirmed round planned, in its statements", reason)
 
 	// A target whose statement is unchanged but now runs as direct-execution
 	// DDL would run write-blocking native DDL the confirmed comment disclosed as
@@ -220,7 +253,7 @@ func TestRoundCoversWork(t *testing.T) {
 	nowDirect["eu/payments-002"].Namespaces["payments"].Tables[0].ExecutionMode = "direct"
 	covered, reason = roundCoversWork(plan(region), plan(region), members(region), nowDirect)
 	assert.False(t, covered, "a target that turned direct since the confirmed round is refused")
-	assert.Equal(t, "target eu/payments-002 would run statements the confirmed round did not plan", reason)
+	assert.Equal(t, "the plan of target eu/payments-002 differs from what the confirmed round planned, in how its statements run", reason)
 
 	covered, reason = roundCoversWork(plan(region), plan(region), map[string]*storage.Plan{}, members(region))
 	assert.False(t, covered)
@@ -236,4 +269,25 @@ func TestPendingRolloutMessageNamesTheTargetsThatNeedTheChange(t *testing.T) {
 	assert.Equal(t,
 		"2 of 2 targets need this change: eu, us. The plans of the targets other than the reviewed one were not on the comment this apply acts on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
 		pendingRolloutMessage(outcome, false))
+}
+
+// An apply-confirm refused because a plan changed after the confirmation tells
+// the operator which target's plan changed. When it is the reviewed target's own
+// re-plan, the message says so rather than blaming the other targets' plans.
+func TestUnconfirmedWorkMessageNamesTheTargetWhosePlanChanged(t *testing.T) {
+	plan := func(ddl string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {Tables: []storage.TableChange{{Namespace: "payments", Table: "orders", Operation: "alter", DDL: ddl}}},
+		}}
+	}
+	confirmed := plan("ALTER TABLE `orders` MODIFY COLUMN `region` varchar(255)")
+	unchanged := map[string]*storage.Plan{"us/payments-002": plan("ALTER TABLE `orders` ADD COLUMN `region` varchar(32)")}
+
+	covered, reason := roundCoversWork(confirmed, plan("ALTER TABLE `orders` MODIFY COLUMN `region` varchar(32)"), unchanged, unchanged)
+	require.False(t, covered)
+	message := unconfirmedWorkMessage(memberWork{pending: 2, members: 2, names: []string{"eu/payments-001", "us/payments-002"}}, reason)
+	assert.Equal(t,
+		"2 of 2 targets need this change: eu/payments-001, us/payments-002. This confirmation no longer covers what the apply would run: the re-plan of the reviewed target differs from the confirmed plan in its statements, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+		message)
+	assert.NotContains(t, message, "other than the reviewed one")
 }

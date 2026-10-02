@@ -149,18 +149,18 @@ func memberWorkReviewedPlanCannotRun(reviewed, member *storage.Plan, reviewedTar
 }
 
 // annotateMemberApplyRefusal records on a plan comment why a PR apply cannot
-// run the other targets' plans it renders, when its reviewed target is already
-// at the desired schema. Such an apply is refused whatever its flags, so the
+// run the other targets' plans it renders, whether or not the reviewed target
+// has work of its own. Such an apply is refused whatever its flags, so the
 // comment must not offer it. A refusal that cannot be computed leaves the apply
 // offered: the apply asks again before it pauses and refuses on the same
 // grounds, so the comment only ever misses a shortcut, never a gate.
 func (h *Handler) annotateMemberApplyRefusal(ctx context.Context, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, repo string, pr int) {
-	if planResp.HasChanges() || !rolloutRunsMemberWork(rollout, data.DeploymentDrift) {
-		h.logger.Debug("plan comment renders no other targets' plans for a converged reviewed target; no member-work refusal to disclose",
+	if !rolloutRunsMemberWork(rollout, data.DeploymentDrift) {
+		h.logger.Debug("plan comment renders no other targets' plans a PR apply would run; no member-work refusal to disclose",
 			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID)
 		return
 	}
-	refusal, err := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, true)
+	refusal, err := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, !planResp.HasChanges())
 	if err != nil {
 		h.logger.Warn("could not tell whether a PR apply can run the other targets' plans; the plan comment offers the apply, which re-checks before it pauses",
 			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -248,6 +248,20 @@ func pendingRolloutMessage(outcome reviewDriftOutcome, reviewedTargetConverged b
 	}
 }
 
+// unconfirmedWorkMessage tells the operator why an apply-confirm did not run:
+// what the rollout would run now is not what the confirmation was given
+// against. reason names only targets, and says whether it is the reviewed
+// target or another one whose plan changed. The rollout's pending summary leads,
+// so the operator sees which targets still need the change, as on every other
+// refusal of a pending rollout.
+func unconfirmedWorkMessage(work memberWork, reason string) string {
+	message := fmt.Sprintf("This confirmation no longer covers what the apply would run: %s, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.", reason)
+	if work.members > 1 && work.pending > 0 {
+		return fmt.Sprintf("%s: %s. %s", work.summary(), strings.Join(work.names, ", "), message)
+	}
+	return message
+}
+
 // confirmationCoversMemberWork reports whether the pending confirmation an
 // apply-confirm acts on was given against the member work it is about to run,
 // with a reason for the log when it was not.
@@ -261,9 +275,9 @@ func pendingRolloutMessage(outcome reviewDriftOutcome, reviewedTargetConverged b
 //
 // The targets are planned again at confirm, and a target's schema can change in
 // between. So the reviewed target, when it still has work, and each member with
-// work now must have been planned with the same statements in the confirmed
-// round, and a statement the confirmed comment did not show never runs on the
-// strength of that confirmation.
+// work now must have been planned with the same work in the confirmed round,
+// and work the confirmed comment did not show never runs on the strength of
+// that confirmation.
 func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID, currentPlanID, environment string) (bool, string, error) {
 	plans := h.service.Storage().Plans()
 	pinned, err := plans.Get(ctx, pinnedPlanID)
@@ -292,12 +306,15 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	return covered, reason, nil
 }
 
-// roundCoversWork reports whether the confirm-time round runs only statements
-// the confirmed round planned, with a reason for the log when it does not. A
-// target with no work now runs nothing, so only targets with work are compared.
+// roundCoversWork reports whether the confirm-time round runs only work the
+// confirmed round planned, with a reason naming the target and the part of its
+// work that differs when it does not. A target with no work now runs nothing,
+// so only targets with work are compared.
 func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*storage.Plan) (bool, string) {
-	if current.HasWork() && !sameMemberWork(pinned, current) {
-		return false, "the reviewed target would run statements the confirmed plan did not show"
+	if current.HasWork() {
+		if difference := memberWorkDifference(pinned, current); difference != workUnchanged {
+			return false, reviewedTargetDifferenceReason(difference)
+		}
 	}
 	for _, member := range slices.Sorted(maps.Keys(now)) {
 		plan := now[member]
@@ -308,11 +325,18 @@ func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*s
 		if !ok {
 			return false, fmt.Sprintf("target %s has work the confirmed round did not plan", member)
 		}
-		if !sameMemberWork(was, plan) {
-			return false, fmt.Sprintf("target %s would run statements the confirmed round did not plan", member)
+		if difference := memberWorkDifference(was, plan); difference != workUnchanged {
+			return false, fmt.Sprintf("the plan of target %s differs from what the confirmed round planned, in %s", member, difference)
 		}
 	}
 	return true, ""
+}
+
+// reviewedTargetDifferenceReason is the refusal reason for a reviewed target
+// whose confirm-time re-plan differs from the plan the confirmation was given
+// against, naming the part of its work that differs.
+func reviewedTargetDifferenceReason(difference workDifference) string {
+	return fmt.Sprintf("the re-plan of the reviewed target differs from the confirmed plan in %s", difference)
 }
 
 // confirmedConvergedTargetRound reports whether the pending confirmation an
@@ -350,22 +374,113 @@ func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanI
 	return false, nil
 }
 
-// sameMemberWork reports whether two plans for one member run the same
-// statements. It compares what the operator reads on the comment, the table
-// changes and each shard's own changes, byte for byte: a difference in spelling
-// alone refuses too, which only ever sends the operator back to review.
-func sameMemberWork(a, b *storage.Plan) bool {
-	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameTableChange) {
-		return false
+// confirmationCoversReviewedTarget reports how the reviewed target's
+// confirm-time re-plan, stored as currentPlanID, differs from the plan the
+// pending confirmation was given against, when that confirmation was given on a
+// rollout's comment. workUnchanged means the confirmation covers the re-plan.
+//
+// Whether it was is read from the confirmed round as well as from the rollout
+// at confirm: rolloutAtConfirm says the environment still has several targets,
+// and a confirmed round that stored plans for other targets was a rollout's
+// even when the topology has since shrunk to the reviewed target alone. A
+// confirmation that neither marks as a rollout's was given for a single target,
+// whose re-plan runs under the single-target gates. A pinned or confirm-time
+// plan that no longer loads is an error: what the comment showed, or what the
+// apply would run, cannot be told.
+func (h *Handler) confirmationCoversReviewedTarget(ctx context.Context, pinnedPlanID, currentPlanID, environment string, rolloutAtConfirm bool) (workDifference, error) {
+	plans := h.service.Storage().Plans()
+	pinned, err := plans.Get(ctx, pinnedPlanID)
+	if err != nil {
+		return workUnchanged, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
+	}
+	if pinned == nil {
+		return workUnchanged, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
+	}
+	if !rolloutAtConfirm {
+		confirmedRound, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
+		if err != nil {
+			return workUnchanged, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
+		}
+		if len(confirmedRound) == 0 {
+			h.logger.Debug("apply-confirm: the confirmed plan was reviewed for a single target, so its re-plan runs under the single-target gates",
+				"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID)
+			return workUnchanged, nil
+		}
+		h.logger.Info("apply-confirm: the confirmed round planned other targets that the rollout no longer has; comparing the reviewed target's re-plan with the confirmed plan",
+			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID, "confirmed_member_plans", len(confirmedRound))
+	}
+	current, err := plans.Get(ctx, currentPlanID)
+	if err != nil {
+		return workUnchanged, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
+	}
+	if current == nil {
+		return workUnchanged, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
+	}
+	return memberWorkDifference(pinned, current), nil
+}
+
+// workDifference names the part of a target's work in which two plans for it
+// differ, in words a refusal shows the operator after "differs ... in". The
+// zero value, workUnchanged, means the plans run the same work.
+type workDifference string
+
+const (
+	workUnchanged     workDifference = ""
+	workStatements    workDifference = "its statements"
+	workExecutionMode workDifference = "how its statements run"
+	workFinalizer     workDifference = "which namespaces it finalizes"
+	workVSchema       workDifference = "the VSchema it writes"
+)
+
+// memberWorkDifference reports the first part of the work in which two plans
+// for one target differ, or workUnchanged when they run the same work. It
+// compares everything an apply created from the plan executes and the comment
+// shows: the table changes and each shard's own changes, byte for byte, then
+// how each of those statements runs, then which namespaces end with a
+// finalizer, and the VSchema each of those writes with the record of what that
+// VSchema change does. A difference in spelling alone refuses too, which only
+// ever sends the operator back to review.
+func memberWorkDifference(a, b *storage.Plan) workDifference {
+	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameStatement) || !sameShardChanges(a.Shards, b.Shards, sameStatement) {
+		return workStatements
+	}
+	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameTableChange) || !sameShardChanges(a.Shards, b.Shards, sameTableChange) {
+		return workExecutionMode
 	}
 	if !slices.Equal(a.FinalizerNamespaces(), b.FinalizerNamespaces()) {
-		return false
+		return workFinalizer
 	}
-	return slices.EqualFunc(a.Shards, b.Shards, func(x, y storage.ShardPlan) bool {
-		return x.Namespace == y.Namespace && x.Shard == y.Shard && slices.EqualFunc(x.Changes, y.Changes, sameTableChange)
+	for _, namespace := range a.FinalizerNamespaces() {
+		if !sameVSchemaChange(a.Namespaces[namespace], b.Namespaces[namespace]) {
+			return workVSchema
+		}
+	}
+	return workUnchanged
+}
+
+// sameShardChanges reports whether two plans' per-shard changes target the
+// same shards with changes that same reports equal.
+func sameShardChanges(a, b []storage.ShardPlan, same func(x, y storage.TableChange) bool) bool {
+	return slices.EqualFunc(a, b, func(x, y storage.ShardPlan) bool {
+		return x.Namespace == y.Namespace && x.Shard == y.Shard && slices.EqualFunc(x.Changes, y.Changes, same)
 	})
 }
 
+// sameVSchemaChange reports whether two plans of one namespace write the same
+// VSchema with the same recorded effect: the document the finalizer applies,
+// and the diff, removals and vindex mutations the comment rendered from it.
+func sameVSchemaChange(a, b *storage.NamespacePlanData) bool {
+	return a.Artifacts[storage.VSchemaArtifactName] == b.Artifacts[storage.VSchemaArtifactName] && maps.Equal(a.Metadata, b.Metadata)
+}
+
+// sameStatement reports whether two table changes run the same statement on
+// the same table, however each is executed.
+func sameStatement(a, b storage.TableChange) bool {
+	return a.Namespace == b.Namespace && a.Table == b.Table && a.Operation == b.Operation && a.DDL == b.DDL
+}
+
+// sameTableChange reports whether two table changes run the same statement the
+// same way.
 func sameTableChange(a, b storage.TableChange) bool {
-	return a.Namespace == b.Namespace && a.Table == b.Table && a.Operation == b.Operation && a.DDL == b.DDL && a.ExecutionMode == b.ExecutionMode
+	return sameStatement(a, b) && a.ExecutionMode == b.ExecutionMode
 }

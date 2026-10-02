@@ -50,10 +50,10 @@ func TestPlannedDestructiveTables_CollectsUnsafeAlters(t *testing.T) {
 		"an additive alter stays out; a destructive one is attributed by its table")
 }
 
-// The unsafe gate reads only the namespace-level changes: a destructive change
-// visible only on an individual shard is outside it, so applying never
-// solicits --allow-unsafe consent for that table.
-func TestUnsafeGateTables_OmitsShardOnlyDestruction(t *testing.T) {
+// The --allow-unsafe gate and the attribution read the same set: a drop
+// confined to one divergent shard is a table the gate solicits consent for,
+// so no attributed destruction reaches an automatic apply unconsented.
+func TestUnsafeGateCoversEveryAttributedTable(t *testing.T) {
 	planResp := &apitypes.PlanResponse{
 		Changes: []*apitypes.SchemaChangeResponse{{
 			Namespace: "keyspace",
@@ -72,11 +72,13 @@ func TestUnsafeGateTables_OmitsShardOnlyDestruction(t *testing.T) {
 		}},
 	}
 
-	gated := unsafeGateTables(planResp)
+	gated := make([]string, 0)
+	for _, unsafe := range planResp.UnsafeChanges() {
+		gated = append(gated, unsafe.Table)
+	}
 
-	assert.Contains(t, gated, "orders", "a namespace-level drop passes through the opt-in gate")
-	assert.NotContains(t, gated, "audit_log", "a shard-only drop never solicits consent")
-	assert.NotContains(t, gated, "users", "an additive alter is not gated at all")
+	assert.ElementsMatch(t, plannedDestructiveTables(planResp), gated,
+		"a shard-only drop solicits consent, an additive alter is not gated at all")
 }
 
 func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
@@ -172,37 +174,6 @@ func TestRenderPlanComment_LockedApplyCommentOmitsAttributedChanges(t *testing.T
 
 	assert.Contains(t, planRendered, "⚠️ **Check before applying**")
 	assert.Contains(t, planRendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
-}
-
-// A destructive change confined to individual shards never passes through the
-// --allow-unsafe opt-in gate, so consent for it was never solicited: the
-// locked auto-apply comment keeps the disclosure — it is the operator's only
-// notice of that destruction.
-func TestRenderPlanComment_LockedApplyCommentKeepsUngatedAttributedChange(t *testing.T) {
-	data := templates.PlanCommentData{
-		Database:    "testdb",
-		Environment: "staging",
-		IsMySQL:     true,
-		Changes: []templates.KeyspaceChangeData{{
-			Keyspace:   "testdb",
-			Statements: []string{"ALTER TABLE `drinks` DROP COLUMN `test`"},
-		}},
-		AttributedChanges: []templates.AttributedChangeData{{
-			Table:             "drinks",
-			Repository:        "block/schemabot",
-			PullRequest:       42,
-			OutsideUnsafeGate: true,
-		}},
-		IsLocked:     true,
-		LockOwner:    "block/schemabot#7",
-		LockAcquired: "2026-08-22 00:13:52 UTC",
-	}
-
-	rendered := templates.RenderPlanComment(data)
-
-	assert.Contains(t, rendered, "🔒 **Lock acquired by**")
-	assert.Contains(t, rendered, "⚠️ **Check before applying**")
-	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 }
 
 // A locked comment downgraded to manual confirmation pauses for apply-confirm,

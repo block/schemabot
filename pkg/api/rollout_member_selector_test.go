@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -537,49 +538,59 @@ func TestPlanHandler_RefusesAnUnknownTargetAsAnInvalidRequest(t *testing.T) {
 	assert.Nil(t, mockClient.planReq)
 }
 
-// A rollout-wide apply ran its plan from payments-001, then the targets list
-// was reordered so payments-002 is first. The rollback is planned against
-// payments-001, and the rollout now runs only from payments-002's plan, so the
-// rollback could reach the rollout only by reverting payments-001 alone. It is
-// refused before planning, with the order the apply ran under as the remedy
-// rather than a target to revert by itself. In the order the apply ran under,
-// the rollback is planned against payments-001 as before.
-func TestExecuteRollbackPlan_RefusedAfterTheRolloutPrimaryMoved(t *testing.T) {
+// rollbackSourceApply is a completed rollout-wide apply of payments whose
+// source plan was made against payments-001 on deployment, with the schema
+// files a rollback restores.
+func rollbackSourceApply(deployment string) (*storage.Plan, *storage.Apply) {
 	source := memberPlan("payments-001")
+	source.Deployment = deployment
 	source.Namespaces["payments"].OriginalFiles = map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}
 	source.Namespaces["payments"].OriginalFilesCaptured = true
-	apply := &storage.Apply{
+	return source, &storage.Apply{
 		ApplyIdentifier: "apply-rollout",
 		PlanID:          source.ID,
 		Database:        "payments",
 		DatabaseType:    storage.DatabaseTypeMySQL,
 		Environment:     "production",
-		Deployment:      DefaultDeployment,
+		Deployment:      deployment,
 		State:           state.Apply.Completed,
 	}
+}
+
+// A rollout-wide apply of two mirrored deployments ran its plan from eu, then
+// deployment_order was changed so us is first. The rollback is planned against
+// eu, and the rollout now runs only from us's plan, so the rollback could reach
+// the rollout only by reverting eu alone. It is refused before planning, with
+// the order the apply ran under as the remedy rather than a deployment to
+// revert by itself. In the order the apply ran under, the rollback is planned
+// against eu as before.
+func TestExecuteRollbackPlan_RefusedAfterTheRolloutPrimaryMoved(t *testing.T) {
+	source, apply := rollbackSourceApply("eu")
 	cases := []struct {
 		name    string
-		targets []string
+		order   []string
 		wantErr string
 	}{
 		{
-			name:    "reordered",
-			targets: []string{"payments-002", "payments-001", "payments-003"},
-			wantErr: "apply apply-rollout ran across the rollout from rollout primary " + DefaultDeployment + "/payments-001, but the rollout primary is now " + DefaultDeployment + "/payments-002; " +
-				"a rollback made against " + DefaultDeployment + "/payments-001 cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. " +
-				"Restore the rollout order the apply ran under (deployment_order, or the order of the targets list) so " + DefaultDeployment + "/payments-001 is first, then retry the rollback",
+			name:  "reordered",
+			order: []string{"us", "eu"},
+			wantErr: "apply apply-rollout ran across the rollout from rollout primary eu/payments-001, but the rollout primary is now us/payments-001; " +
+				"a rollback made against eu/payments-001 cannot be applied to the rollout, and applying it to that target alone would leave the others on the applied schema. " +
+				"Restore the rollout order the apply ran under (deployment_order) so eu/payments-001 is first, then retry the rollback",
 		},
-		{name: "in the order the apply ran under", targets: []string{"payments-001", "payments-002", "payments-003"}},
+		{name: "in the order the apply ran under", order: []string{"eu", "us"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := narrowingServerConfig()
-			env := cfg.Databases["payments"].Environments["production"]
-			env.Targets = targetNames(tc.targets...)
-			cfg.Databases["payments"].Environments["production"] = env
+			cfg.Databases["payments"].Environments["production"] = EnvironmentConfig{
+				Deployments:     map[string]DeploymentTarget{"eu": {Target: "payments-001"}, "us": {Target: "payments-001"}},
+				DeploymentOrder: tc.order,
+			}
 			mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-rollback"}}
 			svc := New(&mockStorageWithPlanLookup{plans: &rollbackSourcePlanStore{source: source}}, cfg, map[string]tern.Client{
-				DefaultDeployment + "/production": mockClient,
+				"eu/production": mockClient,
+				"us/production": &mockTernClient{isRemote: true},
 			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 			_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
@@ -593,6 +604,118 @@ func TestExecuteRollbackPlan_RefusedAfterTheRolloutPrimaryMoved(t *testing.T) {
 			assert.Equal(t, tc.wantErr, err.Error())
 			assert.Equal(t, http.StatusConflict, controlOperationHTTPStatus(err))
 			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback that cannot reach the rollout")
+		})
+	}
+}
+
+// rollbackRoundPlanStore is rollbackSourcePlanStore with the member plans the
+// source plan's review round stored, served to List by the round they are
+// bound to.
+type rollbackRoundPlanStore struct {
+	rollbackSourcePlanStore
+	round   []*storage.Plan
+	listErr error
+}
+
+func (s *rollbackRoundPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	var matched []*storage.Plan
+	for _, plan := range s.round {
+		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
+			matched = append(matched, plan)
+		}
+	}
+	return matched, nil
+}
+
+// A rollout-wide apply ran across payments-001, 002 and 003, each planned
+// against its own schema, so its review round stored a plan for 002 and 003. A
+// rollback is one plan made against payments-001, and no member of such a
+// rollout runs another member's plan, so the rollback is refused before
+// anything is planned, naming the narrowed applies that do restore each
+// target. The round decides, whatever the configuration says now: the refusal
+// holds after the environment is respelled as mirrored deployments, or cut to
+// payments-001 alone, either of which would otherwise run payments-001's
+// rollback DDL on a target it was never planned for, or revert payments-001
+// and leave the others on the applied schema. A round that cannot be read
+// refuses the rollback. An apply whose round planned no target on its own ran
+// one plan everywhere, and rolls back unless the environment has since been
+// respelled as targets planned on their own, which apply creation could not
+// pair with one plan either. A single-target environment rolls back as before.
+func TestExecuteRollbackPlan_RefusedForARolloutOfIndependentlyPlannedTargets(t *testing.T) {
+	source, apply := rollbackSourceApply(DefaultDeployment)
+	roundMember := func(target string) *storage.Plan {
+		plan := memberPlan(target)
+		plan.PrimaryPlanIdentifier = source.PlanIdentifier
+		return plan
+	}
+	independentRound := []*storage.Plan{roundMember("payments-002"), roundMember("payments-003")}
+	targetsEnv := func(targets ...string) EnvironmentConfig {
+		return EnvironmentConfig{Deployment: DefaultDeployment, Targets: targetNames(targets...)}
+	}
+	const plannedOnTheirOwn = "apply apply-rollout ran across the 3 targets of payments/production, which were each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
+		"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target"
+	cases := []struct {
+		name     string
+		env      EnvironmentConfig
+		round    []*storage.Plan
+		listErr  error
+		wantErr  string
+		wantCode int
+	}{
+		{
+			name: "three targets planned on their own", env: targetsEnv("payments-001", "payments-002", "payments-003"),
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
+		},
+		{
+			name: "three targets planned on their own, since respelled as mirrored deployments",
+			env: EnvironmentConfig{
+				Deployments:     map[string]DeploymentTarget{DefaultDeployment: {Target: "payments-001"}, "us": {Target: "payments-002"}},
+				DeploymentOrder: []string{DefaultDeployment, "us"},
+			},
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
+		},
+		{
+			name: "three targets planned on their own, since cut to the primary", env: targetsEnv("payments-001"),
+			round: independentRound, wantErr: plannedOnTheirOwn, wantCode: http.StatusConflict,
+		},
+		{
+			name: "one plan across the rollout, since respelled as targets planned on their own", env: targetsEnv("payments-001", "payments-002"),
+			wantErr: "apply apply-rollout ran one plan across payments/production, whose 2 targets are now each planned against their own schema, and a rollback is one plan made against " + DefaultDeployment + "/payments-001; " +
+				"rollback of such a rollout is not supported, so restore each target by planning and applying the previous schema with its target",
+			wantCode: http.StatusConflict,
+		},
+		{
+			name: "review round unreadable", env: targetsEnv("payments-001"), listErr: errors.New("connection refused"),
+			wantErr:  "rollback of apply apply-rollout: read the review round of its plan plan-payments-001: list member plans for payments/production round plan-payments-001: connection refused",
+			wantCode: http.StatusInternalServerError,
+		},
+		{name: "one target", env: targetsEnv("payments-001")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := narrowingServerConfig()
+			cfg.Databases["payments"].Environments["production"] = tc.env
+			mockClient := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-rollback"}}
+			plans := &rollbackRoundPlanStore{rollbackSourcePlanStore: rollbackSourcePlanStore{source: source}, round: tc.round, listErr: tc.listErr}
+			svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+				DefaultDeployment + "/production": mockClient,
+				"us/production":                   &mockTernClient{isRemote: true},
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				require.NotNil(t, mockClient.planReq)
+				assert.Equal(t, "payments-001", mockClient.planReq.Target)
+				return
+			}
+			require.Error(t, err)
+			assert.Equal(t, tc.wantErr, err.Error())
+			assert.Equal(t, tc.wantCode, controlOperationHTTPStatus(err))
+			assert.Nil(t, mockClient.planReq, "nothing is planned for a rollback no member could run")
 		})
 	}
 }
@@ -620,22 +743,25 @@ func (c *memberDiffClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) 
 	return &ternv1.PlanDiffResponse{Engine: ternv1.Engine_ENGINE_SPIRIT}, nil
 }
 
-// A plan of the whole rollout is made against its primary. When the primary
-// is at the desired schema, the other members are diffed against their own
-// live schemas: the plan is up to date only when every one of them is too, so
-// a converged rollout (onboarding's verification, a re-run of an apply that
-// already landed) reads as up to date. A member that still needs the change,
-// for example after an apply narrowed to the primary landed it there alone, or
-// a member that could not be diffed, turns the plan into an error naming that
-// member. A plan with changes, a narrowed plan, and a plan of a single-target
-// environment are returned as they are, without diffing anyone else.
+// A plan of the whole rollout is made against its primary, and every other
+// member is planned beside it against its own live schema, each once. The
+// rollout reads as up to date only when every member is, so a converged
+// rollout (onboarding's verification, a re-run of an apply that already
+// landed) reads as up to date. When the primary is already at the desired
+// schema, a member that still needs the change, for example after an apply
+// narrowed to the primary landed it there alone, is reported as the rollout's
+// work under its own group, and a member that could not be diffed is listed
+// for attention, which an apply refuses on. Neither fails the plan. A narrowed
+// plan and a plan of a single-target environment are the primary's plan alone
+// and diff no one else.
 func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.T) {
-	withChanges := &ternv1.PlanResponse{PlanId: "plan-changes", Changes: []*ternv1.SchemaChange{{
+	withChanges := &ternv1.PlanResponse{PlanId: "plan-changes", Engine: ternv1.Engine_ENGINE_SPIRIT, Changes: []*ternv1.SchemaChange{{
 		Namespace: "payments",
 		TableChanges: []*ternv1.TableChange{{
 			TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `region` varchar(16)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
 		}},
 	}}}
+	converged := &ternv1.PlanResponse{PlanId: "plan-converged", Engine: ternv1.Engine_ENGINE_SPIRIT}
 	cases := []struct {
 		name       string
 		config     *ServerConfig
@@ -645,36 +771,55 @@ func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.
 		diffs      map[string]*ternv1.PlanDiffResponse
 		diffErrs   map[string]error
 		wantDiffed []string
-		wantErrors []string
+		// wantMembers is the rollout's member count, or 0 when the plan
+		// carries no rollout.
+		wantMembers        int
+		wantPrimaryChanges bool
+		wantRolloutChanges bool
+		// wantChanging are the members of every group with changes.
+		wantChanging  []string
+		wantUnplanned []string
 	}{
 		{
-			name:       "rollout-wide plan with every member converged",
-			config:     narrowingServerConfig(),
-			database:   "payments",
-			planResp:   &ternv1.PlanResponse{PlanId: "plan-converged"},
-			wantDiffed: []string{"payments-002", "payments-003"},
+			name:        "rollout-wide plan with every member converged",
+			config:      narrowingServerConfig(),
+			database:    "payments",
+			planResp:    converged,
+			wantDiffed:  []string{"payments-002", "payments-003"},
+			wantMembers: 3,
 		},
 		{
-			name:       "rollout-wide plan with a converged primary and a member that still needs the change",
-			config:     narrowingServerConfig(),
-			database:   "payments",
-			planResp:   &ternv1.PlanResponse{PlanId: "plan-converged"},
-			diffs:      map[string]*ternv1.PlanDiffResponse{"payments-003": alterUsersDiff("ALTER TABLE `users` ADD COLUMN `region` varchar(16)")},
-			wantDiffed: []string{"payments-002", "payments-003"},
-			wantErrors: []string{"rollout primary " + DefaultDeployment + "/payments-001 is at the desired schema, but 1 other rollout members still need changes: payments-003. " +
-				"The rollout is not up to date; plan and apply each of them with its target"},
+			name:               "rollout-wide plan with a converged primary and a member that still needs the change",
+			config:             narrowingServerConfig(),
+			database:           "payments",
+			planResp:           converged,
+			diffs:              map[string]*ternv1.PlanDiffResponse{"payments-003": alterUsersDiff("ALTER TABLE `users` ADD COLUMN `region` varchar(16)")},
+			wantDiffed:         []string{"payments-002", "payments-003"},
+			wantMembers:        3,
+			wantRolloutChanges: true,
+			wantChanging:       []string{DefaultDeployment + "/payments-003"},
 		},
 		{
-			name:       "rollout-wide plan with a converged primary and a member that could not be diffed",
-			config:     narrowingServerConfig(),
-			database:   "payments",
-			planResp:   &ternv1.PlanResponse{PlanId: "plan-converged"},
-			diffErrs:   map[string]error{"payments-002": errors.New("dial tcp 10.0.0.7:3306: connection refused")},
-			wantDiffed: []string{"payments-002", "payments-003"},
-			wantErrors: []string{"rollout primary " + DefaultDeployment + "/payments-001 is at the desired schema, but 1 other rollout members could not be planned: payments-002. " +
-				"The rollout is not reported as up to date until each of them is planned; see the server logs for why"},
+			name:          "rollout-wide plan with a converged primary and a member that could not be diffed",
+			config:        narrowingServerConfig(),
+			database:      "payments",
+			planResp:      converged,
+			diffErrs:      map[string]error{"payments-002": errors.New("dial tcp 10.0.0.7:3306: connection refused")},
+			wantDiffed:    []string{"payments-002", "payments-003"},
+			wantMembers:   3,
+			wantUnplanned: []string{DefaultDeployment + "/payments-002"},
 		},
-		{name: "rollout-wide plan with changes", config: narrowingServerConfig(), database: "payments", planResp: withChanges},
+		{
+			name:               "rollout-wide plan with changes",
+			config:             narrowingServerConfig(),
+			database:           "payments",
+			planResp:           withChanges,
+			wantDiffed:         []string{"payments-002", "payments-003"},
+			wantMembers:        3,
+			wantPrimaryChanges: true,
+			wantRolloutChanges: true,
+			wantChanging:       []string{DefaultDeployment + "/payments-001"},
+		},
 		{name: "narrowed plan with no changes", config: narrowingServerConfig(), database: "payments", target: "payments-001", planResp: &ternv1.PlanResponse{PlanId: "plan-narrowed"}},
 		{name: "single-target environment", config: singleTargetServerConfig(), database: "orders", planResp: &ternv1.PlanResponse{PlanId: "plan-orders"}},
 	}
@@ -685,28 +830,49 @@ func TestPlanHandler_ConvergedPrimaryIsUpToDateOnlyWhenEveryMemberIs(t *testing.
 				diffs:          tc.diffs,
 				diffErrs:       tc.diffErrs,
 			}
-			svc := New(&mockStorageWithPlanLookup{plans: &capturingPlanStore{}}, tc.config, map[string]tern.Client{
+			svc := New(&mockStorageWithPlanLookup{plans: &recordingPlanStore{}}, tc.config, map[string]tern.Client{
 				DefaultDeployment + "/production": client,
 			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 			body, err := json.Marshal(apitypes.PlanRequest{
 				Database: tc.database, Environment: "production", Type: storage.DatabaseTypeMySQL, Target: tc.target,
-				SchemaFiles: map[string]*apitypes.SchemaFiles{tc.database: {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}}},
+				SchemaFiles:    map[string]*apitypes.SchemaFiles{tc.database: {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}}},
+				RendersRollout: true,
 			})
 			require.NoError(t, err)
 			w := serveNarrowing(t, svc, "/api/plan", string(body))
 			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 			var resp apitypes.PlanResponse
 			require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
-			if tc.wantErrors == nil {
-				assert.Empty(t, resp.Errors)
-			} else {
-				assert.Equal(t, tc.wantErrors, resp.Errors)
-			}
+			assert.Empty(t, resp.Errors, "a member's state is reported in the rollout, never as a plan error")
+			assert.Equal(t, tc.wantPrimaryChanges, resp.HasChanges(), "the primary's own plan")
 			assert.NotContains(t, w.Body.String(), "10.0.0.7", "a member's diff error stays in the server logs")
 			client.mu.Lock()
-			defer client.mu.Unlock()
-			assert.ElementsMatch(t, tc.wantDiffed, client.diffed, "only the members other than the primary are diffed, and only when the primary is converged")
+			diffed := slices.Clone(client.diffed)
+			client.mu.Unlock()
+			slices.Sort(diffed)
+			assert.Equal(t, tc.wantDiffed, diffed, "each member other than the primary is diffed once, and no one for a narrowed or single-target plan")
+
+			if tc.wantMembers == 0 {
+				assert.Nil(t, resp.Rollout, "a narrowed or single-target plan has no other member to plan")
+				return
+			}
+			require.NotNil(t, resp.Rollout)
+			assert.Equal(t, tc.wantMembers, resp.Rollout.Members)
+			assert.Equal(t, tc.wantRolloutChanges, resp.RolloutHasChanges(), "the rollout's work is read from every member's plan")
+			var changing []string
+			for i, plan := range resp.MemberPlans() {
+				if plan.HasChanges() {
+					changing = append(changing, resp.Rollout.Groups[i].Members...)
+				}
+			}
+			assert.Equal(t, tc.wantChanging, changing)
+			var unplanned []string
+			for _, a := range resp.Rollout.Attention {
+				assert.Equal(t, apitypes.PlanMemberUnplanned, a.Reason, "member %s", a.Member)
+				unplanned = append(unplanned, a.Member)
+			}
+			assert.Equal(t, tc.wantUnplanned, unplanned)
 		})
 	}
 }

@@ -22,8 +22,11 @@ type cutoverTurnMember struct {
 	target       string
 	operationKey string
 	remoteID     string
-	opState      string
-	taskState    string
+	// remoteOperationID is the remote operation a dispatch returned for a
+	// target that shares its deployment's remote apply with sibling targets.
+	remoteOperationID string
+	opState           string
+	taskState         string
 }
 
 // seedCutoverTurnApply stores a running multi-operation apply started with
@@ -57,15 +60,16 @@ func seedCutoverTurnApply(t *testing.T, stor storage.Storage, identifier, cutove
 		}
 		groups = append(groups, &storage.ApplyOperationWithTasks{
 			Operation: &storage.ApplyOperation{
-				Deployment:    m.deployment,
-				OperationKey:  m.operationKey,
-				Target:        target,
-				ExternalID:    m.remoteID,
-				State:         m.opState,
-				CutoverPolicy: cutoverPolicy,
-				OnFailure:     storage.OnFailureHalt,
-				CreatedAt:     now,
-				UpdatedAt:     now,
+				Deployment:          m.deployment,
+				OperationKey:        m.operationKey,
+				Target:              target,
+				ExternalID:          m.remoteID,
+				ExternalOperationID: m.remoteOperationID,
+				State:               m.opState,
+				CutoverPolicy:       cutoverPolicy,
+				OnFailure:           storage.OnFailureHalt,
+				CreatedAt:           now,
+				UpdatedAt:           now,
 			},
 			Tasks: []*storage.Task{{
 				TaskIdentifier: identifier + "-" + m.deployment + "-" + m.operationKey,
@@ -302,10 +306,12 @@ func TestGRPCClient_RollingDeploymentTakesCutoverRequestUnchanged(t *testing.T) 
 }
 
 // Two targets listed under one deployment are separate rollout members, each
-// its own database with its own cutover. A barrier rollout started with
+// its own database with its own cutover, sharing the deployment's one remote
+// apply as their own remote operations. A barrier rollout started with
 // --defer-cutover whose first target is still copying therefore holds the
 // second target's cutover exactly as an earlier deployment would, even though
-// both targets belong to the same deployment.
+// both targets belong to the same deployment, and the second target's cutover
+// then names its own remote operation.
 func TestGRPCClient_EarlierTargetOfTheSameDeploymentHoldsCutoverRequest(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -318,8 +324,8 @@ func TestGRPCClient_EarlierTargetOfTheSameDeploymentHoldsCutoverRequest(t *testi
 	client.storage = stor
 
 	apply, ops := seedCutoverTurnApply(t, stor, "apply-cutover-turn-targets", storage.CutoverPolicyBarrier, []cutoverTurnMember{
-		{deployment: "primary", target: "orders-001", operationKey: "orders-001", remoteID: "remote-001", opState: state.ApplyOperation.Running, taskState: state.Task.Running},
-		{deployment: "primary", target: "orders-002", operationKey: "orders-002", remoteID: "remote-002", opState: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
+		{deployment: "primary", target: "orders-001", operationKey: "orders-001", remoteID: "remote-primary", remoteOperationID: "remote-op-001", opState: state.ApplyOperation.Running, taskState: state.Task.Running},
+		{deployment: "primary", target: "orders-002", operationKey: "orders-002", remoteID: "remote-primary", remoteOperationID: "remote-op-002", opState: state.ApplyOperation.WaitingForCutover, taskState: state.Task.WaitingForCutover},
 	})
 
 	driveCutoverRequestAs(t, client, apply, ops[1])
@@ -328,7 +334,10 @@ func TestGRPCClient_EarlierTargetOfTheSameDeploymentHoldsCutoverRequest(t *testi
 
 	setMemberState(t, stor, ops[0], state.ApplyOperation.Completed, state.Task.Completed)
 	driveCutoverRequestAs(t, client, apply, ops[1])
-	assert.Equal(t, "remote-002", server.getCutoverApplyID(), "the later target takes the request once the earlier one has completed")
+	cutoverReq := server.getCutoverRequest()
+	require.NotNil(t, cutoverReq, "the later target takes the request once the earlier one has completed")
+	assert.Equal(t, "remote-primary", cutoverReq.ApplyId)
+	assert.Equal(t, "remote-op-002", cutoverReq.ApplyOperationId, "the later target cuts over only its own remote operation")
 	requireCutoverRequestPending(t, stor, apply.ID, false, "the later target completes the request")
 }
 

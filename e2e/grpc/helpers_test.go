@@ -198,7 +198,10 @@ type grpcSimpleResponse struct {
 func grpcPlan(t *testing.T, database, env string, schemaFiles map[string]string) grpcPlanResponse {
 	t.Helper()
 
-	// Schema files format matches CLI: map[filename] -> content, wrapped in "default" keyspace
+	// Schema files format matches CLI: map[filename] -> content, wrapped in "default" keyspace.
+	// renders_rollout is what the CLI sends: these tests check every rollout
+	// member's outcome themselves, and the server refuses a rollout-wide plan
+	// of a multi-member environment from a caller that does not set it.
 	body := map[string]any{
 		"database":    database,
 		"environment": env,
@@ -208,6 +211,7 @@ func grpcPlan(t *testing.T, database, env string, schemaFiles map[string]string)
 				"files": schemaFiles,
 			},
 		},
+		"renders_rollout": true,
 	}
 	resp := grpcPost(t, "/api/plan", body)
 	if resp.StatusCode != http.StatusOK {
@@ -222,9 +226,12 @@ func grpcPlan(t *testing.T, database, env string, schemaFiles map[string]string)
 
 func grpcApply(t *testing.T, planID, env string, opts map[string]string) grpcApplyResponse {
 	t.Helper()
+	// renders_rollout as in grpcPlan: the server refuses a rollout-wide apply
+	// of a multi-member environment without it.
 	body := map[string]any{
-		"plan_id":     planID,
-		"environment": env,
+		"plan_id":         planID,
+		"environment":     env,
+		"renders_rollout": true,
 	}
 	if opts != nil {
 		body["options"] = opts

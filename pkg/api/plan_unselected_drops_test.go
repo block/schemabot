@@ -247,7 +247,9 @@ func TestUnselectedTableDropError_NamesTheCause(t *testing.T) {
 func TestPlanHandler_UnselectedTableDropIsBadRequest(t *testing.T) {
 	client := &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-primary", Changes: dropsPlan("ns_1", "legacy")}}
 	svc := namespaceSelectionService(t, client, &capturingPlanStore{})
-	body, err := json.Marshal(placedNamespacesRequest())
+	planReq := placedNamespacesRequest()
+	planReq.RendersRollout = true
+	body, err := json.Marshal(planReq)
 	require.NoError(t, err)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")

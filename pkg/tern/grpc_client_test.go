@@ -550,12 +550,33 @@ type capturingTernServer struct {
 	stopRefusal       string // when set, Stop answers Accepted=false with this reason
 	cancelRefusal     string // when set, Cancel answers Accepted=false with this reason
 	omitOperationKey  bool   // emulate a data plane that does not echo the operation key
+	echoOperationKey  string // when set, echoed in place of the derived key, emulating a response for another operation
+	// omitProgressScope emulates a data plane that ignores a progress
+	// request's apply_operation_id and answers for the whole apply.
+	omitProgressScope bool
+	cutoverReq        *ternv1.CutoverRequest
 }
 
 // dispatchOperationKeyEcho mirrors the data plane's operation key derivation
 // for the dispatch shapes these tests exercise, minus the stored-plan
 // validation a real data plane performs before answering.
 func dispatchOperationKeyEcho(req *ternv1.ApplyRequest) string {
+	target, err := dispatchMemberTarget(req)
+	if err != nil {
+		return ""
+	}
+	if target == "" {
+		return unqualifiedDispatchOperationKeyEcho(req)
+	}
+	if namespaces := vschemaOnlyDispatchNamespaces(req.DdlChanges); len(namespaces) > 0 {
+		return storage.TargetOperationKey(target, unqualifiedDispatchOperationKeyEcho(req))
+	}
+	return target
+}
+
+// unqualifiedDispatchOperationKeyEcho is a dispatch's operation key within its
+// target: the shard key, the finalizer key, or empty for whole-target work.
+func unqualifiedDispatchOperationKeyEcho(req *ternv1.ApplyRequest) string {
 	if len(req.TargetShards) == 1 {
 		changes, err := scopedDispatchDDLChanges(req.DdlChanges)
 		if err != nil {
@@ -585,13 +606,17 @@ func (s *capturingTernServer) Apply(_ context.Context, req *ternv1.ApplyRequest)
 	}
 	operationID := s.remoteOperationID
 	omitOperationKey := s.omitOperationKey
+	echoOperationKey := s.echoOperationKey
 	err := s.applyErr
 	s.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 	operationKey := ""
-	if !omitOperationKey {
+	switch {
+	case echoOperationKey != "":
+		operationKey = echoOperationKey
+	case !omitOperationKey:
 		operationKey = dispatchOperationKeyEcho(req)
 	}
 	return &ternv1.ApplyResponse{Accepted: true, ApplyId: applyID, ApplyOperationId: operationID, OperationKey: operationKey}, nil
@@ -650,6 +675,7 @@ func (s *capturingTernServer) Cutover(_ context.Context, req *ternv1.CutoverRequ
 	s.mu.Lock()
 	s.cutoverApplyID = req.ApplyId
 	s.cutoverCaller = req.Caller
+	s.cutoverReq = &ternv1.CutoverRequest{ApplyId: req.ApplyId, Environment: req.Environment, Caller: req.Caller, ApplyOperationId: req.ApplyOperationId}
 	err := s.cutoverErr
 	accepted := s.cutoverAccepted
 	message := s.cutoverMessage
@@ -677,10 +703,15 @@ func (s *capturingTernServer) Revert(_ context.Context, req *ternv1.RevertReques
 func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRequest) (*ternv1.ProgressResponse, error) {
 	s.mu.Lock()
 	s.progressReq = &ternv1.ProgressRequest{
-		ApplyId:     req.ApplyId,
-		Environment: req.Environment,
+		ApplyId:          req.ApplyId,
+		Environment:      req.Environment,
+		ApplyOperationId: req.ApplyOperationId,
 	}
 	s.progressApplyID = req.ApplyId
+	scopedTo := req.ApplyOperationId
+	if s.omitProgressScope {
+		scopedTo = ""
+	}
 	ps := s.progressState
 	psSet := s.progressStateSet
 	if len(s.progressStates) > 0 {
@@ -708,6 +739,7 @@ func (s *capturingTernServer) Progress(_ context.Context, req *ternv1.ProgressRe
 		Tables:                 tables,
 		ErrorMessage:           errorMessage,
 		SettledControlRequests: settled,
+		ApplyOperationId:       scopedTo,
 	}, nil
 }
 func (s *capturingTernServer) Logs(context.Context, *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
@@ -799,9 +831,16 @@ func (s *capturingTernServer) getProgressRequest() *ternv1.ProgressRequest {
 		return nil
 	}
 	return &ternv1.ProgressRequest{
-		ApplyId:     s.progressReq.ApplyId,
-		Environment: s.progressReq.Environment,
+		ApplyId:          s.progressReq.ApplyId,
+		Environment:      s.progressReq.Environment,
+		ApplyOperationId: s.progressReq.ApplyOperationId,
 	}
+}
+
+func (s *capturingTernServer) getCutoverRequest() *ternv1.CutoverRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cutoverReq
 }
 
 func (s *capturingTernServer) getApplyRequest() *ternv1.ApplyRequest {
@@ -950,9 +989,15 @@ func (m *mockApplyLogStore) GetRecentByApply(_ context.Context, _ int64, limit i
 type mockPlanStore struct {
 	storage.PlanStore
 	plan *storage.Plan
+	// byID, when set, answers GetByID per plan id instead of returning plan
+	// for every id, for applies whose operations run plans of their own.
+	byID map[int64]*storage.Plan
 }
 
-func (m *mockPlanStore) GetByID(context.Context, int64) (*storage.Plan, error) {
+func (m *mockPlanStore) GetByID(_ context.Context, id int64) (*storage.Plan, error) {
+	if m.byID != nil {
+		return m.byID[id], nil
+	}
 	return m.plan, nil
 }
 
@@ -975,6 +1020,10 @@ type mockApplyOperationStore struct {
 	ops          map[int64]*storage.ApplyOperation
 	saveErr      error
 	savedResumes []*storage.EngineResumeState
+	// operationIDWriteErr fails any SaveExternalID that carries a remote
+	// operation id, standing in for a pod that dies before that id reaches
+	// storage.
+	operationIDWriteErr error
 }
 
 func (m *mockApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
@@ -1052,21 +1101,12 @@ func (m *mockApplyOperationStore) MarkFailed(_ context.Context, id int64, errMsg
 	return nil
 }
 
-func (m *mockApplyOperationStore) SaveExternalOperationID(_ context.Context, operationID int64, externalOperationID string) error {
+func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, operationID int64, externalID, externalOperationID string) error {
 	if m.saveErr != nil {
 		return m.saveErr
 	}
-	op, ok := m.ops[operationID]
-	if !ok {
-		return storage.ErrApplyOperationNotFound
-	}
-	op.ExternalOperationID = externalOperationID
-	return nil
-}
-
-func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, operationID int64, externalID string) error {
-	if m.saveErr != nil {
-		return m.saveErr
+	if externalOperationID != "" && m.operationIDWriteErr != nil {
+		return m.operationIDWriteErr
 	}
 	op, ok := m.ops[operationID]
 	if !ok {
@@ -1076,6 +1116,9 @@ func (m *mockApplyOperationStore) SaveExternalID(_ context.Context, applyID, ope
 		return fmt.Errorf("apply_operation %d does not belong to apply %d: %w", operationID, applyID, storage.ErrApplyOperationNotFound)
 	}
 	op.ExternalID = externalID
+	if externalOperationID != "" {
+		op.ExternalOperationID = externalOperationID
+	}
 	return nil
 }
 

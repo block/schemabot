@@ -838,8 +838,12 @@ without completing the request would refuse the start the hold exists to preserv
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
 started, to the same gate, with the failure exemption shared by every gate, and `FindNextApplyOperationCutover`
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
-storage parity suite (`pkg/storage/storagetest/apply_operations.go`); for a manually deferred cutover, the turn
-check `CutoverBlocker` (same file, sharing the automatic cutover claim's
+storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
+dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
+`pkg/storage/internal/sqlstore/apply_operations.go`), and each member's progress and cutover are scoped to its own operation
+(`progressScopeOperation` in `pkg/tern/local_client.go`, `boundCutoverRequestTurn` in
+`pkg/tern/local_control.go`); for a manually deferred cutover, the turn
+check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sharing the automatic cutover claim's
 `earlierSiblingHoldsCutoverSQL`), applied when a drive takes the request
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
@@ -1506,12 +1510,19 @@ them. The re-plan that runs just before execution re-checks that verdict, so a p
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
 reviewed target's included, is what the confirmation was given against and carries no consequence
-it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
+it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversReviewedTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
 `pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), and apply creation refusing, whatever the flags,
 unsafe changes that the disclosure never named in a plan it did not come from
-(`rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`), plus rollback confirmation's transactional lock-intent check
-(`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
-`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`).
+(`rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
+when `--allow-unsafe` is passed, judged against every unsafe change the plan carries, a divergent
+shard's included (`pkg/cmd/commands/apply.go`, `pkg/cmd/commands/rollback.go`, over
+`PlanResponse.UnsafeChanges` in `pkg/apitypes/apitypes.go`). On the PR-comment rollback path the
+consent is the `rollback-confirm` comment itself: it is accepted only from an authorized
+admin/operator, after the rollback plan comment has warned that the rollback may include
+destructive changes, and it is pinned to that plan by rollback confirmation's transactional
+lock-intent check (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
+`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`); the apply it submits
+carries `allow_unsafe` on that basis rather than from a flag.
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
@@ -1537,10 +1548,13 @@ direct-execution size bound ([direct-execution.md](direct-execution.md)); the po
 verdicts were judged under recorded on the plan row and read at admission in place of a second
 resolution (`storage.Plan.DirectExecution`, `pkg/api/plan_handlers.go`); in a rollout, each
 member's own direct changes disclosed under that member's plan (`deploymentPlanGroups` in
-`pkg/webhook/plan_drift.go`), with apply-confirm refusing a member whose execution modes differ
-from the confirmed round's (`roundCoversWork` in `pkg/webhook/apply_member_work.go`), and apply
-creation refusing a member's own direct change for any caller other than that confirmed
-apply-confirm (`rejectUnconfirmedMemberDirectExecution` in `pkg/api/plan_handlers.go`).
+`pkg/webhook/plan_drift.go`; for a plan requested through the API, members grouped on their
+verdicts as well as their work by `planGroupKey` in `pkg/api/plan_rollout.go` and disclosed by
+`directChangeNotices` in `pkg/cmd/commands/plan.go`), with apply-confirm refusing a member whose
+execution modes differ from the confirmed round's (`roundCoversWork` in
+`pkg/webhook/apply_member_work.go`), and apply creation refusing a member's own direct change for
+any caller other than that confirmed apply-confirm (`rejectUnconfirmedMemberDirectExecution` in
+`pkg/api/plan_handlers.go`).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
 
@@ -1571,7 +1585,10 @@ Reading one dialect's DDL under another's grammar is the same class of failure a
 at all, because a statement that misparses can also misclassify, and classification is what
 destructive gating reads. A classifier refuses ambiguity, so a compound statement never classifies
 as its first verb and rides past that gate. *Enforced:* dialect resolution at the parser seam
-(`pkg/ddl/parser.go`); the Spirit `statement` and libpg_query boundaries.
+(`pkg/ddl/parser.go`); the Spirit `statement` and libpg_query boundaries; the `fix-lint`
+database-type gate (`pkg/cmd/commands/fixlint.go`), which refuses a schema directory whose
+`schemabot.yaml` declares a type outside the MySQL family because the fixer has only the MySQL
+grammar.
 
 ### RV-7: Rollback needs the originals
 
@@ -1610,8 +1627,11 @@ apply of the whole rollout runs from the rollout primary's plan. An apply that r
 is never rolled back across the rollout. *Enforced:* member pairing at apply creation
 (`resolveApplyMembers` in `pkg/api/apply_members.go`, `applyTargets` in
 `pkg/api/plan_handlers.go`), which holds a plan to the narrowing recorded on its stored row
-(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply
-and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`).
+(`storage.Plan.NarrowedTo`, recorded on a row the planner stored first by `keepStoredPlanOnRoute`); the narrowed-apply,
+independent-rollout, and moved-primary refusals in `ExecuteRollbackPlanForApply` (`refuseRollbackOfIndependentRollout` and `refuseRollbackAfterPrimaryMoved` in `pkg/api/plan_handlers.go`); on a data plane, the plan each
+member target's operation records as it attaches to the deployment's apply
+(`attachDispatchOperation`, `pkg/tern/local_client.go`), which its drive runs (`drivePlanID`) and
+its lost-work verification re-plans from (`planIDForTasks`, `pkg/tern/local_control_resume.go`).
 
 ## Routing and authorization (AZ)
 
@@ -1677,8 +1697,10 @@ their own review requirement. *Enforced:* the review gate and actor authorizatio
 An unscoped PR command resolves to exactly one unambiguous database or is rejected with guidance,
 never resolved by an arbitrary pick. A malformed command is rejected rather than "helpfully"
 corrected into something executable, especially one carrying `--allow-unsafe`. Every command
-receives a response, and silence only ever means another instance owns the reply. *Enforced:*
-command discovery and the unowned-command policy (`pkg/webhook/commands.go`).
+receives a response, and silence only ever means another instance owns the reply or the comment
+issues no command: a line that opens with the product name but reads as a sentence about it, not a
+command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
+unowned-command policy (`pkg/webhook/commands.go`).
 
 ### AZ-6: Local hosting preserves its boundaries
 
