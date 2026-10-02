@@ -45,12 +45,14 @@ func vschemaDeletionsMetadata(currentRaw, desired string) (string, error) {
 // current and desired VSchema and encodes them for plan change metadata.
 // Mutations gate the apply behind the unsafe opt-in just like removals: a
 // same-name vindex whose type, params, or owner changes, a keyspace whose
-// sharded flag flips, or a table whose type, primary vindex, or
-// auto-increment changes alters Vitess query routing, lookup maintenance, or
-// id generation the moment the VSchema lands. Returns "" when nothing
-// changes in place.
-func vschemaMutationsMetadata(currentRaw, desired string) (string, error) {
-	mutations, err := vschema.Mutations(currentRaw, desired)
+// sharded or require_explicit_routing flag flips, or a table whose type,
+// pin, primary vindex, reference source, or auto-increment changes alters
+// Vitess query routing, lookup maintenance, or id generation the moment the
+// VSchema lands. liveTables names the tables on the target so a sequence
+// given to a live table through a new entry in an unsharded keyspace is
+// gated too. Returns "" when nothing changes in place.
+func vschemaMutationsMetadata(currentRaw, desired string, liveTables []string) (string, error) {
+	mutations, err := vschema.Mutations(currentRaw, desired, liveTables)
 	if err != nil {
 		return "", err
 	}
@@ -62,6 +64,16 @@ func vschemaMutationsMetadata(currentRaw, desired string) (string, error) {
 		converted[i] = apitypes.VSchemaMutation{Kind: m.Kind, Name: m.Name, Reason: m.Reason}
 	}
 	return apitypes.EncodeVSchemaMutations(converted)
+}
+
+// liveTableNames returns the names of the tables the target currently holds
+// in one keyspace.
+func liveTableNames(tables []table.TableSchema) []string {
+	names := make([]string, 0, len(tables))
+	for _, t := range tables {
+		names = append(names, t.Name)
+	}
+	return names
 }
 
 // Plan computes the schema changes needed by diffing current schema against desired.
@@ -150,7 +162,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				if deletionsMeta != "" {
 					sc.Metadata[apitypes.VSchemaDeletionsMetadataKey] = deletionsMeta
 				}
-				mutationsMeta, mutErr := vschemaMutationsMetadata(currentVSchemaRaw, ns.Files["vschema.json"])
+				mutationsMeta, mutErr := vschemaMutationsMetadata(currentVSchemaRaw, ns.Files["vschema.json"], liveTableNames(currentSchema[ks]))
 				if mutErr != nil {
 					return fmt.Errorf("detect VSchema mutations for keyspace %s: %w", ks, mutErr)
 				}

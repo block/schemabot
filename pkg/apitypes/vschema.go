@@ -71,18 +71,20 @@ func ParseVSchemaDeletions(metadata map[string]string) ([]VSchemaDeletion, error
 // VSchemaMutationsMetadataKey is the plan change-metadata key under which
 // engines record in-place routing changes in a namespace's VSchema change as a
 // JSON-encoded []VSchemaMutation. A mutation removes nothing but changes how
-// Vitess routes rows or issues ids — a vindex type change or a new primary
-// vindex re-computes every row's keyspace id, a repointed lookup backing
-// table moves lookup rows, and an auto-increment change switches the source
-// of generated ids — so any recorded mutation makes the plan's VSchema
-// change an unsafe change requiring the same operator opt-in as a removal.
+// Vitess routes rows or issues ids — a vindex type change, a new primary
+// vindex, or a moved pin re-computes every row's keyspace id, a repointed
+// lookup backing table or reference source moves rows, an explicit-routing
+// flip changes which queries resolve, and an auto-increment change switches
+// the source of generated ids — so any recorded mutation makes the plan's
+// VSchema change an unsafe change requiring the same operator opt-in as a
+// removal.
 const VSchemaMutationsMetadataKey = "vschema_mutations"
 
 // VSchemaMutation is one in-place routing change in a namespace's VSchema
 // change. It mirrors the engine-side mutation type (pkg/vschema); apitypes
 // keeps its own copy so this package stays dependency-free.
 type VSchemaMutation struct {
-	Kind   string `json:"kind"`   // "vindex_type", "vindex_params", "vindex_owner", "keyspace_sharded", "table_type", "table_primary_vindex", or "table_auto_increment"
+	Kind   string `json:"kind"`   // "vindex_type", "vindex_params", "vindex_owner", "keyspace_sharded", "keyspace_require_explicit_routing", "table_type", "table_primary_vindex", "table_pinned", "table_source", or "table_auto_increment"
 	Name   string `json:"name"`   // vindex name, table name, or empty for the keyspace
 	Reason string `json:"reason"` // operator-facing explanation of the risk
 }

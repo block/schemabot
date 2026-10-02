@@ -116,12 +116,15 @@ func vindexRemovalReason(name string, v *vschemapb.Vindex) string {
 
 // hasNoVSchema reports whether the current document says the keyspace has no
 // VSchema yet. A data plane reports that as either nothing or the empty
-// object, which is how an empty keyspace proto serialises. Neither declares
-// a table, a vindex, or a sharded flag, so no row is routed by it and the
-// first VSchema to land cannot re-route or un-route anything. In particular a
-// sharded keyspace's first VSchema says `sharded: true` because its shards
-// already exist in the topology, not because the keyspace changed from
-// unsharded.
+// object, which is how an empty keyspace proto serialises; a lookup can also
+// come back empty while the data plane's API converges after a recent write,
+// and the two are indistinguishable from the document alone. Such a document
+// declares no table, vindex, or association, so there is nothing for the
+// first VSchema to remove. It is not inert for routing, though: an unsharded
+// keyspace routes every live table without a VSchema, so Mutations compares
+// the first document as an empty keyspace against the target's live tables
+// and exempts only the sharded flag, which a sharded keyspace's first
+// document sets because its shards already exist in the topology.
 func hasNoVSchema(current string) bool {
 	current = strings.TrimSpace(current)
 	return current == "" || current == "{}"

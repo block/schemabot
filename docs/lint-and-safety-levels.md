@@ -157,21 +157,30 @@ radius matches removing the vindex outright, so mutations take the same
 `--allow-unsafe` acknowledgment.
 
 The same holds for in-place changes to the keyspace or a table's routing:
-flipping the keyspace's `sharded` flag, changing a table's `type`, changing a
-table's primary vindex (its first `column_vindexes` entry — including by
-reordering the entries), and adding, removing, or re-pointing a table's
-`auto_increment`. A new primary vindex computes every row's keyspace id
-differently while the rows stay on their current shards; without its
+flipping the keyspace's `sharded` or `require_explicit_routing` flag, changing
+a table's `type`, changing how a table is keyed (its primary vindex — the
+first `column_vindexes` entry, including by reordering the entries — or its
+`pinned` keyspace id, or swapping one for the other), re-pointing a reference
+table's `source`, and adding, removing, or re-pointing a table's
+`auto_increment`. A new primary vindex or pin computes every row's keyspace
+id differently while the rows stay on their current shards; without its
 sequence, inserts pass through to the database, whose backing column is not
 guaranteed to generate an id. These sequence semantics also apply to
-unsharded keyspaces.
+unsharded keyspaces, where a table needs no VSchema entry to be routed: a new
+entry that gives a table the keyspace already holds a sequence changes where
+that table's ids come from, so it is unsafe too, while an entry for a table
+the same plan creates is an addition.
 
 Additions-only VSchema changes (new vindexes, new tables, new secondary
-column-vindex associations) are not unsafe, and neither is a keyspace's first
-VSchema: a keyspace that has none yet routes no row, so there is nothing for
-that document to re-route, whatever it declares. Removals and mutations are
-detected structurally by comparing the current and desired VSchema documents;
-a VSchema that cannot be parsed fails the plan rather than skipping detection.
+column-vindex associations) are not unsafe. A keyspace's first VSchema is
+compared as if its current document were an empty keyspace, so the live
+tables it already routes are protected the same way. The one exemption is the
+`sharded` flag: a sharded keyspace's first document saying it is sharded is
+how the keyspace is onboarded, and a keyspace with one shard routes every
+keyspace id to that shard, so the flag alone re-routes nothing. Removals and
+mutations are detected structurally by comparing the current and desired
+VSchema documents; a VSchema that cannot be parsed fails the plan rather than
+skipping detection.
 
 Unsafe does not mean broken. An unsafe change will usually apply successfully —
 the point of the gate is that it is destructive or irreversible, so SchemaBot
