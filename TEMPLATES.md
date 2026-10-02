@@ -473,9 +473,9 @@ An apply will fail on these statements. Fix what each reason names — rewrite a
 
 ---
 
-▶️ **To apply**, comment:
+The engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:
 ```
-schemabot apply -e staging
+schemabot plan -e staging
 ```
 
 </details>
@@ -509,9 +509,9 @@ An apply will fail on these statements. Fix what each reason names — rewrite a
 
 ---
 
-▶️ **To apply**, comment:
+The engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:
 ```
-schemabot apply -e staging
+schemabot plan -e staging
 ```
 
 </details>

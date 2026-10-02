@@ -679,6 +679,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		}
 	case data.MemberApplyRefusal != "":
 		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal)
+	case data.applyFailsOnRefusedChange():
+		writeRefusedChangeReplan(&sb, "this plan", scopedCommand("schemabot plan", data.Environment, data.ScopedDatabase, data.Tenant))
 	default:
 		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
@@ -697,6 +699,23 @@ func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
 	refusal = escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " "))
 	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: %s.\n\n", refusal)
 	sb.WriteString("An apply runs every target or none, so nothing runs until that plan can. The schema check keeps blocking merge until every target has the change.\n")
+}
+
+// applyFailsOnRefusedChange reports whether the plan carries a change the
+// engine refuses. Its apply fails on that change whatever its flags, so the
+// comment offers a re-plan instead of an apply it knows will fail. A refused
+// change on another target is a member apply refusal, which the footer states
+// on its own.
+func (d PlanCommentData) applyFailsOnRefusedChange() bool {
+	return len(d.BlockedChanges) > 0
+}
+
+// writeRefusedChangeReplan writes, in place of the apply instruction, that the
+// named plan's apply fails on a refused change, and the command that re-plans
+// once it is fixed. The change itself is listed under Cannot apply above.
+func writeRefusedChangeReplan(sb *strings.Builder, plan, planCommand string) {
+	fmt.Fprintf(sb, "The engine refuses a change in %s (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:\n", plan)
+	fmt.Fprintf(sb, "```\n%s\n```\n", planCommand)
 }
 
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
@@ -719,6 +738,10 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 type unsafeConsent struct {
 	findings int
 	tables   string
+	// primaryOnly is set when the count covers the primary target alone: the
+	// flag also consents to whatever unsafe changes the other targets carry,
+	// which the comment has no per-target plan to count from.
+	primaryOnly bool
 }
 
 // planUnsafeConsent reports what the plan's apply would confirm with
@@ -726,7 +749,7 @@ type unsafeConsent struct {
 // apply needs no consent, or the plan carries a change the engine refuses,
 // which fails the apply whatever its flags.
 func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
-	if data.AllowUnsafe || len(data.BlockedChanges) > 0 {
+	if data.AllowUnsafe || data.applyFailsOnRefusedChange() {
 		return unsafeConsent{}, false
 	}
 	// The flag consents to every target's disclosed unsafe changes, not only
@@ -740,9 +763,21 @@ func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
 		return unsafeConsent{}, false
 	}
 	return unsafeConsent{
-		findings: countUnsafeFindings(changes),
-		tables:   unsafeChangeTables(changes),
+		findings:    countUnsafeFindings(changes),
+		tables:      unsafeChangeTables(changes),
+		primaryOnly: !unsafeCountCoversEveryTarget(data.DeploymentDrift),
 	}, true
+}
+
+// unsafeCountCoversEveryTarget reports whether the unsafe changes the comment
+// counts are every one --allow-unsafe would consent to. A single target, or a
+// clean rollup, has them all: mirrored targets run the primary plan, and
+// independent targets' own plans are counted when they render. A rollup that
+// is blocked or could not be computed carries no plan per target, so the
+// count is the primary target's alone. Such a rollup also blocks the apply,
+// but the apply plans the rollout again, and it can be clean by then.
+func unsafeCountCoversEveryTarget(drift *DeploymentDriftData) bool {
+	return drift == nil || (drift.Computed && drift.Clean)
 }
 
 // instruction is the clause that tells the reader how to apply, lower-cased
@@ -753,14 +788,22 @@ func (c unsafeConsent) instruction() string {
 	if c.findings > 1 {
 		noun = "unsafe changes"
 	}
+	if c.primaryOnly {
+		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on the primary target (%s) and any on the other targets", c.findings, noun, c.tables)
+	}
 	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s)", c.findings, noun, c.tables)
 }
+
+// unsafeConsentTablesShown caps how many names the consent sentence lists.
+// The unsafe findings above list every one, so the rest are only counted.
+const unsafeConsentTablesShown = 5
 
 // unsafeChangeTables names what the unsafe changes touch, each once in
 // first-appearance order, comma-separated: a table by its code span, with the
 // shards it applies to when only some carry it, and a VSchema by its
 // namespace. The names match the ones the unsafe findings list above uses, so
-// the reader can match one to the other.
+// the reader can match one to the other. Past unsafeConsentTablesShown the
+// rest are counted.
 func unsafeChangeTables(changes []UnsafeChangeData) string {
 	seen := make(map[string]bool, len(changes))
 	var targets []string
@@ -772,16 +815,21 @@ func unsafeChangeTables(changes []UnsafeChangeData) string {
 		seen[target] = true
 		targets = append(targets, target)
 	}
+	shown := targets[:min(len(targets), unsafeConsentTablesShown)]
 	// A label that lists several targets carries commas of its own, so the
 	// labels are then set apart with semicolons.
 	sep := ", "
-	for _, target := range targets {
+	for _, target := range shown {
 		if strings.Contains(target, ", ") {
 			sep = "; "
 			break
 		}
 	}
-	return strings.Join(targets, sep)
+	list := strings.Join(shown, sep)
+	if hidden := len(targets) - len(shown); hidden > 0 {
+		list += fmt.Sprintf(" and %d more", hidden)
+	}
+	return list
 }
 
 func unsafeConsentTarget(c UnsafeChangeData) string {
@@ -3305,6 +3353,9 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// coach an apply the promotion order refuses.
 	var envsRefused []string
 	var envsBehindRefused []string
+	// An environment whose plan carries a change the engine refuses is refused
+	// too, and is offered a re-plan in place of its apply.
+	var envsFailOnRefusedChange []string
 	for _, env := range data.Environments {
 		if _, hasErr := data.Errors[env]; hasErr {
 			envsWithErrors = append(envsWithErrors, env)
@@ -3312,6 +3363,9 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 			switch {
 			case environmentHasWork(plan) && len(envsRefused) > 0:
 				envsBehindRefused = append(envsBehindRefused, env)
+			case environmentHasWork(plan) && plan.applyFailsOnRefusedChange():
+				envsRefused = append(envsRefused, env)
+				envsFailOnRefusedChange = append(envsFailOnRefusedChange, env)
 			case environmentHasWork(plan):
 				envsWithChanges = append(envsWithChanges, env)
 			case plan.MemberApplyRefusal != "":
@@ -3344,7 +3398,17 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 		sb.WriteString("No changes to apply.\n")
 	}
 
+	for _, env := range envsFailOnRefusedChange {
+		sb.WriteString("\n")
+		writeRefusedChangeReplan(sb, fmt.Sprintf("the **%s** plan", env), command("schemabot plan", env))
+	}
+
 	for _, env := range envsBehindRefused {
+		if slices.Contains(envsFailOnRefusedChange, envsRefused[0]) {
+			fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and %s's plan carries a change the engine refuses (see above).\n",
+				capitalizeFirst(env), envsRefused[0], envsRefused[0])
+			continue
+		}
 		fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and this PR cannot apply %s's other targets' plans (see above).\n",
 			capitalizeFirst(env), envsRefused[0], envsRefused[0])
 	}

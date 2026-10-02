@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/glyph"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1083,13 +1085,14 @@ func TestRenderPlanComment_BlockedChangeIsDisclosedOnce(t *testing.T) {
 		})
 	}
 
+	disclosure := glyph.Refused + " **Cannot apply**:"
 	carried := render(blocked)
-	assert.Equal(t, 1, strings.Count(carried, "**Cannot apply**"))
-	assert.Less(t, strings.Index(carried, "**Cannot apply**"), strings.Index(carried, "### Target `primary/testapp_2`"),
+	assert.Equal(t, 1, strings.Count(carried, disclosure))
+	assert.Less(t, strings.Index(carried, disclosure), strings.Index(carried, "### Target `primary/testapp_2`"),
 		"the refused change is disclosed under its own target's DDL")
 
 	uncarried := render(nil)
-	assert.Equal(t, 1, strings.Count(uncarried, "**Cannot apply**"), "the primary plan's refused change is never left unsaid")
+	assert.Equal(t, 1, strings.Count(uncarried, disclosure), "the primary plan's refused change is never left unsaid")
 }
 
 // A rollout's primary target is already at the desired schema, and another
