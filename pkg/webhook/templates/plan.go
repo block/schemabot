@@ -307,9 +307,11 @@ type DeploymentPlanGroup struct {
 	// Members names the group's members the way an operator addresses them, in
 	// rollout order.
 	Members []string
-	// Primary marks the group the reviewed primary member belongs to. Exactly
-	// one group carries it, and it is the group operators read first: the
-	// reviewed plan is the one they have already seen.
+	// Primary marks the group the primary target belongs to. Exactly one group
+	// carries it. The primary is planned first and its plan is what the
+	// comment's plan-wide sections describe, but it is no more reviewed than
+	// any other group: an approval covers every target's plan the comment
+	// shows, so the primary's group is ordered like any other.
 	Primary bool
 	// Changes is one member's plan, in the same shape the comment renders the
 	// reviewed plan itself. Empty for a group whose members are already at the
@@ -327,7 +329,7 @@ type DeploymentPlanGroup struct {
 	// PlanID is the identifier of the stored plan the group's first member
 	// would run, so DDL cut to fit the comment names the command that prints
 	// the group's plan in full. Unused for the primary's group, which runs the
-	// reviewed plan and points at PlanCommentData.PlanID. Empty when the
+	// primary's plan and points at PlanCommentData.PlanID. Empty when the
 	// member's plan was not stored.
 	PlanID string
 	// DirectChanges are the group's changes the direct execution policy routes
@@ -1963,9 +1965,9 @@ func RendersTargetPlans(drift *DeploymentDriftData) bool {
 	return drift != nil && drift.Computed && drift.Clean && drift.Independent && changingTargetCount(drift) > 0
 }
 
-// targetPlanChanges is the plan a group of targets renders. The reviewed
-// target's group renders the reviewed plan itself, so what a reviewer reads for
-// it is exactly what the rest of the comment describes; every other group
+// targetPlanChanges is the plan a group of targets renders. The primary
+// target's group renders the primary's plan itself, so what a reviewer reads
+// for it is exactly what the plan-wide sections describe; every other group
 // renders its own members' plan.
 func targetPlanChanges(g DeploymentPlanGroup, data PlanCommentData) []KeyspaceChangeData {
 	if g.Primary && hasChanges(data.Changes) {
@@ -1975,8 +1977,8 @@ func targetPlanChanges(g DeploymentPlanGroup, data PlanCommentData) []KeyspaceCh
 }
 
 // targetPlanID is the stored plan a target group's DDL comes from, the one a
-// reader who cannot see all of it is pointed at. The primary runs the reviewed
-// plan itself and has no member plan of its own.
+// reader who cannot see all of it is pointed at. The primary's group runs the
+// primary's own plan and has no member plan of its own.
 func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
 	if g.Primary {
 		return data.PlanID
@@ -1993,10 +1995,16 @@ func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
 func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget, collapse bool) {
 	drift := data.DeploymentDrift
 	// Targets with work lead, as changing shards do: they are what the apply
-	// will run, and the targets already at the schema follow them.
+	// will run, and the targets already at the schema follow them. Among
+	// groups with work the largest leads, since it is what most targets will
+	// run; no group leads for holding the primary, as an approval covers
+	// every group alike.
 	plans := slices.Clone(drift.Plans)
 	slices.SortStableFunc(plans, func(a, b DeploymentPlanGroup) int {
-		return compareWorkFirst(a.Empty(), b.Empty())
+		if c := compareWorkFirst(a.Empty(), b.Empty()); c != 0 {
+			return c
+		}
+		return len(b.Members) - len(a.Members)
 	})
 	// A target group sits one level above its namespaces. In a plan of its
 	// own that is a section heading over namespace headings; inside an

@@ -486,9 +486,13 @@ func TestRenderPlanComment_DivergentTargetsReadLikeDivergentShards(t *testing.T)
 		assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
 	})
 	t.Run("targets need different changes", func(t *testing.T) {
-		out := render(group(1, "a"), group(2, "b", "c"))
+		primary := group(1, "a")
+		primary.Primary = true
+		out := render(primary, group(2, "b", "c"))
 		assert.Contains(t, out, "### Target `a`\n\n```sql\n")
 		assert.Contains(t, out, "`b`, `c`\n\n```sql\n")
+		assert.Less(t, strings.Index(out, "### 2 of 3 targets"), strings.Index(out, "### Target `a`"),
+			"the group most targets run leads, whichever group holds the primary")
 		assert.NotContains(t, out, "_Already applied")
 		assert.Equal(t, 1, strings.Count(out, "📋 **Plan**: "), "the plans are summarized once, together")
 	})
