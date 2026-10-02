@@ -39,6 +39,7 @@ func TestLocalClient_Apply_RowDataFailureIsPermanent(t *testing.T) {
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx), "ping target database")
 
+	dropRowDataFailureTables(t, db)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `row_data_failure` (`id` INT NOT NULL, `amount` BIGINT NULL, PRIMARY KEY (`id`))")
 	require.NoError(t, err, "create row_data_failure")
 	_, err = db.ExecContext(ctx, "INSERT INTO `row_data_failure` (`id`, `amount`) VALUES (1, 10), (2, NULL), (3, 30)")
@@ -94,4 +95,18 @@ func TestLocalClient_Apply_RowDataFailureIsPermanent(t *testing.T) {
 	var nullRows int
 	require.NoError(t, db.QueryRowContext(ctx, "SELECT COUNT(*) FROM `row_data_failure` WHERE `amount` IS NULL").Scan(&nullRows), "count NULL amounts")
 	assert.Equal(t, 1, nullRows, "the failed change leaves the table's data untouched")
+
+	dropRowDataFailureTables(t, db)
+}
+
+// dropRowDataFailureTables removes the test table and the shadow and checkpoint
+// tables the failed copy leaves beside it. The integration suite shares one
+// MySQL container, and a later plan built from every table in the database
+// would otherwise pick them up.
+func dropRowDataFailureTables(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, table := range []string{"row_data_failure", "_row_data_failure_new", "_row_data_failure_chkpnt"} {
+		_, err := db.ExecContext(t.Context(), "DROP TABLE IF EXISTS `"+table+"`")
+		require.NoError(t, err, "drop %s", table)
+	}
 }
