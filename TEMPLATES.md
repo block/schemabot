@@ -317,11 +317,11 @@ ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin N
 
 🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.
 - `sku`, `title` on `products`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`
-  - ⚠️ Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.
-  - ⚠️ `sku` is in unique index `uk_sku`: the apply fails if two existing values compare equal under the new collation.
+  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.
+  - `sku` is in unique index `uk_sku`: the apply fails if two existing values compare equal under the new collation.
 - `handle` on `customers`: `utf8mb4_general_ci` → `utf8mb4_bin`
-  - ⚠️ Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.
-  - ⚠️ `handle` is in unique index `uk_handle`: the apply fails if two existing values compare equal under the new collation.
+  - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.
+  - `handle` is in unique index `uk_handle`: the apply fails if two existing values compare equal under the new collation.
 
 📋 **Plan**: **2** tables to alter
 
