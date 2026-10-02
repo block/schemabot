@@ -694,10 +694,10 @@ func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.\n"+
 			"- `handle` on `handles`: `utf8mb4_general_ci` → `utf8mb4_bin`\n"+
-			"  - ⚠️ Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
-			"  - ⚠️ `handle` is in unique index `uk_handle`: the apply fails if two existing values compare equal under the new collation.\n"+
+			"  - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
+			"  - `handle` is in unique index `uk_handle`: the apply fails if two existing values compare equal under the new collation.\n"+
 			"- `note` on `handles`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`\n"+
-			"  - ⚠️ Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n", body)
+			"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n", body)
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for plan comment")
 	}

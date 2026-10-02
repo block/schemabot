@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/glyph"
 )
 
 // CollationChangeData is one existing column a plan moves onto another
@@ -86,7 +85,7 @@ func writeCollationGroup(sb *strings.Builder, g collationGroup) {
 	}
 	fmt.Fprintf(sb, "- %s on %s: %s → %s\n", collationColumnList(g.columns), inlineCode(g.table), inlineCode(g.from), to)
 	if g.to == "" {
-		fmt.Fprintf(sb, "  - %s The new collation is not in the plan, so it cannot say how letter case and trailing spaces will compare.\n", glyph.Attention)
+		sb.WriteString("  - The new collation is not in the plan, so it cannot say how letter case and trailing spaces will compare.\n")
 	} else {
 		writeComparisonLine(sb, g.caseChange, caseComparison)
 		writeComparisonLine(sb, g.trailingSpaces, trailingSpaceComparison)
@@ -99,8 +98,8 @@ func writeCollationGroup(sb *strings.Builder, g collationGroup) {
 		if len(u.indexes) > 1 {
 			noun = "unique indexes"
 		}
-		fmt.Fprintf(sb, "  - %s %s is in %s %s: the apply fails if two existing values compare equal under the new collation.\n",
-			glyph.Attention, inlineCode(u.column), noun, strings.Join(inlineCodeList(u.indexes), ", "))
+		fmt.Fprintf(sb, "  - %s is in %s %s: the apply fails if two existing values compare equal under the new collation.\n",
+			inlineCode(u.column), noun, strings.Join(inlineCodeList(u.indexes), ", "))
 	}
 }
 
@@ -137,7 +136,7 @@ func writeComparisonLine(sb *strings.Builder, change engine.ComparisonChange, wo
 	default:
 		line = wording.unknown
 	}
-	fmt.Fprintf(sb, "  - %s %s\n", glyph.Attention, line)
+	fmt.Fprintf(sb, "  - %s\n", line)
 }
 
 func collationColumnList(columns []string) string {

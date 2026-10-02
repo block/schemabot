@@ -56,11 +56,11 @@ func TestRenderPlanComment_CollationChanges(t *testing.T) {
 
 	assert.Equal(t, "🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.\n"+
 		"- `body` on `notes`: `utf8mb4_general_ci` → `utf8mb4_bin`\n"+
-		"  - ⚠️ Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
+		"  - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
 		"- `slug` on `notes`: `utf8mb4_bin` → `utf8mb4_0900_ai_ci`\n"+
-		"  - ⚠️ Comparisons become case-insensitive: `'abc'` and `'ABC'` start comparing equal.\n"+
-		"  - ⚠️ Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
-		"  - ⚠️ `slug` is in unique indexes `uk_slug`, `uk_owner_slug`: the apply fails if two existing values compare equal under the new collation.\n",
+		"  - Comparisons become case-insensitive: `'abc'` and `'ABC'` start comparing equal.\n"+
+		"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
+		"  - `slug` is in unique indexes `uk_slug`, `uk_owner_slug`: the apply fails if two existing values compare equal under the new collation.\n",
 		collationSection(t, out))
 }
 
@@ -93,10 +93,10 @@ func TestRenderPlanComment_CollationChangeUnknown(t *testing.T) {
 
 	section := collationSection(t, out)
 	assert.Contains(t, section, "- `body` on `notes`: `utf8mb4_general_ci` → the server's default collation\n"+
-		"  - ⚠️ The new collation is not in the plan, so it cannot say how letter case and trailing spaces will compare.\n")
+		"  - The new collation is not in the plan, so it cannot say how letter case and trailing spaces will compare.\n")
 	assert.Contains(t, section, "- `title` on `notes`: `utf8mb4_general_ci` → `utf8mb4_custom_ci`\n"+
-		"  - ⚠️ The plan cannot read whether letter case is significant under the new collation.\n"+
-		"  - ⚠️ The plan cannot read whether trailing spaces are significant under the new collation.\n")
+		"  - The plan cannot read whether letter case is significant under the new collation.\n"+
+		"  - The plan cannot read whether trailing spaces are significant under the new collation.\n")
 }
 
 // Columns of one table making the same move share a line, which lists a
