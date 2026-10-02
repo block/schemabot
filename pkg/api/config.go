@@ -448,15 +448,21 @@ func (c *ServerConfig) PullPerTargetRateLimit() ratelimit.Config {
 // expected check name, all uncached, on the installation the merge gate writes
 // Check Runs through.
 //
-// The sustained per-caller inspection budget per hour is approximately
+// The budget bounds one caller on one server process, not the installation:
+// every replica admits the configured rate on its own, and every admitted
+// inspection draws on the same installation quota. The sustained cost of one
+// caller per hour is therefore approximately
 //
-//	60 × requests_per_minute × (1 + N)
+//	replicas × 60 × requests_per_minute × (1 + check names)
 //
-// GitHub calls when each lookup fits on one page, where N is the number of
-// check names the deployment publishes for the repository. Pagination
-// multiplies the Check Run reads, and the initial burst adds inspections above
-// the sustained rate. Deployments publishing more check names or observing
-// deep Check Run histories should lower requests_per_minute.
+// installation-authenticated GitHub calls when each lookup fits on one page,
+// where check names is the number the deployment publishes for the repository.
+// Pagination multiplies the Check Run reads, the initial burst adds
+// inspections above the sustained rate, and resolving the installation client
+// adds app-authenticated calls that count against the App rather than the
+// installation. Deployments running more replicas, publishing more check
+// names, or observing deep Check Run histories should lower
+// requests_per_minute.
 const (
 	defaultChecksInspectPerCallerRequestsPerMinute = 6
 	defaultChecksInspectPerCallerBurst             = 10

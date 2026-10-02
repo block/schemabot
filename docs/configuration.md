@@ -650,7 +650,7 @@ per-replica ceiling.
 
 ### Check inspection
 
-`GET /api/checks/inspect` (`schemabot checks inspect`) reads the pull request
+`GET /api/checks/inspect` (`schemabot checks show`) reads the pull request
 and each expected Check Run from GitHub on every call, uncached, through the
 same GitHub App installation SchemaBot publishes its Check Runs through. A
 caller polling it in a loop can spend the installation's hourly REST quota, and
@@ -666,14 +666,23 @@ rate_limits:
       burst: 10               # default: 10
 ```
 
-As an approximate sustained budget, each inspection costs one GitHub read for
-the pull request plus at least one per expected check name. The hourly estimate
-is `60 × requests_per_minute × (1 + N)`, where N is the number of check names.
-Check Run pagination multiplies those reads, and the initial burst permits
-additional inspections. A dashboard polling three pull requests every 30
-seconds fits the sustained default; poll at 30 seconds or longer. A deployment
-that publishes more check names or has deep Check Run histories should lower
-`requests_per_minute`.
+The budget limits each caller on each replica, not the installation. Every
+replica admits the configured rate on its own, and every admitted inspection
+draws on the one installation quota, so size it against the whole deployment.
+Each inspection costs one installation-authenticated GitHub read for the pull
+request plus at least one per expected check name, so one caller's sustained
+hourly cost is approximately
+`replicas × 60 × requests_per_minute × (1 + check names)`. On the defaults, a
+deployment of three replicas publishing two check names admits one caller
+3,240 calls an hour, about two thirds of the 5,000 an hour the smallest
+installation quota allows. Check Run pagination multiplies those reads, the
+initial burst permits additional inspections, and resolving the installation
+client adds app-authenticated calls that count against the App rather than
+the installation. On a single replica, a dashboard polling three pull requests
+every 30 seconds fits the sustained default; poll at 30 seconds or longer, and
+divide the rate by the replica count when there is more than one. A deployment
+that runs more replicas, publishes more check names, or has deep Check Run
+histories should lower `requests_per_minute`.
 
 `per_caller` is keyed the same way as the pull endpoint's. With API auth
 disabled, every caller shares one budget. There is no `per_target` lane. A
