@@ -44,7 +44,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	}
 	for _, w := range work {
 		if len(work) > 1 {
-			writeTargetGroupHeading(sb, targetNames(data.Model, w.members), len(g.Members))
+			writeTargetGroupHeading(sb, "####", targetNames(data.Model, w.members), len(g.Members))
 		}
 		first := memberDetail(data.Details, w.members[0])
 		dialect := dialectForEngine(first.Engine, data.ApplyID)

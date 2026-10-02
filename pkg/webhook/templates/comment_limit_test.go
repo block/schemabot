@@ -665,9 +665,9 @@ func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
 	body := RenderPlanComment(primary)
 	assert.LessOrEqual(t, len(body), commentBodyLimit)
 
-	first, rest, found := strings.Cut(body, "#### `primary/orders_2`")
+	first, rest, found := strings.Cut(body, "### Target `primary/orders_2`")
 	require.True(t, found, body)
-	middle, last, found := strings.Cut(rest, "#### `primary/orders_3`")
+	middle, last, found := strings.Cut(rest, "### Target `primary/orders_3`")
 	require.True(t, found, body)
 
 	assert.Contains(t, first, "the full plan for this target is available from the CLI with `schemabot list-plans -e production plan_reviewed`.")

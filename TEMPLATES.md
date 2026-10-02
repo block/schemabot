@@ -1864,9 +1864,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-#### 2 of 3 targets
-
-`primary/testapp_1`, `primary/testapp_2`
+### 2 of 3 targets: `primary/testapp_1`, `primary/testapp_2`
 
 ```sql
 CREATE TABLE `users` (
@@ -1897,7 +1895,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-#### `primary/testapp_3`
+### Target `primary/testapp_3`
 
 No schema changes detected
 
@@ -1923,9 +1921,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-#### 2 of 3 targets
-
-`primary/testapp_2`, `primary/testapp_3`
+### 2 of 3 targets: `primary/testapp_2`, `primary/testapp_3`
 
 ```sql
 CREATE TABLE `users` (
@@ -1956,7 +1952,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-#### `primary/testapp_1`
+### Target `primary/testapp_1`
 
 No schema changes detected
 
@@ -1982,15 +1978,13 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-#### 2 of 3 targets
-
-`primary/testapp_1`, `primary/testapp_2`
+### 2 of 3 targets: `primary/testapp_1`, `primary/testapp_2`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ```
 
-#### `primary/testapp_3`
+### Target `primary/testapp_3`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
@@ -2022,9 +2016,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-#### 2 targets
-
-`primary/testapp_1`, `primary/testapp_2`
+### 2 targets: `primary/testapp_1`, `primary/testapp_2`
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -2060,9 +2052,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-#### 3 targets
-
-`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`
+### 3 targets: `primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -8137,9 +8127,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-#### 8 of 64 targets
-
-`orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`
+#### 8 of 64 targets: `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 

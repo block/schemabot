@@ -712,8 +712,8 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetsDivergeByChange(t *tes
 		nil,
 	)
 
-	assert.Contains(t, out, "#### 2 of 4 targets\n\n`testapp-001`, `testapp-003`\n\n**`orders`**: ")
-	assert.Contains(t, out, "#### `testapp-002`\n\n**`orders`**: ")
+	assert.Contains(t, out, "#### 2 of 4 targets: `testapp-001`, `testapp-003`\n\n**`orders`**: ")
+	assert.Contains(t, out, "#### Target `testapp-002`\n\n**`orders`**: ")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `note`"))
 	assert.Equal(t, 1, strings.Count(out, "ADD INDEX `idx_note`"))
 	assert.NotContains(t, out, "testapp-004`**", "a target without detail is not a change of its own")

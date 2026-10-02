@@ -153,7 +153,7 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesAfterConfirmation(t *testing
 	assert.Contains(t, body, "The reviewed target already has this schema")
 	assert.Contains(t, body, "ADD COLUMN `email`", "the comment shows the plan us would run")
 	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
-	assert.Contains(t, body, "#### `eu`\n\nNo schema changes detected\n\n", "eu is shown already at the desired schema")
+	assert.Contains(t, body, "### Target `eu`\n\nNo schema changes detected\n\n", "eu is shown already at the desired schema")
 	assert.NotContains(t, body, "✅ **No schema changes detected**", "a target still has work, so the comment never closes as a no-op")
 
 	requireNoApplies(t, svc, dbName)
@@ -395,8 +395,8 @@ func TestE2EAutoPlanPostsCommentWhenOnlyAnotherTargetHasWork(t *testing.T) {
 		action: "opened", headSHA: "abc123", headRef: "feature-branch",
 	}, nil))
 
-	body := awaitCommentContaining(t, result, "#### `us`\n\n```sql\n")
-	assert.Contains(t, body, "#### `eu`\n\nNo schema changes detected\n\n")
+	body := awaitCommentContaining(t, result, "### Target `us`\n\n```sql\n")
+	assert.Contains(t, body, "### Target `eu`\n\nNo schema changes detected\n\n")
 	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 }
 

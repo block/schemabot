@@ -234,8 +234,9 @@ type PlanCommentData struct {
 	MemberApplyRefusal string
 
 	// namespaceLabelsInline renders each keyspace's label as a bold line
-	// rather than a heading, for changes rendered under a target group's
-	// heading so the label never outranks the heading it sits under.
+	// rather than a heading, for changes under a target group heading that
+	// already sits at the namespace heading's level, so the label never
+	// outranks the heading it sits under.
 	namespaceLabelsInline bool
 }
 
@@ -1735,27 +1736,28 @@ func writeNamespaceLabel(sb *strings.Builder, data PlanCommentData, label, value
 	}
 }
 
-// writeTargetGroupHeading heads the targets of a rollout that run one plan. A
-// lone target is the heading; a group is headed by how many targets it holds,
-// and how many the rollout has when it holds only some, with the names on
-// their own line under it, collapsed when too many to read inline. The names
-// stay whole, as an operator addresses each target.
-func writeTargetGroupHeading(sb *strings.Builder, members []string, total int) {
+// writeTargetGroupHeading heads the targets of a rollout that run one plan, at
+// the given heading level: one level above the namespaces under it, so each
+// target group reads as its own section. A lone target is named in the
+// heading; a group is headed by how many targets it holds, and how many the
+// rollout has when it holds only some, followed by the names, collapsed under
+// the heading when too many to read in it. The names stay whole, as an
+// operator addresses each target.
+func writeTargetGroupHeading(sb *strings.Builder, level string, members []string, total int) {
 	if len(members) == 1 {
-		fmt.Fprintf(sb, "#### %s\n\n", inlineCode(members[0]))
+		fmt.Fprintf(sb, "%s Target %s\n\n", level, inlineCode(members[0]))
 		return
 	}
 	count := presentation.CoveragePhrase(targetNoun, len(members), total)
 	if len(members) == total {
 		count = fmt.Sprintf("%d %s", total, targetNoun.Plural)
 	}
-	fmt.Fprintf(sb, "#### %s\n\n", count)
 	names := strings.Join(inlineCodeList(members), ", ")
 	if len(members) <= shardNamesInlineLimit {
-		fmt.Fprintf(sb, "%s\n\n", names)
+		fmt.Fprintf(sb, "%s %s: %s\n\n", level, count, names)
 		return
 	}
-	fmt.Fprintf(sb, "<details>\n<summary>Target names</summary>\n\n%s\n\n</details>\n\n", names)
+	fmt.Fprintf(sb, "%s %s\n\n<details>\n<summary>Target names</summary>\n\n%s\n\n</details>\n\n", level, count, names)
 }
 
 func writeGroupHeading(sb *strings.Builder, noun presentation.Noun, members []string, total int) {
@@ -1994,14 +1996,22 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 	slices.SortStableFunc(plans, func(a, b DeploymentPlanGroup) int {
 		return compareWorkFirst(a.Empty(), b.Empty())
 	})
+	// A target group sits one level above its namespaces. In a plan of its
+	// own that is a section heading over namespace headings; inside an
+	// environment's section it drops a level, and its namespaces become
+	// bold labels so none outranks the target it sits under.
+	level, namespaceLabelsInline := "###", false
+	if collapse {
+		level, namespaceLabelsInline = "####", true
+	}
 	for _, g := range plans {
-		writeTargetGroupHeading(sb, g.Members, len(drift.Deployments))
+		writeTargetGroupHeading(sb, level, g.Members, len(drift.Deployments))
 		if g.Empty() {
 			sb.WriteString(groupNoChanges + "\n\n")
 			continue
 		}
 		group := data
-		group.namespaceLabelsInline = true
+		group.namespaceLabelsInline = namespaceLabelsInline
 		group.Changes = targetPlanChanges(g, data)
 		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)
