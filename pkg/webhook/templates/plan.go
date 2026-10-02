@@ -24,6 +24,14 @@ type LintViolationData struct {
 	Table      string
 	LinterName string
 	CanAutoFix bool
+	// Targets names the rollout targets that raised this finding, for a target
+	// plan group in which only some targets do. Empty when every target in its
+	// group raised it, or for a plan that is not a target plan group's.
+	Targets []string
+	// TotalTargets is how many targets the group holds, so a subset too wide
+	// to name reads as coverage ("3 of 12 targets"). Zero when Targets is
+	// empty.
+	TotalTargets int
 }
 
 // UnsafeChangeData represents a destructive schema change for template rendering.
@@ -618,10 +626,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// Lint violations — shown on the plan comment for review, omitted on the
 	// locked apply comment where they are noise (the operator already reviewed
 	// them at plan time).
-	// Target plans disclose each group's lint under its own plan, the
-	// primary's included, so the plan-wide section would repeat one group's.
-	if len(data.LintViolations) > 0 && !data.IsLocked && !targetPlans {
-		writeLintViolations(&sb, data.LintViolations)
+	if !data.IsLocked {
+		writeLintViolations(&sb, planWideLint(data.LintViolations, data.DeploymentDrift, targetPlans))
 	}
 
 	// Errors
@@ -2049,10 +2055,14 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 	if collapse {
 		level, namespaceLabelsInline = "####", true
 	}
+	shared := sharedTargetLint(drift.Plans)
 	for _, g := range plans {
 		writeTargetGroupHeading(sb, level, g.Members, len(drift.Deployments))
 		if g.Empty() {
 			sb.WriteString(groupNoChanges + "\n\n")
+			if !data.IsLocked {
+				writeLintViolations(sb, groupOwnLint(g, shared))
+			}
 			if g.Primary {
 				writePrimaryTargetDisclosures(sb, data, g)
 			}
@@ -2083,10 +2093,11 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if len(g.DirectChanges) > 0 {
 			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 		}
-		// Lint reads each target's live schema, so a group's findings are
-		// disclosed under its own plan rather than once for the primary's.
-		if len(g.LintViolations) > 0 && !data.IsLocked {
-			writeLintViolations(sb, g.LintViolations)
+		// Lint reads each target's live schema, so a finding not every target
+		// raised is disclosed under the group whose targets raised it; the
+		// plan-wide section carries the ones every target shares.
+		if !data.IsLocked {
+			writeLintViolations(sb, groupOwnLint(g, shared))
 		}
 		// So is an unsafe change, which `--allow-unsafe` consents to on every
 		// target. The primary's group discloses its own with the reviewed
@@ -2608,13 +2619,16 @@ const lintWarningsFoldThreshold = 5
 // table prefixes, and identifiers as inline code.
 func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	n := len(warnings)
+	if n == 0 {
+		return
+	}
 
 	if n <= lintWarningsFoldThreshold {
 		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: %d advisory %s\n", n, pluralize("finding", n))
 		for _, w := range warnings {
 			message := ui.CodeQuoteIdentifiers(w.Message)
-			if w.Table != "" {
-				fmt.Fprintf(sb, "- %s: %s\n", inlineCode(w.Table), message)
+			if label := lintLabel(w.Table, w); label != "" {
+				fmt.Fprintf(sb, "- %s: %s\n", label, message)
 			} else {
 				fmt.Fprintf(sb, "- %s\n", message)
 			}
@@ -2630,8 +2644,12 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 		if group.table != "" {
 			fmt.Fprintf(sb, "**%s**\n", inlineCode(group.table))
 		}
-		for _, message := range group.messages {
-			fmt.Fprintf(sb, "- %s\n", ui.CodeQuoteIdentifiers(message))
+		for _, w := range group.warnings {
+			if label := lintLabel("", w); label != "" {
+				fmt.Fprintf(sb, "- %s: %s\n", label, ui.CodeQuoteIdentifiers(w.Message))
+			} else {
+				fmt.Fprintf(sb, "- %s\n", ui.CodeQuoteIdentifiers(w.Message))
+			}
 		}
 		sb.WriteString("\n")
 	}
@@ -2640,7 +2658,78 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 
 type lintWarningGroup struct {
 	table    string
-	messages []string
+	warnings []LintViolationData
+}
+
+// lintLabel is the label a lint finding's line leads with: its table, if
+// given, and the targets that raised it when only some of its group's did.
+func lintLabel(table string, w LintViolationData) string {
+	var label string
+	if table != "" {
+		label = inlineCode(table)
+	}
+	if len(w.Targets) == 0 {
+		return label
+	}
+	targets := planGroupList(targetNoun, w.Targets, w.TotalTargets)
+	if label == "" {
+		return "on " + targets
+	}
+	return label + " on " + targets
+}
+
+// planWideLint is the lint section a plan carries outside its target plans.
+// A plan that renders target plans carries only the findings every target
+// raised, since each group discloses the rest under its own plan.
+func planWideLint(own []LintViolationData, drift *DeploymentDriftData, targetPlans bool) []LintViolationData {
+	if !targetPlans {
+		return own
+	}
+	return sharedTargetLint(drift.Plans)
+}
+
+// sharedTargetLint lists the findings every target with work raised: each
+// group with work carries it for all of its targets. Lint findings are almost
+// always about the schema every target is brought to, so these are disclosed
+// once for the plan rather than repeated under each group, in the first
+// group's order. A target already at the schema has no changes to lint, so it
+// does not keep a finding from being shared.
+func sharedTargetLint(groups []DeploymentPlanGroup) []LintViolationData {
+	withWork := slices.DeleteFunc(slices.Clone(groups), DeploymentPlanGroup.Empty)
+	if len(withWork) == 0 {
+		return nil
+	}
+	var shared []LintViolationData
+	for _, f := range withWork[0].LintViolations {
+		if !slices.ContainsFunc(withWork, func(g DeploymentPlanGroup) bool { return !raisedByWholeGroup(g, f) }) {
+			shared = append(shared, f)
+		}
+	}
+	return shared
+}
+
+// groupOwnLint lists a group's findings that are not disclosed plan-wide:
+// those only some targets raised, each naming the targets that raised it.
+func groupOwnLint(g DeploymentPlanGroup, shared []LintViolationData) []LintViolationData {
+	var own []LintViolationData
+	for _, f := range g.LintViolations {
+		if !slices.ContainsFunc(shared, func(s LintViolationData) bool { return sameLintFinding(s, f) }) {
+			own = append(own, f)
+		}
+	}
+	return own
+}
+
+// raisedByWholeGroup reports whether every target in the group raised the
+// finding.
+func raisedByWholeGroup(g DeploymentPlanGroup, f LintViolationData) bool {
+	return slices.ContainsFunc(g.LintViolations, func(own LintViolationData) bool {
+		return sameLintFinding(own, f) && len(own.Targets) == 0
+	})
+}
+
+func sameLintFinding(a, b LintViolationData) bool {
+	return a.Table == b.Table && a.Message == b.Message
 }
 
 // groupLintWarningsByTable groups warnings by table in first-appearance order,
@@ -2656,7 +2745,7 @@ func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
 			index[w.Table] = i
 			groups = append(groups, lintWarningGroup{table: w.Table})
 		}
-		groups[i].messages = append(groups[i].messages, w.Message)
+		groups[i].warnings = append(groups[i].warnings, w)
 	}
 	// Untabled warnings read as general notes; surface them first rather
 	// than wherever they happened to appear in the linter output.
@@ -2997,10 +3086,8 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.DatabaseType, plan.IsMySQL)
 	}
 
-	// Lint violations. Target plans disclose each group's under its own plan.
-	if len(plan.LintViolations) > 0 && !targetPlans {
-		writeLintViolations(sb, plan.LintViolations)
-	}
+	// Lint violations.
+	writeLintViolations(sb, planWideLint(plan.LintViolations, plan.DeploymentDrift, targetPlans))
 
 	// Errors
 	if len(plan.Errors) > 0 {

@@ -308,46 +308,85 @@ func TestReviewDriftComment_VerdictInTwoNamespacesNamesItsTargetOnce(t *testing.
 
 // Lint reads each target's live schema beside the changes it would run, so two
 // targets running the same DDL can raise different findings, and a target with
-// different DDL raises its own. Each group's findings render under that group's
-// plan, every finding once however many of its targets raise it, and the
-// primary's findings are not repeated in a plan-wide section. Error-severity
-// findings are unsafe changes, disclosed and gated as such, so they stay out of
-// the advisory list.
+// different DDL raises its own. A finding not every target raised renders under
+// the group whose targets raised it, once however many of them did, and names
+// them when only some of the group's targets did. Error-severity findings are
+// unsafe changes, disclosed and gated as such, so they stay out of the advisory
+// list.
 func TestReviewDriftComment_EachTargetGroupDisclosesItsOwnLint(t *testing.T) {
-	lint := func(table, message, severity string) *ternv1.LintViolation {
-		return &ternv1.LintViolation{Table: table, Message: message, Severity: severity, Linter: "test"}
-	}
 	primary := independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false)
-	primary.LintViolations = []*ternv1.LintViolation{lint("orders", "column `email` should not be nullable", "warning")}
+	primary.LintViolations = []*ternv1.LintViolation{memberLint("orders", "column `email` should not be nullable", "warning")}
 	second := independentMemberDiff("orders-002", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false)
 	second.LintViolations = []*ternv1.LintViolation{
-		lint("orders", "table has no index on `phone`", "warning"),
-		lint("orders", "column `phone` is unsafe", "error"),
+		memberLint("orders", "table has no index on `phone`", "warning"),
+		memberLint("orders", "column `phone` is unsafe", "error"),
 	}
 	third := independentMemberDiff("orders-003", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false)
 	third.LintViolations = []*ternv1.LintViolation{
-		lint("orders", "table has no index on `phone`", "warning"),
-		lint("orders", "table `orders` has no primary key", "warning"),
+		memberLint("orders", "table has no index on `phone`", "warning"),
+		memberLint("orders", "table `orders` has no primary key", "warning"),
 	}
-	diffs := []api.DeploymentPlanDiff{primary, second, third}
+	body := renderLintComment(t, primary, second, third)
+	group, primarySection, found := strings.Cut(body, "### Target `commerce/orders-001`")
+	require.True(t, found, "the primary renders under its own heading")
+
+	assert.Contains(t, group, "💡 **Lint Warnings**: 2 advisory findings\n- `orders`: table has no index on `phone`\n- `orders` on target `commerce/orders-003`: table `orders` has no primary key\n",
+		"the group discloses each finding its targets raised once, naming the target when only one of them raised it")
+	assert.NotContains(t, body, "is unsafe", "an error-severity finding is an unsafe change, not advisory lint")
+	assert.Contains(t, primarySection, "💡 **Lint Warnings**: 1 advisory finding\n- `orders`: column `email` should not be nullable\n",
+		"the primary's findings render under the primary's plan")
+	assert.Equal(t, 2, strings.Count(body, "**Lint Warnings**"), "no plan-wide section repeats a group's findings")
+}
+
+// A finding every target with work raises is about the schema they are all
+// brought to, so it renders once for the plan instead of under every group. A
+// target already at the schema has nothing to lint and does not keep it from
+// being shared. A finding one target raises from its own live state, such as
+// an auto-increment counter near its type's capacity, stays under that
+// target's group and names it.
+func TestReviewDriftComment_LintEveryTargetRaisesRendersOnce(t *testing.T) {
+	const shared = "table `orders` has no primary key"
+	const counter = "AUTO_INCREMENT value 1932735283 is above 85% of the capacity (2147483647) of the auto-inc column's `int` data type"
+	primary := independentMemberDiff("orders-001", "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)", false)
+	primary.LintViolations = []*ternv1.LintViolation{memberLint("orders", shared, "warning")}
+	second := independentMemberDiff("orders-002", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false)
+	second.LintViolations = []*ternv1.LintViolation{memberLint("orders", shared, "warning")}
+	third := independentMemberDiff("orders-003", "ALTER TABLE `orders` ADD COLUMN `phone` varchar(32)", false)
+	third.LintViolations = []*ternv1.LintViolation{memberLint("orders", shared, "warning"), memberLint("orders", counter, "warning")}
+	converged := api.DeploymentPlanDiff{DatabaseType: "mysql", Deployment: "commerce", Target: "orders-004"}
+
+	body := renderLintComment(t, primary, second, third, converged)
+
+	assert.Equal(t, 1, strings.Count(body, shared), "a finding every target with work raises is disclosed once")
+	assert.Contains(t, body, "💡 **Lint Warnings**: 1 advisory finding\n- `orders`: "+shared+"\n",
+		"the shared finding renders plan-wide, naming no target")
+	group, _, found := strings.Cut(body, "### Target `commerce/orders-001`")
+	require.True(t, found, "the primary renders under its own heading")
+	assert.Contains(t, group, "- `orders` on target `commerce/orders-003`: AUTO_INCREMENT value 1932735283",
+		"a finding one target raises names it")
+	assert.Equal(t, 2, strings.Count(body, "**Lint Warnings**"), "one shared section and one for the group the counter finding is in")
+}
+
+func memberLint(table, message, severity string) *ternv1.LintViolation {
+	return &ternv1.LintViolation{Table: table, Message: message, Severity: severity, Linter: "test"}
+}
+
+// renderLintComment rolls independent members up and renders the plan comment,
+// with the primary's own findings as the plan response carries them.
+func renderLintComment(t *testing.T, diffs ...api.DeploymentPlanDiff) string {
+	t.Helper()
 	rollup, err := api.RollupDeploymentDiffs(diffs, driftMembers(diffs), api.PlanIndependent)
 	require.NoError(t, err)
-
-	body := templates.RenderPlanComment(templates.PlanCommentData{
+	var primaryLint []templates.LintViolationData
+	for _, v := range diffs[0].LintViolations {
+		primaryLint = append(primaryLint, templates.LintViolationData{Table: v.GetTable(), Message: v.GetMessage()})
+	}
+	return templates.RenderPlanComment(templates.PlanCommentData{
 		Database:        "orders",
 		Environment:     "production",
 		IsMySQL:         true,
 		DatabaseType:    "mysql",
-		LintViolations:  []templates.LintViolationData{{Table: "orders", Message: "column `email` should not be nullable"}},
+		LintViolations:  primaryLint,
 		DeploymentDrift: deploymentDriftPreview(rollup),
 	})
-	group, primarySection, found := strings.Cut(body, "### Target `commerce/orders-001`")
-	require.True(t, found, "the primary renders under its own heading")
-
-	assert.Contains(t, group, "💡 **Lint Warnings**: 2 advisory findings\n- `orders`: table has no index on `phone`\n- `orders`: table `orders` has no primary key\n",
-		"the group discloses each finding its targets raised, once")
-	assert.NotContains(t, body, "is unsafe", "an error-severity finding is an unsafe change, not advisory lint")
-	assert.Contains(t, primarySection, "💡 **Lint Warnings**: 1 advisory finding\n- `orders`: column `email` should not be nullable\n",
-		"the primary's findings render under the primary's plan")
-	assert.Equal(t, 2, strings.Count(body, "**Lint Warnings**"), "no plan-wide section repeats the primary's findings")
 }
