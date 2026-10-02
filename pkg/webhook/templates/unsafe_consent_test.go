@@ -95,7 +95,7 @@ func TestRenderPlanComment_UnsafeConsentLeadsWithReplanForAttributedChanges(t *t
 	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790}}
 	out := RenderPlanComment(*data)
 
-	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, first resolve the changes listed under **Check before applying**, then re-plan. If undoing them is intended, comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on `transfer_events` and `refund_backfill`:")
+	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, first resolve **Check before applying** and re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added:\n```\nschemabot apply -e staging\n```")
 	assert.Contains(t, out, "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR", "the section the instruction points at is on the comment")
 	for _, block := range fencedCommands(t, out) {
 		assert.NotContains(t, block, "--allow-unsafe")
@@ -167,7 +167,7 @@ func TestRenderPlanComment_UnsafeConsentAccurateForUnknownAndMultipleOwners(t *t
 		{Table: "ledger", Unresolved: true},
 	}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "first resolve the changes listed under **Check before applying**, then re-plan.")
+	assert.Contains(t, out, "first resolve **Check before applying** and re-plan.")
 	assert.Contains(t, out, "`ledger`: ownership could not be established")
 	_, footer, found := strings.Cut(out, "▶️ **To apply**")
 	require.True(t, found, "the comment offers an apply")

@@ -626,7 +626,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply** all schema changes from this PR, first resolve the changes listed under **Check before applying**, then re-plan. If undoing them is intended, comment the command below with `--allow-unsafe` added to confirm the 2 unsafe changes on `orders` and `reconcile_state`:
+▶️ **To apply** all schema changes from this PR, first resolve **Check before applying** and re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added:
 ```
 schemabot apply -e staging
 ```

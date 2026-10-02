@@ -721,11 +721,13 @@ func (c unsafeConsent) instruction() string {
 	if c.findings > 1 {
 		confirm = fmt.Sprintf("the %d unsafe changes on %s", c.findings, c.tables)
 	}
-	add := "comment the command below with `--allow-unsafe` added to confirm " + confirm
 	if c.unattributed {
-		return "first resolve the changes listed under **Check before applying**, then re-plan. If undoing them is intended, " + add
+		// The attribution section and the unsafe findings sit just above and
+		// already list what the flag confirms, so the instruction only says
+		// what to do.
+		return "first resolve **Check before applying** and re-plan. To apply as planned anyway, comment the command below with `--allow-unsafe` added"
 	}
-	return add
+	return "comment the command below with `--allow-unsafe` added to confirm " + confirm
 }
 
 // unsafeChangeTables names what the unsafe changes touch, each once in
