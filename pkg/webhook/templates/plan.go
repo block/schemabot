@@ -330,8 +330,9 @@ type DeploymentPlanGroup struct {
 	BlockedChanges []BlockedChangeData
 	// UnsafeChanges are the group's changes that need `--allow-unsafe`, each
 	// naming the targets that carry it when that is not all of them. The
-	// reviewed plan's own are disclosed plan-wide, so the primary group's are
-	// not rendered under it.
+	// reviewed plan's own are disclosed plan-wide, so under the primary group
+	// only those its other targets carry without the reviewed target are
+	// rendered (unsafeBeyondReviewedPlan).
 	UnsafeChanges []UnsafeChangeData
 	// PlanID is the identifier of the stored plan the group's first member
 	// would run, so DDL cut to fit the comment names the command that prints
@@ -2078,8 +2079,8 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		// target. The reviewed plan's own are already disclosed plan-wide, and
 		// the locked comment omits them as it omits the reviewed plan's: the
 		// apply reached it only under the opt-in.
-		if !g.Primary && len(g.UnsafeChanges) > 0 && !data.IsLocked {
-			writeUnsafeWarning(sb, g.UnsafeChanges, data.DatabaseType, data.IsMySQL)
+		if unsafe := g.unsafeBeyondReviewedPlan(); len(unsafe) > 0 && !data.IsLocked {
+			writeUnsafeWarning(sb, unsafe, data.DatabaseType, data.IsMySQL)
 		}
 	}
 }
@@ -2094,16 +2095,40 @@ func TargetPlanUnsafeChanges(drift *DeploymentDriftData) []UnsafeChangeData {
 	}
 	var out []UnsafeChangeData
 	for _, g := range drift.Plans {
-		if g.Primary {
-			continue
-		}
-		for _, c := range g.UnsafeChanges {
+		for _, c := range g.unsafeBeyondReviewedPlan() {
 			if len(c.Targets) == 0 {
 				c.Targets = slices.Clone(g.Members)
 				c.TotalTargets = 0
 			}
 			out = append(out, c)
 		}
+	}
+	return out
+}
+
+// unsafeBeyondReviewedPlan lists the group's unsafe changes the reviewed plan
+// does not already disclose. That is every one of a group other than the
+// reviewed target's. The reviewed target's group shares its DDL, but each
+// target's unsafe verdict is read from that target's own schema, so a sibling
+// can find a statement unsafe that the reviewed target does not: those are the
+// changes listed with targets that leave the reviewed target, its first
+// member, out.
+func (g DeploymentPlanGroup) unsafeBeyondReviewedPlan() []UnsafeChangeData {
+	if !g.Primary {
+		return g.UnsafeChanges
+	}
+	if len(g.Members) == 0 {
+		return nil
+	}
+	reviewed := g.Members[0]
+	var out []UnsafeChangeData
+	for _, c := range g.UnsafeChanges {
+		// A change every member carries names no targets, and the reviewed
+		// target is one of them.
+		if len(c.Targets) == 0 || slices.Contains(c.Targets, reviewed) {
+			continue
+		}
+		out = append(out, c)
 	}
 	return out
 }

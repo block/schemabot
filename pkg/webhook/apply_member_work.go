@@ -458,6 +458,7 @@ const (
 	workUnchanged     workDifference = ""
 	workStatements    workDifference = "its statements"
 	workExecutionMode workDifference = "how its statements run"
+	workUnsafe        workDifference = "which of its statements are unsafe"
 	workFinalizer     workDifference = "which namespaces it finalizes"
 	workVSchema       workDifference = "the VSchema it writes"
 )
@@ -466,7 +467,9 @@ const (
 // for one target differ, or workUnchanged when they run the same work. It
 // compares everything an apply created from the plan executes and the comment
 // shows: the table changes and each shard's own changes, byte for byte, then
-// how each of those statements runs, then which namespaces end with a
+// how each of those statements runs, then each statement's unsafe verdict and
+// reason, which the target's schema decides and can change without changing
+// the statement, then which namespaces end with a
 // finalizer, and the VSchema each of those writes with the record of what that
 // VSchema change does. A difference in spelling alone refuses too, which only
 // ever sends the operator back to review.
@@ -476,6 +479,9 @@ func memberWorkDifference(a, b *storage.Plan) workDifference {
 	}
 	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameTableChange) || !sameShardChanges(a.Shards, b.Shards, sameTableChange) {
 		return workExecutionMode
+	}
+	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameUnsafeVerdict) || !sameShardChanges(a.Shards, b.Shards, sameUnsafeVerdict) {
+		return workUnsafe
 	}
 	if !slices.Equal(a.FinalizerNamespaces(), b.FinalizerNamespaces()) {
 		return workFinalizer
@@ -513,4 +519,11 @@ func sameStatement(a, b storage.TableChange) bool {
 // same way.
 func sameTableChange(a, b storage.TableChange) bool {
 	return sameStatement(a, b) && a.ExecutionMode == b.ExecutionMode
+}
+
+// sameUnsafeVerdict reports whether two table changes run the same statement
+// the same way and carry the same unsafe verdict and reason, so an opt-in given
+// for one consents to exactly the consequences of the other.
+func sameUnsafeVerdict(a, b storage.TableChange) bool {
+	return sameTableChange(a, b) && a.IsUnsafe == b.IsUnsafe && a.UnsafeReason == b.UnsafeReason
 }

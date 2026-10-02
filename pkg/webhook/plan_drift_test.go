@@ -711,6 +711,46 @@ func TestDeploymentPlanGroups_DiscloseEachTargetsUnsafeChanges(t *testing.T) {
 		"the gate's list names the targets, since it renders beside the reviewed plan's changes")
 }
 
+// Targets that run the same DDL share a group, but each target's unsafe
+// verdict is read from its own schema: dropping an index is unsafe only where
+// the index is visible. A sibling that finds the reviewed target's statement
+// unsafe when the reviewed target does not is disclosed under the reviewed
+// target's group, naming the sibling, and the unsafe gate counts it, so
+// --allow-unsafe never consents to a consequence the comment left out. A
+// verdict the reviewed target shares is already disclosed plan-wide.
+func TestDeploymentPlanGroups_DisclosesASiblingsUnsafeVerdictInTheReviewedGroup(t *testing.T) {
+	dropIndex := "ALTER TABLE `users` DROP INDEX `idx_email`"
+	const visible = "drop_index: index idx_email is visible"
+	reviewed := plannedMember("ski", "users-001", dropIndex)
+	sibling := plannedMember("ski", "users-002", dropIndex)
+	sibling.ChangeSet.Changes[0].TableChanges[0].IsUnsafe = true
+	sibling.ChangeSet.Changes[0].TableChanges[0].UnsafeReason = visible
+
+	groups := deploymentPlanGroups(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{reviewed, sibling}})
+	require.Len(t, groups, 1, "the targets run the same DDL")
+	drift := &templates.DeploymentDriftData{Computed: true, Clean: true, Independent: true, Plans: groups,
+		Deployments: []templates.DeploymentDriftEntry{{Deployment: "ski", Target: "users-001", Primary: true}, {Deployment: "ski", Target: "users-002"}}}
+
+	listed := templates.TargetPlanUnsafeChanges(drift)
+	require.Len(t, listed, 1)
+	assert.Equal(t, "users", listed[0].Table)
+	assert.Equal(t, visible, listed[0].Reason)
+	assert.Equal(t, []string{"ski/users-002"}, listed[0].Targets)
+
+	out := templates.RenderPlanComment(templates.PlanCommentData{
+		Database: "users", Environment: "production", DatabaseType: "vitess",
+		Changes:         groups[0].Changes,
+		DeploymentDrift: drift,
+	})
+	assert.Contains(t, out, "1. `users` on target `ski/users-002`: "+visible+"\n", out)
+
+	shared := plannedMember("ski", "users-001", dropIndex)
+	shared.ChangeSet.Changes[0].TableChanges[0].IsUnsafe = true
+	shared.ChangeSet.Changes[0].TableChanges[0].UnsafeReason = visible
+	drift.Plans = deploymentPlanGroups(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{shared, sibling}})
+	assert.Empty(t, templates.TargetPlanUnsafeChanges(drift), "a verdict the reviewed target carries is the reviewed plan's own")
+}
+
 // A drop is unsafe on a target whose engine left the verdict unset, the same
 // fallback the reviewed plan's changes get, and a change only some of a
 // group's targets carry names them.

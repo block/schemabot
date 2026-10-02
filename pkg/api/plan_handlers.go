@@ -570,7 +570,7 @@ type ApplyRequest struct {
 	ExpectedPendingPlanID string `json:"-"`
 	// ConfirmedMemberWork is an internal webhook guard, set only by a pull
 	// request apply-confirm that checked the confirmation against every other
-	// target's statements and execution modes, on a comment disclosing each
+	// target's statements, execution modes and unsafe verdicts, on a comment disclosing each
 	// target's direct and unsafe changes under that target. Without it, apply
 	// creation refuses another target's direct-execution change, and an unsafe
 	// change the reviewed plan does not carry: no other caller confirms them.
@@ -1875,8 +1875,8 @@ func (s *Service) createStoredApply(
 	// runs the statement (RV-4), so its task carries it, whether or not the
 	// reviewed plan has work. Only a pull request apply-confirm confirms it:
 	// that comment names each target's direct changes under that target, and
-	// the confirm re-checks each target's statements and execution modes
-	// against the confirmed round before it creates the apply. No other caller
+	// the confirm re-checks each target's statements, execution modes and
+	// unsafe verdicts against the confirmed round before it creates the apply. No other caller
 	// confirms another target's direct change, the CLI included, though it
 	// shows each target's notice, so a member's direct change is refused for
 	// it, and runs from an apply narrowed to that member.
@@ -2269,7 +2269,7 @@ func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 // change. Blocked changes never run. Unsafe and direct-execution changes are
 // not refused: the plan comment discloses each under the member that runs it,
 // an unsafe change still needs the opt-in, and apply-confirm re-checks that
-// each member's statements and execution modes are the ones confirmed. A
+// each member's statements, execution modes and unsafe verdicts are the ones confirmed. A
 // caller shown only the reviewed plan is refused a member's unsafe change at
 // apply creation instead (rejectMemberUndisclosedUnsafe).
 func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
