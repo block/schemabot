@@ -58,7 +58,7 @@ func (g collationGroup) makesSameMove(table string, c CollationChangeData) bool 
 // called out rather than left unsaid.
 //
 // Like the size section, it renders nothing on a locked comment that applies
-// without confirmation, and in a rollout it describes the reviewed target.
+// without confirmation, and in a rollout it describes the primary target.
 func writeCollationChangesSection(sb *strings.Builder, data PlanCommentData) {
 	if data.applyingWithoutConfirmation() {
 		return
@@ -68,7 +68,7 @@ func writeCollationChangesSection(sb *strings.Builder, data PlanCommentData) {
 		return
 	}
 	sb.WriteString("🔤 **Collation changes**")
-	if scope := reviewedTargetSizeScope(data.DeploymentDrift, inlineCode); scope != "" {
+	if scope := primaryTargetSizeScope(data.DeploymentDrift, inlineCode); scope != "" {
 		fmt.Fprintf(sb, " (%s)", scope)
 	}
 	sb.WriteString(": these columns sort and compare under a new collation after the apply.\n")
