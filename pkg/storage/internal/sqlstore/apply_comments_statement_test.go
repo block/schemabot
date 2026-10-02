@@ -44,7 +44,7 @@ func TestApplyCommentUpsertStatement(t *testing.T) {
 			name:    "apply lease selects from the update-locked applies row on PostgreSQL",
 			dialect: PostgresDialect{},
 			leased:  true,
-			want:    insert + "SELECT ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE) " + postgresConflict,
+			want:    insert + "SELECT ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR SHARE) " + postgresConflict,
 		},
 	}
 
