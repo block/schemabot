@@ -513,7 +513,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// disclosure coaches is no longer open.
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
-	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")

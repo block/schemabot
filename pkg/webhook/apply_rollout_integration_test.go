@@ -55,7 +55,9 @@ func runRolloutCommandWithFiles(t *testing.T, svc *api.Service, dbName, command 
 	return runRolloutWebhookWithFiles(t, svc, dbName, buildWebhookRequest(t, webhookPayloadOpts{comment: command, isPR: true}, nil), files)
 }
 
-func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, req *http.Request, files map[string]string) *planFlowResult {
+// register serves anything else the command reads from GitHub, such as the
+// state of another pull request.
+func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, req *http.Request, files map[string]string, register ...func(*http.ServeMux)) *planFlowResult {
 	t.Helper()
 
 	mux := http.NewServeMux()
@@ -69,6 +71,9 @@ func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, r
 
 	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	result := setupFakeGitHubForPlan(t, mux, files, schemabotConfig, dbName)
+	for _, r := range register {
+		r(mux)
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger)
@@ -675,6 +680,59 @@ func TestE2EConvergedPrimaryRunsUnsafeWorkOnAnotherTargetUnderTheOptIn(t *testin
 	requireTaskDDLByDeployment(t, svc, created, map[string][]string{
 		"us": {"ADD COLUMN `email`", "DROP COLUMN `legacy`"},
 	})
+}
+
+// The reviewed primary (eu) is already at the PR's schema, and only us's plan
+// drops a column on `users`, a table another open pull request last changed.
+// Whether a destructive change is this pull request's to make is part of what
+// --allow-unsafe consents to, so the unsafe refusal and the comment the
+// operator confirms both name the other pull request, though the reviewed
+// plan changes nothing.
+func TestE2EAnotherTargetsDestructiveChangeDisclosesAttributedTable(t *testing.T) {
+	dbName := "webhook_rollout_member_attributed"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersWithLegacySchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	now := time.Now()
+	_, err := svc.Storage().Tasks().Create(t.Context(), &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task_%s_%d", dbName, now.UnixNano()),
+		ApplyID:        1,
+		PlanID:         1,
+		Database:       dbName,
+		DatabaseType:   "mysql",
+		Engine:         "spirit",
+		Repository:     "octocat/hello-world",
+		PullRequest:    2,
+		Environment:    driftEnv,
+		State:          state.Task.Completed,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `legacy` varchar(64) DEFAULT NULL",
+		DDLAction:      "alter",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+	command := func(comment string) *planFlowResult {
+		return runRolloutWebhookWithFiles(t, svc, dbName, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil),
+			map[string]string{"users.sql": usersWithEmailSchema}, func(mux *http.ServeMux) { registerOpenPullRequest(mux, 2) })
+	}
+	const owner = "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)"
+
+	body := awaitCommentContaining(t, command("schemabot apply -e "+driftEnv), "Apply rejected")
+	assert.Contains(t, body, "`users` on target `us`", "the refusal names us's unsafe change")
+	assert.Contains(t, body, "⚠️ **Check before applying**")
+	assert.Contains(t, body, owner, "the refusal names the open pull request that last changed the table us would drop a column on")
+
+	body = awaitCapture(t, command("schemabot apply -e "+driftEnv+" --allow-unsafe").comments, "the apply command's answer", func(body string) bool {
+		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied")
+	})
+	require.Contains(t, body, "Confirmation required")
+	assert.Contains(t, body, owner, "the comment the operator confirms names the other pull request too")
+	requireNoApplies(t, svc, dbName)
 }
 
 // The reviewed primary (eu) already has the column and us does not, so the

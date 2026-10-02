@@ -194,7 +194,7 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 		// reviewed one, which can have nothing to run.
 		commentData.DeploymentDrift = rolloutPreview
 	}
-	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, commentData.DeploymentDrift, repo, pr, environment)
 	h.logger.Info("apply blocked by unsafe changes",
 		"repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment,
 		"plan_id", planResp.PlanID, "reviewed_unsafe", len(planResp.UnsafeChanges()), "other_targets_unsafe", len(memberUnsafe))

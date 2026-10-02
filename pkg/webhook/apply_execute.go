@@ -611,7 +611,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
-	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
 	commentData.AllowUnsafe = result.AllowUnsafe
