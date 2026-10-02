@@ -662,7 +662,13 @@ refusing member work the apply's operation shape cannot carry, rather than settl
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
 (`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`);
-the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`).
+the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`); an environment whose
+namespace placement refuses its plan stored as a failing check on every plan command
+(`storeNamespacePlacementCheck` in `pkg/webhook/check_records.go`, called by the single- and
+multi-environment plans in `pkg/webhook/plan.go` on each refusal `planRefusedByNamespacePlacement`
+names), or, when that row cannot be stored, a failing aggregate carrying the same block, which only
+the auto-plan guards release (`failClosedOnNamespacePlacement` and `handleMultiEnvPlan` in
+`pkg/webhook/plan.go`).
 
 ## Apply state machine (ST)
 
@@ -1505,9 +1511,13 @@ after the confirmation stops rather than running something the operator never sa
 `pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
 reviewed target's included, is what the confirmation was given against and carries no consequence
 it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversReviewedTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
-`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`), and apply creation refusing, whatever the flags,
-unsafe changes that the disclosure never named in a plan it did not come from
-(`rejectMemberUndisclosedUnsafe` in `pkg/api/plan_handlers.go`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
+`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
+member's unsafe change requiring the same opt-in as the reviewed plan's, both at the PR gate
+(`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
+`TargetPlanUnsafeChanges` in `pkg/webhook/templates/plan.go`) and at apply creation
+(`rejectUnapplyableMemberPlan` in `pkg/api/plan_handlers.go`), and apply creation refusing,
+whatever the flags, a caller that was not shown a member's plan any unsafe change of that member
+the reviewed plan's disclosure never named (`rejectMemberUndisclosedUnsafe`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
 when `--allow-unsafe` is passed, judged against every unsafe change the plan carries, a divergent
 shard's included (`pkg/cmd/commands/apply.go`, `pkg/cmd/commands/rollback.go`, over
 `PlanResponse.UnsafeChanges` in `pkg/apitypes/apitypes.go`). On the PR-comment rollback path the
@@ -1607,7 +1617,13 @@ a table declared by two desired schema files fails planning on every engine thro
 `pkg/engine/planetscale/plan.go` and `refuseTableDeclaredTwice` in `pkg/engine/postgres/postgres.go`).
 A namespace the plan withholds, through `ignore_namespaces` or a targets entry's selection, is
 refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
-`pkg/tern/local_client.go`).
+`pkg/tern/local_client.go`), and a plan of the schema files proposing to drop a table in a namespace
+the target does not select is refused whatever the data plane build (`refuseDropsOfUnselectedTables`
+in `pkg/api/plan_unselected_drops.go`, for the primary and every member). Where the engine
+locates the tables it drops, a drop it places in an unselected namespace is refused. On every other
+engine a drop is refused by name when an unselected namespace declares that table, ignoring case,
+so there a live table no schema file declares is protected only by the review of its drop. A rollback plan re-plans
+the snapshot its source plan captured, not the schema files, and is not checked this way.
 
 ### RV-9: A rollout member runs only a plan made for it
 

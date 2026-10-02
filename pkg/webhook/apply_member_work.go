@@ -96,22 +96,23 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 // and reviewedTargetConverged says whether that plan is empty.
 //
 // The apply runs each member's stored plan, and the comment the operator
-// confirms renders those plans' statements and nothing else. So work the apply
-// cannot run as planned, and anything whose consent rests on a disclosure that
-// comment does not carry, refuses here: an unsafe change the reviewed plan's
-// disclosure does not name, or an unfinished copy the apply would discard. A
-// direct-execution change is not refused: the comment discloses it under the
-// target that runs it. It is asked before the apply pauses, so a refusal never
+// confirms renders those plans' statements with each target's direct and
+// unsafe changes under it. So work the apply cannot run as planned, and
+// anything whose consent rests on a disclosure that comment does not carry,
+// refuses here: an unfinished copy the apply would discard. A direct-execution
+// or unsafe change is not refused: the comment discloses it under the target
+// that runs it, and an unsafe one needs --allow-unsafe as the reviewed plan's
+// own does. It is asked before the apply pauses, so a refusal never
 // pins a confirmation that could not succeed, and again at confirm against the
 // rollout as it is then.
 //
 // A copy at stake refuses whether or not the reviewed target has work, since
 // the comment discloses only the reviewed plan's discarded copies. The rest is
 // what apply creation asks of each member, which depends on the reviewed plan:
-// an empty one can carry only per-member table work and discloses nothing
+// an empty one can carry only per-member table work
 // (api.MemberWorkAConvergedReviewedPlanCannotRun), and one with work holds each
-// member to its shape and to its disclosure (api.MemberWorkTheReviewedPlanCannotRun).
-// A member's direct change runs under either, as the comment disclosed it.
+// member to its shape (api.MemberWorkTheReviewedPlanCannotRun). Neither refuses
+// a blocked change any less.
 func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment string, rollout reviewDriftOutcome, reviewedTargetConverged bool) (string, error) {
 	if rollout.work.copyAtStake != "" {
 		return rollout.work.copyAtStake, nil
@@ -169,13 +170,42 @@ func (h *Handler) annotateMemberApplyRefusal(ctx context.Context, data *template
 	data.MemberApplyRefusal = refusal
 }
 
+// blockUnsafeWithoutOptIn posts the unsafe-changes refusal and reports true
+// when the apply carries an unsafe change and was not given --allow-unsafe.
+// The unsafe changes are the reviewed plan's and, when the apply runs other
+// targets' own plans, theirs too, each named with the targets that carry it.
+func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, result CommandResult, runsMemberWork bool, rolloutPreview *templates.DeploymentDriftData) bool {
+	if result.AllowUnsafe {
+		return false
+	}
+	var memberUnsafe []templates.UnsafeChangeData
+	if runsMemberWork {
+		memberUnsafe = templates.TargetPlanUnsafeChanges(rolloutPreview)
+	}
+	if len(planResp.UnsafeChanges()) == 0 && len(memberUnsafe) == 0 {
+		return false
+	}
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData.ScopedDatabase = result.Database
+	commentData.UnsafeChanges = append(commentData.UnsafeChanges, memberUnsafe...)
+	commentData.HasUnsafeChanges = true
+	if runsMemberWork {
+		// The refusal shows the plan each target would run, not only the
+		// reviewed one, which can have nothing to run.
+		commentData.DeploymentDrift = rolloutPreview
+	}
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, commentData.DeploymentDrift, repo, pr, environment)
+	h.logger.Info("apply blocked by unsafe changes",
+		"repo", repo, "pr", pr, "database", schemaResult.Database, "database_type", schemaResult.Type, "environment", environment,
+		"plan_id", planResp.PlanID, "reviewed_unsafe", len(planResp.UnsafeChanges()), "other_targets_unsafe", len(memberUnsafe))
+	h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+	return true
+}
+
 // memberWorkRefusalMessage tells the operator why the other targets' work was
 // not run. The refusal names only targets, tables, and namespaces.
-func memberWorkRefusalMessage(refusal string, reviewedTargetConverged bool) string {
-	if reviewedTargetConverged {
-		return fmt.Sprintf("The reviewed target already has this schema, but %s. A PR apply whose reviewed target is already at the desired schema cannot run that or disclose it for confirmation, so nothing was applied. The schema check keeps blocking merge until every target has the change.", refusal)
-	}
-	return fmt.Sprintf("Targets other than the reviewed one have plans of their own, but %s. A PR apply cannot run that or disclose it for confirmation, so nothing was applied. The schema check keeps blocking merge until every target has the change.", refusal)
+func memberWorkRefusalMessage(refusal string) string {
+	return fmt.Sprintf("This PR cannot apply every target's plan: %s, so nothing was applied. An apply runs every target or none. The schema check keeps blocking merge until every target has the change.", refusal)
 }
 
 // pauseForMemberWorkConfirmation holds the lock this apply acquired for an
@@ -428,6 +458,7 @@ const (
 	workUnchanged     workDifference = ""
 	workStatements    workDifference = "its statements"
 	workExecutionMode workDifference = "how its statements run"
+	workUnsafe        workDifference = "which of its statements are unsafe"
 	workFinalizer     workDifference = "which namespaces it finalizes"
 	workVSchema       workDifference = "the VSchema it writes"
 )
@@ -436,7 +467,9 @@ const (
 // for one target differ, or workUnchanged when they run the same work. It
 // compares everything an apply created from the plan executes and the comment
 // shows: the table changes and each shard's own changes, byte for byte, then
-// how each of those statements runs, then which namespaces end with a
+// how each of those statements runs, then each statement's unsafe verdict and
+// reason, which the target's schema decides and can change without changing
+// the statement, then which namespaces end with a
 // finalizer, and the VSchema each of those writes with the record of what that
 // VSchema change does. A difference in spelling alone refuses too, which only
 // ever sends the operator back to review.
@@ -446,6 +479,9 @@ func memberWorkDifference(a, b *storage.Plan) workDifference {
 	}
 	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameTableChange) || !sameShardChanges(a.Shards, b.Shards, sameTableChange) {
 		return workExecutionMode
+	}
+	if !slices.EqualFunc(a.FlatDDLChanges(), b.FlatDDLChanges(), sameUnsafeVerdict) || !sameShardChanges(a.Shards, b.Shards, sameUnsafeVerdict) {
+		return workUnsafe
 	}
 	if !slices.Equal(a.FinalizerNamespaces(), b.FinalizerNamespaces()) {
 		return workFinalizer
@@ -483,4 +519,11 @@ func sameStatement(a, b storage.TableChange) bool {
 // same way.
 func sameTableChange(a, b storage.TableChange) bool {
 	return sameStatement(a, b) && a.ExecutionMode == b.ExecutionMode
+}
+
+// sameUnsafeVerdict reports whether two table changes run the same statement
+// the same way and carry the same unsafe verdict and reason, so an opt-in given
+// for one consents to exactly the consequences of the other.
+func sameUnsafeVerdict(a, b storage.TableChange) bool {
+	return sameTableChange(a, b) && a.IsUnsafe == b.IsUnsafe && a.UnsafeReason == b.UnsafeReason
 }

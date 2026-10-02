@@ -647,18 +647,17 @@ func TestRenderMultiEnvPlanComment_OffersApplyForPendingTargets(t *testing.T) {
 	assert.NotContains(t, out, "schemabot apply -e staging")
 }
 
-// When a PR apply cannot run another target's plan, because that plan carries a
-// change the comment renders without the disclosure its consent rests on, the
-// comment says so in place of the apply command: offering it would coach an
-// apply that is refused whatever its flags.
+// When a PR apply cannot run another target's plan, because that target's
+// engine refuses one of its changes, the comment says so in place of the apply
+// command: offering it would coach an apply that is refused whatever its flags.
 func TestRenderPlanComment_ConvergedPrimaryWithRefusedMemberWorkOffersNoApply(t *testing.T) {
 	data := convergedPrimaryPlanData()
-	data.MemberApplyRefusal = `target primary/testapp_2: its plan carries an unsafe change for table "users"`
+	data.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n**1** table to alter\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 		"the other targets' plans are still shown")
-	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but target primary/testapp\\_2: its plan carries an unsafe change for table \"users\".")
+	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**: target primary/testapp\\_2: its plan carries changes its target's engine refuses.")
 	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
 	assert.NotContains(t, out, "schemabot apply", "an apply that is refused whatever its flags is never offered")
 }
@@ -669,14 +668,14 @@ func TestRenderPlanComment_ConvergedPrimaryWithRefusedMemberWorkOffersNoApply(t 
 func TestRenderMultiEnvPlanComment_RefusedMemberWorkOffersNoApply(t *testing.T) {
 	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
 	refused := convergedPrimaryPlanData()
-	refused.MemberApplyRefusal = `target primary/testapp_2: its plan carries an unsafe change for table "users"`
+	refused.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
 
 	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*PlanCommentData{"staging": converged, "production": &refused},
 	})
-	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**")
+	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**")
 	assert.NotContains(t, out, "schemabot apply")
 	assert.NotContains(t, out, "No changes to apply", "a target still needs the change")
 }
@@ -696,7 +695,7 @@ func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testi
 	refused := func(env string) *PlanCommentData {
 		data := convergedPrimaryPlanData()
 		data.Environment = env
-		data.MemberApplyRefusal = `target primary/testapp_2: its plan carries an unsafe change for table "users"`
+		data.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
 		return &data
 	}
 	render := func(staging, production *PlanCommentData) string {
@@ -717,16 +716,16 @@ func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testi
 	assert.NotContains(t, out, "applies only after")
 }
 
-// The reviewed target has work of its own too, and another target's plan runs a
-// statement directly, which the comment cannot disclose for confirmation. The
-// PR apply is refused whatever its flags, so the comment says why in place of
-// the apply command, without claiming the reviewed target is already done.
+// The reviewed target has work of its own too, and another target's engine
+// refuses one of its plan's changes. The PR apply is refused whatever its
+// flags, so the comment says why in place of the apply command, without
+// claiming the reviewed target is already done.
 func TestRenderPlanComment_ReviewedTargetWithWorkAndRefusedMemberWorkOffersNoApply(t *testing.T) {
 	data := reviewedTargetWithWorkPlanData()
-	data.MemberApplyRefusal = `target primary/testapp_2: its plan runs table "users" as direct-execution DDL`
+	data.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**: targets other than the reviewed one have plans of their own, but target primary/testapp\\_2: its plan runs table \"users\" as direct-execution DDL.")
+	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**: target primary/testapp\\_2: its plan carries changes its target's engine refuses.")
 	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
 	assert.NotContains(t, out, "the reviewed target already has this schema", "the reviewed target still has work")
 	assert.NotContains(t, out, "schemabot apply", "an apply that is refused whatever its flags is never offered")
@@ -737,14 +736,14 @@ func TestRenderPlanComment_ReviewedTargetWithWorkAndRefusedMemberWorkOffersNoApp
 func TestRenderMultiEnvPlanComment_ReviewedTargetWithWorkAndRefusedMemberWorkOffersNoApply(t *testing.T) {
 	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
 	refused := reviewedTargetWithWorkPlanData()
-	refused.MemberApplyRefusal = `target primary/testapp_2: its plan runs table "users" as direct-execution DDL`
+	refused.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
 
 	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*PlanCommentData{"staging": converged, "production": &refused},
 	})
-	assert.Contains(t, out, "⚠️ **This PR cannot apply the other targets' plans**: targets other than the reviewed one have plans of their own")
+	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**")
 	assert.NotContains(t, out, "schemabot apply")
 	assert.NotContains(t, out, "No changes to apply", "every target still needs the change")
 }
@@ -1143,4 +1142,42 @@ func TestRenderPlanComment_TargetPlanFinalizeBesideAnotherTargetsDDLIsCounted(t 
 	out := RenderPlanComment(data)
 	assert.Equal(t, 1, strings.Count(out, keyspaceFinalizeNote), out)
 	assert.Contains(t, out, "📋 **Plan**: **1** table to create, **1** keyspace to finalize across 2 targets\n", out)
+}
+
+// Another target's unsafe change is disclosed under that target's plan, the
+// way a direct change is, so the comment shows every unsafe change the apply
+// would run and still offers the apply: --allow-unsafe consents for every
+// target. A change only some of the group's targets carry names them.
+func TestRenderPlanComment_DisclosesAnotherTargetsUnsafeChangeUnderIt(t *testing.T) {
+	data := convergedPrimaryPlanData()
+	data.DeploymentDrift.Plans[1].UnsafeChanges = []UnsafeChangeData{
+		{Table: "users", Reason: "has_timestamp: column created_at uses TIMESTAMP", ChangeType: "alter"},
+		{Table: "legacy", Reason: "DROP TABLE removes all data", ChangeType: "drop", Targets: []string{"primary/testapp_3"}, TotalTargets: 2},
+	}
+
+	out := RenderPlanComment(data)
+	group := sectionOf(t, out, "### 2 of 3 targets")
+	assert.Contains(t, group, "**Issues**: 2 unsafe changes detected\n1. `users`: has_timestamp: column created_at uses TIMESTAMP\n2. `legacy` on target `primary/testapp_3`: DROP TABLE removes all data\n",
+		"the unsafe changes are listed under the targets that carry them")
+	assert.Contains(t, out, "schemabot apply -e production", "the apply is offered, since --allow-unsafe covers every target")
+	assert.NotContains(t, out, "cannot apply every target")
+}
+
+// The unsafe refusal lists every target's unsafe changes beside the reviewed
+// plan's, naming the targets each other change is on, so an operator who
+// re-runs with --allow-unsafe knows everything it consents to.
+func TestRenderUnsafeChangesBlocked_NamesOtherTargetsChanges(t *testing.T) {
+	data := convergedPrimaryPlanData()
+	data.HasUnsafeChanges = true
+	data.UnsafeChanges = []UnsafeChangeData{
+		{Table: "bikes", Reason: "has_timestamp: column created_at uses TIMESTAMP", ChangeType: "create", Targets: []string{"primary/testapp_2", "primary/testapp_3"}},
+	}
+
+	out := RenderUnsafeChangesBlocked(data)
+	assert.Contains(t, out, "Apply rejected**: 1 unsafe change detected\n1. `bikes` on targets `primary/testapp_2`, `primary/testapp_3`: has_timestamp: column created_at uses TIMESTAMP\n")
+	assert.Contains(t, out, "### 2 of 3 targets\n\n`primary/testapp_2`, `primary/testapp_3`\n\n**1** table to alter\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255);\n```\n",
+		"the refusal shows the plan each target would run")
+	assert.NotContains(t, out, "No schema changes detected\n\n---", "the refusal does not read as a no-op when other targets have work")
+	assert.Equal(t, 1, strings.Count(out, "`bikes`"), "each unsafe change is listed once")
+	assert.Contains(t, out, "schemabot apply -e production --allow-unsafe")
 }

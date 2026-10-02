@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -169,6 +170,59 @@ func (s *Service) memberPullNamespaces(req apitypes.PullSchemaRequest, target ro
 		selected = append(selected, namespace)
 	}
 	return selected
+}
+
+// requireSelectablePullNamespaces refuses an explicitly requested namespace that
+// no targets entry of the environment selects. When every entry selects
+// namespaces, their union is every namespace the environment places, so a name
+// outside it is one no target would be asked for: answering with an empty
+// schema would read as a namespace that exists and holds no tables. An entry
+// selecting nothing holds every namespace, so an environment with one places
+// any name, and a pull of every namespace names none to check.
+func requireSelectablePullNamespaces(req apitypes.PullSchemaRequest, targets []routing.ExecutionTarget, namespaces []string) error {
+	if len(namespaces) == 1 && namespaces[0] == "" {
+		return nil
+	}
+	selectable := map[string]bool{}
+	for _, target := range targets {
+		if len(target.Namespaces) == 0 {
+			return nil
+		}
+		for _, namespace := range target.Namespaces {
+			selectable[namespace] = true
+		}
+	}
+	var unselected []string
+	for _, namespace := range namespaces {
+		if !selectable[namespace] {
+			unselected = append(unselected, namespace)
+		}
+	}
+	if len(unselected) == 0 {
+		return nil
+	}
+	return &UnselectedPullNamespaceError{
+		Database:    req.Database,
+		Environment: req.Environment,
+		Namespaces:  unselected,
+		Selectable:  slices.Sorted(maps.Keys(selectable)),
+	}
+}
+
+// UnselectedPullNamespaceError reports requested pull namespaces that no targets
+// entry of the environment selects.
+type UnselectedPullNamespaceError struct {
+	Database    string
+	Environment string
+	// Namespaces are the requested namespaces no entry selects, in request order.
+	Namespaces []string
+	// Selectable are the namespaces the environment's entries select, sorted.
+	Selectable []string
+}
+
+func (e *UnselectedPullNamespaceError) Error() string {
+	return fmt.Sprintf("database %q environment %q has no targets entry selecting namespaces [%s]; the selectable namespaces are [%s]",
+		e.Database, e.Environment, strings.Join(e.Namespaces, ", "), strings.Join(e.Selectable, ", "))
 }
 
 // pullMemberDivergence reports every rollout member of an environment whose

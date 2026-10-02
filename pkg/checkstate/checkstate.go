@@ -79,6 +79,7 @@ const (
 	BlockNoAllowedConfiguredEnvironments  = "no_allowed_configured_environments"
 	BlockParticipantUnresolved            = "participant_unresolved"
 	BlockReviewTimeDeploymentDrift        = storage.ReviewTimeDeploymentDriftBlockingReason
+	BlockNamespacePlacementRefused        = storage.NamespacePlacementRefusedBlockingReason
 )
 
 // blockClass is what a durable blocking reason means for the operator reading
@@ -116,6 +117,7 @@ var blockClasses = map[string]blockClass{
 	BlockApplyCancelledAfterTaskCompleted: blockReconciliation,
 	BlockApplyCancelled:                   blockGuard,
 	BlockReviewTimeDeploymentDrift:        blockGuard,
+	BlockNamespacePlacementRefused:        blockGuard,
 	BlockConfigDiscoveryUnavailable:       blockGuard,
 	BlockConfigDiscoveryFailed:            blockGuard,
 	BlockPlanPublishVerificationFailed:    blockGuard,

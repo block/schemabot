@@ -284,3 +284,30 @@ func TestRenderMultiEnvPlanComment_AttributedChangeAnnotatesItsOwnEnvironmentOnl
 	assert.Contains(t, rendered, "▶️ **To apply**")
 	assert.Contains(t, rendered, "schemabot apply -e staging")
 }
+
+// A target that runs its own plan can drop something on a table the reviewed
+// plan leaves alone, so the ownership lookup covers the tables of every
+// unsafe change the rendered target plans carry beyond the reviewed plan's,
+// each once, and leaves out VSchema changes, which are no table's. A rollout
+// the comment does not render target plans for adds nothing.
+func TestTargetPlanDestructiveTables(t *testing.T) {
+	drift := &templates.DeploymentDriftData{
+		Computed: true, Clean: true, Independent: true,
+		Deployments: []templates.DeploymentDriftEntry{{Deployment: "primary", Target: "eu", Primary: true}, {Deployment: "primary", Target: "us"}, {Deployment: "primary", Target: "ap"}},
+		Plans: []templates.DeploymentPlanGroup{
+			{Members: []string{"primary/eu"}, Primary: true},
+			{Members: []string{"primary/us", "primary/ap"}, Changes: []templates.KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` DROP COLUMN `legacy`"}}},
+				UnsafeChanges: []templates.UnsafeChangeData{
+					{Table: "users", Reason: "DROP COLUMN removes data", ChangeType: "alter"},
+					{Table: "users", Reason: "DROP INDEX removes an index", ChangeType: "alter", Targets: []string{"primary/ap"}, TotalTargets: 2},
+					{Table: "reconcile_state", Reason: "DROP TABLE removes all data", ChangeType: "drop", Targets: []string{"primary/us"}, TotalTargets: 2},
+					{Table: "testapp/vschema.json", Reason: "removes vindex", ChangeType: apitypes.VSchemaChangeType},
+				}},
+		},
+	}
+	assert.Equal(t, []string{"reconcile_state", "users"}, targetPlanDestructiveTables(drift))
+
+	drift.Clean = false
+	assert.Empty(t, targetPlanDestructiveTables(drift), "a blocked rollup renders no target plans")
+	assert.Empty(t, targetPlanDestructiveTables(nil))
+}

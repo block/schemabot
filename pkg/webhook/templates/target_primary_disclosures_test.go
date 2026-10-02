@@ -107,3 +107,15 @@ func TestMultiEnvPlanComment_PrimaryTargetDisclosuresSitUnderItsHeading(t *testi
 	assert.Contains(t, primary, "destroys work in progress")
 	assert.NotContains(t, sectionOf(t, stagingSection, "#### Target `primary/orders_b`"), "unsafe change")
 }
+
+// The unsafe refusal lists the primary's unsafe changes with every other
+// target's, so the primary's group does not repeat them, and it discloses no
+// existing copies, as a single target's refusal does not.
+func TestRenderUnsafeChangesBlocked_PrimaryTargetGroupRepeatsNothing(t *testing.T) {
+	body := RenderUnsafeChangesBlocked(primaryDropsLegacyPlan("production"))
+
+	assert.Contains(t, body, "Apply rejected**: 1 unsafe change detected\n1. `legacy`")
+	assert.Equal(t, 1, strings.Count(body, "drops the table and all of its rows"), "the refusal lists the drop once")
+	assert.NotContains(t, sectionOf(t, body, "### Target `primary/orders_a`"), "unsafe change")
+	assert.NotContains(t, body, "work in progress")
+}

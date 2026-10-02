@@ -248,6 +248,11 @@ func (s *Service) handlePullSchema(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if unselectedErr, ok := errors.AsType[*UnselectedPullNamespaceError](err); ok {
+			s.logger.Warn("pull schema rejected for namespaces no targets entry selects", "database", req.Database, "environment", req.Environment, "namespaces", unselectedErr.Namespaces, "selectable_namespaces", unselectedErr.Selectable)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if unsupportedErr, ok := errors.AsType[*unsupportedPullSchemaError](err); ok {
 			s.logger.Warn("pull schema rejected for unsupported database type", "database", req.Database, "environment", req.Environment, "type", unsupportedErr.DatabaseType)
 			s.writeError(w, http.StatusNotImplemented, err.Error())
@@ -321,6 +326,17 @@ func (s *Service) ExecutePullSchema(ctx context.Context, req apitypes.PullSchema
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid namespaces")
+		return nil, err
+	}
+	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve targets")
+		return nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if err := requireSelectablePullNamespaces(req, targets, namespaces); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "unselected namespaces")
 		return nil, err
 	}
 	catalogDetail, err := pullCatalogDetail(req.CatalogDetail)
@@ -570,10 +586,11 @@ type ApplyRequest struct {
 	ExpectedPendingPlanID string `json:"-"`
 	// ConfirmedMemberWork is an internal webhook guard, set only by a pull
 	// request apply-confirm that checked the confirmation against every other
-	// target's statements and execution modes, on a comment disclosing each
-	// target's direct changes under that target. Without it, apply creation
-	// refuses another target's direct-execution change: no other caller
-	// confirms one. Direct API callers cannot assert it through JSON.
+	// target's statements, execution modes and unsafe verdicts, on a comment disclosing each
+	// target's direct and unsafe changes under that target. Without it, apply
+	// creation refuses another target's direct-execution change, and an unsafe
+	// change the reviewed plan does not carry: no other caller confirms them.
+	// Direct API callers cannot assert it through JSON.
 	ConfirmedMemberWork bool `json:"-"`
 }
 
@@ -651,6 +668,18 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// A plan proposing drops in namespaces the target's entry does not
+		// select is refused the same way on every retry until the configuration,
+		// the schema files or the planning deployment changes, so it is the
+		// request's answer rather than a server fault. Drops that could not be
+		// checked (UnselectedTableDropCheckError) stay a server error below:
+		// SchemaBot failed to perform the check, which says nothing about the
+		// request.
+		if _, ok := errors.AsType[*UnselectedTableDropError](err); ok {
+			s.logger.Warn("plan rejected for proposing drops in namespaces the target's entry does not select", "database", req.Database, "environment", req.Environment, "error", err)
+			s.writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*RolloutMemberSelectionError](err); ok {
 			s.logger.Warn("plan rejected for a target that names no single rollout member", "database", req.Database, "environment", req.Environment, "selector", req.Target, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, err.Error())
@@ -707,6 +736,16 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	)
 	defer span.End()
 
+	// Every plan attempt is counted exactly once, here, whatever path it
+	// leaves by: it counts as a success only once its response is stored.
+	planStart := time.Now()
+	deployment := ""
+	status := "error"
+	defer func() {
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, status)
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, status)
+	}()
+
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid schema files")
@@ -715,15 +754,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
 	}
 
-	planStart := time.Now()
-	deployment := ""
-
 	resolvedTarget, narrowedTo, err := s.planMember(req)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "resolve target")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	deployment = resolvedTarget.Deployment
@@ -731,55 +765,8 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		typeErr := &databaseTypeMismatchError{Database: req.Database, RequestType: req.Type, ConfigType: resolvedTarget.DatabaseType}
 		span.RecordError(typeErr)
 		span.SetStatus(otelcodes.Error, "type mismatch")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, typeErr
 	}
-	// Every declared namespace must be held by some rollout member, on every
-	// plan of the environment and not only a pull request review, so a lone
-	// target selecting a subset cannot report a clean plan that leaves the rest
-	// planned nowhere.
-	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "resolve targets")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
-	}
-	if err := requireNamespaceCoverage(req, targets); err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "namespace coverage")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, nil, err
-	}
-	// The planned member (the primary, or for a narrowed plan the member it
-	// names) plans, and its plan row records, only the namespaces its targets
-	// entry selects. req is this call's copy, so narrowing it here leaves the
-	// caller's request, which the other members are planned from, untouched.
-	plannedSchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, "select namespaces")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
-		return nil, nil, err
-	}
-	if len(resolvedTarget.Namespaces) > 0 {
-		s.logger.Info("plan covers only the namespaces its rollout member's targets entry selects: the primary's, or for a narrowed plan the named member's",
-			"database", req.Database,
-			"environment", req.Environment,
-			"deployment", deployment,
-			"target", resolvedTarget.Target,
-			"narrowed_to", narrowedTo,
-			"repository", req.Repository,
-			"namespaces", resolvedTarget.Namespaces,
-			"declared_namespace_count", len(req.SchemaFiles))
-	}
-	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
-	req.SchemaFiles = plannedSchemaFiles
-
 	prInt := 0
 	if req.PullRequest != nil {
 		prInt = int(*req.PullRequest)
@@ -790,7 +777,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	}
 	// Source policy checks only apply to SchemaBot-discovered PR sources. Direct
 	// operator/API plans remain available through the existing endpoint access
-	// model until the dedicated auth layer is added.
+	// model until the dedicated auth layer is added. The check runs before
+	// namespace placement, so a plan whose source the policy denies is
+	// reported, counted and logged as a source policy block rather than as
+	// whatever placement defect its files also carry.
 	if !req.SourceTrusted {
 		s.logger.Debug("skipping source policy for direct plan request",
 			"database", req.Database,
@@ -807,8 +797,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			reason := sourcePolicyReason(err)
 			span.RecordError(err)
 			span.SetStatus(otelcodes.Error, "source policy")
-			metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 			metrics.RecordSourcePolicyBlock(ctx, "plan", req.Database, req.Environment, reason)
 			s.logger.Warn("plan blocked by source policy",
 				"database", req.Database,
@@ -822,12 +810,50 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 	}
 
+	// Every declared namespace must be held by some rollout member, on every
+	// plan of the environment and not only a pull request review, so a lone
+	// target selecting a subset cannot report a clean plan that leaves the rest
+	// planned nowhere.
+	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "resolve targets")
+		return nil, nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	if err := requireNamespaceCoverage(req, targets); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "namespace coverage")
+		return nil, nil, err
+	}
+	// The planned member (the primary, or for a narrowed plan the member it
+	// names) plans, and its plan row records, only the namespaces its targets
+	// entry selects. req is this call's copy, so narrowing it here leaves the
+	// caller's request, which the other members are planned from, untouched.
+	plannedSchemaFiles, err := memberSchemaFiles(req, resolvedTarget)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "select namespaces")
+		return nil, nil, err
+	}
+	if len(resolvedTarget.Namespaces) > 0 {
+		s.logger.Info("plan covers only the namespaces its rollout member's targets entry selects: the primary's, or for a narrowed plan the named member's",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"target", resolvedTarget.Target,
+			"narrowed_to", narrowedTo,
+			"repository", req.Repository,
+			"namespaces", resolvedTarget.Namespaces,
+			"declared_namespace_count", len(req.SchemaFiles))
+	}
+	unselected := unselectedNamespaces(req.SchemaFiles, resolvedTarget)
+	declaredSchemaFiles := req.SchemaFiles
+	req.SchemaFiles = plannedSchemaFiles
+
 	client, err := s.TernClient(deployment, req.Environment)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "tern client")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
@@ -835,8 +861,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "direct execution policy")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", req.Database, req.Environment, err)
 	}
 	ternReq := &ternv1.PlanRequest{
@@ -908,8 +932,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "plan failed")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		s.logger.Error("ExecutePlan: client.Plan failed",
 			"database", req.Database,
 			"type", resolvedTarget.DatabaseType,
@@ -932,8 +954,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		return nil, nil, err
 	}
 	span.SetAttributes(attribute.String("plan_id", resp.PlanId), attribute.Int("change_count", len(resp.Changes)))
-	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
-	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "success")
 
 	s.logger.Info("ExecutePlan: plan response",
 		"plan_id", resp.PlanId,
@@ -949,7 +969,17 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		}
 	}
 
+	// A plan the control plane refuses is counted as an error, never as a
+	// success, so the plan is recorded as a success only once both refusals
+	// have passed it.
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "withheld table drops")
+		return nil, nil, err
+	}
+	if err := s.refuseDropsOfUnselectedTables(req, declaredSchemaFiles, unselected, resolvedTarget, resp.Changes, resp.Shards); err != nil {
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, "unselected namespace drops")
 		return nil, nil, err
 	}
 
@@ -975,6 +1005,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	planResp.Target = resolvedTarget.Target
 	planResp.SelectedNamespaces = slices.Clone(resolvedTarget.Namespaces)
 	planResp.NarrowedTo = narrowedTo
+	status = "success"
 	return resp, planResp, nil
 }
 
@@ -1874,18 +1905,29 @@ func (s *Service) createStoredApply(
 	// runs the statement (RV-4), so its task carries it, whether or not the
 	// reviewed plan has work. Only a pull request apply-confirm confirms it:
 	// that comment names each target's direct changes under that target, and
-	// the confirm re-checks each target's statements and execution modes
-	// against the confirmed round before it creates the apply. No other caller
+	// the confirm re-checks each target's statements, execution modes and
+	// unsafe verdicts against the confirmed round before it creates the apply. No other caller
 	// confirms another target's direct change, the CLI included, though it
 	// shows each target's notice, so a member's direct change is refused for
 	// it, and runs from an apply narrowed to that member.
+	//
+	// Every member's unsafe change needs the opt-in, as the reviewed plan's
+	// does: one --allow-unsafe consents for every target, the way it does for a
+	// single target (RV-3). That comment also lists each target's unsafe
+	// changes under that target, so a confirmed apply runs them. Any other
+	// caller was shown only the reviewed plan's disclosure, so for it a
+	// member's unsafe change runs only when the reviewed plan carries the same
+	// change.
 	names := applyMemberDisplayNames(members)
 	for i, member := range members {
-		if err := rejectUnapplyableMemberPlan(member, names[i], plan); err != nil {
+		if err := rejectUnapplyableMemberPlan(member, names[i], plan, applyOpts); err != nil {
 			return nil, 0, err
 		}
 		if !req.ConfirmedMemberWork {
 			if err := rejectUnconfirmedMemberDirectExecution(member, plan); err != nil {
+				return nil, 0, err
+			}
+			if err := rejectMemberUndisclosedUnsafe(member, names[i], plan); err != nil {
 				return nil, 0, err
 			}
 		}
@@ -1943,9 +1985,12 @@ const (
 	// MemberPlanBlocked is a change the member's engine refuses to execute.
 	MemberPlanBlocked MemberPlanRefusal = iota
 	// MemberPlanUndisclosedUnsafe is an unsafe change the reviewed plan does
-	// not carry, so the disclosure the operator confirmed never named it and no
-	// opt-in covers it.
+	// not carry, for a caller that was shown only the reviewed plan's
+	// disclosure, so no opt-in covers it.
 	MemberPlanUndisclosedUnsafe
+	// MemberPlanUnsafeWithoutOptIn is an unsafe change on an apply created
+	// without the unsafe opt-in.
+	MemberPlanUnsafeWithoutOptIn
 )
 
 // MemberPlanRefusedError is apply creation refusing one rollout member's own
@@ -2155,20 +2200,30 @@ func planMemberID(plan *storage.Plan) string {
 // looking for it in the plan they reviewed.
 //
 // Blocked changes reject before unsafe ones for the same reason they do there:
-// no opt-in can make a statement the engine refuses executable.
-//
-// The unsafe opt-in itself needs no second check here. The apply's plan cleared
-// it before the members were resolved, and a member's unsafe change passes only
-// when the apply's plan carries the same change, so it clears the opt-in the
-// apply's plan cleared.
-func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *storage.Plan) error {
+// no opt-in can make a statement the engine refuses executable. A member's
+// unsafe change then needs the opt-in the apply's plan needs for its own.
+func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *storage.Plan, applyOpts storage.ApplyOptions) error {
 	if err := member.Plan.BlockedApplyError(); err != nil {
 		return &MemberPlanRefusedError{
 			MemberID: member.MemberID(), Target: target, Refusal: MemberPlanBlocked,
 			Table: member.Plan.BlockedChanges()[0].Table, Err: err,
 		}
 	}
-	return rejectMemberUndisclosedUnsafe(member, target, applyPlan)
+	if member.Plan == applyPlan {
+		return nil
+	}
+	if err := rejectUnsafeStoredPlanWithoutOptIn(member.Plan, applyOpts); err != nil {
+		refused := &MemberPlanRefusedError{
+			MemberID: member.MemberID(), Target: target, Refusal: MemberPlanUnsafeWithoutOptIn, Err: err,
+		}
+		if unsafe := member.Plan.UnsafeDDLChanges(); len(unsafe) > 0 {
+			refused.Table = unsafe[0].Table
+		} else if unsafe := member.Plan.UnsafeVSchemaChanges(); len(unsafe) > 0 {
+			refused.Namespace = unsafe[0].Namespace
+		}
+		return refused
+	}
+	return nil
 }
 
 // rejectUnconfirmedMemberDirectExecution refuses a member planned on its own
@@ -2241,15 +2296,12 @@ func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 // leaves every member on one work operation per member. Per-shard changes and
 // finalizer work have no place in that shape, and a member carrying only them
 // would be settled as having nothing to do while its target never got the
-// change. Blocked changes never run. Unsafe changes are refused whatever the
-// command's flags, by the same rule that holds when the reviewed plan has work:
-// a member's unsafe change runs only when the reviewed plan carries the same
-// change, since the operator consents against the reviewed plan's unsafe
-// disclosure, and an empty reviewed plan carries none
-// (rejectMemberUndisclosedUnsafe). A direct-execution change is not refused:
-// the plan comment discloses it under the member that runs it, and
-// apply-confirm re-checks that each member's statements and execution modes
-// are the ones confirmed.
+// change. Blocked changes never run. Unsafe and direct-execution changes are
+// not refused: the plan comment discloses each under the member that runs it,
+// an unsafe change still needs the opt-in, and apply-confirm re-checks that
+// each member's statements, execution modes and unsafe verdicts are the ones confirmed. A
+// caller shown only the reviewed plan is refused a member's unsafe change at
+// apply creation instead (rejectMemberUndisclosedUnsafe).
 func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 	if plan.BlockedApplyError() != nil {
 		return "carries changes its target's engine refuses"
@@ -2260,23 +2312,16 @@ func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 	if namespaces := plan.FinalizerNamespaces(); len(namespaces) > 0 {
 		return fmt.Sprintf("finalizes namespaces %v", namespaces)
 	}
-	if unsafe := plan.UnsafeDDLChanges(); len(unsafe) > 0 {
-		return fmt.Sprintf("carries an unsafe change for table %q", unsafe[0].Table)
-	}
-	if unsafe := plan.UnsafeVSchemaChanges(); len(unsafe) > 0 {
-		return fmt.Sprintf("carries an unsafe VSchema change in namespace %q", unsafe[0].Namespace)
-	}
 	return ""
 }
 
 // rejectMemberUndisclosedUnsafe refuses a member planned on its own whose plan
-// carries an unsafe change the reviewed plan does not, whatever the command's
-// flags. The operator's unsafe opt-in is given against the disclosure on the
-// comment it confirms, which lists the reviewed plan's unsafe changes and no
-// other target's: the other targets' plans render as statements alone. So a
-// member's unsafe change runs under the opt-in only when the reviewed plan
-// carries the same change, which the disclosure named (RV-3). A member running
-// the apply's plan runs exactly the changes that disclosure names.
+// carries an unsafe change the reviewed plan does not, for an apply whose
+// caller was shown only the reviewed plan, whatever the command's flags. That
+// caller's unsafe opt-in was given against the reviewed plan's disclosure, so a
+// member's unsafe change runs under it only when the reviewed plan carries the
+// same change, which the disclosure named (RV-3). A member running the apply's
+// plan runs exactly the changes that disclosure names.
 //
 // The refusal is a MemberPlanRefusedError naming the target, the way the plan
 // comment names it, and the change's table or namespace.
@@ -2319,12 +2364,10 @@ func (c undisclosedUnsafeChange) description() string {
 	}
 }
 
-// UndisclosedMemberUnsafeChange describes the first unsafe change in a member's
-// own plan that the reviewed plan does not carry, or returns "" when every
-// unsafe change the member carries is one the reviewed plan's disclosure names.
-// An empty reviewed plan discloses nothing, so every unsafe member change is
-// undisclosed. The description names only tables and namespaces, so it is fit
-// for a PR comment.
+// firstUndisclosedMemberUnsafeChange returns the first unsafe change in the
+// member's own plan that the reviewed plan does not carry, and whether there
+// is one. An empty reviewed plan discloses nothing, so every unsafe member
+// change is undisclosed.
 //
 // A table change is the same when it touches the same namespace's table with
 // the same operation and a statement sameUnsafeStatement reads as the same; a
@@ -2333,17 +2376,6 @@ func (c undisclosedUnsafeChange) description() string {
 // ALTER drops the column the reviewed ALTER drops, without the column the
 // reviewed ALTER also adds, runs a statement the disclosure never showed, and
 // the description says the statements differ so the operator knows which.
-func UndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) string {
-	change, ok := firstUndisclosedMemberUnsafeChange(reviewed, member)
-	if !ok {
-		return ""
-	}
-	return change.description()
-}
-
-// firstUndisclosedMemberUnsafeChange returns the first unsafe change in the
-// member's own plan that the reviewed plan does not carry, and whether there
-// is one. UndisclosedMemberUnsafeChange states the rule.
 func firstUndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) (undisclosedUnsafeChange, bool) {
 	disclosed := reviewed.UnsafeDDLChanges()
 	for _, change := range member.UnsafeDDLChanges() {
@@ -2635,20 +2667,18 @@ func memberWorkOutsideShape(memberPlan, applyPlan *storage.Plan, shape operation
 }
 
 // MemberWorkTheReviewedPlanCannotRun describes the first thing in a member's
-// own plan that apply creation refuses when the apply is created from reviewed,
-// or returns "" when there is none: a blocked change, an unsafe change the
-// reviewed plan's disclosure does not name, or work the apply's shape has no
-// place for. It asks what createStoredApply asks of each member, so a caller
-// can refuse before it pins a confirmation that apply creation would refuse. A
-// member's direct-execution change is not among them: the comment discloses it
-// under the target that runs it. The description names only tables,
-// namespaces, and the apply's shape, so it is fit for a PR comment.
+// own plan that apply creation refuses for a pull request apply-confirm when
+// the apply is created from reviewed, or returns "" when there is none: a
+// blocked change, or work the apply's shape has no place for. It asks what
+// createStoredApply asks of each member, so a caller can refuse before it pins
+// a confirmation that apply creation would refuse. A member's direct-execution
+// and unsafe changes are not among them: the comment discloses each under the
+// target that runs it, and an unsafe change needs the opt-in like the reviewed
+// plan's own. The description names only tables, namespaces, and the apply's
+// shape, so it is fit for a PR comment.
 func MemberWorkTheReviewedPlanCannotRun(reviewed, member *storage.Plan) string {
 	if member.BlockedApplyError() != nil {
 		return "carries changes its target's engine refuses"
-	}
-	if reason := UndisclosedMemberUnsafeChange(reviewed, member); reason != "" {
-		return reason
 	}
 	return memberWorkOutsideShape(member, reviewed, operationShapeOf(reviewed, applyTaskChanges(reviewed)))
 }

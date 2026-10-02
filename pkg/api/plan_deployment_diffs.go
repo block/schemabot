@@ -194,6 +194,20 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			// SchemaBot settled on. The primary's baseline arrives already
 			// normalized by the path that planned it.
 			s.normalizePlanExecutionVerdicts(resp.Changes, resp.Shards, req.Database, target.Deployment)
+			// A member is held to the same refusal as the primary: its diff
+			// becomes its stored plan, so a data plane that planned another
+			// target's namespace as drops must block the rollup, not stage them.
+			if err := s.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselectedNamespaces(req.SchemaFiles, target), target, resp.Changes, resp.Shards); err != nil {
+				s.logger.Warn("plan deployment diff proposes dropping tables of unselected namespaces; deployment will block the review rollup",
+					"database", req.Database,
+					"environment", req.Environment,
+					"deployment", target.Deployment,
+					"target", target.Target,
+					"error", err)
+				metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "errored")
+				results[i].Err = err
+				return nil
+			}
 			results[i].Engine = resp.Engine
 			results[i].Changes = resp.Changes
 			results[i].Shards = resp.Shards

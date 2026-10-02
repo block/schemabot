@@ -667,3 +667,132 @@ func TestReviewDriftPreview_TableSizesOnlyForCleanRollup(t *testing.T) {
 	single := reviewDriftPreview(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: entries()[:1]})
 	assert.Nil(t, single, "a single-target plan has no rollup preview")
 }
+
+// Each target's unsafe change is read from its own plan and disclosed under
+// the targets that carry it, so the comment names every unsafe change the
+// apply would run and the --allow-unsafe gate can count them. A change every
+// target in the group carries names no targets, since the heading lists them;
+// one only some carry names those. A created table's lint verdict makes it
+// unsafe, and so does a drop, by the same rule the reviewed plan uses.
+func TestDeploymentPlanGroups_DiscloseEachTargetsUnsafeChanges(t *testing.T) {
+	create := "CREATE TABLE `bikes` (`id` bigint NOT NULL, `created_at` timestamp NULL, PRIMARY KEY (`id`))"
+	unsafeCreate := func(target string) api.DeploymentRollupEntry {
+		e := plannedMember("ski", target, create)
+		tc := e.ChangeSet.Changes[0].TableChanges[0]
+		tc.TableName = "bikes"
+		tc.ChangeType = ternv1.ChangeType_CHANGE_TYPE_CREATE
+		tc.IsUnsafe = true
+		tc.UnsafeReason = "has_timestamp: column created_at uses TIMESTAMP"
+		return e
+	}
+	reviewed := plannedMember("ski", "bikeshare-001")
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries:  []api.DeploymentRollupEntry{reviewed, unsafeCreate("bikeshare-002"), unsafeCreate("bikeshare-003")},
+	}
+
+	groups := deploymentPlanGroups(rollup)
+	require.Len(t, groups, 2)
+	assert.True(t, groups[0].Primary)
+	assert.Empty(t, groups[0].UnsafeChanges, "the reviewed target has nothing to run")
+	assert.Equal(t, []templates.UnsafeChangeData{{
+		Table:      "bikes",
+		Reason:     "has_timestamp: column created_at uses TIMESTAMP",
+		DDL:        create,
+		ChangeType: "create",
+	}}, groups[1].UnsafeChanges, "every target in the group carries it, so it names none")
+
+	drift := &templates.DeploymentDriftData{Computed: true, Clean: true, Independent: true, Plans: groups,
+		Deployments: []templates.DeploymentDriftEntry{{Deployment: "ski", Target: "bikeshare-001"}, {Deployment: "ski", Target: "bikeshare-002"}, {Deployment: "ski", Target: "bikeshare-003"}}}
+	listed := templates.TargetPlanUnsafeChanges(drift)
+	require.Len(t, listed, 1)
+	assert.Equal(t, []string{"ski/bikeshare-002", "ski/bikeshare-003"}, listed[0].Targets,
+		"the gate's list names the targets, since it renders beside the reviewed plan's changes")
+}
+
+// Targets that run the same DDL share a group, but each target's unsafe
+// verdict is read from its own schema: dropping an index is unsafe only where
+// the index is visible. A sibling that finds the reviewed target's statement
+// unsafe when the reviewed target does not is disclosed under the reviewed
+// target's group, naming the sibling, and the unsafe gate counts it, so
+// --allow-unsafe never consents to a consequence the comment left out. A
+// verdict the reviewed target shares is already disclosed plan-wide.
+func TestDeploymentPlanGroups_DisclosesASiblingsUnsafeVerdictInTheReviewedGroup(t *testing.T) {
+	dropIndex := "ALTER TABLE `users` DROP INDEX `idx_email`"
+	const visible = "drop_index: index idx_email is visible"
+	reviewed := plannedMember("ski", "users-001", dropIndex)
+	sibling := plannedMember("ski", "users-002", dropIndex)
+	sibling.ChangeSet.Changes[0].TableChanges[0].IsUnsafe = true
+	sibling.ChangeSet.Changes[0].TableChanges[0].UnsafeReason = visible
+
+	groups := deploymentPlanGroups(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{reviewed, sibling}})
+	require.Len(t, groups, 1, "the targets run the same DDL")
+	drift := &templates.DeploymentDriftData{Computed: true, Clean: true, Independent: true, Plans: groups,
+		Deployments: []templates.DeploymentDriftEntry{{Deployment: "ski", Target: "users-001", Primary: true}, {Deployment: "ski", Target: "users-002"}}}
+
+	listed := templates.TargetPlanUnsafeChanges(drift)
+	require.Len(t, listed, 1)
+	assert.Equal(t, "users", listed[0].Table)
+	assert.Equal(t, visible, listed[0].Reason)
+	assert.Equal(t, []string{"ski/users-002"}, listed[0].Targets)
+
+	out := templates.RenderPlanComment(templates.PlanCommentData{
+		Database: "users", Environment: "production", DatabaseType: "vitess",
+		Changes:         groups[0].Changes,
+		DeploymentDrift: drift,
+	})
+	assert.Contains(t, out, "1. `users` on target `ski/users-002`: "+visible+"\n", out)
+
+	shared := plannedMember("ski", "users-001", dropIndex)
+	shared.ChangeSet.Changes[0].TableChanges[0].IsUnsafe = true
+	shared.ChangeSet.Changes[0].TableChanges[0].UnsafeReason = visible
+	drift.Plans = deploymentPlanGroups(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{shared, sibling}})
+	assert.Empty(t, templates.TargetPlanUnsafeChanges(drift), "a verdict the reviewed target carries is the reviewed plan's own")
+}
+
+// A drop is unsafe on a target whose engine left the verdict unset, the same
+// fallback the reviewed plan's changes get, and a change only some of a
+// group's targets carry names them.
+func TestMemberUnsafeChanges_DropIsUnsafeWithoutAVerdict(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: []*ternv1.TableChange{
+		{TableName: "legacy", Ddl: "DROP TABLE `legacy`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP},
+		{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER},
+	}}}}
+	assert.Equal(t, []templates.UnsafeChangeData{{
+		Table: "legacy", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `legacy`", ChangeType: "drop",
+	}}, memberUnsafeChanges(cs))
+
+	var list []templates.UnsafeChangeData
+	for _, target := range []string{"eu", "us", "us"} {
+		for _, uc := range memberUnsafeChanges(cs) {
+			addUnsafeTarget(&list, uc, target)
+		}
+	}
+	require.Len(t, list, 1)
+	assert.Equal(t, []string{"eu", "us"}, list[0].Targets, "a target is listed once")
+	trimModeTargets(&list[0].Targets, &list[0].TotalTargets, 3)
+	assert.Equal(t, []string{"eu", "us"}, list[0].Targets)
+	assert.Equal(t, 3, list[0].TotalTargets)
+}
+
+// A member's VSchema deletion is unsafe the way the reviewed plan's is, so it
+// is listed beside the member's table changes, and a record that cannot be
+// decoded is listed as unsafe rather than dropped.
+func TestMemberUnsafeChanges_ListsVSchemaChanges(t *testing.T) {
+	deletions, err := apitypes.EncodeVSchemaDeletions([]apitypes.VSchemaDeletion{
+		{Kind: "vindex", Name: "orders_lookup", Reason: "removes vindex orders_lookup, which routes queries on orders"},
+	})
+	require.NoError(t, err)
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{
+		{Namespace: "commerce", Metadata: map[string]string{apitypes.VSchemaDeletionsMetadataKey: deletions},
+			TableChanges: []*ternv1.TableChange{{TableName: "legacy", Ddl: "DROP TABLE `legacy`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP}}},
+		{Namespace: "customers", Metadata: map[string]string{apitypes.VSchemaDeletionsMetadataKey: "{not json"}},
+	}}
+
+	assert.Equal(t, []templates.UnsafeChangeData{
+		{Table: "legacy", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `legacy`", ChangeType: "drop"},
+		{Table: "commerce/vschema.json", Reason: "removes vindex orders_lookup, which routes queries on orders", ChangeType: apitypes.VSchemaChangeType},
+		{Table: "customers/vschema.json", Reason: "VSchema deletions were recorded on this plan but could not be decoded, so the VSchema change is treated as unsafe", ChangeType: apitypes.VSchemaChangeType},
+	}, memberUnsafeChanges(cs))
+}
