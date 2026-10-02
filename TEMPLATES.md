@@ -329,7 +329,7 @@ ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin N
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
