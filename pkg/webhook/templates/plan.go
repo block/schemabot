@@ -575,15 +575,11 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// discarding an unfinished copy destroys hours of work already done, so the
 	// disclosure must sit on the comment the confirmation acts on. The copy is
 	// read from the target at plan time, so it can appear on the apply comment
-	// without having been on the plan comment that preceded it.
-	if len(data.DiscardedCopies) > 0 {
-		writeDiscardedCopies(&sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
-	}
-	if len(data.AdoptedCopies) > 0 {
-		writeAdoptedCopies(&sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
-	}
-	if len(data.RunningCopies) > 0 {
-		writeRunningCopies(&sb, data.RunningCopies, data.applyingWithoutConfirmation())
+	// without having been on the plan comment that preceded it. Target plans
+	// disclose them under the primary target's group, the target they were
+	// read from.
+	if !targetPlans {
+		writeExistingCopies(&sb, data)
 	}
 
 	// Why the apply is waiting, when no disclosure above says so. It sits here
@@ -598,7 +594,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// the locked apply comment: unsafe changes only reach an apply after the
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
 	// and blocks otherwise), so repeating them there is noise.
-	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked {
+	// Target plans disclose them under the primary target's group, whose plan
+	// they are from.
+	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked && !targetPlans {
 		writeUnsafeWarning(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
 	}
 
@@ -2047,6 +2045,9 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		writeTargetGroupHeading(sb, level, g.Members, len(drift.Deployments))
 		if g.Empty() {
 			sb.WriteString(groupNoChanges + "\n\n")
+			if g.Primary {
+				writePrimaryTargetDisclosures(sb, data, g)
+			}
 			continue
 		}
 		group := data
@@ -2079,6 +2080,43 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if len(g.LintViolations) > 0 && !data.IsLocked {
 			writeLintViolations(sb, g.LintViolations)
 		}
+		if g.Primary {
+			writePrimaryTargetDisclosures(sb, data, g)
+		}
+	}
+}
+
+// writePrimaryTargetDisclosures writes, under the primary target's group, the
+// disclosures read from the primary target alone: the unsafe changes in its
+// plan and the copies already on it. Written after the last group instead,
+// they would sit under whichever target's heading came last and read as that
+// target's. Copies are read from the primary only, so in a group of several
+// targets they name it.
+func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g DeploymentPlanGroup) {
+	if hasExistingCopies(data) && len(g.Members) > 1 {
+		fmt.Fprintf(sb, "On the primary target %s:\n\n", inlineCode(g.Members[0]))
+	}
+	writeExistingCopies(sb, data)
+	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked {
+		writeUnsafeWarning(sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
+	}
+}
+
+func hasExistingCopies(data PlanCommentData) bool {
+	return len(data.DiscardedCopies) > 0 || len(data.AdoptedCopies) > 0 || len(data.RunningCopies) > 0
+}
+
+// writeExistingCopies writes the copies already on the target: those applying
+// would discard, resume, or join.
+func writeExistingCopies(sb *strings.Builder, data PlanCommentData) {
+	if len(data.DiscardedCopies) > 0 {
+		writeDiscardedCopies(sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.AdoptedCopies) > 0 {
+		writeAdoptedCopies(sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.RunningCopies) > 0 {
+		writeRunningCopies(sb, data.RunningCopies, data.applyingWithoutConfirmation())
 	}
 }
 
@@ -2869,19 +2907,14 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	}
 
 	// Copies already on the target — read per environment, since each
-	// environment has its own target.
-	if len(plan.DiscardedCopies) > 0 {
-		writeDiscardedCopies(sb, plan.DiscardedCopies, plan.applyingWithoutConfirmation())
-	}
-	if len(plan.AdoptedCopies) > 0 {
-		writeAdoptedCopies(sb, plan.AdoptedCopies, plan.applyingWithoutConfirmation())
-	}
-	if len(plan.RunningCopies) > 0 {
-		writeRunningCopies(sb, plan.RunningCopies, plan.applyingWithoutConfirmation())
+	// environment has its own target. Target plans disclose them, and the
+	// unsafe changes below, under the primary target's group.
+	if !targetPlans {
+		writeExistingCopies(sb, *plan)
 	}
 
 	// Unsafe changes warning
-	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
+	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 && !targetPlans {
 		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.DatabaseType, plan.IsMySQL)
 	}
 
