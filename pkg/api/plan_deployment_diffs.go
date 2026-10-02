@@ -63,14 +63,12 @@ type DeploymentPlanDiff struct {
 }
 
 // PlanDeploymentDiffs computes every configured deployment's desired-vs-live
-// diff for a database/environment at review time. Only the primary deployment
-// plans locally today; the non-primary deployments never do, so drift on them is
-// invisible until apply. This is the producer that closes that gap: each
-// non-primary deployment is diffed with the non-persisting PlanDiff RPC, and the
-// primary reuses the already-persisted primary plan (primaryPlan) so the rollup
-// compares against exactly what the user reviewed rather than re-reading the
-// primary's live schema — which could differ from the primary plan and trip a
-// spurious primary-vs-primary mismatch.
+// diff for a database/environment at review time, so every member is planned
+// before the review gates on it: each non-primary deployment is diffed with the
+// non-persisting PlanDiff RPC, and the primary reuses its already-persisted
+// plan (primaryPlan) so the rollup compares against exactly the plan the
+// comment shows rather than re-reading the primary's live schema, which could
+// differ from that plan and trip a spurious primary-vs-primary mismatch.
 //
 // Per-deployment failures are captured in each result's Err so one unreachable
 // deployment neither hides the others nor aborts the rollup. Results are

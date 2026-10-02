@@ -234,7 +234,7 @@ A single environment can fan out to multiple Tern deployments by replacing the s
 
 `Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies. Control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment.
 
-Planning does not fan out the same way. See [Planning and the Primary Deployment](#planning-and-the-primary-deployment).
+Planning fans out too, and every deployment is held to the same plan. See [Planning and the Primary Deployment](#planning-and-the-primary-deployment).
 
 ```yaml
 storage:
@@ -276,11 +276,11 @@ Rules:
 
 ### Planning and the Primary Deployment
 
-An apply fans out across every deployment. Planning does not: the plan the comment shows, and the plan SchemaBot persists and later applies from, is computed against the **primary deployment** only, meaning the first entry in rollout order. Every deployment is expected to run that same plan, so the one plan the comment shows is every deployment's plan, and approving it approves the change on all of them.
+Planning fans out like the apply. At review time SchemaBot plans every deployment against its own live schema, and the plan check covers all of them: approving the pull request approves the change on every deployment, not on one of them.
 
-The remaining deployments are diffed against the primary deployment's plan at review time, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose schema diverges from the primary deployment's plan, and a deployment that cannot be diffed at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
+The deployments of a `deployments` map are expected to hold the same schema, so they are expected to plan the same changes. The first deployment in rollout order is the **primary deployment**. Its plan is the one SchemaBot stores, and every deployment runs that plan at apply time. Each other deployment's plan is compared against it, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose plan differs from the primary deployment's, and a deployment that cannot be planned at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
 
-A multi-deployment environment is gated on every deployment agreeing with one plan, not on one plan per deployment.
+Being primary decides which plan is stored, not which deployment is reviewed. A multi-deployment environment is gated on every deployment planning the same changes, because every deployment runs the one stored plan.
 
 ### Deployment Order
 
