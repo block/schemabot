@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/block/spirit/pkg/parser/charset"
 	"github.com/block/spirit/pkg/statement"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -77,38 +78,40 @@ func plannedCollationChanges(logger *slog.Logger, alterSQL, currentCreate, desir
 	return changes, nil
 }
 
-func caseSensitive(p statement.CollationProperties) bool { return p.CaseSensitive }
+func caseSensitive(c *charset.Collation) bool { return c.CaseSensitive }
 
 // trailingSpacesSensitive is the inverse of PAD SPACE: a PAD SPACE collation
 // pads the shorter value with spaces before comparing, so 'abc' = 'abc '.
-func trailingSpacesSensitive(p statement.CollationProperties) bool { return !p.PadSpace }
+func trailingSpacesSensitive(c *charset.Collation) bool { return !padsSpaces(c) }
 
-// collationProperties looks up a collation's comparison properties, nil when
-// the collation is not known or has no properties this build can read.
-func collationProperties(logger *slog.Logger, collation string) *statement.CollationProperties {
+func padsSpaces(c *charset.Collation) bool { return c.PadAttribute == charset.PadSpace }
+
+// collationProperties looks up how a collation compares strings, nil when the
+// collation is not known.
+func collationProperties(logger *slog.Logger, collation string) *charset.Collation {
 	if collation == "" {
 		return nil
 	}
-	props, err := statement.LookupCollationProperties(collation)
+	c, err := charset.FindCollationByName(collation)
 	if err != nil {
 		logger.Warn("collation properties unavailable; the plan will report the column's comparisons as possibly changing",
 			"collation", collation, "error", err)
 		return nil
 	}
-	return &props
+	return c
 }
 
 // compareChange classifies how one comparison property moves between two
 // collations. It fails closed: a side whose properties are not known is a
 // possible change.
-func compareChange(before, after *statement.CollationProperties, sensitive func(statement.CollationProperties) bool) engine.ComparisonChange {
+func compareChange(before, after *charset.Collation, sensitive func(*charset.Collation) bool) engine.ComparisonChange {
 	if before == nil || after == nil {
 		return engine.ComparisonUnknown
 	}
 	switch {
-	case sensitive(*before) == sensitive(*after):
+	case sensitive(before) == sensitive(after):
 		return engine.ComparisonUnchanged
-	case sensitive(*after):
+	case sensitive(after):
 		return engine.ComparisonBecomesSensitive
 	default:
 		return engine.ComparisonBecomesInsensitive
@@ -120,7 +123,7 @@ func compareChange(before, after *statement.CollationProperties, sensitive func(
 // the indexes the apply fails on if existing rows collide. A move it cannot do
 // that for lists none, so the plan does not warn about a collision that cannot
 // happen.
-func uniqueIndexesAtRisk(table *statement.CreateTable, column string, change statement.ColumnCollationChange, before, after *statement.CollationProperties) []string {
+func uniqueIndexesAtRisk(table *statement.CreateTable, column string, change statement.ColumnCollationChange, before, after *charset.Collation) []string {
 	if !canMergeValues(change, before, after) {
 		return nil
 	}
@@ -133,14 +136,14 @@ func uniqueIndexesAtRisk(table *statement.CreateTable, column string, change sta
 // it calls two values equal only when they are identical, apart from the
 // trailing spaces it ignores when it pads and the old collation did not. A
 // collation the plan cannot read can merge values.
-func canMergeValues(change statement.ColumnCollationChange, before, after *statement.CollationProperties) bool {
+func canMergeValues(change statement.ColumnCollationChange, before, after *charset.Collation) bool {
 	if before == nil || after == nil {
 		return true
 	}
 	if !after.Binary || !strings.EqualFold(change.Before.Charset, change.After.Charset) {
 		return true
 	}
-	return after.PadSpace && !before.PadSpace
+	return padsSpaces(after) && !padsSpaces(before)
 }
 
 // uniqueIndexesCovering names the primary key and unique indexes that include
