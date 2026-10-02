@@ -183,7 +183,6 @@ func PreviewCommentPlanCollationChanges() string {
 				{
 					Table: "customers", Column: "handle", From: "utf8mb4_general_ci", To: "utf8mb4_bin",
 					Case: engine.ComparisonBecomesSensitive, TrailingSpaces: engine.ComparisonUnchanged,
-					UniqueIndexes: []string{"uk_handle"},
 				},
 			},
 		}},
