@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/state"
@@ -54,8 +55,8 @@ func TestCancelledDriveDoesNotPauseAHealthyApply(t *testing.T) {
 	apply, task := revertWindowDrive()
 	client, logs := newFailureLogTestClient(apply, []*storage.Task{task})
 
-	client.markApplyRetryableWithTasks(cancelledDriveContext(t), apply, []*storage.Task{task},
-		"failed to save engine resume state from progress polling: context canceled")
+	require.NoError(t, client.markApplyRetryableWithTasks(cancelledDriveContext(t), apply, []*storage.Task{task},
+		"failed to save engine resume state from progress polling: context canceled"))
 
 	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a cancelled drive must not pause the apply")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "a cancelled drive must not pause the apply's tasks")
@@ -70,7 +71,7 @@ func TestCancelledDriveDoesNotFailAHealthyApply(t *testing.T) {
 	apply, task := revertWindowDrive()
 	client, logs := newFailureLogTestClient(apply, []*storage.Task{task})
 
-	client.failApplyWithTasks(cancelledDriveContext(t), apply, []*storage.Task{task}, "context canceled")
+	require.NoError(t, client.failApplyWithTasks(cancelledDriveContext(t), apply, []*storage.Task{task}, "context canceled"))
 
 	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a cancelled drive must not fail the apply")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "a cancelled drive must not fail the apply's tasks")

@@ -58,7 +58,7 @@ func TestFailApplyWithTasksRecordsTheFailureInTheApplyLog(t *testing.T) {
 	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders", State: state.Task.Running}
 	client, logs := newFailureLogTestClient(apply, []*storage.Task{task})
 
-	client.failApplyWithTasks(t.Context(), apply, []*storage.Task{task}, "engine lost its connection to the target")
+	require.NoError(t, client.failApplyWithTasks(t.Context(), apply, []*storage.Task{task}, "engine lost its connection to the target"))
 
 	require.Len(t, logs.entries, 1)
 	entry := logs.entries[0]
@@ -79,7 +79,7 @@ func TestMarkApplyRetryableWithTasksRecordsTheRemainingBudget(t *testing.T) {
 	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: apply.ID, TableName: "orders", State: state.Task.Running}
 	client, logs := newFailureLogTestClient(apply, []*storage.Task{task})
 
-	client.markApplyRetryableWithTasks(t.Context(), apply, []*storage.Task{task}, "target refused the connection")
+	require.NoError(t, client.markApplyRetryableWithTasks(t.Context(), apply, []*storage.Task{task}, "target refused the connection"))
 
 	require.Len(t, logs.entries, 1)
 	entry := logs.entries[0]
@@ -98,7 +98,7 @@ func TestMarkApplyRetryableWithTasksReportsAnExhaustedBudget(t *testing.T) {
 	apply := failureLogTestApply(state.Apply.Running, storage.MaxRecoveryAttempts)
 	client, logs := newFailureLogTestClient(apply, nil)
 
-	client.markApplyRetryableWithTasks(t.Context(), apply, nil, "target refused the connection")
+	require.NoError(t, client.markApplyRetryableWithTasks(t.Context(), apply, nil, "target refused the connection"))
 
 	require.Len(t, logs.entries, 1)
 	assert.Contains(t, logs.entries[0].Message,
@@ -112,7 +112,7 @@ func TestFailApplyWithTasksLeavesASettledApplyUnrecorded(t *testing.T) {
 	apply := failureLogTestApply(state.Apply.Cancelled, 0)
 	client, logs := newFailureLogTestClient(apply, nil)
 
-	client.failApplyWithTasks(t.Context(), apply, nil, "engine lost its connection to the target")
+	require.NoError(t, client.failApplyWithTasks(t.Context(), apply, nil, "engine lost its connection to the target"))
 
 	assert.Empty(t, logs.entries)
 	assert.Equal(t, state.Apply.Cancelled, apply.State)

@@ -1024,7 +1024,12 @@ func (c *LocalClient) runWithRecovery(ctx context.Context, apply *storage.Apply,
 	if recovered != nil {
 		errMsg := fmt.Sprintf("panic in apply goroutine: %v", recovered.Value)
 		c.logger.Error(errMsg, apply.LogAttrs()...)
-		c.failApplyWithTasks(ctx, apply, tasks, errMsg)
+		if failErr := c.failApplyWithTasks(ctx, apply, tasks, errMsg); failErr != nil {
+			// The panic is what the operator acts on (AV-5); its containment
+			// marks the apply failed from the reloaded row.
+			c.logger.Error("failed to record the panicked drive's apply failed; the operator's panic containment records it instead",
+				append(apply.LogAttrs(), "error", failErr)...)
+		}
 		return recovered
 	}
 	return err
@@ -1103,8 +1108,7 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 	// verdict also travels on each row so a drive loading work from a peer or
 	// prior build fails closed without relying on the plan it happens to hold.
 	if err := blockedTaskError(tasks); err != nil {
-		c.refuseBlockedTasks(ctx, apply, tasks, err)
-		return nil
+		return c.refuseBlockedTasks(ctx, apply, tasks, err)
 	}
 	if c.usesGroupedApply(apply, options) {
 		return c.runWithRecovery(ctx, apply, tasks, func() error {
@@ -1125,21 +1129,10 @@ func (c *LocalClient) runApplyExecution(ctx context.Context, apply *storage.Appl
 // projection settles the parent and posts the summary instead; failApplyWithTasks
 // already logged that handoff. A drive cancelled before the failure was
 // recorded leaves the apply non-terminal for another driver to claim, so it
-// owes nothing here.
-func (c *LocalClient) refuseBlockedTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, refusal error) {
-	c.failApplyWithTasks(ctx, apply, tasks, refusal.Error())
-	if suppressParentApplyWrites(ctx) {
-		return
-	}
-	if !state.IsTerminalApplyState(apply.State) {
-		return
-	}
-	if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
-		c.logger.Warn("failed to settle pending control requests after refusing blocked task rows",
-			append(apply.LogAttrs(), "error", err)...)
-		return
-	}
-	c.notifyTerminalObserver(apply, tasks)
+// owes nothing here. A failure write that did not land is returned with
+// nothing settled.
+func (c *LocalClient) refuseBlockedTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, refusal error) error {
+	return c.failApplyAndNotify(ctx, apply, tasks, refusal.Error())
 }
 
 // blockedTaskError returns the operator-facing refusal for a task row the
