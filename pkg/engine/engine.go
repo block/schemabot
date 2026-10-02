@@ -574,7 +574,43 @@ type TableChange struct {
 	// estimate: the shard with no estimate could be the largest, so a maximum
 	// over the others would name a smaller shard as the largest.
 	LargestShardRows *int64
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, so a reviewer can see what it does to how their values sort and
+	// compare equal. Empty when the change re-collates no column, and for an
+	// engine that does not report it.
+	CollationChanges []CollationChange
 }
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string
+	// From is the collation the column compares under now, and To the one it
+	// compares under once the change applies. To is empty when the change
+	// leaves the collation to a server default the plan cannot read.
+	From, To string
+	// Case says whether 'abc' and 'ABC' stop or start comparing equal, and
+	// TrailingSpaces whether 'abc' and 'abc ' do.
+	Case, TrailingSpaces ComparisonChange
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column once the change applies. Under a new collation, values that were
+	// distinct can compare equal, and a unique index then rejects them.
+	UniqueIndexes []string
+}
+
+// ComparisonChange is how a collation change moves one way values compare.
+type ComparisonChange string
+
+// ComparisonChange values. Sensitive means the difference is significant:
+// values that differ only by it compare unequal.
+const (
+	ComparisonUnchanged          ComparisonChange = "unchanged"
+	ComparisonBecomesSensitive   ComparisonChange = "becomes_sensitive"
+	ComparisonBecomesInsensitive ComparisonChange = "becomes_insensitive"
+	// ComparisonUnknown is reported when either collation is not known, or
+	// its properties cannot be read. A consumer treats it as a possible change.
+	ComparisonUnknown ComparisonChange = "unknown"
+)
 
 // Execution-mode verdicts recorded on a planned table change. The verdict
 // answers "how will this statement actually run?" so operators learn about

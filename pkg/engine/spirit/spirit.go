@@ -631,6 +631,12 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	for _, ts := range currentSchema {
 		currentByTable[ts.Name] = ts.Schema
 	}
+	// The collation report names the unique indexes that cover a re-collated
+	// column as the desired definition leaves them.
+	desiredByTable := make(map[string]string, len(desiredSchemas))
+	for _, ts := range desiredSchemas {
+		desiredByTable[ts.Name] = ts.Schema
+	}
 
 	// Best-effort per-table size estimates for plan display, read only for the
 	// tables this plan touches so a database with many unrelated tables does
@@ -700,6 +706,14 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			}
 			if err := verdicts.record(ctx, &change, currentCreateTable); err != nil {
 				return nil, err
+			}
+			desiredCreateTable, ok := desiredByTable[pc.TableName]
+			if !ok {
+				return nil, fmt.Errorf("plan produced an ALTER for table %q, which no schema file declares", pc.TableName)
+			}
+			change.CollationChanges, err = plannedCollationChanges(e.logger, pc.Statement, currentCreateTable, desiredCreateTable)
+			if err != nil {
+				return nil, fmt.Errorf("resolve collation changes for table %q: %w", pc.TableName, err)
 			}
 		}
 
