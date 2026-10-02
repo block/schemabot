@@ -596,7 +596,7 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 		"the targets with work read first")
 	assert.Contains(t, out, "**targets `primary/testapp_2`, `primary/testapp_3`**\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	assert.Contains(t, out, "📋 **Plan**: **1** table to alter")
-	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e production\n```\n",
+	assert.Contains(t, out, "▶️ **To apply**, comment:\n```\nschemabot apply -e production\n```\n",
 		"the other targets converge through the apply, which runs each target's own plan")
 }
 

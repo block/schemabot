@@ -673,7 +673,7 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 	if consent, ok := planUnsafeConsent(data); ok {
 		fmt.Fprintf(sb, "▶️ **To apply**, %s:\n", consent.instruction())
 	} else {
-		sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
+		sb.WriteString("▶️ **To apply**, comment:\n")
 	}
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
 }

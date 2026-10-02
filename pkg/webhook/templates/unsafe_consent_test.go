@@ -113,7 +113,7 @@ func TestRenderPlanComment_NoUnsafeConsentWithoutUnsafeChanges(t *testing.T) {
 	data.UnsafeChanges = nil
 	out := RenderPlanComment(*data)
 	assert.NotContains(t, out, "--allow-unsafe")
-	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply**, comment:\n```\nschemabot apply -e staging\n```")
 }
 
 // The locked apply comment already carries the operator's consent in its
@@ -192,5 +192,5 @@ func TestRenderPlanComment_NoUnsafeConsentWhenEngineBlocksAChange(t *testing.T) 
 	data.BlockedChanges = []BlockedChangeData{{Table: "orders", Reason: "statement for table \"orders\" must be rewritten into a form the engine can execute natively, then re-planned"}}
 	out := RenderPlanComment(*data)
 	assert.NotContains(t, out, "--allow-unsafe")
-	assert.Contains(t, out, "▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply**, comment:\n```\nschemabot apply -e staging\n```")
 }
