@@ -282,7 +282,7 @@ func TestApplyConfirmCommandCoreMissingPlanRecoveryCommandKeepsOperatorFlags(t *
 }
 
 // A prior environment with pending changes blocks the confirm as a terminal
-// answer: the durable delivery must not re-drive it, and the reviewed plan stays
+// answer: the durable delivery must not re-drive it, and the primary plan stays
 // pinned for when the prior environment is clean again.
 func TestApplyConfirmCommandCorePriorEnvironmentBlockIsTerminalAndKeepsPendingLock(t *testing.T) {
 	locks := newApplyConfirmContractLockStore()
@@ -307,7 +307,7 @@ func TestApplyConfirmCommandCorePriorEnvironmentBlockIsTerminalAndKeepsPendingLo
 }
 
 // Failure to read a prior environment leaves promotion ordering unevaluated,
-// so the durable delivery retries while preserving the exact reviewed plan.
+// so the durable delivery retries while preserving the exact primary plan.
 func TestApplyConfirmCommandCorePriorEnvironmentReadFailureIsRetryableAndKeepsPendingLock(t *testing.T) {
 	locks := newApplyConfirmContractLockStore()
 	store := newApplyConfirmContractStorage(locks)

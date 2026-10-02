@@ -141,14 +141,14 @@ var managedDirMissingConfigBlock = checkBlockReason{
 }
 
 // reviewTimeDeploymentDriftBlock is used when a review-time drift rollup finds a
-// configured deployment whose live schema no longer matches the reviewed plan,
+// configured deployment whose live schema no longer matches the primary plan,
 // or a deployment that could not be diffed or confirmed to match. The plan check
 // fails closed until an operator reconciles the deployment or replans against
 // matching schema. blockingReason is stored so the block survives later writes
 // (e.g. an apply-time plan) that did not re-evaluate drift.
 var reviewTimeDeploymentDriftBlock = checkBlockReason{
 	blockingReason: checkstate.BlockReviewTimeDeploymentDrift,
-	message:        "One or more deployments differ from the reviewed plan, or could not be confirmed to match it; reconcile the deployment drift or replan once the deployments match before this check can pass.",
+	message:        "One or more deployments differ from the primary target's plan, or could not be confirmed to match it; reconcile the deployment drift or replan once the deployments match before this check can pass.",
 }
 
 // namespacePlacementRefusedBlock is used when an environment's plan was refused

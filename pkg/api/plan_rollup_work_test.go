@@ -62,7 +62,7 @@ func TestPlanRollup_MemberCopyAtStake(t *testing.T) {
 		reported(rollupDeployment("us", rollupAlterUsers(workAddEmail)), adopt),
 		rollupDeployment("au"),
 	).MemberCopyAtStake()
-	assert.Equal(t, -1, at, "the primary's copies are on the reviewed plan, an adopt continues the work, and au has nothing to run")
+	assert.Equal(t, -1, at, "the primary's copies are on the primary target's plan, an adopt continues the work, and au has nothing to run")
 	assert.Empty(t, reason)
 
 	at, reason = independentRollup(t,

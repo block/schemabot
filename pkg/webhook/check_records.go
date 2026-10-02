@@ -26,7 +26,7 @@ const (
 	// plan). Zero value so an unset outcome fails safe — it preserves, never
 	// clears, an existing drift block.
 	driftNotEvaluated reviewDriftState = iota
-	// driftClean: the rollup ran and every deployment matched the reviewed plan.
+	// driftClean: the rollup ran and every deployment matched the primary plan.
 	driftClean
 	// driftBlocked: the rollup ran and a deployment diverged or could not be
 	// confirmed, so the plan check fails closed.
@@ -35,7 +35,7 @@ const (
 
 // reviewDriftOutcome carries the review-time per-deployment drift outcome into
 // the plan check record. When the state is driftBlocked the plan check fails
-// closed regardless of whether the reviewed primary plan itself had changes,
+// closed regardless of whether the primary plan itself had changes,
 // because a deployment's live schema no longer matches what was reviewed (or
 // could not be confirmed to match). summary explains why for the check's Change
 // column and logs.
@@ -43,7 +43,7 @@ type reviewDriftOutcome struct {
 	state   reviewDriftState
 	summary string
 	// work is how many rollout members still need the change, read from the
-	// same rollup. The reviewed primary plan speaks only for the primary, so a
+	// same rollup. The primary plan speaks only for the primary, so a
 	// primary already at the desired schema says nothing about members planned
 	// against schemas of their own.
 	work memberWork
@@ -73,8 +73,8 @@ type memberWork struct {
 	// discard an unfinished copy, or could not say whether it would, and why.
 	// Empty when no member with work puts a copy at stake.
 	copyAtStake string
-	// others counts the members with work other than the reviewed primary,
-	// whose work runs from plans of their own rather than the reviewed plan.
+	// others counts the members with work other than the primary target,
+	// whose work runs from plans of their own rather than the primary plan.
 	others int
 }
 
@@ -108,7 +108,7 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 }
 
 // summary says how many targets still need the change, for a check whose
-// reviewed primary plan has nothing of its own to summarize.
+// primary plan has nothing of its own to summarize.
 func (w memberWork) summary() string {
 	return fmt.Sprintf("%d of %d targets need this change", w.pending, w.members)
 }
@@ -230,9 +230,9 @@ func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclie
 
 // planCheckConclusion decides a plan check's stored conclusion. Review-time
 // drift fails the check closed ahead of the plan's own outcome: a deployment
-// whose live schema no longer matches the reviewed plan (or that could not be
+// whose live schema no longer matches the primary plan (or that could not be
 // confirmed to match) must block the PR even when the primary's diff is clean or
-// empty. A primary plan that reported errors or a final engine refusal likewise
+// empty. The primary plan that reported errors or a final engine refusal likewise
 // fails. Destructive changes remain action-required: the apply path requires
 // the separate --allow-unsafe acknowledgement before they can proceed.
 func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocked bool) string {
@@ -335,7 +335,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	}
 
 	// A check passes only when no rollout member has work (MG-12), so work on a
-	// member counts even when the reviewed primary plan is empty.
+	// member counts even when the primary plan is empty.
 	hasChanges := planResp.HasChanges() || drift.work.pending > 0
 	driftBlocked := drift.blocks()
 

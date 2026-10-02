@@ -35,7 +35,7 @@ func (r PlanRollup) MembersWithWork() []routing.ExecutionTarget {
 // A data plane that did not report copies counts as putting one at stake,
 // because the consent to destroy a copy is given against a disclosure, and a
 // member that disclosed nothing cannot be shown to have nothing to disclose.
-// The primary is skipped: its copies are disclosed on the reviewed plan itself.
+// The primary is skipped: its copies are disclosed on the primary plan itself.
 func (r PlanRollup) MemberCopyAtStake() (int, string) {
 	for i, entry := range r.Entries {
 		if i == 0 || entry.Class == DeploymentErrored || !entry.ChangeSet.HasWork() {

@@ -234,7 +234,7 @@ A single environment can fan out to multiple Tern deployments by replacing the s
 
 `Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies. Control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment.
 
-Review does not fan out the same way. See [Review and the Primary Deployment](#review-and-the-primary-deployment).
+Planning does not fan out the same way. See [Planning and the Primary Deployment](#planning-and-the-primary-deployment).
 
 ```yaml
 storage:
@@ -274,13 +274,13 @@ Rules:
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
 - `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
-### Review and the Primary Deployment
+### Planning and the Primary Deployment
 
-An apply fans out across every deployment. Review does not: the plan reviewers see, and the plan SchemaBot persists and later applies from, is computed against the **primary deployment** only, meaning the first entry in rollout order.
+An apply fans out across every deployment. Planning does not: the plan the comment shows, and the plan SchemaBot persists and later applies from, is computed against the **primary deployment** only, meaning the first entry in rollout order. Every deployment is expected to run that same plan, so the one plan the comment shows is every deployment's plan, and approving it approves the change on all of them.
 
-The remaining deployments are diffed against that reviewed plan at review time, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose schema diverges from the reviewed plan, and a deployment that cannot be diffed at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
+The remaining deployments are diffed against the primary deployment's plan at review time, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose schema diverges from the primary deployment's plan, and a deployment that cannot be diffed at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
 
-A multi-deployment environment is gated on every deployment agreeing with one reviewed plan, not on one reviewed plan per deployment.
+A multi-deployment environment is gated on every deployment agreeing with one plan, not on one plan per deployment.
 
 ### Deployment Order
 

@@ -71,17 +71,17 @@ func TestRolloutApplyRefusals_ListWhatApplyCreationRefuses(t *testing.T) {
 		// refuses it for.
 		narrowedRefusal string
 	}{
-		{name: "same work as the reviewed plan", reviewed: reviewedWith(alter), member: memberWith(alter)},
-		{name: "unsafe change the reviewed plan with work does not carry", reviewed: reviewedWith(alter), member: memberWith(alter, drop),
+		{name: "same work as the primary target's plan", reviewed: reviewedWith(alter), member: memberWith(alter)},
+		{name: "unsafe change the primary target's plan with work does not carry", reviewed: reviewedWith(alter), member: memberWith(alter, drop),
 			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberNeedsTarget,
-				Detail: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`, AllowUnsafe: true}},
-		{name: "unsafe change beside a converged reviewed target", reviewed: reviewedWith(), member: memberWith(drop),
+				Detail: `carries an unsafe change for table "legacy_orders" that the primary target's plan does not carry`, AllowUnsafe: true}},
+		{name: "unsafe change beside a converged primary target", reviewed: reviewedWith(), member: memberWith(drop),
 			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberNeedsTarget,
-				Detail: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`, AllowUnsafe: true}},
+				Detail: `carries an unsafe change for table "legacy_orders" that the primary target's plan does not carry`, AllowUnsafe: true}},
 		{name: "direct-execution change beside reviewed work", reviewed: reviewedWith(alter), member: memberWith(direct),
 			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberNeedsTarget,
 				Detail: `runs table "users" as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target`}},
-		{name: "direct-execution change beside a converged reviewed target", reviewed: reviewedWith(), member: memberWith(direct),
+		{name: "direct-execution change beside a converged primary target", reviewed: reviewedWith(), member: memberWith(direct),
 			want: &apitypes.PlanMemberRefusalResponse{Member: "eu/testapp-002", Target: "testapp-002", Reason: apitypes.PlanMemberNeedsTarget,
 				Detail: `runs table "users" as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target`}},
 		{name: "blocked change", reviewed: reviewedWith(alter), member: memberWith(blocked),
@@ -233,7 +233,7 @@ func TestRefusePlanRolloutUnrenderedByCaller_RefusesAnEnvironmentWhoseMembersDoN
 		"a caller that renders the rollout is not checked")
 }
 
-// The apply side of the same rule: POST /api/apply of a reviewed plan across
+// The apply side of the same rule: POST /api/apply of the primary plan across
 // two targets is refused, before anything is stored, for a caller that does
 // not say it rendered the rollout, and created for one that does. An apply
 // narrowed to one target applies one plan and passes either way.
@@ -247,7 +247,7 @@ func TestHandleApply_RefusesARolloutWideApplyFromACallerThatDoesNotRenderTheRoll
 	}{
 		{name: "rollout-wide apply", body: `{"plan_id":"plan-primary","environment":"production"}`, wantRefused: true},
 		{name: "rollout-wide apply from a caller that renders the rollout", body: `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`},
-		{name: "apply narrowed to the reviewed target", body: `{"plan_id":"plan-primary","environment":"production","target":"testapp-001"}`, target: "testapp-001"},
+		{name: "apply narrowed to the primary target", body: `{"plan_id":"plan-primary","environment":"production","target":"testapp-001"}`, target: "testapp-001"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reviewed := primaryPlanRow("testapp-001")
@@ -277,12 +277,12 @@ func TestHandleApply_RefusesARolloutWideApplyFromACallerThatDoesNotRenderTheRoll
 	}
 }
 
-// A member paired with the reviewed plan runs exactly what the caller was
+// A member paired with the primary plan runs exactly what the caller was
 // shown, so it is never refused, even when the pairing hands back a copy of
-// the reviewed plan rather than the same value: the plan is recognized by its
+// the primary plan rather than the same value: the plan is recognized by its
 // identifier. A member with a plan of its own is still held to the rule, and
 // its direct-execution change needs its own narrowed apply.
-func TestMemberWorkARolloutWideAPIApplyCannotRun_RecognizesTheReviewedPlanByItsIdentifier(t *testing.T) {
+func TestMemberWorkARolloutWideAPIApplyCannotRun_RecognizesThePrimaryPlanByItsIdentifier(t *testing.T) {
 	reviewed := memberPlanWithChange(storage.TableChange{
 		Namespace:     "testapp",
 		Table:         "users",
@@ -294,7 +294,7 @@ func TestMemberWorkARolloutWideAPIApplyCannotRun_RecognizesTheReviewedPlanByItsI
 
 	copied := *reviewed
 	reason, detail := memberWorkARolloutWideAPIApplyCannotRun(reviewed, &copied)
-	assert.Empty(t, reason, "a copy of the reviewed plan is the reviewed plan: %s", detail)
+	assert.Empty(t, reason, "a copy of the primary target's plan is the primary target's plan: %s", detail)
 
 	own := *reviewed
 	own.PlanIdentifier = "plan-own"

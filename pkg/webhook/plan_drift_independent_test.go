@@ -182,8 +182,8 @@ func TestReviewDriftComment_IndependentErroredSaysCouldNotPlan(t *testing.T) {
 // Each target group names the stored plan its members run, so a comment that
 // cuts a group's DDL can point at the plan that holds all of it. A group takes
 // its first member's stored plan, and the comment names it under the group's
-// first member. The primary's group points at the reviewed plan whatever its
-// entry carries, since the primary runs the reviewed plan: the entry here holds
+// first member. The primary's group points at the primary plan whatever its
+// entry carries, since the primary runs the primary plan: the entry here holds
 // an identifier of its own so the comment is seen to ignore it.
 func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 	wide := func(column string) string {
@@ -221,7 +221,7 @@ func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 	require.True(t, found, "the primary renders under its own heading")
 	assert.Contains(t, rest, "### 2 of 3 targets\n\n`commerce/orders-002`, `commerce/orders-003`", "the larger group leads")
 	assert.True(t, strings.Contains(primary, "the full plan for this target is available from the CLI with `schemabot list-plans -e production plan_reviewed`."),
-		"the primary's cut DDL names the reviewed plan")
+		"the primary's cut DDL names the primary target's plan")
 	assert.False(t, strings.Contains(body, "plan_orders_001"), "the primary's own entry identifier is never named")
 	assert.True(t, strings.Contains(rest, "the full plan for `commerce/orders-002` is available from the CLI with `schemabot list-plans -e production plan_orders_002` (every target in this group runs the same DDL)."),
 		"the group's cut DDL names its first member's plan and whose it is")
@@ -229,9 +229,9 @@ func TestDeploymentPlanGroups_CarryEachGroupsStoredPlan(t *testing.T) {
 }
 
 // A target's own plan can route a statement to direct execution when the
-// reviewed target's does not, because the verdict belongs to the target that
+// primary target's does not, because the verdict belongs to the target that
 // runs it. That write-blocking DDL is disclosed under the target that carries
-// it, the way the reviewed plan's own direct changes are, and once rather than
+// it, the way the primary plan's own direct changes are, and once rather than
 // again plan-wide. The verdict is matched the way apply admission matches it,
 // ignoring case, so a verdict spelled in another case that runs directly is
 // disclosed too.

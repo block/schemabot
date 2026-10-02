@@ -39,7 +39,7 @@ func divergedMemberDetail(selector string) string {
 // member, and an apply created from the primary's plan has a stored plan for
 // every member planned against its own schema. It returns nil for an
 // environment with a single member and for a plan narrowed to one member.
-// Beside a primary plan that reported errors no other member is planned, and
+// Beside the primary plan that reported errors no other member is planned, and
 // the rollout lists each of them as needing attention, so the operator reading
 // the primary's errors can tell the other members were not looked at rather
 // than found fine.
@@ -444,16 +444,16 @@ func (s *Service) rolloutApplyRefusals(ctx context.Context, environment, planID 
 }
 
 // memberWorkARolloutWideAPIApplyCannotRun asks of one member's plan what apply
-// creation asks of it when the reviewed plan is applied rollout-wide by a
+// creation asks of it when the primary plan is applied rollout-wide by a
 // caller other than a pull request apply-confirm, and returns the refusal
 // reason and a description naming only tables and namespaces, or two empty
 // strings when apply creation admits it.
 //
-// A member running the reviewed plan runs exactly what the caller was shown.
-// A member with a plan of its own is held to what the reviewed plan's apply
-// can run (MemberWorkTheReviewedPlanCannotRun, and
-// MemberWorkAConvergedReviewedPlanCannotRun when the reviewed plan is empty),
-// and its direct-execution change and any unsafe change the reviewed plan does
+// A member running the primary plan runs exactly what the caller was shown.
+// A member with a plan of its own is held to what the primary plan's apply
+// can run (MemberWorkThePrimaryPlanCannotRun, and
+// MemberWorkAConvergedPrimaryPlanCannotRun when the primary plan is empty),
+// and its direct-execution change and any unsafe change the primary plan does
 // not carry are refused as well: only a pull request comment disclosed them
 // under the target that runs them (rejectUnconfirmedMemberDirectExecution,
 // rejectMemberUndisclosedUnsafe). Those are refused as needing a
@@ -462,27 +462,27 @@ func (s *Service) rolloutApplyRefusals(ctx context.Context, environment, planID 
 // apply refuses as well is refused as blocked, since no apply runs it
 // (memberWorkANarrowedApplyCannotRun).
 //
-// A member running the reviewed plan is recognized by the plan's identifier,
-// not by the pointer it was paired with, so a copy of the reviewed plan still
+// A member running the primary plan is recognized by the plan's identifier,
+// not by the pointer it was paired with, so a copy of the primary plan still
 // reads as the plan the caller was shown, and the primary never lands on its
 // own refusal list. Every member planned on its own is stored under an
 // identifier of its own.
-func memberWorkARolloutWideAPIApplyCannotRun(reviewed, member *storage.Plan) (reason, detail string) {
-	if member.PlanIdentifier == reviewed.PlanIdentifier {
+func memberWorkARolloutWideAPIApplyCannotRun(primary, member *storage.Plan) (reason, detail string) {
+	if member.PlanIdentifier == primary.PlanIdentifier {
 		return "", ""
 	}
 	if detail := memberWorkANarrowedApplyCannotRun(member); detail != "" {
 		return apitypes.PlanMemberBlocked, detail
 	}
-	if detail := MemberWorkTheReviewedPlanCannotRun(reviewed, member); detail != "" {
+	if detail := MemberWorkThePrimaryPlanCannotRun(primary, member); detail != "" {
 		return apitypes.PlanMemberNeedsTarget, detail
 	}
-	if !reviewed.HasWork() {
-		if detail := MemberWorkAConvergedReviewedPlanCannotRun(member); detail != "" {
+	if !primary.HasWork() {
+		if detail := MemberWorkAConvergedPrimaryPlanCannotRun(member); detail != "" {
 			return apitypes.PlanMemberNeedsTarget, detail
 		}
 	}
-	if change, ok := firstUndisclosedMemberUnsafeChange(reviewed, member); ok {
+	if change, ok := firstUndisclosedMemberUnsafeChange(primary, member); ok {
 		return apitypes.PlanMemberNeedsTarget, change.description()
 	}
 	if table := firstDirectExecutionTable(member); table != "" {
@@ -493,7 +493,7 @@ func memberWorkARolloutWideAPIApplyCannotRun(reviewed, member *storage.Plan) (re
 
 // memberWorkANarrowedApplyCannotRun describes the first thing in a member's
 // plan that apply creation refuses even when the apply is narrowed to the
-// member, which runs that plan as the reviewed one, or returns "" when there
+// member, which runs that plan as the apply's own, or returns "" when there
 // is none. Its shape is then chosen from its own plan, so what remains is what
 // no apply runs: a change its engine refuses, per-shard changes in a
 // namespace the plan carries no table statement for outside the per-shard

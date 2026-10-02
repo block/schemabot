@@ -65,7 +65,7 @@ func TestSummarizeReviewDrift_BoundedAndSanitized(t *testing.T) {
 	assert.NotContains(t, summary, "|")
 }
 
-// Review-time drift fails the plan check closed even when the reviewed primary
+// Review-time drift fails the plan check closed even when the primary target
 // plan is a clean no-op, taking precedence over the plan's own outcome.
 func TestPlanCheckConclusion_DriftFailsClosed(t *testing.T) {
 	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, false, false, true),
@@ -261,7 +261,7 @@ func TestDeploymentPlanGroups_SameWorkGroupsTogether(t *testing.T) {
 
 // Targets that hold their own schemas can need different work. Each distinct
 // plan is its own group, so the comment describes every plan the apply would
-// run rather than the reviewed one alone.
+// run rather than the primary plan alone.
 func TestDeploymentPlanGroups_DifferentWorkSplits(t *testing.T) {
 	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
 	phone := "ALTER TABLE users ADD COLUMN phone VARCHAR(32)"
@@ -282,7 +282,7 @@ func TestDeploymentPlanGroups_DifferentWorkSplits(t *testing.T) {
 	}, groupMembers(groups))
 	assert.Equal(t, []string{email}, groups[0].Changes[0].Statements)
 	assert.Equal(t, []string{phone, email}, groups[1].Changes[0].Statements,
-		"a group carries the plan its own members would run, not the reviewed one")
+		"a group carries the plan its own members would run, not the primary plan")
 }
 
 // Targets already at the desired schema form a group of their own, which the
@@ -311,7 +311,7 @@ func TestDeploymentPlanGroups_ConvergedTargetsAreTheirOwnGroup(t *testing.T) {
 }
 
 // The primary's group comes first whatever the primary's own plan, because the
-// reviewed plan is the one the operator has already read.
+// primary plan is the one the operator has already read.
 func TestDeploymentPlanGroups_PrimaryGroupComesFirst(t *testing.T) {
 	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
 	rollup := api.PlanRollup{
@@ -391,7 +391,7 @@ func TestDeploymentDriftPreview_CleanIndependentRollupCarriesGroups(t *testing.T
 	assert.Len(t, preview.Plans, 2)
 }
 
-// A member's plan reaches the comment in the same shape the reviewed plan does,
+// A member's plan reaches the comment in the same shape the primary plan does,
 // so a group's changes render through the code that renders the plan a reviewer
 // has already read.
 func TestMemberPlanChanges_CarriesNamespaceStatements(t *testing.T) {
@@ -521,7 +521,7 @@ func TestMemberPlanChanges_DiffAloneIsVSchemaWork(t *testing.T) {
 
 // A member's keyspace adds a table whose VSchema entry the engine generates
 // from the DDL, and the engine finalizes the keyspace. The member's plan shows
-// the keyspace by its DDL alone, the way the reviewed plan shows it.
+// the keyspace by its DDL alone, the way the primary plan shows it.
 func TestMemberPlanChanges_GeneratedVSchemaChangeShowsOnlyTheDDL(t *testing.T) {
 	create := "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
 	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
@@ -644,7 +644,7 @@ func TestTargetTableSizes_SkipsCreatedTablesAndReadsEveryShard(t *testing.T) {
 
 // A clean multi-target rollup carries each target's table sizes into the
 // preview, so the plan comment totals a table across targets. A blocked
-// rollup carries none, and the size section falls back to the reviewed plan.
+// rollup carries none, and the size section falls back to the primary plan.
 func TestReviewDriftPreview_TableSizesOnlyForCleanRollup(t *testing.T) {
 	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
 	entries := func() []api.DeploymentRollupEntry {
@@ -673,7 +673,7 @@ func TestReviewDriftPreview_TableSizesOnlyForCleanRollup(t *testing.T) {
 // apply would run and the --allow-unsafe gate can count them. A change every
 // target in the group carries names no targets, since the heading lists them;
 // one only some carry names those. A created table's lint verdict makes it
-// unsafe, and so does a drop, by the same rule the reviewed plan uses.
+// unsafe, and so does a drop, by the same rule the primary plan uses.
 func TestDeploymentPlanGroups_DiscloseEachTargetsUnsafeChanges(t *testing.T) {
 	create := "CREATE TABLE `bikes` (`id` bigint NOT NULL, `created_at` timestamp NULL, PRIMARY KEY (`id`))"
 	unsafeCreate := func(target string) api.DeploymentRollupEntry {
@@ -695,7 +695,7 @@ func TestDeploymentPlanGroups_DiscloseEachTargetsUnsafeChanges(t *testing.T) {
 	groups := deploymentPlanGroups(rollup)
 	require.Len(t, groups, 2)
 	assert.True(t, groups[0].Primary)
-	assert.Empty(t, groups[0].UnsafeChanges, "the reviewed target has nothing to run")
+	assert.Empty(t, groups[0].UnsafeChanges, "the primary target has nothing to run")
 	assert.Equal(t, []templates.UnsafeChangeData{{
 		Table:      "bikes",
 		Reason:     "has_timestamp: column created_at uses TIMESTAMP",
@@ -708,17 +708,17 @@ func TestDeploymentPlanGroups_DiscloseEachTargetsUnsafeChanges(t *testing.T) {
 	listed := templates.TargetPlanUnsafeChanges(drift)
 	require.Len(t, listed, 1)
 	assert.Equal(t, []string{"ski/bikeshare-002", "ski/bikeshare-003"}, listed[0].Targets,
-		"the gate's list names the targets, since it renders beside the reviewed plan's changes")
+		"the gate's list names the targets, since it renders beside the primary plan's changes")
 }
 
 // Targets that run the same DDL share a group, but each target's unsafe
 // verdict is read from its own schema: dropping an index is unsafe only where
-// the index is visible. A sibling that finds the reviewed target's statement
-// unsafe when the reviewed target does not is disclosed under the reviewed
+// the index is visible. A sibling that finds the primary target's statement
+// unsafe when the primary target does not is disclosed under the primary
 // target's group, naming the sibling, and the unsafe gate counts it, so
 // --allow-unsafe never consents to a consequence the comment left out. A
-// verdict the reviewed target shares is already disclosed plan-wide.
-func TestDeploymentPlanGroups_DisclosesASiblingsUnsafeVerdictInTheReviewedGroup(t *testing.T) {
+// verdict the primary target shares is already disclosed plan-wide.
+func TestDeploymentPlanGroups_DisclosesASiblingsUnsafeVerdictInThePrimaryGroup(t *testing.T) {
 	dropIndex := "ALTER TABLE `users` DROP INDEX `idx_email`"
 	const visible = "drop_index: index idx_email is visible"
 	reviewed := plannedMember("ski", "users-001", dropIndex)
@@ -748,11 +748,11 @@ func TestDeploymentPlanGroups_DisclosesASiblingsUnsafeVerdictInTheReviewedGroup(
 	shared.ChangeSet.Changes[0].TableChanges[0].IsUnsafe = true
 	shared.ChangeSet.Changes[0].TableChanges[0].UnsafeReason = visible
 	drift.Plans = deploymentPlanGroups(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{shared, sibling}})
-	assert.Empty(t, templates.TargetPlanUnsafeChanges(drift), "a verdict the reviewed target carries is the reviewed plan's own")
+	assert.Empty(t, templates.TargetPlanUnsafeChanges(drift), "a verdict the primary target carries is the primary plan's own")
 }
 
 // A drop is unsafe on a target whose engine left the verdict unset, the same
-// fallback the reviewed plan's changes get, and a change only some of a
+// fallback the primary plan's changes get, and a change only some of a
 // group's targets carry names them.
 func TestMemberUnsafeChanges_DropIsUnsafeWithoutAVerdict(t *testing.T) {
 	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: []*ternv1.TableChange{
@@ -776,7 +776,7 @@ func TestMemberUnsafeChanges_DropIsUnsafeWithoutAVerdict(t *testing.T) {
 	assert.Equal(t, 3, list[0].TotalTargets)
 }
 
-// A member's VSchema deletion is unsafe the way the reviewed plan's is, so it
+// A member's VSchema deletion is unsafe the way the primary plan's is, so it
 // is listed beside the member's table changes, and a record that cannot be
 // decoded is listed as unsafe rather than dropped.
 func TestMemberUnsafeChanges_ListsVSchemaChanges(t *testing.T) {

@@ -284,7 +284,7 @@ func TestRenderBlockedChangesApplyRejectedSanitizesReason(t *testing.T) {
 
 // When every target's own plan renders, a direct change is disclosed under the
 // targets that run it, naming them when only some of the group does. The
-// reviewed plan's own direct changes move under its group rather than repeat
+// primary plan's own direct changes move under its group rather than repeat
 // plan-wide, and stay plan-wide when its group carries none, so the comment
 // never leaves a direct statement undisclosed.
 func TestRenderPlanComment_DirectDisclosedPerTargetGroup(t *testing.T) {
@@ -310,7 +310,7 @@ func TestRenderPlanComment_DirectDisclosedPerTargetGroup(t *testing.T) {
 	}
 
 	out := RenderPlanComment(data)
-	assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the reviewed plan's direct change is disclosed once, under its group")
+	assert.Equal(t, 1, strings.Count(out, "**Direct execution**"), "the primary plan's direct change is disclosed once, under its group")
 	assert.Contains(t, out, "- `users` on targets `payments-001`, `payments-003`: the table has ~1,240 rows\n",
 		"only the targets that run it directly are named")
 
