@@ -47,6 +47,15 @@ type EtreResolverConfig struct {
 	// Assembler turns the resolved endpoint and credentials into the
 	// engine-specific connection, and determines the resolved target's type.
 	Assembler inventory.ConnectionAssembler
+
+	// SchemaOverrides maps a target to its canonical→physical schema mapping,
+	// for targets whose physical schema name differs from the namespace the
+	// declarative root names (for example one shard per target, each holding
+	// the schema under its own ordinal name). Etre records no such field, so
+	// the mapping is configured here and attached to the resolved target. A
+	// target with no entry resolves with no override: the requested namespace
+	// is the physical schema.
+	SchemaOverrides map[string]map[string]string
 }
 
 // EtreResolver resolves targets through Etre, delegating the engine-specific
@@ -90,7 +99,36 @@ func NewEtreResolver(cfg EtreResolverConfig) (*EtreResolver, error) {
 			return nil, fmt.Errorf("fixed label %q collides with the env label", label)
 		}
 	}
+	overrides, err := validateSchemaOverrides(cfg.Assembler.DatabaseType(), cfg.SchemaOverrides)
+	if err != nil {
+		return nil, err
+	}
+	cfg.SchemaOverrides = overrides
 	return &EtreResolver{cfg: cfg}, nil
+}
+
+// validateSchemaOverrides holds each target's mapping to the same contract a
+// static target's is held to, so a misconfigured mapping fails at startup
+// rather than on the first request for that target. It returns a deep copy so
+// a caller mutating its config afterwards cannot change what resolves.
+func validateSchemaOverrides(databaseType string, byTarget map[string]map[string]string) (map[string]map[string]string, error) {
+	if len(byTarget) == 0 {
+		return nil, nil
+	}
+	validated := make(map[string]map[string]string, len(byTarget))
+	for target, overrides := range byTarget {
+		if strings.TrimSpace(target) == "" {
+			return nil, fmt.Errorf("schema overrides: target must not be empty")
+		}
+		if len(overrides) == 0 {
+			return nil, fmt.Errorf("schema overrides for target %q: at least one mapping is required", target)
+		}
+		if err := inventory.ValidateSchemaOverrides(databaseType, overrides); err != nil {
+			return nil, fmt.Errorf("schema overrides for target %q: %w", target, err)
+		}
+		validated[target] = maps.Clone(overrides)
+	}
+	return validated, nil
 }
 
 // ResolveTarget looks the target up in Etre for its endpoint and attributes,
@@ -145,9 +183,10 @@ func (r *EtreResolver) ResolveTarget(ctx context.Context, req inventory.Request)
 	}
 
 	return &inventory.Target{
-		Target:       req.Target,
-		DatabaseType: r.cfg.Assembler.DatabaseType(),
-		DSN:          dsn,
-		Metadata:     metadata,
+		Target:          req.Target,
+		DatabaseType:    r.cfg.Assembler.DatabaseType(),
+		DSN:             dsn,
+		Metadata:        metadata,
+		SchemaOverrides: maps.Clone(r.cfg.SchemaOverrides[req.Target]),
 	}, nil
 }

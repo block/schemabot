@@ -378,6 +378,23 @@ target_resolver:
         # namespace-free endpoint/credentials
 ```
 
+A data plane that resolves targets through Etre maps them in its `etre` block, keyed by target, because Etre records no such field. A sharded database whose shards hold the same schema under ordinal names maps each shard's target to its own physical schema, and one canonical directory serves them all:
+
+```yaml
+target_resolver:
+  etre:
+    - database_type: mysql
+      target_label: dsid
+      # addr, entity_type, mysql, credentials as usual
+      schema_overrides:
+        consentsys-002:
+          consentsys: consentsys_0_production
+        consentsys-003:
+          consentsys: consentsys_1_production
+```
+
+A target with no entry resolves with no override. The same rules apply as on a static target, and a malformed entry fails the data plane at startup.
+
 The canonical namespace stays the name everywhere SchemaBot labels a namespace — requests, plans, tasks, drift comparison, pull responses. The physical name only enters the data plane where the engine addresses the schema. The one place it is visible to a reviewer is the DDL itself: PostgreSQL statements are schema-qualified, so the SQL a plan shows and an apply executes names the physical schema, exactly as it will run on the target. SchemaBot never rewrites DDL to hide that, and an apply whose stored DDL names a different schema than the target now maps the namespace to is refused rather than executed.
 
 ### Rules

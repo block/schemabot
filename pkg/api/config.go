@@ -1074,6 +1074,13 @@ type EtreConfig struct {
 	Vitess EtreVitessConfig `yaml:"vitess,omitempty"`
 	// Credentials configures the credentials for the connection.
 	Credentials EtreCredentialsConfig `yaml:"credentials"`
+	// SchemaOverrides maps a target to its canonical→physical schema mapping,
+	// with the same rules as a static target's schema_overrides. Etre records
+	// no such field, so a target whose physical schema name differs from the
+	// namespace its schema root names (one shard per target, each holding the
+	// schema under its own name) is mapped here. A target without an entry
+	// resolves with the requested namespace as its physical schema.
+	SchemaOverrides map[string]map[string]string `yaml:"schema_overrides,omitempty"`
 }
 
 // EtreHTTPConfig configures the transport for Etre requests. Both fields are

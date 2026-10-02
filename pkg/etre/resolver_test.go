@@ -275,3 +275,106 @@ func TestNewEtreResolverValidatesConfig(t *testing.T) {
 		assert.Contains(t, err.Error(), wantErr)
 	}
 }
+
+// A sharded database holds the same schema under a different name on each
+// shard. Each shard's target carries its own mapping, so the shard's resolved
+// connection names the shard's physical schema while every request still uses
+// the canonical namespace. A target with no mapping keeps the default, where
+// the requested namespace is the physical schema.
+func TestEtreResolverAttachesEachTargetsSchemaOverrides(t *testing.T) {
+	entity := etre.Entity{"writer_endpoint": "consentsys.example"}
+	overrides := map[string]map[string]string{
+		"consentsys-002": {"consentsys": "consentsys_0_production"},
+		"consentsys-003": {"consentsys": "consentsys_1_production"},
+	}
+	r := newEtreResolverForTest(t, nil, []etre.Entity{entity}, EtreResolverConfig{
+		TargetLabel:     "dsid",
+		HostField:       "writer_endpoint",
+		SchemaOverrides: overrides,
+	})
+	// The resolver owns a copy, so a later edit to the caller's config cannot
+	// change where a target's namespace lands.
+	overrides["consentsys-002"]["consentsys"] = "consentsys_9_production"
+
+	shard0, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "consentsys-002", DatabaseType: "mysql"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"consentsys": "consentsys_0_production"}, shard0.SchemaOverrides)
+
+	shard1, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "consentsys-003", DatabaseType: "mysql"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"consentsys": "consentsys_1_production"}, shard1.SchemaOverrides)
+
+	unmapped, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "orders-001", DatabaseType: "mysql"})
+	require.NoError(t, err)
+	assert.Empty(t, unmapped.SchemaOverrides)
+
+	cfg, err := mysql.ParseDSN(shard0.DSN)
+	require.NoError(t, err)
+	assert.Equal(t, "", cfg.DBName, "the mapping is injected per operation; the DSN stays namespace-free")
+
+	// Each resolution hands out its own map, so a consumer cannot rewrite the
+	// mapping the next request for the same target receives.
+	shard0.SchemaOverrides["consentsys"] = "consentsys_9_production"
+	again, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "consentsys-002", DatabaseType: "mysql"})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"consentsys": "consentsys_0_production"}, again.SchemaOverrides)
+}
+
+// A malformed mapping fails at construction, so the data plane refuses to
+// start rather than failing the first request for that target.
+func TestNewEtreResolverRejectsInvalidSchemaOverrides(t *testing.T) {
+	client := newClient(mockClient(nil, nil, nil), "cluster", nil)
+	base := EtreResolverConfig{
+		Client:      client,
+		TargetLabel: "dsid",
+		HostField:   "writer_endpoint",
+		Credentials: inventory.SecretRefCredentialResolver{Username: "ddl", PasswordRef: "pw"},
+		Assembler:   inventory.MySQLConnectionAssembler{},
+	}
+
+	cases := []struct {
+		name      string
+		assembler inventory.ConnectionAssembler
+		overrides map[string]map[string]string
+		wantErr   string
+	}{
+		{
+			name:      "empty target",
+			overrides: map[string]map[string]string{" ": {"consentsys": "consentsys_0_production"}},
+			wantErr:   "target must not be empty",
+		},
+		{
+			name:      "empty mapping",
+			overrides: map[string]map[string]string{"consentsys-002": {}},
+			wantErr:   `schema overrides for target "consentsys-002": at least one mapping is required`,
+		},
+		{
+			name:      "two mappings",
+			overrides: map[string]map[string]string{"consentsys-002": {"consentsys": "consentsys_0_production", "audit": "audit_0"}},
+			wantErr:   "exactly one mapping",
+		},
+		{
+			name:      "unsafe identifier",
+			overrides: map[string]map[string]string{"consentsys-002": {"consentsys": "consentsys-0"}},
+			wantErr:   `schema_overrides value "consentsys-0"`,
+		},
+		{
+			name:      "engine without schema overrides",
+			assembler: inventory.MySQLConnectionAssembler{Type: "strata"},
+			overrides: map[string]map[string]string{"consentsys-002": {"consentsys": "consentsys_0_production"}},
+			wantErr:   `only supported for mysql and postgres, not "strata"`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			if tc.assembler != nil {
+				cfg.Assembler = tc.assembler
+			}
+			cfg.SchemaOverrides = tc.overrides
+			_, err := NewEtreResolver(cfg)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}

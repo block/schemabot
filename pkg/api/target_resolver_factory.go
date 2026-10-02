@@ -26,7 +26,7 @@ func (c TargetResolverConfig) BuildResolver(ctx context.Context, logger *slog.Lo
 	staticConfigured := c.Configured()
 	switch {
 	case etreConfigured && staticConfigured:
-		return nil, fmt.Errorf("target_resolver configures both etre and static targets; per-target overrides are not yet supported — use one")
+		return nil, fmt.Errorf("target_resolver configures both etre and static targets; one data plane resolves through one backend, so configure one (map an etre target's physical schema with etre schema_overrides)")
 	case etreConfigured:
 		return buildEtreResolvers(ctx, c.Etre, logger)
 	case staticConfigured:
@@ -91,7 +91,8 @@ func buildEtreResolvers(ctx context.Context, etres []EtreConfig, logger *slog.Lo
 func logEtreResolver(logger *slog.Logger, cfg EtreConfig) {
 	logger.Info("gRPC server etre resolver configured",
 		"database_type", cfg.DatabaseType, "entity_type", cfg.EntityType,
-		"target_label", cfg.TargetLabel, "credentials", credentialType(cfg.Credentials))
+		"target_label", cfg.TargetLabel, "credentials", credentialType(cfg.Credentials),
+		"schema_override_targets", len(cfg.SchemaOverrides))
 }
 
 // buildEtreResolver assembles the Etre-backed resolver from config: the Etre
@@ -133,6 +134,7 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 		AttributeFields: resolverAttributeFields(cfg),
 		Credentials:     creds,
 		Assembler:       assembler,
+		SchemaOverrides: cfg.SchemaOverrides,
 	})
 }
 

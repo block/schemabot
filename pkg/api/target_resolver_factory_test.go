@@ -2,11 +2,14 @@ package api
 
 import (
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/storage"
@@ -333,4 +336,58 @@ func TestBuildResolverRejectsNeitherConfigured(t *testing.T) {
 	_, err := TargetResolverConfig{}.BuildResolver(t.Context(), slog.New(slog.DiscardHandler))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither etre nor static")
+}
+
+// A data plane resolving through Etre maps each shard's physical schema in its
+// etre block, since Etre records no such field. The mapping is read from the
+// server config and attached to the target Etre resolves, which is what the
+// target router hands the data-plane client.
+func TestBuildResolverAttachesEtreSchemaOverridesFromConfig(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"dsid":"consentsys-002","writer_endpoint":"consentsys-002.example"}]`))
+	}))
+	defer srv.Close()
+	t.Setenv("DDL_PASSWORD", "ddl-secret")
+
+	var cfg ServerConfig
+	require.NoError(t, yaml.Unmarshal([]byte(`
+target_resolver:
+  etre:
+    - addr: `+srv.URL+`
+      database_type: mysql
+      entity_type: aurora_cluster
+      target_label: dsid
+      mysql:
+        host_field: writer_endpoint
+      credentials:
+        username: spirit
+        password_ref: env:DDL_PASSWORD
+      schema_overrides:
+        consentsys-002:
+          consentsys: consentsys_0_production
+`), &cfg))
+
+	resolver, err := cfg.TargetResolver.BuildResolver(t.Context(), slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	target, err := resolver.ResolveTarget(t.Context(), inventory.Request{Target: "consentsys-002", DatabaseType: storage.DatabaseTypeMySQL})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"consentsys": "consentsys_0_production"}, target.SchemaOverrides)
+	assert.Equal(t, "spirit:ddl-secret@tcp(consentsys-002.example)/", target.DSN, "the mapping is injected per operation; the DSN stays namespace-free")
+}
+
+// An invalid mapping in an etre block fails the data plane at startup.
+func TestBuildResolverRejectsInvalidEtreSchemaOverrides(t *testing.T) {
+	cfg := TargetResolverConfig{
+		Etre: []EtreConfig{{
+			Addr: "https://etre.example", DatabaseType: storage.DatabaseTypeMySQL,
+			EntityType: "aurora_cluster", TargetLabel: "dsid",
+			MySQL:           EtreMySQLConfig{HostField: "writer_endpoint"},
+			Credentials:     EtreCredentialsConfig{Username: "spirit", PasswordRef: "env:DDL_PASSWORD"},
+			SchemaOverrides: map[string]map[string]string{"consentsys-002": {"consentsys": "consentsys-0"}},
+		}},
+	}
+	_, err := cfg.BuildResolver(t.Context(), slog.New(slog.DiscardHandler))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `schema overrides for target "consentsys-002"`)
 }
