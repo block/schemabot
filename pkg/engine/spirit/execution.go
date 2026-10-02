@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
@@ -61,15 +62,19 @@ func (e *Engine) newSpiritMigration(host, username, password, database, stmt str
 		Password:                           &password,
 		Database:                           database,
 		Statement:                          stmt,
-		Threads:                            threads,
-		WriteThreads:                       0, // auto-size for the target
-		LockWaitTimeout:                    lockTimeout,
-		InterpolateParams:                  true,
-		CheckpointMaxAge:                   e.checkpointMaxAge,
 		ChecksumYieldTimeout:               e.checksumYieldTimeout,
-		MaxCommitLatency:                   maxCommitLatency,
-		EnableExperimentalAutoscaling:      e.autoscaling,
 		EnableExperimentalLocklessChecksum: e.locklessChecksum,
+		Common: flags.Common{
+			Threads:                       threads,
+			WriteThreads:                  0, // auto-size for the target
+			InterpolateParams:             true,
+			CheckpointMaxAge:              e.checkpointMaxAge,
+			MaxCommitLatency:              maxCommitLatency,
+			EnableExperimentalAutoscaling: e.autoscaling,
+		},
+		Cutover: flags.Cutover{
+			LockWaitTimeout: lockTimeout,
+		},
 	}
 }
 
@@ -391,7 +396,7 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 
 	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
 	migration.DeferCutOver = deferCutover
-	migration.RespectSentinel = deferCutover // Only wait for sentinel when deferring cutover
+	migration.IgnoreSentinel = !deferCutover // Only wait for sentinel when deferring cutover
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {
