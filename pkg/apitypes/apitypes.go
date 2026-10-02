@@ -1548,6 +1548,32 @@ type TableChangeResponse struct {
 	// table (data plus indexes), summed across shards for sharded targets.
 	// Display only, like EstimatedRows. Nil when no estimate was available.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, with how each move changes the way values compare. Empty when
+	// the change re-collates no column, or the engine does not report it.
+	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string `json:"column"`
+	// From is the collation the column compares under now; To is the one it
+	// compares under once the change applies, empty when the change leaves it
+	// to a server default the plan cannot read.
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	// Case and TrailingSpaces say how the comparison of values differing only
+	// in letter case, and only in trailing spaces, moves: "unchanged",
+	// "becomes_sensitive", "becomes_insensitive", or "unknown" when either
+	// collation's properties are not known. "unknown" is a possible change.
+	Case           string `json:"case"`
+	TrailingSpaces string `json:"trailing_spaces"`
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column once the change applies. Values that were distinct can compare
+	// equal under the new collation, and a unique index then rejects them.
+	UniqueIndexes []string `json:"unique_indexes,omitempty"`
 }
 
 // Execution-mode verdicts a planner records on a table change. These mirror
