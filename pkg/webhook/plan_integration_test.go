@@ -624,6 +624,85 @@ func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
 	}
 }
 
+// A plan that moves a table onto a new default collation and makes a unique
+// column case-sensitive says, under the DDL, what each move does to how the
+// columns compare: the column the ALTER redeclares without a collation picks
+// up the new table default and starts treating trailing spaces as
+// significant, and the unique column starts treating letter case as
+// significant and names the unique index the apply can fail on.
+func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
+	dbName := "webhook_plan_collation_changes"
+	svc := setupE2EService(t, dbName)
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema"}
+	svc.Config().Databases[dbName] = dbConfig
+
+	dsnConfig, err := mysql.ParseDSN(e2eTargetDSN)
+	require.NoError(t, err)
+	dsnConfig.DBName = dbName
+	appDB, err := sql.Open("block-mysql", dsnConfig.FormatDSN())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = appDB.Close() })
+	_, err = appDB.ExecContext(t.Context(), "CREATE TABLE `handles` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `handle` varchar(64) NOT NULL,\n"+
+		"  `note` varchar(255) DEFAULT NULL,\n"+
+		"  PRIMARY KEY (`id`),\n"+
+		"  UNIQUE KEY `uk_handle` (`handle`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci")
+	require.NoError(t, err)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
+	schemaFiles := map[string]string{
+		"handles.sql": "CREATE TABLE `handles` (\n" +
+			"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+			"  `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL,\n" +
+			"  `note` varchar(255) DEFAULT NULL,\n" +
+			"  PRIMARY KEY (`id`),\n" +
+			"  UNIQUE KEY `uk_handle` (`handle`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	factory := &fakeClientFactory{client: installClient}
+
+	h := NewHandler(svc, factory, nil, logger)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "plan generated successfully")
+
+	select {
+	case body := <-result.comments:
+		assert.Contains(t, body, "🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.\n"+
+			"- `handle` on `handles`: `utf8mb4_general_ci` → `utf8mb4_bin`\n"+
+			"  - ⚠️ Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
+			"  - ⚠️ `handle` is in unique index `uk_handle`: the apply fails if two existing values compare equal under the new collation.\n"+
+			"- `note` on `handles`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`\n"+
+			"  - ⚠️ Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n", body)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for plan comment")
+	}
+}
+
 // TestE2EPlanCleansStalePlanOnlyChecksBeforeConvergingAggregates verifies the
 // check-refresh path of a plan command on a PR with no managed schema changes
 // when an earlier commit left behind a stale plan-only blocking check (for
