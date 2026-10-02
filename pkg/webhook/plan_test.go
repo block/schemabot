@@ -1431,7 +1431,7 @@ func TestBuildPlanCommentData_TableSizesReadEveryShard(t *testing.T) {
 // checked. Any other plan failure is not stored as a placement block.
 func TestPlanRefusedByNamespacePlacement(t *testing.T) {
 	coverage := &api.NamespaceCoverageError{Database: "orders", Environment: "production", Uncovered: []string{"ns_1"}}
-	drop := &api.UnselectedTableDropError{Deployment: "eu", Target: "orders-001", Tables: []string{"payments"}, Namespaces: []string{"ns_1"}}
+	drop := &api.UnselectedTableDropError{Deployment: "eu", Target: "orders-001", Placed: []string{"payments"}, PlacedNamespaces: []string{"ns_1"}}
 	check := &api.UnselectedTableDropCheckError{Database: "orders", Environment: "production", Target: "orders-001", Err: errors.New("split schema file ns_1/payments.sql: syntax error")}
 
 	assert.True(t, planRefusedByNamespacePlacement(coverage), "a namespace no targets entry selects")

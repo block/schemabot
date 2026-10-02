@@ -31,7 +31,11 @@ import (
 // match would refuse their legitimate drops. Every other drop, one the plan
 // attributes to no namespace or one whose attribution the engine inferred, is
 // judged by its name as well and fails closed: it is refused when an
-// unselected namespace declares that table.
+// unselected namespace declares that table. Name judging protects only the
+// tables the unselected namespaces declare. A live table no schema file
+// declares, such as drift or a table created out of band, is placed in an
+// unselected namespace only by an engine that locates its drops, so on any
+// other engine its drop is reviewed like any drop of an undeclared table.
 //
 // It is a refusal, not an unsafe change awaiting an opt-in: --allow-unsafe
 // accepts drops the schema files ask for, and these are drops they do not.
@@ -52,10 +56,12 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 	locatesDrops := engineLocatesDroppedTables(member.DatabaseType)
 	// placed holds the drops the plan itself attributes to an unselected
 	// namespace; named holds those refused only because an unselected
-	// namespace declares a table of that name.
+	// namespace declares a table of that name. Each keeps the namespaces that
+	// refused it, so the refusal can say which tables were refused how.
 	placed := map[string]bool{}
+	placedNamespaces := map[string]bool{}
 	named := map[string]bool{}
-	namespaces := map[string]bool{}
+	namedNamespaces := map[string]bool{}
 	var judgedByName []string
 	for _, drop := range drops {
 		for _, namespace := range drop.namespaces {
@@ -63,7 +69,7 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 				continue
 			}
 			placed[drop.table] = true
-			namespaces[namespace] = true
+			placedNamespaces[namespace] = true
 		}
 		// Only a located attribution clears a drop: one the plan attributes to
 		// no namespace, or whose namespace the engine inferred, is also judged
@@ -79,20 +85,24 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 			return &UnselectedTableDropCheckError{Database: req.Database, Environment: req.Environment, Target: member.Target, Err: err}
 		}
 		for _, table := range judgedByName {
-			namespace, ok := declaredBy[table]
+			if placed[table] {
+				// The plan's own attribution already refuses it, which is the
+				// stronger claim and carries the remedy that applies.
+				continue
+			}
+			namespace, ok := declaredBy[declaredTableKey(table)]
 			if !ok {
 				continue
 			}
 			named[table] = true
-			namespaces[namespace] = true
+			namedNamespaces[namespace] = true
 		}
 	}
 	if len(placed) == 0 && len(named) == 0 {
 		return nil
 	}
-	refused := maps.Clone(placed)
-	maps.Copy(refused, named)
-	tables := slices.Sorted(maps.Keys(refused))
+	refusedNamespaces := maps.Clone(placedNamespaces)
+	maps.Copy(refusedNamespaces, namedNamespaces)
 	// A refusal is the plan's deterministic answer for this configuration, not
 	// a server fault, so it is a warning; the caller reports it.
 	s.logger.Warn("plan proposes dropping tables in namespaces the target's entry does not select",
@@ -101,17 +111,18 @@ func (s *Service) refuseDropsOfUnselectedTables(req PlanRequest, declared map[st
 		"deployment", member.Deployment,
 		"target", member.Target,
 		"repository", req.Repository,
-		"tables", tables,
-		"refused_namespaces", slices.Sorted(maps.Keys(namespaces)),
+		"refused_by_placement", slices.Sorted(maps.Keys(placed)),
 		"refused_by_name", slices.Sorted(maps.Keys(named)),
+		"refused_namespaces", slices.Sorted(maps.Keys(refusedNamespaces)),
 		"selected_namespaces", member.Namespaces,
 		"unselected_namespaces", unselected)
 	return &UnselectedTableDropError{
-		Deployment:  member.Deployment,
-		Target:      member.Target,
-		Tables:      tables,
-		Namespaces:  slices.Sorted(maps.Keys(namespaces)),
-		MatchedName: len(placed) == 0,
+		Deployment:       member.Deployment,
+		Target:           member.Target,
+		Placed:           slices.Sorted(maps.Keys(placed)),
+		PlacedNamespaces: slices.Sorted(maps.Keys(placedNamespaces)),
+		Named:            slices.Sorted(maps.Keys(named)),
+		NamedNamespaces:  slices.Sorted(maps.Keys(namedNamespaces)),
 	}
 }
 
@@ -134,33 +145,41 @@ func engineLocatesDroppedTables(databaseType string) bool {
 }
 
 // UnselectedTableDropError reports a plan that proposes dropping tables in
-// namespaces the member's targets entry does not select.
+// namespaces the member's targets entry does not select. A refused drop is
+// either placed or named, never both, and each kind carries its own remedy, so
+// a plan refused both ways reports each table under the cause that refused it.
 type UnselectedTableDropError struct {
 	Deployment string
 	Target     string
-	// Tables are the refused drops, sorted.
-	Tables []string
-	// Namespaces are the unselected namespaces the refused drops belong to,
-	// sorted: the namespace the plan attributes a drop to, or for a drop judged
-	// by name, the unselected namespace declaring the table.
-	Namespaces []string
-	// MatchedName is set when every refused drop was refused by name alone: the
-	// plan placed none of them in an unselected namespace, but an unselected
-	// namespace declares a table of each name. The engine cannot say whose
-	// table such a drop is, so it is either a data plane planning another
-	// target's tables or a legitimate drop whose name collides with them.
-	MatchedName bool
+	// Placed are the refused drops the plan attributes to a namespace the
+	// target's entry does not select, sorted, and PlacedNamespaces are those
+	// namespaces, sorted. Only a data plane that planned another target's
+	// namespace proposes such a drop.
+	Placed           []string
+	PlacedNamespaces []string
+	// Named are the refused drops the plan does not place in an unselected
+	// namespace but whose table an unselected namespace declares, sorted, and
+	// NamedNamespaces are the namespaces declaring them, sorted. The engine
+	// cannot say whose table such a drop is, so it is either a data plane
+	// planning another target's tables or a legitimate drop whose name
+	// collides with them.
+	Named           []string
+	NamedNamespaces []string
 }
 
 func (e *UnselectedTableDropError) Error() string {
-	if e.MatchedName {
-		return fmt.Sprintf(
-			"the plan from deployment %q target %q proposes dropping %s, and namespaces [%s], which this target's entry does not select, declare tables of the same name. This target's engine does not report which namespace a dropped table belongs to, so SchemaBot cannot tell a drop of this target's own table from a drop of one of those namespaces' tables, and refuses the plan, --allow-unsafe included. Either that deployment predates selecting namespaces per target and planned those namespaces' tables, or the drop is intended and its table name collides with a table those namespaces still declare, which this target cannot drop while they do",
-			e.Deployment, e.Target, quotedTableList(e.Tables), strings.Join(e.Namespaces, ", "))
+	var causes []string
+	if len(e.Placed) > 0 {
+		causes = append(causes, fmt.Sprintf(
+			"proposes dropping %s in namespaces [%s], which this target's entry does not select. The schema files do not ask for these drops, so the plan is refused, --allow-unsafe included. Upgrade that deployment to a build that supports selecting namespaces per target",
+			quotedTableList(e.Placed), strings.Join(e.PlacedNamespaces, ", ")))
 	}
-	return fmt.Sprintf(
-		"the plan from deployment %q target %q proposes dropping %s in namespaces [%s], which this target's entry does not select. The schema files do not ask for these drops, so the plan is refused, --allow-unsafe included. Upgrade that deployment to a build that supports selecting namespaces per target",
-		e.Deployment, e.Target, quotedTableList(e.Tables), strings.Join(e.Namespaces, ", "))
+	if len(e.Named) > 0 {
+		causes = append(causes, fmt.Sprintf(
+			"proposes dropping %s, and namespaces [%s], which this target's entry does not select, declare tables of the same name. This target's engine does not report which namespace a dropped table belongs to, so SchemaBot cannot tell a drop of this target's own table from a drop of one of those namespaces' tables, and refuses the plan, --allow-unsafe included. Either that deployment predates selecting namespaces per target and planned those namespaces' tables, or the drop is intended and its table name collides with a table those namespaces still declare, which this target cannot drop while they do",
+			quotedTableList(e.Named), strings.Join(e.NamedNamespaces, ", ")))
+	}
+	return fmt.Sprintf("the plan from deployment %q target %q %s", e.Deployment, e.Target, strings.Join(causes, ". It also "))
 }
 
 // UnselectedTableDropCheckError reports a plan whose drops could not be checked
@@ -236,9 +255,10 @@ func plannedTableDrops(changes []*ternv1.SchemaChange, shards []*ternv1.ShardPla
 	return drops
 }
 
-// tablesDeclaredBy maps each table the given namespaces' schema files create to
-// the first of those namespaces, in sorted order, that declares it. Only SQL
-// files declare tables; other schema artifacts such as a VSchema are skipped.
+// tablesDeclaredBy maps each table the given namespaces' schema files create,
+// keyed by declaredTableKey, to the first of those namespaces, in sorted order,
+// that declares it. Only SQL files declare tables; other schema artifacts such
+// as a VSchema are skipped.
 func tablesDeclaredBy(declared map[string]*ternv1.SchemaFiles, namespaces []string, databaseType string) (map[string]string, error) {
 	parser, err := ddl.ParserForDialect(schema.DialectForDatabaseType(databaseType))
 	if err != nil {
@@ -263,11 +283,24 @@ func tablesDeclaredBy(declared map[string]*ternv1.SchemaFiles, namespaces []stri
 				if stmtType != ddl.StatementCreateTable {
 					continue
 				}
-				if _, seen := declaredBy[table]; !seen {
-					declaredBy[table] = namespace
+				if _, seen := declaredBy[declaredTableKey(table)]; !seen {
+					declaredBy[declaredTableKey(table)] = namespace
 				}
 			}
 		}
 	}
 	return declaredBy, nil
+}
+
+// declaredTableKey is the key a dropped table is matched against the unselected
+// namespaces' declarations by. The match ignores case: a server that folds table
+// names, as MySQL does under lower_case_table_names, reports a declared
+// `Orders` as a drop of `orders`, and an exact match would let that drop
+// through. Folding errs toward refusing, the safe direction for a guard that
+// lets a missed match drop a table, so on a server that keeps `orders` and
+// `Orders` apart a drop of one is refused while an unselected namespace
+// declares the other. ddl.TableDeclarations deliberately keeps them apart,
+// because a miss there produces a redundant CREATE TABLE the apply refuses.
+func declaredTableKey(table string) string {
+	return strings.ToLower(table)
 }

@@ -69,8 +69,9 @@ func TestExecutePlan_RefusesDropOfTableAnUnselectedNamespaceDeclares(t *testing.
 		plans, err := plan(t, dropsPlan("ns_1", "legacy"))
 		var dropErr *UnselectedTableDropError
 		require.ErrorAs(t, err, &dropErr)
-		assert.Equal(t, []string{"legacy"}, dropErr.Tables, "a drop placed in an unselected namespace is refused whatever the table")
-		assert.Equal(t, []string{"ns_1"}, dropErr.Namespaces)
+		assert.Equal(t, []string{"legacy"}, dropErr.Placed, "a drop placed in an unselected namespace is refused whatever the table")
+		assert.Equal(t, []string{"ns_1"}, dropErr.PlacedNamespaces)
+		assert.Empty(t, dropErr.Named)
 		assert.Contains(t, err.Error(), `target "orders-001" proposes dropping "legacy" in namespaces [ns_1], which this target's entry does not select`)
 		assert.Contains(t, err.Error(), "--allow-unsafe included")
 		assert.True(t, UnselectedTableDropRefused(err), "the refusal is typed so a merge gate fails the environment's check closed on it")
@@ -81,8 +82,9 @@ func TestExecutePlan_RefusesDropOfTableAnUnselectedNamespaceDeclares(t *testing.
 		plans, err := plan(t, dropsPlan("ns_0", "payments", "refunds"))
 		var dropErr *UnselectedTableDropError
 		require.ErrorAs(t, err, &dropErr, "the MySQL engine infers a drop's namespace, so the attribution cannot clear it")
-		assert.Equal(t, []string{"payments", "refunds"}, dropErr.Tables)
-		assert.Equal(t, []string{"ns_1", "ns_2"}, dropErr.Namespaces)
+		assert.Equal(t, []string{"payments", "refunds"}, dropErr.Named)
+		assert.Equal(t, []string{"ns_1", "ns_2"}, dropErr.NamedNamespaces)
+		assert.Empty(t, dropErr.Placed)
 		assert.Nil(t, plans.created, "a refused plan is never stored")
 	})
 
@@ -96,8 +98,8 @@ func TestExecutePlan_RefusesDropOfTableAnUnselectedNamespaceDeclares(t *testing.
 		plans, err := plan(t, dropsPlan("", "payments", "legacy"))
 		var dropErr *UnselectedTableDropError
 		require.ErrorAs(t, err, &dropErr)
-		assert.Equal(t, []string{"payments"}, dropErr.Tables, "only the unattributed drop an unselected namespace declares is refused")
-		assert.Equal(t, []string{"ns_1"}, dropErr.Namespaces)
+		assert.Equal(t, []string{"payments"}, dropErr.Named, "only the unattributed drop an unselected namespace declares is refused")
+		assert.Equal(t, []string{"ns_1"}, dropErr.NamedNamespaces)
 		assert.Nil(t, plans.created, "a refused plan is never stored")
 	})
 
@@ -126,8 +128,8 @@ func TestRollupReviewTimeDrift_MemberDropOfUnselectedNamespaceTableBlocks(t *tes
 	var dropErr *UnselectedTableDropError
 	require.ErrorAs(t, rollup.Entries[1].Err, &dropErr)
 	assert.Equal(t, "orders-002", dropErr.Target)
-	assert.Equal(t, []string{"orders"}, dropErr.Tables)
-	assert.Equal(t, []string{"ns_0"}, dropErr.Namespaces)
+	assert.Equal(t, []string{"orders"}, dropErr.Placed)
+	assert.Equal(t, []string{"ns_0"}, dropErr.PlacedNamespaces)
 	assert.Empty(t, plans.created, "the refused member plan is never stored")
 }
 
@@ -156,13 +158,13 @@ func TestRefuseDropsOfUnselectedTables(t *testing.T) {
 
 	err := svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, nil, shardDrops("", "", "refunds"))
 	require.ErrorAs(t, err, &dropErr, "an unattributed shard drop fails closed on its name")
-	assert.Equal(t, []string{"refunds"}, dropErr.Tables)
-	assert.Equal(t, []string{"ns_2"}, dropErr.Namespaces)
+	assert.Equal(t, []string{"refunds"}, dropErr.Named)
+	assert.Equal(t, []string{"ns_2"}, dropErr.NamedNamespaces)
 
 	err = svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, nil, shardDrops("ns_0", "ns_2", "legacy"))
 	require.ErrorAs(t, err, &dropErr, "a table change placed in an unselected namespace is refused even on a selected shard")
-	assert.Equal(t, []string{"legacy"}, dropErr.Tables)
-	assert.Equal(t, []string{"ns_2"}, dropErr.Namespaces)
+	assert.Equal(t, []string{"legacy"}, dropErr.Placed)
+	assert.Equal(t, []string{"ns_2"}, dropErr.PlacedNamespaces)
 
 	assert.NoError(t, svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, locating, nil, shardDrops("ns_0", "", "refunds")),
 		"a located shard drop placed in the selected namespace passes")
@@ -171,8 +173,8 @@ func TestRefuseDropsOfUnselectedTables(t *testing.T) {
 
 	err = svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, nil, shardDrops("ns_0", "", "refunds"))
 	require.ErrorAs(t, err, &dropErr, "an inferred attribution to the selected namespace does not clear a drop an unselected namespace declares")
-	assert.Equal(t, []string{"refunds"}, dropErr.Tables)
-	assert.Equal(t, []string{"ns_2"}, dropErr.Namespaces)
+	assert.Equal(t, []string{"refunds"}, dropErr.Named)
+	assert.Equal(t, []string{"ns_2"}, dropErr.NamedNamespaces)
 
 	assert.NoError(t, svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, nil, member, dropsPlan("", "payments"), nil),
 		"a member selecting nothing has no unselected namespaces to protect")
@@ -227,17 +229,65 @@ func TestUnselectedTableDropError_NamesTheCause(t *testing.T) {
 	err := svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, dropsPlan("ns_1", "legacy"), nil)
 	var placed *UnselectedTableDropError
 	require.ErrorAs(t, err, &placed)
-	assert.False(t, placed.MatchedName)
+	assert.Equal(t, []string{"legacy"}, placed.Placed)
+	assert.Empty(t, placed.Named)
 	assert.Contains(t, err.Error(), "Upgrade that deployment to a build that supports selecting namespaces per target")
 
 	err = svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, dropsPlan("ns_0", "payments"), nil)
 	var named *UnselectedTableDropError
 	require.ErrorAs(t, err, &named)
-	assert.True(t, named.MatchedName, "a drop the plan places in the selected namespace is refused by name alone")
-	assert.Equal(t, []string{"payments"}, named.Tables)
+	assert.Equal(t, []string{"payments"}, named.Named, "a drop the plan places in the selected namespace is refused by name alone")
+	assert.Empty(t, named.Placed)
 	assert.Contains(t, err.Error(), `proposes dropping "payments", and namespaces [ns_1], which this target's entry does not select, declare tables of the same name`)
 	assert.Contains(t, err.Error(), "the drop is intended and its table name collides with a table those namespaces still declare")
 	assert.NotContains(t, err.Error(), "Upgrade that deployment", "a name collision does not prescribe an upgrade")
+}
+
+// A plan refused both ways reports each table under the cause that refused it,
+// with that cause's remedy: a Vitess drop of legacy placed in the unselected
+// ns_1 names the upgrade, and an unattributed drop of payments, which ns_1
+// declares, names the collision. A drop the plan places in an unselected
+// namespace is reported as placed even when that namespace also declares it.
+func TestUnselectedTableDropError_MixedRefusalNamesEachCause(t *testing.T) {
+	svc := namespaceSelectionService(t, &mockTernClient{}, &capturingPlanStore{})
+	member := routing.ExecutionTarget{DatabaseType: storage.DatabaseTypeVitess, Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0"}}
+	req := placedNamespacesRequest()
+	unselected := []string{"ns_1", "ns_2"}
+
+	changes := append(dropsPlan("ns_1", "legacy"), dropsPlan("", "payments")...)
+	err := svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, changes, nil)
+	var dropErr *UnselectedTableDropError
+	require.ErrorAs(t, err, &dropErr)
+	assert.Equal(t, []string{"legacy"}, dropErr.Placed)
+	assert.Equal(t, []string{"ns_1"}, dropErr.PlacedNamespaces)
+	assert.Equal(t, []string{"payments"}, dropErr.Named)
+	assert.Equal(t, []string{"ns_1"}, dropErr.NamedNamespaces)
+	assert.Contains(t, err.Error(), `target "orders-001" proposes dropping "legacy" in namespaces [ns_1], which this target's entry does not select. The schema files do not ask for these drops`)
+	assert.Contains(t, err.Error(), `Upgrade that deployment to a build that supports selecting namespaces per target. It also proposes dropping "payments", and namespaces [ns_1], which this target's entry does not select, declare tables of the same name`)
+
+	member.DatabaseType = storage.DatabaseTypeMySQL
+	err = svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselected, member, dropsPlan("ns_1", "payments"), nil)
+	require.ErrorAs(t, err, &dropErr)
+	assert.Equal(t, []string{"payments"}, dropErr.Placed)
+	assert.Empty(t, dropErr.Named, "a placed drop is not also reported as a name collision")
+	assert.NotContains(t, err.Error(), "declare tables of the same name")
+}
+
+// A server that folds table names reports a declared Orders as a drop of
+// orders, so a drop judged by name matches an unselected namespace's
+// declaration whatever its case, and the drop is refused rather than let
+// through on a case mismatch.
+func TestRefuseDropsOfUnselectedTables_NameMatchIgnoresCase(t *testing.T) {
+	svc := namespaceSelectionService(t, &mockTernClient{}, &capturingPlanStore{})
+	member := routing.ExecutionTarget{DatabaseType: storage.DatabaseTypeMySQL, Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0"}}
+	req := placedNamespacesRequest()
+	req.SchemaFiles["ns_1"] = &ternv1.SchemaFiles{Files: map[string]string{"payments.sql": "CREATE TABLE `Payments` (id bigint primary key)"}}
+
+	err := svc.refuseDropsOfUnselectedTables(req, req.SchemaFiles, []string{"ns_1", "ns_2"}, member, dropsPlan("ns_0", "payments", "REFUNDS"), nil)
+	var dropErr *UnselectedTableDropError
+	require.ErrorAs(t, err, &dropErr)
+	assert.Equal(t, []string{"REFUNDS", "payments"}, dropErr.Named, "each drop is reported under the name the plan gave it")
+	assert.Equal(t, []string{"ns_1", "ns_2"}, dropErr.NamedNamespaces)
 }
 
 // A refused drop is the request's answer, not a server fault, so POST

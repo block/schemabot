@@ -1615,7 +1615,10 @@ A namespace the plan withholds, through `ignore_namespaces` or a targets entry's
 refused on a target diffed as one unit rather than read as deleted (`planWithEngine` in
 `pkg/tern/local_client.go`), and a plan of the schema files proposing to drop a table in a namespace
 the target does not select is refused whatever the data plane build (`refuseDropsOfUnselectedTables`
-in `pkg/api/plan_unselected_drops.go`, for the primary and every member). A rollback plan re-plans
+in `pkg/api/plan_unselected_drops.go`, for the primary and every member). Where the engine
+locates the tables it drops, a drop it places in an unselected namespace is refused. On every other
+engine a drop is refused by name when an unselected namespace declares that table, ignoring case,
+so there a live table no schema file declares is protected only by the review of its drop. A rollback plan re-plans
 the snapshot its source plan captured, not the schema files, and is not checked this way.
 
 ### RV-9: A rollout member runs only a plan made for it
