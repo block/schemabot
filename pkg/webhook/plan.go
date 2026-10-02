@@ -104,7 +104,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	prNumber := int32(pr)
 	deployment := ""
 	if resolvedTarget, err := h.service.Config().ResolvePrimaryDatabaseTarget(schemaResult.Database, environment); err != nil {
-		h.logger.Warn("plan metric deployment is unknown because target resolution failed",
+		h.logger.Warn("plan logs carry no deployment because target resolution failed",
 			"repo", repo,
 			"pr", pr,
 			"database", schemaResult.Database,
@@ -132,7 +132,6 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	if planRefusedByNamespacePlacement(err) {
 		h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
 			"repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "head_sha", schemaResult.HeadSHA, "error", err)
-		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
 		h.failClosedOnNamespacePlacement(ctx, client, repo, pr, schemaResult, environment)
 		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan refused by namespace placement"})
@@ -140,7 +139,6 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	}
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", err)
-		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
 		userError := userFacingError(err)
 		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
 			environment: userError,
@@ -160,8 +158,6 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	commentData.DeploymentDrift = driftPreview
 	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
-
-	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
 
 	// Store per-database check record and update aggregate
 	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, drift)

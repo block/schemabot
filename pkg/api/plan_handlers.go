@@ -735,6 +735,16 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	)
 	defer span.End()
 
+	// Every plan attempt is counted exactly once, here, whatever path it
+	// leaves by: it counts as a success only once its response is stored.
+	planStart := time.Now()
+	deployment := ""
+	status := "error"
+	defer func() {
+		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, status)
+		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, status)
+	}()
+
 	if warning, err := validateSchemaFiles(req.SchemaFiles); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "invalid schema files")
@@ -743,15 +753,10 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
 	}
 
-	planStart := time.Now()
-	deployment := ""
-
 	resolvedTarget, narrowedTo, err := s.planMember(req)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "resolve target")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("resolve target for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	deployment = resolvedTarget.Deployment
@@ -759,8 +764,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 		typeErr := &databaseTypeMismatchError{Database: req.Database, RequestType: req.Type, ConfigType: resolvedTarget.DatabaseType}
 		span.RecordError(typeErr)
 		span.SetStatus(otelcodes.Error, "type mismatch")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, typeErr
 	}
 	prInt := 0
@@ -793,8 +796,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 			reason := sourcePolicyReason(err)
 			span.RecordError(err)
 			span.SetStatus(otelcodes.Error, "source policy")
-			metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-			metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 			metrics.RecordSourcePolicyBlock(ctx, "plan", req.Database, req.Environment, reason)
 			s.logger.Warn("plan blocked by source policy",
 				"database", req.Database,
@@ -816,15 +817,11 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "resolve targets")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("resolve targets for %s/%s: %w", req.Database, req.Environment, err)
 	}
 	if err := requireNamespaceCoverage(req, targets); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "namespace coverage")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, err
 	}
 	// The planned member (the primary, or for a narrowed plan the member it
@@ -835,8 +832,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "select namespaces")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, err
 	}
 	if len(resolvedTarget.Namespaces) > 0 {
@@ -858,8 +853,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "tern client")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("database %q (%s): %w", req.Database, req.Environment, err)
 	}
 
@@ -867,8 +860,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "direct execution policy")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, fmt.Errorf("resolve direct_execution policy for database %q environment %q: %w", req.Database, req.Environment, err)
 	}
 	ternReq := &ternv1.PlanRequest{
@@ -940,8 +931,6 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "plan failed")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		s.logger.Error("ExecutePlan: client.Plan failed",
 			"database", req.Database,
 			"type", resolvedTarget.DatabaseType,
@@ -985,19 +974,13 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	if err := s.refuseDropsOfWithheldTables(req, resp, deployment); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "withheld table drops")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, err
 	}
 	if err := s.refuseDropsOfUnselectedTables(req, declaredSchemaFiles, unselected, resolvedTarget, resp.Changes, resp.Shards); err != nil {
 		span.RecordError(err)
 		span.SetStatus(otelcodes.Error, "unselected namespace drops")
-		metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "error")
-		metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "error")
 		return nil, nil, err
 	}
-	metrics.RecordPlan(ctx, req.Repository, req.Database, deployment, req.Environment, "success")
-	metrics.RecordPlanDuration(ctx, time.Since(planStart), req.Repository, req.Database, deployment, req.Environment, "success")
 
 	s.normalizeExecutionVerdicts(resp, req.Database, deployment)
 
@@ -1021,6 +1004,7 @@ func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv
 	planResp.Target = resolvedTarget.Target
 	planResp.SelectedNamespaces = slices.Clone(resolvedTarget.Namespaces)
 	planResp.NarrowedTo = narrowedTo
+	status = "success"
 	return resp, planResp, nil
 }
 
