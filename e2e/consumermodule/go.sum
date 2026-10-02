@@ -52,8 +52,10 @@ github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6 h1:GvubwsqXHanJkhBotCs
 github.com/block/mysql v0.0.0-20260906224346-ee0a93fe50d6/go.mod h1:KEo73lbxXs9cFlq+x3Z35UqGg3MTxAPfjDOR/ob/iik=
 github.com/block/pg-sprite v0.3.4-0.20260929034750-8fee9dab1a62 h1:QKMrGLVmS+4jw/MrRHWCUSLztfDPI1x22CIj7KwKlXI=
 github.com/block/pg-sprite v0.3.4-0.20260929034750-8fee9dab1a62/go.mod h1:RUUeJLVW73GPT6UcWeNV8G5SVJfEwAiCsWWhwPlaI9o=
-github.com/block/spirit v0.17.1-0.20261001231717-5ed4c7a7073d h1:CXScHLixb7QzoH7bTuCqymo8PO4zRjSHyqrMOR+iIXQ=
-github.com/block/spirit v0.17.1-0.20261001231717-5ed4c7a7073d/go.mod h1:WBkD/Eg+VonV5AIeF7P0+/27SH7oG0qUMPpvdpIKPD8=
+github.com/block/spirit v0.17.1-0.20261002070102-9626778cf3ad h1:S4lxiWcNWt9yC2yB5z9T/yWNDVu3DE0OxC8GLJbxocY=
+github.com/block/spirit v0.17.1-0.20261002070102-9626778cf3ad/go.mod h1:WBkD/Eg+VonV5AIeF7P0+/27SH7oG0qUMPpvdpIKPD8=
+github.com/block/spirit v0.17.1-0.20261002232309-dd6c55b6fa6b h1:pQe71ahbJYJdXFAyimM0nk4/hT1JiZaRRvCPrr60Qpg=
+github.com/block/spirit v0.17.1-0.20261002232309-dd6c55b6fa6b/go.mod h1:WBkD/Eg+VonV5AIeF7P0+/27SH7oG0qUMPpvdpIKPD8=
 github.com/block/vitess v0.0.0-20260925015115-736e47fe71a6 h1:XDK3Zeob/5WMIv+UiH5TaPYLUVc1ICZAO5+VKQRdRRw=
 github.com/block/vitess v0.0.0-20260925015115-736e47fe71a6/go.mod h1:kY1CrgkXpUkXdZ8ott1eNfViVY7WDPG5FjL1aoc/NxQ=
 github.com/bradleyfalzon/ghinstallation/v2 v2.18.0 h1:WPqnN6NS9XvYlOgZQAIseN7Z1uAiE+UxgDKlW7FvFuU=
