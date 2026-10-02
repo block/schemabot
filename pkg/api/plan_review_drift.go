@@ -16,13 +16,14 @@ import (
 //
 // What a member is classified against depends on the environment's member
 // planning, which is resolved here. Where members mirror each other, each is
-// diffed against the reviewed primary plan and classified match, diverged, or
+// diffed against the primary plan and classified match, diverged, or
 // errored. Where members hold their own schemas, none is compared to the
-// reviewed plan or to another member: each is classified planned, or errored
+// primary plan or to another member: each is classified planned, or errored
 // when it could not be planned at all.
 //
-// primaryPlan is the just-reviewed primary plan proto, reused as the rollup's
-// baseline so the comparison is against exactly what the user reviewed rather
+// primaryPlan is the primary plan proto just produced, reused as the rollup's
+// baseline so the comparison is against exactly what the comment shows for the
+// primary rather
 // than a fresh read of the primary's live schema (which could have drifted and
 // tripped a spurious primary-vs-primary mismatch). primaryMember is the
 // deployment and target that plan was created against; the producer fails
@@ -66,7 +67,7 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		metrics.RecordReviewDrift(ctx, req.Database, req.Environment, entry.Deployment, entry.Class.String())
 		switch entry.Class {
 		case DeploymentDiverged:
-			s.logger.Warn("review-time drift: deployment diverged from the reviewed plan; the plan check will block the PR until reconciled",
+			s.logger.Warn("review-time drift: deployment diverged from the primary target's plan; the plan check will block the PR until reconciled",
 				append([]any{
 					"repository", req.Repository,
 					"pr", pr,
@@ -100,7 +101,7 @@ const maxDriftDiffLogItems = 5
 
 // driftDiffLogAttrs renders a diverged deployment's change-set diff as log
 // attributes so an operator can tell from the warn log alone what the
-// deployment would run that the reviewed plan does not say (and vice versa).
+// deployment would run that the primary plan does not say (and vice versa).
 // Each item names the namespace, shard when set, table, and operation — never
 // the DDL body, which can be long and belongs on the producer's own logs.
 // Empty lists are omitted.

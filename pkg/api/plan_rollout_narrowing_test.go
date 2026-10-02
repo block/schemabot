@@ -29,7 +29,7 @@ func (s *storingPlanStore) Create(_ context.Context, plan *storage.Plan) (int64,
 }
 
 // Get returns a plan this store holds under the identifier, or the seeded
-// lookup plan, which stands in for the reviewed plan its planner stored.
+// lookup plan, which stands in for the primary plan its planner stored.
 func (s *storingPlanStore) Get(ctx context.Context, planIdentifier string) (*storage.Plan, error) {
 	for _, plan := range s.plans {
 		if plan.PlanIdentifier == planIdentifier {

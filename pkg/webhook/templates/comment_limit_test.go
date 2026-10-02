@@ -643,7 +643,7 @@ func TestPlanCommentUncutDDLNamesNoStoredPlan(t *testing.T) {
 // A rollout whose targets run different plans renders each group's plan, and
 // every member's plan is stored as its own row. When the comment cuts the DDL,
 // each group's marker names the plan that group runs: the primary's group the
-// reviewed plan, another group its first member's plan, and a group whose plan
+// primary plan, another group its first member's plan, and a group whose plan
 // was not stored falls back to the schema files.
 func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
 	primary := greenfieldPlan("production", "orders", 150)
@@ -682,7 +682,7 @@ func TestPlanCommentCutTargetPlansNameEachGroupsStoredPlan(t *testing.T) {
 // A group of several targets stored one plan per member and renders its first
 // member's, so a cut block's marker names that member as the owner of the plan
 // it points at and says the rest of the group runs the same DDL. The primary's
-// group names the reviewed plan, which is the primary member's own.
+// group names the primary plan, which is the primary member's own.
 func TestPlanCommentCutTargetGroupNamesWhosePlanItPointsAt(t *testing.T) {
 	primary := greenfieldPlan("production", "orders", 150)
 	primary.PlanID = "plan_reviewed"

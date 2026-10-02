@@ -1690,9 +1690,9 @@ schemabot apply -e production
 
 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
-- `eu` (primary) ✅ matches the reviewed plan
-- `au` ✅ matches the reviewed plan · blocked: 1
-- `us` ✅ matches the reviewed plan
+- `eu` (primary) ✅ matches the primary target's plan
+- `au` ✅ matches the primary target's plan · blocked: 1
+- `us` ✅ matches the primary target's plan
 
 ```sql
 CREATE TABLE `users` (
@@ -1748,10 +1748,10 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-⚠️ **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:
+⚠️ **Deployment drift detected** — some deployments no longer match the primary target's plan, so the plan check is failing closed:
 
-- `eu` (primary) ✅ matches the reviewed plan
-- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs the reviewed plan
+- `eu` (primary) ✅ matches the primary target's plan
+- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs the primary target's plan
 - `us` ❌ could not verify — diff failed; see server logs
 
 ```sql
@@ -1783,7 +1783,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (reviewed target `eu` only; other targets not shown):
+📊 **Table sizes** (primary target `eu` only; other targets not shown):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
@@ -1839,7 +1839,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (reviewed target only; targets could not be listed):
+📊 **Table sizes** (primary target only; targets could not be listed):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
@@ -2112,7 +2112,7 @@ ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-📊 **Table sizes** (reviewed target `primary/testapp_1` only; other targets not shown):
+📊 **Table sizes** (primary target `primary/testapp_1` only; other targets not shown):
 - `orders`: ~610 MB
 - `users`: ~95.0 MB
 

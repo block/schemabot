@@ -1649,7 +1649,7 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 	// A planner that shares the service's storage stores the row for a plan
 	// with changes first, stamped with the database it was configured with as
 	// the deployment. The service keeps that row and restamps it with the
-	// rollout member it planned, so the apply can find the reviewed target by it.
+	// rollout member it planned, so the apply can find the primary target by it.
 	t.Run("duplicate plan identifier keeps the stored row on the planned route", func(t *testing.T) {
 		svc, _, plans := newPolicyService()
 		plans.createErr = storage.ErrPlanIDExists

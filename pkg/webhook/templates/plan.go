@@ -53,8 +53,8 @@ type UnsafeChangeData struct {
 	TotalShards int
 	// Targets names the rollout targets that carry this change, for a target
 	// plan group in which only some targets do, or for a refusal that lists
-	// other targets' changes beside the reviewed plan's. Empty when the change
-	// is the reviewed plan's, or every target in its group carries it.
+	// other targets' changes beside the primary plan's. Empty when the change
+	// is the primary plan's, or every target in its group carries it.
 	Targets []string
 	// TotalTargets is how many targets the group holds, so a subset too wide
 	// to name reads as coverage ("3 of 12 targets"). Zero when Targets names
@@ -244,16 +244,16 @@ type PlanCommentData struct {
 	RecoveredApplyOwnedCheckState bool
 
 	// DeploymentDrift is the review-time rollup of how every configured
-	// deployment compares to the reviewed primary plan. Nil for a single-target
+	// deployment compares to the primary plan. Nil for a single-target
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
 	// MemberApplyRefusal says why a PR apply cannot run the other targets'
-	// plans this comment renders, whether or not the reviewed target has work
+	// plans this comment renders, whether or not the primary target has work
 	// of its own, naming only targets, tables, and namespaces. Such an apply is
 	// refused whatever its flags, so the comment offers no apply command in its
 	// place. Empty when the apply can run them, or when the comment renders the
-	// reviewed plan alone.
+	// primary plan alone.
 	MemberApplyRefusal string
 
 	// namespaceLabelsInline renders each keyspace's label as a bold line
@@ -273,13 +273,13 @@ type ExemptTablesData struct {
 // DeploymentDriftData renders the review-time drift rollup in the PR preview: a
 // uniform line when every member passed its contract, or a per-member breakdown
 // when some member diverged from — or could not be confirmed against — the
-// reviewed plan.
+// primary plan.
 type DeploymentDriftData struct {
 	// Deployments is every configured rollout member in rollout order, primary
 	// first.
 	Deployments []DeploymentDriftEntry
 	// Clean means every member passed its contract: under mirrored members, that
-	// they all match the reviewed plan; under independent members, that they all
+	// they all match the primary plan; under independent members, that they all
 	// produced a plan of their own.
 	Clean bool
 	// Computed is false when the rollup itself could not be evaluated; the check
@@ -301,7 +301,7 @@ type DeploymentDriftData struct {
 	// changes with a statement whose cost scales with the table's size, in
 	// rollout order, primary first. Each target applies to its own data, so
 	// the size section ranks a table by its largest target rather than by the
-	// reviewed plan alone. Set only for a clean rollup, where every target was
+	// primary plan alone. Set only for a clean rollup, where every target was
 	// planned: a target missing from the list would read as one with nothing
 	// to copy.
 	TableSizes []TargetTableSize
@@ -337,7 +337,7 @@ type DeploymentPlanGroup struct {
 	// shows, so the primary's group is ordered like any other.
 	Primary bool
 	// Changes is one member's plan, in the same shape the comment renders the
-	// reviewed plan itself. Empty for a group whose members are already at the
+	// primary plan itself. Empty for a group whose members are already at the
 	// desired schema.
 	//
 	// The group's members run the same work, so any member's plan describes all
@@ -351,9 +351,9 @@ type DeploymentPlanGroup struct {
 	BlockedChanges []BlockedChangeData
 	// UnsafeChanges are the group's changes that need `--allow-unsafe`, each
 	// naming the targets that carry it when that is not all of them. The
-	// primary group discloses the reviewed plan's own, so beside them it adds
-	// only those its other targets carry without the reviewed target
-	// (unsafeBeyondReviewedPlan).
+	// primary group discloses the primary plan's own, so beside them it adds
+	// only those its other targets carry without the primary target
+	// (unsafeBeyondPrimaryPlan).
 	UnsafeChanges []UnsafeChangeData
 	// PlanID is the identifier of the stored plan the group's first member
 	// would run, so DDL cut to fit the comment names the command that prints
@@ -377,7 +377,7 @@ type DeploymentPlanGroup struct {
 // naming it is the difference between a fleet that is converging and one the
 // comment has quietly left out.
 // A vschema rewrite carries no DDL and is still work, so a group is counted the
-// same way the comment counts the reviewed plan: statements and vschema
+// same way the comment counts the primary plan: statements and vschema
 // rewrites together.
 func (g DeploymentPlanGroup) Empty() bool {
 	statements, vschema := countChanges(g.Changes)
@@ -385,7 +385,7 @@ func (g DeploymentPlanGroup) Empty() bool {
 }
 
 // DeploymentDriftEntry is one rollout member's classification against the
-// reviewed primary plan.
+// primary plan.
 type DeploymentDriftEntry struct {
 	Deployment string
 	// Target is the member's target within its deployment. One deployment can
@@ -531,7 +531,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
-	// even when the reviewed primary plan is a clean no-op.
+	// even when the primary plan is a clean no-op.
 	writeDeploymentDrift(&sb, data.DeploymentDrift, data.Changes)
 	targetPlans := RendersTargetPlans(data.DeploymentDrift)
 	summary := data
@@ -551,7 +551,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// exactly where a reviewer needs to tell a withheld namespace apart from a
 	// genuinely unchanged one.
 	//
-	// A reviewed target with nothing to run while other targets still have work
+	// A primary target with nothing to run while other targets still have work
 	// is not a no-op: the comment goes on to summarize their plans and offer the
 	// apply, which runs each of those targets' own plans.
 	if totalChanges == 0 && !targetPlans {
@@ -1104,7 +1104,7 @@ const groupNoChanges = "No schema changes detected"
 //
 // It answers only for a grouped rollup, which is a clean independent one: a
 // mirrored rollup that passed has already established that every member matches
-// the reviewed plan, so an empty reviewed plan is empty everywhere, and a rollup
+// the primary plan, so an empty primary plan is empty everywhere, and a rollup
 // that did not pass carries no per-member plans to count.
 func changingTargetCount(drift *DeploymentDriftData) int {
 	if drift == nil {
@@ -1133,8 +1133,8 @@ func targetPlansScope(drift *DeploymentDriftData) string {
 }
 
 // writeNoChangesDetected closes a comment with nothing to apply. It is never
-// reached while another target still has work: an empty reviewed plan is a
-// no-op only for the reviewed target, so those comments render the other
+// reached while another target still has work: an empty primary plan is a
+// no-op only for the primary target, so those comments render the other
 // targets' plans and summary instead.
 func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 	sb.WriteString(noChangesDetected + "\n")
@@ -1390,14 +1390,14 @@ func (e tableSizeEntry) hasAnyEstimate() bool {
 // Up to presentation.TableSizesInlineLimit tables are listed in plan order;
 // past that the section collapses and lists the largest tables first. A rollout whose
 // targets were all planned shows each table across every target that changes
-// it. A rollout without per-target sizes shows the reviewed plan's sizes, and
-// the heading names the reviewed target so they are not read as the whole
+// it. A rollout without per-target sizes shows the primary plan's sizes, and
+// the heading names the primary target so they are not read as the whole
 // rollout's.
 //
 // A locked comment that applies automatically renders no section: the
 // operator already saw the sizes on the plan they chose to apply. A locked
 // comment paused for apply-confirm keeps it, because its re-plan can carry
-// statements the reviewed plan did not, and the operator should see the size
+// statements the primary plan did not, and the operator should see the size
 // of what they are confirming. The rule lives here so every renderer that
 // shows a plan applies it the same way.
 func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
@@ -1417,7 +1417,7 @@ func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
 	}
 	if len(entries) <= presentation.TableSizesInlineLimit {
 		sb.WriteString("📊 **Table sizes**")
-		if scope := reviewedTargetSizeScope(drift, inlineCode); scope != "" {
+		if scope := primaryTargetSizeScope(drift, inlineCode); scope != "" {
 			fmt.Fprintf(sb, " (%s)", scope)
 		}
 		sb.WriteString(":\n")
@@ -1425,7 +1425,7 @@ func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
 		sb.WriteString("\n")
 		return
 	}
-	writeCollapsedTableSizes(sb, entries, reviewedTargetSizeScope(drift, summaryCode))
+	writeCollapsedTableSizes(sb, entries, primaryTargetSizeScope(drift, summaryCode))
 }
 
 // writeCollapsedTableSizes renders the size section for a plan with more
@@ -1456,20 +1456,20 @@ func summaryCode(name string) string {
 	return "<code>" + html.EscapeString(flattenIdentifier(name)) + "</code>"
 }
 
-// reviewedTargetSizeScope names the target whose sizes a rollout's section
+// primaryTargetSizeScope names the target whose sizes a rollout's section
 // shows when the rollout carries no per-target sizes: the sizes come from the
-// reviewed plan alone, and a reader would otherwise take them for every
-// target's. The reviewed target is named, with code, when the rollup
+// primary plan alone, and a reader would otherwise take them for every
+// target's. The primary target is named, with code, when the rollup
 // identifies it. A plan with no rollup, or a rollup of one member, has no
 // other target, so its sizes need no scope. A rollup that could not be
 // computed names no members, so it cannot say whether other targets exist and
 // claims none.
-func reviewedTargetSizeScope(drift *DeploymentDriftData, code func(string) string) string {
+func primaryTargetSizeScope(drift *DeploymentDriftData, code func(string) string) string {
 	if drift == nil {
 		return ""
 	}
 	if !drift.Computed || len(drift.Deployments) == 0 {
-		return "reviewed target only; targets could not be listed"
+		return "primary target only; targets could not be listed"
 	}
 	if len(drift.Deployments) == 1 {
 		return ""
@@ -1477,10 +1477,10 @@ func reviewedTargetSizeScope(drift *DeploymentDriftData, code func(string) strin
 	names := driftMemberNames(drift.Deployments)
 	for i, d := range drift.Deployments {
 		if d.Primary {
-			return fmt.Sprintf("reviewed target %s only; other targets not shown", code(names[i]))
+			return fmt.Sprintf("primary target %s only; other targets not shown", code(names[i]))
 		}
 	}
-	return "reviewed target only; other targets not shown"
+	return "primary target only; other targets not shown"
 }
 
 // tableSizeEntries flattens every keyspace's sized tables into section lines,
@@ -1874,7 +1874,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 		// reconcile targets that are supposed to differ.
 		sb.WriteString(glyph.Attention + " **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:\n\n")
 	default:
-		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the primary target's plan, so the plan check is failing closed:\n\n")
 	}
 	// A clean rollup has nothing more to say unless some member will refuse a
 	// change at apply, which the per-member list below is the only place to
@@ -1919,7 +1919,7 @@ func driftMemberLine(drift *DeploymentDriftData, d DeploymentDriftEntry, name st
 	}
 	switch d.Class {
 	case "match":
-		return fmt.Sprintf("- %s ✅ matches the reviewed plan%s\n", name, blockedSuffix(d.Blocked))
+		return fmt.Sprintf("- %s ✅ matches the primary target's plan%s\n", name, blockedSuffix(d.Blocked))
 	case "planned":
 		return fmt.Sprintf("- %s ✅ planned against its own schema%s\n", name, blockedSuffix(d.Blocked))
 	case "diverged":
@@ -1927,7 +1927,7 @@ func driftMemberLine(drift *DeploymentDriftData, d DeploymentDriftEntry, name st
 	default:
 		// An errored member means different things under the two contracts:
 		// a mirrored member's diff could not be confirmed against the
-		// reviewed plan, while an independent member has no plan at all.
+		// primary plan, while an independent member has no plan at all.
 		reason := "could not verify"
 		if drift.Independent {
 			reason = "could not plan"
@@ -1955,7 +1955,7 @@ func quietMembersSummary(drift *DeploymentDriftData, count int) string {
 	if drift.Independent {
 		return fmt.Sprintf("%s ✅ planned against their own schemas", presentation.CoveragePhrase(targetNoun, count, len(drift.Deployments)))
 	}
-	return fmt.Sprintf("%s ✅ match the reviewed plan", presentation.CoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
+	return fmt.Sprintf("%s ✅ match the primary target's plan", presentation.CoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
 }
 
 func anyDeploymentBlocked(deployments []DeploymentDriftEntry) bool {
@@ -1979,15 +1979,15 @@ func blockedSuffix(blocked int) string {
 // rolloutAtThisSchema reports whether a clean rollout has nothing left to apply
 // on any member, so the comment's no-changes line speaks for all of them.
 //
-// Mirrored members run the reviewed plan, so the reviewed plan answers for all
+// Mirrored members run the primary plan, so the primary plan answers for all
 // of them. Independent members answer only through their own grouped plans; a
 // rollup that carries none has not shown that the other targets have nothing to
 // run.
-func rolloutAtThisSchema(drift *DeploymentDriftData, reviewed []KeyspaceChangeData) bool {
+func rolloutAtThisSchema(drift *DeploymentDriftData, primary []KeyspaceChangeData) bool {
 	if !drift.Clean || anyDeploymentBlocked(drift.Deployments) {
 		return false
 	}
-	statements, vschema := countChanges(reviewed)
+	statements, vschema := countChanges(primary)
 	if statements+vschema > 0 {
 		return false
 	}
@@ -1998,10 +1998,10 @@ func rolloutAtThisSchema(drift *DeploymentDriftData, reviewed []KeyspaceChangeDa
 }
 
 // RendersTargetPlans reports whether the comment renders the rollout's plans one
-// group of targets at a time instead of the reviewed plan alone: a clean
+// group of targets at a time instead of the primary plan alone: a clean
 // rollout of independent targets in which some target still has work.
 //
-// Each such target applies its own plan, so the reviewed plan describes only
+// Each such target applies its own plan, so the primary plan describes only
 // the targets that share it. Rendering it alone would leave a reviewer to
 // approve statements the comment never showed.
 func RendersTargetPlans(drift *DeploymentDriftData) bool {
@@ -2089,12 +2089,12 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 		}
 		// So is an unsafe change, which `--allow-unsafe` consents to on every
-		// target. The primary's group discloses its own with the reviewed
-		// plan's, and the locked comment omits them as it omits the reviewed
+		// target. The primary's group discloses its own with the primary
+		// plan's, and the locked comment omits them as it omits the primary
 		// plan's: the apply reached it only under the opt-in.
 		if g.Primary {
 			writePrimaryTargetDisclosures(sb, data, g)
-		} else if unsafe := g.unsafeBeyondReviewedPlan(); len(unsafe) > 0 && !data.IsLocked {
+		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && !data.IsLocked {
 			writeUnsafeWarning(sb, unsafe, data.DatabaseType, data.IsMySQL)
 		}
 	}
@@ -2118,7 +2118,7 @@ func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g 
 	if data.HasUnsafeChanges {
 		unsafe = append(unsafe, data.UnsafeChanges...)
 	}
-	unsafe = append(unsafe, g.unsafeBeyondReviewedPlan()...)
+	unsafe = append(unsafe, g.unsafeBeyondPrimaryPlan()...)
 	if len(unsafe) > 0 {
 		writeUnsafeWarning(sb, unsafe, data.DatabaseType, data.IsMySQL)
 	}
@@ -2143,7 +2143,7 @@ func writeExistingCopies(sb *strings.Builder, data PlanCommentData) {
 }
 
 // TargetPlanUnsafeChanges lists the unsafe changes the rendered target plans
-// carry beyond the reviewed plan's own, each naming the targets that carry it,
+// carry beyond the primary plan's own, each naming the targets that carry it,
 // so the unsafe gate and its refusal cover every target an apply runs. Empty
 // when the drift renders no target plans.
 func TargetPlanUnsafeChanges(drift *DeploymentDriftData) []UnsafeChangeData {
@@ -2152,7 +2152,7 @@ func TargetPlanUnsafeChanges(drift *DeploymentDriftData) []UnsafeChangeData {
 	}
 	var out []UnsafeChangeData
 	for _, g := range drift.Plans {
-		for _, c := range g.unsafeBeyondReviewedPlan() {
+		for _, c := range g.unsafeBeyondPrimaryPlan() {
 			if len(c.Targets) == 0 {
 				c.Targets = slices.Clone(g.Members)
 				c.TotalTargets = 0
@@ -2163,26 +2163,26 @@ func TargetPlanUnsafeChanges(drift *DeploymentDriftData) []UnsafeChangeData {
 	return out
 }
 
-// unsafeBeyondReviewedPlan lists the group's unsafe changes the reviewed plan
+// unsafeBeyondPrimaryPlan lists the group's unsafe changes the primary plan
 // does not already disclose. That is every one of a group other than the
-// reviewed target's. The reviewed target's group shares its DDL, but each
+// primary target's. The primary target's group shares its DDL, but each
 // target's unsafe verdict is read from that target's own schema, so a sibling
-// can find a statement unsafe that the reviewed target does not: those are the
-// changes listed with targets that leave the reviewed target, its first
+// can find a statement unsafe that the primary target does not: those are the
+// changes listed with targets that leave the primary target, its first
 // member, out.
-func (g DeploymentPlanGroup) unsafeBeyondReviewedPlan() []UnsafeChangeData {
+func (g DeploymentPlanGroup) unsafeBeyondPrimaryPlan() []UnsafeChangeData {
 	if !g.Primary {
 		return g.UnsafeChanges
 	}
 	if len(g.Members) == 0 {
 		return nil
 	}
-	reviewed := g.Members[0]
+	primary := g.Members[0]
 	var out []UnsafeChangeData
 	for _, c := range g.UnsafeChanges {
-		// A change every member carries names no targets, and the reviewed
+		// A change every member carries names no targets, and the primary
 		// target is one of them.
-		if len(c.Targets) == 0 || slices.Contains(c.Targets, reviewed) {
+		if len(c.Targets) == 0 || slices.Contains(c.Targets, primary) {
 			continue
 		}
 		out = append(out, c)
@@ -2191,8 +2191,8 @@ func (g DeploymentPlanGroup) unsafeBeyondReviewedPlan() []UnsafeChangeData {
 }
 
 // targetPlansDiscloseDirect reports whether the rendered target plans carry
-// the reviewed plan's direct changes under the reviewed target's own group, so
-// the plan-wide section would only repeat them. A reviewed plan whose group
+// the primary plan's direct changes under the primary target's own group, so
+// the plan-wide section would only repeat them. The primary plan whose group
 // carries none keeps the plan-wide section, so the comment never leaves a direct
 // statement unsaid because the two sources disagree.
 func targetPlansDiscloseDirect(data PlanCommentData) bool {
@@ -2209,7 +2209,7 @@ func targetPlansDiscloseDirect(data PlanCommentData) bool {
 
 // targetPlansDiscloseBlocked reports whether the rendered target plans carry
 // the plan's blocked changes under their own groups, so the plan-wide section
-// would only repeat them. A reviewed plan with blocked changes that no group
+// would only repeat them. The primary plan with blocked changes that no group
 // carries keeps the plan-wide section: a refused change is never left unsaid
 // because the two sources disagree.
 func targetPlansDiscloseBlocked(data PlanCommentData) bool {
@@ -2277,7 +2277,7 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 }
 
 // countCommentDDLBlocks counts the DDL sections a plan's comment renders: the
-// reviewed plan's, or every target plan's when the rollout renders them.
+// primary plan's, or every target plan's when the rollout renders them.
 func countCommentDDLBlocks(data PlanCommentData) int {
 	if !RendersTargetPlans(data.DeploymentDrift) {
 		return countPlanDDLBlocks(data.Changes)
@@ -3029,7 +3029,7 @@ func titleDatabaseType(databaseType string) string {
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, budget *ddlBlockBudget) {
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
-	// environment's reviewed primary plan is a clean no-op.
+	// environment's primary plan is a clean no-op.
 	writeDeploymentDrift(sb, plan.DeploymentDrift, plan.Changes)
 	targetPlans := RendersTargetPlans(plan.DeploymentDrift)
 	summary := *plan
@@ -3045,7 +3045,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 
 	// The ignore_namespaces disclosure renders under each environment's
 	// summary (writePlanSummary) or no-changes message, because entries can
-	// resolve differently per environment. A reviewed target with nothing to
+	// resolve differently per environment. A primary target with nothing to
 	// run while other targets still have work summarizes their plans instead.
 	if totalChanges == 0 {
 		if targetPlans {
@@ -3377,7 +3377,7 @@ func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 //
 // A converging rollout passes its contract, so it is clean and says nothing here
 // on that count. It is still the one case where no environment planning changes
-// does not mean the fleet holds this schema: the reviewed target is at the
+// does not mean the fleet holds this schema: the primary target is at the
 // desired schema and another target is not. Callers consult this only when
 // nothing else would post a comment, so leaving it out is what decides whether
 // the reviewer is told at all.
@@ -3431,7 +3431,7 @@ func capitalizeEnvNames(envs []string) string {
 
 // environmentHasWork reports whether an environment's plan section offers an
 // apply: a PR apply can run the other targets' plans the section renders, and
-// its reviewed plan has changes, or its reviewed target is already at the
+// its primary plan has changes, or its primary target is already at the
 // desired schema while those other targets' plans do. A section whose apply
 // would be refused says why in the section itself.
 func environmentHasWork(plan *PlanCommentData) bool {

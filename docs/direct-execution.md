@@ -302,7 +302,7 @@ confirmation step:
   `apply-confirm` against a comment that discloses it, the same way a
   re-plan whose DDL changed does. An `apply-confirm` given on a comment that
   rendered several targets' plans does not pause again: a statement on the
-  reviewed target that now runs differently, as direct execution or blocked,
+  primary target that now runs differently, as direct execution or blocked,
   refuses the apply and releases the lock, because how each statement runs
   is part of the plan that confirmation covers. A fresh `schemabot apply`
   reviews the rollout as it is now.

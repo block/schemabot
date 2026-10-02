@@ -589,7 +589,7 @@ type ApplyRequest struct {
 	// target's statements, execution modes and unsafe verdicts, on a comment disclosing each
 	// target's direct and unsafe changes under that target. Without it, apply
 	// creation refuses another target's direct-execution change, and an unsafe
-	// change the reviewed plan does not carry: no other caller confirms them.
+	// change the primary plan does not carry: no other caller confirms them.
 	// Direct API callers cannot assert it through JSON.
 	ConfirmedMemberWork bool `json:"-"`
 }
@@ -721,9 +721,9 @@ func (s *Service) ExecutePlan(ctx context.Context, req PlanRequest) (*apitypes.P
 	return resp, nil
 }
 
-// ExecutePlanProto runs a plan and returns both the reviewed plan proto of the
-// member it plans (the primary, or for a narrowed plan the member it names)
-// and its API projection. The proto is the reviewed baseline the review-time
+// ExecutePlanProto runs a plan and returns both the plan proto of the member it
+// plans (the primary, or for a narrowed plan the member it names) and its API
+// projection. The proto is the baseline the review-time
 // drift rollup compares deployments against, so it is exposed alongside the API
 // response rather than reconstructed from storage.
 func (s *Service) ExecutePlanProto(ctx context.Context, req PlanRequest) (*ternv1.PlanResponse, *apitypes.PlanResponse, error) {
@@ -1112,14 +1112,14 @@ func recognizedExecutionMode(mode string) bool {
 
 // storedPlanRoute is what a stored plan row is stamped with beyond the request:
 // the member the plan was produced for, and — for a member planned against its
-// own live schema — the reviewed plan it was produced alongside.
+// own live schema — the primary plan it was produced alongside.
 type storedPlanRoute struct {
 	DatabaseType string
 	Deployment   string
 	Target       string
 
-	// PrimaryPlanIdentifier names the reviewed plan of this member's review
-	// round. Empty for the reviewed plan itself and for every plan of an
+	// PrimaryPlanIdentifier names the primary plan of this member's review
+	// round. Empty for the primary plan itself and for every plan of an
 	// environment whose members all run it.
 	PrimaryPlanIdentifier string
 
@@ -1227,7 +1227,7 @@ func (s *Service) storePlanResponse(ctx context.Context, req PlanRequest, resp *
 // storePlan writes one plan row for a single rollout member: the changes and
 // shards that member would run, stamped with the member's own route and the
 // request's PR context. It is the one place a plan row is built, so the primary
-// member's reviewed plan and a non-primary member's independently produced plan
+// member's plan and a non-primary member's independently produced plan
 // are stored identically and are indistinguishable to everything downstream.
 //
 // planIdentifier is the plan's external identifier — minted by the planner for
@@ -1306,7 +1306,7 @@ func (s *Service) storePlan(ctx context.Context, req PlanRequest, planIdentifier
 // before the service does, stamped with the route it knows: the database it was
 // configured with as the deployment, the target it resolved, and no narrowing.
 // The service keeps that row, so the row has to name the member: an apply finds
-// the reviewed target among the rollout's members by the plan's deployment and
+// the primary target among the rollout's members by the plan's deployment and
 // target, and a row stamped with anything else reads as a member with no stored
 // plan, refused after the operator has confirmed. The row of a plan narrowed to
 // one member also has to record the narrowing, since that is what holds an
@@ -1903,7 +1903,7 @@ func (s *Service) createStoredApply(
 	//
 	// A member's direct-execution verdict is the verdict of the target that
 	// runs the statement (RV-4), so its task carries it, whether or not the
-	// reviewed plan has work. Only a pull request apply-confirm confirms it:
+	// primary plan has work. Only a pull request apply-confirm confirms it:
 	// that comment names each target's direct changes under that target, and
 	// the confirm re-checks each target's statements, execution modes and
 	// unsafe verdicts against the confirmed round before it creates the apply. No other caller
@@ -1911,12 +1911,12 @@ func (s *Service) createStoredApply(
 	// shows each target's notice, so a member's direct change is refused for
 	// it, and runs from an apply narrowed to that member.
 	//
-	// Every member's unsafe change needs the opt-in, as the reviewed plan's
+	// Every member's unsafe change needs the opt-in, as the primary plan's
 	// does: one --allow-unsafe consents for every target, the way it does for a
 	// single target (RV-3). That comment also lists each target's unsafe
 	// changes under that target, so a confirmed apply runs them. Any other
-	// caller was shown only the reviewed plan's disclosure, so for it a
-	// member's unsafe change runs only when the reviewed plan carries the same
+	// caller was shown only the primary plan's disclosure, so for it a
+	// member's unsafe change runs only when the primary plan carries the same
 	// change.
 	names := applyMemberDisplayNames(members)
 	for i, member := range members {
@@ -1933,10 +1933,10 @@ func (s *Service) createStoredApply(
 		}
 	}
 	// An apply whose own plan has no work exists only to run the other members'
-	// own plans, since its reviewed target is already at the desired schema.
+	// own plans, since its primary target is already at the desired schema.
 	if !plan.HasWork() {
 		for _, member := range members {
-			if err := rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member); err != nil {
+			if err := rejectMemberWorkAnEmptyPrimaryPlanCannotCarry(member); err != nil {
 				return nil, 0, err
 			}
 		}
@@ -1984,8 +1984,8 @@ type MemberPlanRefusal int
 const (
 	// MemberPlanBlocked is a change the member's engine refuses to execute.
 	MemberPlanBlocked MemberPlanRefusal = iota
-	// MemberPlanUndisclosedUnsafe is an unsafe change the reviewed plan does
-	// not carry, for a caller that was shown only the reviewed plan's
+	// MemberPlanUndisclosedUnsafe is an unsafe change the primary plan does
+	// not carry, for a caller that was shown only the primary plan's
 	// disclosure, so no opt-in covers it.
 	MemberPlanUndisclosedUnsafe
 	// MemberPlanUnsafeWithoutOptIn is an unsafe change on an apply created
@@ -2023,7 +2023,7 @@ func (e *MemberPlanRefusedError) Unwrap() error {
 // MemberWorkRefusedError is apply creation refusing an apply of the whole
 // rollout because one member's own plan carries work that apply cannot run as
 // planned: another target's direct-execution change, work an apply from an
-// already converged reviewed plan cannot carry, or work outside the apply's
+// already converged primary plan cannot carry, or work outside the apply's
 // shape. The remedy is the operator's, an apply narrowed to that member, so it
 // is a refused request rather than a server failure.
 type MemberWorkRefusedError struct {
@@ -2231,13 +2231,13 @@ func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *s
 // confirmation of that member's verdict. A member running the apply's plan
 // runs exactly the statements, and the verdicts, of the plan being applied.
 //
-// This holds even when the reviewed plan runs the identical statement directly,
-// unlike an unsafe change the reviewed plan also carries
+// This holds even when the primary plan runs the identical statement directly,
+// unlike an unsafe change the primary plan also carries
 // (rejectMemberUndisclosedUnsafe). An unsafe change's consequence is the
 // statement's own, so disclosing it for one target discloses it for every
 // target running it. A direct statement's consequence is its table's: it blocks
-// that table's writes for as long as the statement runs, and the reviewed plan
-// names the reviewed target's table with the size the planner measured there.
+// that table's writes for as long as the statement runs, and the primary plan
+// names the primary target's table with the size the planner measured there.
 // Another target's copy of the table was measured on its own and can be any
 // size under the bound. Only a pull request apply-confirm confirms that
 // target's verdict, given on the comment that shows it with its own measured
@@ -2274,20 +2274,20 @@ func firstDirectExecutionTable(plan *storage.Plan) string {
 	return ""
 }
 
-// rejectMemberWorkAnEmptyReviewedPlanCannotCarry refuses a member's work that
-// an apply created from an empty reviewed plan cannot run as it was planned. The
+// rejectMemberWorkAnEmptyPrimaryPlanCannotCarry refuses a member's work that
+// an apply created from an empty primary plan cannot run as it was planned. The
 // PR apply refuses the same work before it asks for confirmation; this is the
 // check every caller creating such an apply passes through.
-func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
-	if reason := MemberWorkAConvergedReviewedPlanCannotRun(member.Plan); reason != "" {
-		return &MemberWorkRefusedError{Err: fmt.Errorf("rollout member %s: plan %s %s, which an apply whose reviewed target is already at the desired schema cannot run",
+func rejectMemberWorkAnEmptyPrimaryPlanCannotCarry(member applyMember) error {
+	if reason := MemberWorkAConvergedPrimaryPlanCannotRun(member.Plan); reason != "" {
+		return &MemberWorkRefusedError{Err: fmt.Errorf("rollout member %s: plan %s %s, which an apply whose primary target is already at the desired schema cannot run",
 			member.MemberID(), member.Plan.PlanIdentifier, reason)}
 	}
 	return nil
 }
 
-// MemberWorkAConvergedReviewedPlanCannotRun describes the first thing in a
-// member's plan that an apply created from an empty reviewed plan cannot run as
+// MemberWorkAConvergedPrimaryPlanCannotRun describes the first thing in a
+// member's plan that an apply created from an empty primary plan cannot run as
 // it was planned, or returns "" when there is none. The description names only
 // tables and namespaces, so it is fit for a PR comment.
 //
@@ -2300,9 +2300,9 @@ func rejectMemberWorkAnEmptyReviewedPlanCannotCarry(member applyMember) error {
 // not refused: the plan comment discloses each under the member that runs it,
 // an unsafe change still needs the opt-in, and apply-confirm re-checks that
 // each member's statements, execution modes and unsafe verdicts are the ones confirmed. A
-// caller shown only the reviewed plan is refused a member's unsafe change at
+// caller shown only the primary plan is refused a member's unsafe change at
 // apply creation instead (rejectMemberUndisclosedUnsafe).
-func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
+func MemberWorkAConvergedPrimaryPlanCannotRun(plan *storage.Plan) string {
 	if plan.BlockedApplyError() != nil {
 		return "carries changes its target's engine refuses"
 	}
@@ -2316,10 +2316,10 @@ func MemberWorkAConvergedReviewedPlanCannotRun(plan *storage.Plan) string {
 }
 
 // rejectMemberUndisclosedUnsafe refuses a member planned on its own whose plan
-// carries an unsafe change the reviewed plan does not, for an apply whose
-// caller was shown only the reviewed plan, whatever the command's flags. That
-// caller's unsafe opt-in was given against the reviewed plan's disclosure, so a
-// member's unsafe change runs under it only when the reviewed plan carries the
+// carries an unsafe change the primary plan does not, for an apply whose
+// caller was shown only the primary plan, whatever the command's flags. That
+// caller's unsafe opt-in was given against the primary plan's disclosure, so a
+// member's unsafe change runs under it only when the primary plan carries the
 // same change, which the disclosure named (RV-3). A member running the apply's
 // plan runs exactly the changes that disclosure names.
 //
@@ -2336,19 +2336,19 @@ func rejectMemberUndisclosedUnsafe(member applyMember, target string, applyPlan 
 	return &MemberPlanRefusedError{
 		MemberID: member.MemberID(), Target: target, Refusal: MemberPlanUndisclosedUnsafe,
 		Table: change.Table, Namespace: change.Namespace,
-		Err: fmt.Errorf("plan %s %s, so the disclosure on reviewed plan %s never named it and no opt-in covers it",
+		Err: fmt.Errorf("plan %s %s, so the disclosure on the primary target's plan %s never named it and no opt-in covers it",
 			member.Plan.PlanIdentifier, change.description(), applyPlan.PlanIdentifier),
 	}
 }
 
 // undisclosedUnsafeChange is an unsafe change in a member's own plan that the
-// reviewed plan does not carry: a table change, or, when Table is empty, a
+// primary plan does not carry: a table change, or, when Table is empty, a
 // namespace's VSchema change.
 type undisclosedUnsafeChange struct {
 	Table string
 	// Namespace is the VSchema change's namespace, empty for a table change.
 	Namespace string
-	// StatementDiffers is set for a table change on a table the reviewed plan
+	// StatementDiffers is set for a table change on a table the primary plan
 	// also changes unsafely, with a statement that is not the one it discloses.
 	StatementDiffers bool
 }
@@ -2356,17 +2356,17 @@ type undisclosedUnsafeChange struct {
 func (c undisclosedUnsafeChange) description() string {
 	switch {
 	case c.Table != "" && c.StatementDiffers:
-		return fmt.Sprintf("carries an unsafe change for table %q whose statement differs from the one the reviewed plan discloses for that table", c.Table)
+		return fmt.Sprintf("carries an unsafe change for table %q whose statement differs from the one the primary target's plan discloses for that table", c.Table)
 	case c.Table != "":
-		return fmt.Sprintf("carries an unsafe change for table %q that the reviewed plan does not carry", c.Table)
+		return fmt.Sprintf("carries an unsafe change for table %q that the primary target's plan does not carry", c.Table)
 	default:
-		return fmt.Sprintf("carries an unsafe VSchema change in namespace %q that the reviewed plan does not carry", c.Namespace)
+		return fmt.Sprintf("carries an unsafe VSchema change in namespace %q that the primary target's plan does not carry", c.Namespace)
 	}
 }
 
 // firstUndisclosedMemberUnsafeChange returns the first unsafe change in the
-// member's own plan that the reviewed plan does not carry, and whether there
-// is one. An empty reviewed plan discloses nothing, so every unsafe member
+// member's own plan that the primary plan does not carry, and whether there
+// is one. An empty primary plan discloses nothing, so every unsafe member
 // change is undisclosed.
 //
 // A table change is the same when it touches the same namespace's table with
@@ -2376,8 +2376,8 @@ func (c undisclosedUnsafeChange) description() string {
 // ALTER drops the column the reviewed ALTER drops, without the column the
 // reviewed ALTER also adds, runs a statement the disclosure never showed, and
 // the description says the statements differ so the operator knows which.
-func firstUndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) (undisclosedUnsafeChange, bool) {
-	disclosed := reviewed.UnsafeDDLChanges()
+func firstUndisclosedMemberUnsafeChange(primary, member *storage.Plan) (undisclosedUnsafeChange, bool) {
+	disclosed := primary.UnsafeDDLChanges()
 	for _, change := range member.UnsafeDDLChanges() {
 		if slices.ContainsFunc(disclosed, func(named storage.TableChange) bool {
 			return sameUnsafeTableChange(member.DatabaseType, named, change)
@@ -2389,7 +2389,7 @@ func firstUndisclosedMemberUnsafeChange(reviewed, member *storage.Plan) (undiscl
 		})
 		return undisclosedUnsafeChange{Table: change.Table, StatementDiffers: differs}, true
 	}
-	disclosedVSchema := reviewed.UnsafeVSchemaChanges()
+	disclosedVSchema := primary.UnsafeVSchemaChanges()
 	for _, change := range member.UnsafeVSchemaChanges() {
 		if !slices.Contains(disclosedVSchema, change) {
 			return undisclosedUnsafeChange{Namespace: change.Namespace}, true
@@ -2498,7 +2498,7 @@ func buildApplyOperationGroups(
 				// A member planned on its own that already holds the change has
 				// no namespace to finalize, so a finalizer driven from its plan
 				// could never run. It is recorded as the settled work it is, as
-				// the other shapes record it; the reviewed plan has finalizer
+				// the other shapes record it; the primary plan has finalizer
 				// work, so the apply keeps a drivable operation.
 				operation.State = state.ApplyOperation.Completed
 				operation.CompletedAt = &now
@@ -2628,8 +2628,8 @@ func operationShapeOf(plan *storage.Plan, taskChanges []storage.TableChange) ope
 // apply's shape has no place for.
 //
 // A member planned against its own live schema can need a different shape than
-// the reviewed plan: a target whose only change is its VSchema, one with
-// per-shard changes under a reviewed plan without them, or the reverse. Built
+// the primary plan: a target whose only change is its VSchema, one with
+// per-shard changes under the primary plan without them, or the reverse. Built
 // into the apply's shape anyway, that work gets no operation at all, or an
 // operation with no tasks that is settled as done, and the member reads as
 // converged while its target never got the change. So the member must need the
@@ -2654,7 +2654,7 @@ func memberWorkOutsideShape(memberPlan, applyPlan *storage.Plan, shape operation
 	memberChanges := applyTaskChanges(memberPlan)
 	if memberPlan != applyPlan {
 		if needs := operationShapeOf(memberPlan, memberChanges); needs != shape {
-			return fmt.Sprintf("needs %s, but this apply runs %s, chosen from the reviewed plan", needs, shape)
+			return fmt.Sprintf("needs %s, but this apply runs %s, chosen from the primary target's plan", needs, shape)
 		}
 	}
 	if shape == operationShapeSharded {
@@ -2666,21 +2666,21 @@ func memberWorkOutsideShape(memberPlan, applyPlan *storage.Plan, shape operation
 	return ""
 }
 
-// MemberWorkTheReviewedPlanCannotRun describes the first thing in a member's
+// MemberWorkThePrimaryPlanCannotRun describes the first thing in a member's
 // own plan that apply creation refuses for a pull request apply-confirm when
-// the apply is created from reviewed, or returns "" when there is none: a
+// the apply is created from primary, or returns "" when there is none: a
 // blocked change, or work the apply's shape has no place for. It asks what
 // createStoredApply asks of each member, so a caller can refuse before it pins
 // a confirmation that apply creation would refuse. A member's direct-execution
 // and unsafe changes are not among them: the comment discloses each under the
-// target that runs it, and an unsafe change needs the opt-in like the reviewed
+// target that runs it, and an unsafe change needs the opt-in like the primary
 // plan's own. The description names only tables, namespaces, and the apply's
 // shape, so it is fit for a PR comment.
-func MemberWorkTheReviewedPlanCannotRun(reviewed, member *storage.Plan) string {
+func MemberWorkThePrimaryPlanCannotRun(primary, member *storage.Plan) string {
 	if member.BlockedApplyError() != nil {
 		return "carries changes its target's engine refuses"
 	}
-	return memberWorkOutsideShape(member, reviewed, operationShapeOf(reviewed, applyTaskChanges(reviewed)))
+	return memberWorkOutsideShape(member, primary, operationShapeOf(primary, applyTaskChanges(primary)))
 }
 
 // shardWorkWithoutTableChanges returns, in sorted order, the namespaces whose
@@ -2781,7 +2781,7 @@ func buildShardedApplyOperationGroups(
 			// changing shard and no namespace to finalize, so it would get no
 			// operation at all and the apply would address fewer targets than
 			// the rollout has. It is recorded as the settled work it is, as the
-			// other shapes record it; the reviewed plan has per-shard work, so the
+			// other shapes record it; the primary plan has per-shard work, so the
 			// apply keeps a drivable operation.
 			operationKey, err := keys.qualify(member, "")
 			if err != nil {
@@ -3233,7 +3233,7 @@ func rollbackSourcePlanMatchesApply(plan *storage.Plan, apply *storage.Apply) bo
 
 // recordedIgnoreTablesNote qualifies a failed rollback re-plan with where its
 // exclusions came from. The rollback restores a snapshot the entries were never
-// checked against, so an engine can refuse a contradiction the reviewed plan
+// checked against, so an engine can refuse a contradiction the primary plan
 // never had — and its remedy, removing the entry, reads as a config edit. The
 // entries are the source plan's frozen record, so that edit changes nothing and
 // the operator's way out is a pull request that restores the schema. Empty when

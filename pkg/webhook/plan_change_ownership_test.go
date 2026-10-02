@@ -285,9 +285,9 @@ func TestRenderMultiEnvPlanComment_AttributedChangeAnnotatesItsOwnEnvironmentOnl
 	assert.Contains(t, rendered, "schemabot apply -e staging")
 }
 
-// A target that runs its own plan can drop something on a table the reviewed
+// A target that runs its own plan can drop something on a table the primary
 // plan leaves alone, so the ownership lookup covers the tables of every
-// unsafe change the rendered target plans carry beyond the reviewed plan's,
+// unsafe change the rendered target plans carry beyond the primary plan's,
 // each once, and leaves out VSchema changes, which are no table's. A rollout
 // the comment does not render target plans for adds nothing.
 func TestTargetPlanDestructiveTables(t *testing.T) {

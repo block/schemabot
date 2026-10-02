@@ -76,7 +76,7 @@ func (h *Handler) updateCheckRecordForApplyStart(ctx context.Context, client *gh
 
 	// A stored review-time block must not be cleared by starting an apply.
 	// Deployment drift means a deployment's live schema no longer matches the
-	// reviewed plan; a namespace placement refusal means the environment has no
+	// primary plan; a namespace placement refusal means the environment has no
 	// plan that places every namespace. Transitioning the row to in_progress
 	// (which clears the block) would let the apply proceed past either, so fail
 	// closed and leave the block for the fix its reason names.

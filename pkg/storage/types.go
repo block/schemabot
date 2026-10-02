@@ -230,7 +230,7 @@ const (
 	// safe: an existing drift block is preserved, never silently cleared.
 	PlanDriftNotEvaluated PlanDriftState = iota
 	// PlanDriftClean means the rollup ran and every deployment matched the
-	// reviewed plan, so a stale drift block may be cleared.
+	// primary plan, so a stale drift block may be cleared.
 	PlanDriftClean
 	// PlanDriftBlocked means the rollup ran and a deployment diverged or could
 	// not be confirmed, so the write records the drift block.
@@ -732,15 +732,15 @@ type Plan struct {
 	// invariant cannot be evaluated) rather than fail closed.
 	HeadSHA string
 
-	// PrimaryPlanIdentifier names the reviewed plan this one was produced
+	// PrimaryPlanIdentifier names the primary plan this one was produced
 	// alongside, for a rollout member planned against its own live schema. It is
 	// the durable link between a member's plan and the review round the operator
-	// approved: an apply created from the reviewed plan selects its members'
+	// approved: an apply created from the primary plan selects its members'
 	// plans by this identifier, so a plan from a later re-plan of the same commit
-	// is a different round and is never substituted for the reviewed one.
+	// is a different round and is never substituted for the one approved.
 	//
-	// Empty on the reviewed plan itself, and on every plan of an environment
-	// whose members all run the reviewed plan.
+	// Empty on the primary plan itself, and on every plan of an environment
+	// whose members all run the primary plan.
 	PrimaryPlanIdentifier string
 
 	// DirectExecution is the direct execution policy this plan's execution
