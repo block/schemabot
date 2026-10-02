@@ -44,7 +44,7 @@ func classifyRunnerError(err error) error {
 
 // newSpiritMigration builds the Spirit migration for a statement against the
 // target with the engine's copy, durability, and throttling settings.
-// Callers layer statement-specific fields (DeferCutOver, RespectSentinel)
+// Callers layer statement-specific fields (DeferCutOver, IgnoreSentinel)
 // onto the result.
 //
 // Write threads start at the target-appropriate automatic size (on Aurora,
