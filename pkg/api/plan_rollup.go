@@ -125,6 +125,12 @@ type DeploymentRollupEntry struct {
 	// disclosures through unchanged; see DeploymentPlanDiff.
 	ExistingCopies         []*ternv1.ExistingCopy
 	ExistingCopiesReported bool
+
+	// LintViolations are the lint findings the member's own plan raised. Lint
+	// reads each target's live schema beside the changes it would run, so a
+	// member's findings are its own, not the primary's. Empty for a member that
+	// errored, which has no plan for them to describe.
+	LintViolations []*ternv1.LintViolation
 }
 
 // markErrored classifies a member as errored and drops the plan it was
@@ -143,6 +149,7 @@ func (e *DeploymentRollupEntry) markErrored(err error) {
 	e.Err = err
 	e.ChangeSet = tern.ChangeSet{}
 	e.PlanFingerprint = ""
+	e.LintViolations = nil
 }
 
 // PlanRollup aggregates every rollout member's review-time classification for a
@@ -236,6 +243,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			Target:                 d.Target,
 			ExistingCopies:         d.ExistingCopies,
 			ExistingCopiesReported: d.ExistingCopiesReported,
+			LintViolations:         d.LintViolations,
 		}
 		switch {
 		case d.Err != nil:
@@ -346,6 +354,7 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 			Target:                 d.Target,
 			ExistingCopies:         d.ExistingCopies,
 			ExistingCopiesReported: d.ExistingCopiesReported,
+			LintViolations:         d.LintViolations,
 		}
 		switch {
 		case d.Err != nil:

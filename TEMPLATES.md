@@ -1864,9 +1864,9 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-Targets diverge — what applies where:
+### 2 of 3 targets
 
-**targets `primary/testapp_1`, `primary/testapp_2`**
+`primary/testapp_1`, `primary/testapp_2`
 
 ```sql
 CREATE TABLE `users` (
@@ -1897,11 +1897,11 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-**target `primary/testapp_3`**
+### Target `primary/testapp_3`
 
 No schema changes detected
 
-📋 **Plan**: **2** tables to create, **1** table to alter
+📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
 
 
 ---
@@ -1923,9 +1923,9 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-Targets diverge — what applies where:
+### 2 of 3 targets
 
-**targets `primary/testapp_2`, `primary/testapp_3`**
+`primary/testapp_2`, `primary/testapp_3`
 
 ```sql
 CREATE TABLE `users` (
@@ -1956,11 +1956,11 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-**target `primary/testapp_1`**
+### Target `primary/testapp_1`
 
 No schema changes detected
 
-📋 **Plan**: **2** tables to create, **1** table to alter
+📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
 
 
 ---
@@ -1982,15 +1982,15 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-Targets diverge — what applies where:
+### 2 of 3 targets
 
-**targets `primary/testapp_1`, `primary/testapp_2`**
+`primary/testapp_1`, `primary/testapp_2`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ```
 
-**target `primary/testapp_3`**
+### Target `primary/testapp_3`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
@@ -2000,7 +2000,7 @@ ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-📋 **Plan**: **1** table to alter
+📋 **Plan**: **1** table to alter across 3 targets
 
 
 ---
@@ -2022,7 +2022,9 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-**targets `primary/testapp_1`, `primary/testapp_2`**
+### 2 targets
+
+`primary/testapp_1`, `primary/testapp_2`
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -2036,7 +2038,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 - `orders`: ~24.0 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
 - `users`: ~193 MB across 2 targets · largest ~98.0 MB on `primary/testapp_2` · smallest ~95.0 MB
 
-📋 **Plan**: **2** tables to alter
+📋 **Plan**: **2** tables to alter across 2 targets
 
 
 ---
@@ -2058,7 +2060,9 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-**targets `primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`**
+### 3 targets
+
+`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -2072,7 +2076,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 - `orders`: ~24.0 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
 - `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95.0 MB
 
-📋 **Plan**: **2** tables to alter
+📋 **Plan**: **2** tables to alter across 3 targets
 
 
 ---
@@ -8116,10 +8120,10 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
 <dl><dd>
 
-Targets diverge — what applies where:
+#### 56 of 64 targets
 
 <details>
-<summary><b>56 of 64 targets</b></summary>
+<summary>Target names</summary>
 
 `orders_000`, `orders_001`, `orders_002`, `orders_003`, `orders_004`, `orders_005`, `orders_006`, `orders_007`, `orders_008`, `orders_009`, `orders_010`, `orders_011`, `orders_012`, `orders_013`, `orders_014`, `orders_015`, `orders_016`, `orders_017`, `orders_018`, `orders_019`, `orders_020`, `orders_021`, `orders_022`, `orders_023`, `orders_024`, `orders_025`, `orders_026`, `orders_027`, `orders_028`, `orders_029`, `orders_030`, `orders_031`, `orders_032`, `orders_033`, `orders_034`, `orders_035`, `orders_036`, `orders_037`, `orders_038`, `orders_039`, `orders_040`, `orders_041`, `orders_042`, `orders_043`, `orders_044`, `orders_045`, `orders_046`, `orders_047`, `orders_048`, `orders_049`, `orders_050`, `orders_051`, `orders_052`, `orders_053`, `orders_054`, `orders_055`
 
@@ -8133,7 +8137,9 @@ Targets diverge — what applies where:
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
+#### 8 of 64 targets
+
+`orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 

@@ -170,6 +170,30 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 	return data
 }
 
+// addMemberLint records that a target raised each of its advisory lint
+// findings, folding a finding into the group's entry for it when another target
+// already raised it. Error-severity findings are left out: they are unsafe
+// changes, which the plan discloses and gates as such, the way a single plan's
+// lint section leaves them out.
+func addMemberLint(group []templates.LintViolationData, member []*ternv1.LintViolation, target string) []templates.LintViolationData {
+	for _, v := range member {
+		if v.GetSeverity() == "error" {
+			continue
+		}
+		i := slices.IndexFunc(group, func(f templates.LintViolationData) bool {
+			return f.Table == v.GetTable() && f.Message == v.GetMessage()
+		})
+		if i < 0 {
+			group = append(group, templates.LintViolationData{Message: v.GetMessage(), Table: v.GetTable()})
+			i = len(group) - 1
+		}
+		if !slices.Contains(group[i].Targets, target) {
+			group[i].Targets = append(group[i].Targets, target)
+		}
+	}
+	return group
+}
+
 // deploymentPlanGroups groups the rollout's members by the plan each would run,
 // one entry per distinct plan.
 //
@@ -212,6 +236,11 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		for _, dc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeDirect) {
 			addModeTarget(&groups[at].DirectChanges, templates.DirectChangeData(dc), names[i])
 		}
+		// Lint reads each member's live schema, so members that run the same
+		// DDL can still raise different findings. The group carries every
+		// finding any of its members raised, each once, naming the targets
+		// that raised it, so the comment can say which targets each is on.
+		groups[at].LintViolations = addMemberLint(groups[at].LintViolations, e.LintViolations, names[i])
 		// An unsafe change is disclosed under the targets that carry it too, so
 		// one --allow-unsafe consents to it on every target the apply runs.
 		for _, uc := range memberUnsafeChanges(e.ChangeSet) {
@@ -230,6 +259,9 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 		}
 		for ui := range groups[gi].UnsafeChanges {
 			trimModeTargets(&groups[gi].UnsafeChanges[ui].Targets, &groups[gi].UnsafeChanges[ui].TotalTargets, members)
+		}
+		for li := range groups[gi].LintViolations {
+			trimModeTargets(&groups[gi].LintViolations[li].Targets, &groups[gi].LintViolations[li].TotalTargets, members)
 		}
 	}
 	// The primary is the first member, so its group is already first. Ordering is
