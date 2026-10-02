@@ -425,7 +425,7 @@ func TestE2EAutoPlanPostsCommentWhenOnlyAnotherTargetHasWork(t *testing.T) {
 		action: "opened", headSHA: "abc123", headRef: "feature-branch",
 	}, nil))
 
-	body := awaitCommentContaining(t, result, "### Target `us`\n\n**1** table to alter\n\n```sql\n")
+	body := awaitCommentContaining(t, result, "### Target `us`\n\n```sql\n")
 	assert.Contains(t, body, "### Target `eu`\n\nNo schema changes detected\n\n")
 	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 }

@@ -2071,9 +2071,6 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		group.Changes = targetPlanChanges(g, data)
 		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)
-		// Groups run different work, so each states its own count; the plan
-		// summary below counts them together.
-		fmt.Fprintf(sb, "%s\n\n", planSummaryText(group.Changes, data.DatabaseType, data.IsMySQL, statements))
 		restore := budget.forTargetGroup(g.Members)
 		if collapse && statements+vschema > 1 {
 			writeCollapsibleKeyspaceChanges(sb, group, statements, budget)
