@@ -593,8 +593,10 @@ type CollationChange struct {
 	// TrailingSpaces whether 'abc' and 'abc ' do.
 	Case, TrailingSpaces ComparisonChange
 	// UniqueIndexes names the primary key and unique indexes that cover the
-	// column once the change applies. Under a new collation, values that were
-	// distinct can compare equal, and a unique index then rejects them.
+	// column when the move can make values that were distinct compare equal,
+	// which the index then rejects. It is empty for a move that cannot: one
+	// onto a binary collation of the same charset that does not start ignoring
+	// trailing spaces.
 	UniqueIndexes []string
 }
 

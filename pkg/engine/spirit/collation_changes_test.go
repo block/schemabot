@@ -22,18 +22,42 @@ const productsTable = "CREATE TABLE `products` (\n" +
 func TestPlannedCollationChanges(t *testing.T) {
 	tests := []struct {
 		name    string
+		current string
 		alter   string
 		desired string
 		want    []engine.CollationChange
 	}{
 		{
-			name:    "explicit collation on a unique column flips case sensitivity",
+			name:    "a unique column moving onto the charset's binary collation risks no collision",
 			alter:   "ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_bin NOT NULL",
 			desired: productsTable,
 			want: []engine.CollationChange{{
 				Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_bin",
 				Case:           engine.ComparisonBecomesSensitive,
 				TrailingSpaces: engine.ComparisonUnchanged,
+			}},
+		},
+		{
+			name:    "a unique column moving onto a weight-based collation can collide",
+			alter:   "ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL",
+			desired: productsTable,
+			want: []engine.CollationChange{{
+				Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+				Case:           engine.ComparisonUnchanged,
+				TrailingSpaces: engine.ComparisonBecomesSensitive,
+				UniqueIndexes:  []string{"uk_sku"},
+			}},
+		},
+		{
+			name: "a binary collation that starts ignoring trailing spaces can collide",
+			current: "CREATE TABLE `products` (`sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL, UNIQUE KEY `uk_sku` (`sku`)) " +
+				"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			alter:   "ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_bin NOT NULL",
+			desired: "CREATE TABLE `products` (`sku` varchar(64) COLLATE utf8mb4_bin NOT NULL, UNIQUE KEY `uk_sku` (`sku`))",
+			want: []engine.CollationChange{{
+				Column: "sku", From: "utf8mb4_0900_ai_ci", To: "utf8mb4_bin",
+				Case:           engine.ComparisonBecomesSensitive,
+				TrailingSpaces: engine.ComparisonBecomesInsensitive,
 				UniqueIndexes:  []string{"uk_sku"},
 			}},
 		},
@@ -49,7 +73,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 			}},
 		},
 		{
-			name:    "CONVERT TO CHARACTER SET re-collates every character column",
+			name:    "CONVERT TO CHARACTER SET re-collates every character column, and a new charset can collide",
 			alter:   "ALTER TABLE `products` CONVERT TO CHARACTER SET latin1 COLLATE latin1_bin",
 			desired: productsTable,
 			want: []engine.CollationChange{
@@ -78,12 +102,12 @@ func TestPlannedCollationChanges(t *testing.T) {
 		},
 		{
 			name:    "a primary key column is covered by PRIMARY",
-			alter:   "ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_bin NOT NULL",
-			desired: "CREATE TABLE `products` (`sku` varchar(64) COLLATE utf8mb4_bin NOT NULL, PRIMARY KEY (`sku`))",
+			alter:   "ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL",
+			desired: "CREATE TABLE `products` (`sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL, PRIMARY KEY (`sku`))",
 			want: []engine.CollationChange{{
-				Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_bin",
-				Case:           engine.ComparisonBecomesSensitive,
-				TrailingSpaces: engine.ComparisonUnchanged,
+				Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+				Case:           engine.ComparisonUnchanged,
+				TrailingSpaces: engine.ComparisonBecomesSensitive,
 				UniqueIndexes:  []string{"PRIMARY"},
 			}},
 		},
@@ -105,15 +129,21 @@ func TestPlannedCollationChanges(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := plannedCollationChanges(slog.New(slog.DiscardHandler), tt.alter, productsTable, tt.desired)
+			current := tt.current
+			if current == "" {
+				current = productsTable
+			}
+			got, err := plannedCollationChanges(slog.New(slog.DiscardHandler), tt.alter, current, tt.desired)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
 	}
 }
 
+// A collation the plan does not know reports unknown comparisons, and the
+// unique index covering the column, since the plan cannot rule out a collision.
 func TestPlannedCollationChangesUnknownCollationFailsClosed(t *testing.T) {
-	current := "CREATE TABLE `notes` (`body` varchar(64) COLLATE utf8mb4_general_ci NOT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
+	current := "CREATE TABLE `notes` (`body` varchar(64) COLLATE utf8mb4_general_ci NOT NULL, UNIQUE KEY `uk_body` (`body`)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
 	got, err := plannedCollationChanges(slog.New(slog.DiscardHandler),
 		"ALTER TABLE `notes` MODIFY COLUMN `body` varchar(64) COLLATE utf8mb4_made_up_ci NOT NULL", current, current)
 	require.NoError(t, err)
@@ -121,4 +151,5 @@ func TestPlannedCollationChangesUnknownCollationFailsClosed(t *testing.T) {
 	assert.Equal(t, "utf8mb4_made_up_ci", got[0].To)
 	assert.Equal(t, engine.ComparisonUnknown, got[0].Case)
 	assert.Equal(t, engine.ComparisonUnknown, got[0].TrailingSpaces)
+	assert.Equal(t, []string{"uk_body"}, got[0].UniqueIndexes)
 }

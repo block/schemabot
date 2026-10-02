@@ -1076,26 +1076,28 @@ differ only in letter case, or only in trailing spaces, moves. Each is
 `becomes_insensitive` (they start comparing equal), or `unknown`, which a
 caller treats as a possible change. `to` is omitted when the change leaves the
 collation to a server default the plan cannot read. `unique_indexes` names the
-primary key and unique indexes covering the column: values that were distinct
-can compare equal under the new collation, and the apply then fails on that
-index. The field is omitted when the change re-collates no column. MySQL
+primary key and unique indexes covering the column when the move can make
+values that were distinct compare equal, so the apply fails on that index if
+existing rows collide. It is omitted for a move that cannot, such as one onto
+the charset's binary collation that does not start ignoring trailing spaces. The field is omitted when the change re-collates no column. MySQL
 targets planned by Spirit report it; other engines omit it for now.
 
-For example, a table change that makes a unique column case-sensitive
-(illustrative values):
+For example, a table change that moves a unique column onto a UCA 9.0.0
+collation, where trailing spaces start to count and other characters can
+compare differently (illustrative values):
 
 ```json
 {
   "table_name": "customers",
-  "ddl": "ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL",
+  "ddl": "ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL",
   "change_type": "alter",
   "collation_changes": [
     {
       "column": "handle",
       "from": "utf8mb4_general_ci",
-      "to": "utf8mb4_bin",
-      "case": "becomes_sensitive",
-      "trailing_spaces": "unchanged",
+      "to": "utf8mb4_0900_ai_ci",
+      "case": "unchanged",
+      "trailing_spaces": "becomes_sensitive",
       "unique_indexes": ["uk_handle"]
     }
   ]
