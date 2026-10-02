@@ -560,7 +560,12 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// auto-applying locked comment: the disclosure coaches re-planning ("merge
 	// that PR ... then re-plan"), which is noise once the apply is already
 	// running.
-	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) {
+	// When the unsafe warning below lists every attributed table, the
+	// attribution rides on those findings instead of a section of its own, so
+	// each change is explained once.
+	unsafeShown := data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked
+	attributionNotes, attributionFolded := unsafeAttributionNotes(data, unsafeShown)
+	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) && !attributionFolded {
 		writeAttributedChanges(&sb, data.AttributedChanges)
 	}
 
@@ -598,8 +603,8 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// the locked apply comment: unsafe changes only reach an apply after the
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
 	// and blocks otherwise), so repeating them there is noise.
-	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
+	if unsafeShown {
+		writeUnsafeWarning(&sb, data.UnsafeChanges, attributionNotes, data.DatabaseType, data.IsMySQL)
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
@@ -688,11 +693,6 @@ func writeApplyInstruction(sb *strings.Builder, command string, data PlanComment
 type unsafeConsent struct {
 	findings int
 	tables   string
-	// owners links the open pull requests whose applied changes this plan
-	// undoes, each once. The instruction names them as a fact and leaves the
-	// choice to the reader: merging one first is right when it will land,
-	// and undoing it is right when it was abandoned.
-	owners []string
 }
 
 // planUnsafeConsent reports what the plan's apply would confirm with
@@ -700,60 +700,34 @@ type unsafeConsent struct {
 // apply needs no consent, or the plan carries a change the engine refuses,
 // which fails the apply whatever its flags.
 func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
-	if !data.HasUnsafeChanges || len(data.UnsafeChanges) == 0 || data.AllowUnsafe {
+	if data.AllowUnsafe || len(data.BlockedChanges) > 0 {
 		return unsafeConsent{}, false
 	}
-	if len(data.BlockedChanges) > 0 {
+	// The flag consents to every target's disclosed unsafe changes, not only
+	// the reviewed plan's, so the instruction counts and names them all.
+	var changes []UnsafeChangeData
+	if data.HasUnsafeChanges {
+		changes = append(changes, data.UnsafeChanges...)
+	}
+	changes = append(changes, TargetPlanUnsafeChanges(data.DeploymentDrift)...)
+	if len(changes) == 0 {
 		return unsafeConsent{}, false
 	}
-	c := unsafeConsent{
-		findings: countUnsafeFindings(data.UnsafeChanges),
-		tables:   unsafeChangeTables(data.UnsafeChanges),
-	}
-	seen := make(map[string]bool)
-	for _, a := range data.AttributedChanges {
-		if a.Unresolved {
-			continue
-		}
-		link := caller.PullRequestMarkdownLink(a.Repository, a.PullRequest)
-		if !seen[link] {
-			seen[link] = true
-			c.owners = append(c.owners, link)
-		}
-	}
-	return c, true
+	return unsafeConsent{
+		findings: countUnsafeFindings(changes),
+		tables:   unsafeChangeTables(changes),
+	}, true
 }
 
 // instruction is the clause that tells the reader how to apply, lower-cased
-// to continue a sentence.
+// to continue a sentence. Where a change came from is the unsafe warning's to
+// say, on the finding itself, so the instruction stays one short clause.
 func (c unsafeConsent) instruction() string {
 	noun := "unsafe change"
 	if c.findings > 1 {
 		noun = "unsafe changes"
 	}
-	consent := fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s)", c.findings, noun, c.tables)
-	switch len(c.owners) {
-	case 0:
-		return consent
-	case 1:
-		return consent + ". This undoes open PR " + c.owners[0]
-	default:
-		return consent + ". This undoes open PRs " + englishList(c.owners)
-	}
-}
-
-// englishList joins items as an English list: "a", "a and b", "a, b, and c".
-func englishList(items []string) string {
-	switch len(items) {
-	case 0:
-		return ""
-	case 1:
-		return items[0]
-	case 2:
-		return items[0] + " and " + items[1]
-	default:
-		return strings.Join(items[:len(items)-1], ", ") + ", and " + items[len(items)-1]
-	}
+	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s)", c.findings, noun, c.tables)
 }
 
 // unsafeChangeTables names what the unsafe changes touch, each once in
@@ -772,17 +746,30 @@ func unsafeChangeTables(changes []UnsafeChangeData) string {
 		seen[target] = true
 		targets = append(targets, target)
 	}
-	return strings.Join(targets, ", ")
+	// A label that lists several targets carries commas of its own, so the
+	// labels are then set apart with semicolons.
+	sep := ", "
+	for _, target := range targets {
+		if strings.Contains(target, ", ") {
+			sep = "; "
+			break
+		}
+	}
+	return strings.Join(targets, sep)
 }
 
 func unsafeConsentTarget(c UnsafeChangeData) string {
 	if c.VSchemaNamespace != "" {
 		return inlineCode(c.VSchemaNamespace) + " VSchema"
 	}
+	label := inlineCode(c.Table)
 	if len(c.Shards) > 0 {
-		return inlineCode(c.Table) + " on " + planShardList(c.Shards, c.TotalShards)
+		label += " on " + planShardList(c.Shards, c.TotalShards)
 	}
-	return inlineCode(c.Table)
+	if len(c.Targets) > 0 {
+		label += " on " + planGroupList(targetNoun, c.Targets, c.TotalTargets)
+	}
+	return label
 }
 
 // attributionStillActionable reports whether the attributed-changes
@@ -2108,7 +2095,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		// the locked comment omits them as it omits the reviewed plan's: the
 		// apply reached it only under the opt-in.
 		if unsafe := g.unsafeBeyondReviewedPlan(); len(unsafe) > 0 && !data.IsLocked {
-			writeUnsafeWarning(sb, unsafe, data.DatabaseType, data.IsMySQL)
+			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL)
 		}
 	}
 }
@@ -2380,12 +2367,18 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 	}
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {
+// writeUnsafeWarning lists the unsafe findings. attributionNotes, keyed by
+// table, carries the attribution for tables another pull request changed, so
+// the reader learns where a change came from on the finding itself.
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	item := 0
 	for _, c := range changes {
-		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType)
+		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, attributionNotes[c.Table])
+	}
+	if len(attributionNotes) > 0 {
+		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
@@ -2404,26 +2397,66 @@ func unsafeChangeLabel(c UnsafeChangeData) string {
 	return table
 }
 
+// unsafeAttributionNotes returns, keyed by table, the note each attributed
+// table's unsafe findings carry, and whether the attribution is folded into
+// the unsafe warning. It folds only when that warning is shown and lists every
+// attributed table; otherwise the attribution keeps its own section, so no
+// disclosure is lost.
+func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (map[string]string, bool) {
+	if !unsafeShown || len(data.AttributedChanges) == 0 {
+		return nil, false
+	}
+	unsafeTables := make(map[string]bool, len(data.UnsafeChanges))
+	for _, c := range data.UnsafeChanges {
+		unsafeTables[c.Table] = true
+	}
+	notes := make(map[string]string, len(data.AttributedChanges))
+	for _, a := range data.AttributedChanges {
+		if !unsafeTables[a.Table] {
+			return nil, false
+		}
+		if a.Unresolved {
+			notes[a.Table] = "ownership could not be established"
+			continue
+		}
+		notes[a.Table] = "changed by open PR " + pullRequestRef(data.Repository, a.Repository, a.PullRequest)
+	}
+	return notes, true
+}
+
+// pullRequestRef links a pull request, by number alone when it is in the
+// repository the comment is posted on and by repo#number otherwise.
+func pullRequestRef(commentRepo, repo string, pr int) string {
+	if commentRepo != "" && repo == commentRepo {
+		return fmt.Sprintf("[#%d](%s)", pr, caller.PullRequestURL(repo, pr))
+	}
+	return caller.PullRequestMarkdownLink(repo, pr)
+}
+
 // writeUnsafeChangeItem writes one table's unsafe findings, one numbered line
 // per finding, so the rendered list is exactly as long as the heading's count
 // and operators can reference a finding by its number. n carries the running
 // number across tables; a change with no parseable reason still gets a line,
 // carrying the engine's change type when one is known so the finding explains
 // itself.
-func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason, changeType string) {
+func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason, changeType, note string) {
+	suffix := ""
+	if note != "" {
+		suffix = " (" + note + ")"
+	}
 	reasons := ui.LintReasons(reason)
 	if len(reasons) == 0 {
 		*n++
 		if changeType != "" {
-			fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, changeType)
+			fmt.Fprintf(sb, "%d. %s: %s%s\n", *n, table, changeType, suffix)
 		} else {
-			fmt.Fprintf(sb, "%d. %s\n", *n, table)
+			fmt.Fprintf(sb, "%d. %s%s\n", *n, table, suffix)
 		}
 		return
 	}
 	for _, r := range reasons {
 		*n++
-		fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, ui.CodeQuoteIdentifiers(r))
+		fmt.Fprintf(sb, "%d. %s: %s%s\n", *n, table, ui.CodeQuoteIdentifiers(r), suffix)
 	}
 }
 
@@ -2453,7 +2486,7 @@ func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, da
 		return
 	}
 
-	sb.WriteString("**Destructive drop guidance:**\n\n")
+	sb.WriteString("<details>\n<summary>Destructive drop guidance</summary>\n\n")
 	if hasApplicationUsageTarget {
 		fmt.Fprintf(sb, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", applicationUsageTarget)
 	}
@@ -2464,6 +2497,7 @@ func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, da
 			fmt.Fprintf(sb, "Before allowing a destructive drop, verify application queries no longer rely on %s for safe performance.\n\n", indexInvisibleTarget)
 		}
 	}
+	sb.WriteString("</details>\n\n")
 }
 
 func unsafeDropApplicationUsageTarget(drops unsafeDropCounts) (string, bool) {
@@ -2945,7 +2979,9 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Destructive changes to tables another pull request owns — resolved per
 	// environment, since the task history that attributes them is per
 	// environment.
-	if len(plan.AttributedChanges) > 0 {
+	unsafeShown := plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0
+	attributionNotes, attributionFolded := unsafeAttributionNotes(*plan, unsafeShown)
+	if len(plan.AttributedChanges) > 0 && !attributionFolded {
 		writeAttributedChanges(sb, plan.AttributedChanges)
 	}
 
@@ -2968,8 +3004,8 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	}
 
 	// Unsafe changes warning
-	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.DatabaseType, plan.IsMySQL)
+	if unsafeShown {
+		writeUnsafeWarning(sb, plan.UnsafeChanges, attributionNotes, plan.DatabaseType, plan.IsMySQL)
 	}
 
 	// Lint violations

@@ -87,23 +87,58 @@ func TestRenderPlanComment_UnsafeConsentNamesShardsAndVSchema(t *testing.T) {
 	assert.Contains(t, out, "to confirm 3 unsafe changes (`mutes` on shard `40-80`, `commerce_sharded` VSchema):")
 }
 
-// When the plan undoes changes another open pull request applied, the
-// instruction names that pull request as a fact and leaves the choice to the
-// reader: merging it first is right when it will land, and undoing it is right
-// when it was abandoned. It never sends the reader back up to the attribution.
-func TestRenderPlanComment_UnsafeConsentNamesTheOpenPRItUndoes(t *testing.T) {
+// When the plan undoes a change another open pull request applied, the
+// attribution rides on that table's unsafe finding, so each change is
+// explained once and the reader meets it where they review the change. The
+// apply instruction stays one short clause and prescribes nothing about the
+// other pull request, which may land or may have been abandoned.
+func TestRenderPlanComment_AttributionRidesOnTheUnsafeFinding(t *testing.T) {
 	data := unsafeConsentPlan("staging")
+	data.Repository = "acme/payments"
 	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790}}
 	out := RenderPlanComment(*data)
 
-	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`). This undoes open PR [acme/payments#4790](https://github.com/acme/payments/pull/4790):\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "1. `transfer_events`: DROP COLUMN discards the column's data (changed by open PR [#4790](https://github.com/acme/payments/pull/4790))\n2. `refund_backfill`: DROP TABLE removes all data\n")
+	assert.Contains(t, out, "a change another PR applied before merging shows up here as one to undo")
+	assert.NotContains(t, out, "Check before applying", "the attribution is not repeated in a section of its own")
 	_, footer, found := strings.Cut(out, "▶️ **To apply**")
 	require.True(t, found, "the comment offers an apply")
-	assert.NotContains(t, footer, "merge", "an open PR may be abandoned, so the footer does not prescribe merging it")
-	assert.NotContains(t, footer, "Check before applying", "the footer stands on its own")
-	for _, block := range fencedCommands(t, out) {
-		assert.NotContains(t, block, "--allow-unsafe")
+	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```\n", footer)
+}
+
+// An owner in another repository is named with its repository, and a table
+// whose ownership could not be established says so on its finding.
+func TestRenderPlanComment_AttributionNotesForOtherRepoAndUnknownOwner(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.Repository = "acme/payments"
+	data.AttributedChanges = []AttributedChangeData{
+		{Table: "transfer_events", Repository: "acme/ledger", PullRequest: 12},
+		{Table: "refund_backfill", Unresolved: true},
 	}
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "1. `transfer_events`: DROP COLUMN discards the column's data (changed by open PR [acme/ledger#12](https://github.com/acme/ledger/pull/12))\n")
+	assert.Contains(t, out, "2. `refund_backfill`: DROP TABLE removes all data (ownership could not be established)\n")
+	assert.NotContains(t, out, "Check before applying")
+}
+
+// An attributed table the unsafe warning does not list keeps the attribution
+// section, so folding never drops a disclosure.
+func TestRenderPlanComment_AttributionKeepsItsSectionWhenNotAnUnsafeFinding(t *testing.T) {
+	data := unsafeConsentPlan("staging")
+	data.AttributedChanges = []AttributedChangeData{{Table: "ledger_holds", Repository: "acme/payments", PullRequest: 4790}}
+	out := RenderPlanComment(*data)
+	assert.Contains(t, out, "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
+	assert.NotContains(t, out, "(changed by open PR")
+
+	// The locked comment awaiting confirmation hides the unsafe warning, so
+	// the attribution keeps its own section there too.
+	data = unsafeConsentPlan("staging")
+	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790}}
+	data.IsLocked = true
+	data.AllowUnsafe = true
+	data.PendingManualConfirmation = true
+	out = RenderPlanComment(*data)
+	assert.Contains(t, out, "**Check before applying**")
 }
 
 // A plan without unsafe changes keeps the plain instruction.
@@ -160,31 +195,6 @@ func TestRenderMultiEnvPlanComment_UnsafeConsentPerEnvironment(t *testing.T) {
 	assert.Contains(t, out, "▶️ **To apply** these changes, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```")
 }
 
-// The instruction names each open pull request once, however many tables it
-// touched, and adds nothing for a table whose ownership could not be
-// established: the reader has no more to go on than SchemaBot does.
-func TestRenderPlanComment_UnsafeConsentAccurateForUnknownAndMultipleOwners(t *testing.T) {
-	data := unsafeConsentPlan("staging")
-	data.AttributedChanges = []AttributedChangeData{
-		{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790},
-		{Table: "refund_backfill", Repository: "acme/payments", PullRequest: 4791},
-		{Table: "refund_events", Repository: "acme/payments", PullRequest: 4790},
-	}
-	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "This undoes open PRs [acme/payments#4790](https://github.com/acme/payments/pull/4790) and [acme/payments#4791](https://github.com/acme/payments/pull/4791):")
-
-	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Unresolved: true}}
-	out = RenderPlanComment(*data)
-	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```")
-
-	data.AttributedChanges = []AttributedChangeData{
-		{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790},
-		{Table: "refund_backfill", Unresolved: true},
-	}
-	out = RenderPlanComment(*data)
-	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`). This undoes open PR [acme/payments#4790](https://github.com/acme/payments/pull/4790):\n```")
-}
-
 // A plan that also carries a change the engine refuses fails its apply
 // whatever the flags, so the instruction does not offer --allow-unsafe.
 func TestRenderPlanComment_NoUnsafeConsentWhenEngineBlocksAChange(t *testing.T) {
@@ -193,4 +203,19 @@ func TestRenderPlanComment_NoUnsafeConsentWhenEngineBlocksAChange(t *testing.T) 
 	out := RenderPlanComment(*data)
 	assert.NotContains(t, out, "--allow-unsafe")
 	assert.Contains(t, out, "▶️ **To apply**, comment:\n```\nschemabot apply -e staging\n```")
+}
+
+// --allow-unsafe consents to every target's disclosed unsafe changes, so the
+// instruction counts and names another target's changes too, and asks for the
+// flag even when the reviewed plan carries none of its own.
+func TestRenderPlanComment_UnsafeConsentCoversOtherTargets(t *testing.T) {
+	data := convergedPrimaryPlanData()
+	data.DeploymentDrift.Plans[1].UnsafeChanges = []UnsafeChangeData{
+		{Table: "users", Reason: "has_timestamp: column created_at uses TIMESTAMP", ChangeType: "alter"},
+		{Table: "legacy", Reason: "DROP TABLE removes all data", ChangeType: "drop", Targets: []string{"primary/testapp_3"}, TotalTargets: 2},
+	}
+	out := RenderPlanComment(data)
+	_, footer, found := strings.Cut(out, "▶️ **To apply**")
+	require.True(t, found, "the comment offers an apply")
+	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes (`users` on targets `primary/testapp_2`, `primary/testapp_3`; `legacy` on target `primary/testapp_3`):\n```\nschemabot apply -e production\n```\n", footer)
 }

@@ -573,9 +573,12 @@ ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
 ⚠️ **Issues**: 1 unsafe change detected
 1. `orders`: DROP COLUMN discards the column's data
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 📋 **Plan**: **2** tables to alter
 
@@ -607,26 +610,25 @@ ALTER TABLE `orders` DROP COLUMN `notes`;
 DROP TABLE `reconcile_state`;
 ```
 
-⚠️ **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
-- `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
-- `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
-
-A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
-
 ⚠️ **Issues**: 2 unsafe changes detected
-1. `orders`: DROP COLUMN discards the column's data
-2. `reconcile_state`: DROP TABLE removes all data
+1. `orders`: DROP COLUMN discards the column's data (changed by open PR [#4820](https://github.com/block/schemabot/pull/4820))
+2. `reconcile_state`: DROP TABLE removes all data (changed by open PR [#4821](https://github.com/block/schemabot/pull/4821))
 
-**Destructive drop guidance:**
+A plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.
+
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
+
+</details>
 
 📋 **Plan**: **1** table to alter, **1** table to drop
 
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`orders`, `reconcile_state`). This undoes open PRs [block/schemabot#4820](https://github.com/block/schemabot/pull/4820) and [block/schemabot#4821](https://github.com/block/schemabot/pull/4821):
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`orders`, `reconcile_state`):
 ```
 schemabot apply -e staging
 ```
@@ -2182,9 +2184,12 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -2215,9 +2220,12 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
+
+</details>
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -8990,9 +8998,12 @@ ALTER TABLE `mutes`
 ⚠️ **Issues**: 1 unsafe change detected
 1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 📋 **Plan**: **1** table to alter
 
