@@ -304,7 +304,9 @@ schemabot apply -e staging
 ```sql
 ALTER TABLE `products`
     MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,
-    MODIFY COLUMN `title` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL, DEFAULT CHARACTER SET = utf8mb4, DEFAULT COLLATE = utf8mb4_0900_ai_ci;
+    MODIFY COLUMN `title` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,
+    DEFAULT CHARACTER SET = utf8mb4,
+    DEFAULT COLLATE = utf8mb4_0900_ai_ci;
 ```
 
 ```sql
