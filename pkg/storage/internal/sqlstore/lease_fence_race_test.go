@@ -127,7 +127,7 @@ func TestTaskStore_OperationLeaseDoesNotWriteASiblingOperationsTask(t *testing.T
 }
 
 // testLeaseFencedWritesFailClosedAgainstConcurrentSteal pins that a displaced
-// driver's task, comment, log, and check writes never land once another driver
+// driver's task, comment, log, control request and check writes never land once another driver
 // has taken the lease. The steal is applied but left uncommitted while the
 // displaced driver writes, so the write's statement snapshot still holds the
 // token the steal is replacing. The write must wait on the lease row, fail closed with
@@ -321,6 +321,39 @@ func testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t *testing.T, newStor
 		require.NoError(t, err)
 		require.Len(t, logs, len(before)+1)
 		assert.Equal(t, "current driver", logs[len(logs)-1].Message)
+	})
+
+	// A control request is settled by joining its apply's lease row, the same
+	// statement shape as the apply-lease task update, so the fence has to make
+	// a displaced driver's settlement wait on that row and fail closed.
+	t.Run("control request completion under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_control_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_control", 940, "driver-a")
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID: apply.ID, Operation: storage.ControlOperationStop, RequestedBy: "operator",
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		displacedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken})
+		err = writeDuringUncommittedSteal(t, store, waiting, "UPDATE apply_control_requests",
+			func() error {
+				return store.ControlRequests().CompletePending(displacedCtx, apply.ID, storage.ControlOperationStop)
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		pending, err := store.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "a displaced driver must not settle the request")
+		assert.Equal(t, storage.ControlRequestPending, pending.Status)
+
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-b", Token: "tok-b"})
+		require.NoError(t, store.ControlRequests().CompletePending(ownerCtx, apply.ID, storage.ControlOperationStop))
+		pending, err = store.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, pending, "the driver holding the lease settles the request")
 	})
 
 	t.Run("check completion under an apply lease", func(t *testing.T) {

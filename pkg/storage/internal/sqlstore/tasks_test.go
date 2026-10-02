@@ -894,7 +894,9 @@ func TestTaskStore_UpsertShardProgressReportsMissUnderCurrentLease(t *testing.T)
 		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
 	})
 	require.NoError(t, err)
-	store.tasks.identity = missingInsert{store.tasks.identity}
+	realInserter := store.tasks.identity
+	store.tasks.identity = missingInsert{realInserter}
+	t.Cleanup(func() { store.tasks.identity = realInserter })
 
 	shardTask := func() *storage.Task {
 		now := time.Now()

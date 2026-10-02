@@ -8,7 +8,7 @@ import (
 
 const (
 	mysqlApplySourceFence    = "a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR SHARE)"
-	postgresApplySourceFence = "a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE)"
+	postgresApplySourceFence = "a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR SHARE)"
 )
 
 // The lease-guarded shard task insert selects its row from the lease row, so
@@ -37,7 +37,7 @@ func TestShardTaskInsertStatement(t *testing.T) {
 			dialect:    PostgresDialect{},
 			leaseTable: "apply_operations",
 			leaseAlias: "ao",
-			want:       insert + "FROM apply_operations ao WHERE ao.id = ? AND ao.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = ao.id AND fence.lease_token = ? FOR UPDATE)",
+			want:       insert + "FROM apply_operations ao WHERE ao.id = ? AND ao.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = ao.id AND fence.lease_token = ? FOR SHARE)",
 		},
 		{
 			name:       "apply lease selects from the share-locked applies row on MySQL",
@@ -81,5 +81,5 @@ func TestCheckApplyLeasePredicate(t *testing.T) {
 		"lease_apply.id = (SELECT fence.id FROM applies fence WHERE fence.id = lease_apply.id AND fence.lease_token = ? "
 
 	assert.Equal(t, exists+"FOR SHARE))", checkApplyLeasePredicate(MySQLDialect{}))
-	assert.Equal(t, exists+"FOR UPDATE))", checkApplyLeasePredicate(PostgresDialect{}))
+	assert.Equal(t, exists+"FOR SHARE))", checkApplyLeasePredicate(PostgresDialect{}))
 }
