@@ -629,7 +629,7 @@ func (s *cancelOnLookupLockStore) GetByPR(_ context.Context, _ string, _ int) ([
 	return s.locks, nil
 }
 
-func (s *cancelOnLookupLockStore) Release(ctx context.Context, _, _, _ string) error {
+func (s *cancelOnLookupLockStore) ReleaseByID(ctx context.Context, _ int64, _, _, _, _ string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

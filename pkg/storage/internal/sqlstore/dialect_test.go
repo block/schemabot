@@ -35,6 +35,7 @@ func TestMySQLDialectIndexHint(t *testing.T) {
 
 func TestMySQLDialectBinaryEquals(t *testing.T) {
 	assert.Equal(t, "owner COLLATE utf8mb4_0900_bin = ?", MySQLDialect{}.BinaryEquals("owner"))
+	assert.Equal(t, "pending_plan_id COLLATE utf8mb4_0900_bin = ?", MySQLDialect{}.BinaryEquals("pending_plan_id"))
 }
 
 func TestMySQLDialectBinaryCollation(t *testing.T) {
@@ -303,6 +304,7 @@ func TestPostgresDialect(t *testing.T) {
 
 func TestPostgresDialectBinaryEquals(t *testing.T) {
 	assert.Equal(t, "owner = ?", PostgresDialect{}.BinaryEquals("owner"))
+	assert.Equal(t, "pending_plan_id = ?", PostgresDialect{}.BinaryEquals("pending_plan_id"))
 }
 
 func TestPostgresDialectBinaryCollation(t *testing.T) {
