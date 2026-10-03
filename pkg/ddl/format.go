@@ -696,10 +696,17 @@ func findTableNameEnd(ddl string) int {
 	return len(ddl)
 }
 
-// isClauseKeyword checks if the string starts with an ALTER TABLE clause keyword.
+// alterTableOptionPattern matches a table option starting an ALTER TABLE
+// clause, such as DEFAULT COLLATE = utf8mb4_bin or ENGINE = InnoDB.
+var alterTableOptionPattern = regexp.MustCompile(`^(?i)(DEFAULT\s|CHARACTER\s+SET\s|CHARSET\s|COLLATE\s|[A-Z_]+\s*=)`)
+
+// isClauseKeyword checks if the string starts an ALTER TABLE clause: a clause
+// keyword, or a table option, which gets a line of its own so a new default
+// charset or collation does not trail the last column change.
 func isClauseKeyword(s string) bool {
 	upper := strings.ToUpper(s)
-	return strings.HasPrefix(upper, "ADD ") ||
+	return alterTableOptionPattern.MatchString(s) ||
+		strings.HasPrefix(upper, "ADD ") ||
 		strings.HasPrefix(upper, "DROP ") ||
 		strings.HasPrefix(upper, "MODIFY ") ||
 		strings.HasPrefix(upper, "CHANGE ") ||

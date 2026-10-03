@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -1047,6 +1048,26 @@ func shardDDLByTable(shards []*apitypes.ShardPlanResponse) map[planTableRef][]st
 	return byTable
 }
 
+// planCollationChanges lists the collation changes the engine reported for a
+// namespace's table changes, in plan order.
+func planCollationChanges(sc *apitypes.SchemaChangeResponse) []templates.CollationChangeData {
+	var changes []templates.CollationChangeData
+	for _, t := range sc.TableChanges {
+		for _, c := range t.CollationChanges {
+			changes = append(changes, templates.CollationChangeData{
+				Table:          t.TableName,
+				Column:         c.Column,
+				From:           c.From,
+				To:             c.To,
+				Case:           engine.ComparisonChange(c.Case),
+				TrailingSpaces: engine.ComparisonChange(c.TrailingSpaces),
+				UniqueIndexes:  c.UniqueIndexes,
+			})
+		}
+	}
+	return changes
+}
+
 // planTableSizes lists the size estimate of each existing table a namespace's
 // plan copies, rebuilds, or scans. Metadata-only changes get no size line,
 // since a size beside them would be noise on the plan, and neither do tables
@@ -1154,6 +1175,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			Shards:     shardsByKeyspace[sc.Namespace],
 			TableSizes: planTableSizes(schema, sc, shardDDL),
 		}
+		ksData.CollationChanges = planCollationChanges(sc)
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
 		}
