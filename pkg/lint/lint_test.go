@@ -278,7 +278,7 @@ func TestPlanChangesBooleanKeywordDefaultConverges(t *testing.T) {
 			name:     "a default that really did change",
 			declared: "`flag` boolean NOT NULL DEFAULT FALSE",
 			live:     "`flag` tinyint(1) NOT NULL DEFAULT '1'",
-			want:     "MODIFY COLUMN `flag` tinyint(1) NOT NULL DEFAULT 0",
+			want:     "MODIFY COLUMN `flag` tinyint(1) NOT NULL DEFAULT FALSE",
 		},
 		{
 			name:     "a quoted string default against the stored 0",

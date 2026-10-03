@@ -176,6 +176,10 @@ func TestFormatSchemaFileForDialectPreservesMySQLTableOptions(t *testing.T) {
 		"DELAY_KEY_WRITE = 1",
 		"MIN_ROWS = 10",
 		"STATS_AUTO_RECALC = 0",
+		"STATS_PERSISTENT = 0",
+		"STATS_PERSISTENT = 1",
+		"PACK_KEYS = 0",
+		"PACK_KEYS = 1",
 	} {
 		t.Run(option, func(t *testing.T) {
 			input := "CREATE TABLE t (id int) ENGINE=InnoDB " + option + " COMMENT='Keep INT, comma' PARTITION BY HASH (id) PARTITIONS 4"
@@ -186,16 +190,6 @@ func TestFormatSchemaFileForDialectPreservesMySQLTableOptions(t *testing.T) {
 			assert.Contains(t, got, "COMMENT = 'Keep INT, comma'")
 			assert.Contains(t, got, "PARTITION BY HASH")
 			assert.Equal(t, Canonicalize(input), Canonicalize(got))
-		})
-	}
-}
-
-func TestFormatSchemaFileForDialectRefusesLossyMySQLCanonicalization(t *testing.T) {
-	for _, option := range []string{"STATS_PERSISTENT=0", "STATS_PERSISTENT=1", "PACK_KEYS=0", "PACK_KEYS=1"} {
-		t.Run(option, func(t *testing.T) {
-			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE t (id int) ENGINE=InnoDB "+option)
-			require.ErrorContains(t, err, "canonical SQL contains comments")
-			assert.Empty(t, got)
 		})
 	}
 }
