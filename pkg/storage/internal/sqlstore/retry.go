@@ -45,8 +45,13 @@ func withLockRetry(ctx context.Context, classifier ErrorClassifier, op string, f
 }
 
 // sleepBackoff waits before the next retry using exponential backoff with full
-// jitter, returning early if the context is cancelled.
+// jitter, returning early if the context is cancelled. Cancellation is checked
+// before waiting because full jitter can pick a near-zero delay, and a select
+// between an already-cancelled context and an already-fired timer picks either.
 func sleepBackoff(ctx context.Context, attempt int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	maxDelay := lockRetryBaseBackoff << (attempt - 1)
 	delay := time.Duration(rand.Int64N(int64(maxDelay) + 1))
 	timer := time.NewTimer(delay)
