@@ -73,14 +73,19 @@ func inspectQueryAs(t *testing.T, svc *Service, caller, target string) *httptest
 
 // Every target the inspection would refuse is refused before the caller is
 // charged, so a client sending unanswerable requests cannot spend the shared
-// budget other inspections need. The budget is a single token here, so a
-// charge that leaked through any one validation would turn the following valid
-// inspection into a 429.
+// budget other inspections need. Both refusal stages are covered: the targets
+// the query parser cannot read, and the readable targets the server cannot
+// serve. The budget is a single token here, so a charge that leaked through
+// any one validation would turn the following valid inspection into a 429.
 func TestChecksInspectRateLimitValidatesBeforeChargingCaller(t *testing.T) {
 	for name, target := range map[string]string{
-		"malformed repo":        "/api/checks/inspect?repo=malformed&pull_request=7",
-		"non-positive PR":       "/api/checks/inspect?repo=acme/store&pull_request=0",
-		"unhandled environment": "/api/checks/inspect?repo=acme/store&pull_request=7&environment=prod",
+		"no pull request":                             "/api/checks/inspect?repo=acme/store",
+		"a repository with no number":                 "/api/checks/inspect?pull_request=acme/store",
+		"a reference naming neither":                  "/api/checks/inspect?pull_request=not+a+pull+request",
+		"a repository disagreeing with the reference": "/api/checks/inspect?repo=acme/warehouse&pull_request=acme/store%23412",
+		"malformed repo":                              "/api/checks/inspect?repo=malformed&pull_request=7",
+		"non-positive PR":                             "/api/checks/inspect?repo=acme/store&pull_request=0",
+		"unhandled environment":                       "/api/checks/inspect?repo=acme/store&pull_request=7&environment=prod",
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc, calls := newRateLimitedInspectService(t, CallerRateLimitConfig{
