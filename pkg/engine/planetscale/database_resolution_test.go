@@ -55,6 +55,11 @@ func (c *databaseCapturingClient) ListKeyspaces(_ context.Context, req *ps.ListK
 	return nil, nil
 }
 
+func (c *databaseCapturingClient) BranchTableMetrics(_ context.Context, _, database, _ string) (map[string]int64, error) {
+	c.record(database)
+	return nil, nil
+}
+
 func (c *databaseCapturingClient) GetDeployRequest(_ context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error) {
 	c.record(req.Database)
 	return &ps.DeployRequest{Number: req.Number, DeploymentState: deployState.Complete}, nil
