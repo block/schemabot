@@ -1102,33 +1102,32 @@ func PreviewCommentErrorDatabaseNotConfigured() string {
 	})
 }
 
-// PreviewCommentErrorSchemaConfigUnmanaged renders the error comment the
-// aggregate leader posts for a schemabot.yaml no SchemaBot deployment on the
-// repository manages.
-func PreviewCommentErrorSchemaConfigUnmanaged() string {
-	return RenderSchemaConfigUnmanaged(SchemaErrorData{
+// PreviewCommentErrorDatabaseNotRegistered renders the error comment the
+// staging aggregate leader posts for an unscoped command on a schemabot.yaml
+// whose database it has not registered.
+func PreviewCommentErrorDatabaseNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
 		RequestedBy: previewRequestedBy,
 		Timestamp:   "2026-01-15 14:30:00",
-		Environment: "staging",
+		Deployment:  "staging",
 		CommandName: action.Plan,
-		UnmanagedConfigs: []UnmanagedSchemaConfigNoticeData{
-			{Database: "payments", SchemaPath: "services/payments/schema"},
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
 		},
 	})
 }
 
-// PreviewCommentErrorSchemaConfigsUnmanaged renders the same error for a PR
-// carrying several schemabot.yaml files no deployment manages, which one reply
-// names together.
-func PreviewCommentErrorSchemaConfigsUnmanaged() string {
-	return RenderSchemaConfigUnmanaged(SchemaErrorData{
+// PreviewCommentErrorDatabasesNotRegistered renders the same error for a PR
+// carrying several such schemabot.yaml files, which one reply names together.
+func PreviewCommentErrorDatabasesNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
 		RequestedBy: previewRequestedBy,
 		Timestamp:   "2026-01-15 14:30:00",
-		Environment: "staging",
+		Deployment:  "staging",
 		CommandName: action.Plan,
-		UnmanagedConfigs: []UnmanagedSchemaConfigNoticeData{
-			{Database: "payments", SchemaPath: "services/payments/schema"},
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
 			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+			{Database: "payments", SchemaPath: "services/payments/schema"},
 		},
 	})
 }

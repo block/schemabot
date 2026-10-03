@@ -74,20 +74,20 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Empty(t, comments, "the terminal skip must stay silent")
 	})
 
-	// The aggregate leader answers for schema no deployment manages, and that
-	// answer is as terminal as the silent skip: the same config will always be
-	// unmanaged until an operator registers the database, so re-driving would
-	// only re-post the comment.
-	t.Run("leader answer for unmanaged schema is terminal", func(t *testing.T) {
+	// The aggregate leader answers for a database its registry lacks, and
+	// that answer is as terminal as the silent skip: the same config stays
+	// unregistered until an operator registers the database, so re-driving
+	// would only re-post the comment.
+	t.Run("leader answer for an unregistered database is terminal", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
 		retry, err := h.applyCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
 
 		require.NoError(t, err)
-		assert.False(t, retry, "the leader's fleet-wide answer is the command's terminal answer, not a retryable failure")
-		body := requireComment(t, comments, "schema-config-unmanaged answer")
-		assert.Contains(t, body, "No Deployment Manages This Schema Config")
+		assert.False(t, retry, "the leader's answer is the command's terminal answer, not a retryable failure")
+		body := requireComment(t, comments, "database-not-registered answer")
+		assert.Contains(t, body, "Database Not Registered")
 		assert.Contains(t, body, "`orders`")
 	})
 

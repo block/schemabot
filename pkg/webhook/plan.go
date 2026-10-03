@@ -59,7 +59,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
-		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, err) {
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, environment, tenant, err) {
 			h.logger.Debug("unscoped fan-out plan resolves to no schema this deployment answers for; staying silent",
 				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
@@ -288,7 +288,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if databaseName != "" {
 		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
-			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", findErr)
 				return
@@ -299,7 +299,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
 			unownedErr := h.unownedDiscoveredConfigError(repo, config, configDir)
-			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, unownedErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, unownedErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
 				return
@@ -310,9 +310,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 		schemaDatabase = config.Database
 	} else {
-		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Plan)
+		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Plan)
 		if findErr != nil {
-			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "error", findErr)
 				return
@@ -708,26 +708,30 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		return true
 	}
 
-	var unmanagedErr *schemaManagedByNoDeploymentError
-	if errors.As(err, &unmanagedErr) {
-		for _, cfg := range unmanagedErr.Configs {
-			data.UnmanagedConfigs = append(data.UnmanagedConfigs, templates.UnmanagedSchemaConfigNoticeData{
+	var notRegisteredErr *databaseNotRegisteredError
+	if errors.As(err, &notRegisteredErr) {
+		for _, cfg := range notRegisteredErr.Configs {
+			data.UnregisteredConfigs = append(data.UnregisteredConfigs, templates.UnregisteredSchemaConfigData{
 				Database:   cfg.Database,
 				SchemaPath: cfg.SchemaPath,
 			})
 		}
+		// The claim is about this deployment's registry only, so the comment
+		// names the deployment making it.
+		data.Deployment = h.deploymentLabel()
 		// A single config names its database on the metric; several have no
 		// one database to name, the same as Multiple Databases Detected.
 		metricDatabase := databaseName
-		if len(unmanagedErr.Configs) == 1 {
-			metricDatabase = unmanagedErr.Configs[0].Database
+		if len(notRegisteredErr.Configs) == 1 {
+			metricDatabase = notRegisteredErr.Configs[0].Database
 		}
-		h.logger.Warn("schema request: no SchemaBot deployment on this repository manages the schema configs",
+		h.logger.Warn("schema request: database not registered on this deployment and schema directory under no expected participant's paths",
 			"repo", repo, "pr", pr, "environment", environment,
-			"databases", unmanagedErr.Databases(), "schema_paths", unmanagedErr.SchemaPaths(),
+			"deployment", data.Deployment,
+			"databases", notRegisteredErr.Databases(), "schema_paths", notRegisteredErr.SchemaPaths(),
 			"action", commandName, "error", err)
-		metrics.RecordSchemaRequestError(ctx, repo, commandName, metricDatabase, environment, "schema_config_unmanaged")
-		h.postComment(repo, pr, installationID, templates.RenderSchemaConfigUnmanaged(data))
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, metricDatabase, environment, "database_not_registered")
+		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotRegistered(data))
 		return true
 	}
 

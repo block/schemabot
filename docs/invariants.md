@@ -1692,8 +1692,9 @@ receives a response, and silence only ever means another instance owns the reply
 issues no command: a line that opens with the product name but reads as a sentence about it, not a
 command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
 unowned-command policy (`pkg/webhook/commands.go`), and the fan-out silence predicates
-(`pkg/webhook/schema_source_policy.go`), under which the aggregate leader answers for schema no
-deployment manages.
+(`pkg/webhook/schema_source_policy.go`), under which one aggregate leader answers for a database
+its own registry lacks under no expected participant's path: the leader serving the command's
+environment, or the first environment in the promotion order when the command names none.
 
 ### AZ-6: Local hosting preserves its boundaries
 

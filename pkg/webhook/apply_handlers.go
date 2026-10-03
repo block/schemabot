@@ -99,7 +99,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
-		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, environment, result.Tenant, err) {
 			h.logger.Debug("unscoped fan-out apply resolves to no schema this deployment answers for; staying silent",
 				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
@@ -766,7 +766,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.ApplyConfirm)
 	if err != nil {
-		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, environment, result.Tenant, err) {
 			h.logger.Debug("unscoped fan-out apply-confirm resolves to no schema this deployment answers for; staying silent",
 				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
@@ -1403,7 +1403,7 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		return "", err
 	}
 
-	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Unlock)
+	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Unlock)
 	if err != nil {
 		// Schema another deployment owns — whether outside allowed_dirs or for
 		// a database not in this deployment's registry — means there is nothing
@@ -1411,10 +1411,10 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		if isSchemaUnownedByDeploymentError(err) {
 			return "", unlockRejection(ghclient.ErrNoConfig)
 		}
-		// Schema no deployment manages was never locked by any of them, so
-		// there is nothing to unlock here either.
-		var unmanaged *schemaManagedByNoDeploymentError
-		if errors.As(err, &unmanaged) {
+		// Schema whose database this leader never registered was never
+		// locked by it, so there is nothing to unlock here either.
+		var notRegistered *databaseNotRegisteredError
+		if errors.As(err, &notRegistered) {
 			return "", unlockRejection(ghclient.ErrNoConfig)
 		}
 		// A repo with no config, or only malformed ones, is a deterministic

@@ -172,12 +172,12 @@ func TestUnownedSchemaConfigError(t *testing.T) {
 		assert.ErrorIs(t, err, ghclient.ErrNoConfig)
 	})
 
-	// The aggregate leader alone can tell an unowned config from an unmanaged
-	// one: a directory under no expected participant's paths, declaring a
-	// database the leader has not registered, is managed by no deployment,
-	// whatever the leader's own allowlist mode. The same directory under a
-	// participant's paths, or a database the leader does register, keeps the
-	// ownership classes above.
+	// The aggregate leader alone can tell an unowned config from one whose
+	// database it has not registered: a directory under no expected
+	// participant's paths, declaring a database the leader's registry lacks,
+	// is not registered on this deployment, whatever the leader's own
+	// allowlist mode. The same directory under a participant's paths, or a
+	// database the leader does register, keeps the ownership classes above.
 	leaderTenants := []api.ExpectedTenant{{Tenant: "tenant-b", Paths: []string{"db/tenant-b"}, CheckName: "SchemaBot Tenant B"}}
 	openModeLeader := &api.ServerConfig{Repos: map[string]api.RepoConfig{
 		repo: {Aggregate: &api.AggregateConfig{Role: api.AggregateRoleLeader, ExpectedTenants: leaderTenants}},
@@ -191,13 +191,13 @@ func TestUnownedSchemaConfigError(t *testing.T) {
 	}}
 
 	for name, config := range map[string]*api.ServerConfig{"open-mode leader": openModeLeader, "allowlisted leader": allowlistedLeader} {
-		t.Run(name+" reports schema no deployment manages", func(t *testing.T) {
+		t.Run(name+" reports a database not registered on this deployment", func(t *testing.T) {
 			h := sourcePolicyTestHandler(t, config)
 			err := h.unownedSchemaConfigError(repo, "payments", "mysql", "db/payments/schema")
-			var unmanaged *schemaManagedByNoDeploymentError
-			require.ErrorAs(t, err, &unmanaged)
-			assert.Equal(t, []unmanagedSchemaConfig{{Database: "payments", DatabaseType: "mysql", SchemaPath: "db/payments/schema"}}, unmanaged.Configs)
-			assert.False(t, isSchemaUnownedByDeploymentError(err), "nobody else will answer, so it must not be silenced as unowned")
+			var notRegistered *databaseNotRegisteredError
+			require.ErrorAs(t, err, &notRegistered)
+			assert.Equal(t, []unregisteredSchemaConfig{{Database: "payments", DatabaseType: "mysql", SchemaPath: "db/payments/schema"}}, notRegistered.Configs)
+			assert.False(t, isSchemaUnownedByDeploymentError(err), "no participant will answer, so it must not be silenced as unowned")
 		})
 	}
 
@@ -230,7 +230,7 @@ func TestUnownedSchemaConfigError(t *testing.T) {
 		require.ErrorAs(t, err, &outsideDirs, "a dynamic registry cannot say the database is unknown; the misplaced directory is still reported")
 	})
 
-	t.Run("participant never reports schema no deployment manages", func(t *testing.T) {
+	t.Run("participant never reports a database not registered", func(t *testing.T) {
 		h := sourcePolicyTestHandler(t, participant)
 		err := h.unownedSchemaConfigError(repo, "payments", "mysql", "db/payments/schema")
 		var notConfigured *api.DatabaseNotConfiguredError

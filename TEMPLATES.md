@@ -2521,40 +2521,38 @@ Check that the database name, from `-d` or from `schemabot.yaml`, matches one th
 </details>
 
 <details>
-<summary><a name="no-deployment-manages-this-schema-config"></a><strong>No Deployment Manages This Schema Config</strong></summary>
+<summary><a name="database-not-registered"></a><strong>Database Not Registered</strong></summary>
 
 
-## ⚠️ No Deployment Manages This Schema Config
+## ⚠️ Database Not Registered
 
-**Database**: `payments` | **Schema directory**: `services/payments/schema` | **Environment**: `staging`
+**Database**: `ledger` | **Schema directory**: `services/ledger/schema` | **Deployment**: `staging`
 
 *Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
 
-No SchemaBot deployment on this repository manages this `schemabot.yaml`: this SchemaBot instance has no `payments` entry under `databases` in its server configuration, and the schema directory is outside every directory the other deployments manage. A `schemabot.yaml` declaring `database: payments` is not enough on its own: the database also has to be registered on a SchemaBot server.
+The staging SchemaBot deployment has no `ledger` entry under `databases`, and this schema directory is not under any path it expects another deployment to report on.
 
-If `payments` is new to SchemaBot, ask a SchemaBot operator to onboard it with `services/payments/schema` as its schema directory. If it is already onboarded, move the `schemabot.yaml` and its schema files under the schema directory registered for it.
+If `ledger` is new to SchemaBot, ask a SchemaBot operator to register it with this schema directory. If it is already registered, move the `schemabot.yaml` and its schema files under the schema directory registered for it.
 <!-- schemabot:offer-support-channel -->
 
 </details>
 
 <details>
-<summary><a name="no-deployment-manages-these-schema-configs"></a><strong>No Deployment Manages These Schema Configs</strong></summary>
+<summary><a name="databases-not-registered"></a><strong>Databases Not Registered</strong></summary>
 
 
-## ⚠️ No Deployment Manages These Schema Configs
+## ⚠️ Databases Not Registered
 
-**Environment**: `staging`
+**Deployment**: `staging`
 
 *Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
 
-No SchemaBot deployment on this repository manages these `schemabot.yaml` files:
+The staging SchemaBot deployment has none of these databases under `databases`, and none of these schema directories is under a path it expects another deployment to report on:
 
-- `services/payments/schema` declares database `payments`
 - `services/ledger/schema` declares database `ledger`
+- `services/payments/schema` declares database `payments`
 
-This SchemaBot instance has none of these databases under `databases` in its server configuration, and each schema directory is outside every directory the other deployments manage. A `schemabot.yaml` declaring a database is not enough on its own: the database also has to be registered on a SchemaBot server.
-
-For each database that is new to SchemaBot, ask a SchemaBot operator to onboard it with its schema directory. For each one already onboarded, move its `schemabot.yaml` and schema files under the schema directory registered for it.
+For each database that is new to SchemaBot, ask a SchemaBot operator to register it with its schema directory. For each one already registered, move its `schemabot.yaml` and schema files under the schema directory registered for it.
 <!-- schemabot:offer-support-channel -->
 
 </details>

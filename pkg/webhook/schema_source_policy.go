@@ -14,19 +14,25 @@ import (
 
 // silentDiscoveryFailureOnUnscopedFanOut reports whether a failed schema
 // discovery for an unscoped (no -t) command should be a logged silent skip
-// rather than a PR comment. Two independent outcomes qualify — the discovered
-// schema belongs to another deployment, or a participant's partial view cannot
-// resolve the named database — and they belong together here because they say
-// the same thing to the user: a different deployment owns this command's
-// answer, so a reply from this one would land as duplicate noise beside the
-// real one. Every other failure still surfaces, and a -t-scoped command
-// (tenant != "") always reports, since it named a specific deployment.
-func (h *Handler) silentDiscoveryFailureOnUnscopedFanOut(repo, tenant string, err error) bool {
+// rather than a PR comment. Three independent outcomes qualify — the
+// discovered schema belongs to another deployment, a participant's partial
+// view cannot resolve the named database, or another leader serving the
+// command's environment answers for an unregistered database — and they
+// belong together here because they say the same thing to the user: a
+// different deployment owns this command's answer, so a reply from this one
+// would land as duplicate noise beside the real one. Every other failure still
+// surfaces, and a -t-scoped command (tenant != "") always reports, since it
+// named a specific deployment. environment is the command's -e value, empty
+// for a command that named none.
+func (h *Handler) silentDiscoveryFailureOnUnscopedFanOut(repo, environment, tenant string, err error) bool {
 	if tenant != "" {
 		return false
 	}
-	return h.silentUnownedSchemaOnAggregateFanOut(repo, err) ||
-		h.silentUnresolvedDatabaseOnParticipantFanOut(repo, err)
+	if h.silentUnownedSchemaOnAggregateFanOut(repo, environment, err) {
+		h.logLeftToEnvironmentResponder(repo, environment, err)
+		return true
+	}
+	return h.silentUnresolvedDatabaseOnParticipantFanOut(repo, err)
 }
 
 // silentUnownedSchemaOnAggregateFanOut reports whether a "schema not owned by
@@ -38,11 +44,15 @@ func (h *Handler) silentDiscoveryFailureOnUnscopedFanOut(repo, tenant string, er
 // "database not configured" from every non-owning deployment would be exactly
 // the noise fan-out removes.
 //
-// The silence rests on some other deployment answering. The leader can tell
-// when none will: a config outside its own allowed_dirs whose directory no
-// expected participant manages either is misplaced for the whole fleet, so
-// the leader reports it rather than leaving the command unanswered.
-func (h *Handler) silentUnownedSchemaOnAggregateFanOut(repo string, err error) bool {
+// The silence rests on some other deployment answering. A leader can tell
+// when none it knows of will: a config outside its own allowed_dirs whose
+// directory none of its expected participants manages is one it reports
+// against its own allowed_dirs, and an unregistered database under no such
+// directory is one it reports as not registered here. Several leaders can
+// split one repository's environments, and each would reach the second
+// conclusion from its own registry, so only the leader serving the command's
+// environment makes it (answersForUnregisteredDatabase).
+func (h *Handler) silentUnownedSchemaOnAggregateFanOut(repo, environment string, err error) bool {
 	config, ok := h.serverConfig()
 	if !ok {
 		return false
@@ -50,39 +60,93 @@ func (h *Handler) silentUnownedSchemaOnAggregateFanOut(repo string, err error) b
 	if config.AggregateRoleForRepo(repo) == "" {
 		return false
 	}
+	var notRegistered *databaseNotRegisteredError
+	if errors.As(err, &notRegistered) {
+		answers, _ := answersForUnregisteredDatabase(config, environment)
+		return !answers
+	}
 	if !isSchemaUnownedByDeploymentError(err) {
 		return false
 	}
 	var outsideAllowedDirs *schemaConfigOutsideAllowedDirsError
 	if errors.As(err, &outsideAllowedDirs) {
-		return h.schemaManagedByAnotherDeployment(config, repo, outsideAllowedDirs.SchemaPath)
+		return h.schemaUnderExpectedParticipant(config, repo, outsideAllowedDirs.SchemaPath)
 	}
 	return true
 }
 
-// schemaManagedByNoDeployment reports whether a schema config this deployment
-// does not manage is managed by no deployment on repo at all. Only the
-// aggregate leader can tell, and it can when the config's directory is under
-// no expected participant's paths and its database is not in the leader's own
-// registry: every deployment would leave the config to an owner that does not
-// exist, so the leader is the one to speak for it. A leader that resolves
-// databases dynamically (TargetResolver) has no registry to consult for the
-// database half, so it never makes the claim; its misplaced configs surface
+// deploymentLabel names this deployment in a claim about its own registry: the
+// one environment it serves. A deployment serving several environments, or
+// every one, has no single name, so the label is empty and the comment falls
+// back to the environments it covers.
+func (h *Handler) deploymentLabel() string {
+	config, ok := h.serverConfig()
+	if !ok || len(config.AllowedEnvironments) != 1 {
+		return ""
+	}
+	return config.AllowedEnvironments[0]
+}
+
+// answersForUnregisteredDatabase reports whether this leader is the one to
+// answer a command with Database Not Registered, and names the environment
+// whose deployment answers. A command with -e is answered by the leader
+// serving that environment; environment routing already keeps it from every
+// other deployment. An unscoped command reaches every leader on the
+// repository, and each finds the database missing from its own registry, so
+// the leader serving the first environment in the promotion order answers and
+// the others stay silent. A repository with one leader serving every
+// environment always answers.
+func answersForUnregisteredDatabase(config *api.ServerConfig, environment string) (bool, string) {
+	if environment != "" {
+		return config.IsEnvironmentAllowed(environment), environment
+	}
+	return config.ServesFirstPromotionEnvironment()
+}
+
+// logLeftToEnvironmentResponder logs why a leader stays silent on a database
+// it found unregistered: the reply belongs to the leader serving another
+// environment. Other silent fan-out outcomes are logged by their callers.
+func (h *Handler) logLeftToEnvironmentResponder(repo, environment string, err error) {
+	var notRegistered *databaseNotRegisteredError
+	if !errors.As(err, &notRegistered) {
+		return
+	}
+	config, ok := h.serverConfig()
+	if !ok {
+		return
+	}
+	_, responder := answersForUnregisteredDatabase(config, environment)
+	h.logger.Info("database not registered on this leader; the leader serving the responder environment answers the command",
+		"repo", repo, "environment", environment, "responder_environment", responder,
+		"allowed_environments", config.AllowedEnvironments,
+		"databases", notRegistered.Databases(), "schema_paths", notRegistered.SchemaPaths(),
+		"policy", "unscoped commands are answered by the deployment serving the first environment in environment_order")
+}
+
+// databaseNotRegisteredOnLeader reports whether this deployment, as the
+// aggregate leader, finds a schema config it cannot attribute to any
+// deployment it knows of: the config's database has no entry in this
+// deployment's registry, and its directory is under none of the participant
+// paths in this deployment's expected-tenant set. That is all the claim
+// covers. A sibling leader serving other environments may register the
+// database, and this deployment cannot see its registry or allowed_dirs. A
+// leader that resolves databases dynamically (TargetResolver) has no registry
+// to consult, so it never makes the claim; its misplaced configs surface
 // through the allowed_dirs class instead.
-func (h *Handler) schemaManagedByNoDeployment(config *api.ServerConfig, repo, database, schemaPath string) bool {
+func (h *Handler) databaseNotRegisteredOnLeader(config *api.ServerConfig, repo, database, schemaPath string) bool {
 	if config.TargetResolver.Enabled() {
 		return false
 	}
-	return !h.schemaManagedByAnotherDeployment(config, repo, schemaPath) && config.Database(database) == nil
+	return !h.schemaUnderExpectedParticipant(config, repo, schemaPath) && config.Database(database) == nil
 }
 
-// schemaManagedByAnotherDeployment reports whether a schema config this
-// deployment does not manage can belong to a sibling deployment on repo. A
+// schemaUnderExpectedParticipant reports whether a schema config this
+// deployment does not manage can belong to a participant on repo. A
 // participant sees only its own slice of the fleet, so for it the answer is
-// always yes. The leader's expected-tenant set names every participant's path
-// prefixes, so on the leader the answer is yes only when one of them covers
-// the config's schema directory.
-func (h *Handler) schemaManagedByAnotherDeployment(config *api.ServerConfig, repo, schemaPath string) bool {
+// always yes. A leader's expected-tenant set names its participants' path
+// prefixes, so on a leader the answer is yes only when one of them covers the
+// config's schema directory.
+func (h *Handler) schemaUnderExpectedParticipant(config *api.ServerConfig, repo, schemaPath string) bool {
 	if !config.IsAggregateLeaderForRepo(repo) {
 		return true
 	}
@@ -207,36 +271,38 @@ func (e *schemaConfigOutsideAllowedDirsError) Error() string {
 	return fmt.Sprintf("schema config for database %q at %q is outside server allowed_dirs", e.Database, e.SchemaPath)
 }
 
-// schemaManagedByNoDeploymentError reports discovered schema configs that no
-// SchemaBot deployment on the repository manages: each config's database has
-// no entry in this deployment's registry, and its schema directory is under no
-// path prefix an expected participant manages. Only the aggregate leader can
-// establish this, since only the leader's expected-tenant set spans the fleet,
-// and it is never an ownership signal for fan-out silencing: nobody else will
-// answer. It names every such config the command discovered, so one reply
-// covers them all.
-type schemaManagedByNoDeploymentError struct {
-	Configs []unmanagedSchemaConfig
+// databaseNotRegisteredError reports discovered schema configs the aggregate
+// leader cannot attribute to any deployment it knows of: each config's
+// database has no entry in this deployment's registry, and its schema
+// directory is under none of the participant paths in this deployment's
+// expected-tenant set (databaseNotRegisteredOnLeader). It is not an
+// ownership signal: no participant this leader knows of will answer, so
+// whether this leader answers or stays silent is decided by the command's
+// environment instead (answersForUnregisteredDatabase). It names every such
+// config the command discovered, so one reply covers them all.
+type databaseNotRegisteredError struct {
+	Configs []unregisteredSchemaConfig
 }
 
-// unmanagedSchemaConfig identifies one schema config no deployment manages.
-type unmanagedSchemaConfig struct {
+// unregisteredSchemaConfig identifies one schema config whose database this
+// leader has not registered.
+type unregisteredSchemaConfig struct {
 	Database     string
 	DatabaseType string
 	SchemaPath   string
 }
 
-func (e *schemaManagedByNoDeploymentError) Error() string {
+func (e *databaseNotRegisteredError) Error() string {
 	described := make([]string, 0, len(e.Configs))
 	for _, cfg := range e.Configs {
 		described = append(described, fmt.Sprintf("database %q at %q", cfg.Database, cfg.SchemaPath))
 	}
-	return fmt.Sprintf("schema config for %s is managed by no SchemaBot deployment on this repository", strings.Join(described, ", "))
+	return fmt.Sprintf("schema config for %s: database not registered on this deployment, and schema directory under no expected participant's paths", strings.Join(described, ", "))
 }
 
-// Databases lists the database each unmanaged config declares, in discovery
-// order.
-func (e *schemaManagedByNoDeploymentError) Databases() []string {
+// Databases lists the database each unregistered config declares, in
+// discovery order.
+func (e *databaseNotRegisteredError) Databases() []string {
 	databases := make([]string, 0, len(e.Configs))
 	for _, cfg := range e.Configs {
 		databases = append(databases, cfg.Database)
@@ -244,9 +310,9 @@ func (e *schemaManagedByNoDeploymentError) Databases() []string {
 	return databases
 }
 
-// SchemaPaths lists each unmanaged config's schema directory, in discovery
+// SchemaPaths lists each unregistered config's schema directory, in discovery
 // order.
-func (e *schemaManagedByNoDeploymentError) SchemaPaths() []string {
+func (e *databaseNotRegisteredError) SchemaPaths() []string {
 	paths := make([]string, 0, len(e.Configs))
 	for _, cfg := range e.Configs {
 		paths = append(paths, cfg.SchemaPath)
@@ -257,9 +323,9 @@ func (e *schemaManagedByNoDeploymentError) SchemaPaths() []string {
 // unownedSchemaConfigError describes why a discovered schema config is not
 // this deployment's to process, matching the error class to the ownership
 // contract that dropped it. On the aggregate leader, a config whose directory
-// no expected participant manages and whose database the leader has not
-// registered is managed by no deployment at all, and is reported as such so
-// the command is answered by the one deployment that can tell. Otherwise, when
+// none of its expected participants manages and whose database it has not
+// registered is reported as not registered here, so that one leader can
+// answer the command (answersForUnregisteredDatabase). Otherwise, when
 // the repo has a directory allowlist, the config was outside it. In open mode
 // (no allowlist for the repo) the only drop reason is the database registry,
 // so the database is reported as not configured — an allowed_dirs remediation
@@ -269,8 +335,8 @@ func (e *schemaManagedByNoDeploymentError) SchemaPaths() []string {
 // changes what a -t/-d-scoped command reports.
 func (h *Handler) unownedSchemaConfigError(repo, database, databaseType, schemaPath string) error {
 	config, ok := h.serverConfig()
-	if ok && h.schemaManagedByNoDeployment(config, repo, database, schemaPath) {
-		return &schemaManagedByNoDeploymentError{Configs: []unmanagedSchemaConfig{{
+	if ok && h.databaseNotRegisteredOnLeader(config, repo, database, schemaPath) {
+		return &databaseNotRegisteredError{Configs: []unregisteredSchemaConfig{{
 			Database:     database,
 			DatabaseType: databaseType,
 			SchemaPath:   schemaPath,
@@ -346,7 +412,7 @@ func (h *Handler) answerUnregisteredDatabase(repo string, pr int, installationID
 	if err == nil {
 		return false
 	}
-	if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, err) {
+	if h.silentDiscoveryFailureOnUnscopedFanOut(repo, environment, tenant, err) {
 		h.logger.Debug("unscoped fan-out command names a database this deployment does not serve; staying silent",
 			"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "action", commandName)
 		return true
@@ -382,7 +448,7 @@ func (h *Handler) createManagedSchemaRequestFromPR(ctx context.Context, client *
 // createUnscopedSchemaRequestFromPR resolves which database an unscoped
 // command (no -d) targets and fetches that database's schema files.
 func (h *Handler) createUnscopedSchemaRequestFromPR(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, source string) (*ghclient.SchemaRequestResult, error) {
-	config, configDir, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, source)
+	config, configDir, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, environment, source)
 	if err != nil {
 		return nil, err
 	}
@@ -403,7 +469,10 @@ func (h *Handler) createUnscopedSchemaRequestFromPR(ctx context.Context, client 
 //     also touches configs other deployments own
 //   - several managed configs: ErrMultipleConfigs — one apply drives one
 //     database, so the user must scope the command with -d
-func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, source string) (*ghclient.SchemabotConfig, string, error) {
+//
+// environment is the command's -e value, empty when it named none; it decides
+// which of several leaders answers for an unregistered database.
+func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, environment, source string) (*ghclient.SchemabotConfig, string, error) {
 	configs, err := client.FindAllConfigsForPR(ctx, repo, pr)
 	if err != nil {
 		return nil, "", err
@@ -425,7 +494,7 @@ func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghcl
 		h.logger.Info("unscoped command discovered only schema configs this deployment does not manage",
 			"repo", repo, "pr", pr, "source", source,
 			"discovered_configs", len(configs))
-		return nil, "", h.unownedDiscoveredConfigsError(repo, configs)
+		return nil, "", h.unownedDiscoveredConfigsError(repo, environment, configs)
 	}
 	// The directory allowlist is only half the ownership contract: on repos
 	// partitioned by database registry rather than allowed_dirs, a config for
@@ -448,26 +517,27 @@ func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghcl
 
 // unownedDiscoveredConfigsError picks the error to report when discovery found
 // only configs this deployment does not manage. On an unscoped fan-out most of
-// them are silently left to their owners, so a config no deployment manages
-// must not hide behind one a sibling does: the first config whose error this
-// deployment would answer rather than defer decides the report, and when every
-// one defers the first config stands for the set. When the deciding config is
-// one no deployment manages, the report names every such config, so the author
-// learns about all of them from one reply instead of one per retry.
-func (h *Handler) unownedDiscoveredConfigsError(repo string, configs []ghclient.DiscoveredConfig) error {
+// them are silently left to their owners, so a config this leader would answer
+// for must not hide behind one a participant owns: the first config whose
+// error this deployment would answer rather than defer decides the report, and
+// when every one defers the first config stands for the set. When the deciding
+// config's database is not registered here, the report names every such
+// config, so the author learns about all of them from one reply instead of one
+// per retry.
+func (h *Handler) unownedDiscoveredConfigsError(repo, environment string, configs []ghclient.DiscoveredConfig) error {
 	var answered error
-	var unmanaged *schemaManagedByNoDeploymentError
+	var notRegistered *databaseNotRegisteredError
 	for _, cfg := range configs {
 		err := h.unownedDiscoveredConfigError(repo, cfg.Config, cfg.SchemaDir)
-		if h.silentUnownedSchemaOnAggregateFanOut(repo, err) {
+		if h.silentUnownedSchemaOnAggregateFanOut(repo, environment, err) {
 			continue
 		}
-		var one *schemaManagedByNoDeploymentError
+		var one *databaseNotRegisteredError
 		if errors.As(err, &one) {
-			if unmanaged == nil {
-				unmanaged = &schemaManagedByNoDeploymentError{}
+			if notRegistered == nil {
+				notRegistered = &databaseNotRegisteredError{}
 			}
-			unmanaged.Configs = append(unmanaged.Configs, one.Configs...)
+			notRegistered.Configs = append(notRegistered.Configs, one.Configs...)
 		}
 		if answered == nil {
 			answered = err
@@ -476,9 +546,9 @@ func (h *Handler) unownedDiscoveredConfigsError(repo string, configs []ghclient.
 	if answered == nil {
 		return h.unownedDiscoveredConfigError(repo, configs[0].Config, configs[0].SchemaDir)
 	}
-	var first *schemaManagedByNoDeploymentError
+	var first *databaseNotRegisteredError
 	if errors.As(answered, &first) {
-		return unmanaged
+		return notRegistered
 	}
 	return answered
 }
