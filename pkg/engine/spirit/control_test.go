@@ -43,6 +43,94 @@ func registerRunningSchemaChange(eng *Engine) *runningSchemaChange {
 	return rm
 }
 
+// A stop that reaches a schema change which has already failed leaves the
+// failure in place. A failed change cannot be paused or resumed, so recording it
+// as stopped would tell the operator to resume a change that is dead; the stop
+// is refused permanently instead, the change is not cancelled again, and it
+// keeps its failed state and the reason it failed.
+func TestStopLeavesFailedSchemaChangeFailed(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	cancelCalled := false
+	rm.cancelFunc = func() { cancelCalled = true }
+	eng.setSchemaChangeFailed(engine.OperatorErrorf(nil, "copy of users hit a duplicate key"))
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), "failed before the stop arrived")
+	assert.True(t, engine.IsUnsupportedOperation(err), "the durable request must resolve terminally")
+	assert.False(t, engine.IsAlreadyCompleted(err), "a failed change must never reconcile as completed")
+	assert.False(t, cancelCalled)
+	assert.Equal(t, engine.StateFailed, rm.state)
+	assert.Equal(t, "copy of users hit a duplicate key", rm.errorMessage)
+}
+
+func TestStopLeavesCancelledSchemaChangeCancelled(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	rm.state = engine.StateCancelled
+
+	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.True(t, engine.IsUnsupportedOperation(err))
+	assert.Contains(t, err.Error(), "was already cancelled")
+	assert.Equal(t, engine.StateCancelled, rm.state)
+}
+
+// A stop checkpoints the copy before it cancels, and the schema change can
+// settle on its own while that checkpoint is being written. Whatever it settles
+// on wins over the stop: a failure that lands during the checkpoint stays a
+// failure rather than being relabelled as a resumable stop, and a completion
+// that lands there stays completed, with the stop answered by the typed
+// already-completed rejection its caller reconciles from.
+func TestStopKeepsOutcomeThatLandsDuringCheckpoint(t *testing.T) {
+	tests := []struct {
+		name      string
+		settle    func(eng *Engine)
+		wantState engine.State
+		checkErr  func(t *testing.T, err error)
+	}{
+		{
+			name: "failure",
+			settle: func(eng *Engine) {
+				eng.setSchemaChangeFailed(engine.OperatorErrorf(nil, "copy of users hit a duplicate key"))
+			},
+			wantState: engine.StateFailed,
+			checkErr: func(t *testing.T, err error) {
+				assert.Contains(t, err.Error(), "failed before the stop arrived")
+				assert.True(t, engine.IsUnsupportedOperation(err))
+				assert.False(t, engine.IsAlreadyCompleted(err))
+			},
+		},
+		{
+			name:      "completion",
+			settle:    func(eng *Engine) { eng.setSchemaChangeCompleted() },
+			wantState: engine.StateCompleted,
+			checkErr: func(t *testing.T, err error) {
+				assert.True(t, engine.IsAlreadyCompleted(err))
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := New(Config{})
+			rm := registerRunningSchemaChange(eng)
+			cancelCalled := false
+			rm.cancelFunc = func() { cancelCalled = true }
+			eng.stopCheckpointWindow = func() { tc.settle(eng) }
+
+			result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
+			require.Error(t, err)
+			assert.Nil(t, result)
+			tc.checkErr(t, err)
+			assert.False(t, cancelCalled, "a change that already settled has nothing left to cancel")
+			assert.Equal(t, tc.wantState, rm.state)
+		})
+	}
+}
+
 // Stateless control operations (cutover, deferred cutover sentinel lookup)
 // must address the schema the DSN connects to: under per-deployment schema
 // overrides the DSN carries the physical schema name while the request carries
