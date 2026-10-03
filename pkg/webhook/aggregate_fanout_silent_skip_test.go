@@ -143,10 +143,21 @@ func serveSchemaConfigForDatabase(t *testing.T, mux *http.ServeMux, database str
 // the config inside or outside a participant's schema directory.
 func serveSchemaConfigForDatabaseUnder(t *testing.T, mux *http.ServeMux, database, dir string) {
 	t.Helper()
-	configPath := "schemabot.yaml"
-	if dir != "" {
-		configPath = dir + "/schemabot.yaml"
-	}
+	serveSchemaConfigs(t, mux, schemaConfigFixture{database: database, dir: dir})
+}
+
+// schemaConfigFixture places one schemabot.yaml declaring database under dir
+// ("" for the repository root).
+type schemaConfigFixture struct {
+	database string
+	dir      string
+}
+
+// serveSchemaConfigs registers the GitHub routes config discovery needs for a
+// PR that changes every given schemabot.yaml. Discovery orders the configs by
+// path, whatever order the PR lists them in.
+func serveSchemaConfigs(t *testing.T, mux *http.ServeMux, configs ...schemaConfigFixture) {
+	t.Helper()
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
 			"head": map[string]any{"sha": "abc123", "ref": "feature-branch"},
@@ -154,19 +165,24 @@ func serveSchemaConfigForDatabaseUnder(t *testing.T, mux *http.ServeMux, databas
 			"user": map[string]any{"login": "testuser"},
 		}))
 	})
+	files := make([]map[string]string, 0, len(configs))
+	for _, cfg := range configs {
+		configPath := "schemabot.yaml"
+		if cfg.dir != "" {
+			configPath = cfg.dir + "/schemabot.yaml"
+		}
+		files = append(files, map[string]string{"filename": configPath, "status": "modified"})
+		content := "database: " + cfg.database + "\ntype: mysql\n"
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+configPath, func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+				"type":     "file",
+				"encoding": "base64",
+				"content":  base64.StdEncoding.EncodeToString([]byte(content)),
+			}))
+		})
+	}
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
-			"filename": configPath,
-			"status":   "modified",
-		}}))
-	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+configPath, func(w http.ResponseWriter, _ *http.Request) {
-		content := "database: " + database + "\ntype: mysql\n"
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
-			"type":     "file",
-			"encoding": "base64",
-			"content":  base64.StdEncoding.EncodeToString([]byte(content)),
-		}))
+		require.NoError(t, json.NewEncoder(w).Encode(files))
 	})
 }
 
@@ -177,8 +193,9 @@ func serveSchemaConfigForDatabaseUnder(t *testing.T, mux *http.ServeMux, databas
 // is the leader and can tell that no deployment owns the config: a schema
 // directory under no expected participant's paths and a database the leader
 // has not registered is managed by nobody, and the leader answers once with
-// Database Not Registered rather than leaving the command unanswered. A
-// -t-scoped command and a non-aggregate repo still surface the error.
+// No Deployment Manages This Schema Config rather than leaving the command
+// unanswered. A -t-scoped command and a non-aggregate repo still surface the
+// error.
 func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
 	apply := func(h *Handler, tenant string) {
 		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply, Tenant: tenant})
@@ -190,8 +207,8 @@ func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
 
 		apply(h, "")
 
-		body := requireComment(t, comments, "database-not-registered apply error")
-		assert.Contains(t, body, "Database Not Registered")
+		body := requireComment(t, comments, "schema-config-unmanaged apply error")
+		assert.Contains(t, body, "No Deployment Manages This Schema Config")
 		assert.Contains(t, body, "**Database**: `orders` | **Schema directory**: `.` | **Environment**: `staging`")
 		assert.Contains(t, body, "ask a SchemaBot operator to onboard it")
 	})
@@ -202,8 +219,8 @@ func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
 
 		apply(h, "")
 
-		body := requireComment(t, comments, "database-not-registered apply error")
-		assert.Contains(t, body, "Database Not Registered")
+		body := requireComment(t, comments, "schema-config-unmanaged apply error")
+		assert.Contains(t, body, "No Deployment Manages This Schema Config")
 		assert.Contains(t, body, "**Database**: `orders` | **Schema directory**: `orders/schema`")
 	})
 
@@ -220,6 +237,42 @@ func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
 		assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
 		assert.Contains(t, body, "**Schema directory**: `misc/schema`")
 		assert.Contains(t, body, "`databases.billing.allowed_dirs`")
+	})
+
+	// A PR that adds several configs no deployment manages gets one reply
+	// naming all of them, so the author does not learn about the second one
+	// only after fixing the first and re-running the command.
+	t.Run("leader names every config no deployment manages in one reply", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigs(t, mux,
+			schemaConfigFixture{database: "orders", dir: "orders/schema"},
+			schemaConfigFixture{database: "ledger", dir: "ledger/schema"})
+
+		apply(h, "")
+
+		body := requireComment(t, comments, "schema-configs-unmanaged apply error")
+		assert.Contains(t, body, "No Deployment Manages These Schema Configs")
+		assert.Contains(t, body, "- `ledger/schema` declares database `ledger`\n- `orders/schema` declares database `orders`\n")
+		assert.NotContains(t, body, "**Database**:", "several configs have no one database for the header")
+		assert.Empty(t, comments, "one reply answers the command")
+	})
+
+	// A config a participant owns is left to it even when discovery lists it
+	// first (tenant-b/schema sorts before unowned/schema), and the config no
+	// deployment manages is still answered for.
+	t.Run("leader answers for an unmanaged config listed after a participant's", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigs(t, mux,
+			schemaConfigFixture{database: "payments", dir: "tenant-b/schema"},
+			schemaConfigFixture{database: "orders", dir: "unowned/schema"})
+
+		apply(h, "")
+
+		body := requireComment(t, comments, "schema-config-unmanaged apply error")
+		assert.Contains(t, body, "No Deployment Manages This Schema Config")
+		assert.Contains(t, body, "**Database**: `orders` | **Schema directory**: `unowned/schema`")
+		assert.NotContains(t, body, "payments", "the participant answers for its own config")
+		assert.Empty(t, comments, "one reply answers the command")
 	})
 
 	t.Run("leader stays silent for a database under a participant's directory", func(t *testing.T) {
@@ -273,8 +326,8 @@ func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
 // schemabot.yaml is not the owner under the aggregate contract, so it stays
 // silent instead of posting a failure next to the owning deployment's real
 // plan — unless it is the leader and no deployment owns the config, in which
-// case the leader answers once with Database Not Registered. A -t-scoped
-// command and a non-aggregate repo still surface the error.
+// case the leader answers once with No Deployment Manages This Schema Config.
+// A -t-scoped command and a non-aggregate repo still surface the error.
 func TestUnscopedMultiEnvPlanOnUnregisteredDatabase(t *testing.T) {
 	barePlan := func(h *Handler, databaseName, tenant string) {
 		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0)
@@ -286,8 +339,8 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabase(t *testing.T) {
 
 		barePlan(h, "", "")
 
-		body := requireComment(t, comments, "database-not-registered plan error")
-		assert.Contains(t, body, "Database Not Registered")
+		body := requireComment(t, comments, "schema-config-unmanaged plan error")
+		assert.Contains(t, body, "No Deployment Manages This Schema Config")
 		assert.Contains(t, body, "**Database**: `orders` | **Schema directory**: `.`")
 	})
 
@@ -329,8 +382,8 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabase(t *testing.T) {
 
 		barePlan(h, "orders", "")
 
-		body := requireComment(t, comments, "database-not-registered plan error")
-		assert.Contains(t, body, "Database Not Registered")
+		body := requireComment(t, comments, "schema-config-unmanaged plan error")
+		assert.Contains(t, body, "No Deployment Manages This Schema Config")
 		assert.Contains(t, body, "`orders`")
 	})
 
@@ -1061,8 +1114,8 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 
 				run(h)
 
-				body := requireComment(t, comments, "database-not-registered answer")
-				assert.Contains(t, body, "Database Not Registered")
+				body := requireComment(t, comments, "schema-config-unmanaged answer")
+				assert.Contains(t, body, "No Deployment Manages This Schema Config")
 				select {
 				case content := <-reactions:
 					assert.Equal(t, "eyes", content)

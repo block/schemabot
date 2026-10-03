@@ -345,27 +345,53 @@ func TestRenderDatabaseNotConfigured(t *testing.T) {
 	assert.NotContains(t, body, "was found in this repository")
 }
 
-// TestRenderDatabaseNotRegistered pins the comment the aggregate leader posts
-// for a schemabot.yaml no SchemaBot deployment on the repository manages: it
-// names the database and its schema directory, says why no deployment answers
-// for it, and gives both remedies — onboard the database, or move the config
-// under the directory registered for it.
-func TestRenderDatabaseNotRegistered(t *testing.T) {
-	body := RenderDatabaseNotRegistered(SchemaErrorData{
-		RequestedBy:  "hubot",
-		Timestamp:    "2026-07-16 18:56:00",
-		Environment:  "staging",
-		DatabaseName: "payments",
-		SchemaPath:   "services/payments/schema",
-		CommandName:  "plan",
+// TestRenderSchemaConfigUnmanaged pins the comment the aggregate leader posts
+// for schemabot.yaml files no SchemaBot deployment on the repository manages.
+// One config names its database and schema directory in the header, says why
+// no deployment answers for it, and gives both remedies: onboard the database,
+// or move the config under the directory registered for it. Several configs
+// are listed together under a plural title, so one reply covers them all.
+func TestRenderSchemaConfigUnmanaged(t *testing.T) {
+	t.Run("one config", func(t *testing.T) {
+		body := RenderSchemaConfigUnmanaged(SchemaErrorData{
+			RequestedBy: "hubot",
+			Timestamp:   "2026-07-16 18:56:00",
+			Environment: "staging",
+			CommandName: "plan",
+			UnmanagedConfigs: []UnmanagedSchemaConfigNoticeData{
+				{Database: "payments", SchemaPath: "services/payments/schema"},
+			},
+		})
+		assert.Contains(t, body, "## ⚠️ No Deployment Manages This Schema Config\n")
+		assert.Contains(t, body, "**Database**: `payments` | **Schema directory**: `services/payments/schema` | **Environment**: `staging`")
+		assert.Contains(t, body, "*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
+		assert.Contains(t, body, "No SchemaBot deployment on this repository manages this `schemabot.yaml`")
+		assert.Contains(t, body, "has no `payments` entry under `databases` in its server configuration, and the schema directory is outside every directory the other deployments manage")
+		assert.Contains(t, body, "If `payments` is new to SchemaBot, ask a SchemaBot operator to onboard it with `services/payments/schema` as its schema directory")
+		assert.Contains(t, body, "If it is already onboarded, move the `schemabot.yaml` and its schema files under the schema directory registered for it")
 	})
-	assert.Contains(t, body, "## ⚠️ Database Not Registered")
-	assert.Contains(t, body, "**Database**: `payments` | **Schema directory**: `services/payments/schema` | **Environment**: `staging`")
-	assert.Contains(t, body, "*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
-	assert.Contains(t, body, "No SchemaBot deployment on this repository manages this `schemabot.yaml`")
-	assert.Contains(t, body, "has no `payments` entry under `databases` in its server configuration, and the schema directory is outside every directory the other deployments manage")
-	assert.Contains(t, body, "If `payments` is new to SchemaBot, ask a SchemaBot operator to onboard it with `services/payments/schema` as its schema directory")
-	assert.Contains(t, body, "If it is already onboarded, move the `schemabot.yaml` and its schema files under the schema directory registered for it")
+
+	t.Run("several configs", func(t *testing.T) {
+		body := RenderSchemaConfigUnmanaged(SchemaErrorData{
+			RequestedBy: "hubot",
+			Timestamp:   "2026-07-16 18:56:00",
+			Environment: "staging",
+			CommandName: "plan",
+			UnmanagedConfigs: []UnmanagedSchemaConfigNoticeData{
+				{Database: "payments", SchemaPath: "services/payments/schema"},
+				{Database: "ledger", SchemaPath: "services/ledger/schema"},
+			},
+		})
+		assert.Contains(t, body, "## ⚠️ No Deployment Manages These Schema Configs\n\n**Environment**: `staging`\n")
+		assert.NotContains(t, body, "**Database**:")
+		assert.Contains(t, body, "*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
+		assert.Contains(t, body, "No SchemaBot deployment on this repository manages these `schemabot.yaml` files:\n\n"+
+			"- `services/payments/schema` declares database `payments`\n"+
+			"- `services/ledger/schema` declares database `ledger`\n")
+		assert.Contains(t, body, "This SchemaBot instance has none of these databases under `databases` in its server configuration, and each schema directory is outside every directory the other deployments manage")
+		assert.Contains(t, body, "For each database that is new to SchemaBot, ask a SchemaBot operator to onboard it with its schema directory")
+		assert.Contains(t, body, "For each one already onboarded, move its `schemabot.yaml` and schema files under the schema directory registered for it")
+	})
 }
 
 // TestRenderDatabaseRepoNotAllowed pins the comment for a database whose

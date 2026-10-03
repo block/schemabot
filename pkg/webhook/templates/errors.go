@@ -39,6 +39,26 @@ type SchemaErrorData struct {
 	// limited to when GitHub truncated the repository tree. Empty when the
 	// whole repository was searched.
 	SearchedDirs []string
+	// UnmanagedConfigs lists the schema configs no SchemaBot deployment on the
+	// repository manages, for the error the aggregate leader posts about them.
+	UnmanagedConfigs []UnmanagedSchemaConfigNoticeData
+}
+
+// MultipleUnmanagedConfigs reports whether the error names more than one
+// schema config no deployment manages, which renders them as a list.
+func (d SchemaErrorData) MultipleUnmanagedConfigs() bool {
+	return len(d.UnmanagedConfigs) > 1
+}
+
+// UnmanagedConfigLines renders each schema config no deployment manages as its
+// schema directory and the database it declares, as code spans the PR-supplied
+// values cannot break out of.
+func (d SchemaErrorData) UnmanagedConfigLines() []string {
+	lines := make([]string, 0, len(d.UnmanagedConfigs))
+	for _, cfg := range d.UnmanagedConfigs {
+		lines = append(lines, inlineCode(cfg.SchemaPath)+" declares database "+inlineCode(cfg.Database))
+	}
+	return lines
 }
 
 // SearchedDirsCode renders the directories a scoped search probed as code
@@ -170,15 +190,23 @@ This SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases
 
 Check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, matches one this instance serves, or ask a SchemaBot operator to configure the database.`
 
-const databaseNotRegisteredTemplate = "## " + glyph.Attention + ` Database Not Registered
+const schemaConfigUnmanagedTemplate = "## " + glyph.Attention + ` No Deployment Manages {{if .MultipleUnmanagedConfigs}}These Schema Configs{{else}}This Schema Config{{end}}
 
-**Database**: {{.DatabaseNameCode}} | **Schema directory**: {{.SchemaPathCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
+{{if .MultipleUnmanagedConfigs}}{{with .EnvironmentHeader}}{{.}}
 
-{{.Attribution}}
+{{end}}{{else}}**Database**: {{.DatabaseNameCode}} | **Schema directory**: {{.SchemaPathCode}}{{with .EnvironmentHeader}} | {{.}}{{end}}
 
-No SchemaBot deployment on this repository manages this ` + "`schemabot.yaml`" + `: this SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases`" + ` in its server configuration, and the schema directory is outside every directory the other deployments manage. A ` + "`schemabot.yaml`" + ` declaring {{.DatabaseDeclarationCode}} is not enough on its own: the database also has to be registered on a SchemaBot server.
+{{end}}{{.Attribution}}
 
-If {{.DatabaseNameCode}} is new to SchemaBot, ask a SchemaBot operator to onboard it with {{.SchemaPathCode}} as its schema directory. If it is already onboarded, move the ` + "`schemabot.yaml`" + ` and its schema files under the schema directory registered for it.`
+{{if .MultipleUnmanagedConfigs}}No SchemaBot deployment on this repository manages these ` + "`schemabot.yaml`" + ` files:
+
+{{range .UnmanagedConfigLines}}- {{.}}
+{{end}}
+This SchemaBot instance has none of these databases under ` + "`databases`" + ` in its server configuration, and each schema directory is outside every directory the other deployments manage. A ` + "`schemabot.yaml`" + ` declaring a database is not enough on its own: the database also has to be registered on a SchemaBot server.
+
+For each database that is new to SchemaBot, ask a SchemaBot operator to onboard it with its schema directory. For each one already onboarded, move its ` + "`schemabot.yaml`" + ` and schema files under the schema directory registered for it.{{else}}No SchemaBot deployment on this repository manages this ` + "`schemabot.yaml`" + `: this SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases`" + ` in its server configuration, and the schema directory is outside every directory the other deployments manage. A ` + "`schemabot.yaml`" + ` declaring {{.DatabaseDeclarationCode}} is not enough on its own: the database also has to be registered on a SchemaBot server.
+
+If {{.DatabaseNameCode}} is new to SchemaBot, ask a SchemaBot operator to onboard it with {{.SchemaPathCode}} as its schema directory. If it is already onboarded, move the ` + "`schemabot.yaml`" + ` and its schema files under the schema directory registered for it.{{end}}`
 
 const databaseRepoNotAllowedTemplate = "## " + glyph.Attention + ` Database Not Available to This Repository
 
@@ -319,7 +347,7 @@ const genericErrorTemplate = "## " + glyph.Failed + ` {{.CommandName}} Failed
 var (
 	tmplDatabaseNotFound      = template.Must(template.New("databaseNotFound").Parse(databaseNotFoundTemplate))
 	tmplDatabaseNotConfig     = template.Must(template.New("databaseNotConfigured").Parse(databaseNotConfiguredTemplate))
-	tmplDatabaseNotRegistered = template.Must(template.New("databaseNotRegistered").Parse(databaseNotRegisteredTemplate))
+	tmplSchemaConfigUnmanaged = template.Must(template.New("schemaConfigUnmanaged").Parse(schemaConfigUnmanagedTemplate))
 	tmplRepoTreeTruncated     = template.Must(template.New("repositoryTreeTruncated").Parse(repositoryTreeTruncatedTemplate))
 	tmplDatabaseRepoDenied    = template.Must(template.New("databaseRepoNotAllowed").Parse(databaseRepoNotAllowedTemplate))
 	tmplInvalidConfig         = template.Must(template.New("invalidConfig").Parse(invalidConfigTemplate))
@@ -347,14 +375,21 @@ func RenderDatabaseNotConfigured(data SchemaErrorData) string {
 	return offerSupportChannel(renderTemplate(tmplDatabaseNotConfig, data))
 }
 
-// RenderDatabaseNotRegistered renders the error shown when the aggregate
-// leader finds a schemabot.yaml that no SchemaBot deployment on the repository
-// manages: its database is not in the leader's registry and its schema
-// directory is under no expected participant's paths. It is distinct from
-// Database Not Configured, which speaks for one instance; this one speaks for
-// the fleet, so the remedy is to onboard the database or move the config.
-func RenderDatabaseNotRegistered(data SchemaErrorData) string {
-	return offerSupportChannel(renderTemplate(tmplDatabaseNotRegistered, data))
+// RenderSchemaConfigUnmanaged renders the error shown when the aggregate
+// leader finds schemabot.yaml files that no SchemaBot deployment on the
+// repository manages: each one's database is not in the leader's registry and
+// its schema directory is under no expected participant's paths. It is
+// distinct from Database Not Configured, which speaks for one instance; this
+// one speaks for the fleet, so the remedy is to onboard the database or move
+// the config. data.UnmanagedConfigs names every such config; one config
+// renders with its database and schema directory in the header, several as a
+// list.
+func RenderSchemaConfigUnmanaged(data SchemaErrorData) string {
+	if len(data.UnmanagedConfigs) == 1 {
+		data.DatabaseName = data.UnmanagedConfigs[0].Database
+		data.SchemaPath = data.UnmanagedConfigs[0].SchemaPath
+	}
+	return offerSupportChannel(renderTemplate(tmplSchemaConfigUnmanaged, data))
 }
 
 // RenderRepositoryTreeTruncated renders the error shown when GitHub truncated

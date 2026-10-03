@@ -196,9 +196,7 @@ func TestUnownedSchemaConfigError(t *testing.T) {
 			err := h.unownedSchemaConfigError(repo, "payments", "mysql", "db/payments/schema")
 			var unmanaged *schemaManagedByNoDeploymentError
 			require.ErrorAs(t, err, &unmanaged)
-			assert.Equal(t, "payments", unmanaged.Database)
-			assert.Equal(t, "mysql", unmanaged.DatabaseType)
-			assert.Equal(t, "db/payments/schema", unmanaged.SchemaPath)
+			assert.Equal(t, []unmanagedSchemaConfig{{Database: "payments", DatabaseType: "mysql", SchemaPath: "db/payments/schema"}}, unmanaged.Configs)
 			assert.False(t, isSchemaUnownedByDeploymentError(err), "nobody else will answer, so it must not be silenced as unowned")
 		})
 	}

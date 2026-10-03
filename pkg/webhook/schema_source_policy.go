@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -206,20 +207,51 @@ func (e *schemaConfigOutsideAllowedDirsError) Error() string {
 	return fmt.Sprintf("schema config for database %q at %q is outside server allowed_dirs", e.Database, e.SchemaPath)
 }
 
-// schemaManagedByNoDeploymentError reports a discovered schema config that no
-// SchemaBot deployment on the repository manages: its database has no entry in
-// this deployment's registry, and its schema directory is under no path prefix
-// an expected participant manages. Only the aggregate leader can establish
-// this, since only the leader's expected-tenant set spans the fleet, and it is
-// never an ownership signal for fan-out silencing: nobody else will answer.
+// schemaManagedByNoDeploymentError reports discovered schema configs that no
+// SchemaBot deployment on the repository manages: each config's database has
+// no entry in this deployment's registry, and its schema directory is under no
+// path prefix an expected participant manages. Only the aggregate leader can
+// establish this, since only the leader's expected-tenant set spans the fleet,
+// and it is never an ownership signal for fan-out silencing: nobody else will
+// answer. It names every such config the command discovered, so one reply
+// covers them all.
 type schemaManagedByNoDeploymentError struct {
+	Configs []unmanagedSchemaConfig
+}
+
+// unmanagedSchemaConfig identifies one schema config no deployment manages.
+type unmanagedSchemaConfig struct {
 	Database     string
 	DatabaseType string
 	SchemaPath   string
 }
 
 func (e *schemaManagedByNoDeploymentError) Error() string {
-	return fmt.Sprintf("schema config for database %q at %q is managed by no SchemaBot deployment on this repository", e.Database, e.SchemaPath)
+	described := make([]string, 0, len(e.Configs))
+	for _, cfg := range e.Configs {
+		described = append(described, fmt.Sprintf("database %q at %q", cfg.Database, cfg.SchemaPath))
+	}
+	return fmt.Sprintf("schema config for %s is managed by no SchemaBot deployment on this repository", strings.Join(described, ", "))
+}
+
+// Databases lists the database each unmanaged config declares, in discovery
+// order.
+func (e *schemaManagedByNoDeploymentError) Databases() []string {
+	databases := make([]string, 0, len(e.Configs))
+	for _, cfg := range e.Configs {
+		databases = append(databases, cfg.Database)
+	}
+	return databases
+}
+
+// SchemaPaths lists each unmanaged config's schema directory, in discovery
+// order.
+func (e *schemaManagedByNoDeploymentError) SchemaPaths() []string {
+	paths := make([]string, 0, len(e.Configs))
+	for _, cfg := range e.Configs {
+		paths = append(paths, cfg.SchemaPath)
+	}
+	return paths
 }
 
 // unownedSchemaConfigError describes why a discovered schema config is not
@@ -238,11 +270,11 @@ func (e *schemaManagedByNoDeploymentError) Error() string {
 func (h *Handler) unownedSchemaConfigError(repo, database, databaseType, schemaPath string) error {
 	config, ok := h.serverConfig()
 	if ok && h.schemaManagedByNoDeployment(config, repo, database, schemaPath) {
-		return &schemaManagedByNoDeploymentError{
+		return &schemaManagedByNoDeploymentError{Configs: []unmanagedSchemaConfig{{
 			Database:     database,
 			DatabaseType: databaseType,
 			SchemaPath:   schemaPath,
-		}
+		}}}
 	}
 	if ok && !config.RepoHasSchemaDirAllowlist(repo) {
 		return &api.DatabaseNotConfiguredError{Database: database}
@@ -418,20 +450,37 @@ func (h *Handler) resolveUnscopedManagedConfig(ctx context.Context, client *ghcl
 // only configs this deployment does not manage. On an unscoped fan-out most of
 // them are silently left to their owners, so a config no deployment manages
 // must not hide behind one a sibling does: the first config whose error this
-// deployment would answer rather than defer is reported, and when every one
-// defers the first config stands for the set.
+// deployment would answer rather than defer decides the report, and when every
+// one defers the first config stands for the set. When the deciding config is
+// one no deployment manages, the report names every such config, so the author
+// learns about all of them from one reply instead of one per retry.
 func (h *Handler) unownedDiscoveredConfigsError(repo string, configs []ghclient.DiscoveredConfig) error {
-	first := h.unownedDiscoveredConfigError(repo, configs[0].Config, configs[0].SchemaDir)
-	if !h.silentUnownedSchemaOnAggregateFanOut(repo, first) {
-		return first
-	}
-	for _, cfg := range configs[1:] {
+	var answered error
+	var unmanaged *schemaManagedByNoDeploymentError
+	for _, cfg := range configs {
 		err := h.unownedDiscoveredConfigError(repo, cfg.Config, cfg.SchemaDir)
-		if !h.silentUnownedSchemaOnAggregateFanOut(repo, err) {
-			return err
+		if h.silentUnownedSchemaOnAggregateFanOut(repo, err) {
+			continue
+		}
+		var one *schemaManagedByNoDeploymentError
+		if errors.As(err, &one) {
+			if unmanaged == nil {
+				unmanaged = &schemaManagedByNoDeploymentError{}
+			}
+			unmanaged.Configs = append(unmanaged.Configs, one.Configs...)
+		}
+		if answered == nil {
+			answered = err
 		}
 	}
-	return first
+	if answered == nil {
+		return h.unownedDiscoveredConfigError(repo, configs[0].Config, configs[0].SchemaDir)
+	}
+	var first *schemaManagedByNoDeploymentError
+	if errors.As(answered, &first) {
+		return unmanaged
+	}
+	return answered
 }
 
 // registeredDiscoveredConfigs narrows discovered configs to the ones whose

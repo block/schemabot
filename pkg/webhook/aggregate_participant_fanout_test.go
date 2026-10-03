@@ -47,7 +47,7 @@ func TestSilentDiscoveryFailureOnUnscopedFanOut(t *testing.T) {
 		"a leader answers for a config under no participant's directory: nobody else will")
 	assert.True(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", unmanagedDir),
 		"a participant cannot see the fleet, so it defers even for a directory it knows nothing about")
-	unmanaged := &schemaManagedByNoDeploymentError{Database: "orders", SchemaPath: "payments/schema"}
+	unmanaged := &schemaManagedByNoDeploymentError{Configs: []unmanagedSchemaConfig{{Database: "orders", SchemaPath: "payments/schema"}}}
 	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/leader-repo", "", unmanaged),
 		"schema no deployment manages is never an ownership signal")
 	assert.False(t, h.silentDiscoveryFailureOnUnscopedFanOut("octocat/participant-repo", "", unmanaged),

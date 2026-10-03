@@ -2521,10 +2521,10 @@ Check that the database name, from `-d` or from `schemabot.yaml`, matches one th
 </details>
 
 <details>
-<summary><a name="database-not-registered"></a><strong>Database Not Registered</strong></summary>
+<summary><a name="no-deployment-manages-this-schema-config"></a><strong>No Deployment Manages This Schema Config</strong></summary>
 
 
-## ⚠️ Database Not Registered
+## ⚠️ No Deployment Manages This Schema Config
 
 **Database**: `payments` | **Schema directory**: `services/payments/schema` | **Environment**: `staging`
 
@@ -2533,6 +2533,28 @@ Check that the database name, from `-d` or from `schemabot.yaml`, matches one th
 No SchemaBot deployment on this repository manages this `schemabot.yaml`: this SchemaBot instance has no `payments` entry under `databases` in its server configuration, and the schema directory is outside every directory the other deployments manage. A `schemabot.yaml` declaring `database: payments` is not enough on its own: the database also has to be registered on a SchemaBot server.
 
 If `payments` is new to SchemaBot, ask a SchemaBot operator to onboard it with `services/payments/schema` as its schema directory. If it is already onboarded, move the `schemabot.yaml` and its schema files under the schema directory registered for it.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="no-deployment-manages-these-schema-configs"></a><strong>No Deployment Manages These Schema Configs</strong></summary>
+
+
+## ⚠️ No Deployment Manages These Schema Configs
+
+**Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+No SchemaBot deployment on this repository manages these `schemabot.yaml` files:
+
+- `services/payments/schema` declares database `payments`
+- `services/ledger/schema` declares database `ledger`
+
+This SchemaBot instance has none of these databases under `databases` in its server configuration, and each schema directory is outside every directory the other deployments manage. A `schemabot.yaml` declaring a database is not enough on its own: the database also has to be registered on a SchemaBot server.
+
+For each database that is new to SchemaBot, ask a SchemaBot operator to onboard it with its schema directory. For each one already onboarded, move its `schemabot.yaml` and schema files under the schema directory registered for it.
 <!-- schemabot:offer-support-channel -->
 
 </details>

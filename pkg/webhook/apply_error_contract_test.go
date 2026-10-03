@@ -86,8 +86,8 @@ func TestApplyCommandCoreTerminalDispositions(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.False(t, retry, "the leader's fleet-wide answer is the command's terminal answer, not a retryable failure")
-		body := requireComment(t, comments, "database-not-registered answer")
-		assert.Contains(t, body, "Database Not Registered")
+		body := requireComment(t, comments, "schema-config-unmanaged answer")
+		assert.Contains(t, body, "No Deployment Manages This Schema Config")
 		assert.Contains(t, body, "`orders`")
 	})
 

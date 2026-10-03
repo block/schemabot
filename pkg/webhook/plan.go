@@ -710,14 +710,24 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 
 	var unmanagedErr *schemaManagedByNoDeploymentError
 	if errors.As(err, &unmanagedErr) {
-		data.DatabaseName = unmanagedErr.Database
-		data.SchemaPath = unmanagedErr.SchemaPath
-		h.logger.Warn("schema request: no SchemaBot deployment on this repository manages the schema config",
+		for _, cfg := range unmanagedErr.Configs {
+			data.UnmanagedConfigs = append(data.UnmanagedConfigs, templates.UnmanagedSchemaConfigNoticeData{
+				Database:   cfg.Database,
+				SchemaPath: cfg.SchemaPath,
+			})
+		}
+		// A single config names its database on the metric; several have no
+		// one database to name, the same as Multiple Databases Detected.
+		metricDatabase := databaseName
+		if len(unmanagedErr.Configs) == 1 {
+			metricDatabase = unmanagedErr.Configs[0].Database
+		}
+		h.logger.Warn("schema request: no SchemaBot deployment on this repository manages the schema configs",
 			"repo", repo, "pr", pr, "environment", environment,
-			"database", data.DatabaseName, "database_type", unmanagedErr.DatabaseType,
-			"schema_path", data.SchemaPath, "action", commandName, "error", err)
-		metrics.RecordSchemaRequestError(ctx, repo, commandName, data.DatabaseName, environment, "database_not_registered")
-		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotRegistered(data))
+			"databases", unmanagedErr.Databases(), "schema_paths", unmanagedErr.SchemaPaths(),
+			"action", commandName, "error", err)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, metricDatabase, environment, "schema_config_unmanaged")
+		h.postComment(repo, pr, installationID, templates.RenderSchemaConfigUnmanaged(data))
 		return true
 	}
 
