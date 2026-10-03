@@ -21,6 +21,7 @@ const lockColumns = `id, database_name, database_type, repository, pull_request,
 type lockStore struct {
 	db         *rebindDB
 	dialect    Dialect
+	identity   identityInserter
 	classifier ErrorClassifier
 }
 
@@ -42,7 +43,9 @@ func canonicalizeLock(lock *storage.Lock) {
 // confirm command loads, and its disclosure record travels with it. A re-acquire
 // that passes an empty PendingPlanID (CLI) leaves the existing values intact.
 // A re-acquire never changes the recorded acquirer: only the insert that
-// creates the row writes it.
+// creates the row writes it. That insert also sets lock.ID to the new row's
+// ID; a re-acquire leaves lock.ID as passed, so a caller that passes a new
+// Lock reads back a zero ID when the owner already held the lock.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 	return s.acquire(ctx, lock, nil)
 }
@@ -99,13 +102,14 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 	// constraint makes the INSERT the arbiter when two callers race past the
 	// Get above. The INSERT loser sees a duplicate-key error, not a held lock:
 	// re-read and treat a same-owner winner as success.
-	_, err = s.db.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id, disclosed_copy_discard,
 			acquired_by, acquired_by_operator_groups)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, lock.DisclosedCopyDiscard,
 		acquirer.subject, acquirer.operatorGroups)
 	if err == nil {
+		lock.ID = id
 		return nil
 	}
 	if !s.classifier.IsDuplicateKey(err) {

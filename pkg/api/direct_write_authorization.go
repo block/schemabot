@@ -344,10 +344,11 @@ func (s *Service) recordUnresolvedDirectWriteTarget(r *http.Request, operation, 
 }
 
 // authorizeDirectDatabaseWrite is authorizeDirectWrite for environment-less
-// operations (database locks).
-func (s *Service) authorizeDirectDatabaseWrite(w http.ResponseWriter, r *http.Request, operation, database string) bool {
+// operations (database locks). It also returns the decision, whose reason says
+// whether the caller holds a lock by its owner string alone.
+func (s *Service) authorizeDirectDatabaseWrite(w http.ResponseWriter, r *http.Request, operation, database string) (DirectWriteAuthorizationResult, bool) {
 	result := s.config.AuthorizeDirectDatabaseWrite(auth.UserFromContext(r.Context()), database)
-	return s.finishDirectWriteDecision(w, r, operation, database, "", result)
+	return result, s.finishDirectWriteDecision(w, r, operation, database, "", result)
 }
 
 // authorizeDirectAdminWrite enforces admin-only access for mutating endpoints
