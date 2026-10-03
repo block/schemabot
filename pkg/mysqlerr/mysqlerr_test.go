@@ -285,7 +285,7 @@ func TestEveryKnownReasonRendersWithItsCode(t *testing.T) {
 // code the generic sentence carries is part of the reason and survives the
 // rewrite, because it is what an operator searches for.
 func TestPointToRenderedLogsRedirectsTheGenericReason(t *testing.T) {
-	assert.Equal(t, GenericRenderedLogs+" (error 1265)", PointToRenderedLogs(ReasonFromText("Error 1265 (01000): something went wrong")))
+	assert.Equal(t, GenericRenderedLogs+" (error 1105)", PointToRenderedLogs(ReasonFromText("Error 1105 (HY000): something went wrong")))
 	assert.Equal(t, GenericRenderedLogs, PointToRenderedLogs(Generic))
 }
 
