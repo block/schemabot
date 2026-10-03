@@ -1140,12 +1140,21 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// Release only locks that existed when the command was received. A lock
 	// acquired afterwards was never covered by the command's intent and may be
 	// protecting newer work — a fresh apply awaiting confirmation, or another
-	// session's CLI lock on a force unlock. A lock its owner acquired again for
-	// a new pending plan carries that time as UpdatedAt, which a liveness touch
-	// can also advance; skipping on either timestamp fails safe. The comparison
-	// spans two clocks (the lock timestamps are the storage DB's clock, issuedAt
-	// the webhook pod's); skew fails safe too — a wrongly skipped lock gets the
-	// stale-command answer prompting a fresh comment, never a wrongful release.
+	// session's CLI lock on a force unlock. The release below is pinned to the
+	// row, owner, and pending plan this lookup read, which guards everything
+	// that changes after the lookup; this timestamp bound is the only guard
+	// for the window between receipt and the lookup. A lock its owner acquired
+	// again for a new pending plan in that window was read here with the new
+	// plan, so the pin alone would release it: only its UpdatedAt tells it
+	// apart. A liveness touch advances UpdatedAt too and costs such a lock a
+	// stale-command answer rather than a release, the direction that fails
+	// safe. The comparison spans two clocks (the lock timestamps are the
+	// storage DB's clock, issuedAt the webhook pod's). Storage running ahead
+	// skips a lock that did predate the command, which again only costs a
+	// stale-command answer; storage running behind narrows the bound by the
+	// skew, so a lock acquired within it after receipt but before the lookup
+	// is released as if it predated the command. The bound is as good as the
+	// clock alignment between the two hosts, never better.
 	fresh := make([]*storage.Lock, 0, len(locks))
 	var skippedNewer int
 	receiptSecond := issuedAt.Truncate(time.Second)
@@ -1236,37 +1245,43 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	}
 
 	// Release all locks. Every release, force or not, deletes only the lock row
-	// this command looked up and vetted above: the ownership, issued-at,
-	// authorization, and active-apply decisions were all made against that
-	// row, so a lock released and acquired again while they ran (for example
-	// another PR's pending-confirmation apply lock) is a different row and
-	// stays held, as does the same row acquired again for a new plan. A failed release is logged and the loop continues so one
-	// failure does not strand the remaining locks; the collected errors make
-	// the delivery retryable, and a re-drive only sees the locks that are
-	// still held.
+	// this command looked up and vetted above: the ownership, issued-at, and
+	// authorization decisions were all made against that row, so a lock
+	// released and acquired again while they ran (for example another PR's
+	// pending-confirmation apply lock) is a different row and stays held, as
+	// does the same row acquired again for a new plan. The active-apply check
+	// is the one decision the pin does not carry: an apply that becomes durable
+	// after the check leaves the lock row unchanged, so the delete still
+	// matches. That apply's own deployment reservation keeps a second apply
+	// out; the lock row is the operator-visible signal, not the exclusion.
+	// A failed release is logged and the loop continues so one failure does
+	// not strand the remaining locks; the collected errors make the delivery
+	// retryable, and a re-drive only sees the locks that are still held.
 	var releaseErrs []error
 	var released, alreadyGone, reacquired int
 	for _, lock := range locks {
 		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
-		if errors.Is(err, storage.ErrLockIntentChanged) {
-			// The owner acquired the lock again for a new pending plan after the
-			// lookup, so it now protects work this command never vetted and stays
-			// held, exactly as a lock acquired after the command was received.
+		if isLockAcquiredSinceVetting(err) {
+			// The database is locked again since the lookup — the same row with
+			// a new pending plan, or a new row after the vetted one was released
+			// — so the current lock protects work this command never vetted and
+			// stays held, exactly as a lock acquired after the command was
+			// received.
 			reacquired++
-			h.logger.Warn("unlock will not release a lock acquired again for a new plan after the command was vetted",
+			h.logger.Warn("unlock will not release a lock acquired again after the command was vetted",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
-				"owner", lock.Owner, "vetted_pending_plan_id", lock.PendingPlanID, "force", result.Force)
+				"owner", lock.Owner, "vetted_pending_plan_id", lock.PendingPlanID, "force", result.Force, "error", err)
 			continue
 		}
 		if isVettedLockGone(err) {
 			// The vetted lock row vanished between lookup and release — a
 			// concurrent unlock or apply's own stale-lock cleanup got there
-			// first, possibly followed by a new acquisition this command never
-			// vetted. The lock this command targeted is gone, which is the
-			// command's goal, so this is not a failure to retry; skip the
-			// success comment too, since this command did not do the releasing.
+			// first — or is now held under another owner. The lock this command
+			// targeted is gone, which is the command's goal, so this is not a
+			// failure to retry; skip the success comment too, since this
+			// command did not do the releasing.
 			alreadyGone++
-			h.logger.Info("unlock target already released; any lock acquired since stays held",
+			h.logger.Info("unlock target already released",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
 				"owner", lock.Owner, "force", result.Force, "error", err)
 			continue
@@ -1305,18 +1320,30 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 }
 
 // unlockStaleCommandMessage answers an unlock when at least one current lock
-// was acquired, or acquired again, no earlier than the command receipt second.
+// was acquired, or acquired again, no earlier than the command receipt second
+// — by timestamp before the lookup, or by the row pin after it.
 const unlockStaleCommandMessage = "At least one current lock matched by this unlock command was acquired after the command was received, and this command released nothing. Comment `schemabot unlock` again to release the current locks."
+
+// isLockAcquiredSinceVetting reports whether a row-pinned release found the
+// database locked again since unlock looked the lock up: a different row now
+// holds it (ErrLockReplaced), or the vetted row was acquired again for another
+// pending plan (ErrLockIntentChanged). Either way a lock is still held and
+// this command never vetted it, so the answer is the stale-command prompt to
+// comment again, not that nothing is left to unlock. The caller logs the
+// specific error so the two causes stay distinguishable.
+func isLockAcquiredSinceVetting(err error) bool {
+	return errors.Is(err, storage.ErrLockReplaced) ||
+		errors.Is(err, storage.ErrLockIntentChanged)
+}
 
 // isVettedLockGone reports whether a row-pinned release found that the lock
 // row unlock vetted no longer holds the lock: no lock is held at all
-// (ErrLockNotFound), a different row holds it (ErrLockReplaced), or the row is
-// held under another owner (ErrLockNotOwned). Each means the lock the command
-// targeted is gone and nothing this command vetted is left to release; the
-// caller logs the specific error so the cause stays distinguishable.
+// (ErrLockNotFound), or the row is held under another owner (ErrLockNotOwned).
+// Each means the lock the command targeted is gone and nothing this command
+// vetted is left to release; the caller logs the specific error so the cause
+// stays distinguishable.
 func isVettedLockGone(err error) bool {
 	return errors.Is(err, storage.ErrLockNotFound) ||
-		errors.Is(err, storage.ErrLockReplaced) ||
 		errors.Is(err, storage.ErrLockNotOwned)
 }
 

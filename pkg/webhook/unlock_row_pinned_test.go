@@ -89,13 +89,49 @@ func (s *replacedLockStore) ForceRelease(_ context.Context, database, dbType str
 	return nil
 }
 
+// A PR comments `schemabot unlock` after its apply posted a plan awaiting
+// confirmation, so the lock it unlocks carries that pending plan. Nothing
+// races the command, and the vetted lock is released along with its plan,
+// whether the PR unlocks its own lock or an operator force-unlocks it.
+func TestUnlockReleasesLockPinnedToPendingPlan(t *testing.T) {
+	cases := []struct {
+		name   string
+		result CommandResult
+	}{
+		{name: "PR unlock", result: CommandResult{Action: action.Unlock}},
+		{name: "force unlock", result: CommandResult{Action: action.Unlock, Force: true, Database: "orders"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := recordComments(t, mux)
+			held := withLockID(prOwnedOrdersLock(), 41)
+			held.PendingPlanID = "plan-1"
+			lockStore := &replacedLockStore{held: held, replaced: true}
+			st := &unlockTestStorage{locks: lockStore, applies: &noActiveAppliesStore{}}
+			h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+			retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", tc.result)
+
+			require.NoError(t, err)
+			assert.False(t, retry)
+			assert.Nil(t, lockStore.held, "the vetted lock and its pending plan must be released")
+			body := requireComment(t, comments, "release answer")
+			assert.Contains(t, body, "Lock Released")
+			assert.Contains(t, body, "Released by @testuser")
+		})
+	}
+}
+
 // An unlock decides what to release against the lock rows it looked up: the
 // cross-PR ownership check, the issued-at bound, actor authorization, and the
 // active-apply check all read that row. When the row is released and a new
 // lock is acquired on the same database while those checks run, the unlock
-// must leave the new lock held and answer that the lock it targeted is
-// already gone, for a force unlock of a CLI lock that another PR's pending
-// apply takes over and for a PR's own unlock racing that PR's fresh re-acquire.
+// must leave the new lock held. The database is still locked, so the answer
+// is the stale-command prompt to comment again, never that nothing is left to
+// unlock: for a force unlock of a CLI lock that another PR's pending apply
+// takes over, the fresh command then names who holds the lock now; for a PR's
+// own unlock racing that PR's fresh re-acquire, it releases the new lock.
 func TestUnlockLeavesLockAcquiredAfterVettingHeld(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -145,16 +181,18 @@ func TestUnlockLeavesLockAcquiredAfterVettingHeld(t *testing.T) {
 			retry, err := h.unlockCommandCore(t.Context(), time.Now(), "octocat/hello-world", 1, 12345, "testuser", tc.result)
 
 			require.NoError(t, err)
-			assert.False(t, retry, "the targeted lock is gone, which is the command's goal; a re-drive would find nothing it vetted")
+			assert.False(t, retry, "a stale command is terminal; the recovery path is a fresh comment")
 			require.True(t, lockStore.replaced, "the release must have been attempted after the replacement landed")
 			require.NotNil(t, lockStore.held, "the lock acquired after vetting must stay held")
 			assert.Equal(t, int64(42), lockStore.held.ID)
 			assert.Equal(t, tc.replacement.Owner, lockStore.held.Owner)
 			assert.Equal(t, tc.replacement.PendingPlanID, lockStore.held.PendingPlanID)
-			body := requireComment(t, comments, "already-released answer")
-			assert.Contains(t, body, "Locks Already Released")
+			body := requireComment(t, comments, "stale-command answer")
+			assert.Contains(t, body, "acquired after the command was received")
+			assert.Contains(t, body, "Comment `schemabot unlock` again")
+			assert.NotContains(t, body, "Nothing left to unlock", "the database is still locked")
 			assert.NotContains(t, body, "Released by @testuser", "the command must not claim it released the new lock")
-			assert.Empty(t, comments, "the already-released answer must be the command's only comment")
+			assert.Empty(t, comments, "the stale-command answer must be the command's only comment")
 		})
 	}
 }
