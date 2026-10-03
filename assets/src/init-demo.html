@@ -19,7 +19,7 @@ function pacedFrame(frames, seconds, scenes) {
 const clean=s=>s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r/g,'');
 const escape=s=>s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
 const ansi=s=>{let html='',last=0,style='';const re=/\x1b\[([0-9;]*)m/g;let m;while((m=re.exec(s))){html+='<span style="'+style+'">'+escape(s.slice(last,m.index))+'</span>';for(const code of m[1].split(';')){if(code==='0'||code==='')style='';if(code==='1')style+='font-weight:600;';if(code==='34')style+='color:#0969da;';if(code==='35')style+='color:#8250df;';}last=re.lastIndex;}return html+'<span style="'+style+'">'+escape(s.slice(last))+'</span>';};
-window.setRecording=data=>{recording=data; if(data.apply_frames){document.querySelector('h1').textContent='From setup to a verified schema change';document.querySelector('.badge').textContent='Disposable '+(data.engine==='postgres'?'PostgreSQL':'MySQL')+' sample';document.querySelector('.steps').innerHTML=['Connect','Edit','Plan','Apply','Verify'].map((s,i)=>'<div class="step" id="s'+i+'"><span class="number">'+(i+1)+'</span>'+s+'</div>').join('');} document.querySelector('.sub').textContent='SchemaBot · '+(data.engine==='postgres'?'PostgreSQL':'MySQL')+' · local setup'; const first=data.wizard_frames.findIndex(f=>f.rows.some(r=>r.map(s=>s.text).join('').includes('esc cancel'))); if(first>0)recording.wizard_frames=data.wizard_frames.slice(first);};
+window.setRecording=data=>{recording=data; if(data.apply_frames){document.querySelector('h1').textContent='From setup to a verified schema change';document.querySelector('.badge').textContent='Disposable '+(data.engine==='postgres'?'PostgreSQL':data.engine==='vitess'?'Vitess / PlanetScale':'MySQL')+' sample';document.querySelector('.steps').innerHTML=['Connect','Edit','Plan','Apply','Verify'].map((s,i)=>'<div class="step" id="s'+i+'"><span class="number">'+(i+1)+'</span>'+s+'</div>').join('');} document.querySelector('.sub').textContent='SchemaBot · '+(data.engine==='postgres'?'PostgreSQL':data.engine==='vitess'?'Vitess / PlanetScale':'MySQL')+' · local setup'; const first=data.wizard_frames.findIndex(f=>f.rows.some(r=>r.map(s=>s.text).join('').includes('esc cancel'))); if(first>0)recording.wizard_frames=data.wizard_frames.slice(first);};
 window.renderFrame=(t,dt)=>{
  const full=!!recording.apply_frames, wizardEnd=full?9:recording.sample?17:30, editEnd=wizardEnd+(recording.sample?3:6);
  const phase=t<wizardEnd?0:t<editEnd?1:full&&t>=26?4:full&&t>=17?3:2;
@@ -43,6 +43,19 @@ window.renderFrame=(t,dt)=>{
    [1,s=>s.includes('/  sample database')],
    [.8,s=>s.includes('/  connect and verify')],
    [2.2,s=>s.includes('Your schema is ready')]
+  ]):recording.engine==='vitess'?pacedFrame(frames,localTime-commandTime,[
+   [1,s=>s.includes('What would you like to try?')],
+   [1.5,s=>s.includes('Database engine')],
+   [1,s=>s.includes('Database name')],
+   [6,s=>s.includes('Connect to your Vitess database')],
+   [3,s=>s.includes('Where should SchemaBot store its own data?')&&s.includes('Data stays in a Docker volume')&&s.includes('esc cancel')],
+   [1,s=>s.includes('PlanetScale organization')],
+   [3.5,s=>s.includes('Enter token ID and secret')&&s.includes('esc cancel')],
+   [2,s=>s.includes('Token ID')&&!s.includes('Enter token ID')],
+   [1,s=>s.includes('Token secret (hidden)')],
+   [2,s=>s.includes('Review your setup')],
+   [2,s=>s.includes('/  connect and verify')],
+   [4,s=>s.includes('Your schema is ready')]
   ]):frames.filter(f=>f.time<=recordedTime).at(-1)||frames[0];
   const colors={default:'#1f2328',black:'#1f2328',red:'#cf222e',green:'#1a7f37',brown:'#9a6700',blue:'#0969da',magenta:'#8250df',cyan:'#0550ae',white:'#59636e',brightblack:'#59636e'};
   const content=document.getElementById('content');
@@ -52,7 +65,7 @@ window.renderFrame=(t,dt)=>{
   }).join('')+'</div>').join('');
   content.style.transform='none';
   const screenText=frame.rows.map(r=>r.map(s=>s.text).join('')).join('\n');
-  document.getElementById('caption').textContent=phase===3?'Confirm the plan, then watch the change finish.':screenText.includes('What would you like to try?')?'Connect your database or start with a local sample.':screenText.includes('/  sample database')?'Preparing your local database.':screenText.includes('Your schema is ready')?'Your baseline is verified. Ready for the first edit.':screenText.includes('/  connect and verify')?'SchemaBot imports and verifies your schema.':screenText.includes('Review your setup')?'Review your database, files, and connections.':screenText.includes('space select')?'Choose the namespaces you want to manage.':screenText.includes('Connecting and finding')?'Connect and discover what is available.':screenText.includes('✓ Connected')?'Connection verified. Setup continues automatically.':screenText.includes('Checking connection')?'Verify access with a read-only query.':screenText.includes('Where should SchemaBot store its own data?')?'Choose where SchemaBot keeps its own data.':screenText.includes('Connect SchemaBot’s state database')?'Confirm where SchemaBot keeps plans and progress.':screenText.includes('Connect your database')?'Confirm the host and database before connecting.':screenText.includes('Database name')?'Give your database a name.':'Choose your database engine.';
+  document.getElementById('caption').textContent=phase===3?'Confirm the plan, then watch the change finish.':screenText.includes('What would you like to try?')?'Connect your database or start with a local sample.':screenText.includes('/  sample database')?'Preparing your local database.':screenText.includes('Your schema is ready')?'Your baseline is verified. Ready for the first edit.':screenText.includes('/  connect and verify')?'SchemaBot imports and verifies your schema.':screenText.includes('Review your setup')?'Review your database, files, and connections.':screenText.includes('space select')?'Choose the namespaces you want to manage.':screenText.includes('Connecting and finding')?'Connect and discover what is available.':screenText.includes('✓ Connected')?'Connection verified. Setup continues automatically.':screenText.includes('Checking connection')?'Verify access with a read-only query.':screenText.includes('Where should SchemaBot store its own data?')?'Choose where SchemaBot keeps its own data.':(screenText.includes('Connect SchemaBot’s state database')||screenText.includes('Store SchemaBot’s plans and progress'))?'Confirm where SchemaBot keeps plans and progress.':screenText.includes('PlanetScale organization')?'Choose the organization that owns your database.':screenText.includes('Connect the PlanetScale API')?'Verify access to the PlanetScale API.':(screenText.includes('Connect your database')||screenText.includes('Connect to your Vitess database'))?'Confirm the host and database before connecting.':screenText.includes('Database name')?'Give your database a name.':'Choose your database engine.';
   document.getElementById('progress').style.width=((phase+1)/(full?5:3)*100)+'%';
   return;
  }else if(phase===1){

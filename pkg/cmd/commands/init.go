@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/localdemo"
 	"github.com/block/schemabot/pkg/localruntime"
 	"github.com/block/schemabot/pkg/localsetup"
+	"github.com/block/schemabot/pkg/localstorage"
 )
 
 // InitCmd accepts explicit inputs or collects missing decisions in a terminal.
@@ -34,9 +35,13 @@ type InitCmd struct {
 	ReuseSchema    bool         `name:"reuse-schema" help:"Verify existing desired files without replacing them"`
 	Database       string       `short:"d" help:"Name to register for this database"`
 	Environment    string       `short:"e" help:"Environment to initialize"`
-	Type           string       `help:"Database engine: mysql or postgres"`
+	Type           string       `help:"Database engine: mysql, postgres, or vitess"`
 	DSN            string       `help:"Target connection as env:VARIABLE or file:/absolute/path (credentials stay out of schema files)"`
+	Organization   string       `help:"PlanetScale organization that owns a Vitess database"`
+	APIToken       string       `name:"api-token" help:"PlanetScale service token as env:VARIABLE or file:/absolute/path holding TOKEN_ID:TOKEN_SECRET"`
+	APIURL         string       `name:"api-url" help:"PlanetScale-compatible API base URL; defaults to PlanetScale"`
 	Integrated     bool         `help:"Create a separate schemabot database on the application server for SchemaBot state"`
+	LocalStorage   bool         `name:"local-storage" help:"Run SchemaBot state storage in local Docker (Vitess only)"`
 	StorageDSN     string       `name:"storage-dsn" help:"Existing separate state database as env:VARIABLE or file:/absolute/path; startup initializes SchemaBot metadata tables"`
 	SchemaDir      string       `name:"schema-dir" short:"s" default:"schema" help:"New schema directory, or unchanged files from a prior initialization"`
 	Namespaces     []string     `name:"namespace" help:"Explicit namespace to import; repeat for multiple namespaces"`
@@ -102,12 +107,22 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if cmd.Integrated && cmd.StorageDSN != "" {
 		return nil, fmt.Errorf("choose --integrated or --storage-dsn, not both")
 	}
-	storage := api.StorageConfig{Dialect: cmd.Type, DSN: cmd.StorageDSN}
+	if cmd.Type == "vitess" && cmd.Integrated {
+		return nil, fmt.Errorf("vitess needs a separate MySQL state database; use --storage-dsn")
+	}
+	if cmd.LocalStorage && (cmd.Integrated || cmd.StorageDSN != "" || cmd.Type != "vitess") {
+		return nil, fmt.Errorf("--local-storage requires vitess and cannot be combined with --integrated or --storage-dsn")
+	}
+	storage := api.StorageConfig{Dialect: initStorageDialect(cmd.Type), DSN: cmd.StorageDSN}
 	if cmd.Integrated {
 		storage.DSN = cmd.DSN
 		storage.Database = "schemabot"
 	}
-	for _, ref := range []string{cmd.DSN, storage.DSN} {
+	refs := []string{cmd.DSN}
+	if !cmd.LocalStorage {
+		refs = append(refs, storage.DSN)
+	}
+	for _, ref := range refs {
 		if !validInitConnectionReference(ref) {
 			return nil, fmt.Errorf("provide target and storage connections as env:VARIABLE or file:/absolute/path references")
 		}
@@ -179,9 +194,26 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 	if err := localsetup.CheckConnection(ctx, cmd.Type, targetDSN); err != nil {
 		return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.DSN, err)
 	}
+	if cmd.Type == "vitess" {
+		token, err := resolveInitConnection(cmd.APIToken)
+		if err != nil {
+			return nil, err
+		}
+		if err := localsetup.CheckPlanetScale(ctx, localsetup.Target{Engine: cmd.Type, Database: cmd.Database, Organization: cmd.Organization, Token: token, APIURL: cmd.APIURL}); err != nil {
+			return nil, err
+		}
+	}
+	if cmd.LocalStorage {
+		cmd.reportProgress("Starting your local state database in Docker...")
+		storage.DSN, err = localstorage.Prepare(ctx, dir, cmd.reportProgress)
+		if err != nil {
+			return nil, err
+		}
+		cmd.StorageDSN = storage.DSN
+	}
 	registration := localsetup.Registration{
 		Database: cmd.Database, Environment: cmd.Environment, Engine: cmd.Type,
-		Connection: api.EnvironmentConfig{DSN: cmd.DSN}, Storage: storage,
+		Connection: api.EnvironmentConfig{DSN: cmd.DSN, Organization: cmd.Organization, TokenSecretRef: cmd.APIToken, APIURL: cmd.APIURL}, Storage: storage,
 	}
 	if cmd.Integrated {
 		cmd.reportProgress("Preparing a separate schemabot database on your server...")
@@ -193,7 +225,7 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		if err != nil {
 			return nil, err
 		}
-		if err := localsetup.CheckConnection(ctx, cmd.Type, stateDSN); err != nil {
+		if err := localsetup.CheckConnection(ctx, storage.Dialect, stateDSN); err != nil {
 			return nil, fmt.Errorf("check %s before registering runtime: %w", cmd.StorageDSN, err)
 		}
 	}
@@ -206,6 +238,13 @@ func (cmd *InitCmd) initialize(ctx context.Context, g *Globals) (*initResult, er
 		return nil, retainedInitError(err)
 	}
 	return result, nil
+}
+
+func initStorageDialect(engine string) string {
+	if engine == "postgres" {
+		return "postgres"
+	}
+	return "mysql"
 }
 
 func (cmd *InitCmd) importBaseline(ctx context.Context, manager localruntime.Manager, stage, root, profile string, namespaces []string, exclusions client.PlanExclusions) (*initResult, error) {
