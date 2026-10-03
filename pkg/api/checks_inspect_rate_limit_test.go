@@ -71,21 +71,60 @@ func inspectQueryAs(t *testing.T, svc *Service, caller, target string) *httptest
 	return w
 }
 
+// Every target the inspection would refuse is refused before the caller is
+// charged, so a client sending unanswerable requests cannot spend the shared
+// budget other inspections need. Both refusal stages are covered: the targets
+// the query parser cannot read, and the readable targets the server cannot
+// serve. The budget is a single token here, so a charge that leaked through
+// any one validation would turn the following valid inspection into a 429.
 func TestChecksInspectRateLimitValidatesBeforeChargingCaller(t *testing.T) {
-	svc, calls := newRateLimitedInspectService(t, CallerRateLimitConfig{
+	for name, target := range map[string]string{
+		"no pull request":                             "/api/checks/inspect?repo=acme/store",
+		"a repository with no number":                 "/api/checks/inspect?pull_request=acme/store",
+		"a reference naming neither":                  "/api/checks/inspect?pull_request=not+a+pull+request",
+		"a repository disagreeing with the reference": "/api/checks/inspect?repo=acme/warehouse&pull_request=acme/store%23412",
+		"malformed repo":                              "/api/checks/inspect?repo=malformed&pull_request=7",
+		"non-positive PR":                             "/api/checks/inspect?repo=acme/store&pull_request=0",
+		"unhandled environment":                       "/api/checks/inspect?repo=acme/store&pull_request=7&environment=prod",
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, calls := newRateLimitedInspectService(t, CallerRateLimitConfig{
+				PerCaller: RateLimitBudgetConfig{RequestsPerMinute: 60, Burst: 1},
+			}, AuthConfig{})
+
+			invalid := inspectQueryAs(t, svc, "", target)
+			require.Equal(t, http.StatusBadRequest, invalid.Code, invalid.Body.String())
+			assert.Zero(t, calls.total(), "an invalid target must not reach GitHub")
+
+			valid := inspectAs(t, svc, "")
+			require.Equal(t, http.StatusOK, valid.Code, "the invalid request must not have spent the only token: %s", valid.Body.String())
+			assert.Positive(t, calls.total(), "a valid target consumes the available token")
+
+			limited := inspectAs(t, svc, "")
+			assert.Equal(t, http.StatusTooManyRequests, limited.Code, limited.Body.String())
+		})
+	}
+}
+
+// Both of an inspection's budget decisions are counted under the inspection's
+// own endpoint and the caller scope, so a polling client approaching its budget
+// shows up on the inspection's series and not on the pull endpoint's.
+func TestChecksInspectRateLimitRecordsDecisionsUnderItsEndpoint(t *testing.T) {
+	reader := installManualMetricReader(t)
+	svc, _ := newRateLimitedInspectService(t, CallerRateLimitConfig{
 		PerCaller: RateLimitBudgetConfig{RequestsPerMinute: 60, Burst: 1},
-	}, AuthConfig{})
+	}, AuthConfig{Type: "forward_auth"})
 
-	invalid := inspectQueryAs(t, svc, "", "/api/checks/inspect?repo=malformed&pull_request=7")
-	require.Equal(t, http.StatusBadRequest, invalid.Code, invalid.Body.String())
-	assert.Zero(t, calls.total(), "an invalid target must not reach GitHub")
+	require.Equal(t, http.StatusOK, inspectAs(t, svc, "dashboard@example.com").Code)
+	require.Equal(t, http.StatusTooManyRequests, inspectAs(t, svc, "dashboard@example.com").Code)
 
-	valid := inspectAs(t, svc, "")
-	require.Equal(t, http.StatusOK, valid.Code, valid.Body.String())
-	assert.Positive(t, calls.total(), "a valid target consumes the available token")
-
-	limited := inspectAs(t, svc, "")
-	assert.Equal(t, http.StatusTooManyRequests, limited.Code, limited.Body.String())
+	decisions := map[string]int64{}
+	for _, dp := range collectCounterPoints(t, reader, "schemabot.rate_limit_decisions.total") {
+		assert.Equal(t, checksInspectRateLimitEndpoint, attributeValue(t, dp, "endpoint"))
+		assert.Equal(t, rateLimitScopeCaller, attributeValue(t, dp, "scope"))
+		decisions[attributeValue(t, dp, "decision")] += dp.Value
+	}
+	assert.Equal(t, map[string]int64{rateLimitDecisionAllow: 1, rateLimitDecisionLimit: 1}, decisions)
 }
 
 // A dashboard polling a pull request's check state is served while it stays
