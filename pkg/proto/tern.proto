@@ -3,8 +3,39 @@ syntax = "proto3";
 package tern.v1;
 
 import "google/api/annotations.proto";
+import "google/protobuf/descriptor.proto";
 
 option go_package = "github.com/block/schemabot/pkg/proto/ternv1";
+
+extend google.protobuf.FieldOptions {
+  // Names the capability the receiving server must advertise before a caller
+  // sets this field. A field carries it when a server that predates the
+  // field would misread a request that sets it, rather than merely ignore
+  // it: proto3 drops a field the receiver does not know without a trace, so
+  // the rest of the request can then say something the caller never meant.
+  //
+  // A caller sends a request that sets an annotated field only to a server
+  // whose HealthResponse.capabilities lists the name, and refuses the
+  // request itself otherwise. A server advertises every name its compiled
+  // schema declares, so the annotation lands in the same change as the
+  // server code that reads the field. Name a capability after the feature
+  // an operator configures, since refusals show it to them.
+  //
+  // The capability read is a call of its own ahead of the request, so it
+  // cannot bind the request to the server that answered it: during a
+  // rollout behind a per-request load balancer, the request can still reach
+  // a replica that does not advertise the name. Annotate a field only when
+  // an older server that misreads it still fails closed. The annotation
+  // turns that failure into a refusal that names the upgrade; it does not
+  // make an unsafe misread safe.
+  //
+  // The number is process-wide: the protobuf runtime refuses to start a
+  // binary in which two linked schemas extend FieldOptions with the same
+  // number, and a host that embeds SchemaBot links whatever else it links.
+  // The low end of the in-house range is crowded (etcd, which Vitess links,
+  // takes 50000 through 50003), so this sits well away from it.
+  string requires_remote_capability = 78241;
+}
 
 // Tern provides schema change planning and execution.
 //
@@ -522,8 +553,9 @@ message DirectExecutionPolicy {
   // A size bound on the target table's data plus index footprint, in bytes;
   // zero states no byte bound. A refused statement runs directly when the
   // table is within the policy's bound. A negative value is an unusable
-  // bound, which the engine refuses.
-  int64 max_table_bytes = 4;
+  // bound, which the engine refuses. A data plane that predates the field
+  // reads a byte-bound policy as one with no bound at all.
+  int64 max_table_bytes = 4 [(requires_remote_capability) = "direct_execution.max_table_bytes"];
 }
 
 // TableChange represents a DDL change to a table.
@@ -995,6 +1027,16 @@ message HealthRequest {}
 // HealthResponse is the health check response.
 message HealthResponse {
   string status = 1;
+  // SchemaBot version of the binary that answered, for attribution in a
+  // caller's messages only. Empty when the binary cannot name its version.
+  // A caller decides what the data plane supports from capabilities, never
+  // from this.
+  string version = 2;
+  // Every requires_remote_capability name this server's schema declares. A
+  // caller about to send a request that sets an annotated field reads this
+  // first. Absence means unsupported, and a server that predates this
+  // field reports nothing.
+  repeated string capabilities = 3;
 }
 
 // StopRequest pauses an in-progress schema change by apply ID.

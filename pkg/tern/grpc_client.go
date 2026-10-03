@@ -169,6 +169,10 @@ type Config struct {
 	// Address is the gRPC server address (e.g., "localhost:9090").
 	Address string
 
+	// Deployment is the control plane's name for the data plane at Address,
+	// carried into refusals an operator reads. Optional.
+	Deployment string
+
 	// Storage is SchemaBot's storage for apply/task management.
 	// Required for ResumeApply to work.
 	Storage storage.Storage
@@ -337,7 +341,10 @@ func NewGRPCClient(config Config) (*GRPCClient, error) {
 		grpc.WithAuthority(host),
 		grpc.WithDefaultServiceConfig(retryServiceConfig),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxRecvMsgBytes)),
-		grpc.WithUnaryInterceptor(defaultRPCDeadlineInterceptor(grpcMethodDeadline)),
+		grpc.WithChainUnaryInterceptor(
+			defaultRPCDeadlineInterceptor(grpcMethodDeadline),
+			capabilityGateInterceptor(config.Deployment, config.Address, loggerOrDefault(config.Logger)),
+		),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", config.Address, err)
@@ -366,10 +373,15 @@ func (c *GRPCClient) applyLogger(apply *storage.Apply) *slog.Logger {
 // slog.Default() when none was configured. It is for sites that must log
 // before an apply row is loaded, where no identity can be bound yet.
 func (c *GRPCClient) baseLogger() *slog.Logger {
-	if c.logger == nil {
+	return loggerOrDefault(c.logger)
+}
+
+// loggerOrDefault returns logger, or slog.Default() when it is nil.
+func loggerOrDefault(logger *slog.Logger) *slog.Logger {
+	if logger == nil {
 		return slog.Default()
 	}
-	return c.logger
+	return logger
 }
 
 // IsRemote returns true — GRPCClient delegates to a separate Tern service

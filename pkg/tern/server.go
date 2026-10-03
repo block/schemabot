@@ -24,6 +24,9 @@ type Server struct {
 	// WithStorageSchemaService, and while it is nil those RPCs are refused
 	// rather than answered against something else.
 	storageSchema StorageSchemaService
+	// version is the SchemaBot version Health reports, for attribution in a
+	// caller's messages. Empty when the embedder did not supply one.
+	version string
 }
 
 var _ ternv1.TernServer = (*Server)(nil)
@@ -38,6 +41,13 @@ type ServerOption func(*Server)
 // plane rather than leaving it to read some other database's schema.
 func WithStorageSchemaService(service StorageSchemaService) ServerOption {
 	return func(s *Server) { s.storageSchema = service }
+}
+
+// WithVersion sets the SchemaBot version this endpoint reports on Health. A
+// caller only names it in its messages; what the data plane supports is read
+// from the capabilities Health also reports.
+func WithVersion(version string) ServerOption {
+	return func(s *Server) { s.version = version }
 }
 
 // NewServer creates a gRPC server wrapping a Client. The logger carries the
@@ -144,7 +154,7 @@ func (s *Server) Health(ctx context.Context, req *ternv1.HealthRequest) (*ternv1
 		}
 		return nil, status.Error(codes.Unavailable, "service unavailable")
 	}
-	return &ternv1.HealthResponse{Status: "ok"}, nil
+	return &ternv1.HealthResponse{Status: "ok", Version: s.version, Capabilities: serverCapabilities()}, nil
 }
 
 // callerAbandonedHealthCheck reports whether a failed health check ended because
@@ -193,7 +203,7 @@ func pullSchemaErrorCode(err error) codes.Code {
 func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanResponse, error) {
 	resp, err := s.client.Plan(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, s.withUnknownFieldNote(ctx, "Plan", req, err.Error()))
 	}
 	return resp, nil
 }
@@ -201,7 +211,7 @@ func (s *Server) Plan(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.Pla
 func (s *Server) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
 	resp, err := s.client.PlanDiff(ctx, req)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, status.Error(codes.Internal, s.withUnknownFieldNote(ctx, "PlanDiff", req, err.Error()))
 	}
 	return resp, nil
 }
@@ -209,7 +219,7 @@ func (s *Server) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1
 func (s *Server) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ternv1.ApplyResponse, error) {
 	resp, err := s.client.Apply(ctx, req)
 	if err != nil {
-		return nil, status.Error(applyErrorCode(err), err.Error())
+		return nil, status.Error(applyErrorCode(err), s.withUnknownFieldNote(ctx, "Apply", req, err.Error()))
 	}
 	return resp, nil
 }
