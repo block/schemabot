@@ -73,3 +73,37 @@ func TestTableChangeConversionsPreserveSizeEstimates(t *testing.T) {
 		assert.Equal(t, bytes, *stored.EstimatedBytes, name)
 	}
 }
+
+// Every conversion between the engine, proto, and storage table changes copies
+// the collation changes field by field, each field with a distinct value.
+func TestTableChangeConversionsPreserveCollationChanges(t *testing.T) {
+	engineChange := engine.TableChange{
+		Table:     "products",
+		DDL:       "ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_bin NOT NULL",
+		Operation: ddl.StatementAlterTable,
+		CollationChanges: []engine.CollationChange{{
+			Column:         "sku",
+			From:           "utf8mb4_general_ci",
+			To:             "utf8mb4_bin",
+			Case:           engine.ComparisonBecomesSensitive,
+			TrailingSpaces: engine.ComparisonUnknown,
+			UniqueIndexes:  []string{"uk_sku"},
+		}},
+	}
+	want := []storage.CollationChange{{
+		Column:         "sku",
+		From:           "utf8mb4_general_ci",
+		To:             "utf8mb4_bin",
+		Case:           "becomes_sensitive",
+		TrailingSpaces: "unknown",
+		UniqueIndexes:  []string{"uk_sku"},
+	}}
+
+	protoChange := protoTableChangeFromEngine(engineChange, "commerce")
+	for name, stored := range map[string]storage.TableChange{
+		"from engine": storageTableChangeFromEngine(engineChange, "commerce"),
+		"from proto":  StorageTableChangeFromProto(protoChange, "commerce", protoChange.TableName, protoChange.Ddl, "alter"),
+	} {
+		assert.Equal(t, want, stored.CollationChanges, name)
+	}
+}

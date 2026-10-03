@@ -563,6 +563,32 @@ message TableChange {
   // across shards for sharded targets. Unset when no estimate was available.
   // Approximate like estimated_rows.
   optional int64 estimated_bytes = 13;
+  // Existing columns whose collation this change moves, so a reviewer can see
+  // what it does to how values sort and compare equal. Empty when the change
+  // re-collates no column, and for an engine that does not report it.
+  repeated CollationChange collation_changes = 14;
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+message CollationChange {
+  string column = 1;
+  // The collation the column compares under now.
+  string from_collation = 2;
+  // The collation it compares under once the change applies. Empty when the
+  // change leaves it to a server default the plan cannot read.
+  string to_collation = 3;
+  // How the comparison of values differing only in letter case, and only in
+  // trailing spaces, moves: "unchanged", "becomes_sensitive",
+  // "becomes_insensitive", or "unknown" when either collation's properties
+  // are not known. Consumers treat "unknown" as a possible change.
+  string case_comparison = 4;
+  string trailing_space_comparison = 5;
+  // Primary key and unique indexes that cover the column when the move can
+  // make values that were distinct compare equal, which the index then
+  // rejects. Empty for a move that cannot: one onto a binary collation of the
+  // same charset that does not start ignoring trailing spaces.
+  repeated string unique_indexes = 6;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
