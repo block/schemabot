@@ -3601,6 +3601,17 @@ func (c *ServerConfig) PromotionEnvironmentOrder() []string {
 	return slices.Clone(c.EnvironmentOrder)
 }
 
+// ServesFirstPromotionEnvironment reports whether this instance serves the
+// first environment in the server-owned promotion order, and names that
+// environment. A deployment serving every environment serves the first one.
+// Where several deployments split one repository's environments between them,
+// exactly one serves the first, which makes it the one to answer an unscoped
+// command (no -e) that only one of them should answer.
+func (c *ServerConfig) ServesFirstPromotionEnvironment() (bool, string) {
+	first := c.PromotionEnvironmentOrder()[0]
+	return c.IsEnvironmentAllowed(first), first
+}
+
 // PromotionOrderForDatabase returns the environment promotion order used by PR
 // apply gating for a database: the database's environment_order override when
 // configured, otherwise the server-owned order. Databases without an override

@@ -249,6 +249,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			return
 		}
 		h.logger.Info("processing help command", "repo", repo, "pr", pr)
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
 		return
@@ -313,6 +314,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		if result.Action == action.Rollback {
 			if result.ApplyID == "" {
 				h.postComment(repo, pr, installationID, templates.RenderRollbackMissingArguments())
@@ -378,18 +380,22 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.cliName(), result.Environment, h.deploymentTenant()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
 	}
 
-	// Handle invalid command (schemabot mentioned but command not recognized)
+	// Handle invalid command (schemabot mentioned but command not recognized).
+	// The reply is this deployment's answer to the comment, so it carries the
+	// acknowledgment like every other answer.
 	if gateReason == issueCommentGateCommandNotFound {
 		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
 			h.logger.Debug("skipping invalid command response (respond_to_unscoped is false)", "repo", repo, "pr", pr)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
 		return
@@ -403,6 +409,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedAutoConfirm(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return
@@ -414,6 +421,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy,
 			"`--defer-cutover` belongs on `schemabot rollback-confirm`, after reviewing the rollback plan.")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
@@ -427,6 +435,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedDatabaseFlag(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return

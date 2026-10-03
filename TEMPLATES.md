@@ -2570,6 +2570,43 @@ Check that the database name, from `-d` or from `schemabot.yaml`, matches one th
 </details>
 
 <details>
+<summary><a name="database-not-registered"></a><strong>Database Not Registered</strong></summary>
+
+
+## ⚠️ Database Not Registered
+
+**Database**: `ledger` | **Schema directory**: `services/ledger/schema` | **Deployment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+The staging SchemaBot deployment has no `ledger` entry under `databases`, and this schema directory is not under any path it expects another deployment to report on.
+
+If `ledger` is new to SchemaBot, ask a SchemaBot operator to register it with this schema directory. If it is already registered, move the `schemabot.yaml` and its schema files under the schema directory registered for it.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="databases-not-registered"></a><strong>Databases Not Registered</strong></summary>
+
+
+## ⚠️ Databases Not Registered
+
+**Deployment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+The staging SchemaBot deployment has none of these databases under `databases`, and none of these schema directories is under a path it expects another deployment to report on:
+
+- `services/ledger/schema` declares database `ledger`
+- `services/payments/schema` declares database `payments`
+
+For each database that is new to SchemaBot, ask a SchemaBot operator to register it with its schema directory. For each one already registered, move its `schemabot.yaml` and schema files under the schema directory registered for it.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="database-not-available-to-this-repository"></a><strong>Database Not Available To This Repository</strong></summary>
 
 
