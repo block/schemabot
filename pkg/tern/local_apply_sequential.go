@@ -636,7 +636,9 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	// terminalWriteFailures counts consecutive failed writes of the task's
 	// terminal state. It is separate from consecutiveErrors because every
 	// successful poll resets that one, and the poll that finds the task
-	// terminal is itself successful.
+	// terminal is itself successful. A progress write that lands resets it, so
+	// an engine that reports terminal, then in flight, then terminal again
+	// gives the second terminal run the full budget.
 	var terminalWriteFailures int
 	var resumeEventLogged bool
 	var lastProgressMetadata map[string]string
@@ -858,10 +860,18 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 						append(attrs, "error", err)...)
 					return taskAbort
 				}
+				// The write is retried without a budget of its own: a progress row
+				// that stops landing freezes tasks.updated_at, and the operator's
+				// drive liveness check (operationDriveStalled) cancels a drive whose
+				// rows stop advancing for the full ApplyDriveStallAfter window, so a
+				// persistently refused progress write is ended from outside the
+				// loop. The observer is not told about progress that did not
+				// persist; it sees the row the next landed write produces.
 				c.logger.Warn("failed to persist task progress; the drive retries the write at the next poll",
 					append(attrs, "error", err)...)
 				continue
 			}
+			terminalWriteFailures = 0
 
 			// Notify observer with full apply + tasks context
 			if obs := c.getObserver(task.ApplyID); obs != nil {
@@ -1073,6 +1083,11 @@ func (c *LocalClient) settleLostVerifiedTask(ctx context.Context, apply *storage
 		targetState = state.Task.FailedRetryable
 		task.ErrorMessage = fmt.Sprintf("engine reports no active schema change for table %s but the target still needs the change; a fresh claim will re-drive it", task.TableName)
 		task.CompletedAt = nil
+	default:
+		// Every verdict names the state it settles to; one that does not must
+		// write nothing rather than a row with an empty state, which no sweep or
+		// predicate would ever find again.
+		return fmt.Errorf("settle lost task %s: unknown re-plan verdict %d", task.TaskIdentifier, verdict)
 	}
 	if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, targetState, logMessage); err != nil {
 		*task = previous

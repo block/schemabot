@@ -693,6 +693,51 @@ func TestPollTaskToCompletion_RefusedProgressWrite(t *testing.T) {
 	})
 }
 
+// The terminal-write budget counts consecutive refusals, not refusals over the
+// task's life. An engine reports the task finished, storage refuses the
+// terminal write nine times, the engine then reports the task back in flight
+// and that progress write lands; when the engine reports it finished again, the
+// second run of nine refusals must not abort the drive, since a landed write
+// in between showed storage is taking this task's rows again.
+func TestPollTaskToCompletion_TerminalWriteBudgetRestartsAfterALandedProgressWrite(t *testing.T) {
+	refusalsPerRun := maxConsecutiveProgressPollErrors - 1
+	results := make([]*engine.ProgressResult, 0, refusalsPerRun+2)
+	for range refusalsPerRun {
+		results = append(results, &engine.ProgressResult{State: engine.StateCompleted})
+	}
+	results = append(results, &engine.ProgressResult{State: engine.StateRunning}, &engine.ProgressResult{State: engine.StateCompleted})
+	eng := &phaseSequenceEngine{results: results}
+	client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+	refusing := &settlementRefusingTaskStore{
+		stateRecordingTaskStore: recording,
+		err:                     errors.New("storage down"),
+		refusals:                2 * refusalsPerRun,
+	}
+	client.storage.(*exactProgressStorage).tasks = refusing
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskContinue, action, "two runs of refusals, each inside the budget, do not abort the drive")
+	assert.Equal(t, 2*refusalsPerRun, refusing.refused, "every refusal in both runs was attempted")
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, []string{state.Task.Running, state.Task.Completed}, recording.states, "the progress write between the runs lands, then the terminal one")
+	assert.Equal(t, 2*refusalsPerRun+2, eng.calls, "the drive polls once per refusal, once for the in-flight report, and once for the landed terminal write")
+}
+
+// A re-plan verdict the settlement does not know settles nothing: writing a
+// task row with an empty state would leave a row no predicate or sweep can
+// find, so the settlement refuses before it reaches storage.
+func TestSettleLostVerifiedTask_UnknownVerdictWritesNothing(t *testing.T) {
+	client, apply, task, recording := lostWorkPollFixture(&phaseSequenceEngine{}, lostWorkTrustBudgetAmple)
+	before := *task
+
+	err := client.settleLostVerifiedTask(t.Context(), apply, task, replanVerdict(99), engine.StatePending)
+
+	require.ErrorContains(t, err, "unknown re-plan verdict 99")
+	assert.Empty(t, recording.states, "nothing is written for a verdict with no state")
+	assert.Equal(t, before, *task, "the task is left as found")
+}
+
 // A task parked at an operator gate — a held cutover, a deferred deploy, an
 // open revert window — is motionless by design for as long as the operator
 // takes to act. The stall watchdog must stay quiet for those states, so the
