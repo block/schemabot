@@ -68,16 +68,22 @@ type OIDCLogin struct {
 
 // tokenSource returns the OIDC issuer and client ID to renew the cached token
 // with, and whether the token came from an OIDC login at all. The pair recorded
-// at login wins; a profile that does not record it falls back to its oidc
-// settings.
-func (p *Profile) tokenSource() (LoginConfig, bool) {
-	if p.TokenIssuer != "" && p.TokenClientID != "" {
-		return LoginConfig{Issuer: p.TokenIssuer, ClientID: p.TokenClientID}, true
+// at login wins; a profile that records neither half falls back to its oidc
+// settings. A profile that records only one half cannot say where its refresh
+// token came from, so it returns an error instead of falling back to an issuer
+// that may not have issued it.
+func (p *Profile) tokenSource() (LoginConfig, bool, error) {
+	recordedIssuer, recordedClientID := p.TokenIssuer != "", p.TokenClientID != ""
+	if recordedIssuer && recordedClientID {
+		return LoginConfig{Issuer: p.TokenIssuer, ClientID: p.TokenClientID}, true, nil
+	}
+	if recordedIssuer != recordedClientID {
+		return LoginConfig{}, true, fmt.Errorf("profile records only one of token_issuer and token_client_id")
 	}
 	if p.OIDC != nil {
-		return LoginConfig{Issuer: p.OIDC.Issuer, ClientID: p.OIDC.ClientID}, true
+		return LoginConfig{Issuer: p.OIDC.Issuer, ClientID: p.OIDC.ClientID}, true, nil
 	}
-	return LoginConfig{}, false
+	return LoginConfig{}, false, nil
 }
 
 // ConfigPath returns the path to the config file (~/.schemabot/config.yaml).
@@ -455,7 +461,7 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return "", nil
 	}
 
-	source, fromOIDC := profile.tokenSource()
+	source, fromOIDC, sourceErr := profile.tokenSource()
 
 	var expiry time.Time
 	var expiryErr error
@@ -478,6 +484,9 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 			return token, fmt.Errorf("read cached ID token expiry for profile %q (run `%s login`): %w", profileName, cliname.Name(), expiryErr)
 		}
 		return token, fmt.Errorf("token for profile %q is expired or about to expire according to this computer and cannot be refreshed; check the local clock or run `%s login`", profileName, cliname.Name())
+	}
+	if sourceErr != nil {
+		return token, fmt.Errorf("token for profile %q cannot be refreshed (run `%s login`): %w", profileName, cliname.Name(), sourceErr)
 	}
 
 	result, err := RefreshToken(ctx, source, profile.RefreshToken)

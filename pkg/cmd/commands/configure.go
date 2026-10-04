@@ -219,6 +219,12 @@ func (cmd *ConfigureShowCmd) Run(g *Globals) error {
 				marker = "* "
 			}
 			fmt.Printf("    %s%s: %s\n", marker, name, profile.Endpoint)
+			// The recorded pair, not the oidc settings, is where refresh goes,
+			// so show it: otherwise an edit to oidc that has no effect on the
+			// session is visible only by reading the config file.
+			if profile.TokenIssuer != "" || profile.TokenClientID != "" {
+				fmt.Printf("        refreshes at %s as client %s (recorded at login)\n", profile.TokenIssuer, profile.TokenClientID)
+			}
 		}
 	}
 

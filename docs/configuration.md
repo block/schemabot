@@ -1450,7 +1450,7 @@ profiles:
       redirect_port: 8765
 ```
 
-The provider must register `http://127.0.0.1:8765/callback` as a redirect URI for that client and allow refresh tokens. Login flags override settings for that login attempt; they do not save the `oidc:` block. Login records the issuer and client ID the tokens came from as `token_issuer` and `token_client_id` next to the cached tokens, and refresh uses that pair, because a refresh token is valid only at the issuer and for the client that issued it. A login with `--issuer` and `--client-id` therefore keeps refreshing against that provider without an `oidc:` block, and the next login replaces the pair along with the tokens. A profile that does not record the pair refreshes with its `oidc:` settings.
+The provider must register `http://127.0.0.1:8765/callback` as a redirect URI for that client and allow refresh tokens. Login flags override settings for that login attempt; they do not save the `oidc:` block. Login records the issuer and client ID the tokens came from as `token_issuer` and `token_client_id` next to the cached tokens, and refresh uses that pair, because a refresh token is valid only at the issuer and for the client that issued it. A login with `--issuer` and `--client-id` therefore keeps refreshing against that provider without an `oidc:` block, and the next login replaces the pair along with the tokens. Editing `oidc:` does not change where an existing session refreshes; run `schemabot login` after switching providers. `schemabot configure show` prints the recorded pair under each profile that has one. A profile that does not record the pair refreshes with its `oidc:` settings.
 
 ### Forward-auth (authenticating proxy)
 

@@ -199,11 +199,41 @@ func TestResolveBearerTokenRefreshesAtTokenIssuer(t *testing.T) {
 		assert.Equal(t, 1, calls)
 		assert.Equal(t, "cli-client", clientID)
 
+		// Refresh does not record the pair it used: recording is login's job, and
+		// pinning it here would stop the profile from following later edits to
+		// its oidc settings.
 		reloaded, err := LoadConfig()
 		require.NoError(t, err)
 		assert.Empty(t, reloaded.Profiles["default"].TokenIssuer)
 		assert.Empty(t, reloaded.Profiles["default"].TokenClientID)
 	})
+
+	// A profile that records only half of the pair cannot say where its refresh
+	// token came from, so refresh refuses rather than sending the refresh token
+	// to the oidc settings' issuer.
+	for name, half := range map[string]Profile{
+		"only the issuer is recorded":    {TokenIssuer: "https://issuer.invalid"},
+		"only the client ID is recorded": {TokenClientID: "flag-client"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("SCHEMABOT_TOKEN", "")
+			t.Setenv("SCHEMABOT_PROFILE", "")
+			configured := newFakeOIDC(t)
+			expired := testIDToken(`{"exp":1}`)
+			profile := half
+			profile.Endpoint = "https://schemabot.example"
+			profile.Token = expired
+			profile.RefreshToken = "flag-refresh-token"
+			profile.OIDC = &OIDCLogin{Issuer: configured.issuer(), ClientID: "cli-client"}
+			writeConfig(t, &Config{Profiles: map[string]Profile{"default": profile}}, 0o600)
+
+			tok, err := ResolveBearerToken(t.Context(), "", "", "")
+			require.ErrorContains(t, err, "records only one of token_issuer and token_client_id")
+			assert.Equal(t, expired, tok)
+			calls, _ := configured.refreshSeen()
+			assert.Zero(t, calls, "the refresh token must not be sent to an issuer that did not issue it")
+		})
+	}
 }
 
 func TestRefreshPreservesConcurrentConfigEdits(t *testing.T) {
