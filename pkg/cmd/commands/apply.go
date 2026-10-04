@@ -674,9 +674,7 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 		}
 
 		if state.IsState(curState, state.NoActiveChange) {
-			// The background poller may not have updated task states yet.
-			poller.sleep(pollInterval)
-			continue
+			return noActiveChangeError(poller.applyID)
 		}
 
 		tables := ddl.FilterInternalTablesTyped(result.Tables)
@@ -790,7 +788,7 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 				errorMsg = result.ErrorMessage
 			}
 			log.emitApplySummary(state.NormalizeState(curState), tableStates, applyStart, errorMsg)
-			return terminalWatchExit(curState)
+			return terminalWatchExit(result)
 		}
 
 		poller.sleep(pollInterval)
@@ -1009,10 +1007,10 @@ func watchApplyProgressJSON(poller *progressPoller) error {
 		}
 
 		if state.IsTerminalApplyState(curState) {
-			return terminalWatchExit(curState)
+			return terminalWatchExit(result)
 		}
 		if state.IsState(curState, state.NoActiveChange) {
-			return nil
+			return noActiveChangeError(poller.applyID)
 		}
 
 		poller.sleep(pollInterval)

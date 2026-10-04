@@ -1,12 +1,17 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -44,8 +49,9 @@ func scriptedPoller(t *testing.T, steps ...pollStep) (*progressPoller, *[]time.D
 				return nil, step.err
 			}
 			return &apitypes.ProgressResponse{
-				ApplyID: scriptedApplyID,
-				State:   step.state,
+				ApplyID:     scriptedApplyID,
+				Environment: "staging",
+				State:       step.state,
 				Tables: []*apitypes.TableProgressResponse{
 					{TableName: "orders", Status: step.state},
 				},
@@ -68,16 +74,16 @@ func transientSteps(n int) []pollStep {
 	return steps
 }
 
-// terminalWatchCases pairs every terminal apply state with the exit a
-// non-interactive watch reports for it: completed and stopped exit cleanly,
-// and every settled state in which the schema change did not land fails.
-func terminalWatchCases(t *testing.T) map[string]error {
+// terminalWatchCases pairs every terminal apply state with whether a
+// non-interactive watch exits cleanly for it: only completed does, and every
+// other terminal state, in which the schema change is not on the target, fails.
+func terminalWatchCases(t *testing.T) map[string]bool {
 	t.Helper()
-	cases := map[string]error{state.Apply.Stopped: nil}
+	cases := map[string]bool{state.Apply.Stopped: false}
 	for _, s := range state.SettledApplyStates {
-		cases[s] = ErrSilent
+		cases[s] = false
 	}
-	cases[state.Apply.Completed] = nil
+	cases[state.Apply.Completed] = true
 	for s := range cases {
 		require.True(t, state.IsTerminalApplyState(s), "%s must be terminal", s)
 	}
@@ -86,12 +92,24 @@ func terminalWatchCases(t *testing.T) map[string]error {
 	return cases
 }
 
+// requireTerminalWatchExit checks a watch's exit against terminalWatchCases:
+// a clean exit, or a failure that the CLI turns into a non-zero status.
+func requireTerminalWatchExit(t *testing.T, err error, wantSuccess bool) {
+	t.Helper()
+	if wantSuccess {
+		require.NoError(t, err)
+		return
+	}
+	require.Error(t, err)
+	assert.Equal(t, 1, ExitCodeFor(err))
+}
+
 // A CI job watching an apply in log mode ends as soon as the apply reaches any
 // terminal state, including one an operator caused from elsewhere by
-// cancelling or reverting it. It prints the outcome summary and exits non-zero
-// unless the change completed or was deliberately stopped.
+// stopping, cancelling, or reverting it. It prints the outcome summary and
+// exits non-zero unless the change completed.
 func TestWatchApplyProgressLog_ExitsOnEveryTerminalState(t *testing.T) {
-	for terminal, wantErr := range terminalWatchCases(t) {
+	for terminal, wantSuccess := range terminalWatchCases(t) {
 		t.Run(terminal, func(t *testing.T) {
 			poller, _ := scriptedPoller(t,
 				pollStep{state: state.Apply.Running},
@@ -103,11 +121,7 @@ func TestWatchApplyProgressLog_ExitsOnEveryTerminalState(t *testing.T) {
 				err = watchApplyProgressLog(poller, time.Hour)
 			}))
 
-			if wantErr == nil {
-				require.NoError(t, err)
-			} else {
-				require.ErrorIs(t, err, wantErr)
-			}
+			requireTerminalWatchExit(t, err, wantSuccess)
 			assert.Contains(t, out, "Apply "+terminal+" ")
 			assert.Contains(t, out, `tables="`)
 		})
@@ -137,9 +151,9 @@ func TestLogEmitter_EmitApplySummaryCountsCancelledAndReverted(t *testing.T) {
 
 // A script consuming the JSON progress stream sees the terminal state as the
 // last line and the process exits, with a failing status for an apply that
-// was cancelled or reverted.
+// was stopped, cancelled, or reverted.
 func TestWatchApplyProgressJSON_ExitsOnEveryTerminalState(t *testing.T) {
-	for terminal, wantErr := range terminalWatchCases(t) {
+	for terminal, wantSuccess := range terminalWatchCases(t) {
 		t.Run(terminal, func(t *testing.T) {
 			poller, waits := scriptedPoller(t,
 				pollStep{state: state.Apply.Running},
@@ -151,11 +165,7 @@ func TestWatchApplyProgressJSON_ExitsOnEveryTerminalState(t *testing.T) {
 				err = watchApplyProgressJSON(poller)
 			})
 
-			if wantErr == nil {
-				require.NoError(t, err)
-			} else {
-				require.ErrorIs(t, err, wantErr)
-			}
+			requireTerminalWatchExit(t, err, wantSuccess)
 			lines := strings.Split(strings.TrimSpace(out), "\n")
 			require.Len(t, lines, 2)
 			var last map[string]string
@@ -252,8 +262,8 @@ func TestProgressPoller_SuccessResetsFailureCount(t *testing.T) {
 }
 
 // Once the limit of consecutive transient failures is reached the watch ends
-// with an error that keeps the cause and tells the operator the apply is
-// still running and how to resume watching it.
+// with an error that keeps the cause, claims nothing about an apply it can no
+// longer see, and tells the operator how to see it again.
 func TestProgressPoller_FailsAfterConsecutiveTransientFailures(t *testing.T) {
 	poller, waits := scriptedPoller(t, transientSteps(maxConsecutiveProgressFailures)...)
 
@@ -266,7 +276,7 @@ func TestProgressPoller_FailsAfterConsecutiveTransientFailures(t *testing.T) {
 	var connErr *client.ConnectionError
 	require.ErrorAs(t, err, &connErr)
 	assert.Contains(t, err.Error(), "fetch progress for apply "+scriptedApplyID+": 10 consecutive attempts failed")
-	assert.Contains(t, err.Error(), "the schema change continues on the server; rerun the original watch command to resume")
+	assert.Contains(t, err.Error(), "this watch does not affect the apply; rerun the original watch command, or 'schemabot progress "+scriptedApplyID+"', to see its current state")
 	assert.Len(t, *waits, maxConsecutiveProgressFailures-1)
 	assert.Equal(t, maxConsecutiveProgressFailures-1, strings.Count(out, "Progress unavailable, retrying"))
 	assert.Contains(t, out, `attempt=1/10 retry_in=4s error="cannot connect to http://schemabot.test (is the server running?)"`)
@@ -278,11 +288,85 @@ func TestIsRetryableFetchError_TransportAndUnstructuredServerErrors(t *testing.T
 		err  error
 	}{
 		{name: "server error without API code", err: &client.APIError{Status: http.StatusBadGateway, Message: "bad gateway"}},
+		{name: "rate limited by a proxy without API code", err: &client.APIError{Status: http.StatusTooManyRequests, Message: "too many requests"}},
 		{name: "response body interrupted", err: fmt.Errorf("read response: %w", io.ErrUnexpectedEOF)},
+		{name: "response body read timed out", err: fmt.Errorf("read response: %w", &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded})},
+		{name: "response body connection reset", err: fmt.Errorf("read response: %w", &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET})},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.True(t, isRetryableFetchError(tc.err))
+		})
+	}
+}
+
+// Failures the CLI produces on its own side end the watch on the first poll,
+// even when they wrap a network error: an operator who cancelled the watch
+// means it, and a refused token transport refuses again on every retry.
+func TestIsRetryableFetchError_ClientSideFailuresArePermanent(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "operator cancelled", err: context.Canceled},
+		{name: "operator cancelled while reading the body", err: fmt.Errorf("read response: %w", &net.OpError{Op: "read", Net: "tcp", Err: context.Canceled})},
+		{name: "token refused over plaintext", err: &url.Error{Op: "Get", URL: "http://schemabot.example.test/api/progress/apply/x", Err: client.ErrInsecureTokenTransport}},
+		{name: "client error without API code", err: &client.APIError{Status: http.StatusForbidden, Message: "forbidden"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.False(t, isRetryableFetchError(tc.err))
+		})
+	}
+}
+
+// A bearer token that would cross a plaintext connection to a remote host is
+// refused before any dial. Retrying cannot change that answer, so the watch
+// must end on the first poll with the refusal rather than retrying it.
+func TestIsRetryableFetchError_InsecureTokenRefusalIsPermanent(t *testing.T) {
+	client.SetAuthToken("probe-token")
+	t.Cleanup(func() { client.SetAuthToken("") })
+
+	_, err := client.GetProgress("http://schemabot.example.test", "apply-a1b2c3d4e5f6")
+
+	require.ErrorIs(t, err, client.ErrInsecureTokenTransport)
+	assert.False(t, isRetryableFetchError(err), "a token-transport refusal is permanent")
+}
+
+// A stopped apply fails the watch, so a script gating on its exit status does
+// not carry on as if the schema change had landed, and the error tells the
+// operator the command that resumes it.
+func TestTerminalWatchExit_StoppedNamesTheResumeCommand(t *testing.T) {
+	err := terminalWatchExit(&apitypes.ProgressResponse{ApplyID: scriptedApplyID, Environment: "staging", State: state.Apply.Stopped})
+
+	require.EqualError(t, err, "apply "+scriptedApplyID+" was stopped, so the schema change is not on the target; use 'schemabot start -e staging "+scriptedApplyID+"' to resume it")
+	assert.Equal(t, 1, ExitCodeFor(err))
+}
+
+// A by-apply-ID watch that is told there is no active schema change never saw
+// how the apply ended. Both non-interactive watches fail on it, naming the
+// apply and where to look, rather than one exiting cleanly and the other
+// polling forever.
+func TestWatchApplyProgress_NoActiveChangeFailsTheWatch(t *testing.T) {
+	wantErr := "progress for apply " + scriptedApplyID + " reported no active schema change, so this watch cannot tell how the apply ended; check 'schemabot progress " + scriptedApplyID + "'"
+	watches := map[string]func(*progressPoller) error{
+		"log":  func(p *progressPoller) error { return watchApplyProgressLog(p, time.Hour) },
+		"json": watchApplyProgressJSON,
+	}
+	for name, watch := range watches {
+		t.Run(name, func(t *testing.T) {
+			poller, waits := scriptedPoller(t,
+				pollStep{state: state.Apply.Running},
+				pollStep{state: state.NoActiveChange},
+			)
+
+			var err error
+			captureOutput(t, func() {
+				err = watch(poller)
+			})
+
+			require.EqualError(t, err, wantErr)
+			assert.Len(t, *waits, 1, "the watch ends on the first no_active_change response")
 		})
 	}
 }

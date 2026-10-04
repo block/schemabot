@@ -1,23 +1,26 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/state"
 )
 
-// maxConsecutiveProgressFailures bounds how many progress polls in a row a
-// non-interactive watch tolerates failing transiently before it gives up. With
-// the fetch-error backoff this rides out a server restart or a brief network
-// partition, while an endpoint that stays unreachable still ends the watch
-// instead of leaving a CI job polling forever.
+// maxConsecutiveProgressFailures bounds how many progress polls in a row any
+// watch, interactive or not, tolerates failing transiently before it gives up.
+// With the fetch-error backoff this rides out a server restart or a brief
+// network partition, while an endpoint that stays unreachable still ends the
+// watch instead of leaving a CI job or a terminal polling forever.
 const maxConsecutiveProgressFailures = 10
 
 // progressPoller fetches one apply's progress for the non-interactive watch
@@ -63,8 +66,7 @@ func (p *progressPoller) next(onRetry func(progressRetry)) (*apitypes.ProgressRe
 			return nil, fmt.Errorf("fetch progress for apply %s: %w", p.applyID, err)
 		}
 		if failures >= maxConsecutiveProgressFailures {
-			return nil, fmt.Errorf("fetch progress for apply %s: %d consecutive attempts failed; the schema change continues on the server; rerun the original watch command to resume: %w",
-				p.applyID, failures, err)
+			return nil, fmt.Errorf("%s: %w", progressGiveUpMessage(p.applyID, failures), err)
 		}
 		wait := progressRetryWait(err, failures)
 		onRetry(progressRetry{err: err, attempt: failures, wait: wait})
@@ -72,7 +74,22 @@ func (p *progressPoller) next(onRetry func(progressRetry)) (*apitypes.ProgressRe
 	}
 }
 
+// progressGiveUpMessage is what every watch surface reports once progress has
+// stayed unreadable for this many polls in a row. The watcher cannot see the
+// apply at that point, so the message claims nothing about its state and
+// points at the commands that will show it.
+func progressGiveUpMessage(applyID string, failures int) string {
+	return fmt.Sprintf("fetch progress for apply %s: %d consecutive attempts failed; this watch does not affect the apply; rerun the original watch command, or '%s progress %s', to see its current state",
+		applyID, failures, cliname.Name(), applyID)
+}
+
+// isRetryableFetchError reports whether a failed progress fetch is worth
+// polling again: the server could not be reached, the response was cut off,
+// or the server answered with an error it marks transient.
 func isRetryableFetchError(err error) bool {
+	if isPermanentClientSideFailure(err) {
+		return false
+	}
 	var connErr *client.ConnectionError
 	if errors.As(err, &connErr) {
 		return true
@@ -82,10 +99,28 @@ func isRetryableFetchError(err error) bool {
 		if apiErr.ErrorCode != "" {
 			return apitypes.IsRetryableErrorCode(apiErr.ErrorCode)
 		}
-		return apiErr.Status >= 500
+		return isRetryableStatusWithoutCode(apiErr.Status)
 	}
+	// A response body that failed partway through, such as a connection reset
+	// or a read timeout after the headers arrived. Failures to send the request
+	// arrive as a ConnectionError above.
 	var netErr net.Error
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.As(err, &netErr)
+}
+
+// isPermanentClientSideFailure reports a failure the CLI produced on its own
+// side that no retry can change: the operator cancelled the watch, or the
+// client refused to send the auth token over a plaintext connection. Both can
+// wrap a net.Error, so they are ruled out before the transport checks.
+func isPermanentClientSideFailure(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, client.ErrInsecureTokenTransport)
+}
+
+// isRetryableStatusWithoutCode classifies an error response that carries no
+// SchemaBot error code, which is what a proxy or load balancer in front of the
+// server sends: a 5xx while the server restarts, or a 429 from a rate limiter.
+func isRetryableStatusWithoutCode(status int) bool {
+	return status >= http.StatusInternalServerError || status == http.StatusTooManyRequests
 }
 
 // progressRetryWait is the fetch-error backoff for this many consecutive
@@ -110,19 +145,38 @@ func printProgressRetry(r progressRetry) {
 }
 
 // terminalWatchExit is the exit a non-interactive watch reports once the apply
-// reaches a terminal state. A completed apply succeeds. A stopped apply also
-// exits cleanly: the stop was an operator's deliberate pause and the apply can
-// be started again. Every other terminal state (failed, cancelled, reverted, or
-// one added later) means the schema change is not on the target, so the watch
-// fails and a script gating on its exit status does not proceed. The watch has
-// already rendered the outcome, so the error is silent.
-func terminalWatchExit(applyState string) error {
+// reaches a terminal state. Only a completed apply succeeds. Every other
+// terminal state (stopped, failed, cancelled, reverted, or one added later)
+// means the schema change is not on the target, so the watch fails and a
+// script gating on its exit status does not proceed. A stopped apply can be
+// resumed, so its error says how; the other outcomes are already rendered, so
+// their error is silent.
+func terminalWatchExit(result *apitypes.ProgressResponse) error {
 	switch {
-	case state.IsState(applyState, state.Apply.Completed):
+	case state.IsState(result.State, state.Apply.Completed):
 		return nil
-	case state.IsState(applyState, state.Apply.Stopped):
-		return nil
+	case state.IsState(result.State, state.Apply.Stopped):
+		return fmt.Errorf("apply %s was stopped, so the schema change is not on the target; use '%s' to resume it",
+			result.ApplyID, startCommand(result.ApplyID, result.Environment))
 	default:
 		return ErrSilent
 	}
+}
+
+// startCommand is the command that resumes a stopped apply. start requires an
+// environment, so a placeholder stands in when the response did not name one.
+func startCommand(applyID, environment string) string {
+	if environment == "" {
+		environment = "<environment>"
+	}
+	return fmt.Sprintf("%s start -e %s %s", cliname.Name(), environment, applyID)
+}
+
+// noActiveChangeError ends a watch whose apply the server reports no active
+// schema change for. Progress by apply ID carries the apply's stored state, so
+// this answer means the watcher never saw how the apply ended; it fails rather
+// than guessing, and points at a command that will show the apply.
+func noActiveChangeError(applyID string) error {
+	return fmt.Errorf("progress for apply %s reported no active schema change, so this watch cannot tell how the apply ended; check '%s progress %s'",
+		applyID, cliname.Name(), applyID)
 }

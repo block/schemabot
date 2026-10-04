@@ -152,9 +152,15 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case progressMsg:
 		if msg.failed && msg.retryable {
 			// Transient error (connection refused, timeout, engine_unavailable).
-			// Preserve last known state and tables, keep polling with backoff.
+			// Preserve last known state and tables, keep polling with backoff
+			// until the same bound the non-interactive watches give up at.
 			m.consecutiveErrors++
 			m.errorMsg = msg.errorMsg
+			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
+				m.errorMsg = progressGiveUpMessage(m.applyID, m.consecutiveErrors) + ": " + msg.errorMsg
+				m.initialized = true
+				return m, tea.Quit
+			}
 			return m, nil
 		}
 		if msg.failed && !msg.retryable {
