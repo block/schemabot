@@ -5823,7 +5823,7 @@ schemabot apply -e staging
 
 *Applied by @jackjackbits at 2026-03-15 14:22:00 UTC*
 
-> ❌ **Error:** The schema change failed on the target; the engine&#39;s account of it is in the logs below. (error 1265)
+> ❌ **Error:** An existing value would be truncated by the column&#39;s target type or length. Correct the data or choose a compatible type before applying the change. (error 1265)
 
 1 of 2 tables completed before failure.
 
@@ -5852,7 +5852,7 @@ schemabot apply -e staging
 == apply logs ==
 2026-03-15 14:22:00 UTC [INF] Apply dispatched to data plane [queued -> running]
 2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
-2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
+2026-03-15 14:28:00 UTC [ERR] Apply failed: An existing value would be truncated by the column's target type or length. Correct the data or choose a compatible type before applying the change. (error 1265) [running -> failed]
 
 == engine logs: shard-a ==
 2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
@@ -8833,7 +8833,7 @@ schemabot apply -e production
 == apply logs ==
 2026-03-15 14:22:00 UTC [INF] Apply dispatched to data plane [queued -> running]
 2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
-2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
+2026-03-15 14:28:00 UTC [ERR] Apply failed: An existing value would be truncated by the column's target type or length. Correct the data or choose a compatible type before applying the change. (error 1265) [running -> failed]
 
 == engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001 ==
 2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads

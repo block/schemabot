@@ -160,7 +160,9 @@ apply to `failed_retryable` instead of `failed`, and recovery is automatic: a
 recovery driver reclaims the apply and continues it from where it left off,
 using engine checkpoints so completed work is not redone. Failures where
 retrying cannot help — the engine rejected a statement, the target refused the
-change — skip this state and go straight to permanent `failed`.
+change, a row already in the table cannot be stored under the new definition
+(a NULL in a column the change makes `NOT NULL`) — skip this state and go
+straight to permanent `failed`.
 
 A clean shutdown is not one of these failures. A process that stops on purpose
 hands its claims back and leaves the apply active, so a peer driver resumes it
