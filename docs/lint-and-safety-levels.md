@@ -139,8 +139,10 @@ classified unsafe when any of the following hold:
   was never made invisible).
 
 On the MySQL family, a new table is also unsafe when Spirit could not alter it
-later (the `spirit_compatible` rule, error severity). Every table SchemaBot
-creates should stay changeable through an online schema change, so a
+later (the `spirit_compatible` rule, error severity). The rule applies to
+Vitess targets too: Vitess online DDL also needs a primary key and refuses
+foreign-key tables by default. Every table SchemaBot creates should stay
+changeable through an online schema change, so a
 `CREATE TABLE` is flagged when the table has no primary key, has a `FLOAT` or
 `BIT` primary key column, takes part in a foreign key at either end, or has a
 `.` or backtick in its name. Only tables the plan creates are checked. An

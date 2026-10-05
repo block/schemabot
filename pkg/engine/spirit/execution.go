@@ -67,7 +67,7 @@ func (e *Engine) newSpiritMigration(host, username, password, database, stmt str
 		EnableExperimentalLocklessChecksum: e.locklessChecksum,
 		Common: spiritflags.Common{
 			Threads:                       threads,
-			WriteThreads:                  0, // Spirit's default; autoscaling sizes it on Aurora
+			WriteThreads:                  spiritflags.DefaultWriteThreads, // autoscaling sizes it on Aurora
 			InterpolateParams:             true,
 			CheckpointMaxAge:              e.checkpointMaxAge,
 			MaxCommitLatency:              maxCommitLatency,
