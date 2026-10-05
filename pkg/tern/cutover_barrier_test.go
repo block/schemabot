@@ -161,3 +161,27 @@ func TestShouldInspectCutoverSignalForResume(t *testing.T) {
 		})
 	}
 }
+
+// A pending cutover request waits for its member's turn only where the
+// automatic cutover claim orders the swaps: an operation-scoped drive of a
+// multi-operation apply under an ordered policy. Every other drive takes the
+// request on apply-wide readiness, as it always has.
+func TestTakesCutoverRequestInOrder(t *testing.T) {
+	tests := []struct {
+		name  string
+		scope applyTaskScope
+		want  bool
+	}{
+		{"multi-op barrier waits its turn", applyTaskScope{applyOperationID: 7, operation: barrierOp(), multiOperation: true}, true},
+		{"multi-op parallel waits its turn", applyTaskScope{applyOperationID: 7, operation: parallelOp(), multiOperation: true}, true},
+		{"multi-op rolling is unordered", applyTaskScope{applyOperationID: 7, operation: rollingOp(), multiOperation: true}, false},
+		{"single-op barrier has no siblings", applyTaskScope{applyOperationID: 7, operation: barrierOp()}, false},
+		{"whole-apply drive has no member", wholeApplyTaskScope(), false},
+		{"operation not loaded", applyTaskScope{applyOperationID: 7, multiOperation: true}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.scope.takesCutoverRequestInOrder())
+		})
+	}
+}

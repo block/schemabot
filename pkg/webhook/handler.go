@@ -79,6 +79,11 @@ type Handler struct {
 	service   *api.Service
 	ghClients github.ClientSet
 
+	// shardedPlans is the sharded plan cache every comment render this
+	// handler starts shares; see shardedPlanCache. Nil (a Handler built
+	// without its constructor) reads storage on every render.
+	shardedPlans *shardedPlanCache
+
 	// transientPlanRetryDelay overrides the pause before retrying a plan
 	// request that failed with transient remote unavailability. Zero means
 	// the package default.
@@ -318,6 +323,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		checkSuiteRecoveryGrace:     defaultCheckSuiteRecoveryGrace,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
+		shardedPlans:                newShardedPlanCache(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -343,23 +349,13 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				"apply_id", apply.ApplyIdentifier,
 				"repo", apply.Repository,
 				"pr", apply.PullRequest)
-			service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID,
-				NewCommentObserver(CommentObserverConfig{
-					GHClient:       factory,
-					Storage:        service.Storage(),
-					Repo:           apply.Repository,
-					PR:             apply.PullRequest,
-					InstallationID: apply.InstallationID,
-					ApplyID:        apply.ID,
-					ApplyLease:     apply.Lease(),
-					SupportChannel: h.supportChannel(),
-					Tenant:         h.deploymentTenant(),
-					EngineLogs:     h.engineLogReader(),
-					Logger:         logger,
-					OnTerminalHook: func(a *storage.Apply) {
-						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
-					},
-				}))
+			cfg := h.commentObserverConfig(factory, apply.Repository, apply.PullRequest, apply.InstallationID)
+			cfg.ApplyID = apply.ID
+			cfg.ApplyLease = apply.Lease()
+			cfg.OnTerminalHook = func(a *storage.Apply) {
+				h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
+			}
+			service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID, NewCommentObserver(cfg))
 		}
 
 		// Register the aggregate terminal-summary callback, invoked by the
@@ -386,21 +382,12 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				"repo", apply.Repository,
 				"pr", apply.PullRequest,
 				"state", apply.State)
-			obs := NewAggregateTerminalCommentObserver(CommentObserverConfig{
-				GHClient:       factory,
-				Storage:        service.Storage(),
-				Repo:           apply.Repository,
-				PR:             apply.PullRequest,
-				InstallationID: apply.InstallationID,
-				ApplyID:        apply.ID,
-				SupportChannel: h.supportChannel(),
-				Tenant:         h.deploymentTenant(),
-				EngineLogs:     h.engineLogReader(),
-				Logger:         logger,
-				OnTerminalHook: func(a *storage.Apply) {
-					h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
-				},
-			})
+			cfg := h.commentObserverConfig(factory, apply.Repository, apply.PullRequest, apply.InstallationID)
+			cfg.ApplyID = apply.ID
+			cfg.OnTerminalHook = func(a *storage.Apply) {
+				h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
+			}
+			obs := NewAggregateTerminalCommentObserver(cfg)
 			obs.OnTerminal(apply, tasks)
 			return nil
 		}
@@ -660,6 +647,29 @@ func (h *Handler) deploymentTenant() string {
 	return cfg.Tenant
 }
 
+// commentObserverConfig returns the configuration every comment observer the
+// handler builds starts from: the PR it comments on, and the deployment-wide
+// settings its comments render with (cli_name, tenant, support channel, the
+// engine-log reader, the shared sharded plan cache). Building every observer
+// from here keeps a setting added to one observer from going missing on
+// another. Callers set the per-apply fields: the apply ID, its lease, cutover
+// deferral, and the terminal hook.
+func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo string, pr int, installationID int64) CommentObserverConfig {
+	return CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        h.service.Storage(),
+		Repo:           repo,
+		PR:             pr,
+		InstallationID: installationID,
+		SupportChannel: h.supportChannel(),
+		CLIName:        h.cliName(),
+		Tenant:         h.deploymentTenant(),
+		EngineLogs:     h.engineLogReader(),
+		shardedPlans:   h.shardedPlans,
+		Logger:         h.logger,
+	}
+}
+
 // clientForRepo returns an installation-scoped GitHub client for the App
 // that owns the given repository. Callers that already have a factory in
 // scope should use it directly; this is the convenience for the common
@@ -732,11 +742,11 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		// best-effort read that failed on the second pass would silently drop
 		// a section from the body actually posted.
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops)
-		vschemaDiffs := resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops)
+		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops, nil)
+		view := h.shardedPlans.resolve(ctx, h.service.Storage(), apply, ops)
 		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
-			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, vschemaDiffs, h.deploymentTenant())
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant(), h.cliName())
 			return body + renderControlRejections(rejections, h.logger, apply, body)
 		}
 		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)
@@ -787,7 +797,7 @@ func (h *Handler) postClaimedSummaryComment(ctx context.Context, apply *storage.
 		return
 	}
 
-	commentID, _, err := client.CreateIssueComment(ctx, apply.Repository, apply.PullRequest, h.renderPRComment(apply.Repository, apply.PullRequest, body))
+	commentID, _, err := client.CreateIssueComment(ctx, apply.Repository, apply.PullRequest, h.renderPRComment(apply.Repository, apply.PullRequest, apply.Environment, body))
 	if err != nil {
 		h.logger.Error("failed to post reconciled summary comment; releasing summary claim",
 			append(apply.LogAttrs(), "error", err)...)

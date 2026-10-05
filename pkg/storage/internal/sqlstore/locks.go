@@ -44,6 +44,23 @@ func canonicalizeLock(lock *storage.Lock) {
 // A re-acquire never changes the recorded acquirer: only the insert that
 // creates the row writes it.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
+	return s.acquire(ctx, lock, nil)
+}
+
+// AcquireIfPendingPlanID acquires like Acquire, but only while the lock is
+// still in the state the caller observed: free when observedPendingPlanID is
+// empty, or held by the same owner with observedPendingPlanID as its pending
+// plan. Any other same-owner state is a newer intent that a concurrent command
+// pinned since the caller looked, so the acquire returns ErrLockIntentChanged
+// and leaves that pin alone rather than overwriting it.
+func (s *lockStore) AcquireIfPendingPlanID(ctx context.Context, lock *storage.Lock, observedPendingPlanID string) error {
+	return s.acquire(ctx, lock, &observedPendingPlanID)
+}
+
+// acquire claims the lock, retrying transient conflicts. A nil observed pin
+// acquires unconditionally; a non-nil one is the pending plan the caller
+// observed and the claim must find the lock still in that state.
+func (s *lockStore) acquire(ctx context.Context, lock *storage.Lock, observedPendingPlanID *string) error {
 	canonicalizeLock(lock)
 	acquirer, err := encodeLockAcquirer(lock)
 	if err != nil {
@@ -51,15 +68,15 @@ func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 	}
 	op := fmt.Sprintf("acquire lock for %s/%s owner=%s", lock.DatabaseName, lock.DatabaseType, lock.Owner)
 	return withLockRetry(ctx, s.classifier, op, func() error {
-		return s.acquireOnce(ctx, lock, acquirer)
+		return s.acquireOnce(ctx, lock, acquirer, observedPendingPlanID)
 	})
 }
 
 // acquireOnce performs a single claim attempt. Concurrent same-owner callers
 // racing to claim the same key can hit a transient InnoDB lock conflict on the
-// INSERT below; Acquire retries those. Acquire canonicalizes the lock and
+// INSERT below; acquire retries those. acquire canonicalizes the lock and
 // encodes its acquirer first.
-func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquirer lockAcquirerColumns) error {
+func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquirer lockAcquirerColumns, observedPendingPlanID *string) error {
 	existing, err := s.Get(ctx, lock.DatabaseName, lock.DatabaseType)
 	if err != nil {
 		return fmt.Errorf("read existing lock for %s/%s: %w", lock.DatabaseName, lock.DatabaseType, err)
@@ -69,7 +86,13 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 		if existing.Owner != lock.Owner {
 			return storage.ErrLockHeld
 		}
-		return s.refreshPendingConfirmation(ctx, lock, existing)
+		return s.refreshPendingConfirmation(ctx, lock, existing, observedPendingPlanID)
+	}
+
+	// The caller observed a pin it still expects to hold; the lock is gone
+	// instead, so its intent was released or replaced since.
+	if observedPendingPlanID != nil && *observedPendingPlanID != "" {
+		return storage.ErrLockIntentChanged
 	}
 
 	// No lock yet — try to claim it. The UNIQUE(database_name, database_type)
@@ -103,7 +126,7 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 	if winner.Owner != lock.Owner {
 		return storage.ErrLockHeld
 	}
-	return s.refreshPendingConfirmation(ctx, lock, winner)
+	return s.refreshPendingConfirmation(ctx, lock, winner, observedPendingPlanID)
 }
 
 // lockAcquirerColumns holds the insert values of the acquired_by and
@@ -147,7 +170,9 @@ func encodeLockAcquirer(lock *storage.Lock) (lockAcquirerColumns, error) {
 // cannot produce a different answer.
 //
 // The UPDATE is owner-scoped: it only changes the row while this owner still
-// holds the lock.
+// holds the lock. A conditional acquire also scopes it to the pending plan the
+// caller observed, so the write itself, not only the read before it, refuses
+// to replace an intent pinned in between.
 //
 // RowsAffected==0 is ambiguous and must not be read as "the owner predicate no
 // longer matched". Under MySQL's default changed-rows semantics, a matched row
@@ -155,17 +180,25 @@ func encodeLockAcquirer(lock *storage.Lock) (lockAcquirerColumns, error) {
 // which happens when a concurrent same-owner caller set the same pending_plan_id
 // between this caller's read and its write. The owner still holds the lock in that
 // case, so the refresh has succeeded. To distinguish that from a genuine ownership
-// change, re-read the lock and branch on its actual state.
-// Acquire canonicalizes the lock before reaching this helper.
-func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existing *storage.Lock) error {
+// or intent change, re-read the lock and branch on its actual state.
+// acquire canonicalizes the lock before reaching this helper.
+func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existing *storage.Lock, observedPendingPlanID *string) error {
+	if observedPendingPlanID != nil && existing.PendingPlanID != *observedPendingPlanID {
+		return storage.ErrLockIntentChanged
+	}
 	if lock.PendingPlanID == "" || lock.PendingPlanID == existing.PendingPlanID {
 		return nil
 	}
-	result, err := s.db.ExecContext(ctx, `
+	query := `
 		UPDATE locks
 		SET pending_plan_id = ?, disclosed_copy_discard = ?, updated_at = NOW()
-		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
-	`, lock.PendingPlanID, lock.DisclosedCopyDiscard, lock.DatabaseName, lock.DatabaseType, lock.Owner)
+		WHERE database_name = ? AND database_type = ? AND ` + s.dialect.BinaryEquals("owner")
+	args := []any{lock.PendingPlanID, lock.DisclosedCopyDiscard, lock.DatabaseName, lock.DatabaseType, lock.Owner}
+	if observedPendingPlanID != nil {
+		query += ` AND pending_plan_id = ?`
+		args = append(args, *observedPendingPlanID)
+	}
+	result, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("refresh pending confirmation for %s/%s owner=%s: %w",
 			lock.DatabaseName, lock.DatabaseType, lock.Owner, err)
@@ -187,12 +220,20 @@ func (s *lockStore) refreshPendingConfirmation(ctx context.Context, lock, existi
 	if current == nil {
 		return storage.ErrLockNotFound
 	}
-	if current.Owner == lock.Owner {
+	if current.Owner != lock.Owner {
+		return storage.ErrLockHeld
+	}
+	if current.PendingPlanID == lock.PendingPlanID {
 		// The caller still owns the lock; the UPDATE affected no rows only because
 		// the stored value already matched, so the refresh is satisfied.
 		return nil
 	}
-	return storage.ErrLockHeld
+	if observedPendingPlanID != nil {
+		// The owner predicate matched but the observed pin did not: a concurrent
+		// same-owner command replaced the intent this caller planned against.
+		return storage.ErrLockIntentChanged
+	}
+	return nil
 }
 
 // Release releases a lock. Only succeeds if caller is the owner.
@@ -224,18 +265,20 @@ func (s *lockStore) Release(ctx context.Context, database, dbType, owner string)
 }
 
 // ReleaseByID deletes the lock only while the row the caller read still holds
-// it. The row ID pins everything recorded on that row, the acquirer included,
-// since only the insert that creates a row writes it; a caller that authorized
-// against the row it read therefore cannot delete a lock acquired after that
-// read. When nothing is deleted the lock is re-read, so the caller learns
-// whether it is gone, held by a new row, or held under another owner.
-func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType, owner string) error {
+// it for the pending plan the caller read. The row ID pins everything only the
+// insert writes, the acquirer included; the pending plan pins the one thing a
+// same-owner acquire rewrites in place. A caller that authorized against the
+// row it read therefore cannot delete a lock acquired, or acquired again for a
+// new plan, after that read. When nothing is deleted the lock is re-read, so
+// the caller learns whether it is gone, held by a new row, held under another
+// owner, or held for another plan.
+func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	database = storage.CanonicalKey(database)
 	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
-		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
-	`, id, database, dbType, owner)
+		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND `+s.dialect.BinaryEquals("pending_plan_id")+`
+	`, id, database, dbType, owner, pendingPlanID)
 	if err != nil {
 		return fmt.Errorf("release lock row %d for %s/%s owner=%s: %w", id, database, dbType, owner, err)
 	}
@@ -259,7 +302,10 @@ func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType,
 	if current.ID != id {
 		return storage.ErrLockReplaced
 	}
-	return storage.ErrLockNotOwned
+	if current.Owner != owner {
+		return storage.ErrLockNotOwned
+	}
+	return storage.ErrLockIntentChanged
 }
 
 // ReleaseIfPendingPlanID atomically releases only the lock intent the caller

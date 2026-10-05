@@ -142,6 +142,34 @@ func TestDiffKeyspace_RefusesForeignKeys(t *testing.T) {
 	})
 }
 
+// Two schema files in one keyspace both declare `orders`: orders.sql keeps the
+// live `email` column and orders_extras.sql adds `note` instead. The differ can
+// keep only one definition per table, so planning either definition would
+// silently discard the other and could drop `email`. The plan is refused with
+// an error naming the table and both files, on every run.
+func TestDiffKeyspace_RefusesTableDeclaredTwice(t *testing.T) {
+	e := &Engine{
+		linter: lint.New(),
+		logger: slog.New(slog.NewTextHandler(os.Stdout, nil)),
+	}
+	liveOrders := "CREATE TABLE `orders` (\n  `id` bigint NOT NULL,\n  `email` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	withNote := "CREATE TABLE `orders` (\n  `id` bigint NOT NULL,\n  `note` varchar(255) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	currentSchema := map[string][]table.TableSchema{"myapp": {{Name: "orders", Schema: liveOrders}}}
+
+	desired := &schema.Namespace{Files: map[string]string{
+		"orders.sql":        liveOrders + ";",
+		"orders_extras.sql": withNote,
+	}}
+
+	// Map iteration order varies between runs, so plan repeatedly: every run
+	// must refuse with the same, fully named error.
+	for range 20 {
+		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		require.EqualError(t, err, `table "orders" is declared by both schema files "myapp/orders.sql" and "myapp/orders_extras.sql". Declare each table in exactly one schema file`)
+		assert.Empty(t, changes)
+	}
+}
+
 // vschemaFetchStubClient serves a fixed response for keyspace VSchema reads so
 // tests can drive the VSchema half of diffKeyspace without a live API.
 type vschemaFetchStubClient struct {

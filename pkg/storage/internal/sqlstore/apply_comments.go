@@ -22,6 +22,36 @@ type applyCommentStore struct {
 	dialect Dialect
 }
 
+// applyCommentUpsertStatement renders Upsert's statement. Both renderings bind
+// the five inserted columns first; the leased rendering then binds the apply ID
+// and the lease token.
+//
+// The unleased rendering is a plain VALUES upsert. The leased rendering selects
+// its row from the leased applies row instead, so that row is the INSERT …
+// SELECT's only source row and the token check gates the insert and the
+// conflict update alike: a displaced driver's statement selects nothing and
+// writes neither. The check goes through LeaseSourceFence so it serializes
+// against a concurrent steal instead of passing against a token the
+// statement's snapshot still holds, at whatever isolation level the storage
+// session runs.
+func applyCommentUpsertStatement(d Dialect, leased bool) string {
+	const insert = "INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id) "
+	upsert := d.UpsertClause(
+		[]string{"apply_id", "comment_state"},
+		[]UpsertAssignment{
+			{Column: "github_comment_id"},
+			{Column: "posted_phase"},
+			{Column: "pending_freeze_github_comment_id"},
+			{Column: "superseded_at", Expr: "NULL"},
+			{Column: "updated_at", Expr: "NOW()"},
+		},
+	)
+	if !leased {
+		return insert + "VALUES (?, ?, ?, ?, ?) " + upsert
+	}
+	return insert + "SELECT ?, ?, ?, ?, ? FROM applies a WHERE a.id = ? AND " + d.LeaseSourceFence("applies", "a", "id", "lease_token") + " " + upsert
+}
+
 // Upsert creates or updates a comment record.
 // On conflict (same apply_id + comment_state), updates the github_comment_id,
 // posted_phase, and pending_freeze_github_comment_id so the
@@ -35,29 +65,14 @@ func (s *applyCommentStore) Upsert(ctx context.Context, comment *storage.ApplyCo
 	if err != nil {
 		return err
 	}
-	upsert := s.dialect.UpsertClause(
-		[]string{"apply_id", "comment_state"},
-		[]UpsertAssignment{
-			{Column: "github_comment_id"},
-			{Column: "posted_phase"},
-			{Column: "pending_freeze_github_comment_id"},
-			{Column: "superseded_at", Expr: "NULL"},
-			{Column: "updated_at", Expr: "NOW()"},
-		},
-	)
 	if !hasLease {
-		_, err := s.db.ExecContext(ctx, `
-			INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id)
-			VALUES (?, ?, ?, ?, ?)
-			`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID)
+		_, err := s.db.ExecContext(ctx, applyCommentUpsertStatement(s.dialect, false),
+			comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID)
 		return err
 	}
 
-	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO apply_comments (apply_id, comment_state, github_comment_id, posted_phase, pending_freeze_github_comment_id)
-		SELECT ?, ?, ?, ?, ? FROM applies a
-		WHERE a.id = ? AND a.lease_token = ?
-		`+upsert, comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
+	result, err := s.db.ExecContext(ctx, applyCommentUpsertStatement(s.dialect, true),
+		comment.ApplyID, comment.CommentState, comment.GitHubCommentID, comment.PostedPhase, comment.PendingFreezeCommentID, comment.ApplyID, lease.Token)
 	if err != nil {
 		return err
 	}

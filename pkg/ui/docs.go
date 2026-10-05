@@ -1,5 +1,7 @@
 package ui
 
+import "strings"
+
 // DocsBaseURL is the prefix SchemaBot builds every documentation link it
 // renders from. It is deliberately the project's canonical public home rather
 // than a value derived from the configured GitHub host: that host serves
@@ -31,4 +33,22 @@ const (
 var DocLinks = []string{
 	SchemaConfigDocURL,
 	ThrottleDocURL,
+}
+
+// DocRef is the short form a documentation link is displayed as on a terminal:
+// the page's path inside the repository, such as "docs/throttle.md", the way a
+// PR is displayed as "owner/repo#pr". It identifies the page on its own when a
+// terminal drops the hyperlink escape, and stays short enough to sit on one
+// line beside a label. A section anchor stays on the link target but is left
+// off the display, since the page is what the reader recognizes. A URL outside
+// the docs tree has no shorter form and is returned whole.
+func DocRef(url string) string {
+	path, ok := strings.CutPrefix(url, DocsBaseURL)
+	if !ok {
+		return url
+	}
+	if page, _, hasAnchor := strings.Cut(path, "#"); hasAnchor {
+		path = page
+	}
+	return "docs/" + path
 }

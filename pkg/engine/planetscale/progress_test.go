@@ -68,6 +68,98 @@ func TestProgress_InstantIsReportedFromTheDeploymentNotItsEligibility(t *testing
 	}
 }
 
+// A deploy request closed before it was deployed keeps the deployment state it
+// had, so read from the deployment state alone a deferred one still looks like
+// a deploy waiting to start. That is how the waiting-for-deploy timeout would
+// loop: its stop closes the deploy request, the next poll reads waiting again,
+// and the stop is re-sent for ever while the apply never settles. Progress
+// must report the closed, undeployed deploy request as cancelled — for a
+// deferred and a non-deferred apply alike — while an open ready request, a
+// closed request that completed, and a closed request that reports a deploy
+// keep their existing states.
+func TestProgress_ClosedUndeployedDeployRequestIsCancelled(t *testing.T) {
+	deployedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	tests := []struct {
+		name        string
+		deferred    bool
+		dr          ps.DeployRequest
+		wantState   engine.State
+		wantMessage string
+	}{
+		{
+			name:        "deferred deploy request closed while ready",
+			deferred:    true,
+			dr:          ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Ready},
+			wantState:   engine.StateCancelled,
+			wantMessage: "Deploy request #71 closed before it was deployed",
+		},
+		{
+			name:        "non-deferred deploy request closed while ready",
+			dr:          ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Ready},
+			wantState:   engine.StateCancelled,
+			wantMessage: "Deploy request #71 closed before it was deployed",
+		},
+		{
+			name:        "deploy request closed while still pending",
+			dr:          ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Pending},
+			wantState:   engine.StateCancelled,
+			wantMessage: "Deploy request #71 closed before it was deployed",
+		},
+		{
+			name:        "open deferred deploy request is still waiting for its deploy",
+			deferred:    true,
+			dr:          ps.DeployRequest{State: "open", DeploymentState: deployState.Ready},
+			wantState:   engine.StateWaitingForDeploy,
+			wantMessage: "Schema validation complete",
+		},
+		{
+			name:        "deploy request closed by completing",
+			dr:          ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Complete, DeployedAt: &deployedAt},
+			wantState:   engine.StateCompleted,
+			wantMessage: "Deployment complete",
+		},
+		{
+			name:        "deploy request closed with no changes",
+			dr:          ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.NoChanges},
+			wantState:   engine.StateCompleted,
+			wantMessage: "No changes detected",
+		},
+		{
+			name:        "closed ready deploy request that reports a deploy is not called cancelled",
+			deferred:    true,
+			dr:          ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Ready, DeployedAt: &deployedAt},
+			wantState:   engine.StateWaitingForDeploy,
+			wantMessage: "Schema validation complete",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dr := tt.dr
+			client := &resumeDeployClient{recovered: &dr}
+			e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+				func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+			encoded, err := encodePSMetadata(&psMetadata{BranchName: "schemabot-testdb-closed", DeployRequestID: 71, DeferredDeploy: tt.deferred})
+			require.NoError(t, err)
+
+			result, err := e.Progress(t.Context(), &engine.ProgressRequest{
+				Database:    "testdb",
+				ResumeState: &engine.ResumeState{Metadata: encoded},
+				Credentials: &engine.Credentials{Metadata: map[string]string{
+					"organization": "org",
+					"token_name":   "token",
+					"token_value":  "secret",
+				}},
+			})
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.Equal(t, tt.wantState, result.State)
+			assert.Equal(t, tt.wantMessage, result.Message)
+		})
+	}
+}
+
 func TestAggregateShardProgress(t *testing.T) {
 	t.Run("two shards one table", func(t *testing.T) {
 		rows := []vitessMigrationRow{
@@ -348,6 +440,32 @@ func TestValidateMigrationContext(t *testing.T) {
 	assert.Error(t, validateMigrationContext(`has"double`))
 	assert.Error(t, validateMigrationContext("has`backtick"))
 	assert.Error(t, validateMigrationContext(`has\backslash`))
+}
+
+// Per-keyspace progress reads a shared vtgate pool, so the keyspace is named in
+// the statement itself instead of being selected with USE, which would leave the
+// pooled connection switched to that keyspace for whichever reader takes it next.
+func TestShowVitessMigrationsQuery(t *testing.T) {
+	t.Run("names the keyspace and filters by context", func(t *testing.T) {
+		assert.Equal(t,
+			"SHOW VITESS_MIGRATIONS FROM `commerce` LIKE 'singularity:abc-123'",
+			showVitessMigrationsQuery("commerce", "singularity:abc-123"))
+	})
+
+	t.Run("names the keyspace without a filter when no context is known", func(t *testing.T) {
+		assert.Equal(t,
+			"SHOW VITESS_MIGRATIONS FROM `commerce`",
+			showVitessMigrationsQuery("commerce", ""))
+	})
+
+	t.Run("quotes keyspace names that need it", func(t *testing.T) {
+		assert.Equal(t,
+			"SHOW VITESS_MIGRATIONS FROM `my-ks` LIKE 'localscale:42'",
+			showVitessMigrationsQuery("my-ks", "localscale:42"))
+		assert.Equal(t,
+			"SHOW VITESS_MIGRATIONS FROM `odd``ks`",
+			showVitessMigrationsQuery("odd`ks", ""))
+	})
 }
 
 func TestShardLess(t *testing.T) {

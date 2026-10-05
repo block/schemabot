@@ -169,14 +169,18 @@ func protoSchemaFilesToAPI(sf map[string]*ternv1.SchemaFiles) map[string]*apityp
 // field crosses the boundary with one edit.
 func tableChangeResponseFromProto(t *ternv1.TableChange) *apitypes.TableChangeResponse {
 	return &apitypes.TableChangeResponse{
-		TableName:     t.TableName,
-		Namespace:     t.Namespace,
-		DDL:           t.Ddl,
-		ChangeType:    protoChangeTypeToOperation(t.ChangeType),
-		IsUnsafe:      t.IsUnsafe,
-		UnsafeReason:  t.UnsafeReason,
-		ExecutionMode: t.ExecutionMode,
-		ModeReason:    t.ModeReason,
+		TableName:        t.TableName,
+		Namespace:        t.Namespace,
+		DDL:              t.Ddl,
+		ChangeType:       protoChangeTypeToOperation(t.ChangeType),
+		IsUnsafe:         t.IsUnsafe,
+		UnsafeReason:     t.UnsafeReason,
+		ExecutionMode:    t.ExecutionMode,
+		ModeReason:       t.ModeReason,
+		EstimatedRows:    t.EstimatedRows,
+		ShardCount:       int(t.ShardCount),
+		LargestShardRows: t.LargestShardRows,
+		EstimatedBytes:   t.EstimatedBytes,
 	}
 }
 
@@ -358,6 +362,7 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 			}
 		}
 		nsData.Metadata = storage.VSchemaPlanMetadata(sc.Metadata)
+		nsData.Finalize = sc.Metadata[engine.MetadataNeedsFinalizer] == "true"
 		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
 			if nsFiles := schemaFiles[ns]; nsFiles != nil {
 				if vschema := nsFiles.Files[storage.VSchemaArtifactName]; vschema != "" {

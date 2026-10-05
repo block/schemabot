@@ -42,6 +42,7 @@ type ProgressOperation struct {
 	OperationKey        string
 	ExternalID          string
 	ExternalOperationID string
+	OperationKind       string
 	Target              string
 	State               string
 	CutoverPolicy       string
@@ -69,6 +70,9 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// EstimatedBytes is the table's on-disk size when it was planned, shown
+	// beside the row counts. Nil when the plan had no estimate.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -79,7 +83,12 @@ type TableProgress struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
-	Shards         []ShardProgress
+	// Shards is the table's per-part progress: one entry per shard, or one per
+	// target when AcrossTargets is set.
+	Shards []ShardProgress
+	// AcrossTargets marks a table that stands for one change across a
+	// rollout's targets, rolled up the way a sharded table rolls up its shards.
+	AcrossTargets bool
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -103,6 +112,9 @@ type ShardCounts struct {
 	Queued            int
 	Failed            int
 	Cancelled         int
+	// Other counts every status the fields above do not name, keyed by
+	// status, so a part in any phase stays in the summary.
+	Other map[string]int
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -146,6 +158,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			OperationKey:        op.OperationKey,
 			ExternalID:          op.ExternalID,
 			ExternalOperationID: op.ExternalOperationID,
+			OperationKind:       op.OperationKind,
 			Target:              op.Target,
 			State:               state.NormalizeState(op.State),
 			CutoverPolicy:       op.CutoverPolicy,
@@ -169,6 +182,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
+			EstimatedBytes:      tbl.EstimatedBytes,
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,

@@ -602,6 +602,47 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Empty(t, stored.ChangeSummary)
 	})
 
+	// A namespace placement refusal is a review-time block too: a write that did
+	// not re-evaluate the review keeps it, and one that did clears it.
+	t.Run("PlanPlacementBlockDisposition", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		blocked := &storage.Check{
+			Repository: "org/repo", PullRequest: 124, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "placement_db",
+			Status: "completed", Conclusion: "failure",
+			BlockingReason: storage.NamespacePlacementRefusedBlockingReason,
+			ChangeSummary:  "namespace placement refused the plan",
+		}
+		requirePlanResultStored(t, ctx, store, blocked, storage.PlanDriftBlocked)
+
+		notEvaluated := &storage.Check{
+			Repository: "org/repo", PullRequest: 124, HeadSHA: "sha-2",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "placement_db",
+			Status: "completed", Conclusion: "success",
+		}
+		requirePlanResultStored(t, ctx, store, notEvaluated, storage.PlanDriftNotEvaluated)
+
+		stored, err := store.Checks().Get(ctx, "org/repo", 124, "production", storage.DatabaseTypeMySQL, "placement_db")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "sha-2", stored.HeadSHA)
+		assert.Equal(t, "failure", stored.Conclusion, "a write that did not re-plan the placement keeps the block")
+		assert.Equal(t, storage.NamespacePlacementRefusedBlockingReason, stored.BlockingReason)
+		assert.Equal(t, "namespace placement refused the plan", stored.ChangeSummary)
+
+		clean := *notEvaluated
+		clean.HeadSHA = "sha-3"
+		requirePlanResultStored(t, ctx, store, &clean, storage.PlanDriftClean)
+
+		stored, err = store.Checks().Get(ctx, "org/repo", 124, "production", storage.DatabaseTypeMySQL, "placement_db")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "success", stored.Conclusion)
+		assert.Empty(t, stored.BlockingReason)
+	})
+
 	t.Run("MarkStalePlanSuccessful", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)

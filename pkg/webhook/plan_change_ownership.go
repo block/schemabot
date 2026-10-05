@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"slices"
 	"sort"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -35,15 +36,25 @@ import (
 // The lookup fails toward ownership. A storage failure, or a pull-request state
 // lookup that fails, annotates the drop as unresolved rather than letting it
 // render as a drop with nothing said about it.
-func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclient.InstallationClient, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, repo string, pr int, environment string) {
+//
+// rollout is the rollout preview the comment renders, nil when it renders the
+// primary plan alone. A target that runs its own plan can destroy something
+// on a table the primary plan leaves alone, so the tables every rendered
+// target plan destroys something on are looked up as well.
+func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclient.InstallationClient, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, rollout *templates.DeploymentDriftData, repo string, pr int, environment string) {
 	if data == nil {
 		return
 	}
 	tables := plannedDestructiveTables(planResp)
+	for _, table := range targetPlanDestructiveTables(rollout) {
+		if !slices.Contains(tables, table) {
+			tables = append(tables, table)
+		}
+	}
+	slices.Sort(tables)
 	if len(tables) == 0 {
 		return
 	}
-	gated := unsafeGateTables(planResp)
 	for _, table := range tables {
 		ref := storage.TableRef{
 			Database:     data.Database,
@@ -53,23 +64,9 @@ func (h *Handler) annotateAttributedChanges(ctx context.Context, client *ghclien
 		}
 		change, annotate := h.classifyDestructiveChange(ctx, client, ref, repo, pr, table)
 		if annotate {
-			_, consentSolicited := gated[table]
-			change.OutsideUnsafeGate = !consentSolicited
 			data.AttributedChanges = append(data.AttributedChanges, change)
 		}
 	}
-}
-
-// unsafeGateTables returns the tables the --allow-unsafe opt-in gate reads:
-// the namespace-level unsafe changes. A destructive change confined to
-// individual shards is not among them, so applying never solicits consent
-// for it — the attribution disclosure is then the operator's only notice.
-func unsafeGateTables(planResp *apitypes.PlanResponse) map[string]struct{} {
-	gated := map[string]struct{}{}
-	for _, unsafe := range planResp.UnsafeChanges() {
-		gated[unsafe.Table] = struct{}{}
-	}
-	return gated
 }
 
 // classifyDestructiveChange decides whether one table's destructive change must
@@ -174,5 +171,23 @@ func plannedDestructiveTables(planResp *apitypes.PlanResponse) []string {
 		tables = append(tables, table)
 	}
 	sort.Strings(tables)
+	return tables
+}
+
+// targetPlanDestructiveTables returns the distinct tables the rendered target
+// plans destroy something on beyond the primary plan, in a stable order. They
+// are the tables of the unsafe changes the unsafe gate counts for those plans
+// (templates.TargetPlanUnsafeChanges), so a table a target's plan drops, or
+// drops a column or index on, is looked up the way the primary plan's are. A
+// VSchema change is not a table's, and is left out as the primary plan's are.
+func targetPlanDestructiveTables(rollout *templates.DeploymentDriftData) []string {
+	var tables []string
+	for _, change := range templates.TargetPlanUnsafeChanges(rollout) {
+		if change.Table == "" || change.ChangeType == apitypes.VSchemaChangeType || slices.Contains(tables, change.Table) {
+			continue
+		}
+		tables = append(tables, change.Table)
+	}
+	slices.Sort(tables)
 	return tables
 }

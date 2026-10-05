@@ -196,8 +196,8 @@ func setupFakeGitHubForPlanComments(t *testing.T) (*ghclient.InstallationClient,
 
 // setupPlanCommentHandler builds a webhook handler over real SchemaBot storage
 // and the plan-comment fake GitHub, clearing prior rows for the given repo.
-// deleteUnactioned opts the server into the delete-based retirement policy;
-// false exercises the default minimize-based policy.
+// deleteUnactioned selects the default delete-based retirement policy; false
+// opts the server out to the minimize-based policy.
 func setupPlanCommentHandler(t *testing.T, repo string, deleteUnactioned bool) (*Handler, storage.Storage, *planCommentFakeGitHub) {
 	t.Helper()
 	ctx := t.Context()
@@ -224,7 +224,7 @@ func setupPlanCommentHandler(t *testing.T, repo string, deleteUnactioned bool) (
 	factory := &fakeClientFactory{client: installClient}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	cfg := &api.ServerConfig{DeleteUnactionedPlanComments: deleteUnactioned}
+	cfg := &api.ServerConfig{DeleteUnactionedPlanComments: &deleteUnactioned}
 	svc := api.New(st, cfg, map[string]tern.Client{}, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 
@@ -593,14 +593,15 @@ func TestPRWideStalePlanCommentSweepSkipsWhenHeadMoved(t *testing.T) {
 	assert.ElementsMatch(t, []string{"shaA", "shaC"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"))
 }
 
-// TestPlanCommentSupersedeDefaultPolicyMinimizes covers the default
-// minimize-based retirement policy, for a server that has not opted into
-// deletion: a superseded plan comment no apply acted on is minimized —
+// TestPlanCommentSupersedeMinimizePolicyMinimizes covers the minimize-based
+// retirement policy, for a server that opts out of deletion with
+// delete_unactioned_plan_comments: false: a superseded plan comment no apply
+// acted on is minimized —
 // collapsed in the timeline but still expandable — and a superseded comment
 // whose head an apply owns stays fully expanded as the operational record of
 // what ran. Nothing is ever deleted.
-func TestPlanCommentSupersedeDefaultPolicyMinimizes(t *testing.T) {
-	const repo = "org/plan-retire-default-policy"
+func TestPlanCommentSupersedeMinimizePolicyMinimizes(t *testing.T) {
+	const repo = "org/plan-retire-minimize-policy"
 	h, st, fake := setupPlanCommentHandler(t, repo, false)
 
 	slot := planCommentSlot{
@@ -618,7 +619,7 @@ func TestPlanCommentSupersedeDefaultPolicyMinimizes(t *testing.T) {
 	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at sha2")
 	assert.Equal(t, []string{"IC_node1001"}, fake.minimizedNodes(),
 		"the unactioned sha1 comment is minimized, not deleted")
-	assert.Empty(t, fake.deletedCommentIDs(), "the default policy never deletes")
+	assert.Empty(t, fake.deletedCommentIDs(), "the minimize policy never deletes")
 	assert.Equal(t, []string{"sha2"}, unretiredHeads(t, st, repo, 42, "payments", "mysql"))
 
 	// An apply now owns sha2; the next head leaves its comment fully expanded.
@@ -630,7 +631,7 @@ func TestPlanCommentSupersedeDefaultPolicyMinimizes(t *testing.T) {
 		"the apply-owned sha2 comment stays fully expanded")
 	assert.Empty(t, fake.deletedCommentIDs())
 	assert.ElementsMatch(t, []string{"sha2", "sha3"}, unretiredHeads(t, st, repo, 42, "payments", "mysql"),
-		"an apply-owned comment stays unretired under the default policy")
+		"an apply-owned comment stays unretired under the minimize policy")
 }
 
 // TestPlanCommentMinimizeFailureRetriesOnNextSupersede covers the retry

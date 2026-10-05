@@ -66,10 +66,24 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	}
 
 	engineState := deployStateToEngineState(dr.DeploymentState)
+	message := deployStateToMessage(dr.DeploymentState)
 
 	// Deferred deploy: the deploy request is ready but hasn't been triggered yet.
 	if meta.DeferredDeploy && dr.DeploymentState == deployState.Ready {
 		engineState = engine.StateWaitingForDeploy
+	}
+
+	// A deploy request closed before it was deployed keeps the deployment state
+	// it had (pending or ready), so read from that alone it would still look
+	// like a deploy waiting to start. Nothing can start it any more: a cancel
+	// or stop retires an undeployed deploy request by closing it, and so does
+	// an operator closing it in the PlanetScale UI. It is the cancelled outcome,
+	// and reporting it as such is what lets the apply settle — the
+	// waiting-for-deploy timeout stops the deploy request and then relies on
+	// this poll to read the result, as the cutover timeout does.
+	if deployRequestClosedUndeployed(dr) {
+		engineState = engine.StateCancelled
+		message = fmt.Sprintf("Deploy request #%d closed before it was deployed", dr.Number)
 	}
 
 	// Recover the instant DDL flag for an apply whose metadata was persisted
@@ -149,7 +163,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	result := &engine.ProgressResult{
 		State:       engineState,
-		Message:     deployStateToMessage(dr.DeploymentState),
+		Message:     message,
 		ResumeState: req.ResumeState,
 		Metadata:    psDisplayMetadata(meta),
 	}
@@ -632,7 +646,7 @@ func failedShard(rows []vitessMigrationRow) (vitessMigrationRow, bool) {
 }
 
 // showVitessMigrationsForKeyspace connects to vtgate and runs
-// SHOW VITESS_MIGRATIONS LIKE '<context>' for a single keyspace.
+// SHOW VITESS_MIGRATIONS FROM `<keyspace>` LIKE '<context>' for a single keyspace.
 // If migrationContext is empty, returns all migrations.
 func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keyspace, migrationContext string) ([]vitessMigrationRow, error) {
 	if migrationContext != "" {
@@ -646,23 +660,10 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		return nil, fmt.Errorf("get vtgate connection for keyspace %s: %w", keyspace, err)
 	}
 
-	conn, err := db.Conn(ctx)
+	query := showVitessMigrationsQuery(keyspace, migrationContext)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("get connection: %w", err)
-	}
-	defer utils.CloseAndLog(conn)
-
-	if _, err := conn.ExecContext(ctx, "USE `"+keyspace+"`"); err != nil {
-		return nil, fmt.Errorf("use keyspace %s: %w", keyspace, err)
-	}
-
-	query := "SHOW VITESS_MIGRATIONS"
-	if migrationContext != "" {
-		query += " LIKE '" + migrationContext + "'"
-	}
-	rows, err := conn.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("show vitess_migrations: %w", err)
+		return nil, fmt.Errorf("show vitess_migrations for keyspace %s: %w", keyspace, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -738,6 +739,20 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		result = append(result, row)
 	}
 	return result, rows.Err()
+}
+
+// showVitessMigrationsQuery builds the SHOW VITESS_MIGRATIONS statement for one
+// keyspace. The keyspace is named in the statement rather than selected with
+// USE, so the query leaves no session state on the pooled vtgate connection:
+// the pool is shared with other readers, and a connection handed back still
+// switched to this keyspace would silently point the next reader at the wrong
+// keyspace. migrationContext must already have passed validateMigrationContext.
+func showVitessMigrationsQuery(keyspace, migrationContext string) string {
+	query := "SHOW VITESS_MIGRATIONS FROM `" + strings.ReplaceAll(keyspace, "`", "``") + "`"
+	if migrationContext != "" {
+		query += " LIKE '" + migrationContext + "'"
+	}
+	return query
 }
 
 // validateMigrationContext rejects migration context strings containing unsafe characters.

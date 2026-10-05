@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,9 @@ type fakeBuildTracker struct {
 	snapshot  progress.Snapshot
 	cancelErr error
 	cancelled atomic.Bool
+	// cancelBuild, when set, replaces the default CancelBuild so a test can
+	// script what one signal attempt does and when it returns.
+	cancelBuild func(ctx context.Context) error
 }
 
 func (f *fakeBuildTracker) Progress(context.Context) (progress.Snapshot, error) {
@@ -26,6 +30,9 @@ func (f *fakeBuildTracker) Progress(context.Context) (progress.Snapshot, error) 
 }
 
 func (f *fakeBuildTracker) CancelBuild(ctx context.Context) error {
+	if f.cancelBuild != nil {
+		return f.cancelBuild(ctx)
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -111,11 +118,28 @@ func cancelRequest() *engine.ControlRequest {
 	return &engine.ControlRequest{ResumeState: &engine.ResumeState{MigrationContext: cancelTestKey}}
 }
 
+// requestedCancel reports what the drive would read when classifying a
+// cancellation it sees.
 func requestedCancel(t *testing.T, eng *Engine) bool {
 	t.Helper()
-	eng.mu.Lock()
-	defer eng.mu.Unlock()
-	return eng.progress[cancelTestKey].cancelRequested
+	return eng.cancelRequested(cancelTestKey)
+}
+
+// settleCancelledBuild settles the drive as the real drive does when its build
+// comes back cancelled: as the operator's cancel only when the engine reads a
+// cancel as requested, and otherwise as a failure the next drive retries.
+func (d *fakeDrive) settleCancelledBuild() {
+	if d.eng.cancelRequested(d.key) {
+		d.settle(engine.StateCancelled, "")
+		return
+	}
+	d.settle(engine.StateFailed, "concurrent index build cancelled from outside SchemaBot")
+}
+
+func (d *fakeDrive) publishedState() engine.State {
+	d.eng.mu.Lock()
+	defer d.eng.mu.Unlock()
+	return d.eng.progress[d.key].result.State
 }
 
 // A cancel that reaches the running build signals its backend, leaves the
@@ -291,4 +315,139 @@ func TestCancelReportsABuildThatHasNotSettled(t *testing.T) {
 	assert.True(t, tracker.cancelled.Load())
 	assert.False(t, drive.wasCancelled())
 	assert.True(t, requestedCancel(t, eng))
+}
+
+// An operator cancels a concurrent index build and the signal reaches the
+// build backend, but the caller's deadline expires before the reply comes
+// back. The caller hears an error, yet the build returns cancelled by that
+// signal, and the drive records the operator's cancel rather than a failure
+// for the next drive to retry.
+func TestCancelStaysRequestedWhenTheCallerGivesUpAfterSignalling(t *testing.T) {
+	ctx, giveUp := context.WithCancel(t.Context())
+	defer giveUp()
+	tracker := &fakeBuildTracker{}
+	tracker.cancelBuild = func(context.Context) error {
+		tracker.cancelled.Store(true)
+		giveUp()
+		return fmt.Errorf("cancel concurrent index build backend 4242: read reply: %w", context.DeadlineExceeded)
+	}
+	eng, drive := runningDrive(t, tracker, true)
+
+	result, err := eng.Cancel(ctx, cancelRequest())
+
+	assert.Nil(t, result)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, drive.wasCancelled(), "a caller that gave up does not fall back to the drive's context")
+	assert.True(t, requestedCancel(t, eng), "a signal that may have landed keeps the cancel requested")
+	drive.settleCancelledBuild()
+	assert.Equal(t, engine.StateCancelled, drive.publishedState())
+}
+
+// A caller that gives up after the tracker positively reports that nothing was
+// signalled — whichever typed outcome says so — leaves no cancel recorded, so
+// a backend cancellation from outside SchemaBot is still a failure the next
+// drive retries.
+func TestCancelIsNotRequestedWhenTheCallerGivesUpWithNothingSignalled(t *testing.T) {
+	tests := []struct {
+		name    string
+		notSent error
+	}{
+		{name: "no active build", notSent: progress.ErrNoActiveBuild},
+		{name: "build not running", notSent: progress.ErrBuildNotRunning},
+		{name: "build unobservable", notSent: progress.ErrBuildUnobservable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, giveUp := context.WithCancel(t.Context())
+			defer giveUp()
+			tracker := &fakeBuildTracker{}
+			tracker.cancelBuild = func(context.Context) error {
+				giveUp()
+				return fmt.Errorf("cancel concurrent index build backend 4242: %w", tc.notSent)
+			}
+			eng, drive := runningDrive(t, tracker, true)
+
+			result, err := eng.Cancel(ctx, cancelRequest())
+
+			assert.Nil(t, result)
+			require.ErrorIs(t, err, tc.notSent)
+			assert.False(t, drive.wasCancelled())
+			assert.False(t, requestedCancel(t, eng))
+			drive.settleCancelledBuild()
+			assert.Equal(t, engine.StateFailed, drive.publishedState())
+		})
+	}
+}
+
+// Two cancels for the same build overlap. The first signals the build
+// backend; a retry whose caller gives up finds nothing it could signal. The
+// build comes back cancelled by the first signal — whether or not the first
+// call has heard back yet — and both the drive and the first caller report the
+// operator's cancel: the retry that sent nothing does not withdraw it.
+func TestCancelThatSendsNothingDoesNotWithdrawAnOverlappingCancel(t *testing.T) {
+	tests := []struct {
+		name string
+		// buildReturnsInFlight has the build come back cancelled while the
+		// first call is still waiting for its signal's reply.
+		buildReturnsInFlight bool
+	}{
+		{name: "first signal still awaiting its reply", buildReturnsInFlight: true},
+		{name: "first signal acknowledged and waiting to settle", buildReturnsInFlight: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			firstEntered, retryReturned := make(chan struct{}), make(chan struct{})
+			retryCtx, giveUp := context.WithCancel(t.Context())
+			defer giveUp()
+			tracker := &fakeBuildTracker{}
+			eng, drive := runningDrive(t, tracker, true)
+			var calls atomic.Int32
+			tracker.cancelBuild = func(context.Context) error {
+				if calls.Add(1) > 1 {
+					giveUp()
+					return fmt.Errorf("cancel concurrent index build backend 4242: %w", progress.ErrBuildNotRunning)
+				}
+				close(firstEntered)
+				if tc.buildReturnsInFlight {
+					<-retryReturned
+					drive.settleCancelledBuild()
+				}
+				return nil
+			}
+
+			type outcome struct {
+				result *engine.ControlResult
+				err    error
+			}
+			first := make(chan outcome, 1)
+			go func() {
+				result, err := eng.Cancel(t.Context(), cancelRequest())
+				first <- outcome{result: result, err: err}
+			}()
+			select {
+			case <-firstEntered:
+			case <-time.After(backgroundApplyDeadline):
+				require.FailNow(t, "the first cancel never reached the tracker")
+			}
+
+			_, err := eng.Cancel(retryCtx, cancelRequest())
+			require.ErrorIs(t, err, progress.ErrBuildNotRunning)
+			close(retryReturned)
+			if !tc.buildReturnsInFlight {
+				drive.settleCancelledBuild()
+			}
+
+			var got outcome
+			select {
+			case got = <-first:
+			case <-time.After(backgroundApplyDeadline):
+				require.FailNow(t, "the first cancel never settled")
+			}
+			require.NoError(t, got.err)
+			assert.True(t, got.result.Accepted)
+			assert.Equal(t, "Concurrent index build cancelled", got.result.Message)
+			assert.Equal(t, engine.StateCancelled, drive.publishedState())
+			assert.True(t, requestedCancel(t, eng))
+		})
+	}
 }

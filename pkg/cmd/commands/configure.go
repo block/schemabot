@@ -100,8 +100,9 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 // reconfiguredProfile returns the profile to save once the operator has chosen
 // an endpoint, and reports whether a cached login was dropped. Everything
 // `login` wrote survives an unchanged endpoint. A changed endpoint drops the
-// cached token, its refresh token, and its expiry: a token is bound to the
-// server that issued it and must never be sent to a different one. The oidc
+// cached token, its refresh token, its expiry, and the issuer and client ID it
+// came from: a token is bound to the server that issued it and must never be
+// sent to a different one. The oidc
 // settings are kept either way, since `login` can still use or override them.
 func reconfiguredProfile(existing client.Profile, endpoint string) (profile client.Profile, loginCleared bool) {
 	profile = existing
@@ -111,6 +112,8 @@ func reconfiguredProfile(existing client.Profile, endpoint string) (profile clie
 		profile.Token = ""
 		profile.RefreshToken = ""
 		profile.TokenExpiry = 0
+		profile.TokenIssuer = ""
+		profile.TokenClientID = ""
 		loginCleared = true
 	}
 	return profile, loginCleared
@@ -216,6 +219,12 @@ func (cmd *ConfigureShowCmd) Run(g *Globals) error {
 				marker = "* "
 			}
 			fmt.Printf("    %s%s: %s\n", marker, name, profile.Endpoint)
+			// The recorded pair, not the oidc settings, is where refresh goes,
+			// so show it: otherwise an edit to oidc that has no effect on the
+			// session is visible only by reading the config file.
+			if profile.TokenIssuer != "" || profile.TokenClientID != "" {
+				fmt.Printf("        refreshes at %s as client %s (recorded at login)\n", profile.TokenIssuer, profile.TokenClientID)
+			}
 		}
 	}
 

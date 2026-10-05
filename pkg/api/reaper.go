@@ -162,6 +162,10 @@ func (s *Service) reaperLoop(ctx context.Context, stop <-chan struct{}, interval
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	if claimGateClosed(stop) {
+		s.logger.Debug("operator: reaper stopping before its first pass", "pass", name)
+		return
+	}
 	pass(ctx)
 
 	for {
@@ -173,6 +177,10 @@ func (s *Service) reaperLoop(ctx context.Context, stop <-chan struct{}, interval
 			s.logger.Debug("operator: reaper stopping", "pass", name, "error", ctx.Err())
 			return
 		case <-ticker.C:
+			if claimGateClosed(stop) {
+				s.logger.Debug("operator: reaper stopping instead of a polled pass", "pass", name)
+				return
+			}
 			pass(ctx)
 		}
 	}

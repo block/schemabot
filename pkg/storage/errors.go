@@ -23,8 +23,11 @@ var (
 	// released and a new one acquired in its place.
 	ErrLockReplaced = errors.New("lock was replaced by a new lock")
 
-	// ErrLockIntentChanged is returned when an apply's captured lock owner or
-	// pending plan no longer matches at durable apply creation time.
+	// ErrLockIntentChanged is returned when the lock's pending plan is no longer
+	// the one a caller observed: an apply's captured lock owner or pending plan
+	// no longer matches at durable apply creation time, a conditional acquire
+	// finds the same owner's lock pinned to another intent, or a row-pinned
+	// release finds the row re-acquired for another plan.
 	ErrLockIntentChanged = errors.New("lock intent changed")
 
 	// ErrCheckNotFound is returned when a check does not exist.
@@ -66,6 +69,10 @@ var (
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
 
+	// ErrOperationLeaseActive is returned when a repair write requires an
+	// operation to remain unleased but a live drive owns it.
+	ErrOperationLeaseActive = errors.New("operation lease is active")
+
 	// ErrApplyAlreadySuperseded is returned when a handoff would reassign an
 	// apply's superseded_by marker to a different successor. The marker is
 	// write-once, so a second claimant means the takeover is ambiguous.
@@ -97,6 +104,13 @@ var (
 	// ErrApplyOperationExists is returned when an apply_operations row for
 	// (apply_id, deployment, operation_key) is being inserted but already exists.
 	ErrApplyOperationExists = errors.New("apply operation already exists")
+
+	// ErrApplyOperationKeyingMismatch is returned when an attached operation is
+	// keyed by its target (see ApplyOperation.KeyedByTarget) and the
+	// deployment's existing operations of the apply are not, or the reverse.
+	// Mixing the two shapes would let one target's work attach twice under two
+	// keys, so the attach is refused.
+	ErrApplyOperationKeyingMismatch = errors.New("apply operation keying does not match the deployment's existing operations")
 
 	// ErrEngineResumeStateNotFound is returned when no opaque engine resume state exists for an operation.
 	ErrEngineResumeStateNotFound = errors.New("engine resume state not found")

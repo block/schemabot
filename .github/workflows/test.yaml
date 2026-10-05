@@ -214,6 +214,7 @@ jobs:
             mysql:8.0 \
             mysql:8.4 \
             postgres:16 \
+            postgres:17 \
             ministackorg/ministack:1.5.10 \
             testcontainers/ryuk:0.13.0
       - name: "Pre-pull Supabase PostgreSQL"
@@ -548,6 +549,8 @@ jobs:
             run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability|BarrierReleaseBounded)$$
           - shard: failure-policy
             run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue|OnFailurePauseRelease)$$
+          - shard: targets
+            run: TestGRPCMultiDeploy_(TargetsRolloutThroughCLI)$$
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"

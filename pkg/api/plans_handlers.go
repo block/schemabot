@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -174,8 +173,13 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 		if nsData == nil {
 			continue
 		}
-		if nsData.ChangesVSchema() {
+		if nsData.ShowsVSchemaChange() {
 			summary.VSchemaChangeCount++
+		}
+		// A finalize beside a namespace's DDL or VSchema change is part of that
+		// work, so only a namespace whose only work is the finalize counts.
+		if nsData.Finalize && !nsData.ShowsVSchemaChange() && len(nsData.Tables) == 0 {
+			summary.FinalizeCount++
 		}
 		for _, change := range nsData.Tables {
 			if summary.ChangeCounts == nil {
@@ -189,7 +193,7 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 			if change.IsUnsafe {
 				summary.UnsafeCount++
 			}
-			if change.ExecutionMode == engine.ExecutionModeBlocked {
+			if change.EngineBlocked() {
 				summary.BlockedCount++
 			}
 		}
@@ -224,6 +228,7 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 		Environment:  plan.Environment,
 		Deployment:   plan.Deployment,
 		Target:       plan.Target,
+		NarrowedTo:   plan.NarrowedTo,
 		Engine:       storage.EngineForType(plan.DatabaseType),
 		Changes:      []*apitypes.SchemaChangeResponse{},
 		LintResults:  []*apitypes.LintViolationResponse{},
@@ -240,6 +245,21 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 			// rendered diff, so the namespace is flagged as carrying VSchema
 			// work without one.
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
+			if !nsData.ShowsVSchemaChange() {
+				// Carried so the stored plan renders the namespace the way
+				// the live plan did: by its DDL and finalize, with no VSchema
+				// change of its own.
+				change.Metadata[apitypes.VSchemaGeneratedOnlyMetadataKey] = "true"
+			}
+		}
+		if nsData.Finalize {
+			// The stored finalize request is reported under the key the
+			// engine planned it with, so a stored finalize-only plan still
+			// reads as having changes.
+			if change.Metadata == nil {
+				change.Metadata = map[string]string{}
+			}
+			change.Metadata[apitypes.NeedsFinalizerMetadataKey] = "true"
 		}
 		for _, table := range nsData.Tables {
 			tc := tableChangeResponseFromStorage(table)
@@ -270,6 +290,12 @@ func tableChangeResponseFromStorage(change storage.TableChange) *apitypes.TableC
 		UnsafeReason:  change.UnsafeReason,
 		ExecutionMode: change.ExecutionMode,
 		ModeReason:    change.ModeReason,
+		// The size estimates persist with the plan, so the stored-plan view
+		// reports the same sizes a freshly planned response does.
+		EstimatedRows:    change.EstimatedRows,
+		ShardCount:       change.ShardCount,
+		LargestShardRows: change.LargestShardRows,
+		EstimatedBytes:   change.EstimatedBytes,
 	}
 }
 

@@ -347,6 +347,11 @@ func TestValidateRejectsNegativeRateLimits(t *testing.T) {
 			limits:  RateLimitsConfig{Pull: EndpointRateLimitConfig{PerTarget: RateLimitBudgetConfig{Burst: -1}}},
 			wantErr: "rate_limits.pull.per_target.burst must not be negative",
 		},
+		{
+			name:    "negative check inspection rate",
+			limits:  RateLimitsConfig{ChecksInspect: CallerRateLimitConfig{PerCaller: RateLimitBudgetConfig{RequestsPerMinute: -1}}},
+			wantErr: "rate_limits.checks_inspect.per_caller.requests_per_minute must not be negative",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

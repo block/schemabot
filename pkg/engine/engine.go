@@ -365,6 +365,13 @@ type PlanResult struct {
 	// ordinary case.
 	ExistingCopies []*ExistingCopy
 
+	// ExistingCopiesChecked is set by an engine that read the target for every
+	// copy applying this plan could meet, so an empty ExistingCopies means the
+	// target holds none. It stays false when the engine does not look, or when
+	// any lookup failed, and a caller that must know nothing is at stake treats
+	// that as unknown rather than clean.
+	ExistingCopiesChecked bool
+
 	// ExemptTables lists live tables intentionally excluded from a plan verdict,
 	// grouped by namespace and carrying the engine-agnostic reason for exemption.
 	ExemptTables []*ExemptTables
@@ -451,6 +458,32 @@ type SchemaChange struct {
 	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
 }
 
+// MetadataNeedsFinalizer is the plan change-metadata key ("true") an engine
+// sets on a namespace's change when the namespace needs its group finalizer to
+// run once every shard's DDL has landed, whether or not its VSchema changes.
+// It is the scheduling signal for the finalizer; a VSchema change schedules one
+// too, because applying the VSchema is finalizer work. Engines that finish a
+// namespace's work in its DDL never set it.
+const MetadataNeedsFinalizer = "needs_finalizer"
+
+// MetadataVSchemaGeneratedOnly is the plan change-metadata key ("true") an
+// engine sets beside vschema_changed when every difference in the namespace's
+// VSchema is one the engine generates from the plan's own DDL, such as the
+// entries and column lists of the tables the plan creates or alters. The
+// VSchema is still written, but there is nothing hand-written to review, so
+// the engine sends no rendered diff, and plan surfaces show the namespace as
+// finalized after its DDL rather than as a VSchema change with no diff.
+// Engines set it on every change of the namespace that reports VSchema work; a
+// sharded namespace whose changes disagree renders without it. Display-only:
+// no scheduling or safety gate reads it.
+const MetadataVSchemaGeneratedOnly = "vschema_generated_only"
+
+// NeedsFinalizer reports whether the engine asked for this change's namespace
+// to be finalized after its DDL.
+func (sc SchemaChange) NeedsFinalizer() bool {
+	return sc.Metadata[MetadataNeedsFinalizer] == "true"
+}
+
 // ShardName returns the shard this change targets, trimmed of surrounding
 // whitespace. Empty when the change targets the whole namespace.
 func (sc SchemaChange) ShardName() string {
@@ -488,6 +521,12 @@ type LintViolation struct {
 	Severity string // "warning" or "error"
 }
 
+// TableSizeProbeTimeout bounds the plan-time table-size statistics probe.
+// Size estimates are display-only, so a probe that cannot answer within this
+// budget is abandoned and the plan proceeds without sizes — a slow or wedged
+// statistics read must never extend plan latency past this bound.
+const TableSizeProbeTimeout = 5 * time.Second
+
 // TableChange describes a change to a single table within a SchemaChange namespace.
 type TableChange struct {
 	Table     string // Table name
@@ -507,6 +546,34 @@ type TableChange struct {
 	// *can* run but the operator must acknowledge.
 	ExecutionMode string
 	ModeReason    string // Engine's reason for any non-empty ExecutionMode verdict
+
+	// EstimatedRows is the approximate number of rows in the table at plan
+	// time, for display only. Sourced from engine statistics, which may be
+	// stale — never an exact count and never a gate input. An engine that
+	// aggregates a sharded target itself reports the sum across shards; an
+	// engine that emits one SchemaChange per shard reports each shard's own
+	// estimate and the core sums them into the namespace-level view. Nil when
+	// no estimate is available (e.g. the table is being created, or statistics
+	// could not be read). Several TableChanges for one table each carry that
+	// table's full estimate, so a consumer aggregating across changes must
+	// dedupe by table.
+	EstimatedRows *int64
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes) at plan time, for display only. Same sourcing, aggregation, and
+	// nil semantics as EstimatedRows.
+	EstimatedBytes *int64
+	// ShardCount is the number of shards this table change spans. Zero means
+	// there is no shard count to render: the target is not sharded, or its
+	// shard topology could not be read. The two are indistinguishable here, so
+	// a renderer must omit the shard count on zero rather than assert the
+	// table is unsharded.
+	ShardCount int
+	// LargestShardRows is the approximate row count of the largest single
+	// shard, the biggest chunk a shard-at-a-time apply works through at once.
+	// Nil when the target is not sharded, or when any planned shard has no row
+	// estimate: the shard with no estimate could be the largest, so a maximum
+	// over the others would name a smaller shard as the largest.
+	LargestShardRows *int64
 }
 
 // Execution-mode verdicts recorded on a planned table change. The verdict
@@ -522,8 +589,8 @@ const (
 
 	// ExecutionModeDirect marks a statement the engine refuses but that the
 	// database's direct execution policy routes to native DDL on the target
-	// instead: it runs synchronously, it blocks writes to the table while it
-	// runs, and it is not revertible.
+	// instead: it runs synchronously and blocks writes to the table while it
+	// runs.
 	ExecutionModeDirect = "direct"
 )
 
@@ -673,11 +740,17 @@ const (
 	MetadataDirectExecution = "direct_execution"
 
 	// MetadataDirectExecutionMaxTableRows bounds direct execution by the
-	// target table's row count. Required (a positive integer) when direct
-	// execution is enabled, so a native table rebuild can never run
-	// unbounded: above the bound — or when the size cannot be determined —
-	// the statement stays blocked.
+	// target table's row count. An enabled policy carries exactly one of this
+	// bound and the byte bound, so a native table rebuild can never run
+	// unbounded. When present it must be a positive integer.
 	MetadataDirectExecutionMaxTableRows = "direct_execution_max_table_rows"
+
+	// MetadataDirectExecutionMaxTableBytes bounds direct execution by the
+	// target table's on-disk footprint, data plus indexes, in bytes. Optional;
+	// when present it must be a positive integer, and the row bound must be
+	// absent. A statement runs directly when the table is within the bound
+	// the policy sets; a table whose size cannot be determined stays blocked.
+	MetadataDirectExecutionMaxTableBytes = "direct_execution_max_table_bytes"
 
 	// MetadataDirectExecutionLockAcquisitionTimeoutSeconds bounds, in whole
 	// seconds, how long each direct statement waits to acquire its locks
@@ -686,6 +759,15 @@ const (
 	// default when the key is absent.
 	MetadataDirectExecutionLockAcquisitionTimeoutSeconds = "direct_execution_lock_acquisition_timeout_seconds"
 )
+
+// DirectExecutionSettings is a direct execution policy in the shape the
+// metadata keys above carry it. Zero-valued optional bounds state nothing.
+type DirectExecutionSettings struct {
+	Enabled                       bool
+	MaxTableRows                  int64
+	MaxTableBytes                 int64
+	LockAcquisitionTimeoutSeconds int64
+}
 
 // DirectExecutionMetadata renders a direct execution policy into the metadata
 // keys above. It is the one place the policy becomes metadata, so the server
@@ -700,16 +782,26 @@ const (
 // stated no policy at all — and a surface that cannot tell those apart
 // overlays its own grant onto the opt-out. A lock timeout of zero renders
 // nothing, leaving the engine's own default in effect.
-func DirectExecutionMetadata(enabled bool, maxTableRows, lockAcquisitionTimeoutSeconds int64) map[string]string {
-	if !enabled {
+//
+// Both size bounds are optional, and each renders whenever it is non-zero,
+// negative included: a surface that could not read a stored bound records it
+// as negative, and the engine must see that value to refuse it, where omitting
+// it would quietly change the policy the apply was admitted under. An enabled
+// policy with neither bound, or with both, renders as stated, and the engine
+// refuses it.
+func DirectExecutionMetadata(s DirectExecutionSettings) map[string]string {
+	if !s.Enabled {
 		return map[string]string{MetadataDirectExecution: "false"}
 	}
-	md := map[string]string{
-		MetadataDirectExecution:             "true",
-		MetadataDirectExecutionMaxTableRows: strconv.FormatInt(maxTableRows, 10),
+	md := map[string]string{MetadataDirectExecution: "true"}
+	if s.MaxTableRows != 0 {
+		md[MetadataDirectExecutionMaxTableRows] = strconv.FormatInt(s.MaxTableRows, 10)
 	}
-	if lockAcquisitionTimeoutSeconds > 0 {
-		md[MetadataDirectExecutionLockAcquisitionTimeoutSeconds] = strconv.FormatInt(lockAcquisitionTimeoutSeconds, 10)
+	if s.MaxTableBytes != 0 {
+		md[MetadataDirectExecutionMaxTableBytes] = strconv.FormatInt(s.MaxTableBytes, 10)
+	}
+	if s.LockAcquisitionTimeoutSeconds > 0 {
+		md[MetadataDirectExecutionLockAcquisitionTimeoutSeconds] = strconv.FormatInt(s.LockAcquisitionTimeoutSeconds, 10)
 	}
 	return md
 }
@@ -722,6 +814,7 @@ func DirectExecutionKeys() []string {
 	return []string{
 		MetadataDirectExecution,
 		MetadataDirectExecutionMaxTableRows,
+		MetadataDirectExecutionMaxTableBytes,
 		MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
 	}
 }

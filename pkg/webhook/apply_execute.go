@@ -12,7 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/routing"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -28,6 +28,11 @@ import (
 // gate below is not scoped that way: it stops an operator's own apply-confirm too,
 // because a copy can appear after the comment they confirmed was posted.
 //
+// disclosedPlan is the plan whose comment the operator was last shown: the
+// stored plan on the auto-confirm path, the pending confirmation's plan on
+// apply-confirm. A re-plan that routes a statement to direct execution that
+// disclosedPlan did not stops on either path, since no comment disclosed it.
+//
 // disclosedCopyDiscard is what the comment behind this apply told the operator
 // about an unfinished copy on the target, read from the lock's pending
 // confirmation. It is the consent this re-plan is checked against: the plan
@@ -37,7 +42,7 @@ func (h *Handler) executeApply(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, schemaResult *ghclient.SchemaRequestResult,
 	environment string, installationID int64, requestedBy string,
-	result CommandResult, storedPlan *storage.Plan, expectedPendingPlanID string,
+	result CommandResult, storedPlan, disclosedPlan *storage.Plan, expectedPendingPlanID string,
 	disclosedCopyDiscard bool,
 ) {
 	database := schemaResult.Database
@@ -109,18 +114,111 @@ func (h *Handler) executeApply(
 		return
 	}
 
+	// A confirmation given against the comment saying the primary target
+	// already had this schema, which showed only the other targets' plans, does
+	// not cover changes the primary target has gained since: none of them were
+	// on that comment, so they never run on the strength of it. Any other
+	// confirmation was given against the primary target's own plan, and the
+	// gates below re-check that.
+	if storedPlan == nil && planResp.HasChanges() {
+		confirmedConverged, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, environment)
+		if roundErr != nil {
+			h.logger.Error("apply-confirm rejected: could not load the confirmed plan and its review round to compare with the primary target's changes; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", roundErr)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+			return
+		}
+		if confirmedConverged {
+			h.logger.Info("apply-confirm refused: the primary target has changes the confirmed comment did not show",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the primary target has changes the confirmation did not cover")
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"The comment this confirmation acts on showed the primary target already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.")
+			return
+		}
+	}
+
 	// No changes (neither table DDL nor a VSchema update) — release the lock
 	// (keyed on the pending intent this handler observed, so a lock re-pinned by
 	// a newer plan is preserved) and notify. An empty primary plan speaks only
 	// for the primary where members hold schemas of their own, so the other
 	// members are planned first and their work, if any, answers.
-	if !planResp.HasChanges() {
-		rollout, _ := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
-		if rolloutStillPending(rollout) {
-			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rest of the rollout is not at the desired schema")
-			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout)
+	//
+	// The rollout round runs for a primary target with work too: the apply is
+	// created from this re-plan, and each other target runs the plan this round
+	// stores for it, bound to this re-plan.
+	//
+	// Other targets' work runs only from apply-confirm, and only when the
+	// confirmation was given against exactly that work. An automatic apply
+	// reaching here with other targets' work saw it appear after its comment was
+	// posted without it, so it refuses.
+	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+	primaryTargetConverged := !planResp.HasChanges()
+	refuseRollout := func(reason string) {
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
+		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged)
+	}
+	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
+	// confirmedMemberWork records that this confirmation was checked against
+	// every other target's work, so apply creation may run the direct changes
+	// the comment disclosed under those targets.
+	confirmedMemberWork := false
+	switch {
+	case runsMemberWork && storedPlan == nil:
+		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment)
+		if coverErr != nil {
+			// The confirmation is kept: nothing is known to be wrong with it,
+			// and a retry can still confirm the plans the operator reviewed.
+			h.logger.Error("apply-confirm rejected: could not verify that the confirmation covers the other targets' work; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", coverErr)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"SchemaBot could not verify the plans this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
 			return
 		}
+		if !covered {
+			h.logger.Info("apply-confirm refused: the other targets' work is not what the confirmation was given against",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rollout's work is not what was confirmed")
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
+			return
+		}
+		// The statements match the confirmed round's, but a copy can appear on
+		// a target after the comment was posted, and work the apply cannot run
+		// is refused here, releasing the confirmation, rather than at apply
+		// creation, which would leave it pinned.
+		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
+		if refusalErr != nil {
+			h.logger.Error("apply-confirm rejected: could not verify that the other targets' plans can run from this apply; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", refusalErr)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+			return
+		}
+		if refusal != "" {
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
+			return
+		}
+		confirmedMemberWork = true
+		h.logger.Info("apply-confirm: running the confirmed plans of the other targets that still need the change",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names)
+	case runsMemberWork:
+		refuseRollout("other targets' work was not on the comment this automatic apply acts on")
+		return
+	case rollout.blocks():
+		refuseRollout("the rollout round could not confirm every target's plan")
+		return
+	case primaryTargetConverged && rolloutStillPending(rollout):
+		refuseRollout("the rest of the rollout is not at the desired schema")
+		return
+	case primaryTargetConverged:
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no changes to apply")
 		// The target already matches the PR schema — apply found nothing to do.
 		// Record the passing (no-change) check result and refresh the aggregate so
@@ -134,15 +232,45 @@ func (h *Handler) executeApply(
 		}
 		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoChanges(database, environment))
 		return
+	default:
+		// The primary target's re-plan runs from this confirmation even when
+		// no other target has work left, so in a rollout it must be the work
+		// the confirmed comment showed. A rollout that has since shrunk to the
+		// primary target is still checked against its confirmed round.
+		if storedPlan == nil {
+			difference, coverErr := h.confirmationCoversPrimaryTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
+			if coverErr != nil {
+				h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its round, or the re-plan to compare the primary target's work; the pending confirmation is preserved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", coverErr)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+				return
+			}
+			if difference != workUnchanged {
+				reason := primaryTargetDifferenceReason(difference)
+				h.logger.Info("apply-confirm refused: the primary target would run work the confirmed plan did not show",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					unconfirmedWorkMessage(rollout.work, reason))
+				return
+			}
+		}
+		h.logger.Debug("apply: only the primary target's own plan runs",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
 	}
-
 	// Engine-blocked changes reject the apply outright — the re-plan may have
-	// resolved a change to blocked even if the reviewed plan had none (e.g.
+	// resolved a change to blocked even if the primary plan had none (e.g.
 	// the direct execution policy changed, or the table grew past its bound).
 	// Release the lock: no retry of this command can succeed, so holding it
-	// would only force a manual unlock after the schema is rewritten.
+	// would only force a manual unlock after the schema is rewritten. An
+	// apply-confirm given on a rollout's comment refuses a reviewed-target
+	// statement newly resolved to blocked above instead, since how each
+	// statement runs is part of the confirmed plan it is held to.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
@@ -157,7 +285,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			planDriftCause(planResp, storedPlan)); err != nil {
+			planDriftCause(planResp, storedPlan), rolloutPreview); err != nil {
 			h.logger.Error("failed to post the DDL-drift downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -165,22 +293,45 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Direct-execution changes never run from the automatic apply path: the
-	// operator must confirm the blocking, non-revertible native DDL against
-	// the locked plan comment that discloses it, so downgrade to manual
-	// confirmation.
-	if storedPlan != nil && len(planResp.DirectChanges()) > 0 {
-		h.logger.Info("automatic apply downgraded: plan contains direct-execution changes",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		// The direct-execution disclosure is already on this comment, naming
-		// the statements and what running them costs.
-		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			nil); err != nil {
-			h.logger.Error("failed to post the direct-execution downgrade comment",
+	// Engine refusals are judged against the live table, so the re-plan can
+	// route a statement to direct execution that the plan behind the comment the
+	// operator was last shown ran through the engine, without its DDL changing.
+	// That comment never disclosed the native DDL, so stop and ask against one
+	// that does.
+	//
+	// On a single target, the pending confirmation moves onto this re-plan, so
+	// confirming it is checked against the comment that disclosed the direct
+	// statements rather than stopping again on the old one. An apply-confirm
+	// given on a rollout's comment never reaches here with such a change: the
+	// primary target is held to its whole confirmed plan above, how each
+	// statement runs included, so a statement newly routed to direct execution
+	// refuses there and releases the lock, and the operator reviews the rollout
+	// again with a fresh apply.
+	if disclosedPlan != nil {
+		if newlyDirect := newlyDirectChanges(planResp, disclosedPlan); len(newlyDirect) > 0 {
+			h.logger.Info("apply stopped for confirmation: re-plan routes changes to direct execution that the disclosed plan did not",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-				"environment", environment, "error", err)
+				"environment", environment, "action", actionName,
+				"plan_id", planResp.PlanID, "disclosed_plan_id", disclosedPlan.PlanIdentifier, "newly_direct", len(newlyDirect))
+			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				newlyDirectCause(newlyDirect), rolloutPreview); err != nil {
+				h.logger.Error("failed to post the comment disclosing the newly-direct changes, so the pending confirmation was not moved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				return
+			}
+			// The comment just posted renders this re-plan, so it discloses
+			// whatever unfinished copy the re-plan would discard.
+			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+				h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the newly-direct changes",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"Some changes now run as direct execution. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to see how they will run.")
+			}
+			return
 		}
-		return
 	}
 
 	// The copy on the target is read fresh on every plan, so this re-plan can
@@ -203,7 +354,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			nil); err != nil {
+			nil, rolloutPreview); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -225,8 +376,9 @@ func (h *Handler) executeApply(
 	// --defer-cutover only affects engine-driven statements; an all-direct
 	// plan has no cutover to defer, so reject the flag instead of silently
 	// ignoring it. Only apply-confirm reaches this gate (the apply command
-	// rejects the flag before locking, and an automatic apply whose re-plan
-	// carries direct changes downgrades above), so keep the lock: it still
+	// rejects the flag before locking on an all-direct plan, and an apply whose
+	// re-plan routes changes to direct execution that the disclosed plan did
+	// not stops above), so keep the lock: it still
 	// pins the plan the operator confirmed against, and re-running
 	// apply-confirm without the flag executes it.
 	if result.DeferCutover && planResp.AllChangesDirect() {
@@ -237,13 +389,9 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
-	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
-		commentData.ScopedDatabase = result.Database
-		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
-		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+	// Block unsafe changes on confirm (re-plan may have detected new unsafe
+	// changes), on every target the apply runs.
+	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview); blocked {
 		return
 	}
 
@@ -274,27 +422,18 @@ func (h *Handler) executeApply(
 
 	// Set observer before queuing the apply so ExecuteApply can register it on
 	// the durable apply row before operator dispatch starts.
-	observer := NewCommentObserver(CommentObserverConfig{
-		GHClient:       factory,
-		Storage:        h.service.Storage(),
-		Repo:           repo,
-		PR:             pr,
-		InstallationID: installationID,
-		DeferCutover:   options["defer_cutover"] == "true",
-		SupportChannel: h.supportChannel(),
-		Tenant:         h.deploymentTenant(),
-		EngineLogs:     h.engineLogReader(),
-		Logger:         h.logger,
-		OnTerminalHook: func(apply *storage.Apply) {
-			// refreshChecksForTerminalApply routes a completed rollback straight
-			// to action_required. The observer registered here can be consumed by
-			// a rollback apply (pending observers share a per-target key), so the
-			// terminal ordering must honor the rollback intent from the durable
-			// apply, not from the command that registered the observer.
-			h.refreshChecksForTerminalApply(context.Background(), apply, "apply command")
-		},
-	})
-	h.service.SetPendingObserver(database, "", environment, observer)
+	observerCfg := h.commentObserverConfig(factory, repo, pr, installationID)
+	observerCfg.DeferCutover = options["defer_cutover"] == "true"
+	observerCfg.OnTerminalHook = func(apply *storage.Apply) {
+		// refreshChecksForTerminalApply routes a completed rollback straight
+		// to action_required. The observer registered here can be consumed by
+		// a rollback apply (pending observers share a per-target key), so the
+		// terminal ordering must honor the rollback intent from the durable
+		// apply, not from the command that registered the observer.
+		h.refreshChecksForTerminalApply(context.Background(), apply, "apply command")
+	}
+	observer := NewCommentObserver(observerCfg)
+	pendingObserver := h.service.SetPendingObserver(database, "", environment, observer)
 
 	applyReq := api.ApplyRequest{
 		PlanID:                planResp.PlanID,
@@ -304,18 +443,19 @@ func (h *Handler) executeApply(
 		InstallationID:        installationID,
 		ExpectedLockOwner:     fmt.Sprintf("%s#%d", repo, pr),
 		ExpectedPendingPlanID: expectedPendingPlanID,
+		ConfirmedMemberWork:   confirmedMemberWork,
 	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
 	if err != nil {
-		h.service.SetPendingObserver(database, "", environment, nil)
+		h.service.ClearPendingObserver(pendingObserver)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(err))
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, err))
 		return
 	}
 
 	if !applyResp.Accepted {
-		h.service.SetPendingObserver(database, "", environment, nil)
+		h.service.ClearPendingObserver(pendingObserver)
 		h.logger.Info("apply rejected by engine", "repo", repo, "pr", pr, "database", database, "environment", environment, "error", applyResp.ErrorMessage)
 		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, "The apply was not accepted. See SchemaBot server logs for details.")
 		return
@@ -324,7 +464,7 @@ func (h *Handler) executeApply(
 	// ExecuteApply rejects accepted applies unless SchemaBot stored its own
 	// apply row. Keep this guard fail-closed in case that invariant changes.
 	if applyID <= 0 {
-		h.service.SetPendingObserver(database, "", environment, nil)
+		h.service.ClearPendingObserver(pendingObserver)
 		h.logger.Error("accepted apply did not return an apply id",
 			"repo", repo, "pr", pr, "database", database,
 			"database_type", schemaResult.Type, "environment", environment,
@@ -372,15 +512,82 @@ func (h *Handler) executeApply(
 	}
 }
 
-func applyExecutionErrorMessage(err error) string {
+func applyExecutionErrorMessage(command, environment string, err error) string {
+	return dispatchErrorMessage(err, dispatchMessages{
+		command:     command,
+		environment: environment,
+		lockIntentChanged: "The pending schema change changed while this command was running. " +
+			"The apply was rejected; review the latest plan and run the command again.",
+		internal: "Failed to execute apply. See SchemaBot server logs for details.",
+	})
+}
+
+// dispatchMessages carries the command-specific words dispatchErrorMessage
+// renders around the shared classification of a failed dispatch.
+type dispatchMessages struct {
+	// command and environment name the PR command to re-issue in a remedy,
+	// for example `schemabot rollback-confirm -e staging`.
+	command     string
+	environment string
+	// lockIntentChanged is the whole message for a lock intent change; its
+	// recovery differs between apply and rollback.
+	lockIntentChanged string
+	// afterRefusal, when set, follows the remedy for a refused feature and
+	// says what the refusal left in place for the re-issued command to use.
+	afterRefusal string
+	// internal is the fixed line for every failure whose text belongs in
+	// server logs.
+	internal string
+}
+
+// dispatchErrorMessage renders the PR-facing detail for a failed apply or
+// rollback dispatch. Two failures are deterministic and carry their own
+// recovery, so they are named rather than sanitized: a lock intent change is an
+// expected race whose answer is lockIntentChanged, and an unsupported feature
+// is rejected before anything is stored and would be refused the same way on
+// retry, so the operator sees the feature error followed by the command to
+// re-issue without the option that asked for it. A rollout member's refused
+// plan is named by target and table from fields SchemaBot controls. Everything
+// else is an internal error whose text stays in server logs behind the fixed
+// line.
+func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	if errors.Is(err, storage.ErrLockIntentChanged) {
-		return "The pending schema change changed while this command was running. The apply was rejected; review the latest plan and run the command again."
+		return msgs.lockIntentChanged
 	}
 	var featureErr *api.UnsupportedFeatureError
 	if errors.As(err, &featureErr) {
-		return featureErr.Error()
+		parts := []string{featureErr.Error() + "."}
+		if remedy := unsupportedFeatureRemedy(featureErr.Feature, msgs.command, msgs.environment); remedy != "" {
+			parts = append(parts, remedy)
+			if msgs.afterRefusal != "" {
+				parts = append(parts, msgs.afterRefusal)
+			}
+		}
+		return strings.Join(parts, " ")
 	}
-	return "Failed to execute apply. See SchemaBot server logs for details."
+	if refused, ok := errors.AsType[*api.MemberPlanRefusedError](err); ok {
+		switch refused.Refusal {
+		case api.MemberPlanBlocked:
+			return templates.MemberPlanBlockedDetail(refused.Target, refused.Table)
+		case api.MemberPlanUndisclosedUnsafe:
+			return templates.MemberPlanUndisclosedUnsafeDetail(refused.Target, refused.Table, refused.Namespace)
+		case api.MemberPlanUnsafeWithoutOptIn:
+			return templates.MemberPlanUnsafeWithoutOptInDetail(refused.Target, refused.Table, refused.Namespace)
+		}
+		// A refusal kind with no line of its own takes the generic one below,
+		// never the error text.
+	}
+	return msgs.internal
+}
+
+// unsupportedFeatureRemedy names the command to re-issue without the option
+// that asked for a feature the database type refused. Features no PR command
+// option requests have no remedy: the operator cannot change the request.
+func unsupportedFeatureRemedy(feature schema.Feature, command, environment string) string {
+	if feature != schema.FeatureDeferredCutover {
+		return ""
+	}
+	return fmt.Sprintf("Run `schemabot %s -e %s` again without `--defer-cutover`.", command, environment)
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an
@@ -400,11 +607,11 @@ func (h *Handler) postAutoConfirmDowngrade(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
-	cause *templates.PausedApplyCauseData,
+	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData,
 ) error {
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
-	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
 	commentData.AllowUnsafe = result.AllowUnsafe
@@ -412,6 +619,9 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.SkipRevert = result.SkipRevert
 	commentData.PendingManualConfirmation = true
 	commentData.PausedApplyCause = cause
+	// A confirmation of this comment covers the other targets' work only if
+	// the comment renders their plans.
+	commentData.DeploymentDrift = rolloutPreview
 	return h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData))
 }
 
@@ -579,6 +789,131 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 		Heading: "Schema changes differ from the plan this apply was started from",
 		Entries: entries,
 		Remedy:  "The statements above are what will run. Review them, then confirm to apply them.",
+	}
+}
+
+// directChangeIdentity is one statement routed to direct execution, keyed by
+// where it runs: a sharded plan routes each shard's statement on its own.
+type directChangeIdentity struct {
+	namespace string
+	shard     string
+	table     string
+	ddl       string
+}
+
+// newlyDirectChanges returns the statements the re-plan routes to direct
+// execution that disclosedPlan did not, sorted for a stable disclosure. A
+// statement that stops being direct is not returned: it now runs through the
+// engine, which the comment already overstated rather than hid.
+//
+// A sharded namespace's own rows summarize its shards, so where a namespace has
+// per-shard rows those alone are compared: counting the summary too would name
+// one table once for the namespace and again for every shard. DDL is compared
+// trimmed, since the stored plan trims each shard's statement and a planner's
+// response need not.
+func newlyDirectChanges(planResp *apitypes.PlanResponse, disclosedPlan *storage.Plan) []directChangeIdentity {
+	disclosedSharded := make(map[string]bool)
+	for _, sp := range disclosedPlan.Shards {
+		disclosedSharded[normalizePlanNamespace(sp.Namespace)] = true
+	}
+	disclosed := make(map[directChangeIdentity]struct{})
+	for _, tc := range disclosedPlan.FlatDDLChanges() {
+		namespace := normalizePlanNamespace(tc.Namespace)
+		if tc.DirectExecution() && !disclosedSharded[namespace] {
+			disclosed[directChangeIdentity{namespace: namespace, table: tc.Table, ddl: strings.TrimSpace(tc.DDL)}] = struct{}{}
+		}
+	}
+	for _, sp := range disclosedPlan.Shards {
+		for _, tc := range sp.Changes {
+			if tc.DirectExecution() {
+				disclosed[directChangeIdentity{namespace: normalizePlanNamespace(sp.Namespace), shard: sp.Shard, table: tc.Table, ddl: strings.TrimSpace(tc.DDL)}] = struct{}{}
+			}
+		}
+	}
+
+	replanSharded := make(map[string]bool)
+	for _, sp := range planResp.Shards {
+		if sp != nil {
+			replanSharded[normalizePlanNamespace(sp.Namespace)] = true
+		}
+	}
+	var newly []directChangeIdentity
+	addIfNew := func(id directChangeIdentity) {
+		if _, ok := disclosed[id]; !ok {
+			newly = append(newly, id)
+		}
+	}
+	for _, sc := range planResp.Changes {
+		namespace := normalizePlanNamespace(sc.Namespace)
+		if replanSharded[namespace] {
+			continue
+		}
+		for _, tc := range sc.TableChanges {
+			if tc.DirectExecution() {
+				addIfNew(directChangeIdentity{namespace: namespace, table: tc.TableName, ddl: strings.TrimSpace(tc.DDL)})
+			}
+		}
+	}
+	for _, sp := range planResp.Shards {
+		if sp == nil {
+			continue
+		}
+		for _, tc := range sp.Changes {
+			if tc.DirectExecution() {
+				addIfNew(directChangeIdentity{namespace: normalizePlanNamespace(sp.Namespace), shard: sp.Shard, table: tc.TableName, ddl: strings.TrimSpace(tc.DDL)})
+			}
+		}
+	}
+	slices.SortFunc(newly, func(a, b directChangeIdentity) int {
+		return cmp.Or(
+			cmp.Compare(a.namespace, b.namespace),
+			cmp.Compare(a.table, b.table),
+			cmp.Compare(a.shard, b.shard),
+			cmp.Compare(a.ddl, b.ddl),
+		)
+	})
+	return newly
+}
+
+// newlyDirectCause names each table the re-plan newly routes to direct
+// execution, once per table with the shards it moved on. How the statements
+// run is disclosed in the direct execution section above this cause, so the
+// entries only say which tables moved.
+func newlyDirectCause(newly []directChangeIdentity) *templates.PausedApplyCauseData {
+	type tableKey struct{ namespace, table string }
+	var order []tableKey
+	shards := make(map[tableKey][]string)
+	for _, id := range newly {
+		key := tableKey{id.namespace, id.table}
+		if _, seen := shards[key]; !seen {
+			order = append(order, key)
+			shards[key] = nil
+		}
+		if id.shard != "" && !slices.Contains(shards[key], id.shard) {
+			shards[key] = append(shards[key], id.shard)
+		}
+	}
+	var entries []string
+	for _, key := range order {
+		subject := fmt.Sprintf("`%s`", key.table)
+		switch names := shards[key]; len(names) {
+		case 0:
+		case 1:
+			subject += fmt.Sprintf(" (shard `%s`)", names[0])
+		default:
+			subject += " (shards `" + strings.Join(names, "`, `") + "`)"
+		}
+		entries = append(entries, subject+" now runs as direct execution")
+	}
+	if len(entries) > planDriftEntryCap {
+		remaining := len(entries) - planDriftEntryCap
+		entries = append(entries[:planDriftEntryCap:planDriftEntryCap],
+			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("change", "changes", remaining)))
+	}
+	return &templates.PausedApplyCauseData{
+		Heading: "Changes run differently from the plan this apply was started from",
+		Entries: entries,
+		Remedy:  "The direct execution section above shows how they will run. Review it, then confirm to apply.",
 	}
 }
 
