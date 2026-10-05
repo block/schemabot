@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,8 +9,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
@@ -36,7 +33,9 @@ type WatchModel struct {
 	tables     []templates.TableProgress
 	operations []templates.ProgressOperation
 	released   bool // apply-level release latch: a released pause runs degraded, not paused
-	errorMsg   string
+	// deferCutover is whether the apply waits for an operator at each cutover.
+	deferCutover bool
+	errorMsg     string
 
 	// Engine metadata
 	engine           string // "Spirit", "PlanetScale", etc.
@@ -59,36 +58,20 @@ var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 // Messages
 type tickMsg time.Time
 
-// isRetryableFetchError reports whether a fetch error is retryable.
-//
-//   - ConnectionError (server unreachable): always retryable.
-//   - APIError with error code: classified by apitypes.IsRetryableErrorCode.
-//   - APIError without error code, or unknown error types: permanent.
-func isRetryableFetchError(err error) bool {
-	var connErr *client.ConnectionError
-	if errors.As(err, &connErr) {
-		return true
-	}
-	var apiErr *client.APIError
-	if errors.As(err, &apiErr) && apiErr.ErrorCode != "" {
-		return apitypes.IsRetryableErrorCode(apiErr.ErrorCode)
-	}
-	return false
-}
-
 type progressMsg struct {
-	state       string
-	tables      []templates.TableProgress
-	operations  []templates.ProgressOperation
-	released    bool              // apply-level release latch: a released pause runs degraded, not paused
-	errorMsg    string            // Human-readable error message
-	failed      bool              // true when the API call didn't return usable progress data
-	retryable   bool              // when failed, whether the TUI should keep polling
-	applyID     string            // Populated from progress responses
-	database    string            // Populated from apply-id progress responses
-	environment string            // Populated from apply-id progress responses
-	engine      string            // Engine name (e.g., "Spirit", "PlanetScale")
-	metadata    map[string]string // Engine metadata (e.g., deploy_request_url)
+	state        string
+	tables       []templates.TableProgress
+	operations   []templates.ProgressOperation
+	released     bool              // apply-level release latch: a released pause runs degraded, not paused
+	deferCutover bool              // the apply waits for an operator at each cutover
+	errorMsg     string            // Human-readable error message
+	failed       bool              // true when the API call didn't return usable progress data
+	retryable    bool              // when failed, whether the TUI should keep polling
+	applyID      string            // Populated from progress responses
+	database     string            // Populated from apply-id progress responses
+	environment  string            // Populated from apply-id progress responses
+	engine       string            // Engine name (e.g., "Spirit", "PlanetScale")
+	metadata     map[string]string // Engine metadata (e.g., deploy_request_url)
 }
 
 type cutoverResultMsg struct {
@@ -172,9 +155,15 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case progressMsg:
 		if msg.failed && msg.retryable {
 			// Transient error (connection refused, timeout, engine_unavailable).
-			// Preserve last known state and tables, keep polling with backoff.
+			// Preserve last known state and tables, keep polling with backoff
+			// until the same bound the non-interactive watches give up at.
 			m.consecutiveErrors++
 			m.errorMsg = msg.errorMsg
+			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
+				m.errorMsg = progressGiveUpMessage(m.applyID, m.consecutiveErrors) + ": " + msg.errorMsg
+				m.initialized = true
+				return m, tea.Quit
+			}
 			return m, nil
 		}
 		if msg.failed && !msg.retryable {
@@ -194,6 +183,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tables = msg.tables
 		m.operations = msg.operations
 		m.released = msg.released
+		m.deferCutover = msg.deferCutover
 		m.errorMsg = msg.errorMsg
 
 		// Timeout skip-revert if state hasn't transitioned after 10s.

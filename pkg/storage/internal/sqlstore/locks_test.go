@@ -123,7 +123,7 @@ func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
 			DatabaseType:  "vitess",
 			Owner:         "org/repo#123",
 			PendingPlanID: "plan-1",
-		})
+		}, nil)
 	require.NoError(t, err)
 
 	lock, err := store.Get(ctx, "testdb", "vitess")
@@ -142,6 +142,68 @@ func TestLockStore_Acquire_RefreshSameOwnerValueAlreadyMatches(t *testing.T) {
 		Owner:         "org/repo#123",
 		PendingPlanID: "plan-2",
 	}))
+}
+
+// A conditional refresh scopes its UPDATE to the pending plan the caller
+// observed, so a zero-row result has one more cause to tell apart: the same
+// owner replaced the pin in between. Under changed-rows semantics the refresh
+// still succeeds when the concurrent write set the very plan this caller
+// wanted, and reports ErrLockIntentChanged when it set any other plan.
+func TestLockStore_AcquireIfPendingPlanID_RefreshObservedPinReplaced(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+
+	db, err := sql.Open("block-mysql", testDSNChangedRows)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	require.NoError(t, db.PingContext(ctx))
+	store := &lockStore{db: newRebindDB(db, MySQLDialect{}), dialect: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
+
+	require.NoError(t, store.Acquire(ctx, &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Repository:    "org/repo",
+		PullRequest:   123,
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-1",
+	}))
+	observed := "plan-1"
+	wanted := &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-2",
+	}
+	asObserved := &storage.Lock{
+		DatabaseName:  "testdb",
+		DatabaseType:  "vitess",
+		Owner:         "org/repo#123",
+		PendingPlanID: "plan-1",
+	}
+	setStoredPin := func(pin string) {
+		_, err := db.ExecContext(ctx, `
+			UPDATE locks
+			SET pending_plan_id = ?
+			WHERE database_name = ? AND database_type = ? AND owner = ?
+		`, pin, "testdb", "vitess", "org/repo#123")
+		require.NoError(t, err)
+	}
+
+	// A concurrent same-owner caller already wrote plan-2: the conditional
+	// UPDATE matches no row, but the lock carries the plan this caller wanted.
+	setStoredPin("plan-2")
+	require.NoError(t, store.refreshPendingConfirmation(ctx, wanted, asObserved, &observed))
+
+	// A concurrent same-owner caller wrote plan-3 instead: the intent this
+	// caller observed is gone and plan-3 must stay.
+	setStoredPin("plan-3")
+	require.ErrorIs(t, store.refreshPendingConfirmation(ctx, wanted, asObserved, &observed), storage.ErrLockIntentChanged)
+	lock, err := store.Get(ctx, "testdb", "vitess")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	assert.Equal(t, "plan-3", lock.PendingPlanID)
 }
 
 // When the lock changes hands between reading it and refreshing its confirmation
@@ -182,7 +244,7 @@ func TestLockStore_Acquire_RefreshOwnerNoLongerMatches(t *testing.T) {
 			DatabaseType:  "vitess",
 			Owner:         "org/repo#123",
 			PendingPlanID: "plan-1",
-		})
+		}, nil)
 	require.ErrorIs(t, err, storage.ErrLockHeld)
 
 	// The new owner's plan must be untouched by the missed refresh.
@@ -207,7 +269,7 @@ func TestLockStore_Acquire_RefreshOwnerNoLongerMatches(t *testing.T) {
 			DatabaseType:  "vitess",
 			Owner:         "org/repo#123",
 			PendingPlanID: "plan-1",
-		})
+		}, nil)
 	require.ErrorIs(t, err, storage.ErrLockNotFound)
 }
 

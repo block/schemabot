@@ -24,6 +24,7 @@
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
 - [Agent Hint](#agent-hint)
+- [CLI Name](#cli-name)
 - [Repository Allowlist](#repository-allowlist)
 - [PR Checks Gate](#pr-checks-gate)
 - [Base Branch Schema Freshness](#base-branch-schema-freshness)
@@ -233,7 +234,7 @@ A single environment can fan out to multiple Tern deployments by replacing the s
 
 `Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies. Control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment.
 
-Review does not fan out the same way. See [Review and the Primary Deployment](#review-and-the-primary-deployment).
+Planning fans out too, and every deployment is held to the same plan. See [Planning and the Primary Deployment](#planning-and-the-primary-deployment).
 
 ```yaml
 storage:
@@ -271,15 +272,15 @@ Rules:
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
-- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
+- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
-### Review and the Primary Deployment
+### Planning and the Primary Deployment
 
-An apply fans out across every deployment. Review does not: the plan reviewers see, and the plan SchemaBot persists and later applies from, is computed against the **primary deployment** only, meaning the first entry in rollout order.
+Planning fans out like the apply. At review time SchemaBot plans every deployment against its own live schema, and the plan check covers all of them: approving the pull request approves the change on every deployment, not on one of them.
 
-The remaining deployments are diffed against that reviewed plan at review time, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose schema diverges from the reviewed plan, and a deployment that cannot be diffed at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
+The deployments of a `deployments` map are expected to hold the same schema, so they are expected to plan the same changes. The first deployment in rollout order is the **primary deployment**. Its plan is the one SchemaBot stores, and every deployment runs that plan at apply time. Each other deployment's plan is compared against it, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose plan differs from the primary deployment's, and a deployment that cannot be planned at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
 
-A multi-deployment environment is gated on every deployment agreeing with one reviewed plan, not on one reviewed plan per deployment.
+Being primary decides which plan is stored, not which deployment is reviewed. A multi-deployment environment is gated on every deployment planning the same changes, because every deployment runs the one stored plan.
 
 ### Deployment Order
 
@@ -287,6 +288,8 @@ A multi-deployment environment is gated on every deployment agreeing with one re
 
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
+
+Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
 
 ## Multi-Target Environment (preview)
 
@@ -321,17 +324,47 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
             target: payments-003
 ```
 
+### Selecting namespaces per target
+
+When a database's namespaces are spread across its targets, an entry can be a mapping that names which namespaces live on that target. A bare string and a mapping without `namespaces` both mean the target holds every namespace the schema files declare.
+
+```yaml
+      production:
+        deployment: payments-a
+        targets:
+          - target: payments-001
+            namespaces: [payments_0, payments_1]
+          - target: payments-002
+            namespaces: [payments_2, payments_3]
+```
+
+The schema directory declares the namespace set; `namespaces` only selects from it and can never add one. Each target's plan, stored plan, and apply cover only its selected namespaces. A pull of the whole environment asks each target for its selected namespaces by name rather than discovering them on the cluster, and an explicitly requested namespace a target does not select is left out of that target's pull.
+
+A namespace that the schema files declare but a target's entry does not select is an *unselected namespace* of that target. In the example above, `payments_2` and `payments_3` are unselected namespaces of `payments-001`. They still exist, on another target, so they are withheld from that target's plan rather than removed. SchemaBot sends the target's plan only the files of its selected namespaces. It names the rest in the plan request's `unselected_namespaces`, so the Tern deployment knows those namespaces are left out on purpose. Their live tables are never treated as tables to drop.
+
 Rules:
 
 - `targets` requires `type: mysql`. Configuring it on a `vitess`, `strata`, or `postgres` database fails validation at startup.
 - `targets` is mutually exclusive with `target` at the same level, and with a local `dsn` / `dsn_from`.
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
+- `cutover_policy` and `on_failure` order the listed targets the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default, `rolling`, runs one target at a time, and under the default `on_failure: halt` a failed target stops every later one from starting. A large fleet can set `cutover_policy: parallel`, which starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
+- A mapping entry accepts only `target` and `namespaces`; any other key, including a misspelling such as `namespace`, fails validation at startup.
+- `namespaces` is an enumerated list of names, not a pattern. When present it MUST contain at least one entry; each entry must be non-empty, listed once within the entry, and free of `/`. A `namespaces` key with no list (no value, `~`, `null`, or items that are all commented out) fails validation at startup rather than reading as every namespace.
+- The target is still the rollout member, so a target may not be listed twice even with different `namespaces`.
+- A selected namespace the schema files do not declare, or one `ignore_namespaces` withholds, is an error at plan time that names the target and the namespace. For the primary target it fails the plan; for any other target it blocks the review.
+- Every declared namespace must be selected by some target; a target without `namespaces` selects all of them. A declared namespace no entry selects fails every plan of the environment, whether from a pull request or the CLI, since no target would plan or apply it. On a pull request that environment's check fails; the API answers `400 Bad Request` naming the namespaces. To keep one out of the rollout on purpose, list it in `ignore_namespaces`.
+- Selecting namespaces needs a target whose DSN does not name a database. A database-scoped DSN is diffed as one unit, so the namespaces an entry does not select would have their live tables planned as `DROP TABLE`; the plan refuses instead, as it does for `ignore_namespaces`.
 
-`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the same schema. What differs is what a difference between members means when one is found.
+Rollout order: upgrade the Tern deployments serving an environment before adding `namespaces` to its entries. The refusal above for a database-scoped DSN happens in the Tern deployment, which needs `unselected_namespaces` to make it. There is no version check between SchemaBot and Tern. A Tern deployment from an earlier release discards `unselected_namespaces` without error and plans the unselected namespaces' live tables as `DROP TABLE`. SchemaBot reads every plan that comes back and refuses one that drops an unselected namespace's tables, with or without `--allow-unsafe`, so such a plan fails rather than going to review:
+
+- A drop the plan places in an unselected namespace is refused, and the error asks for the Tern deployment to be upgraded.
+- A drop placed in a selected namespace, or in none, is refused when an unselected namespace declares a table of that name, ignoring case. This is the MySQL case, where the engine attributes every drop to the namespace it was sent. A live table that no schema file declares is not caught this way, and is reviewed like any other unsafe drop.
+
+`targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the schema the files describe for it: every declared namespace, or, for a target whose entry selects namespaces, only those. What differs is what a difference between members means when one is found.
 
 The deployments of one environment are mirrors, so a difference between them is a fault: the plan under review was not written for the member that disagrees, and the check blocks rather than apply it.
 
@@ -615,6 +648,39 @@ Budgets are enforced per server process, so a deployment running N replicas
 admits up to N times the configured rate overall. Size the numbers as a
 per-replica ceiling.
 
+### Check inspection
+
+`GET /api/checks/inspect` (`schemabot checks inspect`) reads the pull request
+and each expected Check Run from GitHub on every call, uncached, through the
+same GitHub App installation SchemaBot publishes its Check Runs through. A
+caller polling it in a loop can spend the installation's hourly REST quota, and
+then SchemaBot's own Check Run writes start failing and the merge gate goes
+stale. The endpoint therefore has a per-caller budget, also **on by default**:
+
+```yaml
+rate_limits:
+  checks_inspect:
+    enabled: true             # default: true
+    per_caller:
+      requests_per_minute: 6  # default: 6
+      burst: 10               # default: 10
+```
+
+As an approximate sustained budget, each inspection costs one GitHub read for
+the pull request plus at least one per expected check name. The hourly estimate
+is `60 × requests_per_minute × (1 + N)`, where N is the number of check names.
+Check Run pagination multiplies those reads, and the initial burst permits
+additional inspections. A dashboard polling three pull requests every 30
+seconds fits the sustained default; poll at 30 seconds or longer. A deployment
+that publishes more check names or has deep Check Run histories should lower
+`requests_per_minute`.
+
+`per_caller` is keyed the same way as the pull endpoint's. With API auth
+disabled, every caller shares one budget. There is no `per_target` lane. A
+refusal is the same `429` with `error_code: rate_limited` and `Retry-After`, and
+it is returned before any GitHub call is made. Set `enabled: false` to turn
+enforcement off.
+
 ## Pending Drops
 
 For MySQL databases executed by the Spirit engine, `DROP TABLE` statements can
@@ -668,13 +734,14 @@ MySQL database the server drives:
 ```yaml
 direct_execution:
   enabled: true           # default: false
-  max_table_rows: 100000  # required (positive) when enabled
+  max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
+                          # or max_table_bytes (e.g. max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
 
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more
-place for the row bound to drift. It is also what covers a database with no
+place for the size bounds to drift. It is also what covers a database with no
 `databases` entry at all — one a data-plane server resolves through its
 `target_resolver`, addressed by an opaque identifier.
 
@@ -718,32 +785,80 @@ read off that apply rather than resolved again. The two can differ: a
 rollback runs after the change it reverses, and withdrawing the grant in
 between would otherwise refuse the statement that undoes a change it allowed.
 
-A direct statement is synchronous, blocks writes to the table while it runs,
-and cannot be reverted — `max_table_rows` is the fail-closed blast-radius
-bound. A refused statement runs directly only when the table's size is within
-the bound; larger tables, and tables whose size cannot be determined, stay
-blocked. The size gate trusts the InnoDB optimizer's estimate
-(`information_schema` `TABLE_ROWS`) only to block, and corroborates a verdict
-for direct execution with an exact row count whose scan is capped just past
-the bound — a stale estimate can never approve a large table. The bound is
-re-evaluated when the apply executes, so a table that grew past it after
-planning is blocked, not run.
+A direct statement is synchronous and blocks writes to the table while it
+runs — the size bound is the fail-closed blast-radius cap.
+An enabled policy sets exactly one of `max_table_rows` and `max_table_bytes`,
+and a refused statement runs directly only when the table is within it. A
+table above the bound, or whose size cannot be determined, stays blocked. The
+bound is re-evaluated when the apply executes, so a table that grew past it
+after planning is blocked, not run.
 
-`lock_acquisition_timeout` bounds how long each direct statement waits to
-acquire its locks. Each engine maps it to its native session lock timeout —
-on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`. Native DDL
-queues on the table's metadata lock behind any open transaction that has
-touched the table — and by default MySQL lets it queue essentially forever,
-with all new table traffic stalling behind it. When the bound expires the
-apply fails fast with a retryable "table is busy" error instead. Lower it for
-environments where even a short stall is unacceptable; the value must be a
-whole number of seconds (at least `1s`).
+`max_table_rows` bounds the row count. The size gate trusts the InnoDB
+optimizer's estimate (`information_schema` `TABLE_ROWS`) only to block, and
+corroborates a verdict for direct execution with an exact row count whose scan
+is capped just past the bound — a stale estimate can never approve a large
+table.
+
+`max_table_bytes` bounds the table's footprint, data plus indexes
+(`information_schema` `DATA_LENGTH + INDEX_LENGTH`). How long a native
+rebuild blocks writes tracks how much it copies more closely than how many
+rows there are, so a table of a few wide rows and one of many narrow rows are
+judged by what the rebuild actually moves. The byte figure is an InnoDB
+statistics estimate that, like `TABLE_ROWS`, can undercount a table that just
+grew, and there is no cheap exact measure to corroborate it, so the byte bound
+approves on the estimate alone. Choose `max_table_rows` when only the
+corroborated gate is acceptable. The value is a whole number followed by a
+binary unit, such as `100MiB` or `2GiB`. Decimal units such as `MB` are
+rejected rather than interpreted, because readers disagree on whether they
+mean 1000² or 1024² bytes.
+
+A policy cannot set both. The two bounds differ in strength, and a second
+limit on a safety policy reads as a ceiling: requiring both would let the
+weaker estimate veto the corroborated count, and letting either approve would
+make a table the gate measured far above the byte limit run directly through
+the row bound. Choosing one keeps the configured limit the one that decides.
+
+A server running a build that predates `max_table_bytes` ignores the byte
+bound when it arrives on a request or an apply record, so it rejects a
+byte-bound policy as missing its row bound, and its plans and applies for the
+database fail until it is upgraded. Switch a database to `max_table_bytes`
+once every server that executes statements for it runs a build that reads it.
+
+`lock_acquisition_timeout` bounds how long each attempt of a direct statement
+waits to acquire its locks. Each engine maps it to its native session lock
+timeout — on MySQL, `lock_wait_timeout` and `innodb_lock_wait_timeout`.
+Native DDL queues on the table's metadata lock behind any open transaction
+that has touched the table — and by default MySQL lets it queue essentially
+forever, with all new table traffic stalling behind it. On MySQL, once the
+statement has waited 90% of the bound for the lock, it kills the transactions
+blocking it and tries again, up to 3 attempts, as Spirit does for its own
+DDL. It never kills while it holds the lock and runs, so traffic to a table
+being rebuilt is left alone. A session holding an explicit `LOCK TABLES`, or a
+transaction too large to roll back safely, is never killed, and a session the
+user is not allowed to kill survives the kill too. No later attempt can end
+such a blocker, so the statement stops after the attempt that met it, and the
+apply fails with a retryable "table is busy" error. The full 3 attempts go only
+to blockers the kill ends. Every attempt runs the statement from the
+start, so a rebuild that times out waiting to upgrade its lock at the end is
+rolled back and runs again. Traffic to the table can stall for up to one bound
+per attempt, and between attempts the statement waits up to 30 seconds for
+killed sessions to roll back. A lower bound shortens the stall
+and gives a blocker less time to finish before it is killed; the value must
+be a whole number of seconds (at least `1s`).
+
+The kill reads `performance_schema` and `information_schema.innodb_trx` to
+find the blocking sessions and ends other users' sessions, so the SchemaBot
+user needs `SELECT` on `performance_schema.*`, `PROCESS`, and
+`CONNECTION_ADMIN` (or `SUPER`) for a statement to run directly; without any
+of them the statement is blocked at plan time.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
-enabled without a positive `max_table_rows`, or when
-`lock_acquisition_timeout` is malformed (not a duration, under a second, or
-not whole seconds). A per-database policy that can never take effect is never
+enabled with neither `max_table_rows` nor `max_table_bytes`, when a policy
+sets both, when `max_table_rows` is negative, when `max_table_bytes` is malformed (not a
+positive whole number with a binary unit), or when `lock_acquisition_timeout`
+is malformed (not a duration, under a second, or not whole seconds). The size
+bounds and `lock_acquisition_timeout` are checked even on a disabled policy. A per-database policy that can never take effect is never
 silently carried in config.
 
 The server-wide policy is held to the same shape rules but is not rejected
@@ -757,9 +872,9 @@ engines behind its targets are not knowable from config.
 
 `direct_execution` is a policy rather than an engine setting, which is why it
 sits beside `pending_drops` at the top level rather than inside an engine
-block like `spirit`, `planetscale`, or `postgres`. Its two fields mean the
-same thing on any engine — a blast-radius bound in rows, and a bound on lock
-acquisition — and each engine supplies only the three pieces that are
+block like `spirit`, `planetscale`, or `postgres`. Its fields mean the same
+thing on any engine — blast-radius bounds in rows and in bytes, and a bound
+on lock acquisition — and each engine supplies only the three pieces that are
 genuinely its own: which statements it refuses, how it estimates a table's
 size, and which native session timeout the lock bound maps to. Today the
 MySQL engine is the only one that implements those, so the policy reaches
@@ -780,7 +895,7 @@ direct_execution:
 ```
 
 This keeps the shared bounds stated once, in one place, for every engine —
-which is the property worth protecting, since `max_table_rows` is the only
+which is the property worth protecting, since the size bounds are the only
 thing between a refused statement and an unbounded write outage. There is no
 such field today, and one should only be added where the value genuinely has
 no cross-engine meaning; a bound that any engine could honor belongs at the
@@ -981,6 +1096,18 @@ database's entry wins.
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
 over gRPC run with that deployment's engine settings.
+
+### MySQL server settings Spirit refuses
+
+Spirit checks the target server before every run, including a resumed one,
+and refuses to start on a setting it cannot run safely under. One of them,
+`partial_revokes=ON`, is a server-wide security setting an operator may have
+chosen on purpose. With it on, a `REVOKE` can remove a grant for one schema
+while `SHOW GRANTS` still lists the global grant, so a privilege check passes
+and the schema change fails at cutover. `partial_revokes` is `OFF` by default.
+A target with it `ON` fails every schema change, and an apply already in
+flight fails on its next drive. Turning it off is a server-wide security
+change, so plan it before upgrading rather than after.
 
 ## Postgres
 
@@ -1247,6 +1374,37 @@ The hint must be a single bounded line and must not contain an HTML comment
 terminator (`-->` or `--!>`), which would end the comment early and render the
 rest of the hint on the PR page. When omitted, plan comments are unchanged.
 
+## CLI Name
+
+PR comments name CLI commands an operator runs in a terminal, such as the
+command that prints a stored plan in full when a comment cuts its DDL. When
+operators run the CLI through a wrapper, set `cli_name` to the wrapper's
+invocation so a pasted hint reaches the wrapper instead of an unconfigured
+binary:
+
+```yaml
+cli_name: "acme schemabot"
+```
+
+This is the server-side counterpart of the CLI's `--cli-name` flag (see
+[Wrap the CLI for your team](cli.md#wrap-the-cli-for-your-team)); set the same
+value in both places. Each hint is also scoped to its environment, so a
+wrapper that routes by environment reaches the server that wrote it:
+
+```text
+_DDL truncated to fit GitHub's comment size limit; the full plan is available from the CLI with `acme schemabot list-plans -e staging plan_abc`._
+```
+
+Only terminal commands take the name. Commands a PR author comments on the
+PR, such as `schemabot plan` and `schemabot apply -e staging`, keep
+`schemabot`, the word the bot answers to. Terminal commands also never
+carry `--tenant`: the tenant routes PR comments, and the CLI reaches a
+tenant deployment through its endpoint or profile, so a tenant deployment's
+`cli_name` names the wrapper that points there. When omitted, hints start with
+`schemabot`. The name must be a single line of at most 100 characters with no
+backtick and no leading or trailing whitespace, because it renders inside
+inline code.
+
 ## Repository Allowlist
 
 By default, any repository with the GitHub App installed can use SchemaBot. Adding a `repos` section creates an allowlist — only listed repositories are permitted.
@@ -1313,7 +1471,7 @@ By default, SchemaBot blocks `apply` and `apply-confirm` when non-SchemaBot PR c
 require_passing_checks: true
 ```
 
-Apply is blocked in two cases: completed checks that did not **pass** and checks that are **still running** (`in_progress`, `queued`, `pending`). A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
+Apply is blocked in two cases: completed checks that did not **pass** and checks that have **not finished**. Any status other than `completed` (such as `in_progress`, `queued`, `pending`, `waiting`, or `requested`) counts as not finished, so unrecognized statuses fail closed. A completed check passes only with conclusion `success`, `neutral`, or `skipped`; every other conclusion (such as `failure`, `timed_out`, `cancelled`, `action_required`, `stale`, or `startup_failure`) blocks apply, so unrecognized conclusions fail closed. Each case shows a distinct message — completed checks that are not passing prompt the user to get them passing (fix failures and re-run cancelled or stale checks), while in-progress checks prompt the user to wait. SchemaBot's own checks are always excluded.
 
 For repositories with many optional checks, `required_checks` can narrow the gate to specific check names:
 
@@ -1433,7 +1591,7 @@ auth:
 
 A valid token clears the read tier. The write tier additionally requires the token's groups to include an admin team from `pr_command_authorization.admin_teams`. Machine callers pass a token via `--token` / `SCHEMABOT_TOKEN`; a group-less service token (client-credentials grant) gets read access.
 
-The browser login command caches the ID token as the bearer credential. Login and refresh use that token's `exp` claim for the cached `token_expiry`, independently of the access token's `expires_in`. Commands refresh within 60 seconds of the ID token expiry when a refresh token and OIDC settings are available. For OIDC profiles, commands read `exp` from the cached token on every load, so profiles saved by older versions automatically use the correct lifetime without another browser login.
+The browser login command caches the ID token as the bearer credential. Login and refresh use that token's `exp` claim for the cached `token_expiry`, independently of the access token's `expires_in`. Commands refresh within 60 seconds of the ID token expiry when a refresh token and its OIDC issuer and client ID are available. For OIDC profiles, commands read `exp` from the cached token on every load, so profiles saved by older versions automatically use the correct lifetime without another browser login.
 
 The ID token must have a positive numeric `exp` value in Unix seconds; fractional seconds and exponent notation are supported and truncated to whole seconds for refresh timing. Login and refresh return an error for a missing, malformed, or out-of-range value; neither falls back to the access token's lifetime. An ordinary command that loads a malformed cached ID token attempts to repair the session using the refresh token. If no refresh token is available, or refresh fails, the command warns and preserves the existing cache. The CLI reads `exp` only to schedule renewal and does not reject login based on its local clock; the server still verifies every bearer token before granting access. Keep the client and server clocks synchronized: a fast client clock can cause a refresh and cache rewrite on every command, and a slow one can delay refresh until the server rejects the credential. When a refreshed token is already expired according to the client clock, the CLI saves the rotated session but warns to check the local clock and the provider's ID token lifetime. Explicit `--token` and `SCHEMABOT_TOKEN` credentials are not refreshed automatically.
 
@@ -1450,7 +1608,7 @@ profiles:
       redirect_port: 8765
 ```
 
-The provider must register `http://127.0.0.1:8765/callback` as a redirect URI for that client and allow refresh tokens. Login flags override settings for that login attempt; they do not save the `oidc:` block. Keep the block configured for subsequent commands to refresh automatically.
+The provider must register `http://127.0.0.1:8765/callback` as a redirect URI for that client and allow refresh tokens. Login flags override settings for that login attempt; they do not save the `oidc:` block. Login records the issuer and client ID the tokens came from as `token_issuer` and `token_client_id` next to the cached tokens, and refresh uses that pair, because a refresh token is valid only at the issuer and for the client that issued it. A login with `--issuer` and `--client-id` therefore keeps refreshing against that provider without an `oidc:` block, and the next login replaces the pair along with the tokens. Editing `oidc:` does not change where an existing session refreshes; run `schemabot login` after switching providers. `schemabot configure show` prints the recorded pair under each profile that has one. A profile that does not record the pair refreshes with its `oidc:` settings.
 
 ### Forward-auth (authenticating proxy)
 
@@ -1804,24 +1962,25 @@ to no changes, no new comment appears (the check run alone reports the green
 state), but plan comments from prior commits are still retired — the pending
 DDL and apply prompt they show no longer match the branch.
 
-By default, a superseded comment is minimized (collapsed as **Outdated**) and
-stays expandable on GitHub — with one safety hold: a plan comment whose commit
-produced an apply is never minimized, even after new pushes. That comment is
-the record of what actually ran against the database, and it stays visible
-until an operator reconciles the apply.
+By default, a superseded plan comment no apply ever acted on is deleted from
+the PR timeline outright — its DDL never ran and is reproducible from the
+commit it was rendered at, so on a busy PR the comment is pure noise. A
+superseded comment whose commit produced an apply is minimized (collapsed as
+**Outdated**) rather than deleted, keeping the record of what ran expandable
+on the PR.
 
-A server can opt into a delete-based policy instead, which applies to every
-repository it manages:
+A server can opt out to a minimize-based policy instead, which applies to
+every repository it manages:
 
 ```yaml
-delete_unactioned_plan_comments: true
+delete_unactioned_plan_comments: false
 ```
 
-Under this policy, a superseded plan comment no apply ever acted on is deleted
-from the PR timeline outright — its DDL never ran and is reproducible from the
-commit it was rendered at, so on a busy PR the comment is pure noise. A
-superseded comment whose commit produced an apply is minimized rather than
-deleted, keeping the record of what ran expandable on the PR.
+Under this policy, a superseded comment is minimized and stays expandable on
+GitHub — with one safety hold: a plan comment whose commit produced an apply is
+never minimized, even after new pushes. That comment is the record of what
+actually ran against the database, and it stays visible until an operator
+reconciles the apply.
 
 Unactioned means exactly that: no apply ran from the comment's commit. It says
 nothing about human engagement — a comment people reacted to or linked

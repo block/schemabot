@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -36,12 +37,64 @@ func TestBuildPlanCommentData_CarriesPerShardChanges(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "per-shard changes are threaded into the keyspace")
 	assert.Equal(t, "-40", data.Changes[0].Shards[0].Shard)
 	assert.Equal(t, []string{mutesDrift}, data.Changes[0].Shards[1].Statements, "the drifted shard keeps its own DDL")
+}
+
+// An engine's namespace-level metadata reaches the plan comment's keyspace
+// data: the VSchema change and its diff, and the finalize. A VSchema change the
+// engine generates from the DDL and finalizes carries only the finalize, and
+// a namespace that carries only DDL gets neither.
+func TestSetNamespaceWork_CarriesVSchemaAndFinalizeMetadata(t *testing.T) {
+	var generated templates.KeyspaceChangeData
+	setNamespaceWork(&generated, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaChangedMetadataKey:       "true",
+		apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+		apitypes.NeedsFinalizerMetadataKey:       "true",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{Finalize: true}, generated)
+
+	var generatedUnfinalized templates.KeyspaceChangeData
+	setNamespaceWork(&generatedUnfinalized, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaChangedMetadataKey:       "true",
+		apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{VSchemaChanged: true}, generatedUnfinalized, "with no finalize to show, the VSchema change stays visible")
+
+	var diffed templates.KeyspaceChangeData
+	setNamespaceWork(&diffed, &apitypes.SchemaChangeResponse{Namespace: "payments_001", Metadata: map[string]string{
+		apitypes.VSchemaDiffMetadataKey: "+    \"refunds\": {}",
+	}})
+	assert.Equal(t, templates.KeyspaceChangeData{VSchemaChanged: true, VSchemaDiff: "+    \"refunds\": {}"}, diffed)
+
+	var ddlOnly templates.KeyspaceChangeData
+	setNamespaceWork(&ddlOnly, &apitypes.SchemaChangeResponse{Namespace: "payments_001"})
+	assert.Equal(t, templates.KeyspaceChangeData{}, ddlOnly)
+}
+
+// A rollback that recreates a table the forward apply dropped also updates the
+// keyspace's VSchema entries from the DDL alone, so the rollback comment
+// carries the keyspace's DDL and finalize with no VSchema change, as the plan
+// comment would.
+func TestRollbackKeyspaceChanges_CarriesNamespaceWork(t *testing.T) {
+	got := rollbackKeyspaceChanges([]*apitypes.SchemaChangeResponse{{
+		Namespace:    "payments_001",
+		TableChanges: []*apitypes.TableChangeResponse{{TableName: "refund_notes", DDL: refundNotesDDL, ChangeType: "CREATE"}},
+		Metadata: map[string]string{
+			apitypes.VSchemaChangedMetadataKey:       "true",
+			apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+			apitypes.NeedsFinalizerMetadataKey:       "true",
+		},
+	}})
+	assert.Equal(t, []templates.KeyspaceChangeData{{
+		Keyspace:   "payments_001",
+		Statements: []string{refundNotesDDL},
+		Finalize:   true,
+	}}, got)
 }
 
 // A divergent sharded plan, including a malformed shard row with no DDL,
@@ -71,7 +124,7 @@ func TestPlanSummarySelectionsAgreeForDivergentShards(t *testing.T) {
 	require.Equal(t, []string{"1 table to create", "1 table to alter"}, cliParts)
 
 	schema := &ghclient.SchemaRequestResult{Database: "commerce", Type: "mysql"}
-	commentData := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	commentData := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 	comment := templates.RenderPlanComment(commentData)
 	commentSummary := "📋 **Plan**: " + strings.ReplaceAll(strings.Join(cliParts, ", "), "1 table", "**1** table")
 	assert.Contains(t, comment, commentSummary)
@@ -91,7 +144,7 @@ func TestBuildPlanCommentData_CarriesExemptTables(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.Equal(t, []templates.ExemptTablesData{
 		{Namespace: "app", Tables: []string{"orders_archive_2024", "events_archive_2025_01"}, Reason: "archive naming"},
@@ -118,7 +171,7 @@ func TestBuildPlanCommentData_PerShardUnsafe(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -151,7 +204,7 @@ func TestBuildPlanCommentData_PerShardUnsafeDriftGroupsOneDrop(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.UnsafeChanges, 1, "same table and reason across shards is one unsafe change")
 	assert.Equal(t, []string{"-40", "40-80"}, data.UnsafeChanges[0].Shards)
@@ -185,14 +238,14 @@ func TestBuildPlanCommentData_PostgresDropGuidanceClassifiedFromDDL(t *testing.T
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.Equal(t, "postgres", data.DatabaseType)
 	require.Len(t, data.UnsafeChanges, 1)
 	assert.Equal(t, ddl, data.UnsafeChanges[0].DDL, "the DDL is threaded so the guidance can parse it")
 
 	rendered := templates.RenderPlanComment(data)
-	assert.Contains(t, rendered, "**Destructive drop guidance:**")
+	assert.Contains(t, rendered, "<summary>Destructive drop guidance</summary>")
 	assert.Contains(t, rendered, "no longer reads from or writes to the dropped column.")
 }
 
@@ -227,7 +280,7 @@ func TestRenderMultiEnvPlanComment_PostgresDropGuidanceClassifiedFromDDL(t *test
 
 	rendered := templates.RenderMultiEnvPlanComment(data)
 
-	assert.Contains(t, rendered, "**Destructive drop guidance:**")
+	assert.Contains(t, rendered, "<summary>Destructive drop guidance</summary>")
 	assert.Contains(t, rendered, "no longer reads from or writes to the dropped table.")
 }
 
@@ -248,7 +301,7 @@ func TestBuildPlanCommentData_CarriesSatisfiedShard(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 2, "the satisfied shard is carried, not dropped")
@@ -277,7 +330,7 @@ func TestBuildPlanCommentData_MalformedShardSurfacesError(t *testing.T) {
 		},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	require.Len(t, data.Changes, 1)
 	require.Len(t, data.Changes[0].Shards, 1, "the malformed shard is not carried into the rendered shards")
@@ -313,7 +366,7 @@ func TestBuildPlanCommentData_UnsafeChangesPopulated(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan contains unsafe table changes")
 	require.Len(t, data.UnsafeChanges, 1)
@@ -338,7 +391,7 @@ func TestBuildPlanCommentData_TableDropIsUnsafeWithoutEngineFlag(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -381,7 +434,7 @@ func TestBuildPlanCommentData_VSchemaDeletionsAndMutationsPopulated(t *testing.T
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges, "expected HasUnsafeChanges=true when plan records VSchema deletions and mutations")
 	require.Len(t, data.UnsafeChanges, 2)
@@ -391,6 +444,9 @@ func TestBuildPlanCommentData_VSchemaDeletionsAndMutationsPopulated(t *testing.T
 	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[1].Table)
 	assert.Contains(t, data.UnsafeChanges[1].Reason, "user_idx")
 	assert.Contains(t, data.UnsafeChanges[1].Reason, "changes type")
+	for _, uc := range data.UnsafeChanges {
+		assert.Equal(t, "testapp_sharded", uc.VSchemaNamespace, "the apply instruction names a VSchema change by its namespace")
+	}
 }
 
 func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
@@ -413,7 +469,7 @@ func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.False(t, data.HasUnsafeChanges)
 	assert.Empty(t, data.UnsafeChanges)
@@ -449,7 +505,7 @@ func TestBuildPlanCommentData_MixedSafeAndUnsafe(t *testing.T) {
 		}},
 	}
 
-	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "")
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
 
 	assert.True(t, data.HasUnsafeChanges)
 	require.Len(t, data.UnsafeChanges, 1)
@@ -1223,4 +1279,167 @@ func TestPlanCommentDatabaseFlag(t *testing.T) {
 	assert.Empty(t, planCommentDatabaseFlag("", "payments", false, 0), "an unscoped command stays unscoped")
 	assert.Equal(t, "payments", planCommentDatabaseFlag("", "payments", true, 2), "an auto-plan on a PR touching several databases names the one its comment plans")
 	assert.Empty(t, planCommentDatabaseFlag("", "payments", true, 1), "an auto-plan on a PR touching one database has nothing to disambiguate")
+}
+
+// The plan comment carries the stored plan's identifier, so DDL the comment
+// cuts to fit names the command that prints the plan in full.
+func TestBuildPlanCommentData_CarriesPlanID(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	data := buildPlanCommentData(schema, &apitypes.PlanResponse{PlanID: "plan_7c41f9"}, "staging", "", "testuser", "", "")
+	assert.Equal(t, "plan_7c41f9", data.PlanID)
+}
+
+// Per-table size estimates on the namespace-level plan changes are threaded
+// into the keyspace's TableSizes for rendering, but only for statements whose
+// cost scales with the table: an index add and a column widening carry size
+// lines, while a metadata-only column add and a table being created (no size
+// to report) are omitted.
+func TestBuildPlanCommentData_TableSizes(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	rows, largest, bytes := int64(48_200_000), int64(13_100_000), int64(23_400_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "widgets", DDL: "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`))", ChangeType: "create"},
+				{TableName: "audits", DDL: "ALTER TABLE `audits` ADD COLUMN `reason` varchar(255)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+				{TableName: "outcomes", DDL: "ALTER TABLE `outcomes` MODIFY COLUMN `note` varchar(500)", ChangeType: "alter",
+					EstimatedRows: &rows, ShardCount: 4, LargestShardRows: &largest, EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Len(t, data.Changes[0].Statements, 4, "all statements still render as DDL")
+	require.Len(t, data.Changes[0].TableSizes, 2,
+		"the index add and the widening carry size lines; the created table and the metadata-only column add are omitted")
+	size := data.Changes[0].TableSizes[0]
+	assert.Equal(t, "mutes", size.Table)
+	assert.Equal(t, 4, size.ShardCount)
+	require.NotNil(t, size.EstimatedBytes)
+	assert.Equal(t, bytes, *size.EstimatedBytes)
+	assert.Equal(t, "outcomes", data.Changes[0].TableSizes[1].Table)
+}
+
+// Every change to a table carries the whole table's estimate, so a table that
+// two size-scaling statements change is listed once, not once per statement.
+func TestBuildPlanCommentData_TableSizesListEachTableOnce(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "cdb_resolute", Type: "strata"}
+	bytes := int64(23_400_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "cdb_resolute_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)", ChangeType: "alter", EstimatedBytes: &bytes},
+				{TableName: "mutes", DDL: "ALTER TABLE `mutes` ADD INDEX `status`(`status`)", ChangeType: "alter", EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Len(t, data.Changes[0].Statements, 2, "both statements still render as DDL")
+	require.Len(t, data.Changes[0].TableSizes, 1)
+	assert.Equal(t, "mutes", data.Changes[0].TableSizes[0].Table)
+}
+
+// A table's DDL can join several statements, as a PostgreSQL change set does.
+// Each statement is inspected on its own, so an index build joined after a
+// metadata-only column add still carries the table's size line.
+func TestBuildPlanCommentData_TableSizesInspectEachJoinedStatement(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "postgres"}
+	bytes := int64(1_130_000_000)
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "public",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN email text;\nCREATE INDEX idx_email ON users (email);",
+					ChangeType: "alter", EstimatedBytes: &bytes},
+				{TableName: "accounts", DDL: "ALTER TABLE accounts ADD COLUMN nickname text;\nALTER TABLE accounts DROP COLUMN legacy;",
+					ChangeType: "alter", EstimatedBytes: &bytes},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].TableSizes, 1, "only the table whose joined DDL builds an index carries a size line")
+	assert.Equal(t, "users", data.Changes[0].TableSizes[0].Table)
+	require.NotNil(t, data.Changes[0].TableSizes[0].EstimatedBytes)
+	assert.Equal(t, bytes, *data.Changes[0].TableSizes[0].EstimatedBytes)
+}
+
+// A table the plan creates has no data to size, even when its create set
+// builds an index on it.
+func TestBuildPlanCommentData_TableSizesSkipCreatedTables(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "postgres"}
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "public",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "sessions", DDL: "CREATE TABLE sessions (id bigint PRIMARY KEY, user_id bigint);\nCREATE INDEX idx_user ON sessions (user_id);",
+					ChangeType: "create"},
+			},
+		}},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	assert.Empty(t, data.Changes[0].TableSizes)
+}
+
+// A sharded namespace decides a table's size line from every shard's DDL, so
+// an index build that only some shards run still shows the table's size.
+func TestBuildPlanCommentData_TableSizesReadEveryShard(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "testapp", Type: "strata"}
+	bytes := int64(23_400_000_000)
+	addColumn := "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255)"
+	addIndex := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	planResp := &apitypes.PlanResponse{
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "testapp_sharded",
+			TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "mutes", DDL: addColumn, ChangeType: "alter", ShardCount: 2, EstimatedBytes: &bytes},
+			},
+		}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "testapp_sharded", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: addColumn, ChangeType: "alter"}}},
+			{Namespace: "testapp_sharded", Shard: "80-", Changes: []*apitypes.TableChangeResponse{{TableName: "mutes", DDL: addIndex, ChangeType: "alter"}}},
+		},
+	}
+
+	data := buildPlanCommentData(schema, planResp, "staging", "", "testuser", "", "")
+
+	require.Len(t, data.Changes, 1)
+	require.Len(t, data.Changes[0].TableSizes, 1)
+	size := data.Changes[0].TableSizes[0]
+	assert.Equal(t, "mutes", size.Table)
+	assert.Equal(t, 2, size.ShardCount)
+	require.NotNil(t, size.EstimatedBytes)
+	assert.Equal(t, bytes, *size.EstimatedBytes)
+}
+
+// Every refusal the environment's namespace placement owns stores a failing
+// check for the environment, so a later fold cannot read an older passing row
+// in its place: a namespace no targets entry selects, a plan proposing drops in
+// a namespace the target's entry does not select, and drops that could not be
+// checked. Any other plan failure is not stored as a placement block.
+func TestPlanRefusedByNamespacePlacement(t *testing.T) {
+	coverage := &api.NamespaceCoverageError{Database: "orders", Environment: "production", Uncovered: []string{"ns_1"}}
+	drop := &api.UnselectedTableDropError{Deployment: "eu", Target: "orders-001", Placed: []string{"payments"}, PlacedNamespaces: []string{"ns_1"}}
+	check := &api.UnselectedTableDropCheckError{Database: "orders", Environment: "production", Target: "orders-001", Err: errors.New("split schema file ns_1/payments.sql: syntax error")}
+
+	assert.True(t, planRefusedByNamespacePlacement(coverage), "a namespace no targets entry selects")
+	assert.True(t, planRefusedByNamespacePlacement(fmt.Errorf("plan: %w", drop)), "a drop in an unselected namespace, wrapped")
+	assert.True(t, planRefusedByNamespacePlacement(check), "drops that could not be checked")
+	assert.False(t, planRefusedByNamespacePlacement(errors.New("tern unavailable")), "an unrelated plan failure")
+	assert.False(t, planRefusedByNamespacePlacement(nil), "a plan that succeeded")
 }

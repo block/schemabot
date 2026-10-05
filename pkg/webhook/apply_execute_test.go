@@ -9,21 +9,119 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/stretchr/testify/assert"
 )
 
+// An apply the database type refused for a requested feature is told which
+// feature was refused and the command to re-issue without the option that asked
+// for it, in the environment the refused command named, so the operator's next
+// action is in the comment rather than left to be inferred from the refusal.
 func TestApplyExecutionErrorMessage(t *testing.T) {
-	t.Run("unsupported feature is actionable", func(t *testing.T) {
+	t.Run("unsupported feature names the command to re-issue without the option", func(t *testing.T) {
 		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover}
-		assert.Equal(t, `database "orders": deferred cutover is not supported for database_type: postgres`, applyExecutionErrorMessage(err))
+		assert.Equal(t,
+			"database \"orders\": deferred cutover is not supported for database_type: postgres. "+
+				"Run `schemabot apply -e production` again without `--defer-cutover`.",
+			applyExecutionErrorMessage(action.Apply, "production", err))
+	})
+
+	t.Run("unsupported feature no command option requests has no remedy", func(t *testing.T) {
+		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureMultiTarget}
+		msg := applyExecutionErrorMessage(action.Apply, "staging", err)
+		assert.Equal(t, err.Error()+".", msg)
+		assert.NotContains(t, msg, "again without")
 	})
 
 	t.Run("lock intent change remains actionable", func(t *testing.T) {
-		assert.Contains(t, applyExecutionErrorMessage(fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "staging", fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
+	})
+
+	// A refusal of one target's own plan names that target and the table, from
+	// fields SchemaBot controls, so the engine's reason and the plan identifier
+	// in the underlying error never reach the comment.
+	t.Run("member plan refusal names the target", func(t *testing.T) {
+		cause := errors.New("stored plan plan-7f3a contains a blocked change for table \"orders\": dial tcp 10.0.0.7:3306")
+		blocked := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanBlocked, Table: "orders", Err: cause,
+		})
+		msg := applyExecutionErrorMessage(action.Apply, "production", blocked)
+		assert.Equal(t, "Target `payments-002` has a change on table `orders` that its engine refuses to execute, so nothing was applied. Fix what that target's plan names as the reason, then run the command again.", msg)
+		assert.NotContains(t, msg, "10.0.0.7")
+		assert.NotContains(t, msg, "plan-7f3a")
+
+		unsafe := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Table: "legacy_orders", Err: cause,
+		})
+		msg = applyExecutionErrorMessage(action.Apply, "production", unsafe)
+		assert.Equal(t, "Target `payments-002` has an unsafe change on table `legacy_orders` that the primary target's plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the primary target's plan carries the same change.", msg)
+		assert.NotContains(t, msg, "10.0.0.7")
+		assert.NotContains(t, msg, "plan-7f3a")
+
+		vschema := &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Namespace: "ns_0", Err: cause,
+		}
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", vschema), "an unsafe change on the VSchema of namespace `ns_0` that the primary target's plan does not carry")
+
+		unknown := &api.MemberPlanRefusedError{
+			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanRefusal(99), Table: "orders", Err: cause,
+		}
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "production", unknown),
+			"a refusal kind with no line of its own never renders the error text")
 	})
 
 	t.Run("internal error remains sanitized", func(t *testing.T) {
-		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(errors.New("secret DSN")))
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "staging", errors.New("secret DSN")))
+	})
+}
+
+// A rollback-confirm whose lock stopped pinning the confirmed plan is told that
+// nothing ran and to plan a fresh rollback, in SchemaBot's words rather than
+// the storage error's. A rollback the database type cannot run is told which
+// feature was refused and the rollback-confirm to re-issue without the option
+// that asked for it, because retrying the same command would be refused the
+// same way and the refusal left the pinned rollback in place for the re-issue.
+// Every other dispatch failure stays in server logs behind fixed guidance that
+// does not promise a retry will succeed.
+func TestRollbackExecutionErrorMessage(t *testing.T) {
+	t.Run("lock intent change coaches a fresh rollback", func(t *testing.T) {
+		msg := rollbackExecutionErrorMessage("staging", fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
+		assert.Equal(t, msgRollbackLockIntentChanged, msg)
+		assert.Contains(t, msg, "nothing was applied")
+		assert.Contains(t, msg, "run the rollback command again")
+		assert.NotContains(t, msg, storage.ErrLockIntentChanged.Error())
+	})
+
+	t.Run("unsupported feature names the refused feature and the rollback-confirm to re-issue", func(t *testing.T) {
+		err := fmt.Errorf("execute apply: %w", &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover})
+		assert.Equal(t,
+			"database \"orders\": deferred cutover is not supported for database_type: postgres. "+
+				"Run `schemabot rollback-confirm -e staging` again without `--defer-cutover`. "+
+				"The pending rollback stays pinned for it.",
+			rollbackExecutionErrorMessage("staging", err))
+	})
+
+	t.Run("internal errors use fixed guidance without a retry promise", func(t *testing.T) {
+		err := errors.New("dial tcp storage.internal:3306: connection refused")
+		msg := rollbackExecutionErrorMessage("staging", err)
+		assert.Equal(t, "Failed to execute rollback. See SchemaBot server logs for details.", msg)
+		assert.NotContains(t, msg, err.Error())
+		assert.NotContains(t, msg, "retry")
+	})
+}
+
+func TestPendingRollbackApplyRefusal(t *testing.T) {
+	t.Run("loaded plan offers confirmation in its environment", func(t *testing.T) {
+		msg := pendingRollbackApplyRefusal("orders", &storage.Plan{Environment: "staging"})
+		assert.Contains(t, msg, "schemabot rollback-confirm -e staging")
+		assert.Contains(t, msg, "schemabot unlock")
+	})
+
+	t.Run("unavailable plan only offers unlock", func(t *testing.T) {
+		msg := pendingRollbackApplyRefusal("orders", nil)
+		assert.Contains(t, msg, "rollback plan that is unavailable")
+		assert.Contains(t, msg, "schemabot unlock")
+		assert.NotContains(t, msg, "rollback-confirm")
 	})
 }
 
@@ -377,4 +475,119 @@ func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
 	assert.Equal(t, []string{
 		"`orders` (create) is in this plan but not in the one this apply was started from",
 	}, oneKeyspace.Entries)
+}
+
+// A re-plan can route a statement to direct execution that the plan behind the
+// apply's comment ran through the engine, with the same DDL. Only those
+// statements are newly direct: one already disclosed as direct, or one that
+// now runs through the engine instead, was not hidden from the operator.
+func TestNewlyDirectChanges(t *testing.T) {
+	const swap = "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"
+	const addColumn = "ALTER TABLE `orders` ADD COLUMN `notes` text"
+	replan := func(usersMode, ordersMode string) *apitypes.PlanResponse {
+		return &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "mydb", TableChanges: []*apitypes.TableChangeResponse{
+				{TableName: "users", ChangeType: "alter", DDL: swap, ExecutionMode: usersMode},
+				{TableName: "orders", ChangeType: "alter", DDL: addColumn, ExecutionMode: ordersMode},
+			}},
+		}}
+	}
+	stored := func(usersMode string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", Operation: "alter", DDL: swap, ExecutionMode: usersMode},
+				{Table: "orders", Operation: "alter", DDL: addColumn},
+			}},
+		}}
+	}
+
+	t.Run("statement the plan ran through the engine is newly direct", func(t *testing.T) {
+		assert.Equal(t, []directChangeIdentity{{namespace: "mydb", table: "users", ddl: swap}},
+			newlyDirectChanges(replan("direct", ""), stored("")))
+	})
+	t.Run("statement the plan already disclosed as direct is not", func(t *testing.T) {
+		assert.Empty(t, newlyDirectChanges(replan("direct", ""), stored("direct")))
+	})
+	t.Run("statement that stops being direct is not", func(t *testing.T) {
+		assert.Empty(t, newlyDirectChanges(replan("", ""), stored("direct")))
+	})
+	t.Run("every newly direct statement is returned in table order", func(t *testing.T) {
+		assert.Equal(t, []directChangeIdentity{
+			{namespace: "mydb", table: "orders", ddl: addColumn},
+			{namespace: "mydb", table: "users", ddl: swap},
+		}, newlyDirectChanges(replan("direct", "direct"), stored("")))
+	})
+	t.Run("a shard newly direct is newly direct even when another shard was disclosed", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "ks", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			{Namespace: "ks", Shard: "80-", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+		}}
+		storedPlan := &storage.Plan{Shards: []storage.ShardPlan{
+			{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			{Namespace: "ks", Shard: "80-", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+		}}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", shard: "80-", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan))
+	})
+	t.Run("a sharded namespace is judged by its shard rows, not its namespace summary", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{
+				{Namespace: "ks", TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []*apitypes.ShardPlanResponse{
+				{Namespace: "ks", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+		}
+		storedPlan := &storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"ks": {Tables: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []storage.ShardPlan{
+				{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+			},
+		}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", shard: "-80", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan),
+			"one entry for the shard, and the namespace summary neither adds one nor counts as disclosure")
+	})
+	t.Run("a namespace summary the disclosed plan rendered per shard does not disclose an unsharded re-plan", func(t *testing.T) {
+		planResp := &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{
+			{Namespace: "ks", TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: swap, ExecutionMode: "direct"}}},
+		}}
+		storedPlan := &storage.Plan{
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"ks": {Tables: []storage.TableChange{{Table: "users", DDL: swap, ExecutionMode: "direct"}}},
+			},
+			Shards: []storage.ShardPlan{
+				{Namespace: "ks", Shard: "-80", Changes: []storage.TableChange{{Table: "users", DDL: swap}}},
+			},
+		}
+		assert.Equal(t, []directChangeIdentity{{namespace: "ks", table: "users", ddl: swap}},
+			newlyDirectChanges(planResp, storedPlan))
+	})
+	t.Run("statement differing only in surrounding whitespace is the same statement", func(t *testing.T) {
+		storedPlan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"mydb": {Tables: []storage.TableChange{
+				{Table: "users", DDL: "\n" + swap + "\n", ExecutionMode: "direct"},
+				{Table: "orders", DDL: addColumn},
+			}},
+		}}
+		assert.Empty(t, newlyDirectChanges(replan("direct", ""), storedPlan))
+	})
+}
+
+func TestNewlyDirectCauseNamesEachTable(t *testing.T) {
+	cause := newlyDirectCause([]directChangeIdentity{
+		{namespace: "mydb", table: "users", ddl: "ALTER TABLE `users` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "-80", table: "events", ddl: "ALTER TABLE `events` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "80-", table: "events", ddl: "ALTER TABLE `events` DROP PRIMARY KEY"},
+		{namespace: "ks", shard: "80-", table: "orders", ddl: "ALTER TABLE `orders` DROP PRIMARY KEY"},
+	})
+	assert.Equal(t, "Changes run differently from the plan this apply was started from", cause.Heading)
+	assert.Equal(t, []string{
+		"`users` now runs as direct execution",
+		"`events` (shards `-80`, `80-`) now runs as direct execution",
+		"`orders` (shard `80-`) now runs as direct execution",
+	}, cause.Entries)
+	assert.Equal(t, "The direct execution section above shows how they will run. Review it, then confirm to apply.", cause.Remedy)
 }

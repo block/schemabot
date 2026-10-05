@@ -82,32 +82,57 @@ func trimTrailingZero(v float64) string {
 	return strings.TrimSuffix(fmt.Sprintf("%.1f", v), ".0")
 }
 
+// oneDecimal renders a scaled magnitude with one decimal below 100 ("4.0",
+// "48.2") and none from 100 up ("186"), where the integer already carries
+// three significant figures. A size below 100 keeps its ".0" so a value that
+// happens to be round reads at the same precision as its neighbours instead
+// of looking rounded off.
+func oneDecimal(v float64) string {
+	if v >= 99.95 {
+		return fmt.Sprintf("%.0f", v)
+	}
+	return fmt.Sprintf("%.1f", v)
+}
+
 // FormatApproxBytes renders an approximate byte-size estimate compactly with a
-// leading tilde and decimal units: 812 → "~812 B", 48_200_000_000 → "~48.2 GB".
+// leading tilde, decimal units, and one decimal: 812 → "~812 B",
+// 4_000_000_000 → "~4.0 GB", 48_200_000_000 → "~48.2 GB".
 // Byte estimates come from engine statistics and are never exact, so the tilde
 // is part of the format. Decimal units (not binary) because the value is an
 // order-of-magnitude signal, not an allocation figure — a measured allocation
 // belongs in FormatBytesBinary instead. Each unit's threshold
-// sits where the one-decimal rendering would round to 1000 of the smaller
-// unit, so a value rolls over to "~1 GB" rather than rendering as "~1000 MB".
+// sits where the integer rendering would round to 1000 of the smaller unit,
+// so a value rolls over to "~1.0 GB" rather than rendering as "~1000 MB".
 func FormatApproxBytes(b int64) string {
 	if b < 0 {
 		b = 0
 	}
 	switch {
-	case b >= 999_950_000_000_000:
-		return "~" + trimTrailingZero(float64(b)/1e15) + " PB"
-	case b >= 999_950_000_000:
-		return "~" + trimTrailingZero(float64(b)/1e12) + " TB"
-	case b >= 999_950_000:
-		return "~" + trimTrailingZero(float64(b)/1e9) + " GB"
-	case b >= 999_950:
-		return "~" + trimTrailingZero(float64(b)/1e6) + " MB"
+	case b >= 999_500_000_000_000:
+		return "~" + oneDecimal(float64(b)/1e15) + " PB"
+	case b >= 999_500_000_000:
+		return "~" + oneDecimal(float64(b)/1e12) + " TB"
+	case b >= 999_500_000:
+		return "~" + oneDecimal(float64(b)/1e9) + " GB"
+	case b >= 999_500:
+		return "~" + oneDecimal(float64(b)/1e6) + " MB"
 	case b >= 1_000:
-		return "~" + trimTrailingZero(float64(b)/1e3) + " KB"
+		return "~" + oneDecimal(float64(b)/1e3) + " KB"
 	default:
 		return fmt.Sprintf("~%d B", b)
 	}
+}
+
+// FormatTableSizeClause renders the " · ~23.4 GB" clause a copy progress line
+// carries after its row counts: the table's on-disk size when it was planned,
+// so the operator sees the scale of the copy beside how far it has come. It is
+// the whole table's size, not a measure of bytes copied. Empty when no
+// estimate is known.
+func FormatTableSizeClause(estimatedBytes *int64) string {
+	if estimatedBytes == nil {
+		return ""
+	}
+	return " \u00b7 " + FormatApproxBytes(*estimatedBytes)
 }
 
 // VSchemaStatusLabel maps an engine's vschema_status display value to a human

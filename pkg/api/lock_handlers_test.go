@@ -248,7 +248,7 @@ func (s *memoryLockStore) Release(_ context.Context, database, dbType, owner str
 	return nil
 }
 
-func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbType, owner string) error {
+func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	if s.beforeReleaseByID != nil {
 		s.beforeReleaseByID(s)
 	}
@@ -260,6 +260,9 @@ func (s *memoryLockStore) ReleaseByID(_ context.Context, id int64, database, dbT
 	}
 	if s.lock.Owner != owner {
 		return storage.ErrLockNotOwned
+	}
+	if s.lock.PendingPlanID != pendingPlanID {
+		return storage.ErrLockIntentChanged
 	}
 	s.lock = nil
 	return nil
@@ -373,6 +376,36 @@ func TestScopedLockReleaseIsPerOperatorGroup(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), "released and acquired again")
 		require.NotNil(t, locks.lock, "the new lock must survive a release decided against the one it replaced")
 		assert.Equal(t, int64(8), locks.lock.ID)
+	})
+
+	t.Run("a lock pinned to a pending plan is released", func(t *testing.T) {
+		held := paymentsLock(7, owner, teamAcquirer)
+		held.PendingPlanID = "plan-1"
+		locks := &memoryLockStore{lock: held}
+		rec := release(t, locks, &auth.User{Subject: "carol", Groups: []string{"payments-team"}})
+
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Nil(t, locks.lock, "the checked row and its pending plan are released")
+	})
+
+	t.Run("a lock re-pinned to a new plan after the check is left held", func(t *testing.T) {
+		held := paymentsLock(7, owner, teamAcquirer)
+		held.PendingPlanID = "plan-1"
+		locks := &memoryLockStore{
+			lock: held,
+			beforeReleaseByID: func(s *memoryLockStore) {
+				refreshed := *s.lock
+				refreshed.PendingPlanID = "plan-2"
+				s.lock = &refreshed
+			},
+		}
+		rec := release(t, locks, &auth.User{Subject: "carol", Groups: []string{"payments-team"}})
+
+		assert.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "released and acquired again")
+		require.NotNil(t, locks.lock, "the lock re-pinned to a new plan stays held")
+		assert.Equal(t, int64(7), locks.lock.ID)
+		assert.Equal(t, "plan-2", locks.lock.PendingPlanID)
 	})
 
 	t.Run("a lock released after the check reports it missing", func(t *testing.T) {

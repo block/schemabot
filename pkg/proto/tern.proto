@@ -494,22 +494,36 @@ message PlanRequest {
   // configuration decides, which with none configured leaves every statement
   // the engine refuses blocked.
   DirectExecutionPolicy direct_execution = 14;
+  // Declared namespaces the caller left out of schema_files because the
+  // target's entry in its database's targets list selects only other
+  // namespaces. Like ignored_namespaces, they are withheld rather than
+  // removed, so the data plane refuses engine shapes that diff the whole target
+  // as one unit (a database-scoped MySQL DSN), where an unselected namespace's
+  // live tables would otherwise be planned as drops.
+  repeated string unselected_namespaces = 15;
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses
-// to run verbatim as native DDL, bounded by the target table's size. Engines
-// that do not implement direct execution ignore it.
+// to run verbatim as native DDL, bounded by the target table's size in rows
+// or in bytes. Engines that do not implement direct execution
+// ignore it.
 message DirectExecutionPolicy {
   // Whether refused statements may run directly at all.
   bool enabled = 1;
-  // The fail-closed size bound: a refused statement runs directly only when
-  // the target table is at or below this row count. Required (positive) when
-  // enabled — a grant carrying no bound is refused, never treated as
-  // unbounded — and a table whose size cannot be measured is blocked.
+  // A size bound on the target table's row count; zero states no row bound.
+  // An enabled policy carries exactly one of this bound and max_table_bytes —
+  // a grant carrying no bound is refused, never treated as unbounded — and a
+  // table whose size cannot be measured is blocked. A negative value is an
+  // unusable bound, which the engine refuses.
   int64 max_table_rows = 2;
   // How long each direct statement waits to acquire its locks before failing
   // with a retryable busy-table error. Zero leaves the engine's own default.
   int64 lock_acquisition_timeout_seconds = 3;
+  // A size bound on the target table's data plus index footprint, in bytes;
+  // zero states no byte bound. A refused statement runs directly when the
+  // table is within the policy's bound. A negative value is an unusable
+  // bound, which the engine refuses.
+  int64 max_table_bytes = 4;
 }
 
 // TableChange represents a DDL change to a table.
@@ -531,6 +545,24 @@ message TableChange {
   // that materializes the plan from a dispatch request runs the same
   // apply-time safety gates as one reading its own stored plan.
   map<string, string> metadata = 9;
+  // Approximate number of rows in the table at plan time, for display only.
+  // Sourced from engine statistics (e.g. information_schema TABLE_ROWS), which
+  // may be stale — never treat it as an exact count or use it as a gate input.
+  // For sharded targets this is the sum across shards. Unset when no estimate
+  // is available (e.g. the table is being created, or statistics could not be
+  // read).
+  optional int64 estimated_rows = 10;
+  // Number of shards this table change spans. Zero when the target is not
+  // sharded or the shard topology is unknown.
+  int32 shard_count = 11;
+  // Approximate row count of the largest single shard — the biggest chunk a
+  // shard-at-a-time apply works through at once. Unset when the target is not
+  // sharded or no estimate is available. Approximate like estimated_rows.
+  optional int64 largest_shard_rows = 12;
+  // Approximate on-disk footprint of the table (data plus indexes), summed
+  // across shards for sharded targets. Unset when no estimate was available.
+  // Approximate like estimated_rows.
+  optional int64 estimated_bytes = 13;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
@@ -652,6 +684,13 @@ message PlanDiffResponse {
   // Per-shard membership and drift, populated for sharded engines. Empty for
   // single-endpoint engines.
   repeated ShardPlan shards = 5;
+  // Unfinished work already on the target that applying this diff's changes
+  // would continue or destroy, the same disclosures PlanResponse carries.
+  repeated ExistingCopy existing_copies = 6;
+  // Set by a data plane that read the target for every copy applying this
+  // diff could meet, so a caller can tell a clean target from a data plane
+  // that never looked or whose lookup failed.
+  bool existing_copies_reported = 7;
 }
 
 // ApplyRequest requests execution of a previously generated plan.
@@ -771,6 +810,12 @@ message ProgressRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // When set, scopes the answer to one operation of the apply: the
+  // apply_operation_id a dispatch returned in ApplyResponse. The rollout
+  // members of one deployment share its apply, each with its own operation,
+  // so a member's progress is its operation's state and tables rather than
+  // the whole apply's. Empty asks about the whole apply.
+  string apply_operation_id = 3;
 }
 
 message LogsRequest {
@@ -843,6 +888,10 @@ message TableProgress {
   // Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
   // 2s"). Empty when throttled is false.
   string throttle_reason = 18;
+  // The plan's approximate on-disk footprint of the table (data plus indexes),
+  // for display beside the row counts. Unset when the plan had no estimate and
+  // for a task scoped to one shard, since the estimate covers the whole table.
+  optional int64 estimated_bytes = 19;
 }
 
 // SettledControlRequest reports the fate of a durable control request the
@@ -881,6 +930,11 @@ message ProgressResponse {
   map<string, string> metadata = 10;
   // Control requests on this apply that have reached a terminal status.
   repeated SettledControlRequest settled_control_requests = 11;
+  // The apply_operation_id the answer is scoped to, echoed from the request.
+  // A caller that asked about one operation must refuse an answer without its
+  // id: a data plane that ignores the scope answers for the whole apply, and
+  // reading that as one member's state reports its siblings' work as its own.
+  string apply_operation_id = 12;
 }
 
 // CutoverRequest triggers the cutover phase.
@@ -894,6 +948,11 @@ message CutoverRequest {
   // may not be the one the operator talked to, and the request is what names
   // the requester in the PR notice and the apply log.
   string caller = 3;
+  // When set, cuts over only this operation of the apply: the
+  // apply_operation_id a dispatch returned in ApplyResponse. The rollout
+  // members of one deployment share its apply, and one member's turn to cut
+  // over is not its siblings' turn. Empty cuts over the apply's parked work.
+  string apply_operation_id = 4;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.

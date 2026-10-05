@@ -44,6 +44,12 @@ type Profile struct {
 	// Unix time (seconds) Token expires; 0 means unknown (no proactive refresh).
 	RefreshToken string `yaml:"refresh_token,omitempty"`
 	TokenExpiry  int64  `yaml:"token_expiry,omitempty"`
+	// TokenIssuer and TokenClientID record the OIDC issuer and client ID that
+	// `schemabot login` obtained Token and RefreshToken from. A refresh token is
+	// valid only at the issuer and for the client that issued it, so refresh uses
+	// this pair rather than the oidc settings, which login flags can override.
+	TokenIssuer   string `yaml:"token_issuer,omitempty"`
+	TokenClientID string `yaml:"token_client_id,omitempty"`
 	// OIDC holds the public-client settings `schemabot login` uses to run the
 	// browser auth-code flow for this profile's server. Optional; absent until a
 	// server has OIDC enabled.
@@ -58,6 +64,26 @@ type OIDCLogin struct {
 	Issuer       string `yaml:"issuer"`
 	ClientID     string `yaml:"client_id"`
 	RedirectPort int    `yaml:"redirect_port,omitempty"`
+}
+
+// tokenSource returns the OIDC issuer and client ID to renew the cached token
+// with, and whether the token came from an OIDC login at all. The pair recorded
+// at login wins; a profile that records neither half falls back to its oidc
+// settings. A profile that records only one half cannot say where its refresh
+// token came from, so it returns an error instead of falling back to an issuer
+// that may not have issued it.
+func (p *Profile) tokenSource() (LoginConfig, bool, error) {
+	recordedIssuer, recordedClientID := p.TokenIssuer != "", p.TokenClientID != ""
+	if recordedIssuer && recordedClientID {
+		return LoginConfig{Issuer: p.TokenIssuer, ClientID: p.TokenClientID}, true, nil
+	}
+	if recordedIssuer != recordedClientID {
+		return LoginConfig{}, true, fmt.Errorf("profile records only one of token_issuer and token_client_id")
+	}
+	if p.OIDC != nil {
+		return LoginConfig{Issuer: p.OIDC.Issuer, ClientID: p.OIDC.ClientID}, true, nil
+	}
+	return LoginConfig{}, false, nil
 }
 
 // ConfigPath returns the path to the config file (~/.schemabot/config.yaml).
@@ -398,8 +424,9 @@ func unixExpiry(t time.Time) int64 {
 }
 
 // ResolveBearerToken resolves the Bearer token like ResolveToken, but renews an
-// expired profile-cached token when a refresh token and OIDC settings are
-// present, persisting the rotated token. Flag/env tokens are returned as-is.
+// expired profile-cached token when a refresh token and its OIDC issuer and
+// client ID are known, persisting the rotated token. Flag/env tokens are
+// returned as-is.
 //
 // Error contract for the caller: a non-empty token with a non-nil error is a
 // non-fatal warning (the returned token is the best available — e.g. a stale
@@ -434,12 +461,14 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 		return "", nil
 	}
 
+	source, fromOIDC, sourceErr := profile.tokenSource()
+
 	var expiry time.Time
 	var expiryErr error
 	// OIDC profiles may carry an access-token expiry cached by an older CLI.
 	// Read the actual bearer credential; a malformed hint requests repair via
 	// the refresh grant instead of trusting a stale cached expiry.
-	if profile.OIDC != nil {
+	if fromOIDC {
 		expiry, expiryErr = idTokenExpiry(token)
 	} else if profile.TokenExpiry != 0 {
 		expiry = time.Unix(profile.TokenExpiry, 0)
@@ -450,14 +479,17 @@ func ResolveBearerToken(ctx context.Context, tokenFlag, endpointFlag, profileFla
 			return token, nil
 		}
 	}
-	if profile.RefreshToken == "" || profile.OIDC == nil {
+	if profile.RefreshToken == "" || !fromOIDC {
 		if expiryErr != nil {
 			return token, fmt.Errorf("read cached ID token expiry for profile %q (run `%s login`): %w", profileName, cliname.Name(), expiryErr)
 		}
 		return token, fmt.Errorf("token for profile %q is expired or about to expire according to this computer and cannot be refreshed; check the local clock or run `%s login`", profileName, cliname.Name())
 	}
+	if sourceErr != nil {
+		return token, fmt.Errorf("token for profile %q cannot be refreshed (run `%s login`): %w", profileName, cliname.Name(), sourceErr)
+	}
 
-	result, err := RefreshToken(ctx, LoginConfig{Issuer: profile.OIDC.Issuer, ClientID: profile.OIDC.ClientID}, profile.RefreshToken)
+	result, err := RefreshToken(ctx, source, profile.RefreshToken)
 	if err != nil {
 		return token, fmt.Errorf("could not refresh the token for profile %q (run `%s login`): %w", profileName, cliname.Name(), err)
 	}

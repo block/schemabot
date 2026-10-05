@@ -100,6 +100,9 @@ and environment from the inventory. The response groups `CREATE TABLE`
 statements by namespace: a schema on MySQL or PostgreSQL, a keyspace on Vitess.
 Use `--namespace` (API: `namespaces`) to select namespaces; omit it to discover
 the non-reserved namespaces.
+Supply concrete live namespace names when selecting them. `{env}` and `$ENV`
+are schema-directory placeholders, so both are rejected in `--namespace` and
+`POST /api/pull` `namespaces` arguments.
 
 ```sh
 schemabot pull -d shop -e production
@@ -392,6 +395,25 @@ indexes in a different order are reported as `differs`. The comparison errs
 toward reporting: it will send you to look at a table that turns out to agree,
 but it will not call two different schemas equal.
 
+A target whose entry [selects namespaces](configuration.md#selecting-namespaces-per-target)
+is pulled for exactly those namespaces, by name, and an explicitly requested
+namespace it does not select is left out of its pull. When every entry of the
+environment selects namespaces, a requested namespace none of them selects is
+rejected with `400` naming it and the selectable ones, rather than answered
+with an empty schema:
+
+```json
+{
+  "error": "database \"orders\" environment \"production\" has no targets entry selecting namespaces [shop_l]; the selectable namespaces are [shop_0, shop_1]",
+  "error_code": ""
+}
+```
+
+The response shape does not change, but the comparison is still keyed by namespace and table: two
+targets holding different namespaces report each other's tables as
+`only_on_primary` and `only_on_target`, because neither holds the other's
+namespace.
+
 An environment that does not list `targets` carries no `targets` array at all.
 
 ### Engine support
@@ -568,10 +590,10 @@ live view:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
-  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
 Use `schemabot status apply-example-73` for a single snapshot. SQL rendering
@@ -584,6 +606,10 @@ Table entries identify the DDL and task state. Available metrics depend on the
 engine and execution phase: copying can report rows and percent complete;
 `eta_seconds` is an estimate and may be omitted. Do not interpret an absent ETA
 as zero time remaining. Throttled tasks can include `throttle_reason`.
+`estimated_bytes` is the table's on-disk size when the change was planned,
+the same figure the plan comment shows. It is fixed for the life of the apply
+and does not grow as rows copy. It is omitted when the plan had no estimate,
+and on a row for one shard of a table, since the plan measures the whole table.
 A PostgreSQL concurrent index build reports a whole-build percentage estimated
 from the server's build phase and its counters; it stays below 100 until the
 apply completes and holds its last value between phases (see
@@ -600,6 +626,14 @@ engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
 request fields such as `branch_name` and `deploy_request_url`. Spirit applies
 currently report progress on the table entries and do not report position fields.
+`engine` names the engine running the apply, in one of two forms depending on
+where the response comes from. While the data plane reports the apply's
+progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
+`PostgreSQL`. A response served from SchemaBot's storage carries the stored
+engine name instead: `spirit`, `planetscale`, `strata`, or `postgres`. Storage
+serves a settled, retryable-failed, resuming, or multi-deployment apply, and a
+remote apply the data plane has not yet been handed. `Unknown` means the data
+plane reported an engine this server does not recognize.
 
 <details>
 <summary>Request and response example</summary>
@@ -615,7 +649,7 @@ Response excerpt (illustrative values):
   "apply_id": "apply-example-73",
   "database": "shop",
   "environment": "production",
-  "engine": "spirit",
+  "engine": "Spirit",
   "state": "running",
   "tables": [
     {
@@ -624,6 +658,7 @@ Response excerpt (illustrative values):
       "status": "running",
       "rows_copied": 6000000,
       "rows_total": 10000000,
+      "estimated_bytes": 3200000000,
       "percent_complete": 60,
       "eta_seconds": 2520,
       "throttled": true,
@@ -662,6 +697,7 @@ Response excerpt (illustrative values):
       "target": "shop-001",
       "ddl": "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)",
       "status": "completed",
+      "estimated_bytes": 2400000000,
       "percent_complete": 100
     },
     {
@@ -672,6 +708,7 @@ Response excerpt (illustrative values):
       "status": "running",
       "rows_copied": 2000000,
       "rows_total": 8000000,
+      "estimated_bytes": 2600000000,
       "percent_complete": 25
     }
   ]
@@ -679,7 +716,8 @@ Response excerpt (illustrative values):
 ```
 
 Both rows report the same table under the same deployment, and only `target`
-tells them apart.
+tells them apart. Each row's `estimated_bytes` is that target's own copy of the
+table.
 
 </details>
 
@@ -697,7 +735,7 @@ Response excerpt (illustrative values):
   "apply_id": "apply-example-74",
   "database": "shop",
   "environment": "production",
-  "engine": "postgres",
+  "engine": "PostgreSQL",
   "state": "running",
   "metadata": {
     "phase": "preflight",
@@ -745,7 +783,7 @@ heap is scanned, then `building index: sorting live tuples`, then
 The numbers come from the engine while the apply is active, so they are as
 fresh as the last poll. Once the apply is terminal, the same endpoint answers
 from storage: rows, throttle state, and checksum counts are preserved on the
-task record, and `metadata` holds the last position the engine reported; ETA
+task record along with `estimated_bytes`, and `metadata` holds the last position the engine reported; ETA
 and per-shard rows are not persisted in this view. A new attempt can display
 the prior attempt's position until its first progress save.
 
@@ -778,13 +816,14 @@ Output excerpt:
 ```text
 ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
   ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
-  • Rows: 6,000,000 / 10,000,000 · ETA: 42m 0s
+  • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
-  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 ```
 
-Here, `orders` is 60% copied with an estimated 42 minutes remaining. Copying
+Here, `orders` is 60% copied with an estimated 42 minutes remaining. The
+table measured about 3.2 GB when the change was planned. Copying
 is backing off because 21 active threads exceed the configured budget of 18.
 
 `GET /api/status` spans the registered databases. It returns the
@@ -813,8 +852,50 @@ follow, most recently active first.
 Each row carries the apply ID, database, environment, state, engine, caller,
 error message, and started, completed, and updated timestamps. A row carries
 `deployment` only when the request is deployment-filtered; an unfiltered list
-omits the field on every row. `schemabot status` renders it;
-`schemabot status --json` returns it raw.
+omits the field on every row. On a deployment-filtered row, `state` is that
+deployment's operation state, and `apply_state` is the parent apply's own
+state. An apply holds every deployment it touches until the apply itself
+finishes, so a row whose `state` is `completed` while `apply_state` is still
+`running` means the deployment is still reserved by a rollout running
+elsewhere. `schemabot status` renders it; `schemabot status --json` returns it
+raw.
+
+<details>
+<summary>Deployment-filtered request and response example</summary>
+
+```http
+GET /api/status?environment=production&deployment=us&active=true
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "active_count": 0,
+  "limit": 20,
+  "max_limit": 1000,
+  "state_counts": {
+    "running": 1
+  },
+  "applies": [
+    {
+      "apply_id": "apply-example-74",
+      "database": "orders",
+      "environment": "production",
+      "deployment": "us",
+      "state": "completed",
+      "apply_state": "running",
+      "engine": "spirit",
+      "caller": "example/orders#91",
+      "started_at": "2026-09-01T02:10:00Z",
+      "completed_at": "2026-09-01T02:52:00Z",
+      "updated_at": "2026-09-01T02:52:00Z"
+    }
+  ]
+}
+```
+
+</details>
 
 <details>
 <summary>Request and response example</summary>
@@ -929,12 +1010,33 @@ plan-example-42
 Each replan has its own ID, so one PR can appear more than once. The warning
 marker identifies plans with unsafe changes.
 
+A plan ID given with `-e` must belong to that environment. This is the form
+PR comments print when they cut DDL to fit, so a pasted command either shows
+that environment's plan or refuses:
+
+```sh
+schemabot list-plans -e production plan-example-42
+```
+
+```text
+Error: plan plan-example-42 was made for environment "staging", not "production"; rerun with -e staging
+```
+
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,
 `repository`, and `pull_request` (with `repository`), plus a `last` window.
 Each summary carries the plan ID, database, database type, environment, and
 creation time, plus a count of changes by operation and how many were unsafe
-or blocked; a plan with no changes omits the counts. The repository, PR, and
+or blocked. Namespace-level work is counted separately:
+`vschema_change_count` is how many namespaces show a VSchema change, and
+`finalize_count` is how many namespaces have nothing to run but the finalize
+the engine asked for. A finalize beside a namespace's DDL or VSchema change is
+part of that work, so it is not counted, and a namespace whose VSchema change
+the engine generates entirely from the plan's DDL has nothing to review, so it
+is counted by its DDL alone. A plan with no changes omits every count; a plan
+whose only work is a finalize carries `finalize_count` alone, and
+`list-plans` renders it as `1 finalize` rather than `no changes`. The
+repository, PR, and
 head SHA it was planned from appear when the plan came from a PR (an ad-hoc
 CLI plan has none, and older plans may lack the SHA); `deployment` names the
 primary deployment the plan was computed against, when one was recorded.
@@ -943,12 +1045,171 @@ primary deployment the plan was computed against, when one was recorded.
 DDL that was computed, the change type, whether it was classified unsafe and
 why, and whether it was classified for direct execution. The plan also names
 the rollout member it was computed against, as `deployment` and `target`
-together: one deployment can address several targets, so read the pair. Because a plan is
+together: one deployment can address several targets, so read the pair. A plan
+made for one member with a target selector (`schemabot plan --target`) carries
+that member's `deployment/target` as `narrowed_to`; it says nothing about the
+environment's other members and is applied to that member alone. A plan of the
+whole rollout omits the field. Because a plan is
 stamped with the commit it was computed from, a caller can join it back to the
 repository to inspect the proposed change at that commit. To establish what
 actually ran, inspect the apply's task DDL and outcome through progress.
 `schemabot list-plans` and `schemabot list-plans <plan_id>` render
 both, with `--json` for the raw response.
+
+Each table change can carry the planner's size estimates for the table:
+`estimated_rows`, `estimated_bytes` (data plus indexes), and, when the target
+is sharded, `shard_count` and `largest_shard_rows` (the largest single shard's
+rows). For a sharded target the row and byte figures are totals across the
+planned shards. They come from engine statistics at plan time, so treat them
+as approximate and display-only: they are not inputs to any verdict. A field
+is omitted when no estimate was available. That covers a table the plan
+creates, a failed or timed-out size read, and any shard reporting nothing
+(which omits that table's total rather than undercounting it). MySQL targets
+planned by Spirit report rows and bytes for every existing table the plan
+touches; other engines omit the fields for now.
+
+Each entry in the plan's `changes` is one namespace, and its `metadata`
+carries the namespace-level work the engine planned alongside the table DDL.
+`needs_finalizer: "true"` means the engine asked for the namespace's group
+finalizer to run once its DDL lands (for Strata, registering tables and
+seeding sequences), independently of any VSchema change. The finalizer runs
+as its own `group_finalizer` operation of the apply, so a namespace can carry
+the marker with no table changes at all, and such a plan still has work to
+apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
+engine generates the namespace's whole VSchema change from the plan's DDL, so
+there is no VSchema diff to review; plans show such a namespace by its DDL
+alone.
+
+<details>
+<summary>Stored plan narrowed to one rollout member</summary>
+
+```http
+GET /api/plans/plan-example-50
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-50",
+  "database": "orders",
+  "database_type": "mysql",
+  "environment": "production",
+  "deployment": "us",
+  "created_at": "2026-09-01T04:40:00Z",
+  "change_counts": {
+    "alter": 1
+  },
+  "target": "payments-002",
+  "plan": {
+    "plan_id": "plan-example-50",
+    "database": "orders",
+    "environment": "production",
+    "deployment": "us",
+    "target": "payments-002",
+    "narrowed_to": "us/payments-002",
+    "engine": "spirit",
+    "changes": [
+      {
+        "namespace": "orders",
+        "table_changes": [
+          {
+            "table_name": "invoices",
+            "namespace": "orders",
+            "ddl": "ALTER TABLE `invoices` ADD COLUMN `memo` varchar(255)",
+            "change_type": "alter"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>Stored plan whose only work is a finalize</summary>
+
+```http
+GET /api/plans/plan-example-51
+```
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-51",
+  "database": "payments",
+  "database_type": "strata",
+  "environment": "staging",
+  "created_at": "2026-09-01T04:55:00Z",
+  "finalize_count": 1,
+  "plan": {
+    "plan_id": "plan-example-51",
+    "engine": "strata",
+    "changes": [
+      {
+        "namespace": "payments",
+        "metadata": {
+          "needs_finalizer": "true"
+        }
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary>Stored plan whose VSchema change is generated from its DDL</summary>
+
+```http
+GET /api/plans/plan-example-52
+```
+
+The namespace still reports `vschema_changed`, but the plan counts it by its
+`create` alone, with no `vschema_change_count` and no `finalize_count`.
+
+Response excerpt (illustrative values):
+
+```json
+{
+  "plan_id": "plan-example-52",
+  "database": "payments",
+  "database_type": "strata",
+  "environment": "staging",
+  "created_at": "2026-09-01T05:10:00Z",
+  "change_counts": {
+    "create": 1
+  },
+  "plan": {
+    "plan_id": "plan-example-52",
+    "engine": "strata",
+    "changes": [
+      {
+        "namespace": "payments",
+        "table_changes": [
+          {
+            "table_name": "refund_notes",
+            "namespace": "payments",
+            "ddl": "CREATE TABLE `refund_notes` (\n  `id` bigint unsigned NOT NULL,\n  `note` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n)",
+            "change_type": "create"
+          }
+        ],
+        "metadata": {
+          "needs_finalizer": "true",
+          "vschema_changed": "true",
+          "vschema_generated_only": "true"
+        }
+      }
+    ]
+  }
+}
+```
+
+</details>
 
 A stored plan records what the planner proposed, not what it declined to
 propose. When the planner exempts live tables from the undeclared-table
@@ -1105,21 +1366,27 @@ Response excerpt (illustrative values):
           {
             "table_name": "orders",
             "ddl": "ALTER TABLE `orders` ADD COLUMN `discount_code` varchar(32) DEFAULT NULL",
-            "change_type": "alter"
+            "change_type": "alter",
+            "estimated_rows": 2340000,
+            "estimated_bytes": 1130000000
           },
           {
             "table_name": "old_orders",
             "ddl": "DROP TABLE `old_orders`",
             "change_type": "drop",
             "is_unsafe": true,
-            "unsafe_reason": "Dropping a table permanently deletes its data"
+            "unsafe_reason": "Dropping a table permanently deletes its data",
+            "estimated_rows": 18400,
+            "estimated_bytes": 6100000
           },
           {
             "table_name": "old_order_events",
             "ddl": "DROP TABLE `old_order_events`",
             "change_type": "drop",
             "is_unsafe": true,
-            "unsafe_reason": "Dropping a table permanently deletes its data"
+            "unsafe_reason": "Dropping a table permanently deletes its data",
+            "estimated_rows": 96000,
+            "estimated_bytes": 41000000
           }
         ]
       }

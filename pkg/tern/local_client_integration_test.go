@@ -3276,7 +3276,7 @@ func TestLocalClient_RunApplyExecutionRefusesBlockedTaskRow(t *testing.T) {
 	observer := &recordingTerminalObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	client.runApplyExecution(ctx, apply, []*storage.Task{task}, plan, nil, false)
+	require.NoError(t, client.runApplyExecution(ctx, apply, []*storage.Task{task}, plan, nil, false))
 	assert.Equal(t, 0, driveEngine.applyCount, "a blocked row must never reach the engine")
 
 	storedApply, err := stor.Applies().Get(ctx, apply.ID)
@@ -4517,7 +4517,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 	// The engine reports a failed result with Retryable=true. The local Tern
 	// driver should stop this attempt, keep the apply non-terminal, and leave
 	// already-completed task work untouched for the operator retry.
-	client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil, apply.GetOptions().Map(), false)
+	require.NoError(t, client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil, apply.GetOptions().Map(), false))
 
 	failedApply, err := stor.Applies().Get(ctx, applyID)
 	require.NoError(t, err)
@@ -4549,7 +4549,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 	// When the operator claims this apply, retryable tasks are queued for the
 	// next dispatch attempt. Completed tasks stay completed so successful table
 	// work is not repeated.
-	client.prepareRetryableTasksForResume(ctx, failedApply, failedTasks)
+	require.NoError(t, client.prepareRetryableTasksForResume(ctx, failedApply, failedTasks))
 
 	preparedTasks, err := stor.Tasks().GetByApplyID(ctx, applyID)
 	require.NoError(t, err)

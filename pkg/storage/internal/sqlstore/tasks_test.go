@@ -97,6 +97,68 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, reloaded.State)
 }
 
+// An operation lease absence guard is the conflict check's settlement write: it
+// holds no lease of its own and lands only while no drive holds the task's
+// operation. A heartbeated operation lease refuses the write and leaves the row
+// untouched; once the lease has aged past the reclaim window the write lands.
+func TestTaskStore_OperationLeaseAbsenceGuardsUpdate(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_task_opabsence", 1)
+
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	stampOperationLease(t, opID, "driver", "op-token")
+
+	now := time.Now()
+	taskID, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier:   "task_opabsence_users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		PlanID:           apply.PlanID,
+		Database:         apply.Database,
+		DatabaseType:     apply.DatabaseType,
+		Engine:           storage.EngineSpirit,
+		Environment:      apply.Environment,
+		State:            state.Task.Running,
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)",
+		DDLAction:        "ALTER",
+		Options:          []byte("{}"),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	task.ID = taskID
+	guarded := storage.WithOperationLeaseAbsent(ctx, storage.OperationLeaseAbsence{ApplyID: apply.ID, OperationID: opID})
+
+	task.State = state.Task.Failed
+	require.ErrorIs(t, store.Tasks().Update(guarded, task), storage.ErrOperationLeaseActive,
+		"a drive heartbeating the operation keeps the task")
+	reloaded, err := store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Running, reloaded.State)
+
+	_, err = testDB.ExecContext(ctx,
+		`UPDATE apply_operations SET updated_at = DATE_SUB(NOW(), INTERVAL ? SECOND) WHERE id = ?`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Tasks().Update(guarded, task), "a stale operation lease no longer holds the task")
+	reloaded, err = store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Failed, reloaded.State)
+}
+
 // CountByApplyID reports every task row an apply owns — unsharded drive rows
 // and shard-tagged rows alike, with no operation-key filtering — and never
 // another apply's rows. It is the predicate a drive uses to distinguish a
@@ -807,6 +869,76 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	crossApply := shardTask("a0-")
 	crossApply.ApplyOperationID = &otherOpID // belongs to otherApply, not the leased apply
 	require.ErrorContains(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), crossApply), "belongs to apply")
+}
+
+// missingInsert reports every guarded insert as a miss without running it, so
+// a test can reach the branch where the fence let nothing through while the
+// lease still reads as current — a path real SQL cannot produce today.
+type missingInsert struct{ identityInserter }
+
+func (missingInsert) InsertGuardedID(context.Context, queryExecer, string, ...any) (int64, bool, error) {
+	return 0, false, nil
+}
+
+// A guarded shard insert that writes nothing while the lease is still current
+// must not report success: no row exists and task.ID is still zero, so the
+// caller would carry on as if its progress row were stored. Both lease paths
+// match ApplyLogs().Append and return an error that is not a lease loss.
+func TestTaskStore_UpsertShardProgressReportsMissUnderCurrentLease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	lock := createTestLock(t, store, "probe_shard_miss_db", "vitess")
+	apply := createTestApply(t, store, lock, "apply_probe_shard_miss", 939)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	realInserter := store.tasks.identity
+	store.tasks.identity = missingInsert{realInserter}
+	t.Cleanup(func() { store.tasks.identity = realInserter })
+
+	shardTask := func() *storage.Task {
+		now := time.Now()
+		return &storage.Task{
+			TaskIdentifier: "task_shard_miss", ApplyID: apply.ID, ApplyOperationID: &opID,
+			PlanID: apply.PlanID, Database: apply.Database, DatabaseType: apply.DatabaseType,
+			Engine: storage.EnginePlanetScale, Environment: apply.Environment,
+			State: state.Task.Running, Namespace: "payments", TableName: "users", Shard: "-80",
+			DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "ALTER",
+			ProgressPercent: 20, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+
+	t.Run("apply lease", func(t *testing.T) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
+		`, "driver-a", "apply-token", apply.ID)
+		require.NoError(t, err)
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "apply-token"})
+
+		task := shardTask()
+		err = store.Tasks().UpsertShardProgress(ownerCtx, task)
+		require.Error(t, err, "no shard row was written, yet UpsertShardProgress returned nil with task.ID=%d", task.ID)
+		assert.NotErrorIs(t, err, storage.ErrApplyLeaseLost, "a miss under a current lease is not a lease loss")
+		assert.ErrorContains(t, err, "matched no rows despite current lease")
+		assert.Zero(t, task.ID)
+	})
+
+	t.Run("operation lease", func(t *testing.T) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE apply_operations SET lease_owner = ?, lease_token = ? WHERE id = ?
+		`, "driver-a", "op-token", opID)
+		require.NoError(t, err)
+		ownerCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opID, Owner: "driver-a", Token: "op-token"})
+
+		task := shardTask()
+		err = store.Tasks().UpsertShardProgress(ownerCtx, task)
+		require.Error(t, err, "no shard row was written, yet UpsertShardProgress returned nil with task.ID=%d", task.ID)
+		assert.NotErrorIs(t, err, storage.ErrApplyLeaseLost, "a miss under a current lease is not a lease loss")
+		assert.ErrorContains(t, err, "matched no rows despite current lease")
+		assert.Zero(t, task.ID)
+	})
 }
 
 // The object-ownership lookup answers "which pull requests have changed this

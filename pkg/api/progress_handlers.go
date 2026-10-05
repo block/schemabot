@@ -98,6 +98,8 @@ func engineName(e ternv1.Engine) string {
 		return "Spirit"
 	case ternv1.Engine_ENGINE_PLANETSCALE:
 		return "PlanetScale"
+	case ternv1.Engine_ENGINE_STRATA:
+		return "Strata"
 	case ternv1.Engine_ENGINE_POSTGRES:
 		return "PostgreSQL"
 	default:
@@ -168,6 +170,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			Status:              t.Status,
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,
+			EstimatedBytes:      t.EstimatedBytes,
 			PercentComplete:     t.PercentComplete,
 			ETASeconds:          t.EtaSeconds,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
@@ -932,12 +935,13 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // statusOperationForDeployment narrows an apply's operations to the requested
 // deployment for the status list. A single matching operation is returned
-// as-is. Multiple matches (a deployment applied per shard) fold into a
-// synthetic summary row: aggregated state and timestamps, plus the
-// deployment's one shared data-plane apply id as the external id — every
-// operation of a deployment attaches into the same data-plane apply, so the
-// deployment has exactly one. Per-operation external ids stay out of the
-// summary; they belong to the per-shard detail views.
+// as-is. Multiple matches (a deployment applied per shard, or per target when
+// it addresses several) fold into a synthetic summary row: aggregated state
+// and timestamps, plus the deployment's one shared data-plane apply id as the
+// external id — every operation of a deployment, whichever shard or target it
+// covers, attaches into the same data-plane apply, so the deployment has
+// exactly one. Per-operation external operation ids stay out of the summary;
+// they belong to the per-shard and per-target detail views.
 func (s *Service) statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) *storage.ApplyOperation {
 	if apply == nil {
 		return nil
@@ -1029,6 +1033,7 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 		}
 		active.ExternalOperationID = op.ExternalOperationID
 		active.State = op.State
+		active.ApplyState = apply.State
 		active.ErrorMessage = op.ErrorMessage
 		active.UpdatedAt = op.UpdatedAt.Format("2006-01-02T15:04:05Z07:00")
 		if op.StartedAt != nil {
@@ -1174,6 +1179,7 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			Status:              task.State,
 			RowsCopied:          task.RowsCopied,
 			RowsTotal:           task.RowsTotal,
+			EstimatedBytes:      task.EstimatedBytes,
 			PercentComplete:     int32(task.ProgressPercent),
 			ChecksumRowsChecked: task.ChecksumRowsChecked,
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,

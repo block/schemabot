@@ -18,6 +18,7 @@ package presentation
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/routing"
@@ -42,6 +43,18 @@ type Operation struct {
 
 	// State is the canonical operation state (state.ApplyOperation, == state.Apply).
 	State string
+
+	// OperationKey, Work, Finalizer and NeverStarted carry the stored row's
+	// key, kind and whether a driver ever claimed it. The aggregate reads them
+	// through state.RolloutChildren, the same rules the stored derivation
+	// applies, so a finalizer its own failed work orphaned, or a stop that
+	// caught a row before it started, settles the header exactly as it
+	// settles applies.state. Left zero, a row orphans nothing and counts as
+	// possibly started, which holds the rollout open rather than settling it.
+	OperationKey string
+	Work         bool
+	Finalizer    bool
+	NeverStarted bool
 
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
 	// by the caller from storage.CutoverPolicyBarrier). Under barrier an earlier
@@ -82,6 +95,12 @@ type Operation struct {
 
 	// Error is the operation's error detail, set when State is failed.
 	Error string
+
+	// ExternalID and ExternalOperationID are the data-plane apply and
+	// operation this operation runs as, for an operator to look up when it
+	// needs attention.
+	ExternalID          string
+	ExternalOperationID string
 }
 
 // continuesPastFailure reports whether a terminal-failed earlier sibling stops
@@ -163,6 +182,16 @@ type Deployment struct {
 	// Error is the operation's error detail when it failed, for the renderer to
 	// surface in the failed deployment's section.
 	Error string
+
+	// ExternalID and ExternalOperationID are the data-plane apply and
+	// operation the member runs as. They are carried on the member, beside
+	// its state and error, so a surface that names a member needing attention
+	// reads its identifiers from the same row rather than pairing two lists.
+	ExternalID          string
+	ExternalOperationID string
+
+	// NeverStarted is whether no driver ever claimed the member's operation.
+	NeverStarted bool
 }
 
 // NextActionKind is the semantic operator action the aggregate suggests. The
@@ -234,6 +263,97 @@ type Apply struct {
 	Deployments []Deployment
 }
 
+// Group is one deployment's members of a rollout, so a surface can show a
+// deployment of hundreds of targets as one section.
+type Group struct {
+	Deployment string
+	// Members indexes Apply.Deployments, in resolved order.
+	Members []int
+	// Lead is the member that most needs an operator, so one failed target
+	// heads a group of running ones.
+	Lead Deployment
+	// Counts is the group's per-status histogram, in display order.
+	Counts []StateCount
+	// Open is true when any member is open.
+	Open bool
+}
+
+// Groups partitions the rollout's members by deployment, in the order each
+// deployment first appears in resolved order. A deployment's members form one
+// group only when each is a distinct named target; members that divide one
+// target's work, or carry no target at all, are not targets to count, so each
+// stays a group of its own.
+func (a Apply) Groups() []Group {
+	var order []string
+	byDeployment := make(map[string][]int)
+	for i, d := range a.Deployments {
+		if _, seen := byDeployment[d.Deployment]; !seen {
+			order = append(order, d.Deployment)
+		}
+		byDeployment[d.Deployment] = append(byDeployment[d.Deployment], i)
+	}
+	var groups []Group
+	for _, deployment := range order {
+		members := byDeployment[deployment]
+		if a.membersAreDistinctTargets(members) {
+			groups = append(groups, a.group(deployment, members))
+			continue
+		}
+		for _, i := range members {
+			groups = append(groups, a.group(deployment, []int{i}))
+		}
+	}
+	return groups
+}
+
+// membersAreDistinctTargets reports whether every member names a target of its
+// own, which is what makes the members a deployment's targets.
+func (a Apply) membersAreDistinctTargets(members []int) bool {
+	seen := make(map[string]bool, len(members))
+	for _, i := range members {
+		target := a.Deployments[i].Target
+		if target == "" || seen[target] {
+			return false
+		}
+		seen[target] = true
+	}
+	return true
+}
+
+// group builds deployment's group from members, headed by the member most in
+// need of an operator.
+func (a Apply) group(deployment string, members []int) Group {
+	g := Group{Deployment: deployment, Members: members, Lead: a.Deployments[members[0]]}
+	ds := make([]Deployment, len(members))
+	for j, i := range members {
+		d := a.Deployments[i]
+		ds[j] = d
+		g.Open = g.Open || d.Open
+		if attentionRank(d.Presentation) < attentionRank(g.Lead.Presentation) {
+			g.Lead = d
+		}
+	}
+	g.Counts = summaryCounts(ds)
+	return g
+}
+
+// attentionOrder ranks presentations by how urgently they need an operator,
+// most urgent first and settled members last.
+var attentionOrder = []PresentationState{
+	StateFailed, StateRetrying, StatePaused, StateHalted, StateStopped,
+	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
+	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
+	StateCancelled, StateReverted, StateCompleted,
+}
+
+// attentionRank is ps's position in attentionOrder; unnamed states rank last.
+func attentionRank(ps PresentationState) int {
+	if i := slices.Index(attentionOrder, ps); i >= 0 {
+		return i
+	}
+	return len(attentionOrder)
+}
+
 // MultiDeployment reports whether the apply owns more than one deployment.
 // Callers use it as the single↔multi render threshold: when false, the apply
 // should render exactly as today's UX with no deployment hierarchy. It is
@@ -250,14 +370,20 @@ func (a Apply) MultiDeployment() bool {
 // carrying its operation's Deployment name — and callers rely on that
 // correspondence to key results back to their inputs.
 func Derive(ops []Operation) Apply {
-	children := make([]state.RolloutChild, len(ops))
+	rolloutOps := make([]state.RolloutOperation, len(ops))
 	for i, op := range ops {
-		children[i] = state.RolloutChild{
+		rolloutOps[i] = state.RolloutOperation{
+			Deployment:        op.Deployment,
+			OperationKey:      op.OperationKey,
+			Work:              op.Work,
+			Finalizer:         op.Finalizer,
 			State:             op.State,
+			NeverStarted:      op.NeverStarted,
 			ContinueOnFailure: op.continuesPastFailure(),
 			PauseOnFailure:    op.pausesOnFailure(),
 		}
 	}
+	children := state.RolloutChildren(rolloutOps)
 
 	names := memberNames(ops)
 	deployments := make([]Deployment, len(ops))
@@ -310,7 +436,10 @@ func memberNames(ops []Operation) []string {
 // as sibling j's own section is labelled.
 func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	op := ops[i]
-	d := Deployment{Deployment: op.Deployment, Target: op.Target, Name: names[i], State: op.State, Error: op.Error}
+	d := Deployment{
+		Deployment: op.Deployment, Target: op.Target, Name: names[i], State: op.State, Error: op.Error,
+		ExternalID: op.ExternalID, ExternalOperationID: op.ExternalOperationID, NeverStarted: op.NeverStarted,
+	}
 
 	switch op.State {
 	case state.ApplyOperation.Completed:

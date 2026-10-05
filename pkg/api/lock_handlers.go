@@ -393,14 +393,14 @@ func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	err = s.storage.Locks().ReleaseByID(ctx, lock.ID, req.Database, req.DatabaseType, req.Owner)
+	err = s.storage.Locks().ReleaseByID(ctx, lock.ID, req.Database, req.DatabaseType, req.Owner, lock.PendingPlanID)
 	if errors.Is(err, storage.ErrLockNotFound) {
 		metrics.RecordLockOperation(ctx, "release", req.Database, "not_found")
 		s.logger.Info("scoped lock release found the lock already released", logAttrs...)
 		s.writeError(w, http.StatusNotFound, "lock not found")
 		return
 	}
-	if errors.Is(err, storage.ErrLockReplaced) {
+	if errors.Is(err, storage.ErrLockReplaced) || errors.Is(err, storage.ErrLockIntentChanged) {
 		metrics.RecordLockOperation(ctx, "release", req.Database, "conflict")
 		s.logger.Warn("scoped lock release refused: the lock was released and acquired again after it was checked; the new lock stays held",
 			logAttrs...)

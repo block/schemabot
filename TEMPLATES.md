@@ -48,6 +48,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
@@ -57,7 +60,231 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-columnonly-alter-no-table-sizes"></a><strong>MySQL Plan (Column-only Alter, No Table Sizes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;
+```
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-many-tables-folded-table-sizes"></a><strong>MySQL Plan (Many Tables, Folded Table Sizes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `accounts` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `addresses` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `api_keys` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `audit_events` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `carts` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `categories` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `coupons` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `disputes` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `feature_flags` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `fulfillments` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `inventory` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `invoices` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `ledger_entries` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `line_items` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `locations` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `notifications` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `order_events` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `payment_methods` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `payments` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `payouts` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `prices` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `refunds` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `reviews` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `sessions` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `settlements` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `shipments` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `subscriptions` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `tax_rates` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `transfers` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+```sql
+ALTER TABLE `webhooks` ADD INDEX `idx_tenant_id`(`tenant_id`);
+```
+
+<details>
+<summary>📊 <b>Table sizes</b></summary>
+
+- `audit_events`: ~186 GB
+- `ledger_entries`: ~121 GB
+- `line_items`: ~58.0 GB
+- `notifications`: ~44.0 GB
+- `orders`: ~26.5 GB
+- `payments`: ~23.1 GB
+- `invoices`: ~17.4 GB
+- `fulfillments`: ~11.8 GB
+- `shipments`: ~10.9 GB
+- `transfers`: ~7.7 GB
+- `reviews`: ~6.9 GB
+- `inventory`: ~5.3 GB
+- `users`: ~3.6 GB
+- `carts`: ~3.2 GB
+- `customers`: ~2.9 GB
+- `payment_methods`: ~2.6 GB
+- `settlements`: ~2.1 GB
+- `addresses`: ~1.4 GB
+- `refunds`: ~1.3 GB
+- `products`: ~1.1 GB
+- `payouts`: ~820 MB
+- `accounts`: ~610 MB
+- `webhooks`: ~540 MB
+- `subscriptions`: ~470 MB
+- `prices`: ~210 MB
+- `disputes`: ~150 MB
+- `coupons`: ~41.0 MB
+- `api_keys`: ~6.1 MB
+- `locations`: ~4.2 MB
+- `tax_rates`: ~2.3 MB
+- `categories`: ~1.6 MB
+- `feature_flags`: ~180 KB
+- `order_events`: size estimate unavailable
+- `sessions`: size estimate unavailable
+
+</details>
+
+📋 **Plan**: **34** tables to alter
+
+
+---
+
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -103,6 +330,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ℹ️ Namespaces excluded from this plan by `ignore_namespaces`: `local_fixtures`
@@ -110,7 +340,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -139,7 +369,7 @@ CREATE TABLE app.users (id bigint PRIMARY KEY);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -201,7 +431,7 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -243,9 +473,9 @@ An apply will fail on these statements. Fix what each reason names — rewrite a
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+The engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:
 ```
-schemabot apply -e staging
+schemabot plan -e staging
 ```
 
 </details>
@@ -279,9 +509,9 @@ An apply will fail on these statements. Fix what each reason names — rewrite a
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+The engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:
 ```
-schemabot apply -e staging
+schemabot plan -e staging
 ```
 
 </details>
@@ -308,24 +538,56 @@ ALTER TABLE `users`
 ALTER TABLE `orders` ADD COLUMN `notes` text;
 ```
 
-⚙️ **Direct execution**: 1 change will run as native MySQL DDL
-- `users`: dropping primary key is not supported; runs as native MySQL DDL on a table with ~1,240 rows
+⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
+- `users`: the table has ~1,240 rows
 
-These statements run synchronously outside the schema change engine: writes to each table are blocked while its statement runs, the change is **not revertible**, and `--defer-cutover` does not apply to it. Confirming the apply consents to this.
+Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes.
 
 📋 **Plan**: **2** tables to alter
 
 
 ---
 
-**Confirmation required** — review the plan above, then confirm manually:
-```
-schemabot apply-confirm -e staging
+**Applying automatically**
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-unsafe-change"></a><strong>MySQL Plan (Unsafe Change)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` DROP COLUMN `legacy_ref`;
 ```
 
-🔓 To discard this plan and unlock, comment:
+```sql
+ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
 ```
-schemabot unlock
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `orders`: DROP COLUMN discards the column's data
+
+<details>
+<summary>Destructive drop guidance</summary>
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`orders`):
+```
+schemabot apply -e staging
 ```
 
 </details>
@@ -348,26 +610,25 @@ ALTER TABLE `orders` DROP COLUMN `notes`;
 DROP TABLE `reconcile_state`;
 ```
 
-⚠️ **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
-- `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
-- `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
-
-A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
-
 ⚠️ **Issues**: 2 unsafe changes detected
-1. `orders`: DROP COLUMN discards the column's data
-2. `reconcile_state`: DROP TABLE removes all data
+1. `orders`: DROP COLUMN discards the column's data (changed by open PR [#4820](https://github.com/block/schemabot/pull/4820))
+2. `reconcile_state`: DROP TABLE removes all data (changed by open PR [#4821](https://github.com/block/schemabot/pull/4821))
 
-**Destructive drop guidance:**
+A plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.
+
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
+
+</details>
 
 📋 **Plan**: **1** table to alter, **1** table to drop
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`orders`, `reconcile_state`):
 ```
 schemabot apply -e staging
 ```
@@ -398,7 +659,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -537,7 +798,7 @@ Applying picks up where the existing copy stopped rather than starting over.
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -572,7 +833,7 @@ Applying joins the copy already running rather than starting a new one: every ro
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -648,12 +909,15 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging --tenant alpha
 ```
@@ -876,12 +1140,16 @@ CREATE TABLE `addresses` (
   COLLATE utf8mb4_0900_ai_ci;
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -939,7 +1207,7 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`commerce_sharded` VSchema):
 ```
 schemabot apply -e staging
 ```
@@ -980,7 +1248,7 @@ CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at)
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -1065,7 +1333,11 @@ CREATE TABLE `addresses` (
   COLLATE utf8mb4_0900_ai_ci;
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
 **Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
@@ -1114,7 +1386,7 @@ CREATE TABLE `metrics` (
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -1166,6 +1438,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 </details>
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1233,6 +1508,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 ---
@@ -1289,6 +1567,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
 </details>
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -1357,6 +1638,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 </details>
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
@@ -1387,7 +1671,7 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
+**Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
 ```sql
 CREATE TABLE `users` (
@@ -1418,12 +1702,15 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~10.2 GB across 3 targets · largest ~8.7 GB on `us` · smallest ~412 MB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1440,11 +1727,11 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-✅ **Same plan on all 3 deployments** (`eu`, `au`, `us`).
+**Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
-- `eu` (primary) ✅ matches the reviewed plan
-- `au` ✅ matches the reviewed plan · blocked: 1
-- `us` ✅ matches the reviewed plan
+- `eu` (primary) ✅ matches the primary target's plan
+- `au` ✅ matches the primary target's plan · blocked: 1
+- `us` ✅ matches the primary target's plan
 
 ```sql
 CREATE TABLE `users` (
@@ -1475,12 +1762,15 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~10.2 GB across 3 targets · largest ~8.7 GB on `us` · smallest ~412 MB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1497,10 +1787,10 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-⚠️ **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:
+⚠️ **Deployment drift detected** — some deployments no longer match the primary target's plan, so the plan check is failing closed:
 
-- `eu` (primary) ✅ matches the reviewed plan
-- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs the reviewed plan
+- `eu` (primary) ✅ matches the primary target's plan
+- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs the primary target's plan
 - `us` ❌ could not verify — diff failed; see server logs
 
 ```sql
@@ -1532,12 +1822,15 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes** (primary target `eu` only; other targets not shown):
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1585,12 +1878,289 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes** (primary target only; targets could not be listed):
+- `products`: ~1.1 GB
+
 📋 **Plan**: **2** tables to create, **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-converging"></a><strong>Rollout Plans (Converging)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### 2 of 3 targets
+
+`primary/testapp_1`, `primary/testapp_2`
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+### Target `primary/testapp_3`
+
+No schema changes detected
+
+📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-reviewed-target-already-there"></a><strong>Rollout Plans (Reviewed Target Already There)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### 2 of 3 targets
+
+`primary/testapp_2`, `primary/testapp_3`
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+### Target `primary/testapp_1`
+
+No schema changes detected
+
+📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-distinct-plans"></a><strong>Rollout Plans (Distinct Plans)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### 2 of 3 targets
+
+`primary/testapp_1`, `primary/testapp_2`
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
+```
+
+### Target `primary/testapp_3`
+
+```sql
+ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+📋 **Plan**: **1** table to alter across 3 targets
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-table-sizes-two-targets"></a><strong>Rollout Plans (Table Sizes, Two Targets)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### 2 targets
+
+`primary/testapp_1`, `primary/testapp_2`
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+📊 **Table sizes**:
+- `orders`: ~24.0 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
+- `users`: ~193 MB across 2 targets · largest ~98.0 MB on `primary/testapp_2` · smallest ~95.0 MB
+
+📋 **Plan**: **2** tables to alter across 2 targets
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-table-sizes-three-targets"></a><strong>Rollout Plans (Table Sizes, Three Targets)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+### 3 targets
+
+`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+📊 **Table sizes**:
+- `orders`: ~24.0 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
+- `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95.0 MB
+
+📋 **Plan**: **2** tables to alter across 3 targets
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e production
+```
+
+</details>
+
+<details>
+<summary><a name="rollout-plans-table-sizes-reviewed-target-only"></a><strong>Rollout Plans (Table Sizes, Reviewed Target Only)</strong></summary>
+
+
+## Schema Change Plan — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+⚠️ **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:
+
+- `primary/testapp_1` (primary) ✅ planned against its own schema
+- `primary/testapp_2` ✅ planned against its own schema
+- `primary/testapp_3` ❌ could not plan — diff failed; see server logs
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+📊 **Table sizes** (primary target `primary/testapp_1` only; other targets not shown):
+- `orders`: ~610 MB
+- `users`: ~95.0 MB
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1618,9 +2188,12 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -1651,9 +2224,12 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
+
+</details>
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -1810,7 +2386,7 @@ schemabot apply -e staging
 
 ⚠️ **This comment was too large to post.** SchemaBot rendered it at 84,801 bytes and GitHub accepts at most 65,536 in one comment, so this notice took its place. The schema change itself is unaffected; only this view of it is missing.
 
-**What to do next:** the desired schema is in this PR's schema files, and an apply's progress is available from the CLI with `schemabot status`. The server logs record the rendering with this PR's identifiers.
+**What to do next:** the desired schema is in this PR's schema files, and an apply's progress is available from the CLI with `schemabot status -e staging`. The server logs record the rendering with this PR's identifiers.
 <!-- schemabot:offer-support-channel -->
 
 > 💬 Support: [#schema-help](https://chat.example.com/schema-help).
@@ -1855,6 +2431,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 💡 **Lint Warnings**: 2 advisory findings
 - `users`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
 - `products`: Index `idx_category` on column `category` is redundant - covered by index `idx_category_price` on columns (`category`, `price`)
@@ -1864,7 +2443,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -2594,6 +3173,17 @@ Options:
 </details>
 
 <details>
+<summary><a name="lock-kept-yield"></a><strong>Lock Kept (Yield)</strong></summary>
+
+```
+
+🔒 Lock kept for testapp (mysql) despite --yield: apply apply-a1b2c3d4 is stopped and can still be resumed.
+   Release it once nothing is left to run: schemabot unlock -d testapp -t mysql
+
+```
+</details>
+
+<details>
 <summary><a name="no-lock-found"></a><strong>No Lock Found</strong></summary>
 
 ```
@@ -2811,6 +3401,9 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
 ⚠️ **Schema changes differ from the plan this apply was started from**
 - `orders` (alter) runs a different statement than in the plan this apply was started from
 - `products` (alter) is in this plan but not in the one this apply was started from
@@ -2913,7 +3506,11 @@ CREATE TABLE `addresses` (
   COLLATE utf8mb4_0900_ai_ci;
 ```
 
-📋 **Plan**: **2** tables to create, **2** vschema updates
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
+```
+
+📋 **Plan**: **2** tables to create, **1** table to alter, **2** vschema updates
 
 
 **Options**: ⏸️ Defer Cutover | ⏩ Skip Revert
@@ -2973,7 +3570,7 @@ A CLI session currently holds the lock for this database.
 **Locked by**: `cli:jackjackbits`
 **Since**: 2026-03-15 14:00:00 UTC
 
-Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:
+Ask the lock holder to run `schemabot unlock -d testapp -t mysql` from their CLI, or force-unlock with:
 ```
 schemabot unlock -d testapp --force
 ```
@@ -3081,6 +3678,54 @@ schemabot apply -e staging
 ```
 
 _Requested by @jackjackbits_
+
+</details>
+
+<details>
+<summary><a name="applyconfirm-refused-plan-is-for-another-environment"></a><strong>Apply-confirm Refused: Plan Is For Another Environment</strong></summary>
+
+
+## ⛔ Apply-confirm Refused — Production
+
+**Database**: `testapp`
+
+The pending confirmation is for `staging`, not `production`; nothing was applied.
+
+To confirm the `staging` plan:
+
+```
+schemabot apply-confirm -e staging -d testapp --defer-cutover
+```
+
+To apply `production` instead, dropping the pending `staging` confirmation and planning and applying `production` in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:
+
+```
+schemabot apply -e production -d testapp --defer-cutover
+```
+
+_Requested by @jackjackbits_
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="applyconfirm-refused-plan-cannot-be-loaded"></a><strong>Apply-confirm Refused: Plan Cannot Be Loaded</strong></summary>
+
+
+## ⛔ Apply-confirm Refused — Production
+
+**Database**: `testapp`
+
+The pending confirmation is not backed by a plan SchemaBot can load, so it could not verify which environment was reviewed; nothing was applied.
+
+To replace that confirmation with a fresh plan and apply it in one step, subject to the environment ordering gate and pausing for `apply-confirm` only if its plan needs it:
+
+```
+schemabot apply -e production -d testapp --defer-cutover
+```
+
+_Requested by @jackjackbits_
+<!-- schemabot:offer-support-channel -->
 
 </details>
 
@@ -3580,7 +4225,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
-- Rows: 321,450 / 1,466,232 · ETA: 5m 40s
+- Rows: 321,450 / 1,466,232 · ~438 MB · ETA: 5m 40s
 
 **`users`**: ⏳ Queued
 
@@ -3627,7 +4272,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
 
 **`products`**: ⏳ Queued
 
@@ -3722,7 +4367,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
 - ℹ️ _Throttled: commit-latency 112.4ms >= 100ms · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_
 
 **`products`**: ⏳ Queued
@@ -3911,7 +4556,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ```sql
 ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
-- Rows: 87,231 / 523,140 · ETA: 7m 0s
+- Rows: 87,231 / 523,140 · ~157 MB · ETA: 7m 0s
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -4459,7 +5104,7 @@ schemabot apply -e staging
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 1,055,687 / 1,466,232
+- Rows: 1,055,687 / 1,466,232 · ~391 MB
 
 **`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
 
@@ -5737,7 +6382,7 @@ Single table progress (default):
 
      ~ users: 🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 48.61%
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
-       • Rows: 3,500,000 / 7,200,000 · ETA: 5m 30s
+       • Rows: 3,500,000 / 7,200,000 · ~2.1 GB · ETA: 5m 30s
 
 
 ```
@@ -6023,7 +6668,7 @@ Sequential mode: First complete, second paused by the engine's throttler
      ~ users: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `users` ADD INDEX `idx_email_created`(`email`, `created_at`);
 
-  Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
 
 
 ```
@@ -6583,8 +7228,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
        • Shards: 2 (2 cancelled)
-           ○ -80: cancelled
-           ○ 80-: cancelled
+           ○ -80: cancelled at 38.10% (800,000/2,100,000 rows)
+           ○ 80-: cancelled at 21.05% (400,000/1,900,000 rows)
 
 ```
 </details>
@@ -6906,7 +7551,7 @@ Vitess plan: DDL + VSchema changes in a sharded keyspace
      ~ users
        ALTER TABLE `users` ADD COLUMN `email_verified` tinyint(1) DEFAULT FALSE;
 
-📋 **Plan**: 1 table to create, 1 table to alter, 1 VSchema change
+📋 Plan: 1 table to create, 1 table to alter, 1 VSchema change
 
 
 ```
@@ -6943,7 +7588,7 @@ Vitess plan: VSchema-only update (no table DDL changes)
           },
           "tables": {
 
-📋 **Plan**: 1 VSchema change
+📋 Plan: 1 VSchema change
 
 
 ```
@@ -7003,7 +7648,7 @@ Vitess plan: Multi-keyspace with DDL + VSchema across keyspaces
      ~ orders
        ALTER TABLE `orders` ADD INDEX `idx_status_created`(`status`, `created_at`);
 
-📋 **Plan**: 1 table to create, 2 tables to alter, 2 VSchema changes
+📋 Plan: 1 table to create, 2 tables to alter, 2 VSchema changes
 
 
 ```
@@ -7311,13 +7956,6 @@ No schema changes found for database 'new-db'
 
 **Deployments**: 1 ready for cutover, 1 running, 2 waiting
 
----
-
-To cut over `eu`:
-```
-schemabot cutover apply-a1b2c3d4e5f6 -e production
-```
-
 - 🟢 `eu` — ready for cutover — next in order
 - 🔄 `us` — running table copy
 - ⏳ `au` — waiting for us
@@ -7325,10 +7963,9 @@ schemabot cutover apply-a1b2c3d4e5f6 -e production
 
 <details open>
 <summary>🟢 eu — ready for cutover — next in order</summary>
+<dl><dd>
 
-**Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+**Database**: `payments_eu`
 
 **Status**: Waiting for Cutover
 
@@ -7357,18 +7994,14 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
----
-
-SchemaBot triggers cutover automatically — no action needed.
-
+</dd></dl>
 </details>
 
 <details open>
 <summary>🔄 us — running table copy</summary>
+<dl><dd>
 
-**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+**Database**: `payments_us`
 
 **Status**: In Progress
 
@@ -7381,7 +8014,7 @@ SchemaBot triggers cutover automatically — no action needed.
 ```sql
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
-- Rows: 914,707 / 1,466,232 · ETA: 3m 15s
+- Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
 
 **`products`**: ⏳ Queued
 
@@ -7396,6 +8029,110 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
 
+</dd></dl>
+</details>
+
+<details>
+<summary>⏳ au — waiting for us</summary>
+<dl><dd>
+
+_No details available yet._
+
+</dd></dl>
+</details>
+
+<details>
+<summary>⏳ ca — waiting for us</summary>
+<dl><dd>
+
+_No details available yet._
+
+</dd></dl>
+</details>
+
+---
+
+SchemaBot will cut over `eu` next — no action needed.
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="rollout-where-plans-differ"></a><strong>Rollout Where Plans Differ</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 1 running, 1 waiting
+
+- 🔄 `us` — running table copy
+- ⏳ `eu` — waiting for us
+
+<details open>
+<summary>🔄 us — running table copy</summary>
+<dl><dd>
+
+**Database**: `payments_us` | **Plan**: `plan_7c41f9`
+
+**Status**: In Progress
+
+📊 1 running (62.38%) · 2 queued
+
+**Schema `testapp`**
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38%
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+- Rows: 914,707 / 1,466,232 · ~438 MB · ETA: 3m 15s
+
+**`users`**: ⏳ Queued
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</dd></dl>
+</details>
+
+<details>
+<summary>⏳ eu — waiting for us</summary>
+<dl><dd>
+
+**Database**: `payments_eu` | **Plan**: `plan_3344ab`
+
+**Status**: ⏳ Waiting for us
+
+**Schema `testapp`**
+
+**`orders`**: ⏳ Queued
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+</dd></dl>
+</details>
+
 ---
 
 To stop this schema change:
@@ -7403,21 +8140,212 @@ To stop this schema change:
 schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-two-deployments-64-targets-each"></a><strong>Multi-target Rollout (Two Deployments, 64 Targets Each)</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Targets**: 40 completed, 8 running, 79 queued, 1 failed
+
+> ❌ **First failure:** <code>us/orders_062</code> — Error 1062: Duplicate entry &#39;12345&#39; for key &#39;orders.idx_user_id&#39;
+
+- ❌ `us` — 40 completed, 4 running, 19 queued, 1 failed (64 targets)
+- 🔄 `eu` — 4 running, 60 queued (64 targets)
+
+<details open>
+<summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
+<dl><dd>
+
+#### 56 of 64 targets
+
+<details>
+<summary>Target names</summary>
+
+`orders_000`, `orders_001`, `orders_002`, `orders_003`, `orders_004`, `orders_005`, `orders_006`, `orders_007`, `orders_008`, `orders_009`, `orders_010`, `orders_011`, `orders_012`, `orders_013`, `orders_014`, `orders_015`, `orders_016`, `orders_017`, `orders_018`, `orders_019`, `orders_020`, `orders_021`, `orders_022`, `orders_023`, `orders_024`, `orders_025`, `orders_026`, `orders_027`, `orders_028`, `orders_029`, `orders_030`, `orders_031`, `orders_032`, `orders_033`, `orders_034`, `orders_035`, `orders_036`, `orders_037`, `orders_038`, `orders_039`, `orders_040`, `orders_041`, `orders_042`, `orders_043`, `orders_044`, `orders_045`, `orders_046`, `orders_047`, `orders_048`, `orders_049`, `orders_050`, `orders_051`, `orders_052`, `orders_053`, `orders_054`, `orders_055`
+
+</details>
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 96% · 40 complete, 4 running, 12 queued
+- Rows: 62,308,108 / 64,514,208 across 44 of 56 targets · ETA: ≥ 3m 15s
+- Running: `orders_040`, `orders_041`, `orders_042`, `orders_043`
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+#### 8 of 64 targets
+
+`orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`
+
+**`orders`**: ❌ Failed · 7 queued, 1 failed
+
+```sql
+ALTER TABLE `orders`
+    ADD INDEX `idx_user_id`(`user_id`),
+    ADD COLUMN `note` text;
+```
+
+
+| Target | Status |
+| --- | --- |
+| `orders_062` | ❌ failed — Error 1062: Duplicate entry &#39;12345&#39; for key &#39;orders.idx_user_id&#39; |
+
+</dd></dl>
+</details>
+
+<details open>
+<summary>🔄 eu — 4 running, 60 queued (64 targets)</summary>
+<dl><dd>
+
+**`orders`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 12% · 4 running, 60 queued
+- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
+- Running: `orders_000`, `orders_001`, `orders_002`, `orders_003`
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+</dd></dl>
+</details>
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="barrier-rollout-with-deferred-cutover"></a><strong>Barrier Rollout With Deferred Cutover</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Deployments**: 1 ready for cutover, 1 running, 2 waiting
+
+- 🟢 `eu` — ready for cutover — next in order
+- 🔄 `us` — running table copy
+- ⏳ `au` — waiting for us
+- ⏳ `ca` — waiting for us
+
+<details open>
+<summary>🟢 eu — ready for cutover — next in order</summary>
+<dl><dd>
+
+**Database**: `payments_eu`
+
+**Status**: Waiting for Cutover
+
+**3/3** table(s) ready for cutover
+
+📊 3 waiting for cutover
+
+**Schema `testapp`**
+
+**`orders`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+**`users`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+
+**`products`**: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+
+</dd></dl>
+</details>
+
+<details open>
+<summary>🔄 us — running table copy</summary>
+<dl><dd>
+
+**Database**: `payments_us`
+
+**Status**: In Progress
+
+📊 1/3 complete · 1 running (62.38%) · 1 queued
+
+**Schema `testapp`**
+
+**`users`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38%
+
+```sql
+ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
+```
+- Rows: 914,707 / 1,466,232 · ~391 MB · ETA: 3m 15s
+
+**`products`**: ⏳ Queued
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
+```
+
+**`orders`**: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✅ Complete
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+</dd></dl>
 </details>
 
 <details>
 <summary>⏳ au — waiting for us</summary>
+<dl><dd>
 
 _No details available yet._
 
+</dd></dl>
 </details>
 
 <details>
 <summary>⏳ ca — waiting for us</summary>
+<dl><dd>
 
 _No details available yet._
 
+</dd></dl>
 </details>
+
+---
+
+To cut over `eu`:
+```
+schemabot cutover apply-a1b2c3d4e5f6 -e production
+```
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -7437,13 +8365,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 > ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
----
-
-To retry:
-```
-schemabot apply -e production
-```
-
 - ✅ `eu` — completed
 - ❌ `us` — failed
 - ⏸️ `au` — halted — us failed
@@ -7451,10 +8372,9 @@ schemabot apply -e production
 
 <details>
 <summary>✅ eu — completed</summary>
+<dl><dd>
 
-**Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+**Database**: `payments_eu`
 
 **Status**: Applied
 
@@ -7481,14 +8401,14 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
+</dd></dl>
 </details>
 
 <details open>
 <summary>❌ us — failed</summary>
+<dl><dd>
 
-**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+**Database**: `payments_us`
 
 **Status**: Failed
 <!-- schemabot:offer-support-channel -->
@@ -7518,28 +8438,33 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 > ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
----
-
-To retry:
-```
-schemabot apply -e production
-```
-
+</dd></dl>
 </details>
 
 <details open>
 <summary>⏸️ au — halted — us failed</summary>
+<dl><dd>
 
 _No details available yet._
 
+</dd></dl>
 </details>
 
 <details open>
 <summary>⏸️ ca — halted — us failed</summary>
+<dl><dd>
 
 _No details available yet._
 
+</dd></dl>
 </details>
+
+---
+
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+```
+schemabot apply -e production
+```
 
 </details>
 
@@ -7561,10 +8486,9 @@ _No details available yet._
 
 <details>
 <summary>✅ eu — completed</summary>
+<dl><dd>
 
-**Database**: `payments_eu` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+**Database**: `payments_eu`
 
 **Status**: Applied
 
@@ -7591,14 +8515,14 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
+</dd></dl>
 </details>
 
 <details>
 <summary>✅ us — completed</summary>
+<dl><dd>
 
-**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+**Database**: `payments_us`
 
 **Status**: Applied
 
@@ -7625,14 +8549,14 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
+</dd></dl>
 </details>
 
 <details>
 <summary>✅ au — completed</summary>
+<dl><dd>
 
-**Database**: `payments_au` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+**Database**: `payments_au`
 
 **Status**: Applied
 
@@ -7659,6 +8583,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
+</dd></dl>
 </details>
 
 </details>
@@ -7681,6 +8606,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details>
 <summary>✅ eu — completed</summary>
+<dl><dd>
 
 **Database**: `payments_eu`
 
@@ -7689,8 +8615,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details><summary>Apply details (3 tables)</summary>
 
-_Apply ID: `apply-a1b2c3d4e5f6`_
-
 
 ### testapp
 
@@ -7711,10 +8635,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 </details>
 
+</dd></dl>
 </details>
 
 <details>
 <summary>✅ us — completed</summary>
+<dl><dd>
 
 **Database**: `payments_us`
 
@@ -7723,8 +8649,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details><summary>Apply details (3 tables)</summary>
 
-_Apply ID: `apply-a1b2c3d4e5f6`_
-
 
 ### testapp
 
@@ -7745,10 +8669,12 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 </details>
 
+</dd></dl>
 </details>
 
 <details>
 <summary>✅ au — completed</summary>
+<dl><dd>
 
 **Database**: `payments_au`
 
@@ -7757,8 +8683,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 <details><summary>Apply details (3 tables)</summary>
 
-_Apply ID: `apply-a1b2c3d4e5f6`_
-
 
 ### testapp
 
@@ -7779,6 +8703,7 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 </details>
 
+</dd></dl>
 </details>
 
 </details>
@@ -7798,13 +8723,6 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 > ❌ **First failure:** <code>us</code> — lock wait timeout exceeded; try restarting transaction
 
----
-
-To retry:
-```
-schemabot apply -e production
-```
-
 - ✅ `eu` — completed
 - ❌ `us` — failed
 - ⏸️ `au` — halted — us failed
@@ -7812,6 +8730,7 @@ schemabot apply -e production
 
 <details>
 <summary>✅ eu — completed</summary>
+<dl><dd>
 
 **Database**: `payments_eu`
 
@@ -7819,8 +8738,6 @@ schemabot apply -e production
 > Applied successfully — your schema changes are live!
 
 <details><summary>Apply details (3 tables)</summary>
-
-_Apply ID: `apply-a1b2c3d4e5f6`_
 
 
 ### testapp
@@ -7842,15 +8759,15 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 
 </details>
 
+</dd></dl>
 </details>
 
 <details open>
 <summary>❌ us — failed</summary>
+<dl><dd>
 
 <!-- schemabot:offer-support-channel -->
-**Database**: `payments_us` | **Apply ID**: `apply-a1b2c3d4e5f6`
-
-*Applied by @aparajon at 2026-03-15 14:22:00 UTC*
+**Database**: `payments_us`
 
 > ❌ **Error:** lock wait timeout exceeded; try restarting transaction
 
@@ -7874,28 +8791,33 @@ ALTER TABLE `products` ADD INDEX `idx_price`(`price_cents`);
 ```
 
 
----
-
-To retry:
-```
-schemabot apply -e production
-```
-
+</dd></dl>
 </details>
 
 <details open>
 <summary>⏸️ au — halted — us failed</summary>
+<dl><dd>
 
 _No details available yet._
 
+</dd></dl>
 </details>
 
 <details open>
 <summary>⏸️ ca — halted — us failed</summary>
+<dl><dd>
 
 _No details available yet._
 
+</dd></dl>
 </details>
+
+---
+
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+```
+schemabot apply -e production
+```
 
 </details>
 
@@ -7913,14 +8835,14 @@ _No details available yet._
 2026-03-15 14:22:20 UTC [INF] Task started: schema change on `users`
 2026-03-15 14:28:00 UTC [ERR] Apply failed: The schema change failed on the target; see the server logs for the reason. (error 1265) [running -> failed]
 
-== engine logs: shard-a, target: cluster-a ==
+== engine logs: shard-a, target: payments-aurora-mysql-production-portfolios-001 ==
 2026-03-15 14:22:25 UTC [INF] [users] copy starting: 1466232 rows estimated, 4 threads
 2026-03-15 14:24:00 UTC [INF] [users] copy progress: 12.4% 181812/1466232 rows, eta 21m
 2026-03-15 14:27:00 UTC [INF] [users] copy progress: 30.0% 439870/1466232 rows, eta 14m
 2026-03-15 14:27:40 UTC [WRN] [users] unsafe warning 1265: Data truncated for column 'nickname' at row 1
 2026-03-15 14:27:41 UTC [ERR] [users] aborting: the copy would change values that are already in the table
 
-== engine logs: shard-b, target: cluster-b ==
+== engine logs: shard-b, target: payments-aurora-mysql-production-portfolios-002 ==
 2026-03-15 14:22:30 UTC [INF] [users] copy starting: 1192044 rows estimated, 4 threads
 2026-03-15 14:27:00 UTC [INF] [users] copy complete: 1192044 rows
 2026-03-15 14:28:00 UTC [INF] [users] cutover complete
@@ -7960,12 +8882,15 @@ ALTER TABLE `mutes`
     ADD COLUMN `reason` varchar(255);
 ```
 
+📊 **Table sizes**:
+- `mutes`: ~22.8 GB across 4 shards
+
 📋 **Plan**: **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -7999,7 +8924,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -8019,22 +8944,30 @@ schemabot apply -e production
 #### Keyspace: `cdb_resolute_sharded`
 Shards diverge — what applies where:
 
-**shard `-40`**
-
-_Already applied — no change._
-
 **shards `40-80`, `80-c0`, `c0-`**
 
 ```sql
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 
-📋 **Plan**: **1** table to alter
+```sql
+ALTER TABLE `outcomes` ADD INDEX `status`(`status`);
+```
+
+**shard `-40`**
+
+No schema changes detected
+
+📊 **Table sizes**:
+- `mutes`: size estimate unavailable · 3 shards
+- `outcomes`: ~4.2 GB across 3 shards
+
+📋 **Plan**: **2** tables to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -8071,16 +9004,19 @@ ALTER TABLE `mutes`
 ⚠️ **Issues**: 1 unsafe change detected
 1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 📋 **Plan**: **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`mutes` on shard `40-80`):
 ```
 schemabot apply -e production
 ```
@@ -8104,7 +9040,11 @@ schemabot apply -e production
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)
-- Rows: 914,707 / 1,466,232 across 1 of 4 shards · ETA: ≥ 3m 15s
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+- Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
   └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
@@ -8130,6 +9070,10 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ❌ Failed
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 | Shard | Status |
 | --- | --- |
@@ -8164,6 +9108,18 @@ schemabot apply -e production
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: 🔄 Row copy in progress
+
+**shards `-40`, `80-c0`**
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+**shard `40-80`**
+```sql
+ALTER TABLE `mutes`
+    ADD INDEX `created_at`(`created_at`),
+    ADD COLUMN `reason` varchar(255);
+```
   └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0
 
 Shards diverge — grouped by change:
@@ -8203,14 +9159,26 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **`outcomes`**: ✅ Complete
 
+```sql
+ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);
+```
+
 #### Keyspace `cdb_resolute_lookup`
 
 **`outcomes_lookup`**: 🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 27%
-- Rows: 540,211 / 2,000,780 · ETA: 8m 0s
+
+```sql
+ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);
+```
+- Rows: 540,211 / 2,000,780 · ~612 MB · ETA: 8m 0s
 
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ⏳ Queued
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 ### VSchema
 
@@ -8239,6 +9207,10 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **`mutes`**: ✅ Complete (4 shards)
 
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
 ### VSchema
 
 **`cdb_resolute_sharded`**: Applied
@@ -8261,6 +9233,35 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="summary-keyspace-finalized"></a><strong>Summary: Keyspace Finalized</strong></summary>
+
+
+## ✅ Schema Change Applied — Production
+
+**Database**: `cdb_resolute` | **Type**: `Strata` | **Apply ID**: `apply-a1b2c3d4e5f6` | **Duration**: 28m
+
+*Applied by @jackjackbits at 2026-03-15 14:00:00 UTC*
+
+> Applied successfully — your schema change is live!
+
+**Shards**: 2 completed
+
+#### Keyspace `cdb_resolute_sharded`
+
+**`mutes`**: ✅ Complete (2 shards)
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
+### Finalize
+
+**`cdb_resolute_sharded`**: Finalized
+
+
+</details>
+
+<details>
 <summary><a name="summary-halt-on-failure-one-shard-failed"></a><strong>Summary: Halt On Failure (One Shard Failed)</strong></summary>
 
 
@@ -8278,6 +9279,10 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 #### Keyspace `cdb_resolute_sharded`
 
 **`mutes`**: ❌ Failed
+
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
 
 | Shard | Status |
 | --- | --- |
@@ -8316,6 +9321,10 @@ schemabot apply -e production
 
 **`mutes`**: ⊘ Cancelled — applied on 2 of 4 shards
 
+```sql
+ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
+```
+
 | Shard | Status |
 | --- | --- |
 | `-40` | ✅ completed |
@@ -8346,8 +9355,6 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 │  Deployments:  1 ready for cutover · 1 running · 1 waiting  │
 └─────────────────────────────────────────────────────────────┘
 
-  Next: cut over us-east
-
 🟢 us-east — ready for cutover — next in order (orders-us-east)
 
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
@@ -8367,6 +9374,9 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
+SchemaBot will cut over us-east next — no action needed.
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
 
 ```
 </details>
@@ -8389,8 +9399,6 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
   ❌ First failure: eu-west — duplicate key name 'idx_orders_source'
 
-  Next: review failure in eu-west
-
 ✅ us-east — completed (orders-us-east)
 
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
@@ -8410,6 +9418,8 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
+To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:
+  schemabot apply -s <schema_dir> -e production
 
 ```
 </details>
@@ -8432,8 +9442,6 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
 
   ❌ First failure: us-east — duplicate key name 'idx_orders_source'
 
-  Next: review failure in us-east
-
 ❌ us-east — failed (orders-us-east)
   duplicate key name 'idx_orders_source'
 
@@ -8454,6 +9462,9 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
+A new apply can retry the failure once this one finishes or is stopped; it reprocesses only the tables that haven't completed.
 
 ```
 </details>
@@ -8492,6 +9503,124 @@ This schema change was cancelled and cannot be resumed. Open a new schema change
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
 
+
+```
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-past-a-failed-target"></a><strong>Multi-target Rollout Past A Failed Target</strong></summary>
+
+```
+
+┌─────────────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                             │
+│  Environment:  production                                       │
+│  State:        running (degraded)                               │
+│  Caller:       github:octocat                                   │
+│  Source:       https://github.com/acme/shop/pull/412            │
+│  Started:      Jan 15 14:22:00 UTC                              │
+│  Duration:     8m                                               │
+│  Targets:      40 completed · 19 running · 4 queued · 1 failed  │
+└─────────────────────────────────────────────────────────────────┘
+
+  ❌ First failure: prod/payments-041 — duplicate key name 'idx_orders_source'
+
+❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72% · 40 of 60 targets complete · 1 failed
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+       • Rows: 4,093,000 / 4,720,000 · ETA: 10m 0s
+       • Targets: 60 (40 complete, 19 copying, 1 failed)
+           ✗ payments-041: failed
+           ◉ payments-042: 25.00% (20,000/80,000 rows) ETA 10m 0s
+           ◉ payments-043: 28.75% (23,000/80,000 rows) ETA 9m 35s
+           ◉ payments-044: 32.50% (26,000/80,000 rows) ETA 9m 10s
+           ◉ payments-045: 36.25% (29,000/80,000 rows) ETA 8m 45s
+           ◉ payments-046: 40.00% (32,000/80,000 rows) ETA 8m 20s
+           ... 14 more copying targets
+           ... 40 complete
+
+  4 of 64 targets have not reported progress yet.
+
+  Targets needing attention:
+    ❌ payments-041 — failed: duplicate key name 'idx_orders_source'
+      External apply ID: spirit-apply-041
+
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-waiting-for-cutover"></a><strong>Multi-target Rollout Waiting For Cutover</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        waiting for cutover                    │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Targets:      3 ready for cutover                    │
+└───────────────────────────────────────────────────────┘
+
+🟢 prod — 3 ready for cutover (3 targets)
+
+▸ targets payments-001, payments-002
+
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover · 0 of 2 targets complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+       • Targets: 2 (2 waiting for cutover)
+           ● payments-001: waiting for cutover
+           ● payments-002: waiting for cutover
+
+▸ target payments-003
+
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+       ALTER TABLE `orders` MODIFY COLUMN `source` varchar(32) DEFAULT NULL;
+
+       • Targets: 1 (1 waiting for cutover)
+           ● payments-003: waiting for cutover
+
+To cut over prod/payments-001:
+  schemabot cutover apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-stopped"></a><strong>Multi-target Rollout Stopped</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-multi-a1b2c3d4                   │
+│  Environment:  production                             │
+│  State:        stopped                                │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:22:00 UTC                    │
+│  Duration:     8m                                     │
+│  Targets:      1 completed · 2 stopped                │
+└───────────────────────────────────────────────────────┘
+
+⏹️ prod — 1 completed · 2 stopped (3 targets)
+
+     ~ orders: ⏹️ Stopped · 1 of 3 targets complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+       • Targets: 3 (1 complete, 2 stopped)
+           ✓ payments-001: 80,000 rows
+           ○ payments-002: stopped at 40.00% (32,000/80,000 rows)
+           ○ payments-003: stopped at 25.00% (20,000/80,000 rows)
+
+To resume from where it stopped:
+  schemabot start apply-multi-a1b2c3d4 -e production
 ```
 </details>
 
@@ -9072,6 +10201,7 @@ Retry-After: 1
        • ℹ️ More rows than initially estimated, copying is still active and will continue
 
 
+
 ESC detach • s stop
 ```
 
@@ -9080,7 +10210,7 @@ ESC detach • s stop
 
 ```
 ⣾ running
-1 ready for cutover · 1 running · 1 waiting
+Deployments: 1 ready for cutover · 1 running · 1 waiting
 Apply ID: apply-multi-a1b2c3d4
 Environment: production
 
@@ -9106,6 +10236,10 @@ Environment: production
      ~ orders: ⏳ Queued
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
+
+SchemaBot will cut over us-east next — no action needed.
+To stop this schema change:
+  schemabot stop apply-multi-a1b2c3d4 -e production
 
 ESC to detach
 ```

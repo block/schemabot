@@ -1,6 +1,7 @@
 package presentation
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -595,4 +596,160 @@ func TestDerive_KeyedApplyStaysNamedByDeployment(t *testing.T) {
 	require.Len(t, got.Deployments, 2)
 	assert.Equal(t, "us-east", got.Deployments[0].Name)
 	assert.Equal(t, "us-east", got.Deployments[1].Name)
+}
+
+// A deployment addressing many targets is one group: its members keep their
+// resolved order, the group is headed by the member that most needs attention
+// rather than the first one, it counts its own members only, and it opens when
+// any member would. A single-target deployment is a group of one.
+func TestGroups_RollsUpEachDeploymentsTargets(t *testing.T) {
+	target := func(dep, tgt, st string) Operation {
+		return Operation{Deployment: dep, Target: tgt, State: st, Parallel: true, ContinueOnFailure: true}
+	}
+	apply := Derive([]Operation{
+		target("primary", "t_000", so.Completed),
+		target("primary", "t_001", so.Running),
+		target("primary", "t_002", so.Failed),
+		target("eu", "orders_eu", so.Completed),
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 2)
+
+	primary := groups[0]
+	assert.Equal(t, "primary", primary.Deployment)
+	assert.Equal(t, []int{0, 1, 2}, primary.Members)
+	assert.Equal(t, "primary/t_002", primary.Lead.Name, "the failed target heads the group")
+	assert.Equal(t, []StateCount{{"completed", 1}, {"running", 1}, {"failed", 1}}, primary.Counts)
+	assert.True(t, primary.Open)
+
+	eu := groups[1]
+	assert.Equal(t, "eu", eu.Deployment)
+	assert.Equal(t, []int{3}, eu.Members)
+	assert.Equal(t, "eu", eu.Lead.Name)
+	assert.Equal(t, []StateCount{{"completed", 1}}, eu.Counts)
+	assert.False(t, eu.Open)
+}
+
+// Members that are not distinct targets, such as keyed operations with no
+// target or several operations dividing one target's work, are not rolled up:
+// each stays a group of its own, so no surface counts them as targets.
+func TestGroups_OnlyDistinctTargetsRollUp(t *testing.T) {
+	for name, ops := range map[string][]Operation{
+		"no target": {
+			{Deployment: "primary", State: so.Running, Parallel: true},
+			{Deployment: "primary", State: so.Running, Parallel: true},
+		},
+		"one target's work": {
+			{Deployment: "primary", Target: "orders-001", State: so.Running, Parallel: true},
+			{Deployment: "primary", Target: "orders-001", State: so.Running, Parallel: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			groups := Derive(ops).Groups()
+			require.Len(t, groups, 2)
+			assert.Equal(t, []int{0}, groups[0].Members)
+			assert.Equal(t, []int{1}, groups[1].Members)
+			assert.Equal(t, "primary", groups[1].Deployment)
+		})
+	}
+}
+
+// targetsRollout builds deployment payments-a's targets-list rollout of an
+// orders change: for each target, two shards of work keyed
+// "<target>/orders/<shard>/orders" and an orders finalizer, every row under
+// the given on_failure flags. states gives each target's -80, 80- and
+// finalizer states.
+func targetsRollout(cont, pause bool, states map[string][3]string, targets ...string) []Operation {
+	var ops []Operation
+	for _, target := range targets {
+		st := states[target]
+		for i, shard := range []string{"-80", "80-"} {
+			ops = append(ops, Operation{
+				Deployment: "payments-a", Target: target,
+				OperationKey: target + "/orders/" + shard + "/orders", Work: true,
+				State: st[i], ContinueOnFailure: cont, PauseOnFailure: pause,
+			})
+		}
+		ops = append(ops, Operation{
+			Deployment: "payments-a", Target: target,
+			OperationKey: target + "/orders/group_finalizer", Finalizer: true,
+			State: st[2], ContinueOnFailure: cont, PauseOnFailure: pause,
+		})
+	}
+	return ops
+}
+
+// TestDerive_OrphanedFinalizerSettlesLikeStorage: in a targets-list rollout,
+// shard -80 of payments-001 fails and payments-002 completes, which leaves
+// payments-001's finalizer pending with nothing that will ever start it.
+// Storage settles that rollout failed, so the header must read failed too,
+// not running (degraded) under continue or paused under an unreleased pause.
+// While the finalizer's own work is only parked, it still holds the rollout.
+func TestDerive_OrphanedFinalizerSettlesLikeStorage(t *testing.T) {
+	orphaned := map[string][3]string{
+		"payments-001": {so.Failed, so.Completed, so.Pending},
+		"payments-002": {so.Completed, so.Completed, so.Completed},
+	}
+	for _, tc := range []struct {
+		name        string
+		cont, pause bool
+	}{
+		{name: "continue", cont: true},
+		{name: "unreleased pause", pause: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := targetsRollout(tc.cont, tc.pause, orphaned, "payments-001", "payments-002")
+			got := Derive(ops)
+			assert.Equal(t, state.Apply.Failed, got.State)
+			assert.Equal(t, "failed", got.Label)
+			assert.Equal(t, NextActionReviewFailure, got.NextAction.Kind)
+			assert.Equal(t, "payments-001", got.NextAction.Target)
+		})
+	}
+
+	// payments-002's -80 is still parked at the barrier, so the rollout is
+	// still live and continue keeps it degraded.
+	live := map[string][3]string{
+		"payments-001": {so.Failed, so.Completed, so.Pending},
+		"payments-002": {so.WaitingForCutover, so.Completed, so.Pending},
+	}
+	got := Derive(targetsRollout(true, false, live, "payments-001", "payments-002"))
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+}
+
+// TestDerive_NeverStartedStoppedSettlesLikePending: region-a failed under
+// halt, and a stop caught region-b before any driver claimed it. region-b
+// counts as pending, so the header reads failed; had region-b started before
+// the stop, it would still hold the rollout degraded.
+func TestDerive_NeverStartedStoppedSettlesLikePending(t *testing.T) {
+	failedA := Operation{Deployment: "region-a", Work: true, State: so.Failed, Error: "boom"}
+	neverStarted := Operation{Deployment: "region-b", Work: true, State: so.Stopped, NeverStarted: true}
+	assert.Equal(t, state.Apply.Failed, Derive([]Operation{failedA, neverStarted}).State)
+
+	started := Operation{Deployment: "region-b", Work: true, State: so.Stopped}
+	assert.Equal(t, state.Apply.RunningDegraded, Derive([]Operation{failedA, started}).State)
+}
+
+// Each member carries its own operation's data-plane identifiers and whether
+// a driver ever started it, so a surface reads them from the member rather
+// than pairing the model with the operations it was derived from.
+func TestDerive_MemberCarriesItsOperationsIdentifiers(t *testing.T) {
+	model := Derive([]Operation{
+		{Deployment: "prod", Target: "payments-001", State: state.ApplyOperation.Completed, NeverStarted: true, ExternalID: "spirit-001", ExternalOperationID: "spirit-op-001"},
+		{Deployment: "prod", Target: "payments-002", State: state.ApplyOperation.Failed, Error: "Error 1062: Duplicate entry", ExternalID: "spirit-002", ExternalOperationID: "spirit-op-002"},
+	})
+	require.Len(t, model.Deployments, 2)
+	for _, want := range []struct {
+		target, externalID, externalOperationID string
+		neverStarted                            bool
+	}{
+		{"payments-001", "spirit-001", "spirit-op-001", true},
+		{"payments-002", "spirit-002", "spirit-op-002", false},
+	} {
+		d := model.Deployments[slices.IndexFunc(model.Deployments, func(d Deployment) bool { return d.Target == want.target })]
+		assert.Equal(t, want.externalID, d.ExternalID, want.target)
+		assert.Equal(t, want.externalOperationID, d.ExternalOperationID, want.target)
+		assert.Equal(t, want.neverStarted, d.NeverStarted, want.target)
+	}
 }

@@ -316,7 +316,7 @@ func TestExecuteRollbackPlanCarriesAndRecordsTheReviewedIgnoreTables(t *testing.
 }
 
 // A rollback re-plans schema files the recorded ignore_tables were never
-// checked against, so an engine can refuse a contradiction the reviewed plan
+// checked against, so an engine can refuse a contradiction the primary plan
 // never had. That refusal tells the operator to edit the entry, which does
 // nothing here: the rollback reads the entries frozen on the source plan, so
 // the same edit leaves the same refusal. The failure says where the entries
@@ -354,7 +354,7 @@ func TestExecuteRollbackPlanWithoutIgnoreTablesAddsNoNote(t *testing.T) {
 	assert.NotContains(t, err.Error(), "recorded ignore_tables")
 }
 
-// The refusal that protects a reviewed plan protects a rollback plan the same
+// The refusal that protects the primary plan protects a rollback plan the same
 // way. A data plane that discards the exclusion answers a rollback with a drop
 // of the withheld table, and storing that plan would surface it for review as
 // an ordinary drop.

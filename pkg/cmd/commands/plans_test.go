@@ -34,6 +34,30 @@ func TestPlansCmdParsesListFiltersAndPlanID(t *testing.T) {
 	_, err = parser.Parse([]string{"list-plans", "plan-1784327902264169990"})
 	require.NoError(t, err)
 	assert.Equal(t, "plan-1784327902264169990", cli.Plans.PlanIDArg)
+
+	// The hint a PR comment prints names the plan's environment ahead of the
+	// plan ID, so the two parse together.
+	cli.Plans = PlansCmd{}
+	_, err = parser.Parse([]string{"list-plans", "-e", "staging", "plan_abc"})
+	require.NoError(t, err)
+	assert.Equal(t, "plan_abc", cli.Plans.PlanIDArg)
+	assert.Equal(t, "staging", cli.Plans.Environment)
+}
+
+// A stored plan shown with -e must belong to that environment: a hint pasted
+// against the wrong environment is refused, naming the plan's own, rather
+// than showing another environment's plan as if it were the requested one.
+func TestCheckStoredPlanEnvironment(t *testing.T) {
+	plan := &apitypes.StoredPlanResponse{PlanSummaryResponse: apitypes.PlanSummaryResponse{PlanID: "plan_abc", Environment: "staging"}}
+
+	require.NoError(t, checkStoredPlanEnvironment(plan, "staging"))
+	require.NoError(t, checkStoredPlanEnvironment(plan, ""), "no -e accepts the plan whatever its environment")
+	require.NoError(t, checkStoredPlanEnvironment(plan, "Staging"), "-e matches the stored environment in any case, as the list filter does")
+	require.NoError(t, checkStoredPlanEnvironment(plan, "STAGING"), "-e is folded the way storage folds the environment on write")
+
+	err := checkStoredPlanEnvironment(plan, "production")
+	require.Error(t, err)
+	assert.Equal(t, `plan plan_abc was made for environment "staging", not "production"; rerun with -e staging`, err.Error())
 }
 
 // setHyperlinks pins the terminal hyperlink detection for the test, so
@@ -103,6 +127,16 @@ func TestPlanChangeSummary(t *testing.T) {
 			name:    "vschema-only plan is not a no-change plan",
 			summary: &apitypes.PlanSummaryResponse{VSchemaChangeCount: 1},
 			want:    "1 vschema",
+		},
+		{
+			name:    "finalize-only plan is not a no-change plan",
+			summary: &apitypes.PlanSummaryResponse{FinalizeCount: 2},
+			want:    "2 finalize",
+		},
+		{
+			name:    "finalize-only namespace beside another namespace's table change",
+			summary: &apitypes.PlanSummaryResponse{ChangeCounts: map[string]int{"create": 1}, FinalizeCount: 1},
+			want:    "1 create · 1 finalize",
 		},
 	}
 	for _, tc := range tests {

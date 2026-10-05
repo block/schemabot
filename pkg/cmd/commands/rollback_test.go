@@ -81,3 +81,49 @@ func TestRollbackPreviewUsesTargetDialect(t *testing.T) {
 		})
 	}
 }
+
+// A rollback shows its one rollback plan, which is what every member it runs
+// on runs: the server pairs each member of a mirrored environment with it, and
+// refuses a rollout-wide rollback where members are planned on their own. So
+// the CLI states that it showed the plan every member runs, and the server's
+// rollout rendering gate does not turn away a rollback of a multi-member
+// environment from a current CLI.
+func TestRollbackCmd_ApplySaysItShowedThePlanEveryMemberRuns(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-rollback-test")
+	plan := apitypes.PlanResponse{PlanID: "plan-rollback-1", Database: "shop", DatabaseType: "mysql", Environment: "production", Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` DROP COLUMN `note`"}}}}}
+	applied := make(chan apitypes.ApplyRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/rollback/plan":
+			assert.NoError(t, json.NewEncoder(w).Encode(plan))
+		case "GET /api/status":
+			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StatusResponse{}))
+		case "GET /api/locks/shop/mysql":
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		case "POST /api/locks/acquire":
+			_, err := w.Write([]byte(`{"lock":{}}`))
+			assert.NoError(t, err)
+		case "POST /api/apply":
+			var req apitypes.ApplyRequest
+			assert.NoError(t, json.NewDecoder(r.Body).Decode(&req))
+			applied <- req
+			http.Error(w, `{"error":"recorded"}`, http.StatusInternalServerError)
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	var runErr error
+	captureStdout(func() {
+		cmd := RollbackCmd{ApplyID: "apply-example-85", Environment: "production", AutoApprove: true}
+		runErr = cmd.Run(&Globals{Endpoint: server.URL})
+	})
+	require.Error(t, runErr, "the recording server fails the apply once it is requested")
+	require.Len(t, applied, 1, "the rollback is applied: %v", runErr)
+	req := <-applied
+	assert.Equal(t, "plan-rollback-1", req.PlanID)
+	assert.Empty(t, req.Target, "a rollback runs on every member the apply ran on")
+	assert.True(t, req.RendersRollout, "the rollback says it showed the plan every member runs")
+}

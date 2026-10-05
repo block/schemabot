@@ -76,6 +76,44 @@ func IsAlreadyCompleted(err error) bool {
 	return errors.As(err, &alreadyCompleted)
 }
 
+// SettledOutcomeError wraps an error to indicate the engine refused a control
+// operation because the schema change had already settled on an outcome of its
+// own, such as failed or cancelled, that the operation must not replace. It is
+// a refusal for this change at this moment, not a gap in what the engine
+// supports. Retrying can never succeed, because the outcome will not change
+// back, so a caller consuming a durable control request should resolve the
+// request terminally with the engine's reason and keep driving, so the drive
+// records the outcome the engine reports. A completed change has its own type,
+// AlreadyCompletedError, because its caller reconciles to completed instead.
+type SettledOutcomeError struct {
+	Err error
+}
+
+func (e *SettledOutcomeError) Error() string { return e.Err.Error() }
+func (e *SettledOutcomeError) Unwrap() error { return e.Err }
+
+// NewSettledOutcomeError wraps err as a settled-outcome refusal.
+func NewSettledOutcomeError(msg string, args ...any) error {
+	return &SettledOutcomeError{Err: fmt.Errorf(msg, args...)}
+}
+
+// AsSettledOutcome extracts the settled-outcome refusal from err's tree,
+// reporting whether one is present.
+func AsSettledOutcome(err error) (*SettledOutcomeError, bool) {
+	var settled *SettledOutcomeError
+	if errors.As(err, &settled) {
+		return settled, true
+	}
+	return nil, false
+}
+
+// IsSettledOutcome reports whether err indicates the engine refused a control
+// operation because the schema change had already settled on its own outcome.
+func IsSettledOutcome(err error) bool {
+	_, ok := AsSettledOutcome(err)
+	return ok
+}
+
 // UnsupportedOperationError wraps an error to indicate the engine declines
 // the requested control operation deterministically: it will refuse it for
 // every schema change on its database type, not just for this one or this
@@ -141,6 +179,14 @@ func IsUnsupportedOperation(err error) bool {
 // healthy change as failed. Paths that can receive an unsupported rejection
 // must resolve the control request terminally via IsUnsupportedOperation
 // instead.
+//
+// SettledOutcomeError stays retryable for a different reason: the change has
+// settled, but its outcome is the engine's to report through progress, and it
+// is not always a failure. Classifying the refusal permanent would let a
+// generic failure path record failed over a change that was cancelled, or
+// replace the engine's own failure reason with the refusal's. Paths that can
+// receive a settled-outcome refusal must resolve the control request terminally
+// via IsSettledOutcome and let the drive record the engine's outcome.
 func IsRetryable(err error) bool {
 	if err == nil {
 		return false

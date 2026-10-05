@@ -1420,10 +1420,14 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 	return newest, untrustedApps, nil
 }
 
-// PRCheckStatus represents the status of a single PR check (check run or commit status).
+// PRCheckStatus represents the status of a single PR check (check run or commit
+// status). Status is "completed" once the check has concluded; any other value
+// ("in_progress", "queued", "pending", "waiting", "requested", or one GitHub
+// adds later) means it has not, and callers must treat it as unfinished rather
+// than match a fixed list.
 type PRCheckStatus struct {
 	Name        string
-	Status      string // "completed", "in_progress", "queued"
+	Status      string // "completed", or any other status GitHub reports for an unfinished check
 	Conclusion  string // "success", "failure", "neutral", "skipped", etc.
 	AppSlug     string // creating GitHub App slug; empty for commit statuses
 	IsSchemaBot bool   // true if this check was created by a trusted SchemaBot GitHub App

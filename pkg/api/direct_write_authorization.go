@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 )
@@ -301,8 +302,8 @@ func (s *Service) authorizeDirectWrite(w http.ResponseWriter, r *http.Request, o
 // stored plan — the source of truth for what an apply will mutate — and then
 // enforces the per-database half of the direct-write decision. The plan must
 // exist and resolve at decision time: a missing plan rejects the request with
-// the same error the apply path reports for it, and a plan-load storage failure
-// rejects it with the operation's 500 error. Neither is an authorization
+// the same 404 the apply path reports for it, and a plan-load storage failure
+// rejects it with the same 500 storage error. Neither is an authorization
 // denial; both land on the decision metric as skipped/target_unresolved, and
 // neither lets the request proceed — an unresolvable target must never
 // authorize. Failing closed here (rather than deferring the missing plan to the
@@ -319,14 +320,14 @@ func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *ht
 		s.logger.Error("failed to load plan for direct write authorization",
 			"operation", operation, "plan_id", planID, "environment", environment, "error", err)
 		s.recordUnresolvedDirectWriteTarget(r, operation, environment)
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: get plan %s: %v", operation, planID, err))
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage(operation, planID))
 		return false
 	}
 	if plan == nil {
 		s.logger.Warn("rejecting direct write because the stored plan does not exist",
 			"operation", operation, "plan_id", planID, "environment", environment)
 		s.recordUnresolvedDirectWriteTarget(r, operation, environment)
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: plan not found: %s", operation, planID))
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, storedPlanNotFoundMessage(operation, planID))
 		return false
 	}
 	return s.authorizeDirectWrite(w, r, operation, plan.Database, environment)
