@@ -354,6 +354,69 @@ func TestWatchModel_MultiDeploymentViewRunningDegraded(t *testing.T) {
 	assert.Contains(t, view, "🔄 us — running table copy")
 }
 
+// The watch view offers the cutover command only for an apply that defers
+// cutover, read from the apply's own options on each progress poll; otherwise
+// it says SchemaBot cuts the ready member over itself, as the PR comment does.
+func TestWatchModel_MultiDeploymentCutoverFollowsDeferCutover(t *testing.T) {
+	render := func(options map[string]string) string {
+		progress := apitypes.ProgressResponse{
+			State:       state.Apply.Running,
+			ApplyID:     "apply-cutover-test",
+			Database:    "orders",
+			Environment: "production",
+			Options:     options,
+			Operations: []*apitypes.ProgressOperationResponse{
+				{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.WaitingForCutover, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+			},
+		}
+		updated, _ := NewWatchModel("http://localhost:8080", "", "", false).Update(parseProgressResult(&progress))
+		return updated.(WatchModel).View()
+	}
+
+	automatic := render(nil)
+	assert.Contains(t, automatic, "SchemaBot will cut over us-east next — no action needed.")
+	assert.NotContains(t, automatic, "schemabot cutover")
+
+	deferred := render(map[string]string{"defer_cutover": "true"})
+	assert.Contains(t, deferred, "To cut over us-east:")
+	assert.Contains(t, deferred, "schemabot cutover apply-cutover-test -e production")
+}
+
+// A failed or stopped multi-target rollout ends the watch view on the one
+// command that recovers it, as the progress output does, with the recovery
+// guidance said once rather than repeated in a banner beneath the command.
+// The retry's label carries the fact that decides whether to retry: a new
+// apply reprocesses only the tables that haven't completed.
+func TestWatchModel_MultiTargetRolloutEndsOnItsRecoveryCommand(t *testing.T) {
+	render := func(applyState, failedOpState string) string {
+		m := NewWatchModel("http://localhost:8080", "orders", "production", false)
+		m.applyID = "apply-rollout-end"
+		m.state = applyState
+		m.initialized = true
+		m.operations = []templates.ProgressOperation{
+			{Deployment: "prod", Target: "payments-001", State: state.ApplyOperation.Completed, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+			{Deployment: "prod", Target: "payments-002", State: failedOpState, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate column"},
+		}
+		m.tables = []templates.TableProgress{
+			{Deployment: "prod", Target: "payments-001", TableName: "orders", ChangeType: "alter", Status: state.Task.Completed},
+			{Deployment: "prod", Target: "payments-002", TableName: "orders", ChangeType: "alter", Status: state.Task.Stopped},
+		}
+		return m.View()
+	}
+
+	failed := render(state.Apply.Failed, state.ApplyOperation.Failed)
+	assert.True(t, strings.HasSuffix(failed, "schemabot apply -s <schema_dir> -e production"+templates.ANSIReset+"\n\n"),
+		"the retry command closes the view:\n%s", failed)
+	assert.Contains(t, failed, "To retry once the failure above is resolved — a new apply reprocesses only the tables that haven't completed:\n")
+	assert.Equal(t, 1, strings.Count(failed, "reprocesses only the tables that haven't completed"), "the retry guidance is said once:\n%s", failed)
+
+	stopped := render(state.Apply.Stopped, state.ApplyOperation.Stopped)
+	assert.True(t, strings.HasSuffix(stopped, "schemabot start apply-rollout-end -e production"+templates.ANSIReset+"\n\n"),
+		"the resume command closes the view:\n%s", stopped)
+	assert.NotContains(t, stopped, "Apply stopped")
+}
+
 func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "orders", "production", false)
 	m.applyID = "apply-single-test"
@@ -725,10 +788,11 @@ func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "500")
 }
 
-// Two targets of one deployment each copy the same tables against their own
-// schema. The watch view lists each member's own copies under that member, so a
+// Two targets of one deployment each copy their own tables against their own
+// schema. The watch view rolls the deployment up the way the progress output
+// does, listing each table once under the targets that copied it, so a
 // deployment addressing several targets does not show every copy twice.
-func TestWatchModel_MultiTargetSectionsScopeTablesToTheirMember(t *testing.T) {
+func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "testapp", "production", false)
 	m.applyID = "apply-multi-target"
 	m.state = state.Apply.Running
@@ -745,10 +809,15 @@ func TestWatchModel_MultiTargetSectionsScopeTablesToTheirMember(t *testing.T) {
 	view := m.View()
 
 	assertContainsInOrder(t, view,
-		"primary/testapp-001",
+		"Targets: 1 completed · 1 running",
+		"primary — 1 completed · 1 running (2 targets)",
+		"target testapp-001",
 		"users_001",
-		"primary/testapp-002",
+		"target testapp-002",
 		"users_002",
+		"To stop this schema change:",
+		"schemabot stop apply-multi-target -e production",
+		"ESC to detach",
 	)
 	assert.Equal(t, 1, strings.Count(view, "users_001"))
 	assert.Equal(t, 1, strings.Count(view, "users_002"))

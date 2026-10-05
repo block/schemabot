@@ -24,6 +24,7 @@ import (
 type ApplyCmd struct {
 	SchemaDir    string        `short:"s" required:"" help:"Schema directory with schemabot.yaml and .sql files" name:"schema_dir"`
 	Environment  string        `short:"e" required:"" help:"Target environment"`
+	Target       string        `help:"Plan and apply only this rollout member of the environment: its target, or deployment/target when the name is ambiguous" name:"target"`
 	Repository   string        `help:"Repository name (optional, for tracking)"`
 	PullRequest  int           `help:"Pull request number (optional, for tracking)" name:"pull-request"`
 	AutoApprove  bool          `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
@@ -34,7 +35,7 @@ type ApplyCmd struct {
 	Branch       string        `help:"Reuse existing PlanetScale branch (syncs with main, skips branch creation)" name:"branch"`
 	AllowUnsafe  bool          `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 	Force        bool          `help:"Force acquire lock (breaks existing lock from another owner)"`
-	Yield        bool          `help:"Yield lock after successful completion"`
+	Yield        bool          `help:"Release the lock once the apply has finished (kept while it is still running or stopped)"`
 	NoLock       bool          `help:"Don't hold a database lock during the operation" name:"no-lock"`
 	Output       OutputFormat  `short:"o" help:"Output format" default:"interactive" enum:"interactive,log,json"`
 	LogHeartbeat time.Duration `help:"Interval between progress heartbeats in log mode" default:"10s" name:"log-heartbeat"`
@@ -63,42 +64,17 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// Generate owner for locking (used later if we have changes to apply)
 	owner := client.GenerateCLIOwner()
 
-	// Check for existing active schema change
-	var active *client.ActiveSchemaChange
-	err = withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
-		var checkErr error
-		active, checkErr = client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
-		return checkErr
-	})
-	if err != nil {
-		// Ignore status preflight errors; apply is still guarded server-side.
-	} else if active != nil && active.State != "" {
-		progressCmd := fmt.Sprintf("%s status %s", cliname.Name(), active.ApplyID)
-		var stateMsg string
-		switch {
-		case state.IsState(active.State, state.Apply.WaitingForDeploy):
-			stateMsg = "A schema change is waiting for deploy."
-		case state.IsState(active.State, state.Apply.WaitingForCutover):
-			stateMsg = "A schema change is waiting for cutover."
-		case state.IsRunningApplyState(active.State):
-			stateMsg = "A schema change is already running."
-		case state.IsState(active.State, state.Apply.CuttingOver):
-			stateMsg = "A schema change is currently cutting over."
-		}
-		if stateMsg != "" {
-			fmt.Println()
-			fmt.Println("⏳ Schema Change In Progress")
-			fmt.Println()
-			fmt.Printf("Database: %s\n", cfg.Database)
-			fmt.Printf("Environment: %s\n", cmd.Environment)
-			fmt.Println()
-			fmt.Println(stateMsg)
-			fmt.Println()
-			if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
-				fmt.Printf("To trigger cutover:  %s cutover -e %s %s\n", cliname.Name(), cmd.Environment, active.ApplyID)
-			}
-			fmt.Printf("To watch and manage: %s\n", progressCmd)
-			return fmt.Errorf("schema change already in progress")
+	// Check for existing active schema change. A rollout-wide apply asks about
+	// the whole database and environment before planning. A targeted apply
+	// reserves only its member's deployment, which is known once the plan
+	// resolves the member, so it asks after planning, below, about that
+	// deployment alone: members of a targets list share one deployment, and one
+	// running on another deployment does not conflict with it.
+	if cmd.Target == "" {
+		if err := cmd.refuseActiveSchemaChange(cfg.Database, func() (*client.ActiveSchemaChange, error) {
+			return client.CheckActiveSchemaChange(ep, cfg.Database, cmd.Environment)
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -107,8 +83,11 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	var ignoredNamespaces []string
 	err = withLoading("Generating schema change plan...", cmd.Output != OutputFormatJSON, func() error {
 		var planErr error
-		planResult, ignoredNamespaces, planErr = client.CallPlanAPI(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(),
-			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover))
+		planResult, ignoredNamespaces, planErr = client.CallPlanAPIForTarget(ep, cfg.Database, cfg.Type, cmd.Environment, cfg.SchemaDir, cmd.Repository, cmd.PullRequest, cfg.PlanExclusions(),
+			// The apply refuses the members its rollout lists as needing
+			// attention or as refused, and shows every member's plan before
+			// it prompts.
+			storage.GroupsEngineExecution(cfg.Type, cmd.DeferCutover), cmd.Target, true)
 		return planErr
 	})
 	if err != nil {
@@ -142,9 +121,22 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return fmt.Errorf("plan has errors")
 	}
 
-	// Check if there are any changes (DDL or VSchema)
-	if !planResult.HasChanges() {
+	// An apply runs on every member of a rollout, and one the server could
+	// not plan has no plan to run, so the apply is refused before it starts.
+	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Attention) > 0 {
+		if cmd.Output == OutputFormatJSON {
+			// JSON output prints no member list, so the error itself names
+			// each member and what it needs.
+			return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one, then apply again: %s", len(rollout.Attention), rollout.Members, rolloutAttentionSummary(rollout.Attention))
+		}
+		templates.WriteRolloutAttention(templates.RolloutNoun(rollout), rollout.Attention)
+		return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one listed above, then apply again", len(rollout.Attention), rollout.Members)
+	}
+
+	// Check if there are any changes (DDL or VSchema) on any rollout member
+	if !planResult.RolloutHasChanges() {
 		fmt.Println("No changes. Your schema is up-to-date.")
+		writeNarrowedTo(planResult)
 		// Apply returns here without rendering a plan body, so this is the one
 		// place an operator whose target has nothing to reconcile learns which
 		// live tables the plan was not shown. Every other path reaches the
@@ -155,9 +147,35 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return nil
 	}
 
+	// A targeted apply's preflight: the plan has resolved its member, and has
+	// work that would conflict with a schema change on that deployment.
+	if cmd.Target != "" {
+		if err := cmd.refuseActiveSchemaChange(cfg.Database, func() (*client.ActiveSchemaChange, error) {
+			return client.CheckActiveSchemaChangeOnDeployment(ep, cfg.Database, cmd.Environment, planResult.Deployment)
+		}); err != nil {
+			return err
+		}
+	}
+
+	// The server lists the members whose own plans apply creation refuses in
+	// an apply of the whole rollout from the API, whatever the flags: an
+	// unsafe change the primary's plan does not carry, a direct-execution
+	// change, or work an apply created from the primary's plan has no place
+	// for. Asking for consent here would ask for something the apply cannot
+	// act on, so the apply is refused before it locks or prompts, and each
+	// member is named with the narrowed apply that runs it under its own plan.
+	if rollout := planResult.WholeRollout(); rollout != nil && len(rollout.Refused) > 0 {
+		if cmd.Output == OutputFormatJSON {
+			// JSON output prints no member list, so the error itself names
+			// each refused member, why, and the narrowed apply that runs it.
+			return fmt.Errorf("an apply of the whole rollout cannot run the plan of %d of %d rollout members: %s", len(rollout.Refused), rollout.Members, rolloutRefusalSummary(rollout.Refused, cmd.Environment, cfg.SchemaDir))
+		}
+		return blockRolloutApplyRefused(planResult, rollout, cfg.Database, cmd.Environment, cfg.SchemaDir)
+	}
+
 	// Check for unsafe changes
-	if len(planResult.UnsafeChanges()) > 0 && !cmd.AllowUnsafe {
-		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir)
+	if len(planResult.RolloutUnsafeChanges()) > 0 && !cmd.AllowUnsafe {
+		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Output)
 	}
 
 	// Check lock availability before showing plan (unless --force will break it anyway or --no-lock skips locking)
@@ -186,10 +204,11 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 2: Show the plan
 	OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
+	writeNarrowedTo(planResult)
 
 	// Show unsafe warning if --allow-unsafe was used
 	if cmd.AllowUnsafe {
-		templates.WriteUnsafeWarningAllowed(planResult.UnsafeChanges(), templates.UnsafeConsentAllowFlag)
+		templates.WriteUnsafeWarningAllowed(planResult.RolloutUnsafeChanges(), templates.UnsafeConsentAllowFlag)
 	}
 
 	// Show options if any flags are set
@@ -271,20 +290,106 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying changes...")
 
-	if err := applyAndWatch(ep, planResult, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat); err != nil {
+	// The plan shown above is the plan of every rollout member, grouped by
+	// what each runs. Members the server listed as refused were turned away
+	// before the prompt; a member whose own plan apply creation refuses
+	// without having listed it is refused by POST /api/apply instead.
+	applyID, err := applyAndWatch(ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	if err != nil {
+		if cmd.Yield && !cmd.NoLock && applyID != "" {
+			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
+		}
 		return err
 	}
 
-	// Yield lock if requested and apply was successful
 	if cmd.Yield && !cmd.NoLock {
-		if err := client.ReleaseLock(ep, cfg.Database, cfg.Type, owner); err != nil {
-			fmt.Printf("Warning: failed to release lock: %v\n", err)
-		} else {
-			templates.WriteLockReleased(cfg.Database, cfg.Type)
-		}
+		return yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID)
 	}
 
 	return nil
+}
+
+// shouldYieldLock reports whether --yield may release the database lock. The
+// parent must have settled, and so must every operation and table under it: a
+// settled parent is not proof its work stopped. A rollout projects cancelled as
+// soon as one deployment's operation is cancelled, one failed task fails its
+// operation while a sibling task keeps copying, and a stopped operation can be
+// started again. A failed parent with no operation rows at all offers no proof
+// either way and keeps the lock.
+func shouldYieldLock(progress *apitypes.ProgressResponse) bool {
+	if !state.IsState(progress.State, state.SettledApplyStates...) {
+		return false
+	}
+	if state.IsState(progress.State, state.Apply.Failed) && len(progress.Operations) == 0 {
+		return false
+	}
+	return childWorkSettled(progress)
+}
+
+// childWorkSettled reports whether every operation and table row under the
+// apply has reached a state that no driver will write again.
+func childWorkSettled(progress *apitypes.ProgressResponse) bool {
+	for _, operation := range progress.Operations {
+		if !state.IsState(operation.State, state.SettledApplyStates...) {
+			return false
+		}
+	}
+	for _, table := range progress.Tables {
+		if !state.IsTerminalTaskState(table.Status) {
+			return false
+		}
+	}
+	return true
+}
+
+// yieldLock releases the database lock for --yield once the apply has settled.
+// It reads the apply's state from the server rather than trusting how the
+// command got here: an unwatched apply, a stopped one, and a watch the operator
+// left all return without the apply having finished. Anything that is not a
+// settled state keeps the lock and says how to release it later.
+func yieldLock(ep, database, dbType, owner, environment, applyID string) error {
+	if applyID == "" {
+		templates.WriteLockKept(database, dbType, "the server returned no apply ID to check")
+		return fmt.Errorf("release lock for %s: the server returned no apply ID", database)
+	}
+	progress, err := client.GetProgress(ep, applyID)
+	if err != nil {
+		templates.WriteLockKept(database, dbType, fmt.Sprintf("the state of apply %s could not be read (%v)", applyID, err))
+		return fmt.Errorf("read apply %s before releasing lock for %s: %w", applyID, database, err)
+	}
+	if !shouldYieldLock(progress) {
+		templates.WriteLockKept(database, dbType, lockKeptReason(applyID, environment, progress))
+		return nil
+	}
+	if err := client.ReleaseLock(ep, database, dbType, owner); err != nil {
+		templates.WriteLockKept(database, dbType, fmt.Sprintf("the server did not release it (%v)", err))
+		return fmt.Errorf("release lock for %s: %w", database, err)
+	}
+	templates.WriteLockReleased(database, dbType)
+	return nil
+}
+
+// lockKeptReason says why --yield kept the lock for an apply that
+// shouldYieldLock rejected: the parent has not settled, or it has but a
+// deployment or table under it is still able to write. The settled cases point
+// at the progress command so the operator can see which row is still moving
+// before deciding to unlock.
+func lockKeptReason(applyID, environment string, progress *apitypes.ProgressResponse) string {
+	applyState := state.NormalizeState(progress.State)
+	switch {
+	case state.IsState(applyState, state.Apply.Stopped):
+		return fmt.Sprintf("apply %s is stopped and can still be resumed", applyID)
+	case state.IsState(applyState, state.NoActiveChange):
+		return fmt.Sprintf("the server reported no state for apply %s", applyID)
+	case state.IsState(applyState, state.Apply.Failed) && len(progress.Operations) == 0:
+		return fmt.Sprintf("apply %s is failed and the server reported no deployment rows to check (see %s progress -e %s %s)",
+			applyID, cliname.Name(), environment, applyID)
+	case state.IsState(applyState, state.SettledApplyStates...):
+		return fmt.Sprintf("apply %s is %s, but not every deployment and table under it has stopped yet (see %s progress -e %s %s)",
+			applyID, applyState, cliname.Name(), environment, applyID)
+	default:
+		return fmt.Sprintf("apply %s has not finished (state: %s)", applyID, applyState)
+	}
 }
 
 // OutputFormat specifies how progress output is rendered during apply watch.
@@ -396,14 +501,128 @@ func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
 	}
 }
 
+// refuseActiveSchemaChange runs the active schema change preflight and
+// refuses the apply, with guidance for the schema change already in progress,
+// when check reports one. A preflight that fails is not a refusal: the apply is
+// still guarded server-side.
+func (cmd *ApplyCmd) refuseActiveSchemaChange(database string, check func() (*client.ActiveSchemaChange, error)) error {
+	var active *client.ActiveSchemaChange
+	err := withLoading("Checking active schema changes...", cmd.Output != OutputFormatJSON, func() error {
+		var checkErr error
+		active, checkErr = check()
+		return checkErr
+	})
+	if err != nil || active == nil || active.State == "" {
+		return nil
+	}
+	var stateMsg string
+	switch {
+	case state.IsState(active.State, state.Apply.Pending):
+		stateMsg = "A schema change is queued and has not started yet."
+	case state.IsState(active.State, state.Apply.WaitingForDeploy):
+		stateMsg = "A schema change is waiting for deploy."
+	case state.IsState(active.State, state.Apply.WaitingForCutover):
+		stateMsg = "A schema change is waiting for cutover."
+	case state.IsRunningApplyState(active.State):
+		stateMsg = "A schema change is already running."
+	case state.IsState(active.State, state.Apply.CuttingOver):
+		stateMsg = "A schema change is currently cutting over."
+	}
+	if stateMsg == "" {
+		return nil
+	}
+	fmt.Println()
+	fmt.Println("⏳ Schema Change In Progress")
+	fmt.Println()
+	fmt.Printf("Database: %s\n", database)
+	fmt.Printf("Environment: %s\n", cmd.Environment)
+	fmt.Println()
+	fmt.Println(stateMsg)
+	fmt.Println()
+	if state.IsState(active.State, state.Apply.WaitingForDeploy, state.Apply.WaitingForCutover) {
+		fmt.Printf("To trigger cutover:  %s cutover -e %s %s\n", cliname.Name(), cmd.Environment, active.ApplyID)
+	}
+	fmt.Printf("To watch and manage: %s status %s\n", cliname.Name(), active.ApplyID)
+	return fmt.Errorf("schema change already in progress")
+}
+
 // blockUnsafeApply displays the plan and an error when unsafe changes are detected without --allow-unsafe.
-func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir string) error {
+// A plan narrowed to one rollout member keeps its target in the retry command,
+// so following the advice re-runs the change on that member and not across the
+// whole rollout.
+//
+// JSON output prints neither the plan nor the warning, so the error itself
+// names each unsafe change and the command that permits them.
+func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, schemaDir, target string, output OutputFormat) error {
+	unsafeChanges := planResult.RolloutUnsafeChanges()
+	retry := fmt.Sprintf("apply -s %s -e %s", initShellArg(schemaDir), initShellArg(environment))
+	if target != "" {
+		retry += " --target " + initShellArg(target)
+	}
+	retry += " --allow-unsafe"
+	if output == OutputFormatJSON {
+		return errors.New(templates.UnsafeChangesBlockedSummary(unsafeChanges, retry))
+	}
+
 	// First show the plan so user can see what changes are proposed
 	OutputPlanResult(planResult, database, environment, schemaDir, true)
+	writeNarrowedTo(planResult)
 
 	// Then show the unsafe changes warning
-	unsafeChanges := planResult.UnsafeChanges()
-	templates.WriteUnsafeChangesBlocked(unsafeChanges, fmt.Sprintf("apply -s %s -e %s --allow-unsafe", schemaDir, environment))
+	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry)
+	return ErrSilent
+}
+
+// rolloutAttentionSummary names each rollout member that needs attention with
+// the server's sanitized description of what it needs, on one line.
+func rolloutAttentionSummary(attention []*apitypes.PlanMemberAttentionResponse) string {
+	entries := make([]string, 0, len(attention))
+	for _, a := range attention {
+		entries = append(entries, fmt.Sprintf("%s (%s)", a.Member, a.Detail))
+	}
+	return strings.Join(entries, "; ")
+}
+
+// rolloutRefusalSummary names each refused rollout member with why, on one
+// line: the narrowed apply that runs it, or, for a change its engine refuses,
+// that no apply runs it.
+func rolloutRefusalSummary(refused []*apitypes.PlanMemberRefusalResponse, environment, schemaDir string) string {
+	entries := make([]string, 0, len(refused))
+	for _, r := range refused {
+		if r.Reason == apitypes.PlanMemberBlocked {
+			entries = append(entries, fmt.Sprintf("%s (%s; no apply runs it, so change the schema files)", r.Member, r.Detail))
+			continue
+		}
+		entries = append(entries, fmt.Sprintf("%s (%s; run it with: %s %s)", r.Member, r.Detail, cliname.Name(), narrowedApplyRerun(r, environment, schemaDir)))
+	}
+	return strings.Join(entries, "; ")
+}
+
+// narrowedApplyRerun is the apply narrowed to one refused member, without the
+// binary name. It names the member by the selector the server accepts, which
+// for a deployment with one target is its target rather than the deployment
+// name it is shown under.
+func narrowedApplyRerun(r *apitypes.PlanMemberRefusalResponse, environment, schemaDir string) string {
+	rerun := fmt.Sprintf("apply -s %s -e %s --target %s", initShellArg(schemaDir), initShellArg(environment), initShellArg(r.Target))
+	if r.AllowUnsafe {
+		rerun += " --allow-unsafe"
+	}
+	return rerun
+}
+
+// blockRolloutApplyRefused displays the plan and refuses an apply of the
+// whole rollout that apply creation would refuse for the members the rollout
+// lists, naming the narrowed apply that runs each one.
+func blockRolloutApplyRefused(planResult *apitypes.PlanResponse, rollout *apitypes.PlanRolloutResponse, database, environment, schemaDir string) error {
+	OutputPlanResult(planResult, database, environment, schemaDir, true)
+	var reruns []string
+	for _, r := range rollout.Refused {
+		if r.Reason == apitypes.PlanMemberBlocked {
+			continue
+		}
+		reruns = append(reruns, narrowedApplyRerun(r, environment, schemaDir))
+	}
+	templates.WriteRolloutApplyRefused(templates.RolloutNoun(rollout), rollout.Refused, reruns)
 	return ErrSilent
 }
 

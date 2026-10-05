@@ -138,7 +138,7 @@ proportion to the rows in it, on every pod, inside the boot's budget (see
 
 **PostgreSQL stops the boot rather than make a change that locks a table for as
 long as the change takes.** A new column does that when it is `NOT NULL` with no
-`DEFAULT`, generated, an identity column, `UNIQUE`, or a foreign key with a
+`DEFAULT`, generated, an identity or `serial` column, `UNIQUE`, or a foreign key with a
 `DEFAULT`. One error names every change in that state, and none of them converge
 until all are resolved.
 

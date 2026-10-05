@@ -389,6 +389,153 @@ func TestOutputMultiEnvPlanResult_BothNoChanges(t *testing.T) {
 	assert.Equal(t, 2, noChangesCount, "Expected 2 'No schema changes detected' messages")
 }
 
+// Staging and production share a plan but a third environment drops a column.
+// The plan renders one section per environment so the third environment's
+// DROP COLUMN is shown rather than folded under the shared plan's heading.
+// When all three plans match, they still collapse into one combined section.
+func TestOutputMultiEnvPlanResult_ThreeEnvironments(t *testing.T) {
+	addIndex := func() *apitypes.PlanResponse {
+		return planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+			DDL:        "ALTER TABLE users ADD INDEX idx_email (email)",
+			ChangeType: "ALTER",
+			TableName:  "users",
+		})
+	}
+	dropColumn := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		DDL:        "ALTER TABLE users DROP COLUMN nickname",
+		ChangeType: "ALTER",
+		TableName:  "users",
+	})
+
+	t.Run("one environment differs", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    addIndex(),
+			"production": addIndex(),
+			"sandbox":    dropColumn,
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.NotContains(t, output, "Staging & Production & Sandbox")
+		assert.Contains(t, output, "\nSandbox\n     ~ users\n       ALTER TABLE users DROP COLUMN nickname;")
+		assert.Equal(t, 2, strings.Count(output, "ADD INDEX idx_email (email)"), "staging and production each render their own ADD INDEX")
+	})
+
+	t.Run("all environments match", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    addIndex(),
+			"production": addIndex(),
+			"sandbox":    addIndex(),
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.Contains(t, output, "Staging & Production & Sandbox")
+		assert.Equal(t, 1, strings.Count(output, "ADD INDEX idx_email (email)"), "the shared plan renders once")
+	})
+
+	t.Run("an environment with no plan renders as not configured", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    addIndex(),
+			"production": addIndex(),
+			"sandbox":    nil,
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.NotContains(t, output, "Staging & Production & Sandbox")
+		assert.Contains(t, output, "\nSandbox\n(not configured)\n")
+		assert.Equal(t, 2, strings.Count(output, "ADD INDEX idx_email (email)"), "staging and production each render their own ADD INDEX")
+	})
+
+	t.Run("staging with no plan still names the engine from the next environment", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    nil,
+			"production": addIndex(),
+			"sandbox":    addIndex(),
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.Contains(t, output, "\nStaging\n(not configured)\n")
+		assert.Equal(t, 2, strings.Count(output, "ADD INDEX idx_email (email)"), "production and sandbox each render their own ADD INDEX")
+	})
+}
+
+func dropIndexPlan(unsafeReason string) *apitypes.PlanResponse {
+	return planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		DDL:          "ALTER TABLE users DROP INDEX idx_email",
+		ChangeType:   "ALTER",
+		TableName:    "users",
+		IsUnsafe:     unsafeReason != "",
+		UnsafeReason: unsafeReason,
+	})
+}
+
+// Staging made idx_email invisible before the drop; production and sandbox
+// did not. All three plan the same DROP INDEX, but only staging's plan is
+// clean, so production's and sandbox's unsafe finding must still be shown
+// rather than folded under staging's section.
+func TestOutputMultiEnvPlanResult_SameDDLDifferentUnsafeVerdict(t *testing.T) {
+	const reason = `Index "idx_email" should be made invisible before dropping to ensure it's not needed`
+	results := map[string]*apitypes.PlanResponse{
+		"staging":    dropIndexPlan(""),
+		"production": dropIndexPlan(reason),
+		"sandbox":    dropIndexPlan(reason),
+	}
+
+	output := stripAnsi(captureStdout(func() { outputMultiEnvPlanResult(results, "testapp", "testapp") }))
+
+	assert.NotContains(t, output, "Staging & Production & Sandbox")
+	assert.Equal(t, 2, strings.Count(output, reason), "production and sandbox each disclose their own unsafe finding")
+}
+
+// Only sandbox's plan carries an advisory lint finding; it must not be folded
+// under staging's clean plan.
+func TestOutputMultiEnvPlanResult_SameDDLDifferentLint(t *testing.T) {
+	sandbox := dropIndexPlan("")
+	sandbox.LintResults = []*apitypes.LintViolationResponse{{Message: "sandbox-only advisory finding", Table: "users", Severity: "warning", Linter: "probe"}}
+	results := map[string]*apitypes.PlanResponse{
+		"staging":    dropIndexPlan(""),
+		"production": dropIndexPlan(""),
+		"sandbox":    sandbox,
+	}
+
+	output := stripAnsi(captureStdout(func() { outputMultiEnvPlanResult(results, "testapp", "testapp") }))
+
+	assert.NotContains(t, output, "Staging & Production & Sandbox")
+	assert.Contains(t, output, "sandbox-only advisory finding")
+}
+
+// The same statement under a different keyspace is a different section: a
+// sandbox that alters the table in a second keyspace is not folded under the
+// staging section that names only the first.
+func TestOutputMultiEnvPlanResult_SameDDLDifferentNamespace(t *testing.T) {
+	inKeyspace := func(namespace string) *apitypes.PlanResponse {
+		alter := &apitypes.TableChangeResponse{Namespace: namespace, DDL: "ALTER TABLE users ADD INDEX idx_email (email)", ChangeType: "ALTER", TableName: "users"}
+		return &apitypes.PlanResponse{Engine: "planetscale", Changes: []*apitypes.SchemaChangeResponse{{Namespace: namespace, TableChanges: []*apitypes.TableChangeResponse{alter}}}}
+	}
+	results := map[string]*apitypes.PlanResponse{
+		"staging":    inKeyspace("commerce"),
+		"production": inKeyspace("commerce"),
+		"sandbox":    inKeyspace("archive"),
+	}
+
+	output := stripAnsi(captureStdout(func() { outputMultiEnvPlanResult(results, "testapp", "testapp") }))
+
+	assert.NotContains(t, output, "Staging & Production & Sandbox")
+	assert.Contains(t, output, "archive")
+	assert.Equal(t, 3, strings.Count(output, "ADD INDEX idx_email (email)"), "each environment renders its own section")
+}
+
 func TestSortEnvironments(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -66,10 +66,24 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	}
 
 	engineState := deployStateToEngineState(dr.DeploymentState)
+	message := deployStateToMessage(dr.DeploymentState)
 
 	// Deferred deploy: the deploy request is ready but hasn't been triggered yet.
 	if meta.DeferredDeploy && dr.DeploymentState == deployState.Ready {
 		engineState = engine.StateWaitingForDeploy
+	}
+
+	// A deploy request closed before it was deployed keeps the deployment state
+	// it had (pending or ready), so read from that alone it would still look
+	// like a deploy waiting to start. Nothing can start it any more: a cancel
+	// or stop retires an undeployed deploy request by closing it, and so does
+	// an operator closing it in the PlanetScale UI. It is the cancelled outcome,
+	// and reporting it as such is what lets the apply settle — the
+	// waiting-for-deploy timeout stops the deploy request and then relies on
+	// this poll to read the result, as the cutover timeout does.
+	if deployRequestClosedUndeployed(dr) {
+		engineState = engine.StateCancelled
+		message = fmt.Sprintf("Deploy request #%d closed before it was deployed", dr.Number)
 	}
 
 	// Recover the instant DDL flag for an apply whose metadata was persisted
@@ -149,7 +163,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	result := &engine.ProgressResult{
 		State:       engineState,
-		Message:     deployStateToMessage(dr.DeploymentState),
+		Message:     message,
 		ResumeState: req.ResumeState,
 		Metadata:    psDisplayMetadata(meta),
 	}

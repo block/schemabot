@@ -872,6 +872,10 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 		return fmt.Errorf("attach operation %s to apply %s in state %s: %w", operation.OperationKey, apply.ApplyIdentifier, currentState, storage.ErrApplyNotActive)
 	}
 
+	if err := requireAttachKeyingMatches(ctx, writeTx.tx, apply, operation); err != nil {
+		return err
+	}
+
 	operation.ApplyID = apply.ID
 	if _, err := insertApplyOperation(ctx, writeTx.tx, s.identity, s.classifier, operation); err != nil {
 		return fmt.Errorf("attach apply_operation (deployment=%s, operation_key=%s) to apply %s: %w", operation.Deployment, operation.OperationKey, apply.ApplyIdentifier, err)
@@ -888,6 +892,47 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 
 	if err := writeTx.commit(); err != nil {
 		return fmt.Errorf("commit %s: %w", opName, err)
+	}
+	return nil
+}
+
+// requireAttachKeyingMatches refuses an attach whose operation is keyed by
+// its target when the deployment's existing operations of the apply are not,
+// or the reverse. It runs under the apply's row lock, which serializes every
+// attach to the apply, so two attaches of different shapes cannot both pass.
+//
+// It compares work operations only. A group_finalizer's key cannot say on its
+// own whether it leads with a target ("orders/group_finalizer" is both target
+// orders' deployment-scoped finalizer and namespace orders' finalizer), so a
+// target-keyed finalizer attaches beside its target's work, and the apply's
+// recorded key shape (storage.ApplyOptions.OperationKeysLeadWithTarget), which
+// the dispatch checks before attaching, is what holds finalizers to one shape.
+func requireAttachKeyingMatches(ctx context.Context, tx *rebindTx, apply *storage.Apply, operation *storage.ApplyOperation) error {
+	if operation.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, operation_key, operation_kind, target FROM apply_operations WHERE apply_id = ? AND deployment = ?`, apply.ID, operation.Deployment)
+	if err != nil {
+		return fmt.Errorf("list deployment %s operations of apply %s to attach operation %s: %w", operation.Deployment, apply.ApplyIdentifier, operation.OperationKey, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	attachKeyedByTarget := operation.KeyedByTarget()
+	for rows.Next() {
+		existing := &storage.ApplyOperation{Deployment: operation.Deployment}
+		if err := rows.Scan(&existing.ID, &existing.OperationKey, &existing.OperationKind, &existing.Target); err != nil {
+			return fmt.Errorf("scan deployment %s operation of apply %s to attach operation %s: %w", operation.Deployment, apply.ApplyIdentifier, operation.OperationKey, err)
+		}
+		if existing.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			continue
+		}
+		if existing.KeyedByTarget() != attachKeyedByTarget {
+			return fmt.Errorf("attach operation %q (target %q) to apply %s: deployment %s already holds apply_operation %d keyed %q for target %q: %w",
+				operation.OperationKey, operation.Target, apply.ApplyIdentifier, operation.Deployment, existing.ID, existing.OperationKey, existing.Target, storage.ErrApplyOperationKeyingMismatch)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate deployment %s operations of apply %s to attach operation %s: %w", operation.Deployment, apply.ApplyIdentifier, operation.OperationKey, err)
 	}
 	return nil
 }

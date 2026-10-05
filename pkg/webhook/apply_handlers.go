@@ -9,7 +9,6 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
-	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -192,13 +191,15 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			// Lock held by a different entity
 			h.logger.Info("apply blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 			h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
-				Database:    database,
-				Environment: environment,
-				RequestedBy: requestedBy,
-				LockOwner:   existingLock.Owner,
-				LockRepo:    existingLock.Repository,
-				LockPR:      existingLock.PullRequest,
-				LockCreated: existingLock.CreatedAt,
+				Database:     database,
+				DatabaseType: dbType,
+				Environment:  environment,
+				RequestedBy:  requestedBy,
+				LockOwner:    existingLock.Owner,
+				LockRepo:     existingLock.Repository,
+				LockPR:       existingLock.PullRequest,
+				LockCreated:  existingLock.CreatedAt,
+				CLIName:      h.cliName(),
 			}))
 			return false, nil
 		}
@@ -352,13 +353,69 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// regular plan comment (no lock, no confirm footer). An empty primary plan
 	// speaks only for the primary where members hold schemas of their own, so
 	// the other members are planned first and their work, if any, answers.
-	if !planResp.HasChanges() {
-		rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
-		if rolloutStillPending(rollout) {
-			h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout)
+	//
+	// The rollout round runs whether or not the primary target has work: it
+	// stores the plan each other target runs, bound to this plan, and an apply
+	// created from this plan has nothing to run on a target without one. When
+	// other targets have work, the apply runs their own plans, and it always
+	// stops for apply-confirm: the one-step gates below read only the reviewed
+	// plan, so the operator confirms against the comment that renders every
+	// target's plan instead.
+	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+	primaryTargetConverged := !planResp.HasChanges()
+	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
+	switch {
+	case runsMemberWork:
+		// Record the pending work on the check before anything else can end
+		// this apply: the preflight, the plan's own gates, the lock acquire, and
+		// the fresh-HEAD gate below all have exits of their own, and the stored
+		// check state must not be left reading as a pass from an earlier plan on
+		// any of them (MG-12). No lock is held yet, so a failure needs no release.
+		if recordErr := h.recordPendingRollout(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); recordErr != nil {
+			h.logger.Error("apply rejected: could not record the other targets' pending work on the check; published a failing aggregate from the rollout round instead",
+				"repo", repo, "pr", pr, "head_sha", schemaResult.HeadSHA, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "error", recordErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not record the check state for this apply, so nothing was applied. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command member-work check record %s#%d: %w", repo, pr, recordErr)
+		}
+		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
+		if refusalErr != nil {
+			h.logger.Error("apply rejected: could not verify that the other targets' plans can run from this apply",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", refusalErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
+		}
+		if refusal != "" {
+			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		h.logger.Info("apply: other targets have plans of their own; they will run once confirmed",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged,
+			"targets_pending", rollout.work.pending, "targets", rollout.work.members,
+			"pending_targets", rollout.work.names)
+	case rollout.blocks():
+		// A target that diverged or could not be planned has no plan the apply
+		// could run for it.
+		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged)
+		return false, nil
+	case primaryTargetConverged && rolloutStillPending(rollout):
+		// The primary plan is empty and the pending work cannot be shown on a
+		// comment rendering every target's plan, so there is nothing to confirm.
+		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged)
+		return false, nil
+	case !primaryTargetConverged:
+		h.logger.Debug("apply: only the primary target's own plan runs",
+			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
+	default:
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		commentData.DeploymentDrift = rolloutPreview
 		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
@@ -376,7 +433,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
 	// the rejection needs no release.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
@@ -395,13 +452,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// Block unsafe changes unless --allow-unsafe was specified
-	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
-		commentData.ScopedDatabase = result.Database
-		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
-		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+	// Block unsafe changes unless --allow-unsafe was specified, on every target
+	// the apply runs: one opt-in consents for all of them, as it does for one.
+	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview); blocked {
 		return false, nil
 	}
 
@@ -458,15 +511,16 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// apply proceeds automatically and the unsafe opt-in already solicited
 	// consent for every attributed table, where the re-plan choice the
 	// disclosure coaches is no longer open.
-	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint())
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
-	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
 	commentData.DeferCutover = result.DeferCutover
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
+	commentData.DeploymentDrift = rolloutPreview
 
 	// Re-evaluate the checks gate against the freshness-checked HEAD before
 	// executing. The early gate at the top of applyCommandCore ran against
@@ -487,6 +541,14 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	} else if blocked {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "fresh-HEAD checks gate block")
 		return false, nil
+	}
+
+	// Other targets have work, so the apply runs their own plans, and it never
+	// does so in one step: the gates that let an apply proceed automatically
+	// read only the primary plan. The operator confirms against this comment,
+	// which renders every target's plan.
+	if runsMemberWork {
+		return h.pauseForMemberWorkConfirmation(ctx, repo, pr, installationID, schemaResult, planResp, environment, rollout, commentData, primaryTargetConverged)
 	}
 
 	// Discarding an unfinished copy destroys work already done on the target —
@@ -821,13 +883,15 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if existingLock.Owner != lockOwner {
 		h.logger.Info("apply-confirm blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 		h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
-			Database:    database,
-			Environment: environment,
-			RequestedBy: requestedBy,
-			LockOwner:   existingLock.Owner,
-			LockRepo:    existingLock.Repository,
-			LockPR:      existingLock.PullRequest,
-			LockCreated: existingLock.CreatedAt,
+			Database:     database,
+			DatabaseType: dbType,
+			Environment:  environment,
+			RequestedBy:  requestedBy,
+			LockOwner:    existingLock.Owner,
+			LockRepo:     existingLock.Repository,
+			LockPR:       existingLock.PullRequest,
+			LockCreated:  existingLock.CreatedAt,
+			CLIName:      h.cliName(),
 		}))
 		return false, nil
 	}
@@ -1062,6 +1126,10 @@ func isUnlockRejection(err error) bool {
 // so a re-drive minutes later still releases only the locks the command
 // covered when it arrived — not a lock acquired since, which may be
 // protecting a fresh apply awaiting confirmation or another session's work.
+// A same-owner acquire that refreshes a still-held row for a new pending plan
+// counts as an acquisition too: a row updated after issuedAt is skipped, and
+// release is pinned to the row and pending plan that were looked up, so a
+// refresh landing after the lookup also leaves the lock held.
 // The bound is per delivery receipt, not per original comment: a GitHub
 // Redeliver reopens the stored delivery with a fresh received-at, so a
 // redelivered command may release locks acquired after the original comment,
@@ -1136,18 +1204,31 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// Release only locks that existed when the command was received. A lock
 	// acquired afterwards was never covered by the command's intent and may be
 	// protecting newer work — a fresh apply awaiting confirmation, or another
-	// session's CLI lock on a force unlock. The comparison spans two clocks
-	// (lock.CreatedAt is the storage DB's clock, issuedAt the webhook pod's);
-	// skew fails safe — a wrongly skipped lock gets the stale-command answer
-	// prompting a fresh comment, never a wrongful release.
+	// session's CLI lock on a force unlock. The release below is pinned to the
+	// row, owner, and pending plan this lookup read, which guards everything
+	// that changes after the lookup; this timestamp bound is the only guard
+	// for the window between receipt and the lookup. A lock its owner acquired
+	// again for a new pending plan in that window was read here with the new
+	// plan, so the pin alone would release it: only its UpdatedAt tells it
+	// apart. A liveness touch advances UpdatedAt too and costs such a lock a
+	// stale-command answer rather than a release, the direction that fails
+	// safe. The comparison spans two clocks (the lock timestamps are the
+	// storage DB's clock, issuedAt the webhook pod's). Storage running ahead
+	// skips a lock that did predate the command, which again only costs a
+	// stale-command answer; storage running behind narrows the bound by the
+	// skew, so a lock acquired within it after receipt but before the lookup
+	// is released as if it predated the command. The bound is as good as the
+	// clock alignment between the two hosts, never better.
 	fresh := make([]*storage.Lock, 0, len(locks))
 	var skippedNewer int
+	receiptSecond := issuedAt.Truncate(time.Second)
 	for _, lock := range locks {
-		if lock.CreatedAt.After(issuedAt) {
+		if !lock.CreatedAt.Before(receiptSecond) || !lock.UpdatedAt.Before(receiptSecond) {
 			skippedNewer++
 			h.logger.Warn("unlock will not release a lock acquired after the command was received",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
-				"owner", lock.Owner, "lock_created_at", lock.CreatedAt, "command_received_at", issuedAt)
+				"owner", lock.Owner, "lock_created_at", lock.CreatedAt, "lock_updated_at", lock.UpdatedAt,
+				"command_received_at", issuedAt)
 			continue
 		}
 		fresh = append(fresh, lock)
@@ -1155,8 +1236,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	locks = fresh
 	if len(locks) == 0 && skippedNewer > 0 {
 		h.logger.Info("unlock released nothing because every matched lock postdates the command", "repo", repo, "pr", pr)
-		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
-			"Every lock matched by this unlock command was acquired after the command was received, so nothing was released. Comment `schemabot unlock` again to release the current locks.")
+		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockStaleCommandMessage)
 		return false, nil
 	}
 
@@ -1228,25 +1308,42 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		}
 	}
 
-	// Release all locks. A failed release is logged and the loop continues so
-	// one failure does not strand the remaining locks; the collected errors
-	// make the delivery retryable, and a re-drive only sees the locks that are
-	// still held.
+	// Release all locks. Every release, force or not, deletes only the lock row
+	// this command looked up and vetted above: the ownership, issued-at, and
+	// authorization decisions were all made against that row, so a lock
+	// released and acquired again while they ran (for example another PR's
+	// pending-confirmation apply lock) is a different row and stays held, as
+	// does the same row acquired again for a new plan. The active-apply check
+	// is the one decision the pin does not carry: an apply that becomes durable
+	// after the check leaves the lock row unchanged, so the delete still
+	// matches. That apply's own deployment reservation keeps a second apply
+	// out; the lock row is the operator-visible signal, not the exclusion.
+	// A failed release is logged and the loop continues so one failure does
+	// not strand the remaining locks; the collected errors make the delivery
+	// retryable, and a re-drive only sees the locks that are still held.
 	var releaseErrs []error
-	var released, alreadyGone int
+	var released, alreadyGone, reacquired int
 	for _, lock := range locks {
-		var err error
-		if result.Force {
-			err = h.service.Storage().Locks().ForceRelease(ctx, lock.DatabaseName, lock.DatabaseType)
-		} else {
-			err = h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner)
+		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		if isLockAcquiredSinceVetting(err) {
+			// The database is locked again since the lookup — the same row with
+			// a new pending plan, or a new row after the vetted one was released
+			// — so the current lock protects work this command never vetted and
+			// stays held, exactly as a lock acquired after the command was
+			// received.
+			reacquired++
+			h.logger.Warn("unlock will not release a lock acquired again after the command was vetted",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "vetted_pending_plan_id", lock.PendingPlanID, "force", result.Force, "error", err)
+			continue
 		}
-		if errors.Is(err, storage.ErrLockNotFound) || errors.Is(err, storage.ErrLockNotOwned) {
-			// The lock vanished (or changed owner) between lookup and release —
-			// a concurrent unlock or apply's own stale-lock cleanup got there
-			// first. The lock this command targeted is gone, which is the
-			// command's goal, so this is not a failure to retry; skip the
-			// success comment too, since this command did not do the releasing.
+		if isVettedLockGone(err) {
+			// The vetted lock row vanished between lookup and release — a
+			// concurrent unlock or apply's own stale-lock cleanup got there
+			// first — or is now held under another owner. The lock this command
+			// targeted is gone, which is the command's goal, so this is not a
+			// failure to retry; skip the success comment too, since this
+			// command did not do the releasing.
 			alreadyGone++
 			h.logger.Info("unlock target already released",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
@@ -1268,6 +1365,12 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	if len(releaseErrs) > 0 {
 		return true, fmt.Errorf("unlock command release locks %s#%d: %w", repo, pr, errors.Join(releaseErrs...))
 	}
+	if released == 0 && reacquired > 0 {
+		h.logger.Info("unlock released nothing because at least one current lock was acquired again after the command",
+			"repo", repo, "pr", pr, "reacquired", reacquired, "already_gone", alreadyGone)
+		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockStaleCommandMessage)
+		return false, nil
+	}
 	if released == 0 && alreadyGone > 0 {
 		// Every matched lock was released by a concurrent operation before this
 		// command could act. The per-lock skips stay silent, so without an
@@ -1278,6 +1381,34 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		h.postComment(repo, pr, installationID, templates.RenderLocksAlreadyReleased())
 	}
 	return false, nil
+}
+
+// unlockStaleCommandMessage answers an unlock when at least one current lock
+// was acquired, or acquired again, no earlier than the command receipt second
+// — by timestamp before the lookup, or by the row pin after it.
+const unlockStaleCommandMessage = "At least one current lock matched by this unlock command was acquired after the command was received, and this command released nothing. Comment `schemabot unlock` again to release the current locks."
+
+// isLockAcquiredSinceVetting reports whether a row-pinned release found the
+// database locked again since unlock looked the lock up: a different row now
+// holds it (ErrLockReplaced), or the vetted row was acquired again for another
+// pending plan (ErrLockIntentChanged). Either way a lock is still held and
+// this command never vetted it, so the answer is the stale-command prompt to
+// comment again, not that nothing is left to unlock. The caller logs the
+// specific error so the two causes stay distinguishable.
+func isLockAcquiredSinceVetting(err error) bool {
+	return errors.Is(err, storage.ErrLockReplaced) ||
+		errors.Is(err, storage.ErrLockIntentChanged)
+}
+
+// isVettedLockGone reports whether a row-pinned release found that the lock
+// row unlock vetted no longer holds the lock: no lock is held at all
+// (ErrLockNotFound), or the row is held under another owner (ErrLockNotOwned).
+// Each means the lock the command targeted is gone and nothing this command
+// vetted is left to release; the caller logs the specific error so the cause
+// stays distinguishable.
+func isVettedLockGone(err error) bool {
+	return errors.Is(err, storage.ErrLockNotFound) ||
+		errors.Is(err, storage.ErrLockNotOwned)
 }
 
 func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, result CommandResult) ([]*storage.Lock, error) {

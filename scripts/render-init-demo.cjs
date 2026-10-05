@@ -7,8 +7,11 @@ const {pathToFileURL}=require('node:url');
 const {chromium}=require('playwright');
 (async()=>{
  const root=path.resolve(__dirname,'..'),tmp=fs.mkdtempSync(path.join(os.tmpdir(),'init-gif-'));
- const recording=JSON.parse(fs.readFileSync(path.join(root,'assets/src/init-demo-recording.json')));
+ const name=process.argv[2]||'init-demo';
+ if(!/^init-(sample-)?demo$/.test(name))throw new Error('Use init-demo or init-sample-demo');
+ const recording=JSON.parse(fs.readFileSync(path.join(root,'assets/src/'+name+'-recording.json')));
  if(!recording.wizard.includes('Baseline plan: no changes.')||!recording.plan.includes('ALTER'))throw new Error('Record a successful real wizard and plan first');
+ if(recording.sample&&!recording.wizard_frames.some(f=>f.rows.some(r=>r.map(s=>s.text).join('').includes('What would you like to try?'))))throw new Error('Sample recording must include the initial sample choice');
  const chrome=process.env.CHROME||'/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
  const browser=await chromium.launch({headless:true,...(fs.existsSync(chrome)?{executablePath:chrome}:{})});
  try{
@@ -16,18 +19,20 @@ const {chromium}=require('playwright');
   await page.goto(pathToFileURL(path.join(root,'assets/src/init-demo.html')).href);
   await page.evaluate(data=>window.setRecording(data),recording);
   const frames=[],fps=10;let previous;
-  for(let i=0;i<=42*fps;i++){
+  for(let i=0;i<(recording.apply_frames?30:recording.sample?26:42)*fps;i++){
    await page.evaluate(t=>window.renderFrame(t,.1),i/fps);
    const frame=path.join(tmp,String(i).padStart(4,'0')+'.png');
    const pixels=await page.screenshot();
    if(previous && pixels.equals(previous))frames[frames.length-1].delay+=10;
    else { fs.writeFileSync(frame,pixels);frames.push({path:frame,delay:10});previous=pixels; }
-   if([30,85,130,160,190,250,330,400].includes(i))fs.writeFileSync(path.join(tmp,'preview-'+i+'.png'),pixels);
+   if([20,30,40,50,65,85,105,145,175,185,195,225,245,255,280,299,400].includes(i))fs.writeFileSync(path.join(tmp,'preview-'+i+'.png'),pixels);
   }
   const palette=path.join(tmp,'palette.png');
-  execFileSync('magick',[...frames.filter((_,i)=>i%5===0).map(f=>f.path),'-append','-colors','256','-unique-colors',palette]);
-  const out=path.join(root,'assets/init-demo.gif');
-  execFileSync('magick',['-loop','0',...frames.flatMap(f=>['-delay',String(f.delay),f.path]),'+dither','-remap',palette,'-layers','OptimizePlus',out]);
+  // The sample completion bar appears only near the end. A sampled global palette
+  // can omit its actual emoji colors; retain each frame's colors in this recording.
+  if(!recording.apply_frames)execFileSync('magick',[...frames.filter((_,i)=>i%5===0).map(f=>f.path),'-append','-colors','256','-unique-colors',palette]);
+  const out=path.join(root,'assets/'+name+'.gif');
+  execFileSync('magick',['-loop','0',...frames.flatMap(f=>['-delay',String(f.delay),f.path]),'+dither',...(recording.apply_frames?['-colors','256']:['-remap',palette]),'-layers','OptimizePlus',out]);
   console.log(out,fs.statSync(out).size,'bytes');console.log('Preview frames:',tmp);
  }finally{await browser.close()}
 })().catch(error=>{console.error(error);process.exitCode=1});

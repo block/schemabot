@@ -33,7 +33,7 @@ Thank you for your interest in contributing to SchemaBot! We welcome bug reports
 
 ```bash
 make setup    # Configure git hooks
-make demo     # Start local services, apply schema, seed data
+make demo-full     # Start local services, apply schema, seed data
 make test     # Run all tests (unit + integration + e2e)
 ```
 

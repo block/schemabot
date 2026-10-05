@@ -2,6 +2,7 @@ package templates
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -25,6 +26,10 @@ type ApplyLockConflictData struct {
 	// Active apply info (for "apply in progress" case)
 	ApplyID    string
 	ApplyState string
+
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
 }
 
 // ActorAuthorizationCommentData contains data for PR command actor
@@ -152,7 +157,18 @@ func RenderPRCommandAuthorizationUnavailable(data ActorAuthorizationCommentData)
 // and --allow-unsafe was not specified. Shows the plan DDL plus a blocking message
 // instructing the user to re-run with --allow-unsafe.
 func RenderUnsafeChangesBlocked(data PlanCommentData) string {
-	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+	// Every target's plan renders when the apply runs other targets' plans, so
+	// the refusal shows what each would run. The refusal lists every unsafe
+	// change itself, naming its targets, so the groups do not repeat them.
+	if RendersTargetPlans(data.DeploymentDrift) {
+		drift := *data.DeploymentDrift
+		drift.Plans = slices.Clone(drift.Plans)
+		for i := range drift.Plans {
+			drift.Plans[i].UnsafeChanges = nil
+		}
+		data.DeploymentDrift = &drift
+	}
+	return renderWithinCommentLimit(countCommentDDLBlocks(data), 0, func(budget *ddlBlockBudget) string {
 		return renderUnsafeChangesBlocked(data, budget)
 	})
 }
@@ -168,15 +184,24 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	writePlanAttribution(&sb, data)
 	sb.WriteString("\n")
 
-	// Count and show changes
-	totalStatements, keyspaceUpdates := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspaceUpdates
-
-	if totalChanges > 0 {
+	// Count and show changes, every target's when the apply runs them.
+	summary := data
+	if RendersTargetPlans(data.DeploymentDrift) {
+		// The refusal lists the primary's unsafe changes below with every
+		// other target's, and like a single target's refusal it does not
+		// disclose existing copies, so the primary's group carries neither.
+		groups := data
+		groups.HasUnsafeChanges, groups.UnsafeChanges = false, nil
+		groups.DiscardedCopies, groups.AdoptedCopies, groups.RunningCopies = nil, nil, nil
+		writeTargetPlans(&sb, groups, budget, false)
+		summary.Changes = combinedTargetPlanChanges(data)
+	} else if statements, keyspaceUpdates := countChanges(data.Changes); statements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
+	writeTableSizesSection(&sb, data)
+	totalStatements, keyspaceUpdates := countChanges(summary.Changes)
 
-	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
+	writePlanSummary(&sb, summary, totalStatements, keyspaceUpdates)
 
 	// Unsafe changes blocked section
 	sb.WriteString("---\n\n")
@@ -184,7 +209,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
 	item := 0
 	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(&sb, &item, inlineCode(c.Table), c.Reason, c.ChangeType)
+		writeUnsafeChangeItem(&sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, "")
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
@@ -233,6 +258,7 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 	if totalStatements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
+	writeTableSizesSection(&sb, data)
 
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
@@ -326,13 +352,25 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 	fmt.Fprintf(&sb, "**Since**: %s\n\n", data.LockCreated.UTC().Format("2006-01-02 15:04:05 UTC"))
 
 	if isCLI {
-		sb.WriteString("Ask the lock holder to run `schemabot unlock` from their CLI, or force-unlock with:\n")
+		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, cliUnlockArgs(data.Database, data.DatabaseType)))
 		fmt.Fprintf(&sb, "```\nschemabot unlock -d %s --force\n```\n", data.Database)
 	} else {
 		sb.WriteString("Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.\n")
 	}
 
 	return offerSupportChannel(sb.String())
+}
+
+// cliUnlockArgs renders the CLI unlock arguments for the lock on database.
+// Locks are keyed by database and type, and the CLI's unlock defaults -t to
+// mysql, so the type is named whenever it is known: without it, a hint for a
+// PostgreSQL or Vitess lock would miss the lock it names.
+func cliUnlockArgs(database, databaseType string) string {
+	args := "unlock -d " + database
+	if databaseType != "" {
+		args += " -t " + databaseType
+	}
+	return args
 }
 
 // RenderApplyInProgress renders a comment when the same PR already has an active apply.
@@ -551,11 +589,27 @@ func RenderApplyBlockedByPriorEnv(database, environment, priorEnv, status, actio
 // BlockingCheck represents a PR check that is blocking apply, either because
 // it completed without passing or because it is still running. State holds the
 // GitHub-reported conclusion (e.g. "failure", "timed_out", "cancelled") for
-// completed checks, or the status (e.g. "in_progress", "queued", "pending")
-// for in-progress checks.
+// completed checks, or the status for unfinished checks — any status other than
+// "completed" ("in_progress", "queued", "pending", "waiting", "requested", or
+// one GitHub adds later), rendered as GitHub reported it.
 type BlockingCheck struct {
 	Name  string
 	State string
+}
+
+// checkStatusWaiting is the GitHub check-run status of an Actions job paused on
+// an environment protection rule: it stays there until a deployment reviewer
+// approves or rejects the deployment, so waiting on it is not enough by itself.
+const checkStatusWaiting = "waiting"
+
+// anyCheckInState reports whether any of the checks carries the given State.
+func anyCheckInState(checks []BlockingCheck, state string) bool {
+	for _, c := range checks {
+		if c.State == state {
+			return true
+		}
+	}
+	return false
 }
 
 // RenderApplyBlockedByNonPassingChecks renders a comment when apply is blocked
@@ -670,6 +724,10 @@ func RenderApplyBlockedByInProgressChecks(environment string, inProgress, notRep
 		sb.WriteString("|-------|--------|\n")
 		for _, c := range inProgress {
 			fmt.Fprintf(&sb, "| %s | %s |\n", inlineCodeCell(c.Name), c.State)
+		}
+		if anyCheckInState(inProgress, checkStatusWaiting) {
+			sb.WriteString("\nA check in `waiting` is paused for a deployment reviewer to approve or reject its environment and will not finish on its own. ")
+			sb.WriteString("If the apply should not depend on that approval, leave the check out of `required_checks`.\n")
 		}
 		sb.WriteString("\nWait for checks to complete and retry:\n")
 		fmt.Fprintf(&sb, "```\nschemabot apply -e %s\n```\n", environment)

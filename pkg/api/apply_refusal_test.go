@@ -149,7 +149,7 @@ func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 		})
 		svc, applies, tasks := multiTargetApplyHTTPService(primary, []*storage.Plan{member})
 
-		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production"}`)
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
 
 		assert.Equal(t, http.StatusUnprocessableEntity, status)
 		assert.Equal(t, apitypes.ErrCodePlanBlocked, resp.ErrorCode)
@@ -167,7 +167,7 @@ func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 		})
 		svc, applies, tasks := multiTargetApplyHTTPService(primary, []*storage.Plan{member})
 
-		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production"}`)
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
 
 		assert.Equal(t, http.StatusBadRequest, status)
 		assert.Equal(t, apitypes.ErrCodeUnsafeOptInRequired, resp.ErrorCode)

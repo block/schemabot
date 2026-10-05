@@ -135,3 +135,83 @@ func TestDeriveRolloutApplyState_NeverStartedStopped(t *testing.T) {
 	running.State = ApplyOperation.Running
 	assert.Equal(t, Apply.RunningDegraded, DeriveRolloutApplyState(RolloutChildren([]RolloutOperation{regionA(halt), running})))
 }
+
+// TestRolloutChildren_FinalizerScopedToItsNamespace verifies that a
+// namespace's finalizer is orphaned only by its own namespace's failed work,
+// in both key shapes. Target orders-001 of a targets list runs ns_0 and ns_1:
+// when ns_0's shard fails, ns_0's finalizer is dead and ns_1's is still owed,
+// and the same holds the other way round. A single-target apply keys the same
+// rows without the target and reaches the same answer.
+func TestRolloutChildren_FinalizerScopedToItsNamespace(t *testing.T) {
+	for _, shape := range []struct {
+		name   string
+		prefix string
+	}{
+		{name: "targets list", prefix: "orders-001" + OperationKeyDelimiter},
+		{name: "single target", prefix: ""},
+	} {
+		work := func(namespace, opState string) RolloutOperation {
+			return RolloutOperation{
+				Deployment:   "orders",
+				OperationKey: shape.prefix + namespace + OperationKeyDelimiter + "-80" + OperationKeyDelimiter + "orders",
+				Work:         true,
+				State:        opState,
+			}
+		}
+		finalizer := func(namespace string) RolloutOperation {
+			return RolloutOperation{
+				Deployment:   "orders",
+				OperationKey: shape.prefix + namespace + OperationKeyDelimiter + GroupFinalizerKeySegment,
+				Finalizer:    true,
+				State:        ApplyOperation.Pending,
+			}
+		}
+		for _, failing := range []string{"ns_0", "ns_1"} {
+			succeeding := "ns_1"
+			if failing == "ns_1" {
+				succeeding = "ns_0"
+			}
+			t.Run(shape.name+"/"+failing+" fails", func(t *testing.T) {
+				ops := []RolloutOperation{
+					work(failing, ApplyOperation.Failed),
+					work(succeeding, ApplyOperation.Completed),
+					finalizer(failing),
+					finalizer(succeeding),
+				}
+				children := RolloutChildren(ops)
+				assert.True(t, children[2].Orphaned, "%s's finalizer is dead behind its own failed shard", failing)
+				assert.False(t, children[3].Orphaned, "%s's finalizer is still owed: its own work completed", succeeding)
+			})
+		}
+	}
+}
+
+// TestFinalizerFinalizesWork verifies which work a finalizer finalizes in
+// each key shape: the work under its own namespace, and under its own target
+// when a targets list qualifies the keys.
+func TestFinalizerFinalizesWork(t *testing.T) {
+	cases := []struct {
+		name      string
+		finalizer string
+		work      string
+		want      bool
+	}{
+		{name: "single target, own namespace", finalizer: "ns_0/group_finalizer", work: "ns_0/-80/orders", want: true},
+		{name: "single target, other namespace", finalizer: "ns_0/group_finalizer", work: "ns_1/-80/orders"},
+		{name: "single target, namespace sharing a prefix", finalizer: "ns_0/group_finalizer", work: "ns_01/-80/orders"},
+		{name: "targets list, own target and namespace", finalizer: "orders-001/ns_0/group_finalizer", work: "orders-001/ns_0/-80/orders", want: true},
+		{name: "targets list, other namespace on the same target", finalizer: "orders-001/ns_0/group_finalizer", work: "orders-001/ns_1/-80/orders"},
+		{name: "targets list, same namespace on another target", finalizer: "orders-001/ns_0/group_finalizer", work: "orders-002/ns_0/-80/orders"},
+		{name: "deployment-scoped finalizer", finalizer: "group_finalizer", work: "group_finalizer/-80/orders"},
+		{name: "work keyed by the scope itself", finalizer: "ns_0/group_finalizer", work: "ns_0", want: true},
+		{name: "target-scoped finalizer, other target", finalizer: "orders-001/group_finalizer", work: "orders-002"},
+		{name: "not a finalizer key", finalizer: "ns_0/-80/orders", work: "ns_0/-80/orders"},
+		{name: "namespace differing only by case", finalizer: "orders/group_finalizer", work: "Orders/-80/orders"},
+		{name: "namespace differing only by accent", finalizer: "cafe/group_finalizer", work: "café/-80/orders"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, FinalizerFinalizesWork(tc.finalizer, tc.work))
+		})
+	}
+}

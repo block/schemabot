@@ -96,12 +96,17 @@ func (cmd *LoginCmd) Run(g *Globals) error {
 	if !result.Expiry.IsZero() {
 		profile.TokenExpiry = result.Expiry.Unix()
 	}
+	// Record the issuer and client ID the tokens came from, which --issuer and
+	// --client-id may have overridden: the refresh token is valid only there, so
+	// later commands renew against this pair rather than the oidc settings.
+	profile.TokenIssuer, profile.TokenClientID = loginCfg.Issuer, loginCfg.ClientID
 	if err := client.UpdateConfig(context.WithoutCancel(ctx), func(latest *client.Config) error {
 		current, exists := latest.Profiles[profileName]
 		if !exists || !sameEndpoint(current.Endpoint, profile.Endpoint) || current.LocalRuntime != profile.LocalRuntime || !reflect.DeepEqual(current.OIDC, profile.OIDC) {
 			return fmt.Errorf("profile %q changed its connection during login; the token was not saved to a different server", profileName)
 		}
 		current.Token, current.RefreshToken, current.TokenExpiry = profile.Token, profile.RefreshToken, profile.TokenExpiry
+		current.TokenIssuer, current.TokenClientID = profile.TokenIssuer, profile.TokenClientID
 		latest.Profiles[profileName] = current
 		return nil
 	}); err != nil {

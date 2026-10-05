@@ -365,6 +365,13 @@ type PlanResult struct {
 	// ordinary case.
 	ExistingCopies []*ExistingCopy
 
+	// ExistingCopiesChecked is set by an engine that read the target for every
+	// copy applying this plan could meet, so an empty ExistingCopies means the
+	// target holds none. It stays false when the engine does not look, or when
+	// any lookup failed, and a caller that must know nothing is at stake treats
+	// that as unknown rather than clean.
+	ExistingCopiesChecked bool
+
 	// ExemptTables lists live tables intentionally excluded from a plan verdict,
 	// grouped by namespace and carrying the engine-agnostic reason for exemption.
 	ExemptTables []*ExemptTables

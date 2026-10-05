@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 
@@ -10,22 +11,36 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// plannedPrimaryMember is the rollout member the primary plan was created
+// against, as the plan response recorded it: the deployment and target, and
+// the namespaces the target's entry selected. The rollup checks all three
+// against its own resolution, so a config reloaded between the plan and the
+// rollup fails closed instead of pairing this plan with a different placement.
+func plannedPrimaryMember(planResp *apitypes.PlanResponse) routing.ExecutionTarget {
+	return routing.ExecutionTarget{
+		Deployment: planResp.Deployment,
+		Target:     planResp.Target,
+		Namespaces: planResp.SelectedNamespaces,
+	}
+}
+
 // reviewTimeDrift computes the review-time drift rollup for a database and
 // environment and turns it into the check-record outcome plus the preview
 // rendering of that rollup.
 //
-// It returns a clean outcome when every deployment matches the reviewed plan,
+// It returns a clean outcome when every deployment matches the primary plan,
 // and a blocked outcome on any divergence, a deployment that could not be diffed
 // or compared, or a failure to compute the rollup at all: without a trustworthy
 // comparison SchemaBot cannot confirm the reviewed change is safe to apply
 // everywhere, so the plan check fails closed. A computed rollup's outcome also
-// counts the members that still have work, so a check whose reviewed primary is
+// counts the members that still have work, so a check whose primary target is
 // already at the desired schema does not pass while another member is not.
 //
 // The primary plan reporting errors is not a drift signal — that generic plan
@@ -36,11 +51,11 @@ import (
 // On a successful rollup the preview data is nil for a single-deployment
 // database (nothing to compare) and non-nil otherwise, so the PR comment can
 // show a uniform "same plan everywhere" line or a per-deployment breakdown even
-// when the reviewed primary plan is a clean no-op. On a rollup failure the
+// when the primary plan is a clean no-op. On a rollup failure the
 // preview is always non-nil (Computed:false), regardless of deployment count,
 // so the PR comment explains why the check is failing closed.
 //
-// primaryPlan is the reviewed primary plan proto returned by
+// primaryPlan is the primary plan proto returned by
 // executePlanProtoWithTransientRetry, reused as the rollup baseline so the
 // comparison is against exactly what was reviewed. primaryMember is the
 // deployment and target that plan was created against.
@@ -68,7 +83,8 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 			summary: "drift check failed; see logs",
 		}, &templates.DeploymentDriftData{Computed: false}
 	}
-	preview := deploymentDriftPreview(rollup)
+	preview := reviewDriftPreview(rollup,
+		"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)
 	if rollup.Clean {
 		return reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup)}, preview
 	}
@@ -84,6 +100,25 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 // PR markdown (it can carry internal hostnames, IPs, or DSN fragments) and is
 // logged server-side instead.
 const erroredDriftDetail = "diff failed; see server logs"
+
+// reviewDriftPreview builds the PR-preview rendering data for a computed
+// rollup, carrying each target's table sizes when the rollup is clean so the
+// size section totals a table across the targets that change it. A blocked
+// rollup's targets do not apply one primary plan, so its preview carries no
+// target sizes and the section shows the primary plan's. logAttrs identify
+// the plan in logs.
+func reviewDriftPreview(rollup api.PlanRollup, logAttrs ...any) *templates.DeploymentDriftData {
+	preview := deploymentDriftPreview(rollup)
+	if preview == nil {
+		return nil
+	}
+	if !rollup.Clean {
+		slog.Debug("review-time drift rollup is blocked; the size section shows the primary plan's sizes, not each target's", logAttrs...)
+		return preview
+	}
+	preview.TableSizes = targetTableSizes(rollup, logAttrs...)
+	return preview
+}
 
 // deploymentDriftPreview turns a computed rollup into the PR-preview rendering
 // data. It returns nil for a single-deployment database: with one deployment
@@ -135,6 +170,30 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 	return data
 }
 
+// addMemberLint records that a target raised each of its advisory lint
+// findings, folding a finding into the group's entry for it when another target
+// already raised it. Error-severity findings are left out: they are unsafe
+// changes, which the plan discloses and gates as such, the way a single plan's
+// lint section leaves them out.
+func addMemberLint(group []templates.LintViolationData, member []*ternv1.LintViolation, target string) []templates.LintViolationData {
+	for _, v := range member {
+		if v.GetSeverity() == "error" {
+			continue
+		}
+		i := slices.IndexFunc(group, func(f templates.LintViolationData) bool {
+			return f.Table == v.GetTable() && f.Message == v.GetMessage()
+		})
+		if i < 0 {
+			group = append(group, templates.LintViolationData{Message: v.GetMessage(), Table: v.GetTable()})
+			i = len(group) - 1
+		}
+		if !slices.Contains(group[i].Targets, target) {
+			group[i].Targets = append(group[i].Targets, target)
+		}
+	}
+	return group
+}
+
 // deploymentPlanGroups groups the rollout's members by the plan each would run,
 // one entry per distinct plan.
 //
@@ -142,7 +201,7 @@ func deploymentDriftPreview(rollup api.PlanRollup) *templates.DeploymentDriftDat
 // when their plans are the same work — so a group can be described once and
 // attributed to all of its members without comparing every pair. Groups come out
 // in the rollout order of their first member, with the primary's group first:
-// the reviewed plan is the one an operator has already seen, and a fixed order
+// the primary plan is the one an operator has already seen, and a fixed order
 // keeps a comment that is re-rendered on a later push from reshuffling under a
 // reader who is looking for what changed.
 func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup {
@@ -167,20 +226,42 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 			byPlan[e.PlanFingerprint] = at
 		}
 		groups[at].Members = append(groups[at].Members, names[i])
-		for _, bc := range memberBlockedChanges(e.ChangeSet) {
-			addBlockedTarget(&groups[at], bc, names[i])
+		for _, bc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeBlocked) {
+			addModeTarget(&groups[at].BlockedChanges, bc, names[i])
+		}
+		// A direct verdict is read per member for the same reason a refusal is:
+		// the policy judges each target's own table, so members that run the same
+		// DDL can differ in how it runs. That write-blocking DDL is disclosed
+		// under the targets that run it, the way a refusal is.
+		for _, dc := range memberModeChanges(e.ChangeSet, engine.ExecutionModeDirect) {
+			addModeTarget(&groups[at].DirectChanges, templates.DirectChangeData(dc), names[i])
+		}
+		// Lint reads each member's live schema, so members that run the same
+		// DDL can still raise different findings. The group carries every
+		// finding any of its members raised, each once, naming the targets
+		// that raised it, so the comment can say which targets each is on.
+		groups[at].LintViolations = addMemberLint(groups[at].LintViolations, e.LintViolations, names[i])
+		// An unsafe change is disclosed under the targets that carry it too, so
+		// one --allow-unsafe consents to it on every target the apply runs.
+		for _, uc := range memberUnsafeChanges(e.ChangeSet) {
+			addUnsafeTarget(&groups[at].UnsafeChanges, uc, names[i])
 		}
 	}
-	// A change every target in the group refuses needs no names beside it: the
+	// A change every target in the group carries needs no names beside it: the
 	// group heading already lists them.
 	for gi := range groups {
+		members := len(groups[gi].Members)
 		for bi := range groups[gi].BlockedChanges {
-			bc := &groups[gi].BlockedChanges[bi]
-			if len(bc.Targets) == len(groups[gi].Members) {
-				bc.Targets = nil
-				continue
-			}
-			bc.TotalTargets = len(groups[gi].Members)
+			trimModeTargets(&groups[gi].BlockedChanges[bi].Targets, &groups[gi].BlockedChanges[bi].TotalTargets, members)
+		}
+		for di := range groups[gi].DirectChanges {
+			trimModeTargets(&groups[gi].DirectChanges[di].Targets, &groups[gi].DirectChanges[di].TotalTargets, members)
+		}
+		for ui := range groups[gi].UnsafeChanges {
+			trimModeTargets(&groups[gi].UnsafeChanges[ui].Targets, &groups[gi].UnsafeChanges[ui].TotalTargets, members)
+		}
+		for li := range groups[gi].LintViolations {
+			trimModeTargets(&groups[gi].LintViolations[li].Targets, &groups[gi].LintViolations[li].TotalTargets, members)
 		}
 	}
 	// The primary is the first member, so its group is already first. Ordering is
@@ -199,12 +280,47 @@ func deploymentPlanGroups(rollup api.PlanRollup) []templates.DeploymentPlanGroup
 	return groups
 }
 
-// memberBlockedChanges lists the changes in one member's plan that its engine
-// will refuse at apply. Grouping keys members on the work they would run, not on
-// whether their engines accept it, so each member's verdict is read from its own
-// plan. A sharded namespace is read per shard, the way the reviewed plan's
-// blocked changes are, so a change refused on some shards names them.
-func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
+// targetTableSizes lists every rollout target's size estimate for each table
+// api.MemberSizedTables names for it, in rollout order, primary first, so the
+// PR comment sizes the same tables the CLI's rollout plan does. logAttrs
+// identify the plan in logs.
+func targetTableSizes(rollup api.PlanRollup, logAttrs ...any) []templates.TargetTableSize {
+	names := rollupMemberNames(rollup)
+	var sizes []templates.TargetTableSize
+	for i, e := range rollup.Entries {
+		for _, st := range api.MemberSizedTables(e, logAttrs...) {
+			sizes = append(sizes, templates.TargetTableSize{
+				Target:   names[i],
+				Keyspace: st.Namespace,
+				Size: templates.TableSizeData{
+					Table:          st.Change.GetTableName(),
+					ShardCount:     int(st.Change.GetShardCount()),
+					EstimatedBytes: st.Change.EstimatedBytes,
+				},
+			})
+		}
+	}
+	return sizes
+}
+
+// trimModeTargets drops the target names from a group's disclosure when every
+// target in the group carries it, and otherwise records the group's size so a
+// subset too wide to name reads as coverage.
+func trimModeTargets(targets *[]string, totalTargets *int, members int) {
+	if len(*targets) == members {
+		*targets = nil
+		return
+	}
+	*totalTargets = members
+}
+
+// memberModeChanges lists the changes in one member's plan that its engine
+// judged to run in the given execution mode. Grouping keys members on the work
+// they would run, not on how their engines run it, so each member's verdict is
+// read from its own plan. A sharded namespace is read per shard, the way the
+// primary plan's verdicts are, so a change judged that way on some shards
+// names them.
+func memberModeChanges(cs tern.ChangeSet, mode string) []templates.BlockedChangeData {
 	if len(cs.Shards) > 0 {
 		total := 0
 		var out []templates.BlockedChangeData
@@ -214,10 +330,10 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 			}
 			total++
 			for _, tc := range sp.GetChanges() {
-				if tc.GetExecutionMode() != engine.ExecutionModeBlocked {
+				if !strings.EqualFold(tc.GetExecutionMode(), mode) {
 					continue
 				}
-				out = mergeBlockedShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
+				out = mergeModeShard(out, tc.GetTableName(), tc.GetModeReason(), sp.GetShard())
 			}
 		}
 		for i := range out {
@@ -228,7 +344,7 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 	var out []templates.BlockedChangeData
 	for _, sc := range cs.Changes {
 		for _, tc := range sc.GetTableChanges() {
-			if tc.GetExecutionMode() == engine.ExecutionModeBlocked {
+			if strings.EqualFold(tc.GetExecutionMode(), mode) {
 				out = append(out, templates.BlockedChangeData{Table: tc.GetTableName(), Reason: tc.GetModeReason()})
 			}
 		}
@@ -236,9 +352,9 @@ func memberBlockedChanges(cs tern.ChangeSet) []templates.BlockedChangeData {
 	return out
 }
 
-// mergeBlockedShard records that a shard refuses a table change, folding it into
+// mergeModeShard records a shard's verdict on a table change, folding it into
 // the entry for the same table and reason when one exists.
-func mergeBlockedShard(out []templates.BlockedChangeData, table, reason, shard string) []templates.BlockedChangeData {
+func mergeModeShard(out []templates.BlockedChangeData, table, reason, shard string) []templates.BlockedChangeData {
 	for i := range out {
 		if out[i].Table == table && out[i].Reason == reason {
 			out[i].Shards = append(out[i].Shards, shard)
@@ -248,32 +364,145 @@ func mergeBlockedShard(out []templates.BlockedChangeData, table, reason, shard s
 	return append(out, templates.BlockedChangeData{Table: table, Reason: reason, Shards: []string{shard}})
 }
 
-// addBlockedTarget records that a target refuses one of its group's changes,
+// modeChange is a disclosure of how a target's engine runs one of its changes,
+// refused or direct, keyed the same way whichever verdict it discloses.
+type modeChange interface {
+	templates.BlockedChangeData | templates.DirectChangeData
+}
+
+// addModeTarget records that a target carries one of its group's verdicts,
 // folding it into the group's entry for the same change when another target
-// already refuses it.
-func addBlockedTarget(g *templates.DeploymentPlanGroup, bc templates.BlockedChangeData, target string) {
-	for i := range g.BlockedChanges {
-		existing := &g.BlockedChanges[i]
+// already carries it. A target is listed once however many of its changes
+// fold into the entry, such as the same table in two namespaces: the list is
+// compared against the group's size to decide whether every target carries
+// the verdict, so a repeated name would credit it to targets that do not.
+func addModeTarget[T modeChange](list *[]T, change T, target string) {
+	bc := templates.BlockedChangeData(change)
+	for i := range *list {
+		existing := templates.BlockedChangeData((*list)[i])
 		if existing.Table == bc.Table && existing.Reason == bc.Reason && slices.Equal(existing.Shards, bc.Shards) {
+			if slices.Contains(existing.Targets, target) {
+				slog.Debug("target already carries this verdict in its group; not listing it twice",
+					"target", target, "table", bc.Table)
+				return
+			}
 			existing.Targets = append(existing.Targets, target)
+			(*list)[i] = T(existing)
 			return
 		}
 	}
 	bc.Targets = []string{target}
-	g.BlockedChanges = append(g.BlockedChanges, bc)
+	*list = append(*list, T(bc))
+}
+
+// memberUnsafeChanges lists the table changes in one member's plan that need
+// the unsafe opt-in, read the way the primary plan's are: per shard for a
+// sharded namespace, so a change unsafe on some shards names them, and
+// otherwise from the namespace view. The unsafe verdict and the drop fallback
+// are apitypes.TableChangeResponse.UnsafeChange, the primary plan's own rule.
+// Each namespace's unsafe VSchema change follows its table changes, read by
+// apitypes.SchemaChangeResponse.VSchemaUnsafeChanges as the primary plan's
+// are, so an undecodable record is listed as unsafe rather than dropped.
+func memberUnsafeChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
+	return append(memberUnsafeTableChanges(cs), memberUnsafeVSchemaChanges(cs)...)
+}
+
+// memberUnsafeVSchemaChanges lists each namespace's unsafe VSchema change in
+// one member's plan, from the namespace view, where the plan records VSchema
+// work whether or not the namespace is sharded.
+func memberUnsafeVSchemaChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
+	var out []templates.UnsafeChangeData
+	for _, sc := range cs.Changes {
+		namespace := &apitypes.SchemaChangeResponse{Namespace: sc.GetNamespace(), Metadata: sc.GetMetadata()}
+		for _, uc := range namespace.VSchemaUnsafeChanges() {
+			out = append(out, templates.UnsafeChangeData{Table: uc.Table, Reason: uc.Reason, DDL: uc.DDL, ChangeType: uc.ChangeType})
+		}
+	}
+	return out
+}
+
+// memberUnsafeTableChanges lists the table changes in one member's plan that
+// need the unsafe opt-in, as memberUnsafeChanges describes.
+func memberUnsafeTableChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
+	unsafeOf := func(tc *ternv1.TableChange) (apitypes.UnsafeChange, bool) {
+		op, ok := ternconv.ChangeTypeToOp(tc.GetChangeType())
+		if !ok {
+			op = "other"
+		}
+		return (&apitypes.TableChangeResponse{
+			TableName:    tc.GetTableName(),
+			DDL:          tc.GetDdl(),
+			ChangeType:   op,
+			IsUnsafe:     tc.GetIsUnsafe(),
+			UnsafeReason: tc.GetUnsafeReason(),
+		}).UnsafeChange()
+	}
+	var out []templates.UnsafeChangeData
+	if len(cs.Shards) > 0 {
+		total := 0
+		for _, sp := range cs.Shards {
+			if sp == nil {
+				continue
+			}
+			total++
+			for _, tc := range sp.GetChanges() {
+				uc, ok := unsafeOf(tc)
+				if !ok {
+					continue
+				}
+				at := slices.IndexFunc(out, func(c templates.UnsafeChangeData) bool {
+					return c.Table == uc.Table && c.Reason == uc.Reason
+				})
+				if at < 0 {
+					out = append(out, templates.UnsafeChangeData{Table: uc.Table, Reason: uc.Reason, DDL: uc.DDL, ChangeType: uc.ChangeType})
+					at = len(out) - 1
+				}
+				out[at].Shards = append(out[at].Shards, sp.GetShard())
+			}
+		}
+		for i := range out {
+			out[i].TotalShards = total
+		}
+		return out
+	}
+	for _, sc := range cs.Changes {
+		for _, tc := range sc.GetTableChanges() {
+			if uc, ok := unsafeOf(tc); ok {
+				out = append(out, templates.UnsafeChangeData{Table: uc.Table, Reason: uc.Reason, DDL: uc.DDL, ChangeType: uc.ChangeType})
+			}
+		}
+	}
+	return out
+}
+
+// addUnsafeTarget records that a target carries one of its group's unsafe
+// changes, folding it into the group's entry for the same change when another
+// target already carries it, the way addModeTarget folds a verdict.
+func addUnsafeTarget(list *[]templates.UnsafeChangeData, change templates.UnsafeChangeData, target string) {
+	for i := range *list {
+		existing := &(*list)[i]
+		if existing.Table == change.Table && existing.Reason == change.Reason && slices.Equal(existing.Shards, change.Shards) {
+			if !slices.Contains(existing.Targets, target) {
+				existing.Targets = append(existing.Targets, target)
+			}
+			return
+		}
+	}
+	change.Targets = []string{target}
+	*list = append(*list, change)
 }
 
 // memberPlanChanges renders one member's plan into the shape the comment renders
-// the reviewed plan in, so a group's changes can be shown the way a reviewer has
+// the primary plan in, so a group's changes can be shown the way a reviewer has
 // already read the primary's. It is a second builder of that shape, not the same
-// one: the reviewed plan is built from the plan response in buildPlanCommentData,
+// one: the primary plan is built from the plan response in buildPlanCommentData,
 // and the two have to be kept in step by hand. Both record a namespace's
 // VSchema change and finalize through setNamespaceWork, so a member's plan
-// shows them the way the reviewed plan does.
+// shows them the way the primary plan does.
 //
 // A sharded namespace carries its changes twice: once per shard, and once in a
 // collapsed namespace view that dedupes tables across shards. Both are kept, the
-// same way the reviewed plan keeps them, so the rendering can show what applies
+// same way the primary plan keeps them, so the rendering can show what applies
 // where rather than a namespace-level view that hides a shard.
 //
 // A namespace that appears only on shard rows still gets an entry. The planner
@@ -300,7 +529,7 @@ func memberPlanChanges(cs tern.ChangeSet) []templates.KeyspaceChangeData {
 		// dropped, so a partially-applied namespace shows its divergent state.
 		//
 		// A shard that reported changes and produced no DDL is a different thing:
-		// an incomplete plan, which the reviewed plan refuses to render rather
+		// an incomplete plan, which the primary plan refuses to render rather
 		// than call satisfied. Calling it satisfied here would say the inverse —
 		// already at this schema — so it is worth naming why it cannot arrive.
 		// canonicalDDLForDrift rejects a blank statement, so a member carrying
@@ -343,7 +572,7 @@ func memberPlanChanges(cs tern.ChangeSet) []templates.KeyspaceChangeData {
 }
 
 // describeDriftDiff renders a short, count-based summary of how a diverged
-// deployment differs from the reviewed plan, e.g. "1 unexpected, 2 missing
+// deployment differs from the primary plan, e.g. "1 unexpected, 2 missing
 // changes". The full DDL is intentionally omitted to keep the preview compact;
 // the operator reconciles by replanning the diverged deployment.
 func describeDriftDiff(diff tern.ChangeSetDiff) string {
@@ -369,7 +598,7 @@ func describeDriftDiff(diff tern.ChangeSetDiff) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return strings.Join(parts, ", ") + " change(s) vs the reviewed plan"
+	return strings.Join(parts, ", ") + " change(s) vs the primary target's plan"
 }
 
 // rollupMemberNames renders each rollup entry the way an operator addresses it,
@@ -389,7 +618,7 @@ const maxDriftSummaryLen = 255
 
 // summarizeReviewDrift builds the concise operator-facing reason a review-time
 // drift rollup blocked the plan check. It names the deployments that diverged
-// from the reviewed plan and those that could not be diffed or compared, so the
+// from the primary plan and those that could not be diffed or compared, so the
 // check's Change column tells an operator exactly which deployment to reconcile.
 //
 // Independent members are never expected to agree, so their failure is an
@@ -432,7 +661,7 @@ func summarizeReviewDrift(rollup api.PlanRollup) string {
 		if independent {
 			return "blocks apply: not every target could be planned"
 		}
-		return "drift blocks apply: deployments differ from the reviewed plan"
+		return "drift blocks apply: deployments differ from the primary target's plan"
 	}
 	// Targets that hold their own schemas are never expected to agree, so their
 	// failure is an unplanned target, not drift between them.

@@ -593,6 +593,33 @@ func TestFormatTableProgress_StartingCopy(t *testing.T) {
 	}
 }
 
+// A copying table shows its planned size beside the row counts, before the
+// ETA, and a stopped one keeps it. Without an estimate the row counts stand
+// alone.
+func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	base := TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
+		DDL:        "ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`)",
+		RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720,
+		EstimatedBytes: &bytes,
+	}
+
+	assert.Contains(t, FormatTableProgress(base), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n")
+
+	noETA := base
+	noETA.ETASeconds = 0
+	assert.Contains(t, FormatTableProgress(noETA), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
+
+	stopped := base
+	stopped.Status = state.Task.Stopped
+	assert.Contains(t, FormatTableProgress(stopped), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
+
+	unsized := base
+	unsized.EstimatedBytes = nil
+	assert.Contains(t, FormatTableProgress(unsized), "Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n")
+}
+
 // A table applying its accumulated changes names the catch-up phase rather
 // than rendering a bare full bar — its copy is done but the engine is still
 // draining the changes that piled up on the source, which can run for hours on

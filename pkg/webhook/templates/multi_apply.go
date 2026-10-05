@@ -233,11 +233,12 @@ func writeAggregateFirstFailure(sb *strings.Builder, failure *presentation.Deplo
 // writeRolloutFooter writes the rollout's footer at the bottom, where the
 // single-deployment comment keeps its footer: every control command addresses
 // the whole apply. A pending rollup action leads; otherwise the footer is the
-// one the aggregate state would carry, such as stop while running. Whenever a
-// member is still writing to its target, stop follows in the same footer, so
-// neither a pending action nor the aggregate state can take stop away from
-// live work. A terminal apply refuses stop, so stop is never offered under
-// one.
+// one the aggregate state would carry, such as stop while running. Whether
+// stop follows is presentation.Apply.OffersRolloutStop, which the CLI's
+// rollout footer decides with too: neither a pending action nor the aggregate
+// state can take stop away from live work, a terminal apply refuses stop, and
+// a failure on an apply that is still active is offered stop first, since a
+// new apply is refused until this one settles.
 func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 	footer := rolloutFooterData(data)
 	footerStart := sb.Len()
@@ -253,23 +254,21 @@ func writeRolloutFooter(sb *strings.Builder, data MultiDeploymentApplyData) {
 			appendTenantFlag(fmt.Sprintf("schemabot release %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	}
 	if !actionPending && !paused {
+		// The single-deployment footer already writes stop under every
+		// state that offers it.
 		writeApplyFooter(sb, footer)
-		if applyFooterOffersStop(footer.State) {
+		if presentation.OffersStop(footer.State) {
 			return
 		}
 	}
-	// Stop is refused once the apply is terminal, even while a member is
-	// still writing to its target.
-	if state.IsTerminalApplyState(data.Model.State) {
-		return
-	}
-	// A paused rollout always offers stop beside release; otherwise stop
-	// follows only a member that is still writing to its target.
-	if !paused && !hasStoppableLiveWork(data.Model.Deployments) {
+	if !data.Model.OffersRolloutStop() {
 		return
 	}
 	label, command := rolloutStopAction(footer)
 	writeRolloutFooterAction(sb, footerStart, label, command)
+	if data.Model.RetryWaitsOnActiveApply() {
+		fmt.Fprintf(sb, "\n%s\n", presentation.RetryOnceSettledNote)
+	}
 }
 
 // writeRolloutFooterAction writes one command of the rollout footer. The first
@@ -315,32 +314,6 @@ func rolloutFooterData(data MultiDeploymentApplyData) ApplyStatusCommentData {
 	return footer
 }
 
-// applyFooterOffersStop reports whether writeApplyFooter writes the stop (or
-// cancel) command for an apply in state s: the running family, the PlanetScale
-// setup phases, and an apply retrying a failed table.
-func applyFooterOffersStop(s string) bool {
-	return state.IsRunningApplyState(s) || state.IsState(s,
-		state.Apply.FailedRetryable,
-		state.Apply.PreparingBranch,
-		state.Apply.ApplyingBranchChanges,
-		state.Apply.ValidatingBranch,
-		state.Apply.CreatingDeployRequest,
-		state.Apply.ValidatingDeployRequest)
-}
-
-// hasStoppableLiveWork reports whether any member is still writing to its
-// target in a state where the single-deployment footer offers stop. A member
-// waiting for cutover is left out, as it is from that footer, so a rollout
-// whose members only wait for cutover keeps the cutover as its one command.
-func hasStoppableLiveWork(deployments []presentation.Deployment) bool {
-	for _, d := range deployments {
-		if applyFooterOffersStop(d.State) {
-			return true
-		}
-	}
-	return false
-}
-
 // writeAggregateNextAction renders the single suggested operator action derived
 // for the rollup, if any. An empty action (NextActionNone) writes nothing.
 func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData) {
@@ -367,8 +340,12 @@ func writeAggregateNextAction(sb *strings.Builder, data MultiDeploymentApplyData
 	case presentation.NextActionReviewFailure:
 		// revert applies only to a deployment still in its post-cutover revert
 		// window, not to a failure; the recovery path for a failed apply is a
-		// retry, matching the single-deployment failed footer.
-		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		// retry, matching the single-deployment failed footer. Until the apply
+		// is terminal a new apply is refused, so writeRolloutFooter offers
+		// stop instead.
+		if data.Model.OffersRetry() {
+			writeFooterAction(sb, presentation.RetryLabel+":", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		}
 	case presentation.NextActionNone:
 		// No operator action is pending; nothing to render.
 	}

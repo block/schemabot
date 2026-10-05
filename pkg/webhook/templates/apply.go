@@ -30,6 +30,9 @@ type TableProgressData struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// EstimatedBytes is the table's on-disk size when it was planned, shown
+	// beside the row counts. Nil when the plan had no estimate.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -184,8 +187,13 @@ type ApplyStatusCommentData struct {
 	// reader anything: it ties a running member back to the block it came from
 	// among the several the review showed. A rollout the review showed as one
 	// block names no plan, whether its members share a plan row or were each
-	// planned into their own and came out running the same change.
+	// planned into their own and came out running the same change. DDL cut to
+	// fit the comment names the command that prints this plan in full.
 	PlanID string
+
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
 
 	// InRolloutSection marks this comment as rendered inside one member's
 	// section of a rollout. The rollout comment carries the apply ID, who
@@ -210,7 +218,14 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	})
 }
 
+// storedPlan is the stored plan the apply's DDL comes from, when the comment
+// names one, so DDL cut to fit points at the command that prints it in full.
+func (data ApplyStatusCommentData) storedPlan() storedPlanRef {
+	return storedPlanRef{cliName: data.CLIName, environment: data.Environment, id: data.PlanID}
+}
+
 func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdated bool, renderedAt string, budget *ddlBlockBudget) string {
+	defer budget.pointAt(data.storedPlan())()
 	var sb strings.Builder
 
 	// Header varies by state
@@ -1315,9 +1330,10 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 
 	// Show rows (no ETA) for stopped tables with progress
 	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
-		fmt.Fprintf(sb, "- Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
-			ui.FormatNumber(table.RowsTotal))
+			ui.FormatNumber(table.RowsTotal),
+			ui.FormatTableSizeClause(table.EstimatedBytes))
 	}
 }
 
@@ -1373,15 +1389,18 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 		return
 	}
 	copied := ui.ClampRows(table.RowsCopied, table.RowsTotal)
+	size := ui.FormatTableSizeClause(table.EstimatedBytes)
 	if table.ETASeconds > 0 {
-		fmt.Fprintf(sb, "- Rows: %s / %s \u00b7 ETA: %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s \u00b7 ETA: %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal),
+			size,
 			ui.FormatETA(table.ETASeconds))
 	} else {
-		fmt.Fprintf(sb, "- Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(copied),
-			ui.FormatNumber(table.RowsTotal))
+			ui.FormatNumber(table.RowsTotal),
+			size)
 	}
 }
 
@@ -1465,6 +1484,7 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 }
 
 func renderApplySummaryComment(data ApplyStatusCommentData, budget *ddlBlockBudget) string {
+	defer budget.pointAt(data.storedPlan())()
 	var sb strings.Builder
 
 	completedCount, failedCount := countTableOutcomes(data.Tables)

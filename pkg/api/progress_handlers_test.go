@@ -74,6 +74,34 @@ func TestProgressResponseFromProtoCarriesTableETA(t *testing.T) {
 	assert.Equal(t, int64(540), decoded.Tables[0].ETASeconds)
 }
 
+// A table's planned size travels from the progress proto through the HTTP
+// response as estimated_bytes, and a table without one omits the field rather
+// than reporting a zero-byte table.
+func TestProgressResponseFromProtoCarriesTableSize(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	resp := progressResponseFromProto(&ternv1.ProgressResponse{
+		State:  ternv1.State_STATE_RUNNING,
+		Engine: ternv1.Engine_ENGINE_SPIRIT,
+		Tables: []*ternv1.TableProgress{
+			{TableName: "orders", Namespace: "testdb", Status: "running", RowsTotal: 48_200_000, EstimatedBytes: &bytes},
+			{TableName: "users", Namespace: "testdb", Status: "running", RowsTotal: 1000},
+		},
+	})
+
+	require.Len(t, resp.Tables, 2)
+	require.NotNil(t, resp.Tables[0].EstimatedBytes)
+	assert.Equal(t, bytes, *resp.Tables[0].EstimatedBytes)
+	assert.Nil(t, resp.Tables[1].EstimatedBytes)
+
+	encoded, err := json.Marshal(resp.Tables)
+	require.NoError(t, err)
+	var decoded []map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	require.Len(t, decoded, 2)
+	assert.InDelta(t, float64(bytes), decoded[0]["estimated_bytes"], 0)
+	assert.NotContains(t, decoded[1], "estimated_bytes")
+}
+
 func statusFoldService() *Service {
 	return &Service{logger: slog.New(slog.DiscardHandler)}
 }

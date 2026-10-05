@@ -415,7 +415,7 @@ func KnownReviewDriftClassification(classification string) bool {
 //
 // classification="planned" is the healthy outcome for a member that holds its
 // own schema: it was planned against that schema and never compared to the
-// reviewed plan, so it is the independent counterpart of "match" and not a
+// primary plan, so it is the independent counterpart of "match" and not a
 // signal to alert on. It has to be listed here rather than left to the unknown
 // bucket, which is reserved for a classification the code emits and this
 // contract does not know about — a coding gap, which normal independent
@@ -428,7 +428,7 @@ func RecordReviewDrift(ctx context.Context, database, environment, deployment, c
 		classification = "unknown"
 	}
 	addCounter(ctx, "schemabot.review_drift.total",
-		"review-time per-member classifications: against the reviewed primary plan where members mirror it, against the member's own schema where they do not", "{deployment}",
+		"review-time per-member classifications: against the primary target's plan where members mirror it, against the member's own schema where they do not", "{deployment}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("deployment", deployment),
@@ -2363,9 +2363,9 @@ var knownDirectExecutionOutcomes = map[string]bool{
 // for the statement and MySQL error), and a spike in blocked_size_unknown
 // means row estimates are unavailable (check target connectivity and
 // information_schema access). blocked_force_kill_unavailable means the target
-// user is denied a table the kill reads (grant SELECT on performance_schema.*
-// and PROCESS); blocked_force_kill_unknown means checking those grants failed
-// (check target connectivity).
+// user lacks a grant the kill needs (grant SELECT on performance_schema.*,
+// PROCESS, and CONNECTION_ADMIN or SUPER); blocked_force_kill_unknown means
+// checking those grants failed (check target connectivity).
 func RecordDirectExecution(ctx context.Context, database, outcome string) {
 	if !knownDirectExecutionOutcomes[outcome] {
 		outcome = "unknown"
