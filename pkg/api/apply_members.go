@@ -26,7 +26,7 @@ func (m applyMember) MemberID() string {
 // must be built from.
 //
 // When the environment's members are expected to hold the same schema, every
-// member runs the reviewed plan and the apply's own plan is used throughout.
+// member runs the primary plan and the apply's own plan is used throughout.
 //
 // When the members were planned independently, each one has a plan of its own
 // stored at review time, and running one member's DDL against another's target
@@ -34,11 +34,11 @@ func (m applyMember) MemberID() string {
 // member is paired with its own stored plan from the same review round.
 //
 // The round takes precedence over current config. A round that planned its
-// members independently stored a plan for each, stamped with the reviewed plan's
+// members independently stored a plan for each, stamped with the primary plan's
 // identifier, and those plans are what the operator approved — so they are used
 // even if the environment's routing has since been respelled as mirrored.
 // Config decides only the case the round is silent about: no member plans stored
-// means either that every member was verified against the reviewed plan, or that
+// means either that every member was verified against the primary plan, or that
 // nothing planned the members at all, and only config can tell those apart.
 //
 // A member with no plan for an independently planned round fails apply creation.
@@ -66,7 +66,7 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 		return []applyMember{{Target: targets[0], Plan: plan}}, nil
 	}
 
-	memberPlans, err := s.memberPlansForReviewRound(ctx, plan, environment)
+	memberPlans, err := s.MemberPlansForReviewRound(ctx, plan, environment)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +76,7 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 		planning, err := s.config.MemberPlanningFor(plan.Database, environment)
 		if err != nil {
 			// A database/environment the config no longer resolves cannot be shown
-			// to have had its members verified against the reviewed plan, and that
+			// to have had its members verified against the primary plan, and that
 			// is the only shape in which one plan runs everywhere. Fail rather than
 			// assume it.
 			return nil, fmt.Errorf("resolve member planning for %s/%s: %w", plan.Database, environment, err)
@@ -99,14 +99,7 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 		}
 		memberPlan, ok := memberPlans[target.MemberID()]
 		if !ok {
-			if plan.HeadSHA == "" {
-				// Member plans are only ever written by a pull request review, so
-				// an apply from a plan that had none is unplannable by
-				// construction rather than by a missed round.
-				return nil, fmt.Errorf("apply for %s/%s has no stored plan for rollout member %s, and its plan %s was not produced by a pull request review; plan from a pull request so every target is planned",
-					plan.Database, environment, target.MemberID(), plan.PlanIdentifier)
-			}
-			return nil, fmt.Errorf("apply for %s/%s has no stored plan for rollout member %s in the reviewed round (plan %s); plan the environment again so every target is planned before applying",
+			return nil, fmt.Errorf("apply for %s/%s has no stored plan for rollout member %s in the plan round (plan %s); plan the environment again so every target is planned before applying",
 				plan.Database, environment, target.MemberID(), plan.PlanIdentifier)
 		}
 		members = append(members, applyMember{Target: target, Plan: memberPlan})
@@ -114,10 +107,10 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 	return members, nil
 }
 
-// memberPlansForReviewRound loads the plans stored for the members of this
+// MemberPlansForReviewRound loads the plans stored for the members of this
 // apply's own review round, keyed by member id.
 //
-// The round is identified by the reviewed plan's identifier, which every member
+// The round is identified by the primary plan's identifier, which every member
 // plan is stamped with at review time. A commit can be planned more than once —
 // a re-plan, or two deliveries racing — and each round writes a plan per member
 // carrying the same database, environment, repository, pull request, route, and
@@ -132,18 +125,30 @@ func (s *Service) resolveApplyMembers(ctx context.Context, plan *storage.Plan, e
 // off the end, and a member the listing dropped is indistinguishable here from
 // one the round never planned, which is reported to the operator as an
 // unplanned target and sends them to re-plan a round that was planned fine.
-func (s *Service) memberPlansForReviewRound(ctx context.Context, plan *storage.Plan, environment string) (map[string]*storage.Plan, error) {
+// reviewRoundListing selects the plans of one review round. The round's stamp
+// is what scopes it; the repository and pull request only narrow the scan to
+// an index. A pull request number means nothing without its repository, and a
+// CLI plan can carry one without the other, so the pull request is passed only
+// alongside the repository it belongs to.
+func reviewRoundListing(plan *storage.Plan, environment string) storage.ListPlansOptions {
+	opts := storage.ListPlansOptions{
+		Database:              plan.Database,
+		Environment:           environment,
+		Repository:            plan.Repository,
+		PrimaryPlanIdentifier: plan.PlanIdentifier,
+	}
+	if plan.Repository != "" {
+		opts.PullRequest = plan.PullRequest
+	}
+	return opts
+}
+
+func (s *Service) MemberPlansForReviewRound(ctx context.Context, plan *storage.Plan, environment string) (map[string]*storage.Plan, error) {
 	if plan.PlanIdentifier == "" {
 		return nil, fmt.Errorf("apply for %s/%s addresses several targets but its plan has no identifier to match member plans against",
 			plan.Database, environment)
 	}
-	stored, err := s.storage.Plans().List(ctx, storage.ListPlansOptions{
-		Database:              plan.Database,
-		Environment:           environment,
-		Repository:            plan.Repository,
-		PullRequest:           plan.PullRequest,
-		PrimaryPlanIdentifier: plan.PlanIdentifier,
-	})
+	stored, err := s.storage.Plans().List(ctx, reviewRoundListing(plan, environment))
 	if err != nil {
 		return nil, fmt.Errorf("list member plans for %s/%s round %s: %w", plan.Database, environment, plan.PlanIdentifier, err)
 	}

@@ -72,6 +72,20 @@ human decision. `--dry-run` previews the fixes without writing anything. Run it
 locally when a plan comes back with lint warnings you agree with — it edits
 your declarative files, so the fixes land in the same PR as the change.
 
+It reads the same files `plan` does: `.sql` files directly in the schema
+directory, or one level of namespace subdirectories (`<schema-dir>/<namespace>/*.sql`),
+and writes each fix back to the file it came from. Namespaces listed in
+`schemabot.yaml` `ignore_namespaces` are left alone, as is the empty-namespace
+marker `onboard` writes. Like `plan`, it rejects a directory that mixes the two
+layouts without changing any file. It exits non-zero when the directory holds
+no `.sql` files, since that almost always means a wrong path, and when any
+finding needs a manual fix.
+
+The fixer parses and rewrites with the MySQL grammar, so `fix-lint` is for
+MySQL-family databases (`mysql`, `vitess`, `strata`). A schema directory whose
+`schemabot.yaml` declares another type, such as `postgres`, is refused before
+any file is read; a directory with no `schemabot.yaml` is taken to be MySQL.
+
 ## Auditing a live schema (`pull --lint`)
 
 `schemabot pull --lint` (the `lint` option on the pull API) runs the linters
@@ -142,10 +156,31 @@ in a different table immediately, leaving the old table stale. The blast
 radius matches removing the vindex outright, so mutations take the same
 `--allow-unsafe` acknowledgment.
 
-Additions-only VSchema changes (new vindexes, new tables, new column-vindex
-associations) are not unsafe. Removals and mutations are detected structurally
-by comparing the current and desired VSchema documents; a VSchema that cannot
-be parsed fails the plan rather than skipping detection.
+The same holds for in-place changes to the keyspace or a table's routing:
+flipping the keyspace's `sharded` or `require_explicit_routing` flag, changing
+a table's `type`, changing how a table is keyed (its primary vindex — the
+first `column_vindexes` entry, including by reordering the entries — or its
+`pinned` keyspace id, or swapping one for the other), re-pointing a reference
+table's `source`, and adding, removing, or re-pointing a table's
+`auto_increment`. A new primary vindex or pin computes every row's keyspace
+id differently while the rows stay on their current shards; without its
+sequence, inserts pass through to the database, whose backing column is not
+guaranteed to generate an id. These sequence semantics also apply to
+unsharded keyspaces, where a table needs no VSchema entry to be routed: a new
+entry that gives a table the keyspace already holds a sequence changes where
+that table's ids come from, so it is unsafe too, while an entry for a table
+the same plan creates is an addition.
+
+Additions-only VSchema changes (new vindexes, new tables, new secondary
+column-vindex associations) are not unsafe. A keyspace's first VSchema is
+compared as if its current document were an empty keyspace, so the live
+tables it already routes are protected the same way. The one exemption is the
+`sharded` flag: a sharded keyspace's first document saying it is sharded is
+how the keyspace is onboarded, and a keyspace with one shard routes every
+keyspace id to that shard, so the flag alone re-routes nothing. Removals and
+mutations are detected structurally by comparing the current and desired
+VSchema documents; a VSchema that cannot be parsed fails the plan rather than
+skipping detection.
 
 Unsafe does not mean broken. An unsafe change will usually apply successfully —
 the point of the gate is that it is destructive or irreversible, so SchemaBot
@@ -184,7 +219,9 @@ execute the statement at all, so an apply is guaranteed to fail on it. There is
 no flag that lets a blocked change through — the guidance is to rewrite the
 statement as a supported schema change. Blocked changes render on the plan
 comment and again on the locked apply comment, and any apply command is
-rejected up front while they are present. Local apply admission re-checks the
+rejected up front while they are present. The plan comment offers no apply
+command for an environment with a blocked change; its footer offers the
+re-plan to run once the statement is rewritten. Local apply admission re-checks the
 whole stored plan before creating or attaching apply work, so a dispatch for
 one table or shard cannot partially apply a plan whose other step is blocked.
 A deployment that did not plan locally re-plans the dispatched changes against

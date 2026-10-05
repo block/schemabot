@@ -806,6 +806,14 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 // deploy request number is held in a local so a transient poll error never
 // dereferences a nil deploy request, and the poll honors context cancellation so
 // a deploy stuck in pending does not block indefinitely.
+//
+// A poll that fails with a retryable PlanetScale error (a 5xx, a rate limit, a
+// malformed response) is retried on the next tick rather than failing the
+// apply: the deploy request already exists, so giving up here would abandon it
+// on PlanetScale while the caller either fails the apply or forks a fresh
+// request beside it. The tolerance is bounded to maxRetries consecutive
+// failures so an API that stays down still surfaces; a poll that succeeds
+// resets the count. Any other error is returned at once.
 func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclient.PSClient, org, database string, dr *ps.DeployRequest) (*ps.DeployRequest, error) {
 	// A nil deploy request means an upstream caller never created or fetched it;
 	// poll has nothing to track, so surface the invariant violation rather than
@@ -819,6 +827,7 @@ func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclien
 	ticker := time.NewTicker(deployRequestPollInterval)
 	defer ticker.Stop()
 
+	consecutiveFailures := 0
 	for dr.DeploymentState == deployState.Pending {
 		select {
 		case <-ctx.Done():
@@ -827,8 +836,15 @@ func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclien
 		}
 		next, err := e.getDeployRequest(ctx, client, org, database, number)
 		if err != nil {
-			return nil, fmt.Errorf("poll deploy request %d: %w", number, err)
+			consecutiveFailures++
+			if !isRetryablePSError(err) || consecutiveFailures >= maxRetries {
+				return nil, fmt.Errorf("poll deploy request %d: %w", number, err)
+			}
+			e.logger.Warn("transient error polling the pending deploy request; polling again",
+				"database", database, "deploy_request", number, "consecutive_failures", consecutiveFailures, "error", err)
+			continue
 		}
+		consecutiveFailures = 0
 		dr = next
 	}
 	return dr, nil

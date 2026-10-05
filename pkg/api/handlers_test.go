@@ -69,6 +69,9 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
+func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string, string) error {
+	return nil
+}
 func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
@@ -76,6 +79,18 @@ type capturingPlanStore struct {
 	mockPlanLookupStore
 	created   *storage.Plan
 	createErr error
+	// routed records each UpdateRoute call as "plan_id deployment/target",
+	// followed by " narrowed to <member>" for a narrowed plan.
+	routed []string
+}
+
+func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target, narrowedTo string) error {
+	call := planIdentifier + " " + deployment + "/" + target
+	if narrowedTo != "" {
+		call += " narrowed to " + narrowedTo
+	}
+	s.routed = append(s.routed, call)
+	return nil
 }
 
 func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int64, error) {
@@ -866,13 +881,16 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr      error
-	planResp       *ternv1.PlanResponse
-	planErr        error
-	planReq        *ternv1.PlanRequest
-	planDiffResp   *ternv1.PlanDiffResponse
-	planDiffErr    error
-	planDiffReq    *ternv1.PlanRequest
+	healthErr    error
+	planResp     *ternv1.PlanResponse
+	planErr      error
+	planReq      *ternv1.PlanRequest
+	planDiffResp *ternv1.PlanDiffResponse
+	planDiffErr  error
+	planDiffReq  *ternv1.PlanRequest
+	// planDiffMu guards planDiffReq: a rollout plan diffs its members
+	// concurrently, so one client can serve several diffs at once.
+	planDiffMu     sync.Mutex
 	pullSchemaResp *ternv1.PullSchemaResponse
 	pullSchemaErr  error
 	pullSchemaReq  *ternv1.PullSchemaRequest
@@ -949,7 +967,9 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	return nil, m.planErr
 }
 func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	m.planDiffMu.Lock()
 	m.planDiffReq = req
+	m.planDiffMu.Unlock()
 	if m.planDiffResp != nil {
 		return m.planDiffResp, m.planDiffErr
 	}
@@ -1626,9 +1646,20 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		assert.Empty(t, plans.created.SchemaPath)
 	})
 
-	t.Run("duplicate plan identifier is tolerated", func(t *testing.T) {
+	// A planner that shares the service's storage stores the row for a plan
+	// with changes first, stamped with the database it was configured with as
+	// the deployment. The service keeps that row and restamps it with the
+	// rollout member it planned, so the apply can find the primary target by it.
+	t.Run("duplicate plan identifier keeps the stored row on the planned route", func(t *testing.T) {
 		svc, _, plans := newPolicyService()
 		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     "payments",
+			Target:         "payments-staging-target",
+		}
 		pr := int32(1)
 
 		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
@@ -1646,6 +1677,52 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		require.NotNil(t, resp)
 		require.NotNil(t, plans.created)
 		assert.Equal(t, "schema/payments", plans.created.SchemaPath)
+		assert.Equal(t, []string{"plan-source-policy " + DefaultDeployment + "/payments-staging-target"}, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier already on the planned route is kept as is", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     DefaultDeployment,
+			Target:         "payments-staging-target",
+		}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.NoError(t, err)
+		assert.Empty(t, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier for another database fails the plan", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{PlanIdentifier: "plan-source-policy", Database: "orders", Environment: "staging"}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "collides with a stored plan for database \"orders\"")
+		assert.Empty(t, plans.routed)
 	})
 }
 
@@ -3400,7 +3477,11 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
+	// A rollout-wide apply runs from the rollout primary's plan.
+	plan := executeApplyTestPlan()
+	plan.Deployment = "default-a"
+	plan.Target = "testdb-a"
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -5315,6 +5396,7 @@ func TestHandleStatusDeploymentFilterProjectsMatchingOperation(t *testing.T) {
 	assert.Equal(t, "remote-operation-202", resp.Applies[0].ExternalOperationID)
 	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
 	assert.Equal(t, state.Apply.Completed, resp.Applies[0].State)
+	assert.Equal(t, state.Apply.Running, resp.Applies[0].ApplyState, "the parent's state is reported beside the operation's, since the apply still holds the deployment")
 }
 
 // A deployment applied per shard has exactly one data-plane apply, so the

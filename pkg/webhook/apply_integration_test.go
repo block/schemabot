@@ -24,6 +24,7 @@ import (
 
 	"github.com/block/spirit/pkg/utils"
 
+	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -517,19 +518,46 @@ func TestE2EApplyConfirmNoLock(t *testing.T) {
 	}
 }
 
+// acquireSettledLock seeds a lock that was acquired well before any command a
+// test is about to send. The lock timestamps have second precision, and unlock
+// never releases a lock acquired or touched in the same second the command was
+// received, so a lock acquired in the same instant as the command would read
+// as newer than it. A lock an operator unlocks was acquired long before the
+// comment; backdating the row reproduces that ordering.
+func acquireSettledLock(t *testing.T, svc *api.Service, lock *storage.Lock) {
+	t.Helper()
+	ctx := t.Context()
+	require.NoError(t, svc.Storage().Locks().Acquire(ctx, lock))
+
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(schemabotDB)
+	require.NoError(t, schemabotDB.PingContext(ctx))
+
+	// Acquire canonicalized the key in place, so it matches the stored row.
+	result, err := schemabotDB.ExecContext(ctx, `
+		UPDATE locks
+		SET created_at = created_at - INTERVAL 1 HOUR, updated_at = updated_at - INTERVAL 1 HOUR
+		WHERE database_name = ? AND database_type = ?
+	`, lock.DatabaseName, lock.DatabaseType)
+	require.NoError(t, err)
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 1, affected, "expected to backdate exactly the seeded lock row")
+}
+
 func TestE2EUnlock(t *testing.T) {
 	dbName := "webhook_unlock"
 	svc := setupE2EService(t, dbName)
 
 	// Acquire a lock from this PR
-	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+	acquireSettledLock(t, svc, &storage.Lock{
 		DatabaseName: dbName,
 		DatabaseType: "mysql",
 		Repository:   "octocat/hello-world",
 		PullRequest:  1,
 		Owner:        "octocat/hello-world#1",
 	})
-	require.NoError(t, err)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -599,12 +627,11 @@ func TestE2EUnlockForceInfersDatabaseForCLILock(t *testing.T) {
 
 	// Seed the production symptom: a local CLI session owns the database lock, so
 	// the normal PR-scoped unlock lookup cannot find it by repository/PR.
-	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+	acquireSettledLock(t, svc, &storage.Lock{
 		DatabaseName: dbName,
 		DatabaseType: "mysql",
 		Owner:        "cli:testuser@example.local",
 	})
-	require.NoError(t, err)
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -695,14 +722,13 @@ func TestE2EUnlockDoesNotPassAggregateWithPendingChanges(t *testing.T) {
 
 	// Seed the state after `schemabot apply` has planned work and acquired the
 	// PR-owned lock, but before those changes have been applied.
-	err := svc.Storage().Locks().Acquire(ctx, &storage.Lock{
+	acquireSettledLock(t, svc, &storage.Lock{
 		DatabaseName: dbName,
 		DatabaseType: "mysql",
 		Repository:   "octocat/hello-world",
 		PullRequest:  1,
 		Owner:        "octocat/hello-world#1",
 	})
-	require.NoError(t, err)
 
 	// Both the per-database stored check state and the visible aggregate check
 	// are action_required because schema changes are still waiting for apply.
@@ -1176,14 +1202,13 @@ func TestE2EUnlockBlockedByActiveApply(t *testing.T) {
 	svc := setupE2EService(t, dbName)
 
 	// Acquire a lock from this PR
-	err := svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+	acquireSettledLock(t, svc, &storage.Lock{
 		DatabaseName: dbName,
 		DatabaseType: "mysql",
 		Repository:   "octocat/hello-world",
 		PullRequest:  1,
 		Owner:        "octocat/hello-world#1",
 	})
-	require.NoError(t, err)
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})

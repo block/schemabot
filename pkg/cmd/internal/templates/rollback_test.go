@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -65,4 +66,25 @@ func TestRollbackPlanListsOnlyTheDDLOfAFinalizedKeyspace(t *testing.T) {
 	assert.Contains(t, preview, "  refund_notes (create):\n")
 	assert.NotContains(t, preview, "finalized by the engine")
 	assert.NotContains(t, preview, "VSchema update")
+}
+
+// A keyspace whose shards diverged lists what each shard will run: the drop
+// only one shard needs is shown beside the ALTER its sibling runs, instead of
+// the one entry per table the namespace-level changes keep. A statement
+// uniform across shards appears once.
+func TestRollbackPlanListsADivergentShardsStatement(t *testing.T) {
+	safeAlter := "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);"
+	shardDrop := "ALTER TABLE `orders` DROP COLUMN `legacy`;"
+	plan := &apitypes.PlanResponse{Database: "shop", DatabaseType: "vitess", Environment: "staging",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: safeAlter}}}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "shop", Shard: "-80", Changes: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: safeAlter}}},
+			{Namespace: "shop", Shard: "80-", Changes: []*apitypes.TableChangeResponse{{TableName: "orders", ChangeType: "alter", DDL: safeAlter}, {TableName: "orders", ChangeType: "alter", DDL: shardDrop}}},
+		}}
+
+	preview := ansi.Strip(captureStdout(t, func() { WriteRollbackPlan(plan, "apply-example-85") }))
+
+	assert.Contains(t, preview, "DROP COLUMN `legacy`")
+	assert.Equal(t, 1, strings.Count(preview, "ADD INDEX `idx_status`"))
+	assert.Equal(t, 2, strings.Count(preview, "  orders (alter):\n"))
 }

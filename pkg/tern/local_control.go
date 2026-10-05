@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,7 +36,69 @@ func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverReq
 	if apply == nil {
 		return nil, fmt.Errorf("no active schema change")
 	}
-	return c.queueCutoverRequest(ctx, apply, caller)
+	bound, refusal, err := c.cutoverRequestOperation(ctx, apply, req.GetApplyOperationId())
+	if err != nil {
+		return nil, err
+	}
+	if refusal != "" {
+		c.logger.Warn("cutover refused before it was queued",
+			append(apply.LogAttrs(), "apply_operation_id", req.GetApplyOperationId(), "reason", refusal)...)
+		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: refusal}, nil
+	}
+	return c.queueCutoverRequest(ctx, apply, caller, bound)
+}
+
+// cutoverRequestOperation resolves the operation a cutover request is for. A
+// request that names an operation is bound to it, so only that operation's
+// drive takes it: the rollout members of one deployment share its apply, each
+// with its own operation, and one member's turn to cut over is not its
+// siblings' turn. A request that names none is refused on an apply whose
+// operations run on several targets, since nothing says which target's swap
+// the caller meant. refusal is the reason a request is not queued; err is a
+// failure to decide.
+func (c *LocalClient) cutoverRequestOperation(ctx context.Context, apply *storage.Apply, applyOperationID string) (bound *storage.ApplyOperation, refusal string, err error) {
+	if applyOperationID != "" {
+		op, err := c.applyOperationOfApply(ctx, apply, applyOperationID)
+		if isNotAnOperationOfApply(err) {
+			return nil, fmt.Sprintf("cutover names an operation this apply does not have: %v", err), nil
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("resolve the operation a cutover of apply %s names: %w", apply.ApplyIdentifier, err)
+		}
+		return op, "", nil
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return nil, "", fmt.Errorf("apply operation store is not configured")
+	}
+	ops, err := store.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("list operations of apply %s before cutover: %w", apply.ApplyIdentifier, err)
+	}
+	if operationsSpanSeveralTargets(ops) {
+		return nil, fmt.Sprintf("apply %s runs on several targets; a cutover must name the operation it is for", apply.ApplyIdentifier), nil
+	}
+	return nil, "", nil
+}
+
+// operationsSpanSeveralTargets reports whether an apply's operations run on
+// more than one target, which is the shape of a deployment's rollout members
+// sharing its apply.
+func operationsSpanSeveralTargets(ops []*storage.ApplyOperation) bool {
+	var first string
+	for i, op := range ops {
+		if op == nil {
+			continue
+		}
+		if i == 0 {
+			first = op.Target
+			continue
+		}
+		if op.Target != first {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveControlApply finds the apply a control request targets, by apply
@@ -89,6 +152,13 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 		tasks, lookupErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 		if lookupErr != nil {
 			return nil, fmt.Errorf("get tasks failed: %w", lookupErr)
+		}
+		if id := req.GetApplyOperationId(); id != "" {
+			op, opErr := c.applyOperationOfApply(ctx, apply, id)
+			if opErr != nil {
+				return nil, fmt.Errorf("cutover apply %s: %w", apply.ApplyIdentifier, opErr)
+			}
+			tasks = tasksForOperation(tasks, op.ID)
 		}
 		for _, t := range tasks {
 			if !state.IsTerminalTaskState(t.State) {
@@ -206,20 +276,38 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 // stop and start are routed to the owner. A cutover RPC can land on any instance
 // sharing the route's storage, so it must never act on a local engine that may
 // not be running this schema change.
-func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.CutoverResponse, error) {
+func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Apply, caller string, bound *storage.ApplyOperation) (*ternv1.CutoverResponse, error) {
 	controlStore := c.storage.ControlRequests()
 	if controlStore == nil {
 		return nil, fmt.Errorf("control request store is not available")
 	}
 	requestedBy := controlRequestRequester(caller)
-	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+	request := &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationCutover,
 		Status:      storage.ControlRequestPending,
 		RequestedBy: requestedBy,
-	})
+	}
+	var boundID int64
+	if bound != nil {
+		boundID = bound.ID
+		request.Metadata = storage.CutoverRequestMetadata(bound.ID)
+	}
+	existing, alreadyPending, err := controlStore.RequestPending(ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		pendingFor, err := existing.CutoverOperationID()
+		if err != nil {
+			return nil, fmt.Errorf("read the operation the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+		}
+		if pendingFor != boundID {
+			message := fmt.Sprintf("a cutover of apply %s for operation %d is still pending; this cutover for operation %d was not queued", apply.ApplyIdentifier, pendingFor, boundID)
+			c.logger.Warn("cutover refused: a cutover for another operation of the apply is still pending",
+				append(apply.LogAttrs(), "pending_for_operation", pendingFor, "requested_for_operation", boundID)...)
+			return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: message}, nil
+		}
 	}
 	if alreadyPending {
 		c.logger.Info("cutover request already pending for apply owner",
@@ -240,7 +328,12 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 	return &ternv1.CutoverResponse{Accepted: true}, nil
 }
 
-func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply) error {
+// processPendingCutoverControlRequest takes the apply's pending cutover
+// request on behalf of the drive that owns tasks. A request bound to one
+// operation is taken only by that operation's drive (see
+// boundCutoverRequestTurn); an unbound request is taken by whichever drive of
+// the apply sees it parked, as before.
+func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCutover)
 	if err != nil {
 		return err
@@ -251,6 +344,17 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	// Bind the apply's identity once so every consumption log line is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	boundID, err := controlReq.CutoverOperationID()
+	if err != nil {
+		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if boundID != 0 {
+		take, err := c.boundCutoverRequestTurn(ctx, apply, tasks, controlReq, boundID, logger)
+		if err != nil || !take {
+			return err
+		}
+		return c.takeBoundCutoverRequest(ctx, apply, controlReq, boundID, logger)
+	}
 	if cutoverRequestResolvedByApplyState(apply.State) {
 		logger.Info("completing pending cutover request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
@@ -1104,6 +1208,37 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 	return true, nil
 }
 
+// failPendingRequestForSettledOutcome resolves a pending control request
+// terminally when the engine refused it because the schema change had already
+// settled on an outcome of its own, such as failed, that the operation must not
+// replace. The outcome will not change back, so leaving the request pending
+// would re-run the same refusal on every drive claim. The request is failed
+// with the engine's reason, and the apply is left for the drive to settle: its
+// next progress poll records the outcome the engine reports. Returns
+// settled=false when the error is not a settled-outcome refusal, so the caller
+// applies its normal error handling. When settled=true the operation did not
+// take effect, so a stop or cancel caller must keep its drive going, or the
+// drive loop would record the operator's command over the engine's outcome.
+func (c *LocalClient) failPendingRequestForSettledOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
+	refusal, ok := engine.AsSettledOutcome(opErr)
+	if !ok {
+		return false, nil
+	}
+	message := refusal.Error()
+	caller := controlRequestCaller(controlReq)
+	logger.Warn("rejecting pending control request: the schema change already settled on its own outcome; the drive keeps going and records that outcome",
+		"operation", string(operation),
+		"requested_by", caller,
+		"state", apply.State,
+		"error", opErr)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
+		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
+	}
+	return true, nil
+}
+
 // failRefusedControlRequest resolves a pending control request that the stop or
 // cancel path answered with an explicit refusal. The refusal is a decision, not
 // a delivery failure: the request is already recorded durably, so a later claim
@@ -1206,6 +1341,12 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if settled, settleErr := c.failPendingRequestForSettledOutcome(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); settled {
+			// The request is resolved terminally but no stop took effect: the
+			// schema change already settled, and the drive records that outcome
+			// rather than an operator stop.
+			return false, settleErr
+		}
 		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); declined {
 			// The request is resolved terminally but no stop took effect: the
 			// schema change keeps running, so the drive must not treat this as
@@ -1291,6 +1432,11 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if settled, settleErr := c.failPendingRequestForSettledOutcome(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); settled {
+			// See the stop counterpart: the change already settled, so the drive
+			// records that outcome rather than an operator cancel.
+			return false, settleErr
+		}
 		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); declined {
 			// The request is resolved terminally but no cancel took effect:
 			// the schema change keeps running, so the drive must not treat
@@ -1564,8 +1710,9 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 // (a failed probe) — surfaces the original cancel error unchanged. Typed
 // rejections with their own resolution paths also surface unchanged: an
 // already-completed rejection has the caller reconcile stored state to the
-// completed outcome, and an unsupported-operation decline resolves the durable
-// request without recording a cancel.
+// completed outcome, while an unsupported-operation decline and a
+// settled-outcome refusal each resolve the durable request without recording a
+// cancel.
 func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, cancelErr error) error {
 	if engine.IsAlreadyCompleted(cancelErr) {
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
@@ -1575,6 +1722,12 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 	// pending-request decline path resolves the request terminally without
 	// touching the running change.
 	if engine.IsUnsupportedOperation(cancelErr) {
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	// A settled-outcome refusal means the change already settled on an outcome
+	// a cancel must not replace; it surfaces so the pending-request path
+	// resolves the request and the drive records the engine's own outcome.
+	if engine.IsSettledOutcome(cancelErr) {
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
 	}
 	progress, probeErr := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
@@ -1616,8 +1769,9 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 // stopped record over an engine still executing would let the change keep
 // running unwatched. Typed rejections with their own resolution paths also
 // surface unchanged: an already-completed rejection has the caller reconcile
-// stored state to the completed outcome, and an unsupported-operation decline
-// resolves the durable request without recording a stop.
+// stored state to the completed outcome, while an unsupported-operation decline
+// and a settled-outcome refusal each resolve the durable request without
+// recording a stop.
 func (c *LocalClient) resolveFailedEngineStop(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, stopErr error) error {
 	if engine.IsAlreadyCompleted(stopErr) {
 		return c.wrapFailedEngineStop(task, stopErr)
@@ -1627,6 +1781,13 @@ func (c *LocalClient) resolveFailedEngineStop(ctx context.Context, eng engine.En
 	// pending-request decline path resolves the request terminally without
 	// touching the running change.
 	if engine.IsUnsupportedOperation(stopErr) {
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	// A settled-outcome refusal means the change already settled on an outcome
+	// a stop must not relabel as a resumable pause; it surfaces so the
+	// pending-request path resolves the request and the drive records the
+	// engine's own outcome.
+	if engine.IsSettledOutcome(stopErr) {
 		return c.wrapFailedEngineStop(task, stopErr)
 	}
 	progress, probeErr := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
@@ -2285,4 +2446,115 @@ func (c *LocalClient) getActiveTaskForDatabase(ctx context.Context, database str
 		}
 	}
 	return nil, nil
+}
+
+// boundCutoverRequestTurn decides what the drive owning tasks does with a
+// pending cutover request bound to operation boundID. take is true only for
+// that operation's own drive while the operation is parked at the cutover. A
+// sibling's drive leaves the request pending, or settles it once the
+// operation it is for has ended, so the request never waits on a drive that
+// no longer exists. The dispatcher decides whose turn it is and says so by
+// naming the operation; this plane does not re-derive the order.
+func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) (take bool, err error) {
+	driveOperationID, err := applyOperationIDForTasks(tasks)
+	if err != nil {
+		logger.Warn("pending cutover request is bound to one operation but this drive's tasks do not name a single operation; leaving it for that operation's drive",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "error", err)
+		return false, nil
+	}
+	if driveOperationID == boundID {
+		if !tasksParkedAtCutover(tasks) {
+			logger.Info("pending cutover request is waiting for its operation to park at the cutover",
+				"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
+			return false, nil
+		}
+		return true, nil
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return false, fmt.Errorf("apply operation store is not configured")
+	}
+	bound, err := store.Get(ctx, boundID)
+	if err != nil {
+		return false, fmt.Errorf("load apply_operation %d the pending cutover of apply %s is for: %w", boundID, apply.ApplyIdentifier, err)
+	}
+	if bound == nil {
+		message := fmt.Sprintf("cutover request was not applied because the operation it was sent for (%d) does not exist", boundID)
+		logger.Warn("failing pending cutover request bound to an operation that does not exist",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
+		return false, failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message)
+	}
+	switch {
+	case state.IsState(bound.State, state.ApplyOperation.Completed):
+		logger.Info("completing pending cutover request whose operation has cut over",
+			append(bound.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		return false, completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
+	case state.IsApplyOperationTerminal(bound.State):
+		logger.Warn("failing pending cutover request whose operation ended without cutting over",
+			append(bound.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		return false, failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover,
+			fmt.Sprintf("cutover request was not applied because the operation it was sent for is %s", bound.State))
+	}
+	logger.Debug("pending cutover request is bound to a sibling operation; leaving it for that operation's drive",
+		"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "drive_operation_id", driveOperationID)
+	return false, nil
+}
+
+// takeBoundCutoverRequest cuts over the one operation a pending request is
+// bound to, from that operation's own drive, and settles the request with the
+// outcome. It follows the unbound path's recovery wait and its stop and
+// not-ready handling. The apply-state verdicts the unbound path settles on are
+// not this request's to read: the members sharing the apply end on their own,
+// so the bound operation's own state (see boundCutoverRequestTurn) decides
+// whether the request can still apply.
+func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) error {
+	if state.IsState(apply.State, state.Apply.Recovering) {
+		// The cutover path refuses a recovering apply, and settling the
+		// request on that refusal would fail an acknowledged cutover the
+		// operator then has to re-issue. It waits for recovery instead.
+		logger.Info("pending cutover request is waiting for recovery to complete",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "state", apply.State)
+		return nil
+	}
+	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
+		return fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	} else if stopReq != nil {
+		return fmt.Errorf("process pending cutover for apply %s: schema change has a pending stop request; cutover is blocked until stop is processed", apply.ApplyIdentifier)
+	}
+	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
+		ApplyId:          apply.ApplyIdentifier,
+		Environment:      apply.Environment,
+		ApplyOperationId: strconv.FormatInt(boundID, 10),
+	}, controlRequestCaller(controlReq))
+	if engine.IsNotReady(err) {
+		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "error", err)
+		return nil
+	}
+	if err != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, err.Error()); failErr != nil {
+			return fmt.Errorf("process pending cutover for apply %s operation %d: %w; fail pending cutover request: %w", apply.ApplyIdentifier, boundID, err, failErr)
+		}
+		return fmt.Errorf("process pending cutover for apply %s operation %d: %w", apply.ApplyIdentifier, boundID, err)
+	}
+	if resp == nil {
+		errorMessage := "the cutover path returned neither a response nor an error"
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, boundID, errorMessage)
+	}
+	if !resp.Accepted {
+		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, boundID, errorMessage)
+	}
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
+		return err
+	}
+	logger.Info("pending cutover request for one operation accepted and completed",
+		"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
+	return nil
 }

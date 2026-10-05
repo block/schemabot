@@ -79,10 +79,10 @@ type Handler struct {
 	service   *api.Service
 	ghClients github.ClientSet
 
-	// finalizerPlans is the finalizer plan cache every comment render this
-	// handler starts shares; see finalizerPlanCache. Nil (a Handler built
+	// shardedPlans is the sharded plan cache every comment render this
+	// handler starts shares; see shardedPlanCache. Nil (a Handler built
 	// without its constructor) reads storage on every render.
-	finalizerPlans *finalizerPlanCache
+	shardedPlans *shardedPlanCache
 
 	// transientPlanRetryDelay overrides the pause before retrying a plan
 	// request that failed with transient remote unavailability. Zero means
@@ -323,7 +323,7 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		checkSuiteRecoveryGrace:     defaultCheckSuiteRecoveryGrace,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
-		finalizerPlans:              newFinalizerPlanCache(),
+		shardedPlans:                newShardedPlanCache(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -650,7 +650,7 @@ func (h *Handler) deploymentTenant() string {
 // commentObserverConfig returns the configuration every comment observer the
 // handler builds starts from: the PR it comments on, and the deployment-wide
 // settings its comments render with (cli_name, tenant, support channel, the
-// engine-log reader, the shared finalizer plan cache). Building every observer
+// engine-log reader, the shared sharded plan cache). Building every observer
 // from here keeps a setting added to one observer from going missing on
 // another. Callers set the per-apply fields: the apply ID, its lease, cutover
 // deferral, and the terminal hook.
@@ -665,7 +665,7 @@ func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo
 		CLIName:        h.cliName(),
 		Tenant:         h.deploymentTenant(),
 		EngineLogs:     h.engineLogReader(),
-		finalizerPlans: h.finalizerPlans,
+		shardedPlans:   h.shardedPlans,
 		Logger:         h.logger,
 	}
 }
@@ -743,10 +743,10 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 		// a section from the body actually posted.
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
 		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops, nil)
-		finalizers := h.finalizerPlans.resolve(ctx, h.service.Storage(), apply, ops)
+		view := h.shardedPlans.resolve(ctx, h.service.Storage(), apply, ops)
 		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
 		renderBody := func(apply *storage.Apply) string {
-			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, finalizers, h.deploymentTenant())
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant(), h.cliName())
 			return body + renderControlRejections(rejections, h.logger, apply, body)
 		}
 		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)

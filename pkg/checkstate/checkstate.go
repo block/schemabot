@@ -79,6 +79,7 @@ const (
 	BlockNoAllowedConfiguredEnvironments  = "no_allowed_configured_environments"
 	BlockParticipantUnresolved            = "participant_unresolved"
 	BlockReviewTimeDeploymentDrift        = storage.ReviewTimeDeploymentDriftBlockingReason
+	BlockNamespacePlacementRefused        = storage.NamespacePlacementRefusedBlockingReason
 )
 
 // blockClass is what a durable blocking reason means for the operator reading
@@ -101,7 +102,7 @@ const (
 // blockClasses classifies every durable blocking reason SchemaBot writes.
 //
 // Review-time deployment drift is a guard rather than a reconciliation: the
-// deployments may simply have moved on from the reviewed plan, and a re-plan
+// deployments may simply have moved on from the primary plan, and a re-plan
 // that re-evaluates the rollup lifts the block once they match. Reading it as
 // a reconciliation would deny the action that actually clears it.
 //
@@ -116,6 +117,7 @@ var blockClasses = map[string]blockClass{
 	BlockApplyCancelledAfterTaskCompleted: blockReconciliation,
 	BlockApplyCancelled:                   blockGuard,
 	BlockReviewTimeDeploymentDrift:        blockGuard,
+	BlockNamespacePlacementRefused:        blockGuard,
 	BlockConfigDiscoveryUnavailable:       blockGuard,
 	BlockConfigDiscoveryFailed:            blockGuard,
 	BlockPlanPublishVerificationFailed:    blockGuard,

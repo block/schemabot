@@ -20,8 +20,11 @@ const (
 	rateLimitDecisionLimit = "limit"
 )
 
-// pullRateLimitEndpoint labels the pull endpoint's rate-limit metrics.
-const pullRateLimitEndpoint = "/api/pull"
+// The endpoint labels on rate-limit metrics.
+const (
+	pullRateLimitEndpoint          = "/api/pull"
+	checksInspectRateLimitEndpoint = "/api/checks/inspect"
+)
 
 // targetRateLimitKey builds the per-target bucket key. The NUL separator keeps
 // two different targets from ever colliding on one bucket, which a printable
@@ -142,6 +145,47 @@ func (s *Service) pullCallerRateLimitReason() string {
 		return apitypes.PullRateLimitCallerReason
 	}
 	return apitypes.PullRateLimitSharedReason
+}
+
+// checkChecksInspectCallerBudget spends the request's per-caller inspection
+// budget and reports whether it may proceed. It runs before the inspection
+// resolves a GitHub client, so a refused request costs the installation's
+// quota nothing. When the budget is exhausted it writes the 429 itself and
+// returns false, so the caller only has to return. A disabled budget returns
+// without recording a decision, for the same reason pullRateLimitEnforced
+// gives.
+func (s *Service) checkChecksInspectCallerBudget(w http.ResponseWriter, r *http.Request, req ChecksInspectRequest) bool {
+	if s.checksInspectLimiter == nil {
+		return true
+	}
+
+	ctx := r.Context()
+	metricEnvironment := s.config.metricEnvironmentAttribute(req.Environment)
+
+	caller := callerRateLimitKey(r)
+	if allowed, retryAfter := s.checksInspectLimiter.Allow(caller); !allowed {
+		metrics.RecordRateLimitDecision(ctx, checksInspectRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionLimit, metricEnvironment)
+		s.logger.Warn("check inspection rejected because the caller exceeded its request budget",
+			"caller", caller,
+			"repo", req.Repo,
+			"pr", req.PullRequest,
+			"environment", req.Environment,
+			"retry_after", retryAfter,
+		)
+		s.writeRateLimited(w, retryAfter, s.checksInspectCallerRateLimitReason())
+		return false
+	}
+	metrics.RecordRateLimitDecision(ctx, checksInspectRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionAllow, metricEnvironment)
+	return true
+}
+
+// checksInspectCallerRateLimitReason is pullCallerRateLimitReason for the
+// check inspection.
+func (s *Service) checksInspectCallerRateLimitReason() string {
+	if s.config.Auth.Enabled() {
+		return apitypes.ChecksInspectRateLimitCallerReason
+	}
+	return apitypes.ChecksInspectRateLimitSharedReason
 }
 
 // pullRateLimitEnforced reports whether either lane can refuse a request.

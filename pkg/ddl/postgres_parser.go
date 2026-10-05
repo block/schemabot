@@ -236,10 +236,13 @@ func (postgresStatementParser) SynthesizeAddColumn(createTableDDL, columnName st
 // the ALTER TABLE touches no existing row and builds nothing proportional to
 // the table, because it runs under ACCESS EXCLUSIVE and a lock timeout bounds
 // only the wait to acquire that lock, never the work done while holding it.
-// The decision reads the column's parsed constraint list:
+// The decision reads the column's parsed type name and constraint list:
 //
-//   - Generated and identity columns rewrite the whole table while
-//     PostgreSQL computes values for existing rows.
+//   - Generated, identity, and serial columns rewrite the whole table while
+//     PostgreSQL computes values for existing rows. A serial type carries no
+//     constraint in the parse tree — PostgreSQL expands it into NOT NULL and
+//     a sequence-backed DEFAULT only during analysis — so it is recognized
+//     by its type name.
 //   - NOT NULL without a DEFAULT needs a backfill — the server would reject
 //     the ADD COLUMN outright on a populated table.
 //   - A DEFAULT whose expression is not provably non-volatile (a constant,
@@ -259,6 +262,9 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 		return "", err
 	}
 	column := columnNode.GetColumnDef()
+	if postgresSerialType(column.GetTypeName()) {
+		return "definition is serial, which fills every existing row from a sequence and rewrites the whole table under an exclusive lock; add it manually", nil
+	}
 
 	var notNull, hasDefault, constantDefault, foreignKey bool
 	for _, node := range column.GetConstraints() {
@@ -291,6 +297,25 @@ func PostgresAddColumnManualReason(createTableDDL, columnName string) (string, e
 		return "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT", nil
 	}
 	return "", nil
+}
+
+// postgresSerialType reports whether a column's type name is one of the
+// serial pseudo-types, which PostgreSQL expands into a sequence-backed
+// DEFAULT nextval(...) during analysis rather than in the parse tree. It
+// matches the server's own rule: a single unqualified name, not a %TYPE
+// reference, spelled exactly as the grammar yields it (unquoted identifiers
+// arrive lowercased, so BIGSERIAL matches while a qualified name does not).
+func postgresSerialType(typeName *pgproto.TypeName) bool {
+	names := typeName.GetNames()
+	if len(names) != 1 || typeName.GetPctType() {
+		return false
+	}
+	switch names[0].GetString_().GetSval() {
+	case "smallserial", "serial2", "serial", "serial4", "bigserial", "serial8":
+		return true
+	default:
+		return false
+	}
 }
 
 // postgresNonVolatileExpression reports whether a DEFAULT expression is
@@ -402,13 +427,16 @@ func alterCmdScalesWithTableSize(cmd *pgproto.AlterTableCmd) bool {
 
 // addColumnScalesWithTableSize reports whether adding this column forces a
 // table rewrite or scan: an inline PRIMARY KEY or UNIQUE builds an index, a
-// generated or identity column is computed for every existing row, a
+// generated, identity, or serial column is computed for every existing row, a
 // non-constant DEFAULT is evaluated per row, an inline CHECK is validated
 // against every existing row even though the new column is NULL in all of
 // them, and a REFERENCES column with a DEFAULT validates every existing row
 // against the referenced table. A plain column with no DEFAULT (or a constant
 // one), including a nullable REFERENCES column without one, is metadata-only.
 func addColumnScalesWithTableSize(col *pgproto.ColumnDef) bool {
+	if postgresSerialType(col.GetTypeName()) {
+		return true
+	}
 	var foreignKey, hasDefault bool
 	for _, c := range col.GetConstraints() {
 		constraint := c.GetConstraint()

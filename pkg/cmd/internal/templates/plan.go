@@ -122,7 +122,11 @@ type NamespaceChange struct {
 // For Vitess, each keyspace gets a header, and a keyspace whose VSchema
 // changes shows that change whatever engine reported the plan.
 func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string, dialect schema.Dialect) {
-	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
+	names := make([]string, len(namespaces))
+	for i, ns := range namespaces {
+		names[i] = ns.Namespace
+	}
+	singleNamespace := OmitsNamespaceHeader(names, isMySQL, database)
 
 	// Sort a copy so callers aren't affected by reordering. This keeps output
 	// stable and groups similarly named namespaces together, but collapsing
@@ -191,6 +195,14 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 			}
 		}
 	}
+}
+
+// OmitsNamespaceHeader reports whether WriteNamespaceChanges writes the
+// changes of these namespaces without a header above each: a MySQL plan of
+// the one namespace named for its database. Every other plan opens on a
+// namespace header, which brings its own blank line above it.
+func OmitsNamespaceHeader(namespaces []string, isMySQL bool, database string) bool {
+	return len(namespaces) == 1 && isMySQL && namespaces[0] == database
 }
 
 // collapsible reports whether a namespace renders as its DDL alone, so it can
@@ -369,6 +381,16 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 // WritePlanSummaryWithKeyspaceUpdates writes a single plan summary line
 // including VSchema changes and the keyspaces whose only work is a finalize.
 func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) {
+	if parts := planSummaryParts(ddlChanges, vschemaChanges, finalizes); len(parts) > 0 {
+		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
+		fmt.Println()
+	}
+}
+
+// planSummaryParts builds the clauses of the plan summary: the table and
+// index clauses, then VSchema changes and keyspaces whose only work is a
+// finalize.
+func planSummaryParts(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) []string {
 	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
@@ -384,11 +406,7 @@ func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges 
 		}
 		parts = append(parts, fmt.Sprintf("%d %s to finalize", finalizes, word))
 	}
-
-	if len(parts) > 0 {
-		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
-		fmt.Println()
-	}
+	return parts
 }
 
 // ddlSummaryParts builds the table and index clauses of the plan summary.
@@ -559,6 +577,16 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	fmt.Println()
 }
 
+// UnsafeChangesBlockedSummary is WriteUnsafeChangesBlocked on one line, for a
+// refusal with nowhere to print the list, such as JSON output: the same count
+// and findings, and the command that permits them, starting with the binary
+// name so it runs as pasted. rerun is built as for WriteUnsafeChangesBlocked.
+func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun string) string {
+	findings := unsafeFindingLines(changes)
+	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s %s",
+		len(findings), strings.Join(findings, "; "), cliname.Name(), rerun)
+}
+
 // WriteUnsafeWarningAllowed writes a warning when destructive changes are
 // permitted and will run.
 //
@@ -587,19 +615,26 @@ const UnsafeConsentAllowFlag = "--allow-unsafe enabled"
 // always equals the number of lines below it and a finding can be referenced
 // by its number.
 func writeUnsafeChangesList(changes []UnsafeChange) {
-	n := 0
+	for i, finding := range unsafeFindingLines(changes) {
+		fmt.Printf("  %d. %s\n", i+1, finding)
+	}
+}
+
+// unsafeFindingLines is each unsafe finding as "table: finding", in the order
+// the list numbers them.
+func unsafeFindingLines(changes []UnsafeChange) []string {
+	var lines []string
 	for _, c := range changes {
 		reasons := unsafeChangeFindings(c)
 		if len(reasons) == 0 {
-			n++
-			fmt.Printf("  %d. %s: %s\n", n, c.Table, c.ChangeType)
+			lines = append(lines, c.Table+": "+c.ChangeType)
 			continue
 		}
 		for _, r := range reasons {
-			n++
-			fmt.Printf("  %d. %s: %s\n", n, c.Table, r)
+			lines = append(lines, c.Table+": "+r)
 		}
 	}
+	return lines
 }
 
 // countUnsafeFindings sums the individual findings across changes so the

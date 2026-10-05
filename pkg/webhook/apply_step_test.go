@@ -27,7 +27,7 @@ func TestFormatApplyStatusComment_RendersStoredStatementPosition(t *testing.T) {
 	require.Len(t, displayByOp, 1)
 	assert.Equal(t, apitypes.ProgressStep{Step: 2, StepsTotal: 3, Statement: "CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)"}, displayByOp[1].Step)
 
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "")
 	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)`")
 }
 
@@ -45,7 +45,7 @@ func TestFormatApplyStatusComment_RendersStatementPositionPerDeployment(t *testi
 	require.Len(t, displayByOp, 1)
 	assert.NotContains(t, displayByOp, int64(2))
 
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "")
 	assert.Contains(t, out, "**Deployments**: 2 running")
 	assert.Equal(t, 1, strings.Count(out, "step 1 of 2 · `ALTER TABLE orders ADD COLUMN note text`"))
 }
@@ -72,7 +72,7 @@ func TestFormatApplyStatusComment_RendersStoredBuildWork(t *testing.T) {
 		BlocksDone: 10000, BlocksTotal: 10000, TuplesDone: 12000, TuplesTotal: 50000,
 	}, displayByOp[1].BuildWork)
 
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "")
 	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx_orders_status ON orders (status)`\n"+
 		"building index: 12,000/50,000 tuples\n")
 }
@@ -93,7 +93,7 @@ func TestFormatApplyStatusComment_RendersBuildWorkPerDeployment(t *testing.T) {
 	displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 	require.Len(t, displayByOp, 2)
 
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "")
 	assert.Contains(t, out, "**Deployments**: 2 running")
 	assert.Equal(t, 1, strings.Count(out, "\nwaiting on 2 of 3 lockers\n"))
 	assert.Equal(t, 1, strings.Count(out, "\nbuilding index: 25% of blocks (1/4)\n"))
@@ -109,7 +109,7 @@ func TestFormatApplyStatusComment_KeepsPositionWhenBuildWorkIsMalformed(t *testi
 	require.Len(t, displayByOp, 1)
 	assert.Equal(t, apitypes.BuildWork{}, displayByOp[1].BuildWork)
 
-	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+	out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "")
 	assert.Contains(t, out, "step 2 of 3 · `CREATE INDEX CONCURRENTLY idx ON t (c)`\n")
 	assert.NotContains(t, out, "building index")
 }
@@ -130,7 +130,7 @@ func TestFormatApplyStatusComment_OmitsUnreadableStatementPosition(t *testing.T)
 			displayByOp := resolveDisplayByOperation(t.Context(), nil, runningApply(), ops, nil)
 			assert.Empty(t, displayByOp)
 
-			out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "")
+			out := formatApplyStatusComment(runningApply(), ops, false, nil, displayByOp, nil, nil, "", "")
 			assert.Contains(t, out, "## Schema Change Status")
 			assert.NotContains(t, out, "\nstep ")
 		})

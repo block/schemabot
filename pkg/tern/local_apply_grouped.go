@@ -49,22 +49,19 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	// every task, while operation-scoped drives pass only one operation's tasks.
 	logger.Info("building changes from scoped tasks", "task_count", len(tasks), "plan_id", plan.PlanIdentifier)
 	if len(plan.Namespaces) == 0 {
-		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, "plan has no namespace data")
 	}
 	if c.config.Type == storage.DatabaseTypeMySQL && len(plan.Namespaces) > 1 {
 		var names []string
 		for ns := range plan.Namespaces {
 			names = append(names, ns)
 		}
-		c.failApplyWithTasks(ctx, apply, tasks,
+		return c.failApplyAndNotify(ctx, apply, tasks,
 			fmt.Sprintf("MySQL applies support one namespace per apply, but plan has %d: %v", len(plan.Namespaces), names))
-		return nil
 	}
 	creds, err := c.credentialsForGroupedApply(plan)
 	if err != nil {
-		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, err.Error())
 	}
 	changes := groupedResumeChanges(tasks, plan)
 
@@ -120,24 +117,22 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		if c.driveCancelled(ctx, apply, "while the engine was applying") {
 			return nil
 		}
-		newState := state.Apply.Failed
 		if c.shouldRetryEngineError(err) {
-			c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
-			newState = state.Apply.FailedRetryable
-		} else {
-			c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		}
-		if newState == state.Apply.FailedRetryable {
+			if pauseErr := c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error()); pauseErr != nil {
+				return pauseErr
+			}
 			logger.Warn("apply paused for operator retry", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
-		} else {
-			logger.Error("apply failed", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
+			return nil
 		}
+		if failErr := c.failApplyAndNotify(ctx, apply, tasks, err.Error()); failErr != nil {
+			return failErr
+		}
+		logger.Error("apply failed", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
 		return nil
 	}
 
 	if !result.Accepted {
-		c.failApplyWithTasks(ctx, apply, tasks, result.Message)
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, result.Message)
 	}
 
 	if isTasklessVSchemaOnlyPlan(tasks, plan) {
@@ -166,14 +161,12 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 				}
 				logger.Warn("failed to save engine resume state after accepted apply; pausing apply for operator retry",
 					append(apply.MutableLogAttrs(), "error", saveErr)...)
-				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
-				return nil
+				return c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
 			}
 		}
 	}
 	if c.config.Type == storage.DatabaseTypeVitess && resumeState == nil {
-		c.failApplyWithTasks(ctx, apply, tasks, "engine accepted Vitess apply without resume state")
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, "engine accepted Vitess apply without resume state")
 	}
 
 	if result.ResumeState != nil {
@@ -699,7 +692,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if errors.As(err, &permanent) {
 			logger.Error("progress check failed with permanent error",
 				append(apply.MutableLogAttrs(), "error", err)...)
-			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed: %v", err))
+			ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("progress polling failed: %v", err))
 			return true
 		}
 		ps.consecutiveErrors++
@@ -709,12 +702,12 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			if c.shouldRetryEngineError(err) {
 				logger.Warn("progress polling failed repeatedly, pausing apply for operator retry",
 					"consecutive_errors", ps.consecutiveErrors)
-				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
+				ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
 				return true
 			}
 			logger.Error("progress polling failed repeatedly, failing apply",
 				"consecutive_errors", ps.consecutiveErrors)
-			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
+			ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
 			return true
 		}
 		return false
@@ -759,7 +752,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				logger.Warn("engine reports no active schema change for an in-flight apply and target verification failed; the drive re-verifies at the next poll",
 					append(apply.MutableLogAttrs(), "engine_state", result.State, "consecutive_errors", ps.consecutiveErrors, "error", settleErr)...)
 				if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
-					c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("engine reports no active schema change for an in-flight apply and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", ps.consecutiveErrors))
+					ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("engine reports no active schema change for an in-flight apply and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", ps.consecutiveErrors))
 					return true
 				}
 				return false
@@ -807,7 +800,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 				}
 				logger.Error("failed to save Vitess engine resume state from progress polling",
 					append(apply.MutableLogAttrs(), "error", saveErr)...)
-				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state from progress polling: %v", saveErr))
+				ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state from progress polling: %v", saveErr))
 				return true
 			}
 		}
@@ -852,7 +845,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	} else if standDown {
 		return true
 	}
-	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+	if err := c.processPendingCutoverControlRequest(ctx, apply, tasks); err != nil {
 		logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
 		return true
@@ -1261,9 +1254,13 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 	if len(unverified) == 0 {
 		return settled, nil
 	}
-	plan, err := c.storage.Plans().GetByID(ctx, apply.PlanID)
+	planID, err := planIDForTasks(apply, unverified)
 	if err != nil {
-		return settled, fmt.Errorf("load plan for apply %s to verify target schema: %w", apply.ApplyIdentifier, err)
+		return settled, fmt.Errorf("resolve plan to verify target schema: %w", err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
+	if err != nil {
+		return settled, fmt.Errorf("load plan %d for apply %s to verify target schema: %w", planID, apply.ApplyIdentifier, err)
 	}
 	if plan == nil {
 		return settled, fmt.Errorf("plan not found for apply %s while verifying target schema", apply.ApplyIdentifier)
@@ -1360,7 +1357,7 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 		if errors.As(err, &permanent) {
 			logger.Error("auto-cutover failed with permanent error",
 				append(apply.MutableLogAttrs(), "error", err)...)
-			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed: %v", err))
+			ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("cutover failed: %v", err))
 			return true
 		}
 		ps.consecutiveCutoverFailures++
@@ -1372,12 +1369,12 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 		if c.shouldRetryEngineError(err) {
 			logger.Warn("auto-cutover failed repeatedly, pausing apply for operator retry",
 				append(apply.MutableLogAttrs(), "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
-			c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
+			ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
 			return true
 		}
 		logger.Error("auto-cutover failed repeatedly, failing apply",
 			append(apply.MutableLogAttrs(), "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
-		c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
+		ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
 		return true
 	}
 	return false

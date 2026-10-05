@@ -198,7 +198,8 @@ func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check 
 	}
 
 	// A not-evaluated write preserves the full gating state of an existing
-	// review-time drift block: it may refresh the head SHA and check run id so the
+	// review-time block, a deployment drift block or a namespace placement
+	// refusal: it may refresh the head SHA and check run id so the
 	// current-head aggregate stays aligned, but it must not clear the block's
 	// conclusion, blocking reason, or summary. Only a write that re-ran the rollup
 	// (clean or blocked) rewrites those columns.
@@ -209,28 +210,29 @@ func (s *checkStore) writePlanResultUnlessApplyOwned(ctx context.Context, check 
 	// side against the old row — so blocking_reason is assigned after every
 	// CASE that reads it, keeping both dialects reading the stored value.
 	if drift == storage.PlanDriftNotEvaluated {
+		driftBlock, placementBlock := storage.ReviewTimeDeploymentDriftBlockingReason, storage.NamespacePlacementRefusedBlockingReason
 		_, err = tx.ExecContext(ctx, `
 			UPDATE checks
 			SET head_sha = ?,
 			    check_run_id = ?,
-			    apply_id     = CASE WHEN COALESCE(blocking_reason, '') = ? THEN apply_id     ELSE NULL END,
-			    has_changes  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN has_changes  ELSE ?    END,
-			    status       = CASE WHEN COALESCE(blocking_reason, '') = ? THEN status       ELSE ?    END,
-			    conclusion   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN conclusion   ELSE ?    END,
-			    error_message   = CASE WHEN COALESCE(blocking_reason, '') = ? THEN error_message   ELSE ? END,
-			    change_summary  = CASE WHEN COALESCE(blocking_reason, '') = ? THEN change_summary  ELSE ? END,
-			    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') = ? THEN blocking_reason ELSE ? END,
+			    apply_id     = CASE WHEN COALESCE(blocking_reason, '') IN (?, ?) THEN apply_id     ELSE NULL END,
+			    has_changes  = CASE WHEN COALESCE(blocking_reason, '') IN (?, ?) THEN has_changes  ELSE ?    END,
+			    status       = CASE WHEN COALESCE(blocking_reason, '') IN (?, ?) THEN status       ELSE ?    END,
+			    conclusion   = CASE WHEN COALESCE(blocking_reason, '') IN (?, ?) THEN conclusion   ELSE ?    END,
+			    error_message   = CASE WHEN COALESCE(blocking_reason, '') IN (?, ?) THEN error_message   ELSE ? END,
+			    change_summary  = CASE WHEN COALESCE(blocking_reason, '') IN (?, ?) THEN change_summary  ELSE ? END,
+			    blocking_reason = CASE WHEN COALESCE(blocking_reason, '') IN (?, ?) THEN blocking_reason ELSE ? END,
 			    updated_at = `+s.dialect.CurrentTimestamp(TimestampPrecisionDefault)+`
 			WHERE repository = ? AND pull_request = ?
 			  AND environment = ? AND database_type = ? AND database_name = ?
 		`, check.HeadSHA, checkRunID,
-			storage.ReviewTimeDeploymentDriftBlockingReason,
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.HasChanges,
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.Status,
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.Conclusion,
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.ErrorMessage,
-			storage.ReviewTimeDeploymentDriftBlockingReason, nullString(check.ChangeSummary),
-			storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason,
+			driftBlock, placementBlock,
+			driftBlock, placementBlock, check.HasChanges,
+			driftBlock, placementBlock, check.Status,
+			driftBlock, placementBlock, check.Conclusion,
+			driftBlock, placementBlock, check.ErrorMessage,
+			driftBlock, placementBlock, nullString(check.ChangeSummary),
+			driftBlock, placementBlock, check.BlockingReason,
 			check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
 	} else {
 		_, err = tx.ExecContext(ctx, `
@@ -415,6 +417,18 @@ func isPlanOnlySuccessful(check *storage.Check) bool {
 		!check.HasChanges
 }
 
+// checkApplyLeasePredicate renders the lease guard a terminal check write
+// carries when the apply's driver holds its lease. It binds the apply ID, then
+// the lease token. The applies row is read through a subquery of an UPDATE on
+// checks, so the token check goes through LeaseSourceFence: it serializes
+// against a concurrent steal instead of passing against a token the
+// statement's snapshot still holds, at whatever isolation level the storage
+// session runs.
+func checkApplyLeasePredicate(d Dialect) string {
+	return " AND EXISTS (SELECT 1 FROM applies lease_apply WHERE lease_apply.id = ? AND " +
+		d.LeaseSourceFence("applies", "lease_apply", "id", "lease_token") + ")"
+}
+
 // CompleteForApply updates stored check state to a terminal state only if it
 // still belongs to the apply being completed.
 func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check, apply *storage.Apply) (bool, error) {
@@ -429,12 +443,7 @@ func (s *checkStore) CompleteForApply(ctx context.Context, check *storage.Check,
 		checkStatusInProgress, apply.ID, apply.ID}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 
@@ -507,12 +516,7 @@ func (s *checkStore) MarkActionRequiredForApply(ctx context.Context, check *stor
 	}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 
@@ -579,12 +583,7 @@ func (s *checkStore) MarkCancelledApplyFailed(ctx context.Context, check *storag
 		apply.ID, apply.ID, apply.ID, state.Task.Completed}
 	lease := apply.Lease()
 	if lease.Valid() {
-		leasePredicate = `
-		  AND EXISTS (
-		    SELECT 1
-		    FROM applies lease_apply
-		    WHERE lease_apply.id = ? AND lease_apply.lease_token = ?
-		  )`
+		leasePredicate = checkApplyLeasePredicate(s.dialect)
 		args = append(args, lease.ApplyID, lease.Token)
 	}
 

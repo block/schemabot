@@ -10,9 +10,9 @@ import (
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
-	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/action"
@@ -104,7 +104,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	prNumber := int32(pr)
 	deployment := ""
 	if resolvedTarget, err := h.service.Config().ResolvePrimaryDatabaseTarget(schemaResult.Database, environment); err != nil {
-		h.logger.Warn("plan metric deployment is unknown because target resolution failed",
+		h.logger.Warn("plan logs carry no deployment because target resolution failed",
 			"repo", repo,
 			"pr", pr,
 			"database", schemaResult.Database,
@@ -129,9 +129,16 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 
 	// Execute plan via the service
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+	if planRefusedByNamespacePlacement(err) {
+		h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
+			"repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "head_sha", schemaResult.HeadSHA, "error", err)
+		h.failClosedOnNamespacePlacement(ctx, client, repo, pr, schemaResult, environment)
+		h.postCommandError(repo, pr, installationID, action.Plan, environment, requestedBy, userFacingError(err))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "plan refused by namespace placement"})
+		return
+	}
 	if err != nil {
 		h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "database", schemaResult.Database, "deployment", deployment, "environment", environment, "error", err)
-		metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "error")
 		userError := userFacingError(err)
 		h.postFailingAggregates(ctx, client, repo, pr, schemaResult.HeadSHA, map[string]string{
 			environment: userError,
@@ -141,17 +148,16 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
-	// Roll up every deployment's diff against the reviewed plan so drift on a
+	// Roll up every deployment's diff against the primary plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = databaseName
 	commentData.DeploymentDrift = driftPreview
-	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
-
-	metrics.RecordPlan(ctx, repo, schemaResult.Database, deployment, environment, "success")
+	h.annotateMemberApplyRefusal(ctx, &commentData, planResp, environment, drift, repo, pr)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, environment)
 
 	// Store per-database check record and update aggregate
 	headSHA, recoveredApplyOwnedCheckState, checkErr := h.storeManualPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, drift)
@@ -186,6 +192,43 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		"message": "plan generated successfully",
 		"plan_id": planResp.PlanID,
 	})
+}
+
+// planRefusedByNamespacePlacement reports whether an environment's plan was
+// refused for a reason its namespace placement owns: the targets entries and
+// the schema files disagree on where a namespace lives, or the plan proposed
+// dropping tables in a namespace the target's entry does not select (or those
+// drops could not be checked). Each reproduces on every plan until the server
+// config, the schema files or the planning deployment changes, not when the PR
+// head moves, and leaves the environment with no plan to fold. So its stored
+// check must fail closed rather than keep an older passing row a later fold
+// would read (MG-12).
+func planRefusedByNamespacePlacement(err error) bool {
+	if api.NamespacePlacementRefused(err) {
+		return true
+	}
+	return api.UnselectedTableDropRefused(err)
+}
+
+// failClosedOnNamespacePlacement fails one environment's check closed after
+// namespace placement refused its plan. The refusal is stored as the
+// environment's check row, so a later fold from stored check state, from any
+// plan of any environment, reads it rather than an older passing row (MG-12).
+// A row that cannot be stored is posted as a failing aggregate carrying the
+// placement block instead, so no later fold reads an older passing row in the
+// refusal's place; that block lifts when the check is re-run or a new commit
+// re-plans every environment (namespacePlacementUnstoredSummary).
+func (h *Handler) failClosedOnNamespacePlacement(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schemaResult *ghclient.SchemaRequestResult, environment string) {
+	headSHA, err := h.storeNamespacePlacementCheck(ctx, client, repo, pr, schemaResult, environment)
+	if err != nil {
+		h.logger.Error("failed to store namespace placement check record; posting a failing aggregate carrying the placement block instead, which holds the gate closed until the check is re-run or a commit is pushed",
+			"repo", repo, "pr", pr, "environment", environment, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, schemaResult.HeadSHA,
+			map[string]string{environment: namespacePlacementUnstoredSummary}, namespacePlacementRefusedBlock)
+		return
+	}
+	h.settleChecksReplacedByNewTypeBeforeFold(ctx, client, repo, pr, headSHA, schemaResult.Database, schemaResult.Type)
+	h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 }
 
 // planForResolvedDatabaseBlocked enforces actor authorization once a
@@ -378,6 +421,9 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	// Environments whose check record could not be persisted while some rollout
 	// member, the primary included, has work (MG-12), kept for the same reason.
 	pendingWorkUnstored := map[string]string{}
+	// Environments whose namespace placement refusal could not be persisted,
+	// kept for the same reason and posted under the placement block's reason.
+	placementBlockUnstored := map[string]string{}
 	// Whether any environment's rollout round found a member with work. The
 	// primary's plan alone cannot say, so auto-plan reads this before skipping
 	// its comment.
@@ -449,15 +495,30 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		}
 
 		planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
+		if planRefusedByNamespacePlacement(err) {
+			h.logger.Warn("plan refused by namespace placement; storing a failing check for the environment",
+				"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", err)
+			multiEnvData.Errors[env] = userFacingError(err)
+			sha, checkErr := h.storeNamespacePlacementCheck(ctx, client, repo, pr, schemaResult, env)
+			if checkErr != nil {
+				h.logger.Error("failed to store namespace placement check record; posting a failing aggregate carrying the placement block instead, which holds the gate closed until the check is re-run or a commit is pushed",
+					"repo", repo, "pr", pr, "env", env, "database", schemaResult.Database, "head_sha", schemaResult.HeadSHA, "error", checkErr)
+				placementBlockUnstored[env] = namespacePlacementUnstoredSummary
+			}
+			if sha != "" {
+				headSHA = sha
+			}
+			continue
+		}
 		if err != nil {
 			h.logger.Error("plan execution failed", "repo", repo, "pr", pr, "env", env, "error", err)
 			multiEnvData.Errors[env] = userFacingError(err)
 			continue
 		}
 
-		// Roll up every deployment's diff against the reviewed plan so drift on a
+		// Roll up every deployment's diff against the primary plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, routing.ExecutionTarget{Deployment: planResp.Deployment, Target: planResp.Target}, repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool
@@ -485,9 +546,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		commentData := buildPlanCommentData(schemaResult, planResp, env, tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = planCommentDatabaseFlag(databaseName, schemaDatabase, isAutoPlan, commandScopeDatabases)
-		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, env)
+		h.annotateAttributedChanges(ctx, client, &commentData, planResp, driftPreview, repo, pr, env)
 		commentData.RecoveredApplyOwnedCheckState = recoveredApplyOwnedCheckState
 		commentData.DeploymentDrift = driftPreview
+		h.annotateMemberApplyRefusal(ctx, &commentData, planResp, env, drift, repo, pr)
 		multiEnvData.Plans[env] = &commentData
 	}
 
@@ -531,6 +593,14 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"repo", repo,
 			"pr", pr,
 			"environments", len(driftBlockUnstored))
+	}
+	if len(placementBlockUnstored) > 0 && multiEnvData.HeadSHA != "" {
+		h.postFailingAggregatesWithBlock(ctx, client, repo, pr, multiEnvData.HeadSHA, placementBlockUnstored, namespacePlacementRefusedBlock)
+	} else if len(placementBlockUnstored) > 0 {
+		h.logger.Warn("namespace placement refused one or more environments' plans but no head SHA is known; the fallback failing aggregate was not posted, so an operator must re-run plan to re-establish the merge-gate block",
+			"repo", repo,
+			"pr", pr,
+			"environments", len(placementBlockUnstored))
 	}
 	if len(pendingWorkUnstored) > 0 && multiEnvData.HeadSHA != "" {
 		h.postFailingAggregates(ctx, client, repo, pr, multiEnvData.HeadSHA, pendingWorkUnstored)
@@ -954,6 +1024,63 @@ func planCommentDatabaseFlag(requestedDatabase, resolvedDatabase string, isAutoP
 	return ""
 }
 
+// planTableRef names a table within a plan namespace.
+type planTableRef struct{ namespace, table string }
+
+// shardDDLByTable collects every shard's DDL for each table, so a sharded
+// namespace's size lines are decided from what each shard runs rather than
+// from the one statement the namespace view keeps per table.
+func shardDDLByTable(shards []*apitypes.ShardPlanResponse) map[planTableRef][]string {
+	byTable := make(map[planTableRef][]string)
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if t == nil || t.DDL == "" {
+				continue
+			}
+			ref := planTableRef{sp.Namespace, t.TableName}
+			byTable[ref] = append(byTable[ref], t.DDL)
+		}
+	}
+	return byTable
+}
+
+// planTableSizes lists the size estimate of each existing table a namespace's
+// plan copies, rebuilds, or scans. Metadata-only changes get no size line,
+// since a size beside them would be noise on the plan, and neither do tables
+// the plan creates, which have no data yet. A table is listed once however
+// many statements change it, since each statement carries the whole table's
+// estimate.
+func planTableSizes(schema *ghclient.SchemaRequestResult, sc *apitypes.SchemaChangeResponse, shardDDL map[planTableRef][]string) []templates.TableSizeData {
+	var sizes []templates.TableSizeData
+	listed := make(map[string]bool)
+	for _, t := range sc.TableChanges {
+		logAttrs := []any{"repo", schema.Repository, "database", schema.Database, "namespace", sc.Namespace, "table", t.TableName}
+		if listed[t.TableName] {
+			slog.Debug("table already has a size line; skipping its further statements", logAttrs...)
+			continue
+		}
+		if ddl.OpToStatementType(t.ChangeType) == ddl.StatementCreateTable {
+			slog.Debug("table is created by this plan; it has no size to show", logAttrs...)
+			continue
+		}
+		ddls := append([]string{t.DDL}, shardDDL[planTableRef{sc.Namespace, t.TableName}]...)
+		if !ddl.TableCostScalesWithSize(schema.Type, ddls, logAttrs...) {
+			slog.Debug("table's changes are metadata-only; it gets no size line", logAttrs...)
+			continue
+		}
+		listed[t.TableName] = true
+		sizes = append(sizes, templates.TableSizeData{
+			Table:          t.TableName,
+			ShardCount:     t.ShardCount,
+			EstimatedBytes: t.EstimatedBytes,
+		})
+	}
+	return sizes
+}
+
 // buildPlanCommentData converts plan results into template data.
 func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, tenant, requestedBy, agentHint, cliName string) templates.PlanCommentData {
 	data := templates.PlanCommentData{
@@ -1020,10 +1147,12 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 	}
 
 	// Build keyspace changes from namespace-grouped plan response
+	shardDDL := shardDDLByTable(planResp.Shards)
 	for _, sc := range planResp.Changes {
 		ksData := templates.KeyspaceChangeData{
-			Keyspace: sc.Namespace,
-			Shards:   shardsByKeyspace[sc.Namespace],
+			Keyspace:   sc.Namespace,
+			Shards:     shardsByKeyspace[sc.Namespace],
+			TableSizes: planTableSizes(schema, sc, shardDDL),
 		}
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
@@ -1062,10 +1191,11 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 		for _, uc := range sc.VSchemaUnsafeChanges() {
 			unsafe = append(unsafe, templates.UnsafeChangeData{
-				Table:      uc.Table,
-				Reason:     uc.Reason,
-				DDL:        uc.DDL,
-				ChangeType: uc.ChangeType,
+				Table:            uc.Table,
+				Reason:           uc.Reason,
+				DDL:              uc.DDL,
+				ChangeType:       uc.ChangeType,
+				VSchemaNamespace: sc.Namespace,
 			})
 		}
 	}

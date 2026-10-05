@@ -251,7 +251,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("octo/repo", 7, "", "## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+		body := h.renderPRComment("octo/repo", 7, "", "## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply**, comment:\n```\nschemabot apply -e staging\n```")
 
 		assert.NotContains(t, body, "Support:")
 	})
@@ -370,10 +370,10 @@ func TestHandlerRendersCLIHintsWithTheConfiguredCLIName(t *testing.T) {
 // printed. Both observer kinds, the per-driver one and the one-shot aggregate
 // terminal-summary publisher, render the same hint.
 func TestCommentObserverRendersOversizedNoticeWithTheConfiguredCLIName(t *testing.T) {
-	h := &Handler{logger: testLogger(), service: api.New(nil, &api.ServerConfig{CLIName: "acme schemabot"}, nil, testLogger()), finalizerPlans: newFinalizerPlanCache()}
+	h := &Handler{logger: testLogger(), service: api.New(nil, &api.ServerConfig{CLIName: "acme schemabot"}, nil, testLogger()), shardedPlans: newShardedPlanCache()}
 	cfg := h.commentObserverConfig(nil, "octo/repo", 7, 42)
 	assert.Equal(t, "acme schemabot", cfg.CLIName)
-	assert.Same(t, h.finalizerPlans, cfg.finalizerPlans, "every observer shares the handler's finalizer plan cache")
+	assert.Same(t, h.shardedPlans, cfg.shardedPlans, "every observer shares the handler's sharded plan cache")
 
 	oversized := "## Schema Change Apply — Staging\n\n" + strings.Repeat("x", 2*templates.GitHubIssueCommentMaxChars)
 	apply := &storage.Apply{ApplyIdentifier: "apply-7c41f9", Database: "orders", Environment: "staging"}
@@ -829,6 +829,158 @@ func TestWebhookNoMention(t *testing.T) {
 	select {
 	case <-comments:
 		t.Fatal("should not post a comment when not mentioned")
+	default:
+	}
+}
+
+// A status update that reports an apply in command words ("SchemaBot apply -e
+// staging succeeded") is a sentence, not a request: SchemaBot starts nothing
+// and posts nothing.
+func TestWebhookSentenceReportingAnApplyDoesNotApply(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "SchemaBot apply -e staging succeeded, and the check passes.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+	select {
+	case body := <-comments:
+		require.Failf(t, "unexpected comment posted", "%s", body)
+	default:
+	}
+}
+
+// A comment that explains itself in a sentence opening with the product name
+// and then issues a command on its own line runs that command.
+func TestWebhookSentenceThenCommandRunsTheCommand(t *testing.T) {
+	h, _, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "SchemaBot planned this earlier and the plan looks right.\n\nschemabot rollback-confirm -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "rollback-confirm started")
+}
+
+// A CLI-only flag named in a sentence does not trip the usage gate for the
+// command on the next line, and the same flag on the command line does.
+func TestWebhookFlagInSentenceDoesNotReachTheCommand(t *testing.T) {
+	t.Run("flag in the sentence", func(t *testing.T) {
+		h, _, _ := newTestHandler(t)
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "SchemaBot apply -e staging --yes is a CLI habit.\n\nschemabot rollback-confirm -e staging",
+			isPR:    true,
+		}, nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "rollback-confirm started")
+	})
+	t.Run("flag on the command line", func(t *testing.T) {
+		h, comments, _ := newTestHandler(t)
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "SchemaBot apply is a PR comment.\n\nschemabot rollback-confirm -e staging --yes",
+			isPR:    true,
+		}, nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "unsupported flag")
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "is not supported for `rollback-confirm`")
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, "timed out waiting for comment")
+		}
+	})
+}
+
+// A quote-reply to an apply command is a response to it, not a new request:
+// SchemaBot runs nothing and posts nothing.
+func TestWebhookQuoteReplyToCommandIsNotRun(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "> schemabot apply -e production\n\nShould this go to staging first?",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+	select {
+	case body := <-comments:
+		require.Failf(t, "unexpected comment posted", "%s", body)
+	default:
+	}
+}
+
+// A command line with a token SchemaBot does not accept exactly, here an
+// unsafe flag with a full stop typed after it, is a botched command rather
+// than a sentence. SchemaBot runs nothing and answers with the invalid-command
+// help, so the commenter learns the apply did not start.
+func TestWebhookMalformedCommandIsRejected(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging --allow-unsafe.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid command")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Command")
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for comment")
+	}
+}
+
+// An agent's status update that opens a paragraph with the product name is a
+// sentence about SchemaBot, not a command. SchemaBot leaves it unanswered
+// rather than replying with the invalid-command help.
+func TestWebhookProseMentionIsNotAnswered(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "Rebased onto main.\n\nSchemaBot applied the `orders` table in staging from commit `abc1234`; the staging check passes.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+	select {
+	case body := <-comments:
+		require.Failf(t, "unexpected comment posted", "%s", body)
 	default:
 	}
 }

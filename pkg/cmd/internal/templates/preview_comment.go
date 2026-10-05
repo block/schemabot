@@ -44,6 +44,8 @@ func previewCommentAllOutput() {
 		fn   func()
 	}{
 		{"PLAN COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
+		{"PLAN COMMENT (COLUMN-ONLY ALTER, NO TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter()) }},
+		{"PLAN COMMENT (MANY TABLES, FOLDED TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyTables()) }},
 		{"PLAN COMMENT (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"PLAN COMMENT (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"PLAN COMMENT (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
@@ -91,6 +93,11 @@ func previewCommentAllOutput() {
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
+		{"ROLLOUT PLANS (TABLE SIZES, TWO TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTwoTargetTableSizes()) }},
+		{"ROLLOUT PLANS (TABLE SIZES, THREE TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTableSizes()) }},
+		{"ROLLOUT PLANS (TABLE SIZES, REVIEWED TARGET ONLY)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutPrimaryTargetTableSizes())
+		}},
 		{"HELP COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentHelp()) }},
 		{"SUPPORT CHANNEL FOOTER", func() { fmt.Print(webhooktemplates.PreviewCommentSupportChannel()) }},
 		{"OVERSIZED COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentOversized()) }},
@@ -161,6 +168,8 @@ func previewCommentPlanAllOutput() {
 		fn   func()
 	}{
 		{"MYSQL PLAN", func() { fmt.Print(webhooktemplates.PreviewCommentPlan()) }},
+		{"MYSQL PLAN (COLUMN-ONLY ALTER, NO TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter()) }},
+		{"MYSQL PLAN (MANY TABLES, FOLDED TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyTables()) }},
 		{"MYSQL PLAN (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"POSTGRES PLAN (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"MYSQL PLAN (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
@@ -168,6 +177,7 @@ func previewCommentPlanAllOutput() {
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"POSTGRES PLAN (ENGINE-BLOCKED CHANGE, TWO CAUSES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlockedPostgres()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
+		{"MYSQL PLAN (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnsafe()) }},
 		{"MYSQL PLAN (CHANGE ATTRIBUTED TO ANOTHER PR)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanAttributedChange()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED, APPLYING)", func() {
@@ -207,6 +217,11 @@ func previewCommentPlanAllOutput() {
 		{"ROLLOUT PLANS (CONVERGING)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConverging()) }},
 		{"ROLLOUT PLANS (REVIEWED TARGET ALREADY THERE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutConvergedPrimary()) }},
 		{"ROLLOUT PLANS (DISTINCT PLANS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutDistinctPlans()) }},
+		{"ROLLOUT PLANS (TABLE SIZES, TWO TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTwoTargetTableSizes()) }},
+		{"ROLLOUT PLANS (TABLE SIZES, THREE TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTableSizes()) }},
+		{"ROLLOUT PLANS (TABLE SIZES, REVIEWED TARGET ONLY)", func() {
+			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutPrimaryTargetTableSizes())
+		}},
 		{"DROP COLUMN BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked()) }},
 		{"DROP INDEX BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked()) }},
 		{"SCHEMA LINT ERRORS BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentLintErrorsBlocked()) }},
@@ -427,6 +442,7 @@ func previewCLILockingAllOutput() {
 		{"LOCK CONFLICT (PR)", previewLockConflictOutput},
 		{"LOCK CONFLICT (CLI)", previewLockConflictByCLIOutput},
 		{"LOCK RELEASED", previewLockReleasedOutput},
+		{"LOCK KEPT (YIELD)", previewLockKeptOutput},
 		{"NO LOCK FOUND", previewNoLockFoundOutput},
 		{"LOCK EXISTS UNDER OTHER TYPE", previewLockExistsUnderOtherTypeOutput},
 		{"UNLOCK NOT OWNED", previewUnlockNotOwnedOutput},

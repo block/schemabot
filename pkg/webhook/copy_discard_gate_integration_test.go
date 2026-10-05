@@ -459,7 +459,7 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 	}, repo, pr)
 	require.NoError(t, err)
 	require.True(t, planResp.HasChanges(), "the schema declares an index the target does not have")
-	require.Empty(t, planResp.DiscardedCopies(), "the reviewed plan must disclose no copy for the window to exist")
+	require.Empty(t, planResp.DiscardedCopies(), "the primary target's plan must disclose no copy for the window to exist")
 
 	storedPlan, err := svc.Storage().Plans().Get(t.Context(), planResp.PlanID)
 	require.NoError(t, err)
@@ -476,7 +476,7 @@ func TestE2EReplanDiscardingCopyDowngradesToConfirm(t *testing.T) {
 		PendingPlanID: planResp.PlanID,
 	}))
 
-	// The copy appears inside the window: after the reviewed plan, before the
+	// The copy appears inside the window: after the primary plan, before the
 	// dispatch re-plans.
 	seedCopyArtifacts(t, dbName)
 
