@@ -143,7 +143,7 @@ func TestCheckReviewGate_Disabled(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	assert.Nil(t, result, "gate should return nil when disabled")
 }
@@ -161,7 +161,7 @@ func TestCheckReviewGate_NoReviewsBlocks(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
@@ -188,7 +188,7 @@ func TestCheckReviewGate_OperatorUserApproval(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
@@ -313,7 +313,7 @@ func TestCheckReviewGate_ApprovalCommit(t *testing.T) {
 			client, err := h.clientForRepo("octocat/hello-world", 12345)
 			require.NoError(t, err)
 
-			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", tt.schemaLinkPath)
+			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", tt.schemaLinkPath, reviewGateTestHeadSHA)
 			require.NoError(t, err, "an approval that does not count blocks on the merits, not as an evaluation failure")
 			require.NotNil(t, result)
 			assert.Equal(t, tt.wantApproved, result.Approved)
@@ -329,8 +329,8 @@ func TestCheckReviewGate_ApprovalCommit(t *testing.T) {
 }
 
 // Two operators approved the same earlier commit and a third approved the
-// head: the earlier commit is compared once, and the head approval satisfies
-// the gate even though the earlier ones no longer count.
+// head: the head approval satisfies the gate on its own, so the earlier
+// commit is never compared.
 func TestCheckReviewGate_HeadApprovalOutranksStaleApprovals(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		db := cfg.Databases["orders"]
@@ -357,11 +357,185 @@ func TestCheckReviewGate_HeadApprovalOutranksStaleApprovals(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
-	assert.LessOrEqual(t, len(compares), 1, "reviewers who approved the same commit share one comparison")
+	assert.Empty(t, compares, "a head approval is checked before approvals that need a comparison")
+}
+
+// Two operators approved the same earlier commit and nobody approved the head.
+// Schema inputs changed since that commit, so neither approval counts, the
+// commit is compared exactly once, and both are named as stale approvers.
+func TestCheckReviewGate_SharedStaleApprovalBlocksAndComparesOnce(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob", "carol"}
+		cfg.Databases["orders"] = db
+	}))
+	registerPREndpoint(mux, "alice")
+	now := time.Now()
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}, CommitID: new("aaa111")},
+		{User: &gh.User{Login: new("carol")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}, CommitID: new("aaa111")},
+	})
+	compares := make(chan struct{}, 10)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, _ *http.Request) {
+		compares <- struct{}{}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&gh.CommitsComparison{
+			Status: new("ahead"),
+			Files:  []*gh.CommitFile{{Filename: new("schema/testdb/orders.sql"), Status: new("modified")}},
+		})
+	})
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.Approved, "neither stale approval covers the head")
+	assert.ElementsMatch(t, []string{"bob", "carol"}, result.StaleApprovers)
+	assert.Len(t, compares, 1, "reviewers who approved the same commit share one comparison")
+}
+
+// A non-.sql entry under the database's own schema path (a namespace symlink
+// retargeted, for example) changed after the approval: the approval no longer
+// covers the head.
+func TestCheckReviewGate_NonSQLFileUnderSchemaPathInvalidatesApproval(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new("aaa111")},
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&gh.CommitsComparison{
+			Status: new("ahead"),
+			Files:  []*gh.CommitFile{{Filename: new("schema/testdb/billing"), Status: new("modified")}},
+		})
+	})
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.Approved)
+	assert.Equal(t, []string{"bob"}, result.StaleApprovers)
+}
+
+// GitHub is unavailable for the comparison: the approval state could not be
+// determined, so the gate returns an evaluation error (retryable) rather than
+// a "Review Required" merit block, matching TestEnforceReviewGate's contract.
+func TestCheckReviewGate_CompareUnavailableIsEvaluationFailure(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new("aaa111")},
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	})
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
+	require.ErrorIs(t, err, ghclient.ErrGitHubUnavailable)
+	assert.Nil(t, result)
+}
+
+// GitHub is unavailable for comparisons, but another operator approved the
+// head: that approval satisfies the gate without any comparison, so the outage
+// does not turn a valid approval into an evaluation failure.
+func TestCheckReviewGate_HeadApprovalNeedsNoComparison(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob", "carol"}
+		cfg.Databases["orders"] = db
+	}))
+	registerPREndpoint(mux, "alice")
+	now := time.Now()
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}, CommitID: new("aaa111")},
+		{User: &gh.User{Login: new("carol")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: now}},
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+	})
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	// Approvals arrive in no fixed order; repeating catches an evaluation that
+	// would compare the earlier commit before reaching the head approval.
+	for range 5 {
+		result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
+		require.NoError(t, err)
+		require.NotNil(t, result)
+		assert.True(t, result.Approved)
+	}
+}
+
+// The gate measures approvals against the commit the schema files were read
+// from, not against whatever head a later PR read reports: an approval on the
+// PR-info head still has to prove it covers the schema's commit.
+func TestCheckReviewGate_CoverageUsesSchemaCommit(t *testing.T) {
+	const schemaSHA = "fff999"
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateTestHeadSHA)},
+	})
+	compared := make(chan string, 10)
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, r *http.Request) {
+		compared <- r.PathValue("range")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&gh.CommitsComparison{
+			Status: new("ahead"),
+			Files:  []*gh.CommitFile{{Filename: new("schema/testdb/orders.sql"), Status: new("modified")}},
+		})
+	})
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", schemaSHA)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.Approved)
+	require.Len(t, compared, 1)
+	assert.Equal(t, reviewGateTestHeadSHA+"..."+schemaSHA, <-compared)
+}
+
+// Without the commit the schema was read from, no approval can be measured
+// against it: the gate fails closed with an evaluation error.
+func TestCheckReviewGate_UnknownSchemaCommitIsEvaluationFailure(t *testing.T) {
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}},
+	})
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", "")
+	require.ErrorContains(t, err, "the commit the schema was read from is unknown")
+	assert.Nil(t, result)
 }
 
 func TestCheckReviewGate_AdminUserApproval(t *testing.T) {
@@ -381,7 +555,7 @@ func TestCheckReviewGate_AdminUserApproval(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
@@ -409,7 +583,7 @@ func TestCheckReviewGate_RepoAdminUserApproval(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
@@ -439,7 +613,7 @@ func TestCheckReviewGate_RepoAdminTeamApproval(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
@@ -468,7 +642,7 @@ func TestCheckReviewGate_RepoAdminTeamNonMemberBlocked(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
@@ -496,7 +670,7 @@ func TestCheckReviewGate_RepoAdminOfOtherRepoBlocked(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
@@ -517,7 +691,7 @@ func TestCheckReviewGate_NotApproved(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
@@ -545,7 +719,7 @@ func TestCheckReviewGate_SelfApprovalBlocked(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved, "self-approval should be blocked")
@@ -578,7 +752,7 @@ func TestCheckReviewGate_OperatorTeamApproval(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
@@ -604,7 +778,7 @@ func TestCheckReviewGate_OperatorTeamNotApproved(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
@@ -637,7 +811,7 @@ func TestCheckReviewGate_OperatorsSplitFromOtherReviewers(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
@@ -668,7 +842,7 @@ func TestCheckReviewGate_CodeownersIgnoredByDefault(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
@@ -695,13 +869,13 @@ func TestCheckReviewGate_CodeownersOptIn(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/payments", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/payments", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.True(t, result.Approved)
 	assert.Contains(t, result.OtherReviewers, "bob")
 
-	result, err = h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/orders", "")
+	result, err = h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/orders", "", reviewGateTestHeadSHA)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 	assert.False(t, result.Approved)
@@ -719,7 +893,7 @@ func TestCheckReviewGate_NoConfiguredReviewersErrors(t *testing.T) {
 	client, err := h.clientForRepo("octocat/hello-world", 12345)
 	require.NoError(t, err)
 
-	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "")
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, "orders", "schema/testdb", "", reviewGateTestHeadSHA)
 	require.Error(t, err)
 	assert.Nil(t, result)
 	assert.Contains(t, err.Error(), "no configured reviewers")
@@ -740,7 +914,7 @@ func reviewGateTestConfig(opts ...func(*api.ServerConfig)) *api.ServerConfig {
 // missing approval blocks on the merits without error. The evaluation-failure
 // comment must stay sanitized: no raw GitHub error text in PR markdown.
 func TestEnforceReviewGate(t *testing.T) {
-	schemaResult := &ghclient.SchemaRequestResult{Database: "orders", SchemaPath: "schema/testdb"}
+	schemaResult := &ghclient.SchemaRequestResult{Database: "orders", SchemaPath: "schema/testdb", HeadSHA: reviewGateTestHeadSHA}
 
 	registerCommentsCapture := func(mux *http.ServeMux) chan string {
 		comments := make(chan string, 10)
@@ -830,6 +1004,42 @@ func TestEnforceReviewGate(t *testing.T) {
 		case body := <-comments:
 			assert.Contains(t, body, "Review Required")
 			assert.Contains(t, body, "@bob")
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for review-required comment")
+		}
+	})
+
+	t.Run("approval on an earlier commit is named in the review-required comment", func(t *testing.T) {
+		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+			db := cfg.Databases["orders"]
+			db.OperatorUsers = []string{"bob"}
+			cfg.Databases["orders"] = db
+		}))
+		registerPREndpoint(mux, "alice")
+		registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+			{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new("aaa111")},
+		})
+		mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(&gh.CommitsComparison{
+				Status: new("ahead"),
+				Files:  []*gh.CommitFile{{Filename: new("schema/testdb/orders.sql"), Status: new("modified")}},
+			})
+		})
+		comments := registerCommentsCapture(mux)
+
+		client, err := h.clientForRepo("octocat/hello-world", 12345)
+		require.NoError(t, err)
+
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
+		require.NoError(t, err)
+		assert.True(t, blocked)
+
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "Review Required")
+			assert.Contains(t, body, "Approvals on an earlier commit no longer count")
+			assert.Contains(t, body, "could not confirm they did not: @bob.")
 		case <-time.After(2 * time.Second):
 			t.Fatal("timed out waiting for review-required comment")
 		}
