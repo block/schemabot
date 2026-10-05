@@ -19,6 +19,7 @@ import (
 func TestEngine_Plan_CollationChangeReadsTheTargetsCharsetDefault(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
+	dropTablesOnCleanup(t, db, "products")
 
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE `products` ("+
 		"`id` bigint unsigned NOT NULL AUTO_INCREMENT, "+
