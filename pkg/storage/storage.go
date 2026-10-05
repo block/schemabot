@@ -136,6 +136,9 @@ type Storage interface {
 type LockStore interface {
 	// Acquire attempts to acquire a lock. Returns ErrLockHeld if already held by another owner.
 	// If the same owner already holds the lock, this is a no-op (idempotent).
+	// When Acquire creates the lock row it sets lock.ID to the new row's ID; a
+	// re-acquire leaves lock.ID as passed, so a caller passing a new Lock can
+	// tell a row it created (non-zero ID) from one the owner already held.
 	Acquire(ctx context.Context, lock *Lock) error
 
 	// AcquireIfPendingPlanID acquires like Acquire, but only while the lock is

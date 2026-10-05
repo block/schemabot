@@ -650,7 +650,7 @@ per-replica ceiling.
 
 ### Check inspection
 
-`GET /api/checks/inspect` (`schemabot checks inspect`) reads the pull request
+`GET /api/checks/inspect` (`schemabot checks show`) reads the pull request
 and each expected Check Run from GitHub on every call, uncached, through the
 same GitHub App installation SchemaBot publishes its Check Runs through. A
 caller polling it in a loop can spend the installation's hourly REST quota, and
@@ -666,14 +666,31 @@ rate_limits:
       burst: 10               # default: 10
 ```
 
-As an approximate sustained budget, each inspection costs one GitHub read for
-the pull request plus at least one per expected check name. The hourly estimate
-is `60 × requests_per_minute × (1 + N)`, where N is the number of check names.
-Check Run pagination multiplies those reads, and the initial burst permits
-additional inspections. A dashboard polling three pull requests every 30
-seconds fits the sustained default; poll at 30 seconds or longer. A deployment
-that publishes more check names or has deep Check Run histories should lower
-`requests_per_minute`.
+The budget limits each caller on each replica, not the installation. Every
+replica admits the configured rate on its own, and every admitted inspection
+draws on the one installation quota, so size it against the whole deployment.
+Each inspection costs one installation-authenticated GitHub read for the pull
+request plus at least one per expected check name. The most one caller can be
+admitted, when its requests spread across every replica, is approximately
+`replicas × 60 × requests_per_minute × (1 + check names)` calls an hour; size
+`requests_per_minute` so that ceiling, across the callers you expect, stays
+inside the installation quota. On the defaults, a deployment of three replicas
+publishing two check names admits one caller up to 3,240 calls an hour, about
+two thirds of the 5,000 an hour the smallest installation quota allows. Check
+Run pagination multiplies those reads, the initial burst permits additional
+inspections, and resolving the installation client adds three
+app-authenticated calls per inspection (the App, the repository's
+installation, and a fresh installation token) that count against the App
+rather than the installation. A client's own cost does not grow with the
+replica count: it is the client's request rate × (1 + check names). A
+dashboard polling three pull requests every 30 seconds makes 6 requests a
+minute and spends `360 × (1 + check names)` calls an hour, 1,080 with two
+check names, on any number of replicas. A client that holds its connection
+open usually stays on one replica, so it needs `requests_per_minute` of at
+least its own poll rate there; the default of 6 fits that dashboard. A
+deployment that runs more replicas, publishes more check names, or has deep
+Check Run histories should lower `requests_per_minute`, but not below the poll
+rate of the clients it serves.
 
 `per_caller` is keyed the same way as the pull endpoint's. With API auth
 disabled, every caller shares one budget. There is no `per_target` lane. A
@@ -1676,7 +1693,7 @@ The decision has two halves. The middleware admits any caller in `write_groups` 
 
 Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`).
 
-A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, or a lock taken by a server version that did not record acquirers) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. `write_groups` members, and every caller on a deployment without `operator_groups`, release by owner alone.
+A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, a lock taken by a server version that did not record acquirers, or one taken through the loopback break-glass lane, whose identity headers are not proxy-verified) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. The same rule decides whether a scoped operator who acquires a lock already held under the owner they sent is told they hold it: re-acquiring a lock their own group took succeeds without changing it, and sending the owner of another group's lock, or of a lock that belongs to no group, is a `403` naming the groups that may release it, with the lock unchanged. `write_groups` members, and every caller on a deployment without `operator_groups`, re-acquire and release by owner alone. A lock records its acquirer's groups when it is taken, while the caller's groups are read from the current configuration, so editing `operator_groups` strands locks: after a group is renamed, no scoped operator can release or re-acquire a lock taken under its old name, and an operator moved out of every group a lock recorded can no longer release or re-acquire the lock they took, until a `write_groups` member (or, for a moved operator, a remaining member of one of those groups) releases it.
 
 The grant fails closed everywhere: an unconfigured database or an environment outside `operator_environments` denies scoped callers with a `403` naming the groups that would grant access, and a target that cannot be resolved at decision time — a stored plan or apply lookup failure — surfaces as the operation's own `500`, never as an authorization. Misconfiguration is a startup error, not a silent no-op: any `operator_groups` grant requires a non-empty `operator_environments` (and the reverse), requires `auth.type: forward_auth`, and every granted database must have at least one of its environments in `operator_environments` — a grant that could never authorize anything is rejected at startup.
 
