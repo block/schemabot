@@ -1061,6 +1061,7 @@ func planCollationChanges(sc *apitypes.SchemaChangeResponse) []templates.Collati
 				To:             c.To,
 				Case:           engine.ComparisonChange(c.Case),
 				TrailingSpaces: engine.ComparisonChange(c.TrailingSpaces),
+				CanMergeValues: c.CanMergeValues,
 				UniqueIndexes:  c.UniqueIndexes,
 			})
 		}

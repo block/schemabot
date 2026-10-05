@@ -51,7 +51,7 @@ func TestRenderPlanComment_CollationChanges(t *testing.T) {
 		CollationChangeData{
 			Table: "notes", Column: "slug", From: "utf8mb4_bin", To: "utf8mb4_0900_ai_ci",
 			Case: engine.ComparisonBecomesInsensitive, TrailingSpaces: engine.ComparisonBecomesSensitive,
-			UniqueIndexes: []string{"uk_slug", "uk_owner_slug"},
+			CanMergeValues: true, UniqueIndexes: []string{"uk_slug", "uk_owner_slug"},
 		},
 	)))
 
@@ -61,21 +61,49 @@ func TestRenderPlanComment_CollationChanges(t *testing.T) {
 		"- `slug` on `notes`: `utf8mb4_bin` → `utf8mb4_0900_ai_ci`\n"+
 		"  - Comparisons become case-insensitive: `'abc'` and `'ABC'` start comparing equal.\n"+
 		"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
+		"  - Values that differ only by accents or other characters can start comparing equal.\n"+
 		"  - `slug` is in unique indexes `uk_slug`, `uk_owner_slug`: the apply fails if two existing rows collide in one of them under the new collation.\n",
 		collationSection(t, out))
 }
 
-// A move that changes neither letter case nor trailing spaces still says that
-// other characters can compare differently, so a quiet line never reads as no
-// change at all.
-func TestRenderPlanComment_CollationChangeKeepsCaseAndSpaces(t *testing.T) {
+// A move that can merge values says so whatever the case and trailing space
+// lines say, since collations also weigh accents and other characters
+// differently. That is what tells a reviewer a column outside any unique
+// index still changes: under the new collation `title` matches, groups, and
+// deduplicates values it kept apart before.
+func TestRenderPlanComment_CollationChangeCanMergeValues(t *testing.T) {
 	out := RenderPlanComment(collationPlanData(collationKeyspace("testapp", CollationChangeData{
-		Table: "notes", Column: "body", From: "utf8mb4_general_ci", To: "utf8mb4_unicode_ci",
-		Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonUnchanged,
+		Table: "products", Column: "title", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+		Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+		CanMergeValues: true,
 	})))
 
-	assert.Contains(t, collationSection(t, out),
-		"  - Letter case and trailing spaces compare as before. Accented and other characters can still sort and compare differently.\n")
+	assert.Equal(t, "🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.\n"+
+		"- `title` on `products`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`\n"+
+		"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
+		"  - Values that differ only by accents or other characters can start comparing equal.\n",
+		collationSection(t, out))
+}
+
+// A move that changes neither letter case nor trailing spaces still says what
+// it does to other values, so a quiet line never reads as no change at all.
+func TestRenderPlanComment_CollationChangeKeepsCaseAndSpaces(t *testing.T) {
+	merges := RenderPlanComment(collationPlanData(collationKeyspace("testapp", CollationChangeData{
+		Table: "notes", Column: "body", From: "utf8mb4_general_ci", To: "utf8mb4_unicode_ci",
+		Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonUnchanged,
+		CanMergeValues: true,
+	})))
+	assert.Equal(t, "- `body` on `notes`: `utf8mb4_general_ci` → `utf8mb4_unicode_ci`\n"+
+		"  - Values that differ only by accents or other characters can start comparing equal.\n",
+		strings.SplitN(collationSection(t, merges), "\n", 2)[1])
+
+	keeps := RenderPlanComment(collationPlanData(collationKeyspace("testapp", CollationChangeData{
+		Table: "notes", Column: "body", From: "utf8mb4_0900_as_cs", To: "utf8mb4_0900_bin",
+		Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonUnchanged,
+	})))
+	assert.Equal(t, "- `body` on `notes`: `utf8mb4_0900_as_cs` → `utf8mb4_0900_bin`\n"+
+		"  - Letter case and trailing spaces compare as before, and no values that compare unequal now start comparing equal.\n",
+		strings.SplitN(collationSection(t, keeps), "\n", 2)[1])
 }
 
 // What the plan cannot read is a warning, never silence: a collation left to
@@ -85,19 +113,23 @@ func TestRenderPlanComment_CollationChangeUnknown(t *testing.T) {
 		CollationChangeData{
 			Table: "notes", Column: "body", From: "utf8mb4_general_ci",
 			Case: engine.ComparisonUnknown, TrailingSpaces: engine.ComparisonUnknown,
+			CanMergeValues: true,
 		},
 		CollationChangeData{
 			Table: "notes", Column: "title", From: "utf8mb4_general_ci", To: "utf8mb4_custom_ci",
 			Case: engine.ComparisonUnknown, TrailingSpaces: engine.ComparisonUnknown,
+			CanMergeValues: true,
 		},
 	)))
 
 	section := collationSection(t, out)
 	assert.Contains(t, section, "- `body` on `notes`: `utf8mb4_general_ci` → the server's default collation\n"+
-		"  - The new collation is not in the plan, so it cannot say how letter case and trailing spaces will compare.\n")
+		"  - The statement leaves the collation to the server's default, which the plan could not read, so it cannot say how values will compare.\n"+
+		"- `title`")
 	assert.Contains(t, section, "- `title` on `notes`: `utf8mb4_general_ci` → `utf8mb4_custom_ci`\n"+
 		"  - The plan cannot read whether letter case is significant under the new collation.\n"+
-		"  - The plan cannot read whether trailing spaces are significant under the new collation.\n")
+		"  - The plan cannot read whether trailing spaces are significant under the new collation.\n"+
+		"  - Values that differ only by accents or other characters can start comparing equal.\n")
 }
 
 // Columns of one table making the same move share a line, which lists a
@@ -109,6 +141,7 @@ func TestRenderPlanComment_CollationChangesGroupAndQualify(t *testing.T) {
 		wide = append(wide, CollationChangeData{
 			Table: "notes", Column: column, From: "latin1_swedish_ci", To: "utf8mb4_0900_ai_ci",
 			Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+			CanMergeValues: true,
 		})
 	}
 	out := RenderPlanComment(collationPlanData(
@@ -122,6 +155,26 @@ func TestRenderPlanComment_CollationChangesGroupAndQualify(t *testing.T) {
 	section := collationSection(t, out)
 	assert.Contains(t, section, "- `c1`, `c2`, `c3`, `c4`, `c5`, `c6`, `c7`, `c8` and 2 more on `commerce.notes`: `latin1_swedish_ci` → `utf8mb4_0900_ai_ci`\n")
 	assert.Contains(t, section, "- `memo` on `billing.notes`: `utf8mb4_general_ci` → `utf8mb4_bin`\n")
+}
+
+// A table that converts many unique columns at once lists a bounded number of
+// unique index lines and counts the rest, so the cap on the column list is
+// not undone by the lines under it.
+func TestRenderPlanComment_CollationUniqueLinesAreBounded(t *testing.T) {
+	var wide []CollationChangeData
+	for i := range collationColumnsShown + 2 {
+		column := fmt.Sprintf("c%d", i+1)
+		wide = append(wide, CollationChangeData{
+			Table: "notes", Column: column, From: "latin1_swedish_ci", To: "utf8mb4_0900_ai_ci",
+			Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+			CanMergeValues: true, UniqueIndexes: []string{"uk_" + column},
+		})
+	}
+	section := collationSection(t, RenderPlanComment(collationPlanData(collationKeyspace("testapp", wide...))))
+
+	assert.Contains(t, section, "  - `c8` is in unique index `uk_c8`: the apply fails if two existing rows collide in that index under the new collation.\n"+
+		"  - …and 2 more columns in unique indexes, where the apply fails if two existing rows collide under the new collation.\n")
+	assert.NotContains(t, section, "`c9` is in unique index")
 }
 
 // The section sits under the table sizes, describing the DDL above it, and a
@@ -176,7 +229,7 @@ func TestRenderPlanComment_CollationChangesCollapse(t *testing.T) {
 	}
 	last := collationMove("t_last", "handle")
 	last.To, last.Case, last.TrailingSpaces = "utf8mb4_0900_ai_ci", engine.ComparisonUnchanged, engine.ComparisonBecomesSensitive
-	last.UniqueIndexes = []string{"uk_handle"}
+	last.CanMergeValues, last.UniqueIndexes = true, []string{"uk_handle"}
 	changes = append(changes, last)
 	out := RenderPlanComment(collationPlanData(collationKeyspace("testapp", changes...)))
 

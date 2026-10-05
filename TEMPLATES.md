@@ -320,6 +320,7 @@ ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin N
 🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.
 - `sku`, `title` on `products`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`
   - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.
+  - Values that differ only by accents or other characters can start comparing equal.
   - `sku` is in unique index `uk_sku`: the apply fails if two existing rows collide in that index under the new collation.
 - `handle` on `customers`: `utf8mb4_general_ci` → `utf8mb4_bin`
   - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.

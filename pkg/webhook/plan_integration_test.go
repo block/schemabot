@@ -630,8 +630,8 @@ func TestE2EPlanCommentShowsTableSizes(t *testing.T) {
 // column case-sensitive says, under the DDL, what each move does to how the
 // columns compare. The column the ALTER redeclares without a collation picks
 // up the new table default, starts treating trailing spaces as significant,
-// and names its unique index, since other characters can start comparing
-// equal. The column moved onto the binary collation starts treating letter
+// says that values differing by accents or other characters can start
+// comparing equal, and names its unique index for that reason. The column moved onto the binary collation starts treating letter
 // case as significant and names no index: no two values can start colliding.
 func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 	dbName := "webhook_plan_collation_changes"
@@ -703,6 +703,7 @@ func TestE2EPlanCommentShowsCollationChanges(t *testing.T) {
 			"  - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.\n"+
 			"- `note` on `handles`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`\n"+
 			"  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.\n"+
+			"  - Values that differ only by accents or other characters can start comparing equal.\n"+
 			"  - `note` is in unique index `uk_note`: the apply fails if two existing rows collide in that index under the new collation.\n", body)
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for plan comment")

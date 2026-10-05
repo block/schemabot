@@ -18,11 +18,13 @@ type CollationChangeData struct {
 	// the plan cannot read.
 	From, To             string
 	Case, TrailingSpaces engine.ComparisonChange
+	CanMergeValues       bool
 	UniqueIndexes        []string
 }
 
-// collationColumnsShown caps the column names one collation line lists, so a
-// CONVERT TO CHARACTER SET on a wide table stays one readable line.
+// collationColumnsShown caps the column names one collation line lists, and
+// the unique index lines under it, so a CONVERT TO CHARACTER SET on a wide
+// table stays a few readable lines.
 const collationColumnsShown = 8
 
 // collationGroupsInlineLimit is how many collation moves the section lists
@@ -42,6 +44,7 @@ type collationGroup struct {
 	from, to       string
 	caseChange     engine.ComparisonChange
 	trailingSpaces engine.ComparisonChange
+	canMergeValues bool
 	columns        []string
 	// unique lists, for each of the columns a unique index covers, the
 	// indexes that cover it.
@@ -57,7 +60,8 @@ type uniqueColumn struct {
 // same collations with the same effect on comparisons as the group.
 func (g collationGroup) makesSameMove(table string, c CollationChangeData) bool {
 	return g.table == table && g.from == c.From && g.to == c.To &&
-		g.caseChange == c.Case && g.trailingSpaces == c.TrailingSpaces
+		g.caseChange == c.Case && g.trailingSpaces == c.TrailingSpaces &&
+		g.canMergeValues == c.CanMergeValues
 }
 
 // writeCollationChangesSection renders what the plan does to the collation of
@@ -65,7 +69,8 @@ func (g collationGroup) makesSameMove(table string, c CollationChangeData) bool 
 // values sort together and compare equal, so a change to it can change query
 // results and make a unique index reject values it accepted before, and none
 // of that shows in the DDL. Each line names the move and says how letter case
-// and trailing spaces compare afterwards; a property the plan cannot read is
+// and trailing spaces compare afterwards, and whether values that differ in
+// other ways can start comparing equal; a property the plan cannot read is
 // called out rather than left unsaid.
 //
 // Like the size section, it renders nothing on a locked comment that applies
@@ -147,21 +152,39 @@ func writeCollationGroup(sb *strings.Builder, g collationGroup) {
 	}
 	fmt.Fprintf(sb, "- %s on %s: %s → %s\n", collationColumnList(g.columns), inlineCode(g.table), inlineCode(g.from), to)
 	if g.to == "" {
-		sb.WriteString("  - The new collation is not in the plan, so it cannot say how letter case and trailing spaces will compare.\n")
+		sb.WriteString("  - The statement leaves the collation to the server's default, which the plan could not read, so it cannot say how values will compare.\n")
 	} else {
 		writeComparisonLine(sb, g.caseChange, caseComparison)
 		writeComparisonLine(sb, g.trailingSpaces, trailingSpaceComparison)
-		if g.caseChange == engine.ComparisonUnchanged && g.trailingSpaces == engine.ComparisonUnchanged {
-			sb.WriteString("  - Letter case and trailing spaces compare as before. Accented and other characters can still sort and compare differently.\n")
-		}
+		writeMergeLine(sb, g)
 	}
-	for _, u := range g.unique {
+	shown := g.unique[:min(len(g.unique), collationColumnsShown)]
+	for _, u := range shown {
 		noun, collisionTarget := "unique index", "that index"
 		if len(u.indexes) > 1 {
 			noun, collisionTarget = "unique indexes", "one of them"
 		}
 		fmt.Fprintf(sb, "  - %s is in %s %s: the apply fails if two existing rows collide in %s under the new collation.\n",
 			inlineCode(u.column), noun, strings.Join(inlineCodeList(u.indexes), ", "), collisionTarget)
+	}
+	if hidden := len(g.unique) - len(shown); hidden > 0 {
+		fmt.Fprintf(sb, "  - …and %d more %s in unique indexes, where the apply fails if two existing rows collide under the new collation.\n",
+			hidden, pluralize("column", hidden))
+	}
+}
+
+// writeMergeLine says whether values that compare unequal now can start
+// comparing equal for a reason the case and trailing space lines do not name.
+// Collations also weigh accents and other characters differently, so only a
+// move the engine knows cannot merge values says so; one that keeps both
+// properties says that too, so a quiet line never reads as no change at all.
+func writeMergeLine(sb *strings.Builder, g collationGroup) {
+	keepsCaseAndSpaces := g.caseChange == engine.ComparisonUnchanged && g.trailingSpaces == engine.ComparisonUnchanged
+	switch {
+	case g.canMergeValues:
+		sb.WriteString("  - Values that differ only by accents or other characters can start comparing equal.\n")
+	case keepsCaseAndSpaces:
+		sb.WriteString("  - Letter case and trailing spaces compare as before, and no values that compare unequal now start comparing equal.\n")
 	}
 }
 
@@ -229,7 +252,10 @@ func collationGroups(changes []KeyspaceChangeData) []collationGroup {
 			}
 			i := slices.IndexFunc(groups, func(g collationGroup) bool { return g.makesSameMove(table, c) })
 			if i < 0 {
-				groups = append(groups, collationGroup{table: table, from: c.From, to: c.To, caseChange: c.Case, trailingSpaces: c.TrailingSpaces})
+				groups = append(groups, collationGroup{
+					table: table, from: c.From, to: c.To,
+					caseChange: c.Case, trailingSpaces: c.TrailingSpaces, canMergeValues: c.CanMergeValues,
+				})
 				i = len(groups) - 1
 			}
 			groups[i].columns = append(groups[i].columns, c.Column)

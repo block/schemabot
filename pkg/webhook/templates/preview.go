@@ -174,11 +174,12 @@ func PreviewCommentPlanCollationChanges() string {
 				{
 					Table: "products", Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
 					Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
-					UniqueIndexes: []string{"uk_sku"},
+					CanMergeValues: true, UniqueIndexes: []string{"uk_sku"},
 				},
 				{
 					Table: "products", Column: "title", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
 					Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+					CanMergeValues: true,
 				},
 				{
 					Table: "customers", Column: "handle", From: "utf8mb4_general_ci", To: "utf8mb4_bin",
