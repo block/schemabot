@@ -141,11 +141,7 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	// gone was released before this request could be told it held it.
 	acquired, err := s.storage.Locks().Get(ctx, req.Database, req.DatabaseType)
 	if err != nil {
-		metrics.RecordLockOperation(ctx, "acquire", req.Database, "error")
-		s.logger.Error("lock acquire could not read the lock back after acquiring it; the lock is not reported held",
-			"repository", req.Repository, "database", req.Database, "database_type", req.DatabaseType,
-			"owner", req.Owner, "error", err)
-		s.writeError(w, http.StatusInternalServerError, "internal error")
+		s.writeLockReadBackFailed(w, r, req, lock.ID, err)
 		return
 	}
 	if acquired == nil {
@@ -163,6 +159,30 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	metrics.RecordLockOperation(ctx, "acquire", req.Database, "success")
 
 	s.writeJSON(w, http.StatusOK, LockResponse{Lock: lockToInfo(acquired)})
+}
+
+// writeLockReadBackFailed answers an acquire whose read of the lock afterwards
+// failed with readErr. The lock is not reported held, since it is unknown
+// whether the row is one the caller holds. When this acquire created the row
+// (createdID is the ID it assigned), the row stays held under the owner the
+// caller sent, so the response says so and how to clear it rather than leaving
+// the caller to assume nothing was taken.
+func (s *Service) writeLockReadBackFailed(w http.ResponseWriter, r *http.Request, req LockAcquireRequest, createdID int64, readErr error) {
+	ctx := r.Context()
+	metrics.RecordLockOperation(ctx, "acquire", req.Database, "error")
+	attrs := []any{
+		"repository", req.Repository, "database", req.Database, "database_type", req.DatabaseType,
+		"owner", req.Owner, "error", readErr,
+	}
+	if createdID == 0 {
+		s.logger.Error("lock acquire could not read the lock back after acquiring it; the lock was already held under this owner and is not reported held", attrs...)
+		s.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	s.logger.Error("lock acquire created the lock but could not read it back; the lock stays held under this owner and is not reported held", attrs...)
+	s.writeError(w, http.StatusInternalServerError,
+		fmt.Sprintf("lock on database %q was acquired but could not be read back, so it is not reported held; the lock may be held under owner %q: retry the acquire to confirm it, or release it under that owner",
+			req.Database, req.Owner))
 }
 
 // scopedLockAcquireHeld decides whether a scoped operator whose acquire
@@ -202,7 +222,7 @@ func (s *Service) scopedLockAcquireHeld(w http.ResponseWriter, r *http.Request, 
 			"acquirer_operator_groups", acquired.Acquirer.OperatorGroups)
 	}
 	s.logger.Warn("scoped lock acquire refused: the lock is already held under this owner and does not belong to any of the caller's operator groups; the lock is unchanged", attrs...)
-	s.writeError(w, http.StatusForbidden, s.scopedLockDenialMessage("lock_acquire", "holding", req.Database, acquired.Acquirer, refusal))
+	s.writeError(w, http.StatusForbidden, s.scopedLockDenialMessage("lock_acquire", "holding", acquired, refusal))
 	return false
 }
 
@@ -246,8 +266,9 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		authorization = s.config.AuthorizeDirectDatabaseWrite(auth.UserFromContext(r.Context()), req.Database)
-		if !s.finishDirectWriteDecision(w, r, "lock_release", req.Database, "", authorization) {
+		var allowed bool
+		authorization, allowed = s.authorizeDirectDatabaseWrite(w, r, "lock_release", req.Database)
+		if !allowed {
 			return
 		}
 	}
@@ -389,7 +410,7 @@ func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req 
 				"acquirer_operator_groups", lock.Acquirer.OperatorGroups)
 		}
 		s.logger.Warn("scoped lock release refused: the lock does not belong to any of the caller's operator groups; the lock stays held", attrs...)
-		s.writeError(w, http.StatusForbidden, s.scopedLockDenialMessage("lock_release", "releasing", req.Database, lock.Acquirer, refusal))
+		s.writeError(w, http.StatusForbidden, s.scopedLockDenialMessage("lock_release", "releasing", lock, refusal))
 		return
 	}
 
@@ -453,19 +474,24 @@ func sharesOperatorGroup(acquirerGroups, callerGroups []string) bool {
 // (operation, and action as the gerund naming what the grant does not cover)
 // and names who may release the lock instead, so the caller knows who to ask.
 // Group names are visible only to callers already authenticated behind the
-// trusted proxy.
-func (s *Service) scopedLockDenialMessage(operation, action, database string, acquirer *storage.LockAcquirer, refusal string) string {
+// trusted proxy. A refusal is reached only once the lock's owner matched the
+// one the caller sent, so a lock that records no acquirer is named by that
+// owner: the caller can then recognize a lock taken under their own owner
+// string, for example by an earlier run of their own, rather than read the
+// refusal as someone else's lock.
+func (s *Service) scopedLockDenialMessage(operation, action string, lock *storage.Lock, refusal string) string {
 	writeGroups := strings.Join(s.config.Auth.ForwardAuth.WriteGroups, ", ")
+	database := lock.DatabaseName
 	switch refusal {
 	case lockRefusalAcquirerUnrecorded:
-		return fmt.Sprintf("%s on database %q: the lock records no verified acquirer, so no operator grant covers %s it; a deployment write group (%s) may release it",
-			operation, database, action, writeGroups)
+		return fmt.Sprintf("%s on database %q: the lock is held under owner %q, the owner you sent, but records no verified acquirer (a lock taken by a server version that did not record acquirers, by a PR apply, or through the loopback break-glass lane records none), so no operator grant covers %s it; a deployment write group (%s) may release it",
+			operation, database, lock.Owner, action, writeGroups)
 	case lockRefusalAcquirerNoOperatorGroup:
 		return fmt.Sprintf("%s on database %q: the lock was acquired by a caller in none of the database's operator groups, so no operator grant covers %s it; a deployment write group (%s) may release it",
 			operation, database, action, writeGroups)
 	case lockRefusalAcquirerOtherOperatorGroup:
 		return fmt.Sprintf("%s on database %q: the lock was acquired under operator groups (%s), and you are a member of none of them; a member of one of those groups or of a deployment write group (%s) may release it",
-			operation, database, strings.Join(acquirer.OperatorGroups, ", "), writeGroups)
+			operation, database, strings.Join(lock.Acquirer.OperatorGroups, ", "), writeGroups)
 	default:
 		return fmt.Sprintf("%s on database %q: your operator grant does not cover %s this lock; a deployment write group (%s) may release it",
 			operation, database, action, writeGroups)

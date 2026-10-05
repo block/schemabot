@@ -190,8 +190,9 @@ type memoryLockStore struct {
 	// beforeAcquire runs at the start of an acquire, to stage a lock taken
 	// under the same owner before this acquire's insert.
 	beforeAcquire func(*memoryLockStore)
-	// afterAcquire runs once an acquire has succeeded, to stage a release
-	// between the acquire and the handler's read of the lock.
+	// afterAcquire runs once an acquire has succeeded, to stage a release, a
+	// replacement, or a failing read between the acquire and the handler's
+	// read of the lock.
 	afterAcquire func(*memoryLockStore)
 	// getError, when set, fails every read of the lock.
 	getError error
@@ -338,7 +339,7 @@ func TestScopedLockReleaseIsPerOperatorGroup(t *testing.T) {
 		rec := release(t, locks, &auth.User{Subject: "bob", Groups: []string{"payments-team"}})
 
 		assert.Equal(t, http.StatusForbidden, rec.Code)
-		assert.Contains(t, rec.Body.String(), "records no verified acquirer")
+		assert.Contains(t, rec.Body.String(), `the lock is held under owner \"`+owner+`\", the owner you sent, but records no verified acquirer`)
 		assert.Contains(t, rec.Body.String(), "schema-admins")
 		assert.NotNil(t, locks.lock, "a refused release leaves the lock held")
 	})
@@ -492,13 +493,14 @@ func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
 		assertUnchanged(t, locks, held)
 	})
 
-	t.Run("a lock with no recorded acquirer is refused", func(t *testing.T) {
+	t.Run("a lock with no recorded acquirer is refused and named as held under the caller's own owner", func(t *testing.T) {
 		held := paymentsLock(7, owner, nil)
 		locks := &memoryLockStore{lock: paymentsLock(7, owner, nil)}
 		rec := acquire(t, locks, bob)
 
 		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
-		assert.Contains(t, rec.Body.String(), "records no verified acquirer")
+		assert.Contains(t, rec.Body.String(), `the lock is held under owner \"`+owner+`\", the owner you sent, but records no verified acquirer`)
+		assert.Contains(t, rec.Body.String(), "schema-admins", "the denial names the write groups that may release it")
 		assertUnchanged(t, locks, held)
 	})
 
@@ -575,13 +577,44 @@ func TestScopedLockReacquireIsPerOperatorGroup(t *testing.T) {
 		assert.Nil(t, locks.lock)
 	})
 
-	t.Run("a lock that cannot be read back after the acquire is not reported held", func(t *testing.T) {
-		locks := &memoryLockStore{getError: errors.New("storage unavailable")}
+	t.Run("a lock this acquire created and then lost to another group before it was read back is refused", func(t *testing.T) {
+		otherTeam := paymentsLock(99, owner, &storage.LockAcquirer{Subject: "erin", OperatorGroups: []string{"payments-oncall"}})
+		locks := &memoryLockStore{afterAcquire: func(s *memoryLockStore) {
+			taken := *otherTeam
+			s.lock = &taken
+		}}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "acquired under operator groups (payments-oncall)")
+		assertUnchanged(t, locks, otherTeam)
+	})
+
+	t.Run("a lock this acquire created that cannot be read back is not reported held and is named to the caller", func(t *testing.T) {
+		locks := &memoryLockStore{afterAcquire: func(s *memoryLockStore) { s.getError = errors.New("storage unavailable") }}
+		rec := acquire(t, locks, bob)
+
+		assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), "was acquired but could not be read back, so it is not reported held")
+		assert.Contains(t, rec.Body.String(), `the lock may be held under owner \"`+owner+`\"`)
+		assert.Contains(t, rec.Body.String(), "release it under that owner")
+		assert.NotContains(t, rec.Body.String(), `"lock":`, "a lock that could not be read back is not reported held")
+		require.NotNil(t, locks.lock, "the created lock is left held")
+		assert.Equal(t, owner, locks.lock.Owner)
+	})
+
+	t.Run("a lock already held under this owner that cannot be read back is not reported held", func(t *testing.T) {
+		held := paymentsLock(7, owner, teamAcquirer)
+		locks := &memoryLockStore{
+			lock:         paymentsLock(7, owner, teamAcquirer),
+			afterAcquire: func(s *memoryLockStore) { s.getError = errors.New("storage unavailable") },
+		}
 		rec := acquire(t, locks, bob)
 
 		assert.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
 		assert.Contains(t, rec.Body.String(), "internal error")
 		assert.NotContains(t, rec.Body.String(), owner, "a lock that could not be read back is not described to the caller")
+		assertUnchanged(t, locks, held)
 	})
 
 	t.Run("a deployment write-group member re-acquires any group's lock by owner", func(t *testing.T) {

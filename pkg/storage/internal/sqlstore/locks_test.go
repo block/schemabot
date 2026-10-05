@@ -159,7 +159,7 @@ func TestLockStore_AcquireIfPendingPlanID_RefreshObservedPinReplaced(t *testing.
 		require.NoError(t, db.Close())
 	})
 	require.NoError(t, db.PingContext(ctx))
-	store := &lockStore{db: newRebindDB(db, MySQLDialect{}), dialect: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
+	store := &lockStore{db: newRebindDB(db, MySQLDialect{}), dialect: MySQLDialect{}, identity: MySQLDialect{}, classifier: NewMySQLErrorClassifier()}
 
 	require.NoError(t, store.Acquire(ctx, &storage.Lock{
 		DatabaseName:  "testdb",
