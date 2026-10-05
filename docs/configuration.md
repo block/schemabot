@@ -1055,15 +1055,16 @@ spirit:
 
 The defaults, and why they were chosen:
 
-- **Write threads are auto-sized and autoscaled** (not configurable as a fixed
-  count). Spirit starts write threads at a size appropriate for the target
-  instance and, with `enable_experimental_autoscaling` on, scales them
+- **Thread pools are autoscaled on Aurora** (not configurable as a fixed
+  count). With `enable_experimental_autoscaling` on, Spirit sizes the copy,
+  apply, and checksum thread pools from the Aurora instance and scales them
   dynamically from throttler feedback. A fixed thread count is the classic
   failure mode on large targets — throughput that made sense on one instance
   class silently starves or overloads another, and autoscaling is why there is
-  no operator knob for copy aggressiveness. Set
-  `enable_experimental_autoscaling: false` only as an incident kill switch when
-  autoscaling misbehaves on a target fleet.
+  no operator knob for copy aggressiveness. Autoscaling needs Aurora's load
+  signal: on other MySQL targets Spirit leaves it disengaged and runs at fixed
+  default thread counts. Set `enable_experimental_autoscaling: false` only as
+  an incident kill switch when autoscaling misbehaves on a target fleet.
 - **The copy is verified under the snapshot checksum** unless
   `enable_experimental_lockless_checksum: true` is set. The lockless checker
   verifies with optimistic reads, retries, and hot-range splitting instead of a
@@ -1071,11 +1072,6 @@ The defaults, and why they were chosen:
   keeps a long checksum from pinning InnoDB purge on the target. Cutover locking
   is the same either way. It is experimental and off by default, and these are
   the terms an operator accepts by turning it on:
-  - **A confirmed divergence fails the apply instead of being repaired.** The
-    snapshot checker rewrites a mismatched chunk from the source and carries on.
-    The lockless checker treats a chunk that mismatches twice with the source
-    unchanged as real divergence and aborts the apply — where the snapshot
-    checker would have self-healed, this one stops.
   - **A continuously updated row can keep the verify phase running.** Such a
     row is not yet supported: its chunk is deferred at the end of every pass, no
     pass ever comes back clean, and passes repeat until an operator stops the

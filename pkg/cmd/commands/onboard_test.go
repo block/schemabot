@@ -105,7 +105,7 @@ func TestBuildOnboardWritePlanPreservesMySQLTableOptions(t *testing.T) {
 // filesystem changes, even when an earlier table could be formatted.
 func TestBuildOnboardWritePlanRefusesLossyFormatting(t *testing.T) {
 	for _, databaseType := range []string{"mysql", "vitess"} {
-		for _, suffix := range []string{"/* keep me */", "STATS_PERSISTENT=0", "PACK_KEYS=1"} {
+		for _, suffix := range []string{"/* keep me */", "/*!50100 PARTITION BY HASH (id) PARTITIONS 4 */", "ENGINE_ATTRIBUTE='{}'"} {
 			t.Run(databaseType+"/"+suffix, func(t *testing.T) {
 				root := t.TempDir()
 				plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
@@ -136,10 +136,10 @@ func TestBuildOnboardWritePlanReportsAllFormattingFailures(t *testing.T) {
 	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
 		Database: "app", Type: "mysql", Environment: "staging", TableCount: 4,
 		Namespaces: map[string]*apitypes.PulledNamespace{
-			"z": {Tables: map[string]string{"c": "CREATE TABLE c (id int) PACK_KEYS=1"}},
+			"z": {Tables: map[string]string{"c": "CREATE TABLE c (id int) ENGINE_ATTRIBUTE='{}'"}},
 			"a": {Tables: map[string]string{
 				"good": "CREATE TABLE good (id int)",
-				"b":    "CREATE TABLE b (id int) STATS_PERSISTENT=0",
+				"b":    "CREATE TABLE b (id int) ENGINE_ATTRIBUTE='{\"k\": 1}'",
 				"a":    "CREATE TABLE a (id int) /* keep me */",
 			}},
 		},
@@ -150,8 +150,8 @@ func TestBuildOnboardWritePlanReportsAllFormattingFailures(t *testing.T) {
 	require.GreaterOrEqual(t, len(lines), 6)
 	assert.Equal(t, "onboarding refused; no files were written:", lines[0])
 	assert.Contains(t, lines[1], "namespace a table a: cannot preserve MySQL comments")
-	assert.Contains(t, lines[2], "namespace a table b: cannot prove statement 1 preserved its SQL")
-	assert.Contains(t, lines[3], "namespace z table c: cannot prove statement 1 preserved its SQL")
+	assert.Contains(t, lines[2], "namespace a table b: formatter could not prove statement 1 preserved its SQL")
+	assert.Contains(t, lines[3], "namespace z table c: formatter could not prove statement 1 preserved its SQL")
 	assert.Contains(t, err.Error(), "pull with -o json")
 	assert.Contains(t, err.Error(), "plan against the source environment and require no schema changes")
 	assert.Contains(t, err.Error(), "onboard pulls the source again")
