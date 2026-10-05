@@ -1,4 +1,4 @@
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -7,7 +7,7 @@ RUN go mod download
 COPY . .
 RUN go build -o /schemabot ./pkg/cmd
 
-FROM alpine:3.19
+FROM alpine:3.24
 # Retried with backoff; deploy/Dockerfile explains why.
 RUN for attempt in 1 2 3 4 5; do \
         apk add --no-cache ca-certificates && break; \

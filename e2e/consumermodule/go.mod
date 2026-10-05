@@ -11,7 +11,7 @@ module github.com/block/schemabot/e2e/consumermodule
 go 1.26.8
 
 require (
-	github.com/block/schemabot v0.0.0
+	github.com/block/schemabot v0.1.74
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/otel/sdk v1.45.0
 )
