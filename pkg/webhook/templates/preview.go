@@ -1337,6 +1337,21 @@ func PreviewCommentReviewRequiredNoOperators() string {
 	})
 }
 
+// PreviewCommentReviewRequiredStaleApproval renders the "review required"
+// comment when an authorized reviewer approved an earlier commit and schema
+// files changed after it, so that approval no longer counts.
+func PreviewCommentReviewRequiredStaleApproval() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		StaleApprovers:    []string{"jdoe"},
+	})
+}
+
 // PreviewCommentReviewGateError renders a sample review gate error comment (fail-closed).
 func PreviewCommentReviewGateError() string {
 	return RenderGenericError(SchemaErrorData{

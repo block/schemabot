@@ -166,7 +166,7 @@ func TestListReviewsRetriesUnavailableRead(t *testing.T) {
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		_, err := w.Write([]byte(`[{"user": {"login": "alice"}, "state": "APPROVED"}]`))
+		_, err := w.Write([]byte(`[{"user": {"login": "alice"}, "state": "APPROVED", "commit_id": "abc123"}]`))
 		require.NoError(t, err)
 	})
 
@@ -177,5 +177,6 @@ func TestListReviewsRetriesUnavailableRead(t *testing.T) {
 	require.Len(t, reviews, 1)
 	assert.Equal(t, "alice", reviews[0].User)
 	assert.Equal(t, ReviewApproved, reviews[0].State)
+	assert.Equal(t, "abc123", reviews[0].CommitID)
 	assert.Equal(t, 2, requests)
 }
