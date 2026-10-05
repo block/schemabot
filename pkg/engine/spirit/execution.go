@@ -44,13 +44,14 @@ func classifyRunnerError(err error) error {
 
 // newSpiritMigration builds the Spirit migration for a statement against the
 // target with the engine's copy, durability, and throttling settings.
-// Callers layer statement-specific fields (DeferCutOver, IgnoreSentinel)
+// Callers layer statement-specific fields (DeferCutOver)
 // onto the result.
 //
-// Write threads start at the target-appropriate automatic size (on Aurora,
-// the instance vCPU count) and, when autoscaling is enabled, scale
-// dynamically from there on throttler feedback, so apply throughput tracks
-// the target instance rather than a fixed constant.
+// On Aurora with autoscaling enabled, Spirit sizes the thread pools from the
+// instance and scales them on throttler feedback, so apply throughput tracks
+// the target instance rather than a fixed constant. Other MySQL targets, and
+// Aurora with autoscaling disabled, run at the configured copier threads and
+// Spirit's default write threads.
 //
 // The copy is verified under the snapshot checksum unless the lockless one is
 // enabled; cutover locking is the same either way.
@@ -66,7 +67,7 @@ func (e *Engine) newSpiritMigration(host, username, password, database, stmt str
 		EnableExperimentalLocklessChecksum: e.locklessChecksum,
 		Common: spiritflags.Common{
 			Threads:                       threads,
-			WriteThreads:                  0, // auto-size for the target
+			WriteThreads:                  0, // Spirit's default; autoscaling sizes it on Aurora
 			InterpolateParams:             true,
 			CheckpointMaxAge:              e.checkpointMaxAge,
 			MaxCommitLatency:              maxCommitLatency,
@@ -396,7 +397,6 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 
 	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
 	migration.DeferCutOver = deferCutover
-	migration.IgnoreSentinel = !deferCutover // Only wait for sentinel when deferring cutover
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {

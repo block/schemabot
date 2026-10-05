@@ -517,10 +517,11 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 // here are merged into every locally driven MySQL database's metadata unless
 // the database sets the same key itself.
 type SpiritConfig struct {
-	// EnableExperimentalAutoscaling controls whether Spirit scales write
-	// threads dynamically from throttler feedback. Defaults to true when not
-	// configured (nil = enabled); set false as the operator kill switch when
-	// autoscaling misbehaves on a target fleet.
+	// EnableExperimentalAutoscaling controls whether Spirit scales its thread
+	// pools dynamically from throttler feedback. It engages on Aurora targets
+	// only; other MySQL targets run at fixed thread counts. Defaults to true
+	// when not configured (nil = enabled); set false as the operator kill
+	// switch when autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
 
 	// EnableExperimentalLocklessChecksum verifies the copy with optimistic

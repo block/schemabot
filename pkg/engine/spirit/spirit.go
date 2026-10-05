@@ -39,9 +39,10 @@ import (
 	"github.com/block/schemabot/pkg/targetauth"
 )
 
-// DefaultThreads is the default number of concurrent copier threads. Spirit's
-// write-thread autoscaler adjusts throughput from throttler feedback during the
-// copy, so this is a starting point rather than the throughput ceiling.
+// DefaultThreads is the default number of concurrent copier threads. On
+// Aurora, Spirit's autoscaler sizes the pools from the instance and adjusts
+// them from throttler feedback during the copy, overriding this value; on
+// other MySQL targets it is the fixed copier thread count.
 const DefaultThreads = 2
 
 // DefaultLockWaitTimeout is how long Spirit waits for table locks. Spirit's
