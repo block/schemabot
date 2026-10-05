@@ -611,8 +611,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, err
 	}
 	// The target connection opens lazily, so a plan with no changes never
-	// opens it. The size probe, the policy bound's row estimates, and the
-	// existing-copy disclosure below all read the target through it.
+	// opens it. The size probe, the policy bound's row estimates, the
+	// collation report's charset defaults, and the existing-copy disclosure
+	// below all read the target through it.
 	defer verdicts.Close()
 	target := verdicts.target
 
@@ -636,6 +637,16 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	currentByTable := make(map[string]string, len(currentSchema))
 	for _, ts := range currentSchema {
 		currentByTable[ts.Name] = ts.Schema
+	}
+	// The collation report names the unique indexes that cover a re-collated
+	// column as the desired definition leaves them.
+	desiredByTable := make(map[string]string, len(desiredSchemas))
+	for _, ts := range desiredSchemas {
+		desiredByTable[ts.Name] = ts.Schema
+	}
+	collationDefaults := &targetCollationDefaults{target: target}
+	defaultCollation := func(charset string) (string, error) {
+		return collationDefaults.defaultCollation(ctx, charset)
 	}
 
 	// Best-effort per-table size estimates for plan display, read only for the
@@ -706,6 +717,14 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			}
 			if err := verdicts.record(ctx, &change, currentCreateTable); err != nil {
 				return nil, err
+			}
+			desiredCreateTable, ok := desiredByTable[pc.TableName]
+			if !ok {
+				return nil, fmt.Errorf("plan produced an ALTER for table %q, which no schema file declares", pc.TableName)
+			}
+			change.CollationChanges, err = plannedCollationChanges(e.logger, pc.Statement, currentCreateTable, desiredCreateTable, defaultCollation)
+			if err != nil {
+				return nil, fmt.Errorf("resolve collation changes for table %q: %w", pc.TableName, err)
 			}
 		}
 

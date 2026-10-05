@@ -515,6 +515,37 @@ type TableChange struct {
 	// table (data plus indexes), summed across shards for sharded targets.
 	// Display only, like EstimatedRows. Nil when no estimate was available.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, with how each move changes the way values compare. Empty when
+	// the change re-collates no column, or the engine does not report it.
+	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string `json:"column"`
+	// From is the collation the column compares under now; To is the one it
+	// compares under once the change applies, empty when the change leaves it
+	// to a server default the plan cannot read.
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	// Case and TrailingSpaces say how the comparison of values differing only
+	// in letter case, and only in trailing spaces, moves: "unchanged",
+	// "becomes_sensitive", "becomes_insensitive", or "unknown" when either
+	// collation's properties are not known. "unknown" is a possible change.
+	Case           string `json:"case"`
+	TrailingSpaces string `json:"trailing_spaces"`
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool `json:"can_merge_values"`
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
+	UniqueIndexes []string `json:"unique_indexes,omitempty"`
 }
 
 // TaskEstimatedBytes returns the byte estimate a task created from this change

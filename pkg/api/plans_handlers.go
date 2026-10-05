@@ -296,7 +296,19 @@ func tableChangeResponseFromStorage(change storage.TableChange) *apitypes.TableC
 		ShardCount:       change.ShardCount,
 		LargestShardRows: change.LargestShardRows,
 		EstimatedBytes:   change.EstimatedBytes,
+		CollationChanges: collationChangesFromStorage(change.CollationChanges),
 	}
+}
+
+func collationChangesFromStorage(changes []storage.CollationChange) []apitypes.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]apitypes.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = apitypes.CollationChange(c)
+	}
+	return out
 }
 
 // sortedPlanNamespaces returns the plan's namespace keys in sorted order so
