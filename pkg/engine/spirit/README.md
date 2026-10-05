@@ -30,8 +30,7 @@ Spirit copies table data row-by-row to a new shadow table with the desired schem
 1. Categorizes DDL statements by type: CREATE, ALTER, DROP
 2. Executes CREATE statements first (direct SQL), then ALTER (via Spirit), then DROP (direct SQL)
 3. For ALTER statements, creates a `spiritmigration.Migration` with:
-   - `DeferCutOver` — When deferred cutover is requested; the apply then waits on Spirit's sentinel table until cutover is released
-   - `IgnoreSentinel` — Set for every non-deferred apply, so a sentinel left in the schema by another run never holds its cutover
+   - `DeferCutOver` — When deferred cutover is requested; the apply then waits on Spirit's sentinel table until cutover is released. Only a deferred apply waits, so a sentinel left in the schema by another run never holds a non-deferred apply's cutover
    - Non-strict mode — Spirit falls back to a fresh copy when checkpoint resume fails (idempotent behavior)
 4. Runs the migration in a background goroutine with a cancellable context
 5. If only CREATE/DROP statements exist (no ALTER), completes immediately without Spirit

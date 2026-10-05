@@ -46,8 +46,7 @@ func classifyRunnerError(err error) error {
 
 // newSpiritMigration builds the Spirit migration for a statement against the
 // target with the engine's copy, durability, and throttling settings.
-// Callers layer statement-specific fields (DeferCutOver, IgnoreSentinel)
-// onto the result.
+// Callers layer statement-specific fields (DeferCutOver) onto the result.
 //
 // On Aurora with autoscaling enabled, Spirit sizes the thread pools from the
 // instance and scales them on throttler feedback, so apply throughput tracks
@@ -398,14 +397,11 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	e.reportExistingCopy(ctx, targetDSN(host, username, password, database), database, combinedStatement, tables)
 
 	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
+	// Only a deferred apply waits on the sentinel table. A sentinel left in
+	// the schema by an earlier cancelled or failed deferred apply never holds
+	// a non-deferred apply, whose cutover SchemaBot could neither surface nor
+	// release.
 	migration.DeferCutOver = deferCutover
-	// Only a deferred apply waits on the sentinel table. Spirit by default
-	// holds every run's cutover while any sentinel exists, including one left
-	// by an earlier cancelled or failed deferred apply, and SchemaBot can
-	// neither surface nor release that hold on a non-deferred apply. A
-	// deferred run waits regardless of IgnoreSentinel (Cutover.WaitsOnSentinel).
-	// Remove this once Spirit waits on a sentinel only for a deferred run.
-	migration.IgnoreSentinel = !deferCutover
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {
