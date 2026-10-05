@@ -1,9 +1,11 @@
 package lint
 
 import (
+	"strings"
 	"sync"
 	"testing"
 
+	spiritlint "github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -305,4 +307,74 @@ func TestPlanChangesBooleanKeywordDefaultConverges(t *testing.T) {
 func tableWithColumn(column string) string {
 	return "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, " + column +
 		", PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+}
+
+// Every table SchemaBot creates must stay changeable through an online schema
+// change later. The MySQL and Vitess engines both plan through PlanChanges with
+// this linter's Spirit config, so a CREATE TABLE that Spirit could not alter is
+// reported there at error severity, which blocks the apply unless the operator
+// passes --allow-unsafe. A table with a usable primary key and no foreign keys
+// is not flagged.
+func TestPlanChangesFlagsTablesSpiritCannotAlter(t *testing.T) {
+	const suffix = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	current := []table.TableSchema{{
+		Name:   "customers",
+		Schema: "CREATE TABLE `customers` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))" + suffix,
+	}}
+	incompatible := []struct {
+		name   string
+		create string
+	}{
+		{
+			name:   "no primary key",
+			create: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL, `note` varchar(64) NOT NULL)" + suffix,
+		},
+		{
+			name:   "a FLOAT primary key",
+			create: "CREATE TABLE `events` (`id` float NOT NULL, PRIMARY KEY (`id`))" + suffix,
+		},
+		{
+			name: "a foreign key",
+			create: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `customer_id` bigint unsigned NOT NULL, " +
+				"PRIMARY KEY (`id`), KEY `customer_id` (`customer_id`), " +
+				"CONSTRAINT `events_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`))" + suffix,
+		},
+	}
+	for _, tt := range incompatible {
+		t.Run(tt.name, func(t *testing.T) {
+			desired := append(append([]table.TableSchema{}, current...), table.TableSchema{Name: "events", Schema: tt.create})
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			assert.Equal(t, []string{"error"}, spiritCompatibleSeverities(plan, "events"))
+		})
+	}
+
+	t.Run("a bigint primary key and no foreign keys", func(t *testing.T) {
+		desired := append(append([]table.TableSchema{}, current...), table.TableSchema{
+			Name:   "events",
+			Schema: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))" + suffix,
+		})
+		plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+		require.NoError(t, err)
+		require.Len(t, plan.Statements(), 1)
+		assert.Contains(t, plan.Statements()[0], "CREATE TABLE `events`")
+		assert.Empty(t, spiritCompatibleSeverities(plan, "events"))
+	})
+}
+
+// spiritCompatibleSeverities returns the severity of each spirit_compatible
+// violation the plan reports against tableName.
+func spiritCompatibleSeverities(plan *spiritlint.Plan, tableName string) []string {
+	var severities []string
+	for _, change := range plan.Changes {
+		if change.TableName != tableName {
+			continue
+		}
+		for _, v := range change.Violations {
+			if v.Linter.Name() == "spirit_compatible" {
+				severities = append(severities, strings.ToLower(v.Severity.String()))
+			}
+		}
+	}
+	return severities
 }
