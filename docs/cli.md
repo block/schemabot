@@ -334,7 +334,7 @@ $ schemabot pull -d shop -e staging -o json
   "namespaces": {
     "shop": {
       "tables": {
-        "orders": "CREATE TABLE orders (id bigint NOT NULL) STATS_PERSISTENT=0"
+        "orders": "CREATE TABLE orders (id bigint NOT NULL) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */"
       }
     }
   },
@@ -358,7 +358,7 @@ without changing options, comments, or statements. The example becomes
 ```sql
 CREATE TABLE orders (
     id bigint NOT NULL
-) STATS_PERSISTENT=0;
+) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */;
 ```
 
 Copy namespace artifacts such as `vschema.json` into the same namespace
