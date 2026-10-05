@@ -75,33 +75,31 @@ func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engin
 	tracked.cancelsInFlight++
 	e.mu.Unlock()
 
-	if err := tracker.CancelBuild(ctx); err != nil {
-		if ctx.Err() != nil {
-			// The caller gave up while the cancel was being attempted. Only
-			// the typed outcomes positively say nothing was signalled; any
-			// other error may have come back after the signal landed.
-			mayHaveSignalled := !cancelSignalNotSent(err)
-			e.settleCancelAttempt(tracked, mayHaveSignalled)
-			if mayHaveSignalled {
+	err := tracker.CancelBuild(ctx)
+	callerErr := ctx.Err()
+	// The attempt settles exactly once, before anything acts on its outcome,
+	// so the record is in place before the drive's context is cancelled.
+	mayHaveActed := cancelAttemptMayHaveActed(err, callerErr != nil)
+	e.settleCancelAttempt(tracked, mayHaveActed)
+	if err != nil {
+		if callerErr != nil {
+			if mayHaveActed {
 				logger.Warn("PostgreSQL cancel caller gave up after the build backend may have been signalled; the drive will still read a cancellation as the operator's",
-					"task_id", key, "reason", err, "caller_error", ctx.Err())
+					"task_id", key, "reason", err, "caller_error", callerErr)
 			} else {
 				logger.Info("PostgreSQL cancel caller gave up and the build backend was not signalled; the apply is unchanged",
-					"task_id", key, "reason", err, "caller_error", ctx.Err())
+					"task_id", key, "reason", err, "caller_error", callerErr)
 			}
-			return nil, fmt.Errorf("cancel PostgreSQL concurrent index build for apply %q: %w (caller gave up: %w)", key, err, ctx.Err())
+			return nil, fmt.Errorf("cancel PostgreSQL concurrent index build for apply %q: %w (caller gave up: %w)", key, err, callerErr)
 		}
 		// Whatever kept the signal from a running statement — no build
 		// tracked yet, a build that already returned, a backend this role
 		// cannot observe or signal, a reserved session that failed — the
 		// drive's own context still ends the statement it is on, and a build
 		// that has already returned settles on its own.
-		e.settleCancelAttempt(tracked, true)
 		logger.Info("PostgreSQL cancel could not signal the build backend; cancelling the apply's own context instead",
 			"task_id", key, "reason", err)
 		cancelApply()
-	} else {
-		e.settleCancelAttempt(tracked, true)
 	}
 
 	settle, cancel := context.WithTimeout(ctx, cancelSettleTimeout)
@@ -151,10 +149,34 @@ func (e *Engine) settleCancelAttempt(tracked *trackedApply, mayHaveActed bool) {
 	tracked.cancelsInFlight--
 }
 
+// cancelAttemptMayHaveActed reports whether one Cancel call may have reached
+// the apply, given what CancelBuild returned and whether the caller had given
+// up by then. Only a caller that gave up on an outcome that positively says
+// nothing was signalled leaves the apply as it found it.
+func cancelAttemptMayHaveActed(signalErr error, callerGaveUp bool) bool {
+	if signalErr == nil {
+		// The signal was accepted for a backend running the build.
+		return true
+	}
+	if !callerGaveUp {
+		// A caller still waiting goes on to cancel the drive's context.
+		return true
+	}
+	// Any error that is not a typed not-sent outcome may have come back after
+	// the signal landed.
+	return !cancelSignalNotSent(signalErr)
+}
+
 // cancelSignalNotSent reports whether a CancelBuild error positively says no
 // signal was sent to the build backend: no build was tracked, the server
 // showed no statement running on its backend, or the backend's state was
 // hidden so none was sent blind.
+//
+// The set is not exhaustive. The tracker also sends nothing when the caller
+// has given up by the time it holds its poll lock, but it reports that as a
+// wrapped context error, which cannot be told apart from a signal that timed
+// out after it was sent; that case is therefore read as possibly signalled.
+// A typed not-dispatched outcome from the tracker would close the gap.
 func cancelSignalNotSent(err error) bool {
 	return errors.Is(err, progress.ErrNoActiveBuild) ||
 		errors.Is(err, progress.ErrBuildNotRunning) ||

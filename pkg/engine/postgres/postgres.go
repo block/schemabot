@@ -102,7 +102,9 @@ type trackedApply struct {
 	// on this apply but have not yet learned whether their signal was sent.
 	// The drive reads the apply as cancelled by the operator while any is in
 	// flight, because a signal can land before the call that sent it hears
-	// back.
+	// back. The cost runs the other way too: while a call is in flight, a
+	// backend cancellation SchemaBot did not send is also read as the
+	// operator's.
 	cancelsInFlight int
 	done            chan struct{}
 }

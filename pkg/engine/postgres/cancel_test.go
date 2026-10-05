@@ -344,24 +344,39 @@ func TestCancelStaysRequestedWhenTheCallerGivesUpAfterSignalling(t *testing.T) {
 }
 
 // A caller that gives up after the tracker positively reports that nothing was
-// signalled leaves no cancel recorded, so a backend cancellation from outside
-// SchemaBot is still a failure the next drive retries.
+// signalled — whichever typed outcome says so — leaves no cancel recorded, so
+// a backend cancellation from outside SchemaBot is still a failure the next
+// drive retries.
 func TestCancelIsNotRequestedWhenTheCallerGivesUpWithNothingSignalled(t *testing.T) {
-	ctx, giveUp := context.WithCancel(t.Context())
-	defer giveUp()
-	tracker := &fakeBuildTracker{}
-	tracker.cancelBuild = func(context.Context) error {
-		giveUp()
-		return fmt.Errorf("cancel concurrent index build backend 4242: %w", progress.ErrBuildNotRunning)
+	tests := []struct {
+		name    string
+		notSent error
+	}{
+		{name: "no active build", notSent: progress.ErrNoActiveBuild},
+		{name: "build not running", notSent: progress.ErrBuildNotRunning},
+		{name: "build unobservable", notSent: progress.ErrBuildUnobservable},
 	}
-	eng, drive := runningDrive(t, tracker, true)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, giveUp := context.WithCancel(t.Context())
+			defer giveUp()
+			tracker := &fakeBuildTracker{}
+			tracker.cancelBuild = func(context.Context) error {
+				giveUp()
+				return fmt.Errorf("cancel concurrent index build backend 4242: %w", tc.notSent)
+			}
+			eng, drive := runningDrive(t, tracker, true)
 
-	result, err := eng.Cancel(ctx, cancelRequest())
+			result, err := eng.Cancel(ctx, cancelRequest())
 
-	assert.Nil(t, result)
-	require.ErrorIs(t, err, progress.ErrBuildNotRunning)
-	assert.False(t, drive.wasCancelled())
-	assert.False(t, requestedCancel(t, eng))
+			assert.Nil(t, result)
+			require.ErrorIs(t, err, tc.notSent)
+			assert.False(t, drive.wasCancelled())
+			assert.False(t, requestedCancel(t, eng))
+			drive.settleCancelledBuild()
+			assert.Equal(t, engine.StateFailed, drive.publishedState())
+		})
+	}
 }
 
 // Two cancels for the same build overlap. The first signals the build
