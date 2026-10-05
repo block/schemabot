@@ -450,16 +450,21 @@ func (c *ServerConfig) PullPerTargetRateLimit() ratelimit.Config {
 //
 // The budget bounds one caller on one server process, not the installation:
 // every replica admits the configured rate on its own, and every admitted
-// inspection draws on the same installation quota. The sustained cost of one
-// caller per hour is therefore approximately
+// inspection draws on the same installation quota. The most one caller can
+// spend per hour, when its requests spread across every replica, is therefore
+// approximately
 //
 //	replicas × 60 × requests_per_minute × (1 + check names)
 //
 // installation-authenticated GitHub calls when each lookup fits on one page,
 // where check names is the number the deployment publishes for the repository.
-// Pagination multiplies the Check Run reads, the initial burst adds
-// inspections above the sustained rate, and resolving the installation client
-// adds app-authenticated calls that count against the App rather than the
+// That ceiling is what requests_per_minute is sized against. A caller's own
+// cost is its request rate × (1 + check names) on any number of replicas, and
+// a caller that stays on one replica is refused there once it outpaces
+// requests_per_minute and has spent its burst. Pagination multiplies the Check
+// Run reads, the initial burst adds inspections above the sustained rate, and
+// every inspection resolves a fresh installation client, adding
+// app-authenticated calls that count against the App rather than the
 // installation. Deployments running more replicas, publishing more check
 // names, or observing deep Check Run histories should lower
 // requests_per_minute.

@@ -670,19 +670,27 @@ The budget limits each caller on each replica, not the installation. Every
 replica admits the configured rate on its own, and every admitted inspection
 draws on the one installation quota, so size it against the whole deployment.
 Each inspection costs one installation-authenticated GitHub read for the pull
-request plus at least one per expected check name, so one caller's sustained
-hourly cost is approximately
-`replicas × 60 × requests_per_minute × (1 + check names)`. On the defaults, a
-deployment of three replicas publishing two check names admits one caller
-3,240 calls an hour, about two thirds of the 5,000 an hour the smallest
-installation quota allows. Check Run pagination multiplies those reads, the
-initial burst permits additional inspections, and resolving the installation
-client adds app-authenticated calls that count against the App rather than
-the installation. On a single replica, a dashboard polling three pull requests
-every 30 seconds fits the sustained default; poll at 30 seconds or longer, and
-divide the rate by the replica count when there is more than one. A deployment
-that runs more replicas, publishes more check names, or has deep Check Run
-histories should lower `requests_per_minute`.
+request plus at least one per expected check name. The most one caller can be
+admitted, when its requests spread across every replica, is approximately
+`replicas × 60 × requests_per_minute × (1 + check names)` calls an hour; size
+`requests_per_minute` so that ceiling, across the callers you expect, stays
+inside the installation quota. On the defaults, a deployment of three replicas
+publishing two check names admits one caller up to 3,240 calls an hour, about
+two thirds of the 5,000 an hour the smallest installation quota allows. Check
+Run pagination multiplies those reads, the initial burst permits additional
+inspections, and resolving the installation client adds three
+app-authenticated calls per inspection (the App, the repository's
+installation, and a fresh installation token) that count against the App
+rather than the installation. A client's own cost does not grow with the
+replica count: it is the client's request rate × (1 + check names). A
+dashboard polling three pull requests every 30 seconds makes 6 requests a
+minute and spends `360 × (1 + check names)` calls an hour, 1,080 with two
+check names, on any number of replicas. A client that holds its connection
+open usually stays on one replica, so it needs `requests_per_minute` of at
+least its own poll rate there; the default of 6 fits that dashboard. A
+deployment that runs more replicas, publishes more check names, or has deep
+Check Run histories should lower `requests_per_minute`, but not below the poll
+rate of the clients it serves.
 
 `per_caller` is keyed the same way as the pull endpoint's. With API auth
 disabled, every caller shares one budget. There is no `per_target` lane. A

@@ -120,7 +120,7 @@ func TestChecksInspectRateLimitRecordsDecisionsUnderItsEndpoint(t *testing.T) {
 
 	decisions := map[string]int64{}
 	for _, dp := range collectCounterPoints(t, reader, "schemabot.rate_limit_decisions.total") {
-		assert.Equal(t, checksInspectRateLimitEndpoint, attributeValue(t, dp, "endpoint"))
+		assert.Equal(t, "/api/checks/inspect", attributeValue(t, dp, "endpoint"))
 		assert.Equal(t, rateLimitScopeCaller, attributeValue(t, dp, "scope"))
 		decisions[attributeValue(t, dp, "decision")] += dp.Value
 	}
