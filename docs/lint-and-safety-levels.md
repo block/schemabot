@@ -138,6 +138,17 @@ classified unsafe when any of the following hold:
 - a lint rule raised it at error severity (for example dropping an index that
   was never made invisible).
 
+On the MySQL family, a new table is also unsafe when Spirit could not alter it
+later (the `spirit_compatible` rule, error severity). Every table SchemaBot
+creates should stay changeable through an online schema change, so a
+`CREATE TABLE` is flagged when the table has no primary key, has a `FLOAT` or
+`BIT` primary key column, takes part in a foreign key at either end, or has a
+`.` or backtick in its name. Only tables the plan creates are checked. An
+existing table that Spirit cannot alter is left to the runtime checks, so a
+legacy table does not block unrelated changes. `--allow-unsafe` overrides the
+rule. Use it only for legacy cases, because the table can then only be
+changed by blocking DDL, which is limited to small tables.
+
 A Vitess VSchema change is unsafe when it removes anything from the current
 VSchema: a vindex definition, a table's routing entry, or a table's
 column-vindex association. A removal changes query routing the moment the
