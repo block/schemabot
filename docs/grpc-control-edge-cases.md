@@ -172,7 +172,7 @@ than process-local memory.
 | Step | Actor | What happens | User-visible result |
 | --- | --- | --- | --- |
 | 1 | Operator / automation | Starts apply without `--defer-cutover` | No later cutover command is needed |
-| 2 | MySQL / Spirit | Runs the online schema change without creating a sentinel and proceeds through cutover; a sentinel table that already exists on the target database holds cutover until it is dropped | Progress advances to completed unless the apply fails or is stopped |
+| 2 | MySQL / Spirit | Runs the online schema change and proceeds through cutover without waiting on the sentinel | Progress advances to completed unless the apply fails or is stopped |
 | 3 | Vitess / PlanetScale | Creates a deploy request with the backend's auto-cutover disabled; the drive triggers cutover once the deploy request reports cutover-ready | Progress advances through deploy/cutover to completed or revert window |
 | 4 | SchemaBot driver | Polls and stores progress | CLI watch / PR comment / check show the normal apply lifecycle |
 

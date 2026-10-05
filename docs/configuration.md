@@ -1055,11 +1055,6 @@ The defaults, and why they were chosen:
   keeps a long checksum from pinning InnoDB purge on the target. Cutover locking
   is the same either way. It is experimental and off by default, and these are
   the terms an operator accepts by turning it on:
-  - **A confirmed divergence fails the apply instead of being repaired.** The
-    snapshot checker rewrites a mismatched chunk from the source and carries on.
-    The lockless checker treats a chunk that mismatches twice with the source
-    unchanged as real divergence and aborts the apply — where the snapshot
-    checker would have self-healed, this one stops.
   - **A continuously updated row can keep the verify phase running.** Such a
     row is not yet supported: its chunk is deferred at the end of every pass, no
     pass ever comes back clean, and passes repeat until an operator stops the

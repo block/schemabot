@@ -30,13 +30,15 @@ const maxCommitLatency = 100 * time.Millisecond
 // classifyRunnerError marks runner failures that are verdicts about the data
 // as permanent, so operator retries are not spent repeating a lossy schema
 // change: the snapshot checksum found row differences on every completed
-// attempt, or the lockless checksum proved a divergence the copy cannot heal.
-// Attempts that errored before establishing row differences remain retryable,
-// and so does the lockless checksum's pass budget running out: that verdict
-// proves no divergence, only that ranges were still changing too fast to
-// verify, which a later attempt against a quieter table can resolve.
+// attempt. Everything else remains retryable:
+//   - attempts that errored before establishing row differences;
+//   - the lockless checksum's pass budget running out, which proves no
+//     divergence, only that ranges were still changing too fast to verify;
+//   - a divergence found by the continuous checksum during the deferred
+//     cutover wait. That checksum never repairs, because a cutover may be
+//     imminent; the resumed run's initial checksum repairs the range.
 func classifyRunnerError(err error) error {
-	if errors.Is(err, checksum.ErrDifferencesExhausted) || errors.Is(err, checksum.ErrPermanentDivergence) {
+	if errors.Is(err, checksum.ErrDifferencesExhausted) {
 		return &engine.PermanentError{Err: err}
 	}
 	return err
@@ -44,7 +46,7 @@ func classifyRunnerError(err error) error {
 
 // newSpiritMigration builds the Spirit migration for a statement against the
 // target with the engine's copy, durability, and throttling settings.
-// Callers layer statement-specific fields (DeferCutOver)
+// Callers layer statement-specific fields (DeferCutOver, IgnoreSentinel)
 // onto the result.
 //
 // On Aurora with autoscaling enabled, Spirit sizes the thread pools from the
@@ -397,6 +399,13 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 
 	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
 	migration.DeferCutOver = deferCutover
+	// Only a deferred apply waits on the sentinel table. Spirit by default
+	// holds every run's cutover while any sentinel exists, including one left
+	// by an earlier cancelled or failed deferred apply, and SchemaBot can
+	// neither surface nor release that hold on a non-deferred apply. A
+	// deferred run waits regardless of IgnoreSentinel (Cutover.WaitsOnSentinel).
+	// Remove this once Spirit waits on a sentinel only for a deferred run.
+	migration.IgnoreSentinel = !deferCutover
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {
