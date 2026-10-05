@@ -780,7 +780,9 @@ progress sync (`pkg/tern/state_converters.go`, [pkg/state/README.md](../pkg/stat
 
 ### ST-7: Stop checkpoints conservatively
 
-On stop, every non-terminal task goes `stopped` whatever its engine sub-state says. A task is
+On stop, every non-terminal task goes `stopped` whatever its engine sub-state says, unless the
+engine refuses the stop because the change already settled on its own outcome, in which case the
+drive records that outcome instead (CO-3). A task is
 never promoted to `completed` on partial engine progress, and the stop snapshot is taken only
 after the engine's own stop returns. *Enforced:* stop handling in `pkg/tern/local_control.go` and
 `pkg/tern/stop_terminality.go`.
@@ -1094,10 +1096,14 @@ command may delay a drive but never wedge it. A failed request requires fresh op
 rather than being retried forever, and polling windows are bounded with visible timeout failures.
 An operation an engine declines for its whole database type is one of these doomed commands, so
 every engine states that decline in the type system rather than as a generic failure, and the
-drive resolves the request with the engine's reason instead of reattempting it.
+drive resolves the request with the engine's reason instead of reattempting it. So is an
+operation an engine refuses because the change already settled on an outcome the operation must
+not replace (CO-3), which is typed apart from a decline for the database type.
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
-`pkg/tern/control_requests.go`), the terminal resolution of a typed unsupported-operation
+`pkg/tern/control_requests.go`), the terminal resolution of a typed settled-outcome refusal on the
+stop and cancel paths (`failPendingRequestForSettledOutcome`, `pkg/tern/local_control.go`), the
+terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
 `pkg/tern/local_apply_grouped.go`, and the refusal paths of the pending control-request processors
@@ -1109,9 +1115,13 @@ When the engine's own record shows the change already settled, the drive adopts 
 instead of fighting it. A cancel against a deploy that already completed records the apply as
 completed rather than re-sending the cancel forever. Only engines whose backend holds the
 authoritative record of the change (PlanetScale, where the deploy request lives server-side) are
-consulted this way; for all others the question fails closed. And only settled outcomes are
-adopted, never a remote state still in motion. *Enforced:* terminal-truth preflights on the
-control paths (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`).
+consulted this way before a command is sent; for all others the drive's question fails closed. An
+engine that holds the record in-process answers from it when the command arrives instead: it
+refuses a stop or cancel that would replace an outcome the change already settled on, and the
+drive resolves the request and records that outcome. And only settled outcomes are adopted, never
+a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
+(`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the in-process engine's settled
+outcome checks on stop and cancel (`pkg/engine/spirit/control.go`).
 
 ### CO-4: Stop wins
 

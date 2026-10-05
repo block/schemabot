@@ -93,6 +93,11 @@ type Engine struct {
 	// engine activity into that window deterministically.
 	drainRaceWindow func()
 
+	// stopCheckpointWindow is a test seam invoked between Stop's checkpoint
+	// dump and its write of the stopped state, so tests can land an outcome in
+	// that window deterministically.
+	stopCheckpointWindow func()
+
 	// sizeProbeFault is a test seam invoked with the plan-time size probe's
 	// context when the probe starts. A non-nil error fails the probe, so tests
 	// can prove a failed or slow probe never fails or stalls a plan.
