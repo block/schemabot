@@ -61,7 +61,10 @@ func createTestDB(t *testing.T, prefix string) (appDBName, appDSN string) {
 	appDSN = strings.Replace(targetDSN, "/target_test", "/"+appDBName, 1)
 
 	t.Cleanup(func() {
-		_, err := targetDB.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
+		// t.Context() is already cancelled when cleanup runs.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		_, err := targetDB.ExecContext(ctx, "DROP DATABASE IF EXISTS `"+appDBName+"`")
 		assert.NoError(t, err, "drop app database %s", appDBName)
 		assert.NoError(t, targetDB.Close(), "close target db")
 	})
