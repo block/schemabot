@@ -1074,13 +1074,19 @@ collations, and `case` and `trailing_spaces` say how comparing values that
 differ only in letter case, or only in trailing spaces, moves. Each is
 `unchanged`, `becomes_sensitive` (such values stop comparing equal),
 `becomes_insensitive` (they start comparing equal), or `unknown`, which a
-caller treats as a possible change. `to` is omitted when the change leaves the
-collation to a server default the plan cannot read. `unique_indexes` names the
-primary key and unique indexes covering the column when the move can make
-values that were distinct compare equal, so the apply fails on that index if
-existing rows collide. It is omitted for a move that cannot, such as one onto
-the charset's binary collation that does not start ignoring trailing spaces. The field is omitted when the change re-collates no column. MySQL
-targets planned by Spirit report it; other engines omit it for now.
+caller treats as a possible change. A definition that names a charset without
+a collation takes the target server's default collation for that charset,
+which the plan reads from the target. `to` is omitted when the plan cannot
+read that default. `can_merge_values` says whether values that compare unequal
+now can compare equal after the move, whether or not `case` and
+`trailing_spaces` name the reason: collations also weigh accents and other
+characters differently. It is `false` only for a move onto the charset's binary
+collation that does not start ignoring trailing spaces. `unique_indexes` names
+the primary key and unique indexes covering the column when
+`can_merge_values` is `true`, since the apply fails on such an index if
+existing rows collide. The field is omitted when the change re-collates no
+column. MySQL targets planned by Spirit report it; other engines omit it for
+now.
 
 For example, a table change that moves a unique column onto a UCA 9.0.0
 collation, where trailing spaces start to count and other characters can
@@ -1098,6 +1104,7 @@ compare differently (illustrative values):
       "to": "utf8mb4_0900_ai_ci",
       "case": "unchanged",
       "trailing_spaces": "becomes_sensitive",
+      "can_merge_values": true,
       "unique_indexes": ["uk_handle"]
     }
   ]

@@ -592,11 +592,15 @@ type CollationChange struct {
 	// Case says whether 'abc' and 'ABC' stop or start comparing equal, and
 	// TrailingSpaces whether 'abc' and 'abc ' do.
 	Case, TrailingSpaces ComparisonChange
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason: collations also differ in how they weigh accents and
+	// other characters. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool
 	// UniqueIndexes names the primary key and unique indexes that cover the
-	// column when the move can make values that were distinct compare equal,
-	// which the index then rejects. It is empty for a move that cannot: one
-	// onto a binary collation of the same charset that does not start ignoring
-	// trailing spaces.
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
 	UniqueIndexes []string
 }
 

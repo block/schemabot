@@ -1,6 +1,8 @@
 package spirit
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -35,6 +37,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 				Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_bin",
 				Case:           engine.ComparisonBecomesSensitive,
 				TrailingSpaces: engine.ComparisonUnchanged,
+				CanMergeValues: false,
 			}},
 		},
 		{
@@ -45,6 +48,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 				Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
 				Case:           engine.ComparisonUnchanged,
 				TrailingSpaces: engine.ComparisonBecomesSensitive,
+				CanMergeValues: true,
 				UniqueIndexes:  []string{"uk_sku"},
 			}},
 		},
@@ -58,6 +62,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 				Column: "sku", From: "utf8mb4_0900_ai_ci", To: "utf8mb4_bin",
 				Case:           engine.ComparisonBecomesSensitive,
 				TrailingSpaces: engine.ComparisonBecomesInsensitive,
+				CanMergeValues: true,
 				UniqueIndexes:  []string{"uk_sku"},
 			}},
 		},
@@ -71,6 +76,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 				Column: "sku", From: "utf8mb4_bin", To: "utf8mb4_general_ci",
 				Case:           engine.ComparisonBecomesInsensitive,
 				TrailingSpaces: engine.ComparisonUnchanged,
+				CanMergeValues: true,
 				UniqueIndexes:  []string{"uk_sku"},
 			}},
 		},
@@ -84,6 +90,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 				Column: "sku", From: "utf8mb4_0900_ai_ci", To: "utf8mb4_general_ci",
 				Case:           engine.ComparisonUnchanged,
 				TrailingSpaces: engine.ComparisonBecomesInsensitive,
+				CanMergeValues: true,
 				UniqueIndexes:  []string{"uk_sku"},
 			}},
 		},
@@ -96,6 +103,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 				Column: "title", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
 				Case:           engine.ComparisonUnchanged,
 				TrailingSpaces: engine.ComparisonBecomesSensitive,
+				CanMergeValues: true,
 			}},
 		},
 		{
@@ -107,24 +115,47 @@ func TestPlannedCollationChanges(t *testing.T) {
 					Column: "sku", From: "utf8mb4_general_ci", To: "latin1_bin",
 					Case:           engine.ComparisonBecomesSensitive,
 					TrailingSpaces: engine.ComparisonUnchanged,
+					CanMergeValues: true,
 					UniqueIndexes:  []string{"uk_sku"},
 				},
 				{
 					Column: "title", From: "utf8mb4_general_ci", To: "latin1_bin",
 					Case:           engine.ComparisonBecomesSensitive,
 					TrailingSpaces: engine.ComparisonUnchanged,
+					CanMergeValues: true,
 				},
 			},
 		},
 		{
-			name:    "a collation left to the server default is reported as unknown",
+			name:    "a charset named without a collation takes the target's default for it",
 			alter:   "ALTER TABLE `products` MODIFY COLUMN `title` varchar(255) CHARACTER SET utf8mb4 DEFAULT NULL",
 			desired: productsTable,
 			want: []engine.CollationChange{{
-				Column: "title", From: "utf8mb4_general_ci", To: "",
-				Case:           engine.ComparisonUnknown,
-				TrailingSpaces: engine.ComparisonUnknown,
+				Column: "title", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+				Case:           engine.ComparisonUnchanged,
+				TrailingSpaces: engine.ComparisonBecomesSensitive,
+				CanMergeValues: true,
 			}},
+		},
+		{
+			name: "a new charset named without a collation takes the target's default for it",
+			current: "CREATE TABLE `products` (`title` varchar(255) CHARACTER SET latin1 COLLATE latin1_swedish_ci DEFAULT NULL) " +
+				"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			alter:   "ALTER TABLE `products` MODIFY COLUMN `title` varchar(255) CHARACTER SET utf8mb4 DEFAULT NULL",
+			desired: "CREATE TABLE `products` (`title` varchar(255) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci",
+			want: []engine.CollationChange{{
+				Column: "title", From: "latin1_swedish_ci", To: "utf8mb4_0900_ai_ci",
+				Case:           engine.ComparisonUnchanged,
+				TrailingSpaces: engine.ComparisonBecomesSensitive,
+				CanMergeValues: true,
+			}},
+		},
+		{
+			name: "a charset named without a collation whose default is the current collation re-collates nothing",
+			current: "CREATE TABLE `products` (`title` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL) " +
+				"DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			alter:   "ALTER TABLE `products` MODIFY COLUMN `title` varchar(255) CHARACTER SET utf8mb4 DEFAULT NULL",
+			desired: "CREATE TABLE `products` (`title` varchar(255) DEFAULT NULL) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
 		},
 		{
 			name:    "a primary key column is covered by PRIMARY",
@@ -134,6 +165,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 				Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
 				Case:           engine.ComparisonUnchanged,
 				TrailingSpaces: engine.ComparisonBecomesSensitive,
+				CanMergeValues: true,
 				UniqueIndexes:  []string{"PRIMARY"},
 			}},
 		},
@@ -159,7 +191,7 @@ func TestPlannedCollationChanges(t *testing.T) {
 			if current == "" {
 				current = productsTable
 			}
-			got, err := plannedCollationChanges(slog.New(slog.DiscardHandler), tt.alter, current, tt.desired)
+			got, err := plannedCollationChanges(slog.New(slog.DiscardHandler), tt.alter, current, tt.desired, serverDefaultCollations)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
@@ -171,11 +203,40 @@ func TestPlannedCollationChanges(t *testing.T) {
 func TestPlannedCollationChangesUnknownCollationFailsClosed(t *testing.T) {
 	current := "CREATE TABLE `notes` (`body` varchar(64) COLLATE utf8mb4_general_ci NOT NULL, UNIQUE KEY `uk_body` (`body`)) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci"
 	got, err := plannedCollationChanges(slog.New(slog.DiscardHandler),
-		"ALTER TABLE `notes` MODIFY COLUMN `body` varchar(64) COLLATE utf8mb4_made_up_ci NOT NULL", current, current)
+		"ALTER TABLE `notes` MODIFY COLUMN `body` varchar(64) COLLATE utf8mb4_made_up_ci NOT NULL", current, current, serverDefaultCollations)
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 	assert.Equal(t, "utf8mb4_made_up_ci", got[0].To)
 	assert.Equal(t, engine.ComparisonUnknown, got[0].Case)
 	assert.Equal(t, engine.ComparisonUnknown, got[0].TrailingSpaces)
+	assert.True(t, got[0].CanMergeValues)
 	assert.Equal(t, []string{"uk_body"}, got[0].UniqueIndexes)
+}
+
+// A charset default the target cannot answer leaves the new collation unknown,
+// and the column's comparisons unknown with it, rather than failing the plan.
+func TestPlannedCollationChangesUnreadableServerDefaultFailsClosed(t *testing.T) {
+	unreachable := func(string) (string, error) { return "", errors.New("connect: connection refused") }
+	got, err := plannedCollationChanges(slog.New(slog.DiscardHandler),
+		"ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) CHARACTER SET utf8mb4 NOT NULL", productsTable, productsTable, unreachable)
+	require.NoError(t, err)
+	assert.Equal(t, []engine.CollationChange{{
+		Column: "sku", From: "utf8mb4_general_ci", To: "",
+		Case:           engine.ComparisonUnknown,
+		TrailingSpaces: engine.ComparisonUnknown,
+		CanMergeValues: true,
+		UniqueIndexes:  []string{"uk_sku"},
+	}}, got)
+}
+
+// serverDefaultCollations answers each charset's default the way MySQL 8.0
+// and later do.
+func serverDefaultCollations(charset string) (string, error) {
+	switch charset {
+	case "utf8mb4":
+		return "utf8mb4_0900_ai_ci", nil
+	case "latin1":
+		return "latin1_swedish_ci", nil
+	}
+	return "", fmt.Errorf("no charset %q", charset)
 }

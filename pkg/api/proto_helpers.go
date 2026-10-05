@@ -197,6 +197,7 @@ func collationChangesFromProto(changes []*ternv1.CollationChange) []apitypes.Col
 			To:             c.GetToCollation(),
 			Case:           c.GetCaseComparison(),
 			TrailingSpaces: c.GetTrailingSpaceComparison(),
+			CanMergeValues: c.GetCanMergeValues(),
 			UniqueIndexes:  c.GetUniqueIndexes(),
 		}
 	}

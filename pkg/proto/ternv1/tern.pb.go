@@ -1567,13 +1567,17 @@ type CollationChange struct {
 	// are not known. Consumers treat "unknown" as a possible change.
 	CaseComparison          string `protobuf:"bytes,4,opt,name=case_comparison,json=caseComparison,proto3" json:"case_comparison,omitempty"`
 	TrailingSpaceComparison string `protobuf:"bytes,5,opt,name=trailing_space_comparison,json=trailingSpaceComparison,proto3" json:"trailing_space_comparison,omitempty"`
-	// Primary key and unique indexes that cover the column when the move can
-	// make values that were distinct compare equal, which the index then
-	// rejects. Empty for a move that cannot: one onto a binary collation of the
-	// same charset that does not start ignoring trailing spaces.
+	// Primary key and unique indexes that cover the column when
+	// can_merge_values, since those are the indexes that reject values once
+	// they compare equal.
 	UniqueIndexes []string `protobuf:"bytes,6,rep,name=unique_indexes,json=uniqueIndexes,proto3" json:"unique_indexes,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Whether values that compare unequal now can compare equal after the
+	// move, whether or not the two comparisons above name the reason. False
+	// only for a move onto a binary collation of the same charset that does not
+	// start ignoring trailing spaces.
+	CanMergeValues bool `protobuf:"varint,7,opt,name=can_merge_values,json=canMergeValues,proto3" json:"can_merge_values,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CollationChange) Reset() {
@@ -1646,6 +1650,13 @@ func (x *CollationChange) GetUniqueIndexes() []string {
 		return x.UniqueIndexes
 	}
 	return nil
+}
+
+func (x *CollationChange) GetCanMergeValues() bool {
+	if x != nil {
+		return x.CanMergeValues
+	}
+	return false
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
@@ -5044,14 +5055,15 @@ const file_tern_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\x11\n" +
 	"\x0f_estimated_rowsB\x15\n" +
 	"\x13_largest_shard_rowsB\x12\n" +
-	"\x10_estimated_bytes\"\xff\x01\n" +
+	"\x10_estimated_bytes\"\xa9\x02\n" +
 	"\x0fCollationChange\x12\x16\n" +
 	"\x06column\x18\x01 \x01(\tR\x06column\x12%\n" +
 	"\x0efrom_collation\x18\x02 \x01(\tR\rfromCollation\x12!\n" +
 	"\fto_collation\x18\x03 \x01(\tR\vtoCollation\x12'\n" +
 	"\x0fcase_comparison\x18\x04 \x01(\tR\x0ecaseComparison\x12:\n" +
 	"\x19trailing_space_comparison\x18\x05 \x01(\tR\x17trailingSpaceComparison\x12%\n" +
-	"\x0eunique_indexes\x18\x06 \x03(\tR\runiqueIndexes\"\xb0\x03\n" +
+	"\x0eunique_indexes\x18\x06 \x03(\tR\runiqueIndexes\x12(\n" +
+	"\x10can_merge_values\x18\a \x01(\bR\x0ecanMergeValues\"\xb0\x03\n" +
 	"\fSchemaChange\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x129\n" +
 	"\rtable_changes\x18\x02 \x03(\v2\x14.tern.v1.TableChangeR\ftableChanges\x12?\n" +

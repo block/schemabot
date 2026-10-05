@@ -87,6 +87,7 @@ func TestTableChangeConversionsPreserveCollationChanges(t *testing.T) {
 			To:             "utf8mb4_bin",
 			Case:           engine.ComparisonBecomesSensitive,
 			TrailingSpaces: engine.ComparisonUnknown,
+			CanMergeValues: true,
 			UniqueIndexes:  []string{"uk_sku"},
 		}},
 	}
@@ -96,6 +97,7 @@ func TestTableChangeConversionsPreserveCollationChanges(t *testing.T) {
 		To:             "utf8mb4_bin",
 		Case:           "becomes_sensitive",
 		TrailingSpaces: "unknown",
+		CanMergeValues: true,
 		UniqueIndexes:  []string{"uk_sku"},
 	}}
 

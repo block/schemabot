@@ -584,11 +584,15 @@ message CollationChange {
   // are not known. Consumers treat "unknown" as a possible change.
   string case_comparison = 4;
   string trailing_space_comparison = 5;
-  // Primary key and unique indexes that cover the column when the move can
-  // make values that were distinct compare equal, which the index then
-  // rejects. Empty for a move that cannot: one onto a binary collation of the
-  // same charset that does not start ignoring trailing spaces.
+  // Primary key and unique indexes that cover the column when
+  // can_merge_values, since those are the indexes that reject values once
+  // they compare equal.
   repeated string unique_indexes = 6;
+  // Whether values that compare unequal now can compare equal after the
+  // move, whether or not the two comparisons above name the reason. False
+  // only for a move onto a binary collation of the same charset that does not
+  // start ignoring trailing spaces.
+  bool can_merge_values = 7;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most

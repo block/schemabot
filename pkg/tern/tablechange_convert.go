@@ -101,6 +101,7 @@ func storageCollationChangesFromEngine(changes []engine.CollationChange) []stora
 			To:             c.To,
 			Case:           string(c.Case),
 			TrailingSpaces: string(c.TrailingSpaces),
+			CanMergeValues: c.CanMergeValues,
 			UniqueIndexes:  c.UniqueIndexes,
 		}
 	}
@@ -119,6 +120,7 @@ func protoCollationChangesFromEngine(changes []engine.CollationChange) []*ternv1
 			ToCollation:             c.To,
 			CaseComparison:          string(c.Case),
 			TrailingSpaceComparison: string(c.TrailingSpaces),
+			CanMergeValues:          c.CanMergeValues,
 			UniqueIndexes:           c.UniqueIndexes,
 		}
 	}
@@ -137,6 +139,7 @@ func storageCollationChangesFromProto(changes []*ternv1.CollationChange) []stora
 			To:             c.GetToCollation(),
 			Case:           c.GetCaseComparison(),
 			TrailingSpaces: c.GetTrailingSpaceComparison(),
+			CanMergeValues: c.GetCanMergeValues(),
 			UniqueIndexes:  c.GetUniqueIndexes(),
 		}
 	}

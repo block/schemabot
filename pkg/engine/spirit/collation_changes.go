@@ -1,9 +1,13 @@
 package spirit
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/block/spirit/pkg/parser/charset"
 	"github.com/block/spirit/pkg/statement"
@@ -14,10 +18,12 @@ import (
 // plannedCollationChanges reports each existing column whose collation the
 // ALTER moves, resolved the way MySQL applies the statement: a MODIFY that
 // names no collation picks up the table default the same statement sets, and
-// CONVERT TO CHARACTER SET re-collates every character column. A column whose
-// new collation depends on a default the definitions do not carry is reported
-// with an empty To, so the plan says it cannot tell rather than nothing.
-func plannedCollationChanges(logger *slog.Logger, alterSQL, currentCreate, desiredCreate string) ([]engine.CollationChange, error) {
+// CONVERT TO CHARACTER SET re-collates every character column. A definition
+// that names a charset and no collation takes the server's default for that
+// charset, which defaultCollation reads from the target. A column whose new
+// collation depends on a default the plan cannot read is reported with an
+// empty To, so the plan says it cannot tell rather than nothing.
+func plannedCollationChanges(logger *slog.Logger, alterSQL, currentCreate, desiredCreate string, defaultCollation func(charset string) (string, error)) ([]engine.CollationChange, error) {
 	stmts, err := statement.New(alterSQL)
 	if err != nil {
 		return nil, fmt.Errorf("parse planned ALTER: %w", err)
@@ -34,6 +40,14 @@ func plannedCollationChanges(logger *slog.Logger, alterSQL, currentCreate, desir
 		return nil, fmt.Errorf("parse desired definition: %w", err)
 	}
 	tableDefault := current.TableDefault()
+	resolve := func(column string, cc statement.CharsetCollation) string {
+		collation, err := resolvedCollation(cc, defaultCollation)
+		if err != nil {
+			logger.Warn("the target's default collation for a charset is unavailable; the plan will report the column's comparisons as unknown",
+				"table", current.TableName, "column", column, "charset", cc.Charset, "error", err)
+		}
+		return collation
+	}
 
 	var changes []engine.CollationChange
 	for _, col := range current.GetColumns() {
@@ -58,24 +72,102 @@ func plannedCollationChanges(logger *slog.Logger, alterSQL, currentCreate, desir
 				"table", current.TableName, "column", col.Name)
 			continue
 		}
-		to := change.After.Collation
-		if !determined {
-			logger.Debug("column's collation after the ALTER depends on a server default; the plan will report it as unknown",
-				"table", current.TableName, "column", col.Name)
-			to = ""
+		from := resolve(col.Name, change.Before)
+		to := resolve(col.Name, change.After)
+		if from != "" && strings.EqualFold(from, to) {
+			logger.Debug("column's collation resolves to the one it has; the ALTER does not re-collate it",
+				"table", current.TableName, "column", col.Name, "collation", from)
+			continue
 		}
-		before := collationProperties(logger, change.Before.Collation)
+		if to == "" {
+			logger.Debug("column's collation after the ALTER depends on a default the plan cannot read; the plan will report it as unknown",
+				"table", current.TableName, "column", col.Name)
+		}
+		before := collationProperties(logger, from)
 		after := collationProperties(logger, to)
+		merges := canMergeValues(change, before, after)
+		var unique []string
+		if merges {
+			unique = uniqueIndexesCovering(desired, col.Name)
+		}
 		changes = append(changes, engine.CollationChange{
 			Column:         col.Name,
-			From:           change.Before.Collation,
+			From:           from,
 			To:             to,
 			Case:           compareChange(before, after, caseSensitive),
 			TrailingSpaces: compareChange(before, after, trailingSpacesSensitive),
-			UniqueIndexes:  uniqueIndexesAtRisk(desired, col.Name, change, before, after),
+			CanMergeValues: merges,
+			UniqueIndexes:  unique,
 		})
 	}
 	return changes, nil
+}
+
+// resolvedCollation is the collation a column compares under: the one its
+// definition names, or for a definition that names only a charset, the
+// server's default for that charset. It is empty when neither is known.
+func resolvedCollation(cc statement.CharsetCollation, defaultCollation func(charset string) (string, error)) (string, error) {
+	if cc.Collation != "" || cc.Charset == "" {
+		return cc.Collation, nil
+	}
+	collation, err := defaultCollation(cc.Charset)
+	if err != nil {
+		return "", fmt.Errorf("read the default collation of charset %q: %w", cc.Charset, err)
+	}
+	return collation, nil
+}
+
+// collationDefaultProbeTimeout bounds each read of a charset's default
+// collation from the target. The collation report is informational, so a slow
+// target leaves a column's comparisons unknown rather than stalling the plan.
+const collationDefaultProbeTimeout = 5 * time.Second
+
+// targetCollationDefaults reads the collation the target gives each charset
+// that a definition names without a collation. The default differs between
+// server versions, so the plan asks the target rather than assuming one. Each
+// answer, including a failure, is cached for the plan, so a plan that
+// re-collates many columns reads each charset once. It is not safe for
+// concurrent use; the plan reports its tables one at a time.
+type targetCollationDefaults struct {
+	target *lazyTargetDB
+	cache  map[string]collationDefault
+}
+
+type collationDefault struct {
+	collation string
+	err       error
+}
+
+func (d *targetCollationDefaults) defaultCollation(ctx context.Context, charset string) (string, error) {
+	key := strings.ToLower(charset)
+	if cached, ok := d.cache[key]; ok {
+		return cached.collation, cached.err
+	}
+	collation, err := d.read(ctx, charset)
+	if d.cache == nil {
+		d.cache = make(map[string]collationDefault)
+	}
+	d.cache[key] = collationDefault{collation: collation, err: err}
+	return collation, err
+}
+
+func (d *targetCollationDefaults) read(ctx context.Context, charset string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, collationDefaultProbeTimeout)
+	defer cancel()
+	db, err := d.target.get(ctx)
+	if err != nil {
+		return "", fmt.Errorf("connect for the default collation of charset %q: %w", charset, err)
+	}
+	var collation string
+	err = db.QueryRowContext(ctx,
+		"SELECT DEFAULT_COLLATE_NAME FROM information_schema.CHARACTER_SETS WHERE CHARACTER_SET_NAME = ?", charset).Scan(&collation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("the target has no charset %q", charset)
+	}
+	if err != nil {
+		return "", fmt.Errorf("query the default collation of charset %q: %w", charset, err)
+	}
+	return collation, nil
 }
 
 func caseSensitive(c *charset.Collation) bool { return c.CaseSensitive }
@@ -118,24 +210,13 @@ func compareChange(before, after *charset.Collation, sensitive func(*charset.Col
 	}
 }
 
-// uniqueIndexesAtRisk names the unique indexes covering column when the move
-// can make values that compared unequal start comparing equal, since those are
-// the indexes the apply fails on if existing rows collide. A move it cannot do
-// that for lists none, so the plan does not warn about a collision that cannot
-// happen.
-func uniqueIndexesAtRisk(table *statement.CreateTable, column string, change statement.ColumnCollationChange, before, after *charset.Collation) []string {
-	if !canMergeValues(change, before, after) {
-		return nil
-	}
-	return uniqueIndexesCovering(table, column)
-}
-
 // canMergeValues reports whether a collation move can make two values that
-// compared unequal start comparing equal. Only a move onto a binary collation
-// of the same charset is known not to: it compares code points or bytes, so
-// it calls two values equal only when they are identical, apart from the
-// trailing spaces it ignores when it pads and the old collation did not. A
-// collation the plan cannot read can merge values.
+// compared unequal start comparing equal, which is when a unique index
+// covering the column can reject rows it accepted before. Only a move onto a
+// binary collation of the same charset is known not to: it compares code
+// points or bytes, so it calls two values equal only when they are identical,
+// apart from the trailing spaces it ignores when it pads and the old
+// collation did not. A collation the plan cannot read can merge values.
 func canMergeValues(change statement.ColumnCollationChange, before, after *charset.Collation) bool {
 	if before == nil || after == nil {
 		return true

@@ -1570,11 +1570,14 @@ type CollationChange struct {
 	// collation's properties are not known. "unknown" is a possible change.
 	Case           string `json:"case"`
 	TrailingSpaces string `json:"trailing_spaces"`
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool `json:"can_merge_values"`
 	// UniqueIndexes names the primary key and unique indexes that cover the
-	// column when the move can make values that were distinct compare equal,
-	// which the index then rejects. It is empty for a move that cannot: one
-	// onto a binary collation of the same charset that does not start ignoring
-	// trailing spaces.
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
 	UniqueIndexes []string `json:"unique_indexes,omitempty"`
 }
 

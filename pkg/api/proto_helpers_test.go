@@ -532,6 +532,7 @@ func TestTableChangeResponseCarriesCollationChanges(t *testing.T) {
 		To:             "utf8mb4_bin",
 		Case:           "becomes_sensitive",
 		TrailingSpaces: "unknown",
+		CanMergeValues: true,
 		UniqueIndexes:  []string{"uk_sku"},
 	}}
 	fromProto := tableChangeResponseFromProto(&ternv1.TableChange{
@@ -542,6 +543,7 @@ func TestTableChangeResponseCarriesCollationChanges(t *testing.T) {
 			ToCollation:             "utf8mb4_bin",
 			CaseComparison:          "becomes_sensitive",
 			TrailingSpaceComparison: "unknown",
+			CanMergeValues:          true,
 			UniqueIndexes:           []string{"uk_sku"},
 		}},
 	})
@@ -553,6 +555,7 @@ func TestTableChangeResponseCarriesCollationChanges(t *testing.T) {
 			To:             "utf8mb4_bin",
 			Case:           "becomes_sensitive",
 			TrailingSpaces: "unknown",
+			CanMergeValues: true,
 			UniqueIndexes:  []string{"uk_sku"},
 		}},
 	})
