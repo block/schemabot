@@ -252,6 +252,27 @@ func TestIsUnsupportedOperation(t *testing.T) {
 	})
 }
 
+// A settled-outcome refusal is its own type: it never reads as a gap in what
+// the engine supports or as a completion, and it stays retryable so no generic
+// failure path records an outcome the engine has not reported.
+func TestIsSettledOutcome(t *testing.T) {
+	refusal := NewSettledOutcomeError("stop rejected: the schema change on database %s failed before the stop arrived", "testdb")
+	wrapped := fmt.Errorf("stop local engine for task t-1: %w", refusal)
+
+	assert.True(t, IsSettledOutcome(refusal))
+	assert.True(t, IsSettledOutcome(wrapped))
+	settled, ok := AsSettledOutcome(wrapped)
+	require.True(t, ok)
+	assert.Equal(t, "stop rejected: the schema change on database testdb failed before the stop arrived", settled.Error())
+
+	assert.False(t, IsUnsupportedOperation(wrapped))
+	assert.False(t, IsAlreadyCompleted(wrapped))
+	assert.True(t, IsRetryable(wrapped))
+	assert.False(t, IsSettledOutcome(NewUnsupportedOperationError("stop is not supported")))
+	assert.False(t, IsSettledOutcome(fmt.Errorf("connection refused")))
+	assert.False(t, IsSettledOutcome(nil))
+}
+
 func TestIsTransientTransportError(t *testing.T) {
 	tests := []struct {
 		name string

@@ -1390,7 +1390,7 @@ func TestLocalClient_StopSurfacesErrorWhenEngineHasLiveWork(t *testing.T) {
 }
 
 // A stop refused because the engine has already failed is a settled-outcome
-// decline. It bypasses the live-work probe so the durable request processor can
+// refusal. It bypasses the live-work probe so the durable request processor can
 // resolve it terminally while the drive continues and records the failure.
 func TestLocalClient_StopPreservesSettledEngineFailure(t *testing.T) {
 	apply := &storage.Apply{
@@ -1409,7 +1409,7 @@ func TestLocalClient_StopPreservesSettledEngineFailure(t *testing.T) {
 		Namespace:      "testdb",
 		State:          state.Task.Running,
 	}
-	stopErr := engine.NewUnsupportedOperationError("schema change already failed")
+	stopErr := engine.NewSettledOutcomeError("schema change already failed")
 	eng := &controlCaptureEngine{
 		stopErr:        stopErr,
 		progressResult: &engine.ProgressResult{State: engine.StateFailed},
@@ -1419,10 +1419,98 @@ func TestLocalClient_StopPreservesSettledEngineFailure(t *testing.T) {
 	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
 
 	require.ErrorIs(t, err, stopErr)
-	assert.True(t, engine.IsUnsupportedOperation(err))
-	assert.Nil(t, eng.progressReq, "a settled-outcome decline must not enter the live-work retry path")
+	assert.True(t, engine.IsSettledOutcome(err))
+	assert.Nil(t, eng.progressReq, "a settled-outcome refusal must not enter the live-work retry path")
 	assert.Equal(t, state.Task.Running, task.State)
 	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// A durable stop or cancel that reaches a MySQL schema change whose engine has
+// already failed, before the drive's next poll has recorded the failure, is
+// refused by the engine with a settled-outcome refusal. The drive resolves the
+// request as failed with the engine's reason, so it is not re-sent on every
+// claim, and keeps going rather than standing down: the task and apply are not
+// recorded stopped or cancelled, and the drive's next poll records the failure
+// the engine reports.
+func TestLocalClient_PendingControlResolvesSettledEngineFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation storage.ControlOperation
+		configure func(eng *controlCaptureEngine, refusal error)
+		process   func(t *testing.T, client *LocalClient, apply *storage.Apply) (bool, error)
+		reason    string
+	}{
+		{
+			name:      "stop",
+			operation: storage.ControlOperationStop,
+			configure: func(eng *controlCaptureEngine, refusal error) { eng.stopErr = refusal },
+			process: func(t *testing.T, client *LocalClient, apply *storage.Apply) (bool, error) {
+				return client.processPendingStopControlRequest(t.Context(), apply)
+			},
+			reason: "stop rejected: the schema change on database testdb failed before the stop arrived; the failure stands, plan and apply again to retry",
+		},
+		{
+			name:      "cancel",
+			operation: storage.ControlOperationCancel,
+			configure: func(eng *controlCaptureEngine, refusal error) { eng.cancelErr = refusal },
+			process: func(t *testing.T, client *LocalClient, apply *storage.Apply) (bool, error) {
+				return client.processPendingCancelControlRequest(t.Context(), apply)
+			},
+			reason: "cancel rejected: the schema change on database testdb failed before the cancel arrived; the failure stands, plan and apply again to retry",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-mysql-pending-" + tc.name + "-failed",
+				State:           state.Apply.Running,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+			}
+			task := &storage.Task{
+				ID:             7,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-mysql-pending-" + tc.name + "-failed",
+				Database:       "testdb",
+				Namespace:      "testdb",
+				State:          state.Task.Running,
+			}
+			eng := &controlCaptureEngine{progressResult: &engine.ProgressResult{State: engine.StateFailed}}
+			tc.configure(eng, engine.NewSettledOutcomeError("%s", tc.reason))
+			client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+			testStorage, ok := client.storage.(*controlTestStorage)
+			require.True(t, ok)
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:     apply.ID,
+				Operation:   tc.operation,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+			}}}
+			testStorage.controlRequests = controlRequests
+
+			standDown, err := tc.process(t, client, apply)
+
+			require.NoError(t, err)
+			assert.False(t, standDown, "the drive must keep going and record the engine's failure, not an operator command")
+			assert.Nil(t, eng.progressReq, "a settled-outcome refusal must not enter the live-work retry path")
+			assert.Equal(t, state.Task.Running, task.State, "the task must not be recorded stopped or cancelled over a failed change")
+			assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for the drive's poll to record the failure")
+			pending, err := controlRequests.GetPending(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			assert.Nil(t, pending, "the durable request must be resolved, not re-sent on every claim")
+			resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			require.NotNil(t, resolved)
+			assert.Equal(t, storage.ControlRequestFailed, resolved.Status)
+			assert.Equal(t, tc.reason, resolved.ErrorMessage, "the failed request must carry the engine's reason, including how to recover")
+
+			standDown, err = tc.process(t, client, apply)
+			require.NoError(t, err)
+			assert.False(t, standDown, "a resolved refusal must not be re-consumed on the next drive claim")
+		})
+	}
 }
 
 // When the live-work probe itself fails, the engine's state is unknown:

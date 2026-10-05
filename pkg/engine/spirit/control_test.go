@@ -43,6 +43,20 @@ func registerRunningSchemaChange(eng *Engine) *runningSchemaChange {
 	return rm
 }
 
+// assertSettledOutcomeRefusal checks that err is the typed refusal for a
+// control operation that found the schema change already settled: the durable
+// request resolves on it, it never reads as a gap in what the engine supports or
+// as a completion, and its reason tells the operator how to recover.
+func assertSettledOutcomeRefusal(t *testing.T, err error, wantReason string) {
+	t.Helper()
+	require.Error(t, err)
+	assert.True(t, engine.IsSettledOutcome(err), "the durable request must resolve terminally on the settled outcome")
+	assert.False(t, engine.IsUnsupportedOperation(err), "a settled outcome is not a control operation the engine lacks")
+	assert.False(t, engine.IsAlreadyCompleted(err), "a change that did not complete must never reconcile as completed")
+	assert.Contains(t, err.Error(), wantReason)
+	assert.Contains(t, err.Error(), "plan and apply again to retry")
+}
+
 // A stop that reaches a schema change which has already failed leaves the
 // failure in place. A failed change cannot be paused or resumed, so recording it
 // as stopped would tell the operator to resume a change that is dead; the stop
@@ -56,11 +70,8 @@ func TestStopLeavesFailedSchemaChangeFailed(t *testing.T) {
 	eng.setSchemaChangeFailed(engine.OperatorErrorf(nil, "copy of users hit a duplicate key"))
 
 	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
-	require.Error(t, err)
 	assert.Nil(t, result)
-	assert.Contains(t, err.Error(), "failed before the stop arrived")
-	assert.True(t, engine.IsUnsupportedOperation(err), "the durable request must resolve terminally")
-	assert.False(t, engine.IsAlreadyCompleted(err), "a failed change must never reconcile as completed")
+	assertSettledOutcomeRefusal(t, err, "failed before the stop arrived; the failure stands")
 	assert.False(t, cancelCalled)
 	assert.Equal(t, engine.StateFailed, rm.state)
 	assert.Equal(t, "copy of users hit a duplicate key", rm.errorMessage)
@@ -72,11 +83,29 @@ func TestStopLeavesCancelledSchemaChangeCancelled(t *testing.T) {
 	rm.state = engine.StateCancelled
 
 	result, err := eng.Stop(t.Context(), &engine.ControlRequest{})
-	require.Error(t, err)
 	assert.Nil(t, result)
-	assert.True(t, engine.IsUnsupportedOperation(err))
-	assert.Contains(t, err.Error(), "was already cancelled")
+	assertSettledOutcomeRefusal(t, err, "was already cancelled before the stop arrived")
 	assert.Equal(t, engine.StateCancelled, rm.state)
+}
+
+// A cancel that reaches a schema change which has already failed leaves the
+// failure in place, the same way a stop does: recording it as cancelled would
+// replace the failure and its reason with an outcome the operator chose. The
+// change is not cancelled again and its artifacts are not touched.
+func TestCancelLeavesFailedSchemaChangeFailed(t *testing.T) {
+	eng := New(Config{})
+	rm := registerRunningSchemaChange(eng)
+	cancelCalled := false
+	rm.cancelFunc = func() { cancelCalled = true }
+	eng.setSchemaChangeFailed(engine.OperatorErrorf(nil, "copy of users hit a duplicate key"))
+
+	result, err := eng.Cancel(t.Context(), &engine.ControlRequest{})
+	assert.Nil(t, result)
+	assertSettledOutcomeRefusal(t, err, "failed before the cancel arrived; the failure stands")
+	assert.False(t, cancelCalled)
+	assert.Equal(t, engine.StateFailed, rm.state)
+	assert.Equal(t, "copy of users hit a duplicate key", rm.errorMessage)
+	assert.Same(t, rm, eng.runningSchemaChange, "a refused cancel must leave the failed change tracked so progress keeps reporting it")
 }
 
 // A stop checkpoints the copy before it cancels, and the schema change can
@@ -99,9 +128,7 @@ func TestStopKeepsOutcomeThatLandsDuringCheckpoint(t *testing.T) {
 			},
 			wantState: engine.StateFailed,
 			checkErr: func(t *testing.T, err error) {
-				assert.Contains(t, err.Error(), "failed before the stop arrived")
-				assert.True(t, engine.IsUnsupportedOperation(err))
-				assert.False(t, engine.IsAlreadyCompleted(err))
+				assertSettledOutcomeRefusal(t, err, "failed before the stop arrived; the failure stands")
 			},
 		},
 		{
