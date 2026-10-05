@@ -17,6 +17,9 @@ type ReviewGateData struct {
 	// the gate: admins, repo admins, and codeowners.
 	OtherReviewers []string
 	PRAuthor       string
+	// StaleApprovers are authorized reviewers whose approval was given on an
+	// earlier commit and no longer counts.
+	StaleApprovers []string
 }
 
 // RenderReviewRequired renders a PR comment when the review gate blocks an apply.
@@ -30,6 +33,14 @@ func RenderReviewRequired(data ReviewGateData) string {
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
 	sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
+	if len(data.StaleApprovers) > 0 {
+		mentions := make([]string, 0, len(data.StaleApprovers))
+		for _, approver := range data.StaleApprovers {
+			mentions = append(mentions, "@"+approver)
+		}
+		fmt.Fprintf(&sb, "\nApprovals on an earlier commit no longer count, because schema files changed since then or SchemaBot could not confirm they did not: %s. Ask for an approval of the latest commit.\n",
+			strings.Join(mentions, ", "))
+	}
 
 	hasOperators := len(data.OperatorReviewers) > 0
 	hasOthers := len(data.OtherReviewers) > 0

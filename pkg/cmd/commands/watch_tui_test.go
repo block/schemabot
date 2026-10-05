@@ -34,7 +34,7 @@ func TestFetchProgress_ServerReturns500_ReturnsError(t *testing.T) {
 	require.True(t, ok, "expected progressMsg, got %T", msg)
 	assert.Empty(t, pmsg.state, "fetchProgress should not set state on error")
 	assert.True(t, pmsg.failed, "should be a fetch error")
-	assert.False(t, pmsg.retryable, "5xx without error code should not be retryable")
+	assert.True(t, pmsg.retryable, "5xx without error code should be retryable")
 	assert.Contains(t, pmsg.errorMsg, "500")
 }
 
@@ -85,6 +85,36 @@ func TestWatchModel_FirstPollRetryableError_ShowsLoadingWithError(t *testing.T) 
 		"should show the error")
 
 	assert.Nil(t, retCmd, "retryable error should return nil cmd (tick loop handles retry)")
+}
+
+// An operator watching interactively while the server stays unreachable sees
+// the last known progress with the error for a bounded stretch, then the watch
+// quits with the same give-up message the non-interactive watches return,
+// rather than polling stale state forever.
+func TestWatchModel_GivesUpAfterConsecutiveRetryableFailures(t *testing.T) {
+	m := NewWatchModel("http://schemabot.test", "", "staging", false)
+	m.applyID = scriptedApplyID
+	updated, _ := m.Update(progressMsg{state: state.Apply.Running, tables: []templates.TableProgress{{TableName: "orders", Status: state.Apply.Running}}})
+	model := updated.(WatchModel)
+	failure := progressMsg{failed: true, retryable: true, errorMsg: "cannot connect to http://schemabot.test (is the server running?)"}
+
+	for attempt := 1; attempt < maxConsecutiveProgressFailures; attempt++ {
+		var cmd tea.Cmd
+		updated, cmd = model.Update(failure)
+		model = updated.(WatchModel)
+		require.Nil(t, cmd, "attempt %d is below the limit and must keep polling", attempt)
+		assert.Equal(t, failure.errorMsg, model.errorMsg)
+	}
+
+	updated, cmd := model.Update(failure)
+	model = updated.(WatchModel)
+
+	require.NotNil(t, cmd, "the attempt that reaches the limit ends the watch")
+	assert.IsType(t, tea.QuitMsg{}, cmd())
+	assert.Equal(t, maxConsecutiveProgressFailures, model.consecutiveErrors)
+	assert.Equal(t, progressGiveUpMessage(scriptedApplyID, maxConsecutiveProgressFailures)+": "+failure.errorMsg, model.errorMsg)
+	assert.Contains(t, model.errorMsg, "fetch progress for apply "+scriptedApplyID+": 10 consecutive attempts failed; this watch does not affect the apply")
+	assert.Equal(t, state.Apply.Running, model.state, "the last known state is kept on screen")
 }
 
 func TestWatchModel_CompletedViewShowsCompactSummary(t *testing.T) {
@@ -569,10 +599,10 @@ func TestFetchProgress_ErrorCodeClassification(t *testing.T) {
 			retryable: false,
 		},
 		{
-			name:      "no error_code treated as permanent",
+			name:      "server error without error_code is retryable",
 			status:    http.StatusInternalServerError,
 			body:      `{"error":"internal server error"}`,
-			retryable: false,
+			retryable: true,
 		},
 	}
 

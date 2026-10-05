@@ -106,12 +106,16 @@ func TestApplyYield_NoWatchKeepsLockWhileApplyRuns(t *testing.T) {
 
 // An apply watched with --yield that ends stopped can still be resumed with
 // `start`, so the lock that keeps other operators off the database stays held
-// and the output says why.
+// and the output says why. The schema change is not on the target, so the
+// command still fails and names the command that resumes it.
 func TestApplyYield_StoppedApplyKeepsLock(t *testing.T) {
 	server, releases := yieldTestServer(t, state.Apply.Stopped)
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "staging", AutoApprove: true, Yield: true, Watch: true, Output: OutputFormatLog}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
 
-	out := runYieldApply(t, server, true)
-
+	require.ErrorContains(t, runErr, "apply apply-yield was stopped, so the schema change is not on the target")
+	assert.ErrorContains(t, runErr, "start -e")
 	assert.Contains(t, out, "Apply stopped")
 	assert.Zero(t, releases.Load(), "a resumable apply must keep its lock:\n%s", out)
 	assert.Contains(t, out, "Lock kept for testdb (mysql) despite --yield: apply apply-yield is stopped and can still be resumed.")

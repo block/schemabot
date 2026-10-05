@@ -24,10 +24,17 @@ const maxPollInterval = 30 * time.Second
 
 var callStartAPI = client.CallStartAPI
 
+// fetchErrorBackoff is the wait before the next progress poll after this many
+// consecutive failed fetches: the base interval doubled per failure, capped at
+// maxPollInterval. Every watch surface backs off on the same schedule.
+func fetchErrorBackoff(consecutiveErrors int) time.Duration {
+	return min(pollInterval<<min(consecutiveErrors, 4), maxPollInterval)
+}
+
 func (m WatchModel) tick() tea.Cmd {
 	d := pollInterval
 	if m.consecutiveErrors > 0 {
-		d = min(pollInterval<<min(m.consecutiveErrors, 4), maxPollInterval)
+		d = fetchErrorBackoff(m.consecutiveErrors)
 	}
 	return tea.Tick(d, func(t time.Time) tea.Msg {
 		return tickMsg(t)
