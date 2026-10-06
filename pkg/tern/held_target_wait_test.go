@@ -150,3 +150,19 @@ func TestRunEngineTask_HeldTargetPastTheWaitCapHandsTheApplyBack(t *testing.T) {
 	assert.NotContains(t, recording.states, state.Task.FailedRetryable, "a held table never spends the retry budget")
 	assert.NotContains(t, recording.states, state.Task.Failed)
 }
+
+// A namespace-unit re-plan that lists only a sibling's statement for a shard
+// task's table says nothing about whether this task's statement reached the
+// shard while it waited. The task starts again with its reviewed statement
+// rather than being settled as landed.
+func TestRunEngineTask_HeldShardTaskIsNotSettledByTheUnitsSiblingStatement(t *testing.T) {
+	eng := &heldTargetEngine{heldAttempts: 1, plan: heldTaskReplan(siblingStatementDDL)}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+	task.DDL = heldTaskDDL
+
+	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, withPendingSibling(task), nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, 2, eng.applies, "the task starts again with its reviewed statement")
+	assert.Equal(t, state.Task.Completed, task.State)
+}

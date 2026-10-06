@@ -362,6 +362,11 @@ func (c *LocalClient) recheckTargetAfterHeldWait(ctx context.Context, logger *sl
 		message := fmt.Sprintf("Table %s was released by another run of a schema change, but a fresh plan no longer includes this task's statement, so it was not run. Plan the schema change again.", task.TableName)
 		return false, c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, message)), nil
 	}
+	if landed && !replanKeyedByTaskShard(task, replanKey) {
+		logger.Warn("the re-plan describes the table's namespace as a unit and lists only sibling statements; the task starts again with its reviewed statement and the engine decides its outcome",
+			task.LogAttrs()...)
+		return true, taskAbort, nil
+	}
 	if landed {
 		logger.Info("the task's statement reached the table while it waited for another run to release it; the task is settled without starting it again", task.LogAttrs()...)
 		return false, c.settleTaskAlreadyOnTarget(ctx, logger, apply, task), nil
