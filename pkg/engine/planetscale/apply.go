@@ -746,6 +746,19 @@ func (e *Engine) diffBranchForResume(currentSchema map[string][]table.TableSchem
 	return diff, nil
 }
 
+// saveResumeState records a resume milestone through OnStateChange. A save
+// that does not land costs only crash recovery: the apply carries on, and the
+// result it returns carries the same state for the caller to store.
+func (e *Engine) saveResumeState(req *engine.ApplyRequest, rs *engine.ResumeState, milestone string) {
+	if req.OnStateChange == nil {
+		return
+	}
+	if err := req.OnStateChange(rs); err != nil {
+		e.logger.Warn("resume state was not saved; the apply continues and returns the state with its result",
+			"database", req.Database, "milestone", milestone, "error", err)
+	}
+}
+
 // remainingPlannedChanges returns the planned changes a resumed branch still
 // needs: each planned table change whose table the branch still differs on,
 // with the DDL the plan approved, plus each keyspace whose planned VSchema
@@ -1025,12 +1038,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		if encErr != nil {
 			return nil, fmt.Errorf("encode metadata for deferred deploy on resume: %w", encErr)
 		}
-		if req.OnStateChange != nil {
-			req.OnStateChange(&engine.ResumeState{
-				MigrationContext: req.ResumeState.MigrationContext,
-				Metadata:         persistMeta,
-			})
-		}
+		e.saveResumeState(req, &engine.ResumeState{
+			MigrationContext: req.ResumeState.MigrationContext,
+			Metadata:         persistMeta,
+		}, "deferred deploy on resume")
 		suffix := ""
 		if useInstant {
 			suffix = " (instant DDL)"
@@ -1049,12 +1060,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata on resume: %w", err)
 	}
-	if req.OnStateChange != nil {
-		req.OnStateChange(&engine.ResumeState{
-			MigrationContext: req.ResumeState.MigrationContext,
-			Metadata:         persistMeta,
-		})
-	}
+	e.saveResumeState(req, &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         persistMeta,
+	}, "deploy request created on resume")
 
 	// Capture the migration_context baseline before deploying so the new Vitess
 	// context can be identified once Vitess creates migrations for this deploy.
@@ -1367,7 +1376,7 @@ func (e *Engine) recordRecoveredDeferredDeploy(ctx context.Context, client pscli
 		Metadata:         persistMeta,
 	}
 	if req.OnStateChange != nil {
-		req.OnStateChange(resumeState)
+		e.saveResumeState(req, resumeState, fmt.Sprintf("recovered deferred deploy request #%d", dr.Number))
 	} else {
 		e.logger.Warn("recovered deferred deploy recorded only in the returned resume state: no OnStateChange callback",
 			"database", req.Database, "deploy_request", dr.Number)
@@ -1444,8 +1453,8 @@ func (e *Engine) persistResumeSchemaChangeContext(req *engine.ApplyRequest, migr
 	}
 	e.logger.Info("persisting rediscovered Vitess context on resume",
 		"database", req.Database, "context", migrationContext)
-	req.OnStateChange(&engine.ResumeState{
+	e.saveResumeState(req, &engine.ResumeState{
 		MigrationContext: migrationContext,
 		Metadata:         metadata,
-	})
+	}, "rediscovered Vitess context")
 }
