@@ -531,6 +531,23 @@ const (
 	// apply.
 	maxConsecutiveProgressPollErrors = 10
 
+	// maxConsecutiveTerminalWriteFailures bounds how many consecutive refused
+	// writes of a task's terminal state a sequential drive tolerates before it
+	// exits and leaves the apply for a later drive. It is a budget of its own
+	// rather than the progress poll budget because the failure is different: a
+	// poll error is the engine not answering, a terminal-write failure is
+	// storage refusing one transition.
+	maxConsecutiveTerminalWriteFailures = 10
+
+	// maxTotalTerminalWriteFailures bounds refused terminal writes across one
+	// task's poll, however the engine's terminal and in-flight reports
+	// interleave. A landed progress write restarts the consecutive budget, and
+	// it also keeps the operator's drive liveness signal fresh, so without this
+	// ceiling an engine that keeps alternating between finished and in flight
+	// would hold the database's active-apply slot forever. It leaves room for
+	// one full consecutive run after an earlier one was interrupted.
+	maxTotalTerminalWriteFailures = 2 * maxConsecutiveTerminalWriteFailures
+
 	// defaultLostEngineWorkPendingBudget is how long an engine that provisions
 	// resources after accepting work may keep reporting no active schema change
 	// for a task whose stored state says the work is already in flight, before
@@ -614,8 +631,14 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	// successful poll resets that one, and the poll that finds the task
 	// terminal is itself successful. A progress write that lands resets it, so
 	// an engine that reports terminal, then in flight, then terminal again
-	// gives the second terminal run the full budget.
+	// gives the second terminal run the full consecutive budget, within the
+	// total ceiling below.
 	var terminalWriteFailures int
+	// totalTerminalWriteFailures counts every failed write of the task's
+	// terminal state in this poll and is never reset, so the terminal write is
+	// attempted a bounded number of times whatever the engine reports between
+	// attempts.
+	var totalTerminalWriteFailures int
 	var resumeEventLogged bool
 	var lastProgressMetadata map[string]string
 	var progressMetadataLeaseLost bool
@@ -797,13 +820,20 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 						return taskAbort
 					}
 					terminalWriteFailures++
-					if terminalWriteFailures >= maxConsecutiveProgressPollErrors {
+					totalTerminalWriteFailures++
+					attrs = append(attrs, "consecutive_write_failures", terminalWriteFailures, "total_write_failures", totalTerminalWriteFailures)
+					if terminalWriteFailures >= maxConsecutiveTerminalWriteFailures {
 						c.logger.Error("task finished on the engine but its terminal state could not be persisted; this driver exits without starting further tasks and leaves the apply for a later drive",
-							append(attrs, "consecutive_write_failures", terminalWriteFailures, "error", err)...)
+							append(attrs, "error", err)...)
+						return taskAbort
+					}
+					if totalTerminalWriteFailures >= maxTotalTerminalWriteFailures {
+						c.logger.Error("task finished on the engine but its terminal state could not be persisted across repeated terminal reports interleaved with in-flight ones; this driver exits without starting further tasks and leaves the apply for a later drive",
+							append(attrs, "error", err)...)
 						return taskAbort
 					}
 					c.logger.Warn("task finished on the engine but persisting its terminal state failed; the drive retries the write at the next poll and starts no further task until it lands",
-						append(attrs, "consecutive_write_failures", terminalWriteFailures, "error", err)...)
+						append(attrs, "error", err)...)
 					continue
 				}
 				logger.Info("task finished",
