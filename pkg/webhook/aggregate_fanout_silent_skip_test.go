@@ -647,14 +647,28 @@ func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testin
 		h.notifyUnmanagedDiscoveredConfigs("octocat/hello-world", 1, 12345, "pull_request", "abc123", func() bool { return true }, sandbox, nil)
 	}
 
+	// With no notice, the Warn log is the only trace when no deployment
+	// manages the config, so it carries every identifier triage needs.
 	t.Run("staging-scoped deployment posts no notice for a production-only database", func(t *testing.T) {
 		cfg := nonAggregateConfig()
 		cfg.AllowedEnvironments = []string{"staging"}
 		h, _, comments := newFanOutSkipHandler(t, cfg)
+		var logs bytes.Buffer
+		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
 		notify(h)
 
 		assert.Empty(t, comments, "the production deployment may plan ledger_sandbox")
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), "exactly one log entry: %s", logs.String())
+		assert.Equal(t, "WARN", entry["level"])
+		assert.Equal(t, "octocat/hello-world", entry["repo"])
+		assert.EqualValues(t, 1, entry["pr"])
+		assert.Equal(t, "abc123", entry["head_sha"])
+		assert.Equal(t, "pull_request", entry["source"])
+		assert.Equal(t, "ledger_sandbox", entry["database"])
+		assert.Equal(t, "services/ledger/schema_sandbox", entry["schema_path"])
+		assert.Equal(t, []any{"staging"}, entry["allowed_environments"])
 	})
 
 	t.Run("deployment serving every environment posts the notice", func(t *testing.T) {
