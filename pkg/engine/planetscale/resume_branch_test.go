@@ -450,7 +450,7 @@ func TestApplyKeyspaceChanges_SnapshotDeferralIsRetriedAndReported(t *testing.T)
 	require.Len(t, events, 3*maxRetries)
 	assert.Contains(t, events[0].Message, "Retrying keyspace commerce on branch schemabot-testdb-snap")
 	assert.Contains(t, events[0].Message, "(attempt 2)")
-	assert.Contains(t, events[0].Message, "PlanetScale is taking a schema snapshot of the branch, retrying for up to 1m0s")
+	assert.Contains(t, events[0].Message, "PlanetScale is taking a schema snapshot of the branch, retrying for up to 1m0s more")
 	assert.NotContains(t, events[0].Message, "Cannot update VSchema")
 }
 
@@ -468,4 +468,97 @@ func TestApplyKeyspaceChanges_SnapshotDeferralGivesUpAfterItsWindow(t *testing.T
 	assert.Contains(t, err.Error(), "Cannot update VSchema while a schema snapshot is in progress")
 	assert.Greater(t, client.calls, maxRetries, "the snapshot window must allow more attempts than a transient error gets")
 	assert.Less(t, client.calls, 1<<20)
+}
+
+// Each snapshot retry reports how much of the window is left rather than the
+// whole window, so a retry late in the window does not promise time that is
+// already spent.
+func TestApplyKeyspaceChanges_SnapshotRetryReportsTheWindowLeft(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Second, 3*time.Second)
+	client := &snapshotThenAcceptClient{rejections: 2}
+
+	events, err := applySnapshotDeferredKeyspace(t, client)
+
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	assert.Contains(t, events[0].Message, "retrying for up to 3s more")
+	assert.Contains(t, events[1].Message, "retrying for up to 2s more")
+}
+
+// scriptedVSchemaClient answers each VSchema write with the next error in its
+// script, then accepts every write after the script runs out.
+type scriptedVSchemaClient struct {
+	psclient.PSClient
+
+	script []error
+	calls  int
+}
+
+func (c *scriptedVSchemaClient) UpdateKeyspaceVSchema(context.Context, *ps.UpdateKeyspaceVSchemaRequest) (*ps.VSchema, error) {
+	c.calls++
+	if c.calls <= len(c.script) {
+		return nil, c.script[c.calls-1]
+	}
+	return &ps.VSchema{}, nil
+}
+
+// The transient budget counts failures in a row, independent of the snapshot
+// window: a snapshot rejection between transient failures starts their count
+// again, so unrelated blips scattered across a long snapshot wait do not add up
+// to a failed keyspace. Each transient retry says how many more the keyspace
+// can take.
+func TestApplyKeyspaceChanges_SnapshotRejectionResetsTheTransientBudget(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Millisecond, time.Minute)
+	transient := &ps.Error{Code: ps.ErrInternal}
+	snapshot := errors.New("Cannot update VSchema while a schema snapshot is in progress")
+	client := &scriptedVSchemaClient{script: []error{transient, transient, snapshot, transient, transient}}
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+	var events []engine.ApplyEvent
+
+	err := e.applyKeyspaceChanges(t.Context(),
+		engine.SchemaChange{Namespace: "commerce", Metadata: map[string]string{"vschema_changed": "true"}},
+		schema.SchemaFiles{"commerce": {Files: map[string]string{"vschema.json": "{}"}}},
+		&ps.DatabaseBranchPassword{}, client, "org", "testdb", "schemabot-testdb-snap",
+		func(event engine.ApplyEvent) { events = append(events, event) },
+	)
+
+	require.NoError(t, err, "four transient failures split by a snapshot rejection are never three in a row")
+	assert.Equal(t, 6, client.calls)
+	require.Len(t, events, 5)
+	assert.Contains(t, events[0].Message, "(attempt 2): the previous attempt failed with a transient error, retrying up to 2 more times")
+	assert.Contains(t, events[1].Message, "(attempt 3): the previous attempt failed with a transient error, retrying up to 1 more time;")
+	assert.Contains(t, events[3].Message, "(attempt 5): the previous attempt failed with a transient error, retrying up to 2 more times")
+}
+
+// Transient failures in a row still fail the keyspace once the budget is spent.
+func TestApplyKeyspaceChanges_TransientFailuresInARowFailTheKeyspace(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Millisecond, time.Minute)
+	transient := &ps.Error{Code: ps.ErrInternal}
+	client := &scriptedVSchemaClient{script: []error{transient, transient, transient}}
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+
+	err := e.applyKeyspaceChanges(t.Context(),
+		engine.SchemaChange{Namespace: "commerce", Metadata: map[string]string{"vschema_changed": "true"}},
+		schema.SchemaFiles{"commerce": {Files: map[string]string{"vschema.json": "{}"}}},
+		&ps.DatabaseBranchPassword{}, client, "org", "testdb", "schemabot-testdb-snap",
+		func(engine.ApplyEvent) {},
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "after 3 transient failures in a row, 3 attempts in all")
+	assert.Equal(t, maxRetries, client.calls)
+}
+
+// One branch password carries every keyspace's changes and the validation
+// after them, so it must outlive the longest apply the retry budgets allow:
+// every batch of maxConcurrentKeyspaces waiting out a full snapshot window.
+// It never drops below an hour.
+func TestBranchPasswordTTLOutlivesTheLongestApply(t *testing.T) {
+	assert.Equal(t, 3600, branchPasswordTTL(0))
+	assert.Equal(t, 3600, branchPasswordTTL(1))
+	for keyspaces := 1; keyspaces <= 256; keyspaces++ {
+		batches := (keyspaces + maxConcurrentKeyspaces - 1) / maxConcurrentKeyspaces
+		longest := time.Duration(batches)*snapshotRetryWait + 90*time.Second
+		assert.Greater(t, time.Duration(branchPasswordTTL(keyspaces))*time.Second, longest, "%d keyspaces", keyspaces)
+	}
 }

@@ -173,10 +173,14 @@ func TestApplyKeepsItsBranchForTheDriverThatResumesIt(t *testing.T) {
 type branchHandoverClient struct {
 	branchLifecycleClient
 
-	lastCreate *ps.CreateDeployRequestRequest
+	lastCreate  *ps.CreateDeployRequestRequest
+	passwordTTL int
 }
 
-func (c *branchHandoverClient) CreateBranchPassword(context.Context, *ps.DatabaseBranchPasswordRequest) (*ps.DatabaseBranchPassword, error) {
+func (c *branchHandoverClient) CreateBranchPassword(_ context.Context, req *ps.DatabaseBranchPasswordRequest) (*ps.DatabaseBranchPassword, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.passwordTTL = req.TTL
 	return &ps.DatabaseBranchPassword{}, nil
 }
 
@@ -215,6 +219,7 @@ func TestApplyHandsOnlyItsOwnBranchToTheDeployRequest(t *testing.T) {
 		require.NotNil(t, client.lastCreate)
 		assert.Equal(t, created[0], client.lastCreate.Branch)
 		assert.True(t, client.lastCreate.AutoDeleteBranch)
+		assert.Equal(t, branchPasswordTTL(0), client.passwordTTL, "the branch password is sized by the keyspaces the apply can touch")
 	})
 
 	t.Run("an operator-supplied branch outlives the deploy request", func(t *testing.T) {

@@ -434,6 +434,24 @@ var deployRequestPendingWait = 30 * time.Minute
 // shorten it.
 var snapshotRetryWait = 10 * time.Minute
 
+// branchPasswordHeadroom is the part of a branch password's lifetime that is
+// not spent waiting out schema snapshots: the transient retries, the DDL and
+// VSchema writes themselves, and the branch validation after them.
+const branchPasswordHeadroom = 30 * time.Minute
+
+// branchPasswordTTL is how long, in seconds, the branch password an apply
+// creates stays valid. One password carries every keyspace's changes and the
+// branch validation after them, keyspaces run maxConcurrentKeyspaces at a
+// time, and each can wait out a schema snapshot for snapshotRetryWait. A
+// password that expired partway would fail a late keyspace with an
+// authentication error on a branch that is otherwise fine, so the TTL covers
+// every batch's snapshot window plus headroom, and never drops below an hour.
+func branchPasswordTTL(keyspaces int) int {
+	batches := max((keyspaces+maxConcurrentKeyspaces-1)/maxConcurrentKeyspaces, 1)
+	ttl := max(time.Duration(batches)*snapshotRetryWait+branchPasswordHeadroom, time.Hour)
+	return int(ttl / time.Second)
+}
+
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
 var deployState = state.DeployRequest
 

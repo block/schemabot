@@ -259,7 +259,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		Database:     req.Database,
 		Branch:       branchName,
 		Role:         "admin",
-		TTL:          3600,
+		TTL:          branchPasswordTTL(len(req.SchemaFiles)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create branch password: %w", err)
@@ -560,11 +560,12 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 }
 
 // applyKeyspaceChanges applies VSchema and DDL for a single keyspace with retries.
-// A transient failure is retried up to maxRetries attempts. A rejection because
-// PlanetScale is taking a schema snapshot of the branch is retried with a longer
-// backoff for up to snapshotRetryWait from the first such rejection: a snapshot
-// of a large sharded branch can outlast any small attempt count, and it clears
-// on its own.
+// A transient failure is retried until maxRetries of them occur in a row. A
+// rejection because PlanetScale is taking a schema snapshot of the branch is
+// retried with a longer backoff for up to snapshotRetryWait from the first such
+// rejection: a snapshot of a large sharded branch can outlast any small attempt
+// count, and it clears on its own. The two budgets are independent, so a
+// snapshot rejection between transient failures starts their count again.
 func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string, emitEvent func(engine.ApplyEvent)) error {
 	start := time.Now()
 	e.logger.Info(fmt.Sprintf("applying changes to keyspace %s on branch %s", sc.Namespace, branchName),
@@ -590,22 +591,27 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		}
 
 		delay := retryDelay(attempt, lastErr)
+		var reason string
 		if isSnapshotInProgress(err) {
 			if snapshotSince.IsZero() {
 				snapshotSince = time.Now()
 			}
-			if time.Since(snapshotSince)+delay > snapshotRetryWait {
+			transientFailures = 0
+			left := snapshotRetryWait - time.Since(snapshotSince)
+			if delay > left {
 				return fmt.Errorf("apply keyspace %s: PlanetScale was still taking a schema snapshot of branch %s after %s (%d attempts): %w", sc.Namespace, branchName, snapshotRetryWait, attempt, lastErr)
 			}
+			reason = snapshotRetryReason(left)
 		} else {
 			transientFailures++
 			if transientFailures >= maxRetries {
-				return fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, attempt, lastErr)
+				return fmt.Errorf("apply keyspace %s (after %d transient failures in a row, %d attempts in all): %w", sc.Namespace, transientFailures, attempt, lastErr)
 			}
+			reason = transientRetryReason(maxRetries - transientFailures)
 		}
 
 		e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
-		emitEvent(keyspaceRetryEvent(sc.Namespace, branchName, attempt+1, delay, lastErr))
+		emitEvent(keyspaceRetryEvent(sc.Namespace, branchName, attempt+1, delay, reason))
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -618,15 +624,27 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 // snapshot can defer a keyspace's changes for minutes, and saying so is what
 // tells an operator, and the driver, that the apply is waiting rather than
 // wedged. The reason is a fixed phrase: the raw error stays in the server log.
-func keyspaceRetryEvent(keyspace, branch string, attempt int, delay time.Duration, lastErr error) engine.ApplyEvent {
-	reason := fmt.Sprintf("the previous attempt failed with a transient error, retrying up to %d attempts; see server logs", maxRetries)
-	if isSnapshotInProgress(lastErr) {
-		reason = fmt.Sprintf("PlanetScale is taking a schema snapshot of the branch, retrying for up to %s", snapshotRetryWait)
-	}
+func keyspaceRetryEvent(keyspace, branch string, attempt int, delay time.Duration, reason string) engine.ApplyEvent {
 	return engine.ApplyEvent{
 		Message:  fmt.Sprintf("Retrying keyspace %s on branch %s in %s (attempt %d): %s", keyspace, branch, delay.Round(time.Second), attempt, reason),
 		Metadata: map[string]string{"keyspace": keyspace, "branch": branch},
 	}
+}
+
+// snapshotRetryReason says how much of the snapshot window is left, so a retry
+// late in the window does not read as though the whole window were still ahead.
+func snapshotRetryReason(left time.Duration) string {
+	return fmt.Sprintf("PlanetScale is taking a schema snapshot of the branch, retrying for up to %s more", left.Round(time.Second))
+}
+
+// transientRetryReason says how many more transient failures in a row the
+// keyspace can take before it fails.
+func transientRetryReason(left int) string {
+	retries := "times"
+	if left == 1 {
+		retries = "time"
+	}
+	return fmt.Sprintf("the previous attempt failed with a transient error, retrying up to %d more %s; see server logs", left, retries)
 }
 
 // applyKeyspaceChangesOnce applies VSchema and DDL for a single keyspace in one attempt.
@@ -924,7 +942,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer resumePwCancel()
 	password, err := client.CreateBranchPassword(resumePwCtx, &ps.DatabaseBranchPasswordRequest{
-		Organization: org, Database: req.Database, Branch: meta.BranchName, Role: "admin", TTL: 3600,
+		Organization: org, Database: req.Database, Branch: meta.BranchName, Role: "admin", TTL: branchPasswordTTL(len(req.SchemaFiles)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create branch password on resume: %w", err)
