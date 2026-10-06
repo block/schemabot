@@ -16,6 +16,8 @@ import (
 // It first canonicalizes using Spirit's parser, then formats:
 //   - ALTER statements: each clause on its own line
 //   - CREATE TABLE statements: each column/index on its own line
+//   - ENUM and SET value lists too long for a line of their own: wrapped
+//     onto indented lines
 //   - Data types, functions, and charset/collate values are lowercased
 //     while SQL keywords remain uppercase (PlanetScale style).
 func FormatDDL(ddl string) string {
@@ -220,8 +222,11 @@ func layoutDDLWithOptions(ddl string, multilineCreate bool) string {
 // the dialect's parser rejects — or any statement of a dialect with no
 // registered parser (logged, since it means a database type reached the
 // display layer without a parser) — renders unformatted, with only
-// surrounding whitespace trimmed and a trailing semicolon enforced. Display
-// transformations preserve quoted names and values, and unknown dialects emit
+// surrounding whitespace trimmed and a trailing semicolon enforced. Value
+// lists too long for a line of their own wrap onto indented lines; the
+// wrapping is kept only when the dialect's parser reads the wrapped statement
+// as the same SQL. Display transformations preserve quoted names and values,
+// and unknown dialects emit
 // only a debug diagnostic so interactive prompts remain readable.
 func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 	raw := strings.TrimRight(strings.TrimSpace(stmt), ";") + ";"
@@ -235,7 +240,7 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 		slog.Debug("DDL display normalization changed the statement; preserving original SQL", "dialect", dialect)
 		return raw
 	}
-	wrapped := wrapLongValueLists(formatted)
+	wrapped := wrapLongValueLists(formatted, valueListPatternFor(dialect))
 	if wrapped == formatted {
 		return formatted
 	}
@@ -252,29 +257,48 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 // plain text.
 const valueListWrapWidth = 100
 
-// valueListPattern matches the opening of an ENUM or SET value list.
-var valueListPattern = regexp.MustCompile(`(?i)^(enum|set)\s*\(`)
+// mysqlValueListPattern matches the opening of a MySQL ENUM or SET column
+// type's value list. A MySQL statement only opens a parenthesis directly after
+// SET in that type; CHARACTER SET and SET DEFAULT never take one.
+var mysqlValueListPattern = regexp.MustCompile(`(?i)^(enum|set)\s*\(`)
 
-// wrapLongValueLists breaks each ENUM or SET value list that cannot fit on a
-// line of its own across indented lines packed to valueListWrapWidth, with the
-// closing parenthesis back at the line's own indentation:
+// enumValueListPattern matches the opening of an ENUM value list. Outside the
+// MySQL family SET is not a type, and SET ( opens a parameter list such as a
+// table's storage parameters, so only ENUM lists wrap.
+var enumValueListPattern = regexp.MustCompile(`(?i)^enum\s*\(`)
+
+// valueListPatternFor returns the matcher for the dialect's value-list types.
+func valueListPatternFor(dialect schema.Dialect) *regexp.Regexp {
+	if dialect == schema.DialectMySQL {
+		return mysqlValueListPattern
+	}
+	return enumValueListPattern
+}
+
+// wrapLongValueLists breaks each value list matched by listPattern that
+// cannot fit on a line of its own across indented lines packed to
+// valueListWrapWidth, with the closing parenthesis back at the line's own
+// indentation:
 //
 //	MODIFY COLUMN `status` enum(
 //	    'PENDING', 'ACTIVE', ...
 //	) NOT NULL
 //
-// Lists short enough to fit stay inline, and quoted regions are never
-// searched or split.
-func wrapLongValueLists(ddl string) string {
+// Lists short enough to fit stay inline. Quoted regions on a line are never
+// searched or split, but each line is scanned on its own, so a literal that
+// spans lines, or a quoting form the scanner does not know such as a
+// PostgreSQL dollar-quoted body, can be misread as SQL. FormatDDLForDialect
+// keeps the result only when the parser reads it as the same statement.
+func wrapLongValueLists(ddl string, listPattern *regexp.Regexp) string {
 	lines := strings.Split(ddl, "\n")
 	for i, line := range lines {
-		lines[i] = wrapLineValueLists(line)
+		lines[i] = wrapLineValueLists(line, listPattern)
 	}
 	return strings.Join(lines, "\n")
 }
 
 // wrapLineValueLists wraps the long value lists on one line of a statement.
-func wrapLineValueLists(line string) string {
+func wrapLineValueLists(line string, listPattern *regexp.Regexp) string {
 	if len(line) <= valueListWrapWidth {
 		return line
 	}
@@ -295,7 +319,7 @@ func wrapLineValueLists(line string) string {
 		if i > 0 && isIdentifierByte(line[i-1]) {
 			continue
 		}
-		loc := valueListPattern.FindStringIndex(line[i:])
+		loc := listPattern.FindStringIndex(line[i:])
 		if loc == nil {
 			continue
 		}

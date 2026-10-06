@@ -1077,3 +1077,56 @@ func TestFormatDDLForDialectWrapsLongValueLists(t *testing.T) {
 		})
 	}
 }
+
+// The wrap scanner reads one line at a time and knows only single, double,
+// and backtick quotes, so list-like text inside a PostgreSQL literal that
+// spans lines, or inside a dollar-quoted body, looks like a value list to it.
+// Wrapping that text would change the literal; the displayed statement keeps
+// its unwrapped form instead.
+func TestFormatDDLForDialectKeepsUnwrappedFormWhenWrappingChangesSQL(t *testing.T) {
+	listText := func(quote string) string {
+		v := make([]string, 8)
+		for i := range v {
+			v[i] = quote + fmt.Sprintf("STATUS_%02d_VALUE", i) + quote
+		}
+		return "enum(" + strings.Join(v, ",") + ")"
+	}
+	tests := []struct {
+		name    string
+		dialect schema.Dialect
+		input   string
+	}{
+		{
+			name:    "postgres comment literal spanning lines",
+			dialect: schema.DialectPostgres,
+			input:   "COMMENT ON TABLE orders IS 'allowed values:\n" + listText("''") + "\nend of list'",
+		},
+		{
+			name:    "postgres dollar-quoted function body",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE FUNCTION order_statuses() RETURNS text LANGUAGE sql AS $$ SELECT 'statuses' WHERE " + listText("'") + " IS NOT NULL $$",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			parser, err := ParserForDialect(tc.dialect)
+			require.NoError(t, err)
+			unwrapped, equivalent := formatDDLForDialect(tc.dialect, parser, tc.input, false)
+			require.True(t, equivalent)
+			wrapped := wrapLongValueLists(unwrapped, valueListPatternFor(tc.dialect))
+			require.NotEqual(t, unwrapped, wrapped, "the scanner must misread the literal for this case to exercise the guard")
+			require.NotEqual(t, parser.Canonicalize(unwrapped), parser.Canonicalize(wrapped), "wrapping must change the literal for this case to exercise the guard")
+
+			assert.Equal(t, unwrapped, FormatDDLForDialect(tc.dialect, tc.input))
+		})
+	}
+}
+
+// SET is a column type only in the MySQL family. A long PostgreSQL SET (...)
+// storage-parameter list is not a value list and stays on its line.
+func TestFormatDDLForDialectLeavesPostgresSetParametersInline(t *testing.T) {
+	input := "ALTER TABLE orders SET (fillfactor = 70, autovacuum_vacuum_scale_factor = 0.01, autovacuum_analyze_scale_factor = 0.005, toast_tuple_target = 4096)"
+	formatted := FormatDDLForDialect(schema.DialectPostgres, input)
+	assert.NotContains(t, formatted, "\n", "storage parameters must not wrap")
+	assert.Contains(t, formatted, "toast_tuple_target")
+}
