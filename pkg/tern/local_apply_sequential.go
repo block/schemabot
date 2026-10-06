@@ -1043,6 +1043,15 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 // land by being retried: storage refused a value outright, which it does the
 // same way every time, or transient failures ran through the poll's error
 // budget.
+//
+// The budget is counted in polls, so it runs out after a few poll intervals.
+// That is far sooner than storage.ApplyLeaseStaleAfter, so a storage brownout
+// shorter than the lease window still halts the run and hands the apply back.
+// That trade is deliberate. While its writes fail, the run keeps changing the
+// target with nothing recording what it did, and every operator surface shows
+// progress that has stopped being true. A later drive resumes the apply and
+// reads the target before it continues (RV-1), so halting early costs a
+// resume, not a change to the target that nothing recorded.
 func progressWriteRejectedForGood(err error, consecutiveFailures int) bool {
 	if errors.Is(err, storage.ErrValueRejected) {
 		return true
