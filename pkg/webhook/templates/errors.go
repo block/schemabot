@@ -342,12 +342,14 @@ SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but {{.DeploymentSub
 Ask a SchemaBot operator to add this directory to {{.AllowedDirsKey}} in the server config, or move the schema config and files under an allowed directory.`
 
 const unmanagedSchemaConfigsNoticeTemplate = "## " + glyph.Attention + ` Schema Changes Not Managed by SchemaBot
-
-This PR changes schema under the following path(s), which this SchemaBot deployment is not configured to manage:
+{{with .Environments}}
+**Environments**: {{.}}
+{{end}}
+This PR changes schema under the following path(s), which SchemaBot is not configured to manage in any environment:
 
 {{range .Configs}}- {{.SchemaPath}} — declares database {{.Database}}
 {{end}}
-This deployment will **not** plan or apply these schema changes, and its checks on this PR do not cover them.
+These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's ` + "`allowed_dirs`" + ` in the server config; otherwise remove these schema changes from this PR.`
 
@@ -482,10 +484,13 @@ type UnmanagedSchemaConfigNoticeData struct {
 
 // RenderUnmanagedSchemaConfigsNotice renders the notice posted when a PR
 // changes schema under configs this deployment is not authorized to manage
-// and no other deployment is expected to handle them. The database names and
-// paths come from the PR's own schemabot.yaml files — untrusted input — so
-// each is normalized into a safe inline code span before rendering.
-func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeData) string {
+// and no other deployment is expected to handle them. Only a deployment
+// serving every environment posts it, so the claim covers every environment,
+// and environments names them in promotion order; the header is omitted when
+// none are known. The database names and paths come from the PR's own
+// schemabot.yaml files — untrusted input — so each is normalized into a safe
+// inline code span before rendering.
+func RenderUnmanagedSchemaConfigsNotice(environments []string, configs []UnmanagedSchemaConfigNoticeData) string {
 	normalized := make([]UnmanagedSchemaConfigNoticeData, len(configs))
 	for i, cfg := range configs {
 		normalized[i] = UnmanagedSchemaConfigNoticeData{
@@ -495,8 +500,9 @@ func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeDat
 	}
 	var sb strings.Builder
 	data := struct {
-		Configs []UnmanagedSchemaConfigNoticeData
-	}{Configs: normalized}
+		Environments string
+		Configs      []UnmanagedSchemaConfigNoticeData
+	}{Environments: strings.Join(inlineCodeList(environments), ", "), Configs: normalized}
 	if err := tmplUnmanagedNotice.Execute(&sb, data); err != nil {
 		return fmt.Sprintf("Error rendering template: %v", err)
 	}
@@ -507,7 +513,7 @@ func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeDat
 // schema changes under configs this deployment does not manage, with the
 // support-channel footer a configured deployment appends to it.
 func PreviewCommentUnmanagedSchemaConfigsNotice() string {
-	return RenderSupportChannelFooter(RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+	return RenderSupportChannelFooter(RenderUnmanagedSchemaConfigsNotice([]string{"staging", "production"}, []UnmanagedSchemaConfigNoticeData{
 		{Database: "inventory", SchemaPath: "services/inventory/schema"},
 	}), previewSupportChannel())
 }

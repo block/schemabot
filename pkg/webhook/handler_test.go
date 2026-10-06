@@ -279,7 +279,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("octo/repo", 7, "", templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderUnmanagedSchemaConfigsNotice(nil, []templates.UnmanagedSchemaConfigNoticeData{
 			{SchemaPath: "services/orders/schema", Database: "orders"},
 		}))
 

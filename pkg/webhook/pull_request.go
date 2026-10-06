@@ -692,7 +692,11 @@ func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installa
 			SchemaPath: cfg.SchemaDir,
 		})
 	}
-	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(notice))
+	var environments []string
+	if ok {
+		environments = config.OrderedEnvironments(config.KnownEnvironments())
+	}
+	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(environments, notice))
 }
 
 // droppedDiscoveredConfigs returns the discovered configs the managed filter

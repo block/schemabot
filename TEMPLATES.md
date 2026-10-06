@@ -2717,11 +2717,13 @@ type: mysql
 
 ## ⚠️ Schema Changes Not Managed by SchemaBot
 
-This PR changes schema under the following path(s), which this SchemaBot deployment is not configured to manage:
+**Environments**: `staging`, `production`
+
+This PR changes schema under the following path(s), which SchemaBot is not configured to manage in any environment:
 
 - `services/inventory/schema` — declares database `inventory`
 
-This deployment will **not** plan or apply these schema changes, and its checks on this PR do not cover them.
+These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's `allowed_dirs` in the server config; otherwise remove these schema changes from this PR.
 <!-- schemabot:offer-support-channel -->

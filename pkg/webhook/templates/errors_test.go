@@ -157,21 +157,29 @@ func TestRenderMultipleConfigsUsageExample(t *testing.T) {
 }
 
 func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
-	t.Run("lists each dropped config with its database", func(t *testing.T) {
-		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+	t.Run("lists each dropped config with its database across every environment", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice([]string{"staging", "production"}, []UnmanagedSchemaConfigNoticeData{
 			{Database: "inventory", SchemaPath: "services/inventory/schema"},
 			{Database: "billing", SchemaPath: "services/billing/schema"},
 		})
-		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot\n\n**Environments**: `staging`, `production`\n\nThis PR changes schema")
+		assert.Contains(t, body, "which SchemaBot is not configured to manage in any environment")
 		assert.Contains(t, body, "- `services/inventory/schema` — declares database `inventory`")
 		assert.Contains(t, body, "- `services/billing/schema` — declares database `billing`")
-		assert.Contains(t, body, "which this SchemaBot deployment is not configured to manage")
-		assert.Contains(t, body, "This deployment will **not** plan or apply these schema changes, and its checks on this PR do not cover them.")
+		assert.Contains(t, body, "These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.")
 		assert.Contains(t, body, "`allowed_dirs`")
 	})
 
+	t.Run("omits the environments header when none are known", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice(nil, []UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		})
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot\n\nThis PR changes schema")
+		assert.NotContains(t, body, "**Environments**")
+	})
+
 	t.Run("normalizes values that would break markdown code spans", func(t *testing.T) {
-		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+		body := RenderUnmanagedSchemaConfigsNotice(nil, []UnmanagedSchemaConfigNoticeData{
 			{Database: "inven`tory", SchemaPath: "services/inventory\nschema"},
 		})
 		assert.Contains(t, body, "- `services/inventory schema` — declares database `` inven`tory ``")

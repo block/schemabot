@@ -345,7 +345,7 @@ func TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo(t *testing.T) {
 		assert.Contains(t, body, "Schema Changes Not Managed by SchemaBot")
 		assert.Contains(t, body, "`schema`")
 		assert.Contains(t, body, fmt.Sprintf("declares database `%s`", dbName))
-		assert.Contains(t, body, "This deployment will **not** plan or apply these schema changes")
+		assert.Contains(t, body, "will **not** be planned or applied in any environment")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for unmanaged schema config notice")
 	}

@@ -664,7 +664,8 @@ func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testin
 
 		body := requireComment(t, comments, "unmanaged schema config notice")
 		assert.Contains(t, body, "- `services/ledger/schema_sandbox` — declares database `ledger_sandbox`")
-		assert.Contains(t, body, "This deployment will **not** plan or apply these schema changes, and its checks on this PR do not cover them.")
+		assert.Contains(t, body, "**Environments**: `staging`, `production`")
+		assert.Contains(t, body, "These schema changes will **not** be planned or applied in any environment")
 	})
 }
 
