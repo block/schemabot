@@ -36,7 +36,7 @@ func TestHaltForShutdownCancelsTheCopyAndWaitsForItToExit(t *testing.T) {
 
 	var lockReleased sync.WaitGroup
 	lockReleased.Add(1)
-	rm.wg.Go(func() {
+	rm.goRun(func() {
 		<-runCtx.Done()
 		lockReleased.Done()
 	})
@@ -61,7 +61,7 @@ func TestHaltForShutdownFailsWhenTheCopyWillNotComeDown(t *testing.T) {
 		tables:   []string{"line_items"},
 		state:    engine.StateRunning,
 	}
-	rm.wg.Go(func() { <-stuck })
+	rm.goRun(func() { <-stuck })
 	eng.runningSchemaChange = rm
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -72,6 +72,151 @@ func TestHaltForShutdownFailsWhenTheCopyWillNotComeDown(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "orders", "the failure names the target that may still be locked")
 	assert.Contains(t, err.Error(), "line_items")
+}
+
+// A drive halts the engine work it started every time it returns, including
+// after the change has run to its outcome. Work that has already ended holds
+// nothing, so the halt neither cancels nor waits.
+func TestHaltForShutdownAfterTheChangeEndedIsANoOp(t *testing.T) {
+	eng := New(Config{})
+	cancelled := false
+	rm := &runningSchemaChange{
+		database:   "orders",
+		tables:     []string{"line_items"},
+		state:      engine.StateCompleted,
+		cancelFunc: func() { cancelled = true },
+	}
+	rm.goRun(func() {})
+	rm.wg.Wait()
+	eng.runningSchemaChange = rm
+
+	require.NoError(t, eng.HaltForShutdown(t.Context()))
+
+	assert.False(t, cancelled, "a change that has ended is not cancelled")
+	assert.Equal(t, engine.StateCompleted, rm.state)
+}
+
+// A change that has reached its outcome may still be tearing down, and it
+// holds the target's lock until it returns. The halt waits for that teardown
+// without cancelling it, so the next driver finds the target released and the
+// outcome intact.
+func TestHaltForShutdownWaitsOutATeardownWithoutCancellingIt(t *testing.T) {
+	eng := New(Config{})
+	cancelled := false
+	rm := &runningSchemaChange{
+		database:   "orders",
+		tables:     []string{"line_items"},
+		state:      engine.StateCompleted,
+		cancelFunc: func() { cancelled = true },
+	}
+	teardown := make(chan struct{})
+	rm.goRun(func() { <-teardown })
+	eng.runningSchemaChange = rm
+
+	halted := make(chan error, 1)
+	go func() { halted <- eng.HaltForShutdown(t.Context()) }()
+
+	select {
+	case err := <-halted:
+		require.Failf(t, "halt returned before the teardown ended", "error: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(teardown)
+	select {
+	case err := <-halted:
+		require.NoError(t, err)
+	case <-time.After(shutdownHaltTestDeadline):
+		require.FailNow(t, "halt did not return once the teardown ended")
+	}
+	assert.False(t, cancelled, "a teardown is waited out, not cancelled")
+}
+
+// shutdownHaltTestDeadline bounds a wait for the halt to return.
+const shutdownHaltTestDeadline = 5 * time.Second
+
+// A drive halts the engine work it started the moment it returns, which can
+// be right after the engine accepted the work. The run's cancel is in place by
+// the time Apply returns, so that halt always reaches the run instead of
+// finding it active with nothing to cancel.
+func TestApplyPublishesTheRunsCancelBeforeReturning(t *testing.T) {
+	eng := New(Config{})
+	t.Cleanup(eng.Drain)
+
+	result, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+		Database:    "testdb",
+		Credentials: &engine.Credentials{DSN: "root:pass@tcp(127.0.0.1:1)/testdb"},
+		Changes: []engine.SchemaChange{{
+			Namespace:    "testdb",
+			TableChanges: []engine.TableChange{{Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}},
+		}},
+	})
+	require.NoError(t, err)
+	require.True(t, result.Accepted)
+
+	eng.mu.Lock()
+	rm := eng.runningSchemaChange
+	var cancelRun context.CancelFunc
+	if rm != nil {
+		cancelRun = rm.cancelFunc
+	}
+	eng.mu.Unlock()
+	require.NotNil(t, rm)
+	assert.NotNil(t, cancelRun, "the accepted run can be cancelled as soon as Apply returns")
+}
+
+// One engine serves every drive of a target in this process. A drive that
+// hands its apply back halts the run it started, and never the run a later
+// drive has already started in its place.
+func TestHaltWorkOwnedByLeavesAnotherDrivesRunRunning(t *testing.T) {
+	eng := New(Config{})
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	t.Cleanup(cancelRun)
+	cancelled := false
+	rm := &runningSchemaChange{
+		database:   "orders",
+		tables:     []string{"line_items"},
+		state:      engine.StateRunning,
+		owner:      "drive-b",
+		cancelFunc: func() { cancelled = true; cancelRun() },
+	}
+	rm.goRun(func() { <-runCtx.Done() })
+	eng.runningSchemaChange = rm
+
+	require.NoError(t, eng.HaltWorkOwnedBy(t.Context(), "drive-a"))
+	assert.False(t, cancelled, "the run belongs to drive-b, so drive-a's halt leaves it running")
+	assert.Equal(t, int32(1), rm.active.Load())
+
+	require.NoError(t, eng.HaltWorkOwnedBy(t.Context(), "drive-b"))
+	assert.True(t, cancelled, "drive-b's halt reaches the run drive-b started")
+	assert.Zero(t, rm.active.Load())
+}
+
+// The run records the owner of the context it was started under, so the halt
+// can tell whose run it is.
+func TestApplyRecordsTheRunsOwner(t *testing.T) {
+	eng := New(Config{})
+	t.Cleanup(eng.Drain)
+
+	result, err := eng.Apply(engine.WithWorkOwner(t.Context(), "drive-a"), &engine.ApplyRequest{
+		Database:    "testdb",
+		Credentials: &engine.Credentials{DSN: "root:pass@tcp(127.0.0.1:1)/testdb"},
+		Changes: []engine.SchemaChange{{
+			Namespace:    "testdb",
+			TableChanges: []engine.TableChange{{Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}},
+		}},
+	})
+	require.NoError(t, err)
+	require.True(t, result.Accepted)
+
+	eng.mu.Lock()
+	rm := eng.runningSchemaChange
+	var owner string
+	if rm != nil {
+		owner = rm.owner
+	}
+	eng.mu.Unlock()
+	require.NotNil(t, rm)
+	assert.Equal(t, "drive-a", owner)
 }
 
 // A drive waits for an earlier schema change to exit only while it holds the
@@ -86,7 +231,7 @@ func TestDrainContextEndsWithTheCallersContext(t *testing.T) {
 		tables:   []string{"line_items"},
 		state:    engine.StateRunning,
 	}
-	rm.wg.Go(func() { <-exit })
+	rm.goRun(func() { <-exit })
 	eng.runningSchemaChange = rm
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
@@ -114,7 +259,7 @@ func TestApplyStopsWaitingForThePreviousRunWithTheCallersContext(t *testing.T) {
 		tables:   []string{"users"},
 		state:    engine.StateRunning,
 	}
-	rm.wg.Go(func() { <-exit })
+	rm.goRun(func() { <-exit })
 	eng.runningSchemaChange = rm
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)

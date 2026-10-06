@@ -83,9 +83,9 @@ type Drainer interface {
 // runs inside this process. Such an engine holds resources on the target — for
 // Spirit, an advisory lock on the table it is copying — for exactly as long as
 // its in-process work lives, and that work outlives the drive that started it.
-// Without a way to bring it down, a shutting-down process stops renewing the
-// apply's lease while still holding the target, and peer drivers reclaim work
-// they cannot execute.
+// Without a way to bring it down, a process that stops renewing the apply's
+// lease, because it is shutting down or because its drive was displaced, keeps
+// holding the target, and peer drivers reclaim work they cannot execute.
 //
 // An engine whose work runs elsewhere (a remote online-DDL service) must not
 // implement this: its schema change is unaffected by this process going away,
@@ -96,8 +96,25 @@ type ShutdownHalter interface {
 	// no longer holds the target's resources. It is not an operator stop: it
 	// records no operator intent and leaves the apply active for reclaim.
 	// It returns an error if the work has not come down by the time ctx expires,
-	// so a caller can report that the target may still be held.
+	// so a caller can report that the target may still be held. Work that has
+	// already ended leaves nothing to halt.
 	HaltForShutdown(ctx context.Context) error
+}
+
+// OwnedWorkHalter is an optional capability, alongside ShutdownHalter, for an
+// engine that can halt one drive's in-process work without touching another's.
+// A drive that hands its apply back halts through it, so its run does not keep
+// holding the target under nobody's claim.
+//
+// It is separate from ShutdownHalter so an engine that only halts for shutdown
+// keeps that halt. Such an engine's drives hand the apply back without halting
+// anything, as they did before this capability existed.
+type OwnedWorkHalter interface {
+	// HaltWorkOwnedBy halts like HaltForShutdown, but only the work started
+	// under owner (see WithWorkOwner). One engine serves every drive of a
+	// target in this process, so the drive that hands an apply back must not
+	// bring down the run a later drive has already started in its place.
+	HaltWorkOwnedBy(ctx context.Context, owner string) error
 }
 
 // HaltEngineForShutdown brings eng's in-process schema change work down when it
@@ -110,6 +127,33 @@ func HaltEngineForShutdown(ctx context.Context, eng Engine) (supported bool, err
 		return false, nil
 	}
 	return true, halter.HaltForShutdown(ctx)
+}
+
+// HaltEngineWorkOwnedBy halts the work eng started under owner when eng
+// implements OwnedWorkHalter, and reports whether it does.
+func HaltEngineWorkOwnedBy(ctx context.Context, eng Engine, owner string) (supported bool, err error) {
+	halter, ok := eng.(OwnedWorkHalter)
+	if !ok {
+		return false, nil
+	}
+	return true, halter.HaltWorkOwnedBy(ctx, owner)
+}
+
+type workOwnerContextKey struct{}
+
+// WithWorkOwner names the owner of the engine work started under ctx. An
+// engine that runs its work in this process records the owner on the work
+// when it accepts an Apply or a Start, and HaltWorkOwnedBy halts by it. Work
+// started with no owner belongs to the empty owner.
+func WithWorkOwner(ctx context.Context, owner string) context.Context {
+	return context.WithValue(ctx, workOwnerContextKey{}, owner)
+}
+
+// WorkOwnerFromContext returns the owner WithWorkOwner attached to ctx, or
+// the empty owner.
+func WorkOwnerFromContext(ctx context.Context) string {
+	owner, _ := ctx.Value(workOwnerContextKey{}).(string)
+	return owner
 }
 
 // DeferredCutoverSignalChecker is an optional capability for engines that can

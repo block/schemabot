@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
@@ -45,10 +47,11 @@ var terminalTaskStatesSQL = func() string {
 
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
-	db       *rebindDB
-	dialect  Dialect
-	identity identityInserter
-	locker   namedlock.Locker
+	db         *rebindDB
+	dialect    Dialect
+	identity   identityInserter
+	locker     namedlock.Locker
+	classifier ErrorClassifier
 }
 
 func canonicalizeTaskIdentity(task *storage.Task) {
@@ -65,6 +68,7 @@ func (s *taskStore) Create(ctx context.Context, task *storage.Task) (int64, erro
 
 func insertTask(ctx context.Context, exec queryExecer, identity identityInserter, task *storage.Task) (int64, error) {
 	canonicalizeTaskIdentity(task)
+	boundEngineReportedFields(task)
 
 	// Ensure options has valid JSON (empty object if nil)
 	options := task.Options
@@ -106,6 +110,44 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 	`, taskIdentifier)
 
 	return scanTask(row)
+}
+
+// maxStoredETASeconds is the largest value the tasks.eta_seconds column holds,
+// a signed 32-bit integer in every dialect.
+const maxStoredETASeconds = math.MaxInt32
+
+// maxStoredThrottleReasonChars is the width of the tasks.throttle_reason
+// column, in characters in every dialect.
+const maxStoredThrottleReasonChars = 255
+
+// boundEngineReportedFields fits the task's engine-reported display fields to
+// the columns that hold them, on the caller's task, so the task a drive keeps
+// in memory and the row it reads back agree. These values come from an engine
+// and have no bound of their own; written unbounded, one would refuse every
+// progress write for the task and freeze the row over a display value.
+func boundEngineReportedFields(task *storage.Task) {
+	task.ETASeconds = storedETASeconds(task.ETASeconds)
+	task.ThrottleReason = storedThrottleReason(task.ThrottleReason)
+}
+
+// storedETASeconds bounds an engine-reported ETA to what the column holds. The
+// ETA is an engine's estimate and has no upper bound of its own: one paced on
+// key distance rather than rows reports decades for a table whose keys have a
+// wide gap, so a larger value is stored as the column's maximum, which still
+// reads as far beyond any useful estimate. A negative estimate means nothing,
+// and is stored as no estimate.
+func storedETASeconds(eta int) int {
+	return max(0, min(eta, maxStoredETASeconds))
+}
+
+// storedThrottleReason cuts an engine's throttle reason to the column's width
+// on a character boundary, marking the cut with an ellipsis.
+func storedThrottleReason(reason string) string {
+	if utf8.RuneCountInString(reason) <= maxStoredThrottleReasonChars {
+		return reason
+	}
+	runes := []rune(reason)
+	return string(runes[:maxStoredThrottleReasonChars-1]) + "…"
 }
 
 // taskUpdateAssignments is the SET list Update writes from the caller's task.
@@ -210,6 +252,7 @@ func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
 // renders instead waits out the steal and fails, or wins the row lock and holds
 // the steal off until the task write commits.
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
+	boundEngineReportedFields(task)
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
@@ -244,6 +287,9 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 
 	result, err := s.db.ExecContext(ctx, taskUpdateStatement(s.dialect, guard), args...)
 	if err != nil {
+		if s.classifier != nil && s.classifier.IsValueRejected(err) {
+			return fmt.Errorf("update task %d (%s): %w: %w", task.ID, task.TaskIdentifier, storage.ErrValueRejected, err)
+		}
 		return fmt.Errorf("update task %d (%s): %w", task.ID, task.TaskIdentifier, err)
 	}
 	if verifyLeaseStillOwned == nil {
@@ -381,6 +427,7 @@ const shardTaskInsertColumns = `
 // shardTaskInsertStatement renders the lease guard; the caller appends the
 // guard's args.
 func shardTaskInsertValues(task *storage.Task) (string, []any) {
+	boundEngineReportedFields(task)
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")

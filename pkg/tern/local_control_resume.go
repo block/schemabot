@@ -274,7 +274,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 	}
-	result, err := eng.Start(ctx, controlReq)
+	result, err := eng.Start(withDriveWorkOwner(ctx), controlReq)
 	if err != nil {
 		return nil, fmt.Errorf("start deferred deploy: %w", err)
 	}
@@ -321,6 +321,10 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 	if !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
 		return false, nil
 	}
+	// The engine starts the deploy inside startDeferredDeploy, so every exit
+	// before the poll takes it over halts it.
+	work := c.trackAcceptedEngineWork(ctx, logger)
+	defer work.haltUnlessPolled()
 	started, err := c.startDeferredDeploy(ctx, apply, controlRequestCaller(controlReq))
 	if err != nil {
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
@@ -364,6 +368,7 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 	}
+	work.handToPoll()
 	if err := c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier); err != nil {
 		return true, err
 	}
@@ -392,6 +397,13 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	// Mutable attrs (task state, apply state) stay per-call so they are never
 	// frozen stale into the bound logger.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// Registered after the heartbeat, so on a return the drive was not
+	// cancelled for it runs while the claim is still renewed. A cancelled
+	// drive's heartbeat has already stopped; the halt's bound keeps it inside
+	// the claim's staleness window unless the heartbeat's own failure ended
+	// the drive, in which case the claim is already stale and only the
+	// halt's owner scope keeps it to this drive's work.
+	defer c.haltEngineWorkLeftByDrive(ctx, logger)
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
@@ -513,12 +525,14 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			continue
 		}
 
-		action = c.runEngineTask(ctx, apply, task, options)
-
+		// The task row moves to running only once the engine accepts the task,
+		// so this records that the resume is starting it, not a transition.
 		taskID := task.ID
-		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Task %s resumed (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
-			state.Task.Stopped, state.Task.Running)
+		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Resuming task %s (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
+			"", "")
+
+		action = c.runEngineTask(ctx, apply, task, options)
 
 		if action == taskFailed {
 			failedTask = task
@@ -1375,6 +1389,11 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		}
 	}()
 
+	// From the reattach on the engine runs this drive's work, so every exit
+	// before the poll takes it over halts it.
+	work := c.trackAcceptedEngineWork(ctx, c.logger.With(apply.IdentityLogAttrs()...))
+	defer work.haltUnlessPolled()
+
 	// Resume the grouped apply with the engine's persisted state so it
 	// reattaches to in-flight engine work instead of launching a duplicate
 	// schema change. The changes are rebuilt from the stored tasks so the
@@ -1440,12 +1459,14 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		// heartbeats the operation row instead.
 		stopHeartbeat := c.startParentApplyHeartbeat(pollCtx, apply, suppressParent, cancelPoll)
 		defer stopHeartbeat()
+		work.handToPoll()
 		return c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 	}
 
 	resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
 	stopHeartbeat := c.startParentApplyHeartbeat(resumeCtx, apply, suppressParent, cancelResume)
 	pollDetached = true
+	work.handToPoll()
 	// The detached poll deliberately outlives the caller's context, so its log
 	// wiring has to as well: a callback holding the caller's context records
 	// nothing once that context is cancelled, and the engine lines for the rest

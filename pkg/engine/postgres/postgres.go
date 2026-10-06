@@ -107,6 +107,8 @@ type trackedApply struct {
 	// operator's.
 	cancelsInFlight int
 	done            chan struct{}
+	// owner is the drive the apply was started for (engine.WithWorkOwner).
+	owner string
 }
 
 type buildTracker interface {
@@ -1482,13 +1484,7 @@ func applyGoroutineExited(tracked *trackedApply) bool {
 // shutdown open.
 func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	e.mu.Lock()
-	halted := 0
-	for _, tracked := range e.progress {
-		if tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
-			tracked.cancelApply()
-			halted++
-		}
-	}
+	halted := e.cancelConcurrentBuildsLocked(func(*trackedApply) bool { return true })
 	e.mu.Unlock()
 	if halted > 0 {
 		slog.Info("PostgreSQL engine halting concurrent index builds for shutdown", "builds", halted)
@@ -1508,6 +1504,47 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return fmt.Errorf("halt PostgreSQL engine for shutdown: schema change work is still running on the target: %w", ctx.Err())
 	}
+}
+
+// HaltWorkOwnedBy halts like HaltForShutdown, but only the applies started
+// for owner, and waits only for those. Another drive's applies on the same
+// engine are left running and are not waited on.
+func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
+	e.mu.Lock()
+	owned := func(tracked *trackedApply) bool { return tracked.owner == owner }
+	halted := e.cancelConcurrentBuildsLocked(owned)
+	var pending []chan struct{}
+	for _, tracked := range e.progress {
+		if owned(tracked) {
+			pending = append(pending, tracked.done)
+		}
+	}
+	e.mu.Unlock()
+	if halted > 0 {
+		slog.Info("PostgreSQL engine halting the concurrent index builds a drive started as it returns", "builds", halted)
+	}
+
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return fmt.Errorf("halt PostgreSQL engine work a drive started: schema change work is still running on the target: %w", ctx.Err())
+		}
+	}
+	return nil
+}
+
+// cancelConcurrentBuildsLocked ends the running concurrent index builds that
+// selected picks and returns how many it ended. The caller holds e.mu.
+func (e *Engine) cancelConcurrentBuildsLocked(selected func(*trackedApply) bool) int {
+	halted := 0
+	for _, tracked := range e.progress {
+		if selected(tracked) && tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+			tracked.cancelApply()
+			halted++
+		}
+	}
+	return halted
 }
 
 // Stop declines: a concurrent index build has no resumable midpoint, so stop
@@ -1548,5 +1585,7 @@ var _ engine.Engine = (*Engine)(nil)
 // Compile-time check that Engine implements engine.Drainer.
 var _ engine.Drainer = (*Engine)(nil)
 
-// Compile-time check that Engine implements engine.ShutdownHalter.
+// Compile-time check that Engine implements engine.ShutdownHalter and
+// engine.OwnedWorkHalter.
 var _ engine.ShutdownHalter = (*Engine)(nil)
+var _ engine.OwnedWorkHalter = (*Engine)(nil)

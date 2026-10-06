@@ -5,6 +5,8 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -428,6 +430,69 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 	assert.Equal(t, "requires privileges unavailable to the engine", cleared.ModeReason)
 }
 
+// An engine's ETA and throttle reason are display values it may report past
+// what their columns hold, as a copy over a sparse primary key can. The
+// progress write fits them to the columns instead of being refused, so the row
+// keeps updating, and the caller's task carries the values the row holds.
+// A value storage refuses outright comes back as storage.ErrValueRejected, so
+// the drive can tell it apart from a write a retry would land.
+func TestTaskStore_UpdateBoundsEngineReportedValuesAndReportsRejectedValues(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testapp", "mysql")
+	apply := createTestApply(t, store, lock, "apply_eta", 1)
+	now := time.Now()
+	_, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_eta",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Running,
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+		DDLAction:      "ALTER",
+		ETASeconds:     -1,
+		ThrottleReason: strings.Repeat("x", 300),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Zero(t, task.ETASeconds, "a negative estimate is stored as no estimate")
+	assert.Equal(t, strings.Repeat("x", 254)+"…", task.ThrottleReason, "the insert fits the reason to its column")
+	task.ETASeconds = math.MaxInt32 + 1_000_000
+	task.ThrottleReason = strings.Repeat("é", 300)
+	task.RowsCopied = 42
+	require.NoError(t, store.Tasks().Update(ctx, task), "engine values past their columns do not refuse the progress write")
+
+	stored, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt32, stored.ETASeconds)
+	assert.Equal(t, strings.Repeat("é", 254)+"…", stored.ThrottleReason, "the reason is cut on a character boundary")
+	assert.Equal(t, int64(42), stored.RowsCopied, "the rest of the progress lands with it")
+	assert.Equal(t, stored.ETASeconds, task.ETASeconds, "the caller's task holds what the row holds")
+	assert.Equal(t, stored.ThrottleReason, task.ThrottleReason)
+
+	stored.ETASeconds = -5
+	require.NoError(t, store.Tasks().Update(ctx, stored))
+	reread, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Zero(t, reread.ETASeconds, "a negative estimate is stored as no estimate")
+
+	reread.ExecutionMode = strings.Repeat("x", 60)
+	err = store.Tasks().Update(ctx, reread)
+	require.ErrorIs(t, err, storage.ErrValueRejected, "a value the column cannot hold is reported as rejected")
+}
+
 // A sharded work operation's operation key identifies which shard task is real
 // drive input. Other shard rows remain progress detail and must not be replayed
 // as extra table changes if the operation is resumed.
@@ -741,11 +806,22 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, got[0].State, "a lost lease must not overwrite the shard row")
 	assert.Equal(t, 100, got[0].ProgressPercent)
 
-	// A different shard under the same operation is a separate row.
-	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), shardTask("80-")))
+	// A different shard under the same operation is a separate row. The insert
+	// fits the engine's display values to their columns rather than being
+	// refused over them.
+	second := shardTask("80-")
+	second.ETASeconds = math.MaxInt32 + 1_000_000
+	second.ThrottleReason = strings.Repeat("x", 300)
+	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), second))
 	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
-	assert.Len(t, got, 2, "a different shard is its own per-shard task row")
+	require.Len(t, got, 2, "a different shard is its own per-shard task row")
+	for _, row := range got {
+		if row.Shard == "80-" {
+			assert.Equal(t, math.MaxInt32, row.ETASeconds)
+			assert.Equal(t, strings.Repeat("x", 254)+"…", row.ThrottleReason)
+		}
+	}
 
 	// A row targeting a different operation than the held lease is refused, so
 	// the lease cannot gate a write that points at another operation.

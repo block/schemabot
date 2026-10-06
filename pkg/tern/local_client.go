@@ -199,6 +199,9 @@ type LocalConfig struct {
 // supply an engine without the core depending on its package.
 type EngineFactory func(cfg LocalConfig, logger *slog.Logger) (engine.Engine, error)
 
+// defaultHeartbeatInterval is how often a drive renews its claim.
+const defaultHeartbeatInterval = 10 * time.Second
+
 // LocalClient implements Client by calling an embedded engine directly — the
 // built-in Spirit (mysql) or PlanetScale (vitess) engine, or an engine supplied
 // by an embedder for another database type. It uses SchemaBot's storage for
@@ -218,7 +221,8 @@ type LocalClient struct {
 	unrecognizedStatuses unrecognizedStatusReporter
 
 	// heartbeatInterval controls how often the apply heartbeat updates updated_at.
-	// Defaults to 10s. Tests may lower this to verify heartbeat behavior.
+	// Defaults to defaultHeartbeatInterval. Tests may lower this to verify
+	// heartbeat behavior.
 	heartbeatInterval time.Duration
 
 	// taskPollIntervalOverride, when positive, replaces defaultTaskPollInterval
@@ -356,7 +360,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
-		heartbeatInterval: 10 * time.Second,
+		heartbeatInterval: defaultHeartbeatInterval,
 	}, nil
 }
 
@@ -605,6 +609,7 @@ func (c *LocalClient) remapsPostgresNamespaces() bool {
 }
 
 func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	ctx = withDriveWorkOwner(ctx)
 	req = applyRequestWithStatedDirectExecution(req)
 	if !c.remapsPostgresNamespaces() {
 		return eng.Apply(ctx, req)

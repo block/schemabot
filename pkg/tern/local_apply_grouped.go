@@ -79,6 +79,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		return nil
 	}
 
+	// The engine can hold the target from inside Apply on, so every exit
+	// before the poll takes the work over halts it.
+	work := c.trackAcceptedEngineWork(ctx, logger)
+	defer work.haltUnlessPolled()
+
 	// Grouped mode: all DDLs in one engine call. Use the apply identifier so all
 	// table work shares one context for progress tracking.
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
@@ -191,6 +196,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, apply.State)
 
 	// Poll for completion - all tasks share the same state
+	work.handToPoll()
 	return c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 }
 
@@ -592,6 +598,38 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
 // Each table copies and cuts over independently.
 
+// acceptedEngineWork covers a grouped drive from the moment it hands work to
+// the engine until pollForCompletionAtomic takes that work over. The poll
+// halts the work on its own exit, except at the cutover barrier; before the
+// handoff a drive can still return — a storage write after acceptance fails,
+// the lease is lost — and every such exit halts the work here instead, so it
+// never outlives the drive that started it (OW-3).
+type acceptedEngineWork struct {
+	client    *LocalClient
+	ctx       context.Context
+	logger    *slog.Logger
+	handedOff bool
+}
+
+func (c *LocalClient) trackAcceptedEngineWork(ctx context.Context, logger *slog.Logger) *acceptedEngineWork {
+	return &acceptedEngineWork{client: c, ctx: ctx, logger: logger}
+}
+
+// handToPoll records that pollForCompletionAtomic owns the work's halt from
+// here on, whether it polls in this goroutine or a detached one.
+func (w *acceptedEngineWork) handToPoll() {
+	w.handedOff = true
+}
+
+// haltUnlessPolled halts the drive's engine work when the drive returns before
+// handing it to a poll.
+func (w *acceptedEngineWork) haltUnlessPolled() {
+	if w.handedOff {
+		return
+	}
+	w.client.haltEngineWorkLeftByDrive(w.ctx, w.logger)
+}
+
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 //
 // It returns an error only when the drive settled the apply's outcome but could
@@ -617,6 +655,15 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		revertSkipped:   apply.RevertSkippedAt != nil,
 		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
 	}
+
+	// Every exit but the cutover barrier's leaves no engine work running behind
+	// the drive (OW-3).
+	defer func() {
+		if ps.parkedAtCutoverBarrier {
+			return
+		}
+		c.haltEngineWorkLeftByDrive(ctx, c.logger.With(apply.IdentityLogAttrs()...))
+	}()
 
 	for {
 		select {
@@ -837,7 +884,25 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 
 	// Update all tasks with engine progress
-	c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled)
+	if syncErr := c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled); syncErr != nil {
+		if errors.Is(syncErr, storage.ErrApplyLeaseLost) {
+			logger.Warn("task progress write was refused because the drive's lease was lost; this driver exits",
+				append(apply.MutableLogAttrs(), "error", syncErr)...)
+			return true
+		}
+		ps.progressWriteFailures++
+		if progressWriteRejectedForGood(syncErr, ps.progressWriteFailures) {
+			logger.Error("task progress could not be persisted; this driver halts the engine and exits, leaving the apply for a later drive",
+				append(apply.MutableLogAttrs(), "consecutive_write_failures", ps.progressWriteFailures, "value_rejected", errors.Is(syncErr, storage.ErrValueRejected), "error", syncErr)...)
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventInfo, storage.LogSourceSchemaBot,
+				"Task progress could not be recorded; the drive stopped the schema change and handed the apply back. See server logs.", "", "")
+			return true
+		}
+		logger.Warn("failed to persist task progress; the drive retries the write at the next poll",
+			append(apply.MutableLogAttrs(), "consecutive_write_failures", ps.progressWriteFailures, "error", syncErr)...)
+	} else {
+		ps.progressWriteFailures = 0
+	}
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
@@ -862,7 +927,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		logger.Info("auto-triggering deploy (not in defer-deploy mode)")
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventDeployTriggered, storage.LogSourceSchemaBot,
 			"Auto-triggering deploy (defer_deploy not set)", "", "")
-		if _, err := eng.Start(ctx, controlReq); err != nil {
+		if _, err := eng.Start(withDriveWorkOwner(ctx), controlReq); err != nil {
 			logger.Error("auto-deploy failed", append(apply.MutableLogAttrs(), "error", err)...)
 		}
 	}
@@ -1009,6 +1074,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
 			logger.Info("operation parked at cutover barrier; exiting operation drive",
 				"mode", groupedApplyMode(apply, options), "operation_state", opState)
+			ps.parkedAtCutoverBarrier = true
 			return true
 		}
 		if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
@@ -1186,6 +1252,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
 		logger.Info("operation parked at cutover barrier; exiting copy drive",
 			"mode", groupedApplyMode(apply, options), "operation_state", opState, "apply_state", apply.State)
+		ps.parkedAtCutoverBarrier = true
 		return true
 	}
 	if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
@@ -1621,9 +1688,13 @@ func (p enginePoll) retryableFailure() bool {
 // tick to tick. A task the poll does not speak for is one already settled from
 // a more authoritative source earlier in the tick, and it took its persisted
 // write from that settlement.
-func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) {
+//
+// It returns the writes that did not land, joined, after attempting every
+// task, so one refused row does not keep the others from updating.
+func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) error {
 	tableProgress := indexEngineTableProgress(result.Tables)
 	poll := enginePoll{result: result, newState: newState, now: now}
+	var writeErrs []error
 	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
 		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
 			poll.instantFromMetadata = meta.IsInstant
@@ -1648,8 +1719,12 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 			c.unrecognizedStatuses.observeTaskStatus(ctx, logger, task, tp.State)
 		}
 		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, poll)
-		c.advanceTaskFromEngineProgress(ctx, task, tp, poll)
+		if err := c.advanceTaskFromEngineProgress(ctx, task, tp, poll); err != nil {
+			logger.Warn("failed to persist task progress", append(task.LogAttrs(), "error", err)...)
+			writeErrs = append(writeErrs, err)
+		}
 	}
+	return errors.Join(writeErrs...)
 }
 
 // refreshTaskDisplayFromEngine projects a progress poll onto the fields the
@@ -1706,8 +1781,9 @@ func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *
 // policy for whether the claim is allowed to move the stored state.
 //
 // This is also where the tick reaches storage, for the task's stamps and for
-// the display fields the refresh left in memory.
-func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, tp *engine.TableProgress, poll enginePoll) {
+// the display fields the refresh left in memory. A write that does not land is
+// returned with the task's state left as it arrived.
+func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, tp *engine.TableProgress, poll enginePoll) error {
 	retryableFailure := poll.retryableFailure()
 	if tp != nil {
 		if tp.StartedAt != nil && task.StartedAt == nil {
@@ -1728,7 +1804,7 @@ func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *s
 			task.ErrorMessage = msg
 		}
 	}
-	c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp)), "")
+	return c.persistTaskStateTransition(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp)), "")
 }
 
 // engineTaskStateClaim is the state a progress poll claims for one task: the
@@ -1751,7 +1827,10 @@ func engineTaskStateClaim(newState string, tp *engine.TableProgress) string {
 
 // applyEngineTableDisplayFields copies a poll's per-table progress onto the
 // task's display fields. Shared by the grouped and sequential drives so both
-// render from the same projection of an engine report.
+// render from the same projection of an engine report. The throttle reason is
+// bounded here whatever engine reported it: a reason too long for its column
+// would refuse every progress write for the task, and the drive would hand
+// the apply back on a value that only ever served display.
 func applyEngineTableDisplayFields(task *storage.Task, tp *engine.TableProgress) {
 	task.RowsCopied = tp.RowsCopied
 	task.RowsTotal = tp.RowsTotal
@@ -1760,7 +1839,7 @@ func applyEngineTableDisplayFields(task *storage.Task, tp *engine.TableProgress)
 	task.ChecksumRowsChecked = tp.ChecksumRowsChecked
 	task.ChecksumRowsTotal = tp.ChecksumRowsTotal
 	task.Throttled = tp.Throttled
-	task.ThrottleReason = tp.ThrottleReason
+	task.ThrottleReason = engine.SanitizeThrottleReason(tp.ThrottleReason)
 	task.IsInstant = tp.IsInstant
 }
 

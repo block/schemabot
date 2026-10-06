@@ -153,20 +153,38 @@ type runningSchemaChange struct {
 	// only; a resume that goes through Apply starts with an empty record.
 	quarantinedDrops map[dropTarget]pendingdrops.QuarantinedTable
 
+	// owner is the drive the run belongs to (engine.WithWorkOwner), set when
+	// Apply starts the run and again when Start resumes it, under Engine.mu.
+	owner string
+
 	// For resume support
 	cancelFunc context.CancelFunc
 	host       string
 	username   string
 	password   string
 
-	// For waiting on schema change to finish
-	wg sync.WaitGroup
+	// For waiting on schema change to finish. active counts the run goroutines
+	// still executing, so a halt can tell work that is still running from work
+	// that has already ended.
+	wg     sync.WaitGroup
+	active atomic.Int32
+}
+
+// goRun runs the schema change's background work, tracked by both wg and
+// active.
+func (rm *runningSchemaChange) goRun(run func()) {
+	rm.active.Add(1)
+	rm.wg.Go(func() {
+		defer rm.active.Add(-1)
+		run()
+	})
 }
 
 // Compile-time check that Engine implements the interface.
 var _ engine.Engine = (*Engine)(nil)
 var _ engine.Drainer = (*Engine)(nil)
 var _ engine.ShutdownHalter = (*Engine)(nil)
+var _ engine.OwnedWorkHalter = (*Engine)(nil)
 var _ engine.DeferredCutoverSignalChecker = (*Engine)(nil)
 var _ engine.CancelledArtifactReleaser = (*Engine)(nil)
 
@@ -495,24 +513,68 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 // lock while no longer renewing the apply's lease — every driver that then
 // reclaims the apply is refused the lock and burns a recovery attempt.
 //
+// A drive that hands its apply back for another driver halts its own run the
+// same way, through HaltWorkOwnedBy, for the same reason: the work must not
+// outlive the claim it was started under.
+//
 // This is not an operator stop. The tracked state is left alone so nothing
 // reads the halt as an operator's decision to park the apply: the schema change
 // is checkpointed and the apply stays active for another driver to claim and
 // resume.
 func (e *Engine) HaltForShutdown(ctx context.Context) error {
+	return e.halt(ctx, func(*runningSchemaChange) bool { return true })
+}
+
+// HaltWorkOwnedBy halts like HaltForShutdown, but only a run that owner
+// started. The run is selected and its owner compared under the same lock that
+// publishes a new run, so a run another drive starts in its place is never the
+// one this halt reaches.
+func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
+	return e.halt(ctx, func(rm *runningSchemaChange) bool {
+		if rm.owner == owner {
+			return true
+		}
+		e.schemaChangeLogger(rm).Debug("schema change belongs to another drive; leaving it running",
+			"database", rm.database, "tables", rm.tables)
+		return false
+	})
+}
+
+// halt brings the tracked run down when selected reports it is one to halt.
+// selected is called under e.mu.
+func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) bool) error {
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
 		e.mu.Unlock()
 		return nil
 	}
+	if !selected(rm) {
+		e.mu.Unlock()
+		return nil
+	}
+	if rm.active.Load() == 0 {
+		database, tables, state := rm.database, rm.tables, rm.state
+		e.mu.Unlock()
+		e.schemaChangeLogger(rm).Debug("schema change has already ended; nothing to halt",
+			"database", database, "tables", tables, "state", state)
+		return nil
+	}
 	runners := rm.runners
 	database := rm.database
 	tables := rm.tables
 	cancelRun := rm.cancelFunc
+	outcome := rm.state
 	e.mu.Unlock()
 
 	logger := e.schemaChangeLogger(rm)
+
+	// A change that has reached its outcome is only tearing down: checkpointing
+	// it would write progress for work that is over, and cancelling would cut
+	// short a teardown that releases the table on its own. Wait for it instead.
+	if outcome.IsTerminal() {
+		return waitForSchemaChangeExit(ctx, rm, database, tables)
+	}
 
 	// Checkpoint before cancelling. Spirit checkpoints on its own interval, so
 	// without this the driver that reclaims the apply resumes from the last
@@ -528,13 +590,22 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 		cancelRun()
 	}
 
-	// Wait off the calling goroutine so a runner that will not come down bounds
-	// shutdown at ctx rather than blocking it forever.
-	if err := waitForRunExit(ctx, rm); err != nil {
-		return fmt.Errorf("halt schema change on database %s tables %v for shutdown: still running after %w; the target may still be locked", database, tables, err)
+	if err := waitForSchemaChangeExit(ctx, rm, database, tables); err != nil {
+		return err
 	}
-	logger.Info("schema change halted for shutdown; the target's lock is released and the apply stays active for another driver",
+	logger.Info("schema change halted; the target's lock is released and the apply stays active for another driver",
 		"database", database, "tables", tables)
+	return nil
+}
+
+// waitForSchemaChangeExit waits for the change's run goroutines to return. It
+// waits off the calling goroutine so a runner that will not come down bounds
+// the caller at ctx rather than blocking it forever; the wait goroutine ends
+// with the runner it is waiting on.
+func waitForSchemaChangeExit(ctx context.Context, rm *runningSchemaChange, database string, tables []string) error {
+	if err := waitForRunExit(ctx, rm); err != nil {
+		return fmt.Errorf("halt schema change on database %s tables %v: still running after %w; the target may still be locked", database, tables, err)
+	}
 	return nil
 }
 
@@ -916,6 +987,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 	}
 
+	// Start schema change in background with cancellable context.
+	// Use WithoutCancel to preserve context values (tracing) without inheriting
+	// the request deadline — the schema change must outlive the API call.
+	// Stop() and HaltForShutdown cancel via rm.cancelFunc, which is in place
+	// before the run is published, so a halt that finds the run active always
+	// reaches it.
+	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	rm := &runningSchemaChange{
 		logger:         logger,
 		spiritLogger:   spiritLogger,
@@ -930,21 +1008,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		host:           host,
 		username:       username,
 		password:       password,
+		cancelFunc:     cancel,
+		owner:          engine.WorkOwnerFromContext(ctx),
 	}
 	e.installRunningSchemaChange(rm)
 
-	// Start schema change in background with cancellable context.
-	// Use WithoutCancel to preserve context values (tracing) without inheriting
-	// the request deadline — the schema change must outlive the API call.
-	// Stop() cancels via rm.cancelFunc.
-	rm.wg.Go(func() {
-		bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	rm.goRun(func() {
 		defer cancel()
-		e.mu.Lock()
-		if e.runningSchemaChange != nil {
-			e.runningSchemaChange.cancelFunc = cancel
-		}
-		e.mu.Unlock()
 		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
 	})
 
