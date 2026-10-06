@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -264,6 +265,7 @@ func testLeaseTakeoverDoesNotOrphanTheEngineRun(t *testing.T, deferCutover bool)
 	var last *storage.Apply
 	originalAlive := true
 	cutoverRequested := false
+	refusedClaimAged := false
 	testutil.Poll(t, leaseTakeoverPollDeadline, 50*time.Millisecond, func() bool {
 		holder := spiritLockHolder(t, ctx, target, appDBName, table)
 		current, err := shared.Applies().Get(ctx, apply.ID)
@@ -279,6 +281,21 @@ func testLeaseTakeoverDoesNotOrphanTheEngineRun(t *testing.T, deferCutover bool)
 				applyIdentifier, current.Attempt, originalRun, current.State, current.ErrorMessage)
 		} else {
 			originalAlive = false
+		}
+		// The original learns it was displaced from its next lease-guarded
+		// write, so the peer's first start can come before or after the
+		// original copy lets go. A deferred cutover drives every table
+		// together, and a drive refused the table hands the apply back under
+		// its claim; the next drive starts the work again once that claim
+		// goes stale. That window is aged in storage too, once the original
+		// copy has let go.
+		if deferCutover && !originalAlive && !refusedClaimAged &&
+			applyLogMentions(t, shared, apply.ID, "the apply is handed back to start again once it lets go") {
+			_, err = storageDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", apply.ID)
+			require.NoError(t, err)
+			_, err = storageDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_id = ?", apply.ID)
+			require.NoError(t, err)
+			refusedClaimAged = true
 		}
 		if deferCutover && !originalAlive && !cutoverRequested && state.IsState(current.State, state.Apply.WaitingForCutover) {
 			cutoverResp := postJSON(t, peer.addr+"/api/cutover", map[string]any{"apply_id": applyIdentifier, "environment": "staging"})
@@ -303,4 +320,18 @@ func testLeaseTakeoverDoesNotOrphanTheEngineRun(t *testing.T, deferCutover bool)
 		"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ? AND table_name LIKE '\\_"+table+"\\_%'",
 		appDBName).Scan(&shadowTables))
 	assert.Zero(t, shadowTables, "no shadow or checkpoint table is left on the target")
+}
+
+// applyLogMentions reports whether any entry in the apply's durable log
+// contains text.
+func applyLogMentions(t *testing.T, store storage.Storage, applyID int64, text string) bool {
+	t.Helper()
+	logs, err := store.ApplyLogs().List(t.Context(), storage.ApplyLogFilter{ApplyID: applyID})
+	require.NoError(t, err)
+	for _, entry := range logs {
+		if strings.Contains(entry.Message, text) {
+			return true
+		}
+	}
+	return false
 }
