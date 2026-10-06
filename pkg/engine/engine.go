@@ -73,8 +73,10 @@ type Engine interface {
 // schema change's goroutine has fully exited (releasing DB connections) before
 // checking whether the next table still needs changes.
 type Drainer interface {
-	// Drain waits for any in-flight background work to complete and clears it.
-	Drain()
+	// DrainContext waits for any in-flight background work to complete and
+	// clears it. When ctx ends first it returns an error and leaves the work
+	// tracked.
+	DrainContext(ctx context.Context) error
 }
 
 // ShutdownHalter is an optional capability for engines whose schema change work

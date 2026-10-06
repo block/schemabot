@@ -503,11 +503,11 @@ func TestReplanAndFilterTasks_FailsClosedOnDrift(t *testing.T) {
 }
 
 // The sequential resume loop re-plans each table right before applying it to
-// catch a cutover that raced the resume. tableStillNeedsChange must return the
-// DDL that re-plan would now apply so the loop can confirm it still matches the
+// catch a cutover that raced the resume. The re-plan must return the DDL it
+// would now apply so the loop can confirm it still matches the
 // reviewed DDL before applying — closing the window between the resume-entry
 // re-plan and this later per-task apply.
-func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
+func TestResumeTaskReplan_ReturnsReplannedDDL(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
@@ -521,8 +521,10 @@ func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	replanned, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
+	verdict, key := replanVerdictForTask(replanDDL, task)
+	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	assert.True(t, needsChange)
 	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, replanned)
 	_, _, err = c.verifyReplannedTaskDDL(task, replanned, []*storage.Task{task})
@@ -530,9 +532,9 @@ func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
 }
 
 // When the table has dropped out of the re-plan diff (its cutover completed) the
-// sequential loop treats it as already applied, so tableStillNeedsChange must
-// report that no change remains.
-func TestTableStillNeedsChange_TableAbsentReportsDone(t *testing.T) {
+// sequential loop treats it as already applied, so the re-plan must report that
+// no change remains.
+func TestResumeTaskReplan_TableAbsentReportsDone(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	// Re-plan for a different table only: the task's table is no longer in the diff.
 	otherTablePlan := &engine.PlanResult{
@@ -557,17 +559,19 @@ func TestTableStillNeedsChange_TableAbsentReportsDone(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	replanned, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
+	verdict, key := replanVerdictForTask(replanDDL, task)
+	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	assert.False(t, needsChange)
 	assert.Empty(t, replanned)
 }
 
 // If live drifts between resume entry and a later per-task apply, the re-plan the
 // sequential loop performs returns DDL that no longer matches the reviewed DDL.
-// tableStillNeedsChange surfaces that DDL and verifyReplannedTaskDDL fails closed
+// The re-plan surfaces that DDL and verifyReplannedTaskDDL fails closed
 // so the loop refuses to apply unreviewed DDL.
-func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
+func TestResumeTaskReplan_DriftFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	drifted := &engine.PlanResult{
 		Changes: []engine.SchemaChange{{
@@ -591,8 +595,10 @@ func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	replanned, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
+	verdict, key := replanVerdictForTask(replanDDL, task)
+	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	require.True(t, needsChange)
 	_, _, err = c.verifyReplannedTaskDDL(task, replanned, []*storage.Task{task})
 	require.Error(t, err)

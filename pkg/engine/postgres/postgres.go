@@ -1392,8 +1392,33 @@ func (e *Engine) RegistersWorkSynchronously() bool {
 // in flight from a lost lease cannot race the next drive's view of the schema,
 // and so the next poll reads a clean engine instead of the previous change's
 // terminal snapshot.
+//
+// Drain waits without a bound, for a caller that owns the engine outright. A
+// drive waits through DrainContext instead, so it never outlives its claim.
 func (e *Engine) Drain() {
 	e.wg.Wait()
+	e.clearDrainedProgress()
+}
+
+// DrainContext is Drain bounded by ctx. When ctx ends before every apply
+// goroutine has finished, it returns an error and leaves the schema changes
+// tracked, so the engine still reports them as holding the target.
+func (e *Engine) DrainContext(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		e.clearDrainedProgress()
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("drain PostgreSQL schema changes: still running after %w", ctx.Err())
+	}
+}
+
+func (e *Engine) clearDrainedProgress() {
 	e.mu.Lock()
 	e.progress = nil
 	e.mu.Unlock()

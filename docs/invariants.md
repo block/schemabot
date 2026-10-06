@@ -1498,8 +1498,10 @@ sibling was reviewed with refuses the resume instead, since nothing will run it 
 `pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
 `replanAndFilterTasks` and `resumeApplySequential`); `settleLostVerifiedTask` on the lost-work
-path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
-the sequential and grouped drives). The cross-deployment comparison a plan is reviewed against
+path (`pkg/tern/local_apply_sequential.go`, reached from the sequential and grouped drives).
+Every one of these reads the re-plan through `replanVerdictForTask`
+(`pkg/tern/local_control_resume.go`), which judges whether the re-plan speaks for a
+shard-tagged task at all. The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced

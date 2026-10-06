@@ -1,0 +1,238 @@
+package tern
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+)
+
+// replanTargetEngine accepts every Apply and reports it completed. Plan
+// returns what the target looks like when the drive re-plans it.
+type replanTargetEngine struct {
+	engine.Engine
+	plan    *engine.PlanResult
+	planErr error
+
+	applies   int
+	planCalls int
+}
+
+func (e *replanTargetEngine) Name() string { return "replan-target" }
+
+func (e *replanTargetEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.applies++
+	return &engine.ApplyResult{Accepted: true}, nil
+}
+
+func (e *replanTargetEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{State: engine.StateCompleted}, nil
+}
+
+func (e *replanTargetEngine) Plan(context.Context, *engine.PlanRequest) (*engine.PlanResult, error) {
+	e.planCalls++
+	return e.plan, e.planErr
+}
+
+const resumeTaskDDL = "ALTER TABLE `orders` ADD COLUMN `note` VARCHAR(255)"
+
+// resumeTaskReplan is a re-plan that still asks for ddl on the task's table.
+func resumeTaskReplan(ddl string) *engine.PlanResult {
+	return &engine.PlanResult{Changes: []engine.SchemaChange{{
+		Namespace:    "appdb_sharded",
+		TableChanges: []engine.TableChange{{Table: "orders", DDL: ddl}},
+	}}}
+}
+
+// A shard-scoped dispatch tags its tasks with their shard, while a re-plan of
+// the reviewed schema set describes each namespace as a unit. The verdict
+// reads the unit's statements as the shard's, and never reads the unit's
+// silence as the shard having the change.
+func TestReplanVerdictForTask_ShardTaskUnderANamespaceUnitReplan(t *testing.T) {
+	task := &storage.Task{Namespace: "appdb_sharded", Shard: "-40", TableName: "orders"}
+	unitKey := shardTableKey{namespace: "appdb_sharded", table: "orders"}
+	shardKey := shardTableKey{namespace: "appdb_sharded", shard: "-40", table: "orders"}
+
+	verdict, key := replanVerdictForTask(map[shardTableKey][]string{unitKey: {resumeTaskDDL}}, task)
+	assert.Equal(t, replanNeedsChange, verdict, "the unit still owing the table is reason to run the reviewed statement")
+	assert.Equal(t, unitKey, key)
+
+	verdict, _ = replanVerdictForTask(map[shardTableKey][]string{}, task)
+	assert.Equal(t, replanCannotAttribute, verdict, "the unit's silence is not evidence about this shard")
+
+	verdict, key = replanVerdictForTask(map[shardTableKey][]string{shardKey: {resumeTaskDDL}}, task)
+	assert.Equal(t, replanNeedsChange, verdict)
+	assert.Equal(t, shardKey, key)
+
+	otherShard := shardTableKey{namespace: "appdb_sharded", shard: "40-", table: "orders"}
+	verdict, _ = replanVerdictForTask(map[shardTableKey][]string{otherShard: {resumeTaskDDL}}, task)
+	assert.Equal(t, replanChangeLanded, verdict, "a re-plan that keys by shard and omits this one speaks for it")
+}
+
+// shardTaskFixture is a resume of one shard-tagged task whose reviewed
+// statement the engine runs, against a re-plan that describes the namespace as
+// a unit.
+func shardTaskFixture(eng *replanTargetEngine) (*LocalClient, *storage.Apply, *storage.Task) {
+	client, apply, task, _ := lostWorkPollFixtureInState(eng, lostWorkTrustBudgetAmple, state.Task.Pending)
+	client.heartbeatInterval = 10 * time.Second
+	client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: apply}
+	task.DDL = resumeTaskDDL
+	return client, apply, task
+}
+
+// A resume never completes a shard's task because a namespace-unit re-plan no
+// longer mentions the table: that silence says nothing about the shard. The
+// task stays active with its reviewed statement, so the engine decides its
+// outcome rather than the resume reporting a change it never saw made.
+func TestReplanAndFilterTasks_ShardTaskIsNotCompletedByTheUnitsSilence(t *testing.T) {
+	eng := &replanTargetEngine{plan: &engine.PlanResult{NoChanges: true}}
+	client, apply, task := shardTaskFixture(eng)
+
+	rp, err := client.replanAndFilterTasks(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7})
+
+	require.NoError(t, err)
+	assert.Zero(t, rp.CompletedCount)
+	require.Len(t, rp.ActiveTasks, 1)
+	assert.Equal(t, resumeTaskDDL, rp.ActiveTasks[0].DDL, "the reviewed statement is kept")
+	assert.Equal(t, state.Task.Pending, task.State)
+}
+
+// A namespace-unit re-plan that still lists the shard task's table is checked
+// against the reviewed statement like any other, so drift on the unit fails
+// the resume closed instead of being run on the shard.
+func TestReplanAndFilterTasks_ShardTaskIsVerifiedAgainstTheUnitsStatements(t *testing.T) {
+	eng := &replanTargetEngine{plan: resumeTaskReplan(resumeTaskDDL)}
+	client, apply, task := shardTaskFixture(eng)
+	rp, err := client.replanAndFilterTasks(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7})
+	require.NoError(t, err)
+	require.Len(t, rp.ActiveTasks, 1)
+	assert.Equal(t, resumeTaskDDL, rp.ActiveTasks[0].DDL)
+
+	eng = &replanTargetEngine{plan: resumeTaskReplan("ALTER TABLE `orders` ADD COLUMN `memo` TEXT")}
+	client, apply, task = shardTaskFixture(eng)
+	_, err = client.replanAndFilterTasks(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "drifted from the reviewed plan")
+}
+
+// The sequential resume re-plans each table right before it runs. A target
+// that cannot be re-planned is unverified, so the resume returns the failure
+// without starting the task, and the apply stays active for a later drive.
+func TestResumeApplySequential_UnverifiedTargetIsNotStarted(t *testing.T) {
+	eng := &replanTargetEngine{planErr: errors.New("dial tcp: connection refused")}
+	client, apply, task := shardTaskFixture(eng)
+	task.Shard = ""
+
+	err := client.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7}, nil)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "connection refused")
+	assert.Zero(t, eng.applies, "the task is never started on an unverified target")
+	assert.Equal(t, state.Task.Pending, task.State)
+}
+
+// A shard task the namespace-unit re-plan no longer mentions is run with its
+// reviewed statement on resume rather than settled from that silence.
+func TestResumeApplySequential_ShardTaskRunsWhenTheUnitIsSilent(t *testing.T) {
+	eng := &replanTargetEngine{plan: &engine.PlanResult{NoChanges: true}}
+	client, apply, task := shardTaskFixture(eng)
+
+	err := client.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7}, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, eng.applies, "the engine runs the task and decides its outcome")
+	assert.Equal(t, state.Task.Completed, task.State)
+}
+
+// blockedDrainEngine is an engine whose in-process work from an earlier drive
+// never exits, so draining it waits until the caller gives up.
+type blockedDrainEngine struct {
+	*replanTargetEngine
+	draining chan struct{}
+}
+
+func (e *blockedDrainEngine) DrainContext(ctx context.Context) error {
+	close(e.draining)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A resume waits for in-process engine work to exit before it reads the
+// target, and that work can be a run an earlier drive left behind that never
+// ends. The wait lasts only as long as the drive's claim: a drive cancelled
+// while it waits returns promptly and hands the apply back without
+// re-planning the target or starting the task.
+func TestResumeApplySequential_CancelledDriveStopsWaitingOnEngineWork(t *testing.T) {
+	target := &replanTargetEngine{plan: resumeTaskReplan(resumeTaskDDL)}
+	eng := &blockedDrainEngine{replanTargetEngine: target, draining: make(chan struct{})}
+	client, apply, task, _ := lostWorkPollFixtureInState(eng, lostWorkTrustBudgetAmple, state.Task.Pending)
+	client.heartbeatInterval = 10 * time.Second
+	task.Shard = ""
+	task.DDL = resumeTaskDDL
+	driveCtx, cancelDrive := context.WithCancel(t.Context())
+	defer cancelDrive()
+
+	returned := make(chan error, 1)
+	go func() {
+		returned <- client.resumeApplySequential(driveCtx, apply, []*storage.Task{task}, &storage.Plan{ID: 7}, nil)
+	}()
+	select {
+	case <-eng.draining:
+	case <-time.After(resumeTestDeadline):
+		require.FailNow(t, "the resume never waited on the engine work")
+	}
+	cancelDrive()
+
+	select {
+	case err := <-returned:
+		require.NoError(t, err, "a cancelled drive hands the apply back")
+	case <-time.After(resumeTestDeadline):
+		require.FailNow(t, "the cancelled drive kept waiting on the engine work")
+	}
+	assert.Zero(t, target.planCalls, "the target is not re-planned once the drive is cancelled")
+	assert.Zero(t, target.applies, "the task is not started once the drive is cancelled")
+	assert.Equal(t, state.Task.Pending, task.State)
+}
+
+// resumeTestDeadline bounds a wait on the drive under test.
+const resumeTestDeadline = 5 * time.Second
+
+// cancellingApplyEngine fails Apply because the drive was cancelled while the
+// engine was starting the task.
+type cancellingApplyEngine struct {
+	*replanTargetEngine
+	cancelDrive context.CancelFunc
+}
+
+func (e *cancellingApplyEngine) Apply(ctx context.Context, _ *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.applies++
+	e.cancelDrive()
+	return nil, fmt.Errorf("wait for the previous schema change to exit: %w", ctx.Err())
+}
+
+// An engine error from a drive that was cancelled while the engine started
+// the task describes the cancellation, not the task. The drive hands the
+// apply back with no verdict recorded, so the retry budget is not spent.
+func TestRunEngineTask_CancelledDriveRecordsNoVerdictForTheEnginesError(t *testing.T) {
+	driveCtx, cancelDrive := context.WithCancel(t.Context())
+	defer cancelDrive()
+	eng := &cancellingApplyEngine{replanTargetEngine: &replanTargetEngine{}, cancelDrive: cancelDrive}
+	client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+	task.Shard = ""
+	task.DDL = resumeTaskDDL
+
+	action := client.runEngineTask(driveCtx, apply, task, nil)
+
+	assert.Equal(t, taskHandover, action)
+	assert.Equal(t, 1, eng.applies)
+	assert.Empty(t, recording.states, "no failure verdict is written for a cancelled drive")
+	assert.Empty(t, task.ErrorMessage)
+}
