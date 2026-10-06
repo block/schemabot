@@ -123,6 +123,56 @@ func TestReplanAndFilterTasks_ShardTaskIsVerifiedAgainstTheUnitsStatements(t *te
 	assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 }
 
+// siblingStatementDDL is the reviewed statement of a second task on the same
+// shard and table.
+const siblingStatementDDL = "ALTER TABLE `orders` ADD INDEX `idx_created` (`created_at`)"
+
+// withPendingSibling adds a second pending task for the same shard and table,
+// reviewed with siblingStatementDDL.
+func withPendingSibling(task *storage.Task) []*storage.Task {
+	sibling := *task
+	sibling.ID = task.ID + 1
+	sibling.TaskIdentifier = task.TaskIdentifier + "-sibling"
+	sibling.DDL = siblingStatementDDL
+	sibling.State = state.Task.Pending
+	return []*storage.Task{task, &sibling}
+}
+
+// A namespace-unit re-plan that lists only a sibling's statement for the
+// table says the namespace still owes that statement. It says nothing about
+// whether this task's statement reached the shard, so the task stays active
+// with its reviewed statement rather than being settled as landed.
+func TestReplanAndFilterTasks_ShardTaskIsNotSettledByTheUnitsSiblingStatement(t *testing.T) {
+	eng := &replanTargetEngine{plan: resumeTaskReplan(siblingStatementDDL)}
+	client, apply, task := shardTaskFixture(eng)
+	tasks := withPendingSibling(task)
+
+	rp, err := client.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{ID: 7})
+
+	require.NoError(t, err)
+	assert.Zero(t, rp.CompletedCount, "no task is settled on the unit's statements")
+	require.Len(t, rp.ActiveTasks, 2)
+	assert.Equal(t, resumeTaskDDL, rp.ActiveTasks[0].DDL, "the task keeps its reviewed statement")
+	assert.Equal(t, siblingStatementDDL, rp.ActiveTasks[1].DDL)
+	assert.Equal(t, state.Task.Pending, task.State)
+}
+
+// The sequential resume runs a shard task with its reviewed statement when a
+// namespace-unit re-plan lists only a sibling's statement for the table.
+func TestResumeApplySequential_ShardTaskRunsWhenTheUnitListsOnlyASibling(t *testing.T) {
+	eng := &replanTargetEngine{plan: resumeTaskReplan(siblingStatementDDL)}
+	client, apply, task := shardTaskFixture(eng)
+	tasks := withPendingSibling(task)
+	client.storage.(*exactProgressStorage).tasks.(*stateRecordingTaskStore).tasks = tasks
+
+	err := client.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{ID: 7}, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, eng.applies, "the engine runs both tasks and decides their outcomes")
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.Equal(t, state.Task.Completed, tasks[1].State)
+}
+
 // The sequential resume re-plans each table right before it runs. A target
 // that cannot be re-planned is unverified, so the resume returns the failure
 // without starting the task, and the apply stays active for a later drive.

@@ -486,6 +486,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			}
 			failedTask = task
 			break
+		} else if landed && !replanKeyedByTaskShard(task, replanKey) {
+			logger.Warn("the re-plan describes the table's namespace as a unit and lists only sibling statements; the task resumes with its reviewed statement and the engine decides its outcome",
+				task.LogAttrs()...)
 		} else if landed {
 			// The table still has pending statements, but every one of them
 			// is the reviewed DDL of a sibling task that is not yet terminal:
@@ -664,7 +667,10 @@ const (
 // than the direction that reports a change as made.
 //
 // The returned key is where the re-plan's statements for the task live when
-// it needs the change.
+// it needs the change. When that is the namespace unit's key rather than the
+// task's own, the statements describe the namespace, so the task's statement
+// missing from them is not evidence that it landed on the shard; callers check
+// this with replanKeyedByTaskShard before settling on that absence.
 func replanVerdictForTask(replanDDL map[shardTableKey][]string, task *storage.Task) (replanVerdict, shardTableKey) {
 	key := shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}
 	if _, needsChange := replanDDL[key]; needsChange {
@@ -678,6 +684,13 @@ func replanVerdictForTask(replanDDL map[shardTableKey][]string, task *storage.Ta
 		return replanCannotAttribute, key
 	}
 	return replanChangeLanded, key
+}
+
+// replanKeyedByTaskShard reports whether the re-plan statements read for a
+// task came from the task's own shard rather than its namespace as a unit.
+// Only then does the task's statement missing from them mean it landed.
+func replanKeyedByTaskShard(task *storage.Task, replanKey shardTableKey) bool {
+	return replanKey.shard == task.Shard
 }
 
 // replanCoversShards reports whether a re-plan described the namespace one
@@ -812,6 +825,16 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			ddl, landed, err := c.verifyReplannedTaskDDL(task, replanned, tasks)
 			if err != nil {
 				return nil, err
+			}
+			if landed && !replanKeyedByTaskShard(task, replanKey) {
+				// The unit's statements are the namespace's, not the shard's:
+				// the task's own statement missing from them says nothing about
+				// whether it reached this shard. The task stays active with its
+				// reviewed statement, and the engine decides its outcome.
+				c.logger.Warn("resume re-plan describes the table's namespace as a unit and lists only sibling statements; keeping the task active with its reviewed statement",
+					task.LogAttrs()...)
+				activeTasks = append(activeTasks, task)
+				continue
 			}
 			if landed {
 				// The table is still in the diff, but only for the reviewed

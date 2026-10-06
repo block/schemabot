@@ -1499,7 +1499,7 @@ sibling was reviewed with refuses the resume instead, since nothing will run it 
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
 `replanAndFilterTasks` and `resumeApplySequential`); `settleLostVerifiedTask` on the lost-work
 path (`pkg/tern/local_apply_sequential.go`, reached from the sequential and grouped drives).
-Every one of these reads the re-plan through `replanVerdictForTask`
+The resume and lost-work paths read the re-plan through `replanVerdictForTask`
 (`pkg/tern/local_control_resume.go`), which judges whether the re-plan speaks for a
 shard-tagged task at all. The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
