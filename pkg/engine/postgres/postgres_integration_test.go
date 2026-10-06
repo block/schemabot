@@ -730,7 +730,7 @@ func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "app", rollbackBaseline(nil, engine.IgnoredTables{}))
+	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
 	require.NoError(t, err)
 	assert.Empty(t, renderErrors)
 	assert.Len(t, rendered, baselineIntrospectionConcurrency*2)
@@ -840,7 +840,7 @@ func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *test
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "app", rollbackBaseline(nil, engine.IgnoredTables{}))
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
 	assert.False(t, dropped.timedOut.Load(),
 		"the sibling introspections must be cancelled by the failure; a render that lets them run holds them to the deadline")
 	require.ErrorIs(t, err, schemadiff.ErrTableNotFound)
@@ -885,7 +885,7 @@ func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T)
 	require.NoError(t, err)
 	defer pool.Close()
 
-	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "app", pulledBaseline)
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", pulledBaseline)
 	assert.False(t, rendezvous.timedOut.Load(),
 		"two introspections must be in flight at once; a render that takes tables one at a time never reaches the second BEGIN")
 	require.NoError(t, err)
@@ -907,7 +907,7 @@ func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T)
 	require.NoError(t, err)
 	defer freePool.Close()
 	for range 3 {
-		again, againErrors, err := renderPostgresTables(t.Context(), freePool, "app", pulledBaseline)
+		again, againErrors, err := renderPostgresTables(t.Context(), freePool, "appdb", "app", pulledBaseline)
 		require.NoError(t, err)
 		assert.Equal(t, rendered, again)
 		require.Len(t, againErrors, len(renderErrors))

@@ -115,7 +115,7 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		// accountable for, so a pulled baseline declares exactly what a later
 		// plan would otherwise report as undeclared. Partitions and
 		// extension-owned tables have no file of their own and are left out.
-		tables, tableErrors, err := renderPostgresTables(ctx, pool, namespace, pulledBaseline)
+		tables, tableErrors, err := renderPostgresTables(ctx, pool, e.pullDatabase, namespace, pulledBaseline)
 		if err != nil {
 			return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 		}
@@ -169,14 +169,17 @@ func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) ba
 	}
 }
 
-func (p baselinePolicy) includesTable(table string) bool {
+// exclusionReason names the rule that leaves a table out of the baseline,
+// using the same reason strings a plan reports for its exempt tables, or
+// returns "" when the baseline carries the table.
+func (p baselinePolicy) exclusionReason(table string) string {
 	if p.ignoredTables.Withholds(table) {
-		return false
+		return engine.ExemptReasonIgnoreTables
 	}
 	if p.skipUndeclaredArchiveTables && !p.declaredTables[table] && spirittable.IsArchiveTable(table) {
-		return false
+		return exemptReasonArchiveNaming
 	}
-	return true
+	return ""
 }
 
 // baselineIntrospectionConcurrency caps how many tables a baseline render
@@ -219,17 +222,19 @@ type renderedTable struct {
 // the whole render with an error, and cancels the introspections still in
 // flight, instead of being recorded as a per-table refusal and carried on
 // past.
-func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
+func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
 	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
 	}
 	managedTables := make([]string, 0, len(tables))
 	for _, table := range tables {
-		if !policy.includesTable(table) {
+		if reason := policy.exclusionReason(table); reason != "" {
 			slog.Debug("PostgreSQL table is outside management and left out of the rendered baseline",
+				"database", database,
 				"namespace", namespace,
-				"table", table)
+				"table", table,
+				"reason", reason)
 			continue
 		}
 		managedTables = append(managedTables, table)

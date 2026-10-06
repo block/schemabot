@@ -325,7 +325,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			result.ExemptTables = append(result.ExemptTables, &engine.ExemptTables{
 				Namespace: namespace,
 				Tables:    exempt,
-				Reason:    "archive naming",
+				Reason:    exemptReasonArchiveNaming,
 			})
 		}
 		if exemption := ignored.Exemption(namespace, withheld); exemption != nil {
@@ -393,7 +393,7 @@ func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
 // introspections run concurrently within the pool's ceiling, so the wall
 // time grows more slowly than the table count does.
 func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, captured bool, err error) {
-	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, rollbackBaseline(declared, ignored))
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, ignored))
 	if err != nil {
 		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}
@@ -892,6 +892,11 @@ func concurrentIndexStatement(sql string) (bool, error) {
 	}
 	return statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent(), nil
 }
+
+// exemptReasonArchiveNaming is the exemption reason a plan carries for an
+// undeclared live table whose name marks it as an archive: the table is left
+// in place rather than dropped, and left out of the rollback baseline.
+const exemptReasonArchiveNaming = "archive naming"
 
 // undeclaredTableDrops surfaces every live table in the namespace that no
 // schema file declares, whether its file was deleted or it was never declared
