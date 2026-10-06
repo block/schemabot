@@ -808,6 +808,25 @@ func TestSettleLostVerifiedTask_EveryVerdictSettles(t *testing.T) {
 	}
 }
 
+// An engine refused the table because another run of a schema change still
+// holds it has not failed the schema change. The poll reports the refusal to
+// its caller, which waits for the holder, and records no failure verdict.
+func TestPollTaskToCompletion_TargetHeldIsNotAFailure(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{
+		State: engine.StateFailed, TargetHeld: true,
+		ErrorMessage: "could not acquire advisory lock: lock is held by another connection",
+	}}}
+	client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+	assert.Equal(t, taskTargetHeld, action)
+	assert.Equal(t, 1, eng.calls)
+	assert.Equal(t, state.Task.Running, task.State, "the task is not rested failed or failed_retryable")
+	assert.Empty(t, task.ErrorMessage)
+	assert.Empty(t, recording.states, "no failure verdict is written")
+}
+
 // A task parked at an operator gate — a held cutover, a deferred deploy, an
 // open revert window — is motionless by design for as long as the operator
 // takes to act. The stall watchdog must stay quiet for those states, so the
@@ -1197,4 +1216,25 @@ func TestPollTaskToCompletion_FinishedTransitionNamesTheStateLeft(t *testing.T) 
 	require.NotNil(t, finished, "the drive records the task finishing")
 	assert.Equal(t, state.Task.Running, finished.OldState)
 	assert.Equal(t, state.Task.Completed, finished.NewState)
+}
+
+// A drive waiting for another run to release the table keeps the task row
+// fresh so the wait reads as alive. A write storage refuses outright is
+// refused the same way every time, so the drive exits rather than waiting on
+// with a frozen row.
+func TestWaitForTargetRelease_RejectedWriteExits(t *testing.T) {
+	client, _, task, recording := lostWorkPollFixture(&phaseSequenceEngine{}, lostWorkTrustBudgetAmple)
+	refusing := &progressRefusingTaskStore{
+		stateRecordingTaskStore: recording,
+		err:                     fmt.Errorf("update task %s: %w", task.TaskIdentifier, storage.ErrValueRejected),
+		refusals:                -1,
+	}
+	client.storage.(*exactProgressStorage).tasks = refusing
+
+	assert.Equal(t, taskAbort, client.waitForTargetRelease(t.Context(), slog.Default(), task))
+	assert.Equal(t, 1, refusing.refused)
+
+	refusing.err = errors.New("storage down")
+	assert.Equal(t, taskContinue, client.waitForTargetRelease(t.Context(), slog.Default(), task),
+		"a transient failure starts the task again and retries the write")
 }

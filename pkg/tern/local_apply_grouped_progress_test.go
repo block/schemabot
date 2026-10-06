@@ -422,6 +422,30 @@ func TestPollForCompletionAtomic_LostEngineWorkSettlesShardTasksOnPerShardReplan
 	assert.Equal(t, 100, payments.ProgressPercent)
 }
 
+// A grouped engine refused the target because another run of a schema change
+// still holds it has not failed the schema change. The drive hands the apply
+// back with every row as it stands, so no retry attempt is spent, and the
+// driver that next claims it starts the work again once the holder lets go.
+func TestPollForCompletionAtomic_TargetHeldHandsBackWithoutAFailure(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{
+		State: engine.StateFailed, TargetHeld: true,
+		ErrorMessage: "could not acquire advisory lock: lock is held by another connection",
+	}}}
+	client, apply, tasks, recording := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, 1, eng.calls, "the drive hands back at the refusal")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply is not paused or failed")
+	assert.Nil(t, apply.CompletedAt)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Running, task.State, "table %s", task.TableName)
+		assert.Empty(t, task.ErrorMessage, "table %s", task.TableName)
+	}
+	assert.Empty(t, recording.states, "no failure verdict is written")
+	assertApplyLogContains(t, client, "held by another run of a schema change")
+}
+
 // Every grouped tick persists each task row, and the operator reads those rows
 // as the drive's liveness. A write that storage refuses outright, or one that
 // keeps failing, ends the drive with its own error instead of polling on until

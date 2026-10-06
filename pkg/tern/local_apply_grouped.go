@@ -759,6 +759,19 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		return false
 	}
+	if engineRefusedTheTarget(result) {
+		// Another run of a schema change holds the target, so the refused
+		// start is not this schema change failing and must not spend the
+		// retry budget. The drive hands the apply back with every row as it
+		// stands; the driver that claims it once the lease goes stale starts
+		// the work again, by which time the holder has had the window to let go.
+		c.observeTargetHeld(ctx, logger, apply, "")
+		logger.Warn("engine was refused the target because another run of a schema change holds it; this driver hands the apply back without recording a failure",
+			append(apply.MutableLogAttrs(), "engine_error", result.ErrorMessage)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			"The target is held by another run of a schema change; the apply is handed back to start again once it lets go", "", "")
+		return true
+	}
 	var saveErr error
 	ps.lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(ps.lastProgressMetadata, result.Metadata, &ps.progressMetadataLeaseLost, func(metadata map[string]string) error {
 		return c.saveApplyProgressMetadata(ctx, apply, tasks, metadata)
