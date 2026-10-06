@@ -34,39 +34,47 @@ var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after hear
 // itself once the drives have returned.
 var ErrOperatorShutdown = errors.New("operator is shutting down")
 
-type operatorContextKey struct{}
+type operatorShutdownKey struct{}
 
-// WithOperatorContext attaches the operator's own context to the contexts its
-// drives run under. A drive's context can be cancelled for its own reasons —
-// a lost lease, a stall, a hand-back — before the operator shuts down, and
-// then its cause never says shutdown. The operator's context still does, so a
-// drive tearing down after its own cancellation can still see a shutdown
-// begin and leave the teardown to it.
-func WithOperatorContext(ctx context.Context) context.Context {
-	return context.WithValue(ctx, operatorContextKey{}, ctx)
+// NewOperatorContext returns the context an operator runs its drives under and
+// the function that shuts them down, which cancels the drives with
+// ErrOperatorShutdown. A drive's context can end for other reasons first — a
+// lost lease, a stall, a hand-back, or the operator's parent context being
+// cancelled — and then its cause never says shutdown. So the signal that
+// shutdown has begun lives on a context of its own that only shutDown ends,
+// and a drive tearing down after any earlier cancellation still sees a
+// shutdown begin and leaves the teardown to it.
+func NewOperatorContext(parent context.Context) (ctx context.Context, shutDown func()) {
+	drives, cancelDrives := context.WithCancelCause(parent)
+	shutdown, signalShutdown := context.WithCancelCause(context.WithoutCancel(parent))
+	ctx = context.WithValue(drives, operatorShutdownKey{}, shutdown)
+	return ctx, func() {
+		signalShutdown(ErrOperatorShutdown)
+		cancelDrives(ErrOperatorShutdown)
+	}
 }
 
 // operatorShuttingDown reports whether the operator running this drive has
 // begun shutting down, read from the drive's own cancellation cause and from
-// the operator context WithOperatorContext attached.
+// the shutdown signal NewOperatorContext attached.
 func operatorShuttingDown(ctx context.Context) bool {
 	if errors.Is(context.Cause(ctx), ErrOperatorShutdown) {
 		return true
 	}
-	operator, ok := ctx.Value(operatorContextKey{}).(context.Context)
-	return ok && errors.Is(context.Cause(operator), ErrOperatorShutdown)
+	shutdown, ok := ctx.Value(operatorShutdownKey{}).(context.Context)
+	return ok && errors.Is(context.Cause(shutdown), ErrOperatorShutdown)
 }
 
 // afterOperatorShutdown arranges for f to run once the operator running this
 // drive begins shutting down, and returns a function that stops the
-// arrangement. A drive with no operator context never runs f.
+// arrangement. A drive with no operator shutdown signal never runs f.
 func afterOperatorShutdown(ctx context.Context, f func()) (stop func() bool) {
-	operator, ok := ctx.Value(operatorContextKey{}).(context.Context)
+	shutdown, ok := ctx.Value(operatorShutdownKey{}).(context.Context)
 	if !ok {
 		return func() bool { return true }
 	}
-	return context.AfterFunc(operator, func() {
-		if errors.Is(context.Cause(operator), ErrOperatorShutdown) {
+	return context.AfterFunc(shutdown, func() {
+		if errors.Is(context.Cause(shutdown), ErrOperatorShutdown) {
 			f()
 		}
 	})

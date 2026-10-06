@@ -117,9 +117,9 @@ func TestDriveExitHaltReachesOnlyTheDrivesOwnWork(t *testing.T) {
 func TestShutdownTakesOverADriveHaltAlreadyUnderway(t *testing.T) {
 	eng := &ownedWorkEngine{block: true}
 	client := newOwnedWorkClient(eng)
-	operatorCtx, shutDown := context.WithCancelCause(t.Context())
-	defer shutDown(nil)
-	drive, stall := context.WithCancel(driveContext(WithOperatorContext(operatorCtx), "token-a"))
+	operatorCtx, shutDown := NewOperatorContext(t.Context())
+	defer shutDown()
+	drive, stall := context.WithCancel(driveContext(operatorCtx, "token-a"))
 	stall()
 
 	halted := make(chan struct{})
@@ -130,7 +130,36 @@ func TestShutdownTakesOverADriveHaltAlreadyUnderway(t *testing.T) {
 	require.Eventually(t, func() bool { return len(eng.halts()) == 1 }, driveHaltTestDeadline, time.Millisecond,
 		"the stalled drive halts its own work")
 
-	shutDown(ErrOperatorShutdown)
+	shutDown()
+	select {
+	case <-halted:
+	case <-time.After(driveHaltTestDeadline):
+		require.FailNow(t, "the drive kept halting after the operator began shutting down")
+	}
+}
+
+// The operator's own parent context can be cancelled before the operator is
+// stopped, which ends every drive with a cause that does not say shutdown.
+// Each drive then halts its own work, and a shutdown that begins while it does
+// still takes the halt over.
+func TestShutdownTakesOverAHaltAfterTheOperatorsParentIsCancelled(t *testing.T) {
+	eng := &ownedWorkEngine{block: true}
+	client := newOwnedWorkClient(eng)
+	parent, cancelParent := context.WithCancel(t.Context())
+	operatorCtx, shutDown := NewOperatorContext(parent)
+	defer shutDown()
+	drive := driveContext(operatorCtx, "token-a")
+	cancelParent()
+
+	halted := make(chan struct{})
+	go func() {
+		defer close(halted)
+		client.haltEngineWorkLeftByDrive(drive, slog.Default())
+	}()
+	require.Eventually(t, func() bool { return len(eng.halts()) == 1 }, driveHaltTestDeadline, time.Millisecond,
+		"the drive ended by its parent halts its own work")
+
+	shutDown()
 	select {
 	case <-halted:
 	case <-time.After(driveHaltTestDeadline):
@@ -143,10 +172,10 @@ func TestShutdownTakesOverADriveHaltAlreadyUnderway(t *testing.T) {
 func TestDriveReturningDuringShutdownLeavesTheHaltToIt(t *testing.T) {
 	eng := &ownedWorkEngine{}
 	client := newOwnedWorkClient(eng)
-	operatorCtx, shutDown := context.WithCancelCause(t.Context())
-	drive, stall := context.WithCancel(driveContext(WithOperatorContext(operatorCtx), "token-a"))
+	operatorCtx, shutDown := NewOperatorContext(t.Context())
+	drive, stall := context.WithCancel(driveContext(operatorCtx, "token-a"))
 	stall()
-	shutDown(ErrOperatorShutdown)
+	shutDown()
 
 	client.haltEngineWorkLeftByDrive(drive, slog.Default())
 
