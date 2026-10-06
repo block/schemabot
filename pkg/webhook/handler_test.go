@@ -1055,6 +1055,40 @@ func TestWebhookProseMentionIsNotAnswered(t *testing.T) {
 	}
 }
 
+// An agent's explanation of how to land a schema change closes with a line
+// that opens with the product name, in any case, and mentions apply commands
+// only inline. SchemaBot leaves it unanswered rather than replying with the
+// invalid-command help.
+func TestWebhookExplanationOpeningWithTheProductNameIsNotAnswered(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	for _, lastLine := range []string{
+		"SchemaBot will then comment the exact DDL it plans for staging and production, " +
+			"and you apply it with `schemabot apply -e staging`, then `schemabot apply -e production`.",
+		"SchemaBot will then comment the exact DDL it plans for staging and production on this PR.",
+		"Schemabot will then comment the exact DDL it plans for staging and production on this PR.",
+		"SCHEMABOT will then comment the exact DDL it plans for staging and production on this PR.",
+	} {
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: agentExplanationBody(lastLine),
+			isPR:    true,
+		}, nil)
+
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code, lastLine)
+		assert.Contains(t, rr.Body.String(), "no SchemaBot command", lastLine)
+
+		// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+		select {
+		case body := <-comments:
+			require.Failf(t, "unexpected comment posted", "last line %q: %s", lastLine, body)
+		default:
+		}
+	}
+}
+
 func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 

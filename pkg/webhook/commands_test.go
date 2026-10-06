@@ -1040,6 +1040,97 @@ func TestParseCommand_SentenceThenCommand(t *testing.T) {
 	}
 }
 
+// agentExplanationBody is an agent's explanation of how to land a schema
+// change: an imperative-style command appears only inline in a sentence, and
+// the closing line opens with the product name as the subject of a sentence.
+func agentExplanationBody(lastLine string) string {
+	return "🤖 Heads up: this service's schema is now managed by SchemaBot (#123, merged today). " +
+		"`db/migrate/` is kept as history only, so the new `20260921190000_add_column.rb` in this PR won't be picked up by SchemaBot.\n" +
+		"\n" +
+		"To land this change, move it into the declarative schema instead:\n" +
+		"\n" +
+		"1. Drop `db/migrate/20260921190000_add_column.rb`.\n" +
+		"2. Edit `db/mysql/schema/app_{env}/widgets.sql` so its `CREATE TABLE` reflects the end state you want.\n" +
+		"\n" +
+		lastLine
+}
+
+// An explanation whose closing line opens with the product name, in any case,
+// is a sentence about SchemaBot. It runs nothing and gets no answer, while the
+// same comment with a command alone on a line still runs that command.
+func TestParseCommand_ExplanationOpeningWithTheProductName(t *testing.T) {
+	parser := NewCommandParser()
+	const withApplySteps = "will then comment the exact DDL it plans for staging and production, " +
+		"and you apply it with `schemabot apply -e staging`, then `schemabot apply -e production`."
+	const onThisPR = "will then comment the exact DDL it plans for staging and production on this PR."
+	const readmeCovers = "will then comment the exact DDL it plans for staging and production, " +
+		"and the README covers how to apply it."
+
+	tests := []struct {
+		name     string
+		body     string
+		expected CommandResult
+	}{
+		{
+			name:     "closing line with inline apply commands",
+			body:     agentExplanationBody("SchemaBot " + withApplySteps),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "closing line about the comment on this PR",
+			body:     agentExplanationBody("SchemaBot " + onThisPR),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "closing line pointing at the README",
+			body:     agentExplanationBody("SchemaBot " + readmeCovers),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "title-case product name",
+			body:     agentExplanationBody("Schemabot " + onThisPR),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "upper-case product name",
+			body:     agentExplanationBody("SCHEMABOT " + withApplySteps),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "lower-case product name",
+			body:     agentExplanationBody("schemabot " + onThisPR),
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "explanation sentence alone",
+			body:     "SchemaBot " + onThisPR,
+			expected: CommandResult{ProseMention: true},
+		},
+		{
+			name:     "command alone on a line after the explanation runs",
+			body:     agentExplanationBody("SchemaBot "+onThisPR) + "\n\nschemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "command alone on a line",
+			body:     "schemabot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+		{
+			name:     "capitalized command alone on a line",
+			body:     "SchemaBot apply -e staging",
+			expected: CommandResult{Action: "apply", Environment: "staging", Found: true, IsMention: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parser.ParseCommand(tt.body)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
+}
+
 // The usage gates read flags from the same command line ParseCommand acts
 // on, so a flag mentioned in a sentence never rejects the command below it,
 // and a flag on the command line always does.
