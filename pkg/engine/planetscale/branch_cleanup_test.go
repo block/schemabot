@@ -94,6 +94,68 @@ func TestApplyDeletesItsOwnBranchWhenItFailsBeforeTheDeployRequest(t *testing.T)
 	})
 }
 
+// handbackClient ends the drive while the branch is being prepared, the way
+// the operator cancels a drive whose lease was lost, that looked stalled, or
+// whose instance is shutting down.
+type handbackClient struct {
+	branchLifecycleClient
+	cancel context.CancelFunc
+}
+
+func (c *handbackClient) CreateBranchPassword(ctx context.Context, _ *ps.DatabaseBranchPasswordRequest) (*ps.DatabaseBranchPassword, error) {
+	c.cancel()
+	return nil, ctx.Err()
+}
+
+// A drive that ends while its branch is being prepared hands the apply to
+// another driver, which resumes from the branch the stored resume state names.
+// Deleting that branch would discard the resume's starting point, and after a
+// lost lease would pull it from under a peer already preparing it. A branch
+// the stored state never named cannot be resumed, so it is still deleted.
+func TestApplyKeepsItsBranchForTheDriverThatResumesIt(t *testing.T) {
+	shortenEngineWaits(t)
+	tests := []struct {
+		name        string
+		recorded    bool
+		wantDeleted bool
+	}{
+		{name: "a branch the stored resume state names is kept", recorded: true, wantDeleted: false},
+		{name: "a branch the stored resume state never named is deleted", recorded: false, wantDeleted: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			client := &handbackClient{cancel: cancel}
+			var stored []*engine.ResumeState
+			req := &engine.ApplyRequest{
+				PlanID:      "plan-0123456789abcdef",
+				Database:    "commerce",
+				Credentials: conformanceCredentials(),
+			}
+			if tt.recorded {
+				req.ResumeState = &engine.ResumeState{MigrationContext: "apply-0123456789abcdef"}
+				req.OnStateChange = func(rs *engine.ResumeState) { stored = append(stored, rs) }
+			}
+
+			_, err := conformanceEngine(client).Apply(ctx, req)
+			require.ErrorIs(t, err, context.Canceled)
+
+			created, deleted := client.snapshot()
+			require.Len(t, created, 1)
+			if tt.wantDeleted {
+				assert.Equal(t, created, deleted)
+				return
+			}
+			assert.Empty(t, deleted, "the branch the resume will look for must survive the handback")
+			require.NotEmpty(t, stored)
+			meta, decodeErr := decodePSMetadata(stored[len(stored)-1].Metadata)
+			require.NoError(t, decodeErr)
+			assert.Equal(t, created[0], meta.BranchName, "the kept branch is the one the stored state names")
+		})
+	}
+}
+
 // branchHandoverClient carries a fresh apply through branch preparation to the
 // deploy request: credentials are issued, the request has no changes so no
 // MySQL connection is opened, and the deploy request it creates reports no

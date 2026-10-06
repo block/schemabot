@@ -512,20 +512,41 @@ func (e *Engine) createBranch(ctx context.Context, client psclient.PSClient, org
 	return branch, nil
 }
 
-func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClient, org, database, branchName string) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+// branchReadyPollInterval paces the readiness polls while a branch is being
+// prepared. It is a variable so tests can shorten it.
+var branchReadyPollInterval = 2 * time.Second
+
+// branchReadyWait bounds how long an apply waits for one branch to become
+// ready before failing.
+const branchReadyWait = 30 * time.Minute
+
+// waitForBranchReady polls until the branch reports ready. A large sharded
+// database can take many minutes to branch, so the wait reports itself through
+// a waitHeartbeat. The wait is bounded by branchReadyWait, so the heartbeat
+// cannot keep a drive alive indefinitely.
+//
+// The error says which of three things ended the wait, because they call for
+// different recoveries: the caller's context ending (the drive was cancelled),
+// the branch not being found, or the wait running out.
+func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClient, org, database, branchName string, emitEvent func(engine.ApplyEvent)) error {
+	waitCtx, cancel := context.WithTimeout(ctx, branchReadyWait)
 	defer cancel()
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(branchReadyPollInterval)
 	defer ticker.Stop()
+	heartbeat := newWaitHeartbeat(emitEvent, fmt.Sprintf("Waiting for branch %s to be ready", branchName), map[string]string{"branch": branchName})
 
 	var consecutiveErrors int
 	for {
 		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for branch %s", branchName)
+		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return fmt.Errorf("stopped waiting for branch %s: %w", branchName, ctx.Err())
+			}
+			return fmt.Errorf("timeout waiting for branch %s after %s", branchName, branchReadyWait)
 		case <-ticker.C:
-			branch, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
+			heartbeat.beat()
+			branch, err := client.GetBranch(waitCtx, &ps.GetDatabaseBranchRequest{
 				Organization: org,
 				Database:     database,
 				Branch:       branchName,
@@ -545,6 +566,12 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 			}
 		}
 	}
+}
+
+// isNotFound reports whether err carries a PlanetScale not-found response.
+func isNotFound(err error) bool {
+	var psErr *ps.Error
+	return errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound
 }
 
 func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoDeleteBranch bool) (*ps.DeployRequest, error) {
@@ -742,7 +769,11 @@ func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient,
 // transient-error retry bound, which validation routinely outlives. Transient
 // API errors retry with backoff up to maxRetries. Any other rejection fails
 // immediately.
-func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64, instantDDL bool) (*ps.DeployRequest, error) {
+//
+// The validation wait reports itself through a waitHeartbeat; emitEvent may be
+// nil outside a drive.
+func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64, instantDDL bool, emitEvent func(engine.ApplyEvent)) (*ps.DeployRequest, error) {
+	heartbeat := newWaitHeartbeat(emitEvent, fmt.Sprintf("Waiting for PlanetScale to finish validating deploy request #%d", number), nil)
 	var validationDeadline time.Time
 	validationWaitLogged := false
 	transientAttempts := 0
@@ -766,6 +797,7 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 			if validationDeadline.IsZero() {
 				validationDeadline = time.Now().Add(deployValidationWait)
 			}
+			heartbeat.beat()
 			if time.Now().After(validationDeadline) {
 				return nil, fmt.Errorf("deploy deploy request #%d: PlanetScale was still validating the deploy request after waiting %s: %w", number, deployValidationWait, err)
 			}
@@ -814,7 +846,12 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 // request beside it. The tolerance is bounded to maxRetries consecutive
 // failures so an API that stays down still surfaces; a poll that succeeds
 // resets the count. Any other error is returned at once.
-func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclient.PSClient, org, database string, dr *ps.DeployRequest) (*ps.DeployRequest, error) {
+//
+// The wait reports itself through a waitHeartbeat and gives up after
+// deployRequestPendingWait, so a deploy request PlanetScale never finishes
+// diffing fails the apply instead of holding the drive forever. emitEvent may
+// be nil outside a drive.
+func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclient.PSClient, org, database string, dr *ps.DeployRequest, emitEvent func(engine.ApplyEvent)) (*ps.DeployRequest, error) {
 	// A nil deploy request means an upstream caller never created or fetched it;
 	// poll has nothing to track, so surface the invariant violation rather than
 	// dereferencing it below.
@@ -826,6 +863,8 @@ func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclien
 
 	ticker := time.NewTicker(deployRequestPollInterval)
 	defer ticker.Stop()
+	heartbeat := newWaitHeartbeat(emitEvent, fmt.Sprintf("Waiting for PlanetScale to compute the schema diff of deploy request #%d", number), nil)
+	deadline := time.Now().Add(deployRequestPendingWait)
 
 	consecutiveFailures := 0
 	for dr.DeploymentState == deployState.Pending {
@@ -834,6 +873,10 @@ func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclien
 			return nil, fmt.Errorf("context cancelled waiting for deploy request %d: %w", number, ctx.Err())
 		case <-ticker.C:
 		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("deploy request #%d was still pending after %s; PlanetScale did not finish computing its schema diff", number, deployRequestPendingWait)
+		}
+		heartbeat.beat()
 		next, err := e.getDeployRequest(ctx, client, org, database, number)
 		if err != nil {
 			consecutiveFailures++

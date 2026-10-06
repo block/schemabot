@@ -85,6 +85,7 @@ func TestApplyKeyspaceChanges_PermanentVSchemaErrorIsPermanent(t *testing.T) {
 		"org",
 		"database",
 		"branch",
+		func(engine.ApplyEvent) {},
 	)
 
 	require.Error(t, err)
@@ -143,7 +144,7 @@ func TestWaitForDeployRequestPending_PollErrorIsWrapped(t *testing.T) {
 	client := &pendingPollClient{number: 7, pollErr: apiErr, pollsBefore: 1}
 
 	_, err := e.waitForDeployRequestPending(t.Context(), client, "org", "testdb",
-		&ps.DeployRequest{Number: 7, DeploymentState: deployState.Pending})
+		&ps.DeployRequest{Number: 7, DeploymentState: deployState.Pending}, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "poll deploy request 7")
@@ -160,7 +161,7 @@ func TestWaitForDeployRequestPending_TransientPollErrorIsRetried(t *testing.T) {
 	client := &pendingPollClient{number: 8, pollErr: &ps.Error{Code: ps.ErrInternal}, pollsBefore: 1, failPolls: 1}
 
 	dr, err := e.waitForDeployRequestPending(t.Context(), client, "org", "testdb",
-		&ps.DeployRequest{Number: 8, DeploymentState: deployState.Pending})
+		&ps.DeployRequest{Number: 8, DeploymentState: deployState.Pending}, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, dr)
@@ -182,7 +183,7 @@ func TestWaitForDeployRequestPending_SuccessfulPollResetsTheRetryBound(t *testin
 	}}
 
 	dr, err := e.waitForDeployRequestPending(t.Context(), client, "org", "testdb",
-		&ps.DeployRequest{Number: 12, DeploymentState: deployState.Pending})
+		&ps.DeployRequest{Number: 12, DeploymentState: deployState.Pending}, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, dr)
@@ -199,7 +200,7 @@ func TestWaitForDeployRequestPending_NonRetryablePollErrorFailsAtOnce(t *testing
 	client := &pendingPollClient{number: 10, pollErr: apiErr, pollsBefore: 1, failPolls: 1}
 
 	_, err := e.waitForDeployRequestPending(t.Context(), client, "org", "testdb",
-		&ps.DeployRequest{Number: 10, DeploymentState: deployState.Pending})
+		&ps.DeployRequest{Number: 10, DeploymentState: deployState.Pending}, nil)
 
 	require.Error(t, err)
 	assert.ErrorIs(t, err, apiErr)
@@ -219,7 +220,7 @@ func TestWaitForDeployRequestPending_HonorsContextCancellation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := e.waitForDeployRequestPending(ctx, client, "org", "testdb",
-			&ps.DeployRequest{Number: 9, DeploymentState: deployState.Pending})
+			&ps.DeployRequest{Number: 9, DeploymentState: deployState.Pending}, nil)
 		done <- err
 	}()
 
@@ -241,7 +242,7 @@ func TestWaitForDeployRequestPending_NilDeployRequestIsRejected(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	client := &pendingPollClient{number: 11, pollErr: errors.New("unreachable"), pollsBefore: 1_000_000}
 
-	dr, err := e.waitForDeployRequestPending(t.Context(), client, "org", "testdb", nil)
+	dr, err := e.waitForDeployRequestPending(t.Context(), client, "org", "testdb", nil, nil)
 
 	require.Error(t, err)
 	assert.Nil(t, dr)
@@ -290,7 +291,7 @@ func TestDeployDeployRequest_RetriesWhileStillValidating(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	client := &deployRejectionClient{rejectErr: errors.New(stillValidatingMessage), rejections: 2}
 
-	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 124, false)
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 124, false, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, dr)
@@ -306,7 +307,7 @@ func TestDeployDeployRequest_ValidationPastDeadlineFails(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	client := &deployRejectionClient{rejectErr: errors.New(stillValidatingMessage), rejections: 1_000_000}
 
-	_, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 126, false)
+	_, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 126, false, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "still validating")
@@ -320,7 +321,7 @@ func TestDeployDeployRequest_TransientErrorsRetry(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	client := &deployRejectionClient{rejectErr: &ps.Error{Code: ps.ErrRetry}, rejections: 1}
 
-	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 7, true)
+	dr, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 7, true, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, dr)
@@ -334,7 +335,7 @@ func TestDeployDeployRequest_ApprovalRequirementFailsImmediately(t *testing.T) {
 	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	client := &deployRejectionClient{rejectErr: errors.New("deploy request must be approved"), rejections: 1_000_000}
 
-	_, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false)
+	_, err := e.deployDeployRequest(t.Context(), client, "org", "testdb", 9, false, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Require administrator approval")
@@ -1312,6 +1313,10 @@ type branchResumeClient struct {
 
 func (c *branchResumeClient) GetBranch(_ context.Context, req *ps.GetDatabaseBranchRequest) (*ps.DatabaseBranch, error) {
 	return &ps.DatabaseBranch{Name: req.Branch, Ready: true}, nil
+}
+
+func (c *branchResumeClient) CreateBranchPassword(context.Context, *ps.DatabaseBranchPasswordRequest) (*ps.DatabaseBranchPassword, error) {
+	return &ps.DatabaseBranchPassword{}, nil
 }
 
 func (c *branchResumeClient) CreateDeployRequest(_ context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {

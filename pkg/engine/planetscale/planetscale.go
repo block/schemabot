@@ -429,6 +429,11 @@ var (
 	deployValidationPollInterval = 5 * time.Second
 )
 
+// deployRequestPendingWait bounds how long an apply waits for PlanetScale to
+// finish computing a deploy request's schema diff. A variable so tests can
+// compress the wait.
+var deployRequestPendingWait = 30 * time.Minute
+
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
 var deployState = state.DeployRequest
 
@@ -791,8 +796,9 @@ func isRetryablePSError(err error) bool {
 
 // retryDelay returns the backoff duration for a retry attempt using
 // exponential backoff with full jitter. When a schema snapshot is in
-// progress the base delay is longer since snapshots can take 30-60s.
-func retryDelay(attempt int, lastErr error) time.Duration {
+// progress the base delay is longer since snapshots can take 30-60s. A
+// variable so tests can retry without waiting out the backoff.
+var retryDelay = func(attempt int, lastErr error) time.Duration {
 	if isSnapshotInProgress(lastErr) {
 		// Snapshot: 10s, 20s, 40s, 60s, 60s + up to 5s jitter
 		base := min(10*time.Second*(1<<min(attempt, 3)), 60*time.Second)
