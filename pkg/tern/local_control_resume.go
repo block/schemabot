@@ -436,19 +436,30 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// Wait for any in-flight engine work to finish before checking schema.
 		// Without this, the previous task's cutover might complete between our
 		// schema check and the new eng.Apply() call, causing "Duplicate key name".
-		if drainer, ok := eng.(engine.Drainer); ok {
-			drainer.Drain()
+		if proceed, err := c.drainEngineForDrive(ctx, apply, eng); err != nil || !proceed {
+			return err
 		}
 
 		// Verify this table still needs changes before applying. There's a race
 		// between re-plan (which reads schema) and Spirit's cutover (which renames
 		// the shadow table). If Spirit completed the cutover after the re-plan read
-		// the schema, the table already has the desired changes.
-		replanned, needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
+		// the schema, the table already has the desired changes. A target that
+		// cannot be re-planned is unverified, so the task is not started on it.
+		replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
 		if err != nil {
-			logger.Warn("could not verify table schema state, proceeding with apply",
-				"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
-		} else if !needsChange {
+			if c.driveCancelled(ctx, apply, "while re-planning the target before resuming a task") {
+				return nil
+			}
+			logger.Error("could not re-plan the target before resuming the task; the resume stops without starting it, and the apply stays active for a later drive",
+				append(task.LogAttrs(), "error", err)...)
+			return fmt.Errorf("re-plan before resuming task %s on table %s: %w", task.TaskIdentifier, task.TableName, err)
+		}
+		verdict, replanKey := replanVerdictForTask(replanDDL, task)
+		if verdict == replanCannotAttribute {
+			logger.Warn("the re-plan describes the table's namespace as a unit and does not mention this shard; the task resumes with its reviewed statement and the engine decides its outcome",
+				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
+		} else if verdict == replanChangeLanded {
 			logger.Info("table already has desired schema, skipping",
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			now := time.Now()
@@ -468,7 +479,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				return nil
 			}
 			continue
-		} else if _, landed, err := c.verifyReplannedTaskDDL(task, replanned, tasks); err != nil {
+		} else if _, landed, err := c.verifyReplannedTaskDDL(task, replanDDL[replanKey], tasks); err != nil {
 			// The statements this shard now needs no longer include what this
 			// task was reviewed with. Fail closed rather than apply unreviewed
 			// DDL.
@@ -479,6 +490,10 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			}
 			failedTask = task
 			break
+		} else if landed && !replanKeyedByTaskShard(task, replanKey) {
+			logger.Warn("the re-plan describes the table's namespace as a unit and lists only sibling statements; the task resumes with its reviewed statement and the engine decides its outcome",
+				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
 		} else if landed {
 			// The table still has pending statements, but every one of them
 			// is the reviewed DDL of a sibling task that is not yet terminal:
@@ -644,19 +659,56 @@ const (
 // dispatch tags its tasks with the shard they ran on. Such a task can never
 // match a whole-namespace key, so reading its absence as success would
 // complete a shard's change on evidence that never mentioned the shard. It is
-// unattributable instead, and the caller rests it retryable.
+// unattributable instead, and no caller completes it on that evidence.
 //
 // The check is on what the re-plan demonstrably covered rather than on the
 // engine, so a plan that does key by shard settles its shard-tagged tasks
 // normally.
-func replanVerdictForTask(replanDDL map[shardTableKey][]string, task *storage.Task) replanVerdict {
-	if _, needsChange := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]; needsChange {
-		return replanNeedsChange
+//
+// A namespace-unit re-plan that still lists the table is read as needing the
+// change on the task's shard too, and an unattributable task runs its reviewed
+// statement again. Either can be wrong for a shard that already has the
+// change, but it is wrong in the direction that runs the statement rather than
+// the direction that reports a change as made. Running it is not free: an
+// engine whose statement is not idempotent, such as MySQL adding a column the
+// shard already has, fails the task, and the apply fails on a change that may
+// have landed. The operator plans the schema change again to see the target as
+// it is. Callers record each such start in the apply's timeline
+// (logUnattributableTaskStart), so that failure traces back to this decision.
+//
+// The returned key is where the re-plan's statements for the task live when
+// it needs the change. When that is the namespace unit's key rather than the
+// task's own, the statements describe the namespace, so the task's statement
+// missing from them is not evidence that it landed on the shard; callers check
+// this with replanKeyedByTaskShard before settling on that absence.
+func replanVerdictForTask(replanDDL map[shardTableKey][]string, task *storage.Task) (replanVerdict, shardTableKey) {
+	key := shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}
+	if _, needsChange := replanDDL[key]; needsChange {
+		return replanNeedsChange, key
 	}
 	if task.Shard != "" && !replanCoversShards(replanDDL, task.Namespace) {
-		return replanCannotAttribute
+		unitKey := shardTableKey{namespace: task.Namespace, table: task.TableName}
+		if _, needsChange := replanDDL[unitKey]; needsChange {
+			return replanNeedsChange, unitKey
+		}
+		return replanCannotAttribute, key
 	}
-	return replanChangeLanded
+	return replanChangeLanded, key
+}
+
+// replanKeyedByTaskShard reports whether the re-plan statements read for a
+// task came from the task's own shard rather than its namespace as a unit.
+// Only then does the task's statement missing from them mean it landed.
+func replanKeyedByTaskShard(task *storage.Task, replanKey shardTableKey) bool {
+	return replanKey.shard == task.Shard
+}
+
+// logUnattributableTaskStart records in the apply's timeline that a task runs
+// its reviewed statement on a re-plan that could not say whether the task's
+// shard already has the change.
+func (c *LocalClient) logUnattributableTaskStart(ctx context.Context, apply *storage.Apply, task *storage.Task) {
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("A fresh plan could not tell whether table %s on shard %s already has its change, so the task runs its reviewed statement again. If the engine reports the change as already present, plan the schema change again to see the target as it is.", task.TableName, task.Shard), "", "")
 }
 
 // replanCoversShards reports whether a re-plan described the namespace one
@@ -671,19 +723,25 @@ func replanCoversShards(replanDDL map[shardTableKey][]string, namespace string) 
 	return false
 }
 
-// tableStillNeedsChange re-plans the full schema set and then looks up whether
-// this task's table still needs a change on its (namespace, shard). Returns
-// false if it already has the desired schema (e.g., Spirit's cutover completed
-// during the stop sequence). When the table still needs changes, it also returns
-// the statements the re-plan would now apply to it so the caller can confirm the
-// task's own statement is still among them before applying it.
-func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) ([]string, bool, error) {
-	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
-	if err != nil {
-		return nil, false, err
+// drainEngineForDrive waits for in-process engine work to exit before the
+// drive reads the target, for as long as the drive's context lasts. A drive
+// whose claim is gone has its context cancelled, so it never sits behind a run
+// for longer than it holds the apply. It reports whether the drive may go on;
+// a drive cancelled while it waited, or as the wait ended, hands the apply
+// back without verifying or starting anything.
+func (c *LocalClient) drainEngineForDrive(ctx context.Context, apply *storage.Apply, eng engine.Engine) (bool, error) {
+	if drainer, ok := eng.(engine.Drainer); ok {
+		if err := drainer.DrainContext(ctx); err != nil {
+			if c.driveCancelled(ctx, apply, "while waiting for in-process engine work to exit") {
+				return false, nil
+			}
+			return false, fmt.Errorf("wait for in-process engine work before driving apply %s: %w", apply.ApplyIdentifier, err)
+		}
 	}
-	statements, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
-	return statements, stillNeeded, nil
+	if c.driveCancelled(ctx, apply, "as in-process engine work exited") {
+		return false, nil
+	}
+	return true, nil
 }
 
 // replanResult holds the result of replanAndFilterTasks.
@@ -746,8 +804,20 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			activeTasks = append(activeTasks, task)
 			continue
 		}
-		replanned, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
-		if !stillNeeded {
+		verdict, replanKey := replanVerdictForTask(replanDDL, task)
+		if verdict == replanCannotAttribute {
+			// The re-plan's silence says nothing about this shard, and
+			// completion is the one direction it must never be guessed in.
+			// The task stays active with its reviewed statement, and the
+			// engine decides its outcome.
+			c.logger.Warn("resume re-plan describes the table's namespace as a unit and does not mention this shard; keeping the task active with its reviewed statement",
+				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
+			activeTasks = append(activeTasks, task)
+			continue
+		}
+		replanned := replanDDL[replanKey]
+		if verdict == replanChangeLanded {
 			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
 			// this shard's live schema. A table dropping out of that diff means
 			// live already matches the reviewed target, so there is no remaining
@@ -775,6 +845,17 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			if err != nil {
 				return nil, err
 			}
+			if landed && !replanKeyedByTaskShard(task, replanKey) {
+				// The unit's statements are the namespace's, not the shard's:
+				// the task's own statement missing from them says nothing about
+				// whether it reached this shard. The task stays active with its
+				// reviewed statement, and the engine decides its outcome.
+				c.logger.Warn("resume re-plan describes the table's namespace as a unit and lists only sibling statements; keeping the task active with its reviewed statement",
+					task.LogAttrs()...)
+				c.logUnattributableTaskStart(ctx, apply, task)
+				activeTasks = append(activeTasks, task)
+				continue
+			}
 			if landed {
 				// The table is still in the diff, but only for the reviewed
 				// DDL of siblings that will still run it: this task's own
@@ -797,7 +878,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// tightened here, never relaxed, so the resumed drive's blocked-row
 			// gate judges what this target says today rather than a verdict
 			// frozen at admission.
-			key := replanStatementKey{shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}, ddl}
+			key := replanStatementKey{replanKey, ddl}
 			if reason, blocked := blockedStatements[key]; blocked && !task.EngineBlocked() {
 				c.logger.Warn("resume re-plan now refuses a task's statement; the resumed drive will refuse the row",
 					append(task.LogAttrs(), "mode_reason", reason)...)
@@ -1214,8 +1295,8 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return fmt.Errorf("resolve credentials for grouped resume apply %s: %w", apply.ApplyIdentifier, err)
 	}
 
-	if drainer, ok := eng.(engine.Drainer); ok {
-		drainer.Drain()
+	if proceed, err := c.drainEngineForDrive(ctx, apply, eng); err != nil || !proceed {
+		return err
 	}
 
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)

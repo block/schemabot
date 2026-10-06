@@ -1581,8 +1581,8 @@ func (c *LocalClient) applyRevertPhaseBlock(ctx context.Context, apply *storage.
 //   - WaitingForCutover: Spirit runner alive, holding connections until cutover.
 //   - Recovering: Spirit's runner is restarted with a detached context during
 //     recovery; only eng.Stop kills it, so without this the runner keeps copying
-//     rows while storage reports stopped and a later resume blocks in Drain()
-//     behind the abandoned runner.
+//     rows while storage reports stopped and every later resume waits in
+//     DrainContext behind the abandoned runner until its drive gives up.
 //   - WaitingForDeploy: the PlanetScale deferred deploy request exists and stays
 //     startable from the PlanetScale UI until eng.Stop cancels it.
 //   - FailedRetryable: a transient failure (e.g. repeated progress-poll errors)

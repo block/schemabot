@@ -3437,8 +3437,8 @@ func TestDrainStopsTrackingEverySchemaChange(t *testing.T) {
 	eng := New()
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil)
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil)
+	close(eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil))
+	close(eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil))
 
 	eng.Drain()
 

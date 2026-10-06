@@ -341,18 +341,43 @@ func (e *Engine) RegistersWorkSynchronously() bool {
 // result instead of concluding no schema change ever ran. Draining an engine
 // with nothing running changes nothing: an already-retained outcome stays
 // retained.
+//
+// Drain waits without a bound, for a caller that owns the engine outright. A
+// drive waits through DrainContext instead, so it never outlives its claim.
 func (e *Engine) Drain() {
-	e.mu.Lock()
-	rm := e.runningSchemaChange
-	raceWindow := e.drainRaceWindow
+	rm, raceWindow := e.trackedForDrain()
 	if rm == nil {
-		e.mu.Unlock()
 		return
 	}
-	e.mu.Unlock()
-
 	rm.wg.Wait()
+	e.releaseDrained(rm, raceWindow)
+}
 
+// DrainContext is Drain bounded by ctx. When ctx ends before the schema change
+// exits, it returns an error and leaves the change tracked, so the engine
+// still reports it as holding the target.
+func (e *Engine) DrainContext(ctx context.Context) error {
+	rm, raceWindow := e.trackedForDrain()
+	if rm == nil {
+		return nil
+	}
+	if err := waitForRunExit(ctx, rm); err != nil {
+		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", rm.database, rm.tables, err)
+	}
+	e.releaseDrained(rm, raceWindow)
+	return nil
+}
+
+// trackedForDrain returns the schema change a drain waits for, if any.
+func (e *Engine) trackedForDrain() (*runningSchemaChange, func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.runningSchemaChange, e.drainRaceWindow
+}
+
+// releaseDrained stops tracking rm once its run has exited, keeping its
+// outcome for a later progress poll.
+func (e *Engine) releaseDrained(rm *runningSchemaChange, raceWindow func()) {
 	if raceWindow != nil {
 		raceWindow()
 	}
@@ -504,8 +529,19 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	}
 
 	// Wait off the calling goroutine so a runner that will not come down bounds
-	// shutdown at ctx rather than blocking it forever. The wait goroutine ends
-	// with the runner it is waiting on.
+	// shutdown at ctx rather than blocking it forever.
+	if err := waitForRunExit(ctx, rm); err != nil {
+		return fmt.Errorf("halt schema change on database %s tables %v for shutdown: still running after %w; the target may still be locked", database, tables, err)
+	}
+	logger.Info("schema change halted for shutdown; the target's lock is released and the apply stays active for another driver",
+		"database", database, "tables", tables)
+	return nil
+}
+
+// waitForRunExit waits off the calling goroutine for the change's run
+// goroutines to return, or for ctx to end. The wait goroutine ends with the
+// runner it is waiting on.
+func waitForRunExit(ctx context.Context, rm *runningSchemaChange) error {
 	done := make(chan struct{})
 	go func() {
 		rm.wg.Wait()
@@ -514,11 +550,9 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
-		logger.Info("schema change halted for shutdown; the target's lock is released and the apply stays active for another driver",
-			"database", database, "tables", tables)
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("halt schema change on database %s tables %v for shutdown: still running after %w; the target may still be locked", database, tables, ctx.Err())
+		return ctx.Err()
 	}
 }
 
@@ -862,9 +896,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("parse DSN: %w", err)
 	}
 
-	// Wait for any in-flight migration to fully exit before starting a new one.
-	// This ensures the old Spirit runner's DB connections are released.
-	e.Drain()
+	// Wait for any in-flight schema change to fully exit before starting a new
+	// one. This ensures the old Spirit runner's DB connections are released.
+	// The wait ends with the caller's context, so a drive whose claim is gone
+	// does not sit behind a run it can no longer act on.
+	if err := e.DrainContext(ctx); err != nil {
+		return nil, fmt.Errorf("wait for the previous schema change to exit: %w", err)
+	}
 
 	// Initialize running state and start background execution.
 	// Build a table→namespace lookup from the apply request. Each SchemaChange

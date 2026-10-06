@@ -267,6 +267,11 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 	result, err := c.applyWithEngine(ctx, c.getEngine(), request)
 
 	if err != nil {
+		// A cancelled drive's engine error describes the cancellation, not the
+		// task, so no verdict is recorded and the next driver re-plans it.
+		if c.driveCancelled(ctx, apply, "while the engine was starting task "+task.TaskIdentifier) {
+			return taskHandover
+		}
 		var verdictErr error
 		if c.shouldRetryEngineError(err) {
 			verdictErr = c.markTaskRetryable(ctx, task, err.Error())
@@ -1050,7 +1055,7 @@ func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.A
 	if err != nil {
 		return taskContinue, fmt.Errorf("verify target schema for task %s table %s: %w", task.TaskIdentifier, task.TableName, err)
 	}
-	verdict := replanVerdictForTask(replanDDL, task)
+	verdict, _ := replanVerdictForTask(replanDDL, task)
 	if err := c.settleLostVerifiedTask(ctx, apply, task, verdict, engineState); err != nil {
 		return taskAbort, err
 	}
