@@ -865,9 +865,10 @@ be a whole number of seconds (at least `1s`).
 
 The kill reads `performance_schema` and `information_schema.innodb_trx` to
 find the blocking sessions and ends other users' sessions, so the SchemaBot
-user needs `SELECT` on `performance_schema.*`, `PROCESS`, and
-`CONNECTION_ADMIN` (or `SUPER`) for a statement to run directly; without any
-of them the statement is blocked at plan time.
+user needs `SELECT` on `performance_schema.*`, `PROCESS`, and either
+`CONNECTION_ADMIN` (or `SUPER`) or, on RDS, `EXECUTE` on `mysql.rds_kill` for a
+statement to run directly; without any of them the statement is blocked at
+plan time.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
