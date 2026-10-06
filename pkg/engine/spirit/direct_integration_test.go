@@ -1378,8 +1378,11 @@ func createRDSKill(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.ExecContext(t.Context(), "CREATE PROCEDURE `mysql`.`rds_kill`(IN thread BIGINT) SELECT thread")
 	require.NoError(t, err, "create mysql.rds_kill")
+	// The test context is cancelled before cleanup runs, so the drop gets its
+	// own bounded context that outlives it.
+	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(cleanupCtx, 10*time.Second)
 		defer cancel()
 		_, err := db.ExecContext(ctx, "DROP PROCEDURE IF EXISTS `mysql`.`rds_kill`")
 		assert.NoError(t, err, "drop mysql.rds_kill")
