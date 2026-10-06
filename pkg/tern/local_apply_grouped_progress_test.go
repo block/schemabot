@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -451,4 +452,19 @@ func TestPollForCompletionAtomic_ProgressWriteThatCannotLandEndsTheDrive(t *test
 			assertApplyLogContains(t, client, "Task progress could not be recorded")
 		})
 	}
+}
+
+// An engine's throttle reason is display text whose length the engine does not
+// bound. Copied onto a task, it always fits its column, so a long reason can
+// never refuse the progress write that carries it.
+func TestApplyEngineTableDisplayFields_BoundsTheThrottleReason(t *testing.T) {
+	task := &storage.Task{}
+	reason := "replica lag\n| " + strings.Repeat("x", 1000)
+
+	applyEngineTableDisplayFields(task, &engine.TableProgress{Throttled: true, ThrottleReason: reason})
+
+	assert.True(t, task.Throttled)
+	assert.Equal(t, engine.SanitizeThrottleReason(reason), task.ThrottleReason)
+	assert.LessOrEqual(t, len(task.ThrottleReason), 255, "the reason fits the throttle_reason column")
+	assert.True(t, strings.HasPrefix(task.ThrottleReason, "replica lag / x"))
 }

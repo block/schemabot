@@ -1827,7 +1827,10 @@ func engineTaskStateClaim(newState string, tp *engine.TableProgress) string {
 
 // applyEngineTableDisplayFields copies a poll's per-table progress onto the
 // task's display fields. Shared by the grouped and sequential drives so both
-// render from the same projection of an engine report.
+// render from the same projection of an engine report. The throttle reason is
+// bounded here whatever engine reported it: a reason too long for its column
+// would refuse every progress write for the task, and the drive would hand
+// the apply back on a value that only ever served display.
 func applyEngineTableDisplayFields(task *storage.Task, tp *engine.TableProgress) {
 	task.RowsCopied = tp.RowsCopied
 	task.RowsTotal = tp.RowsTotal
@@ -1836,7 +1839,7 @@ func applyEngineTableDisplayFields(task *storage.Task, tp *engine.TableProgress)
 	task.ChecksumRowsChecked = tp.ChecksumRowsChecked
 	task.ChecksumRowsTotal = tp.ChecksumRowsTotal
 	task.Throttled = tp.Throttled
-	task.ThrottleReason = tp.ThrottleReason
+	task.ThrottleReason = engine.SanitizeThrottleReason(tp.ThrottleReason)
 	task.IsInstant = tp.IsInstant
 }
 
