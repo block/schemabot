@@ -364,15 +364,19 @@ func (c *snapshotThenAcceptClient) UpdateKeyspaceVSchema(context.Context, *ps.Up
 	return &ps.VSchema{}, nil
 }
 
-// A VSchema write deferred by a schema snapshot is retried, and each retry is
-// on the apply's timeline with a fixed reason rather than the raw error.
-func TestApplyKeyspaceChanges_SnapshotDeferralIsRetriedAndReported(t *testing.T) {
-	origDelay := retryDelay
-	retryDelay = func(int, error) time.Duration { return time.Millisecond }
-	t.Cleanup(func() { retryDelay = origDelay })
-	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
-	client := &snapshotThenAcceptClient{rejections: 1}
+// shortenKeyspaceRetries makes keyspace retries immediate and bounds the
+// snapshot retry window to the given duration.
+func shortenKeyspaceRetries(t *testing.T, delay, snapshotWait time.Duration) {
+	t.Helper()
+	origDelay, origWait := retryDelay, snapshotRetryWait
+	retryDelay = func(int, error) time.Duration { return delay }
+	snapshotRetryWait = snapshotWait
+	t.Cleanup(func() { retryDelay, snapshotRetryWait = origDelay, origWait })
+}
 
+func applySnapshotDeferredKeyspace(t *testing.T, client *snapshotThenAcceptClient) ([]engine.ApplyEvent, error) {
+	t.Helper()
+	e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
 	var events []engine.ApplyEvent
 	err := e.applyKeyspaceChanges(t.Context(),
 		engine.SchemaChange{Namespace: "commerce", Metadata: map[string]string{"vschema_changed": "true"}},
@@ -380,12 +384,40 @@ func TestApplyKeyspaceChanges_SnapshotDeferralIsRetriedAndReported(t *testing.T)
 		&ps.DatabaseBranchPassword{}, client, "org", "testdb", "schemabot-testdb-snap",
 		func(event engine.ApplyEvent) { events = append(events, event) },
 	)
+	return events, err
+}
+
+// A VSchema write deferred by a schema snapshot keeps being retried for as long
+// as the snapshot window allows, well past the attempt count a transient error
+// gets, and each retry is on the apply's timeline with a fixed reason rather
+// than the raw error.
+func TestApplyKeyspaceChanges_SnapshotDeferralIsRetriedAndReported(t *testing.T) {
+	shortenKeyspaceRetries(t, time.Millisecond, time.Minute)
+	client := &snapshotThenAcceptClient{rejections: 3 * maxRetries}
+
+	events, err := applySnapshotDeferredKeyspace(t, client)
 
 	require.NoError(t, err)
-	assert.Equal(t, 2, client.calls)
-	require.Len(t, events, 1)
+	assert.Equal(t, 3*maxRetries+1, client.calls)
+	require.Len(t, events, 3*maxRetries)
 	assert.Contains(t, events[0].Message, "Retrying keyspace commerce on branch schemabot-testdb-snap")
-	assert.Contains(t, events[0].Message, "attempt 2/5")
-	assert.Contains(t, events[0].Message, "PlanetScale is taking a schema snapshot of the branch")
+	assert.Contains(t, events[0].Message, "(attempt 2)")
+	assert.Contains(t, events[0].Message, "PlanetScale is taking a schema snapshot of the branch, retrying for up to 1m0s")
 	assert.NotContains(t, events[0].Message, "Cannot update VSchema")
+}
+
+// A snapshot that outlasts the retry window fails the keyspace with an error
+// that says PlanetScale was still snapshotting the branch, so the failure reads
+// as PlanetScale's wait rather than as a broken change.
+func TestApplyKeyspaceChanges_SnapshotDeferralGivesUpAfterItsWindow(t *testing.T) {
+	shortenKeyspaceRetries(t, 5*time.Millisecond, 50*time.Millisecond)
+	client := &snapshotThenAcceptClient{rejections: 1 << 20}
+
+	_, err := applySnapshotDeferredKeyspace(t, client)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "PlanetScale was still taking a schema snapshot of branch schemabot-testdb-snap after 50ms")
+	assert.Contains(t, err.Error(), "Cannot update VSchema while a schema snapshot is in progress")
+	assert.Greater(t, client.calls, maxRetries, "the snapshot window must allow more attempts than a transient error gets")
+	assert.Less(t, client.calls, 1<<20)
 }

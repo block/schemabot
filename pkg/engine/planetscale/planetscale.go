@@ -407,12 +407,6 @@ const (
 	// maxRetries is the number of retry attempts per keyspace when applying DDL.
 	maxRetries = 3
 
-	// maxSnapshotRetries is used when a schema snapshot is in progress
-	// (e.g., after RefreshSchema or VSchema updates). With exponential
-	// backoff (20s, 40s, 60s, 60s) this gives ~3 minutes of total
-	// wait time before failing.
-	maxSnapshotRetries = 5
-
 	// deployRequestPollInterval is how long to wait between polls while a deploy
 	// request is pending PlanetScale's asynchronous schema diff computation.
 	deployRequestPollInterval = 500 * time.Millisecond
@@ -433,6 +427,12 @@ var (
 // finish computing a deploy request's schema diff. A variable so tests can
 // compress the wait.
 var deployRequestPendingWait = 30 * time.Minute
+
+// snapshotRetryWait bounds how long a keyspace keeps retrying while PlanetScale
+// rejects its changes because a schema snapshot of the branch is in progress,
+// measured from the first such rejection. It is a variable so tests can
+// shorten it.
+var snapshotRetryWait = 10 * time.Minute
 
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
 var deployState = state.DeployRequest
