@@ -236,6 +236,9 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 		return raw
 	}
 	wrapped := wrapLongValueLists(formatted)
+	if wrapped == formatted {
+		return formatted
+	}
 	if parser.Canonicalize(wrapped) != parser.Canonicalize(formatted) {
 		slog.Debug("DDL display value-list wrapping changed the statement; preserving unwrapped SQL", "dialect", dialect)
 		return formatted
