@@ -235,7 +235,117 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 		slog.Debug("DDL display normalization changed the statement; preserving original SQL", "dialect", dialect)
 		return raw
 	}
-	return formatted
+	wrapped := wrapLongValueLists(formatted)
+	if parser.Canonicalize(wrapped) != parser.Canonicalize(formatted) {
+		slog.Debug("DDL display value-list wrapping changed the statement; preserving unwrapped SQL", "dialect", dialect)
+		return formatted
+	}
+	return wrapped
+}
+
+// valueListWrapWidth is the line width a displayed statement's value lists
+// are wrapped to. Beyond keeping the DDL readable without scrolling, short
+// lines keep GitHub's syntax highlighting on: it renders a very long line as
+// plain text.
+const valueListWrapWidth = 100
+
+// valueListPattern matches the opening of an ENUM or SET value list.
+var valueListPattern = regexp.MustCompile(`(?i)^(enum|set)\s*\(`)
+
+// wrapLongValueLists breaks each ENUM or SET value list that cannot fit on a
+// line of its own across indented lines packed to valueListWrapWidth, with the
+// closing parenthesis back at the line's own indentation:
+//
+//	MODIFY COLUMN `status` enum(
+//	    'PENDING', 'ACTIVE', ...
+//	) NOT NULL
+//
+// Lists short enough to fit stay inline, and quoted regions are never
+// searched or split.
+func wrapLongValueLists(ddl string) string {
+	lines := strings.Split(ddl, "\n")
+	for i, line := range lines {
+		lines[i] = wrapLineValueLists(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// wrapLineValueLists wraps the long value lists on one line of a statement.
+func wrapLineValueLists(line string) string {
+	if len(line) <= valueListWrapWidth {
+		return line
+	}
+	indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+	innerIndent := indent + "    "
+
+	var sb strings.Builder
+	start := 0
+	for i := 0; i < len(line); i++ {
+		if isQuote(line[i]) {
+			end, ok := quotedEnd(line, i)
+			if !ok {
+				return line
+			}
+			i = end - 1
+			continue
+		}
+		if i > 0 && isIdentifierByte(line[i-1]) {
+			continue
+		}
+		loc := valueListPattern.FindStringIndex(line[i:])
+		if loc == nil {
+			continue
+		}
+		openParen := i + loc[1] - 1
+		closeParen := findMatchingParen(line, openParen)
+		if closeParen == -1 {
+			return line
+		}
+		body := line[openParen+1 : closeParen]
+		if len(innerIndent)+len(body) <= valueListWrapWidth {
+			i = closeParen
+			continue
+		}
+		sb.WriteString(line[start : openParen+1])
+		sb.WriteString("\n")
+		for _, packed := range packValues(splitByComma(body), valueListWrapWidth-len(innerIndent)) {
+			sb.WriteString(innerIndent)
+			sb.WriteString(packed)
+			sb.WriteString("\n")
+		}
+		sb.WriteString(indent)
+		start = closeParen
+		i = closeParen
+	}
+	sb.WriteString(line[start:])
+	return sb.String()
+}
+
+// packValues joins values with ", " into lines no wider than width, ending
+// every line but the last with the comma that separates it from the next. A
+// value wider than width gets a line of its own.
+func packValues(values []string, width int) []string {
+	var lines []string
+	current := ""
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		switch {
+		case current == "":
+			current = value
+		case len(current)+len(", ")+len(value)+len(",") > width:
+			lines = append(lines, current+",")
+			current = value
+		default:
+			current += ", " + value
+		}
+	}
+	return append(lines, current)
+}
+
+// isIdentifierByte reports whether c can continue an unquoted identifier, so
+// a type keyword is only matched where it starts a word.
+func isIdentifierByte(c byte) bool {
+	return c == '_' || c == '$' || unicode.IsLetter(rune(c)) || unicode.IsDigit(rune(c))
 }
 
 // formatDDLForDialect formats one statement and reports whether the parser can
