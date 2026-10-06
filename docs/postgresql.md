@@ -681,15 +681,18 @@ Rollback captures the same live table set the forward plan manages. Exact,
 case-sensitive `ignore_tables` matches are excluded before introspection, as are
 archive-named tables with no schema file. An explicitly declared archive remains
 managed and keeps its original definition, so rollback can reverse its changes.
-Pull still exports archive-named tables; these capture exclusions do not change
-pull behavior or permit a table to be both ignored and declared.
+A declared archive the forward plan creates has no original to keep: the
+rollback re-plan finds it live with no file and, like any archive-named table
+without one, leaves it in place and discloses it as exempt rather than dropping
+it. Pull still exports archive-named tables; these capture exclusions do not
+change pull behavior or permit a table to be both ignored and declared.
 
 Capture is complete for that managed set or the plan is rollback-incapable;
 an unrenderable ignored table or undeclared archive does not prevent capture.
 Managed RLS tables still prevent capture until recovery can restore their
 complete access rules alongside sibling tables. Capture never strips policies to
 mark a plan rollback-capable, and a catalog read failure or cancellation still
-ends planning. [RV-7](https://github.com/block/schemabot/blob/main/docs/invariants.md#rv-7-rollback-needs-the-originals)
+ends planning. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
 requires complete originals before rollback can proceed; missing originals in
 older plans are never reconstructed from the current target.
 

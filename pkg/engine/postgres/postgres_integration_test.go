@@ -487,6 +487,60 @@ func TestEnginePlanCaptureLeavesExemptArchiveTablesOutOfBaseline(t *testing.T) {
 		"the baseline declares exactly the tables a rollback re-plan would manage")
 }
 
+// A declared archive the forward plan creates has no live original, so the
+// baseline holds only the tables that existed, and the plan stays
+// rollback-capable. The rollback re-plan reverses the managed table's change
+// and finds the new archive live with no file: it is left in place and
+// disclosed as exempt, as any archive-named table without a file is.
+func TestEnginePlanRollbackLeavesCreatedDeclaredArchiveInPlace(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+	const archive = "audit_log_archive_2019"
+
+	dsn, db := testutil.StartPostgres(t, "plan_created_archive_rollback_test")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	eng := New()
+	forward, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database: "plan_created_archive_rollback_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"users.sql":      "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			archive + ".sql": fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY)", archive),
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, forward.Changes, 1)
+	assert.Empty(t, forward.ExemptTables, "a declared archive is managed, not exempt")
+	require.True(t, forward.Changes[0].OriginalFilesCaptured)
+	assert.Equal(t, map[string]string{"users.sql": originalUsers}, forward.Changes[0].OriginalFiles,
+		"a table that does not exist yet has no original to capture")
+	require.Len(t, forward.Changes[0].TableChanges, 2)
+	for _, change := range forward.Changes[0].TableChanges {
+		require.Empty(t, change.ExecutionMode, "%s", change.DDL)
+		applied, err := eng.Apply(ctx, applyRequest(dsn, change.Table, change.DDL))
+		require.NoError(t, err)
+		require.True(t, applied.Accepted)
+		require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, change.Table).State)
+	}
+
+	rollback, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database:    "plan_created_archive_rollback_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: forward.Changes[0].OriginalFiles}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, rollback.Changes, 1)
+	require.Len(t, rollback.Changes[0].TableChanges, 1)
+	assert.Equal(t, "ALTER TABLE public.users DROP email", rollback.Changes[0].TableChanges[0].DDL)
+	require.Len(t, rollback.ExemptTables, 1)
+	assert.Equal(t, "public", rollback.ExemptTables[0].Namespace)
+	assert.Equal(t, []string{archive}, rollback.ExemptTables[0].Tables)
+	assert.Equal(t, "archive naming", rollback.ExemptTables[0].Reason)
+}
+
 // A cancellation that arrives after listing a namespace of excluded tables
 // still ends capture, even though no managed table needs introspection.
 func TestRenderPostgresTablesReturnsCancellationAfterFiltering(t *testing.T) {
