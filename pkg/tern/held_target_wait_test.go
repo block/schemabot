@@ -158,6 +158,7 @@ func TestRunEngineTask_HeldTargetPastTheWaitCapHandsTheApplyBack(t *testing.T) {
 func TestRunEngineTask_HeldShardTaskIsNotSettledByTheUnitsSiblingStatement(t *testing.T) {
 	eng := &heldTargetEngine{heldAttempts: 1, plan: heldTaskReplan(siblingStatementDDL)}
 	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+	logs := captureApplyLogs(client)
 	task.DDL = heldTaskDDL
 
 	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, withPendingSibling(task), nil)
@@ -165,4 +166,23 @@ func TestRunEngineTask_HeldShardTaskIsNotSettledByTheUnitsSiblingStatement(t *te
 	assert.Equal(t, taskContinue, action)
 	assert.Equal(t, 2, eng.applies, "the task starts again with its reviewed statement")
 	assert.Equal(t, state.Task.Completed, task.State)
+	assertTimelineMentions(t, logs, unattributableStartLog)
+}
+
+// A namespace-unit re-plan that no longer mentions a shard task's table says
+// nothing about the shard, so a held shard task starts again with its reviewed
+// statement rather than being settled from that silence, and the timeline
+// records that it ran without evidence either way.
+func TestRunEngineTask_HeldShardTaskStartsAgainWhenTheUnitIsSilent(t *testing.T) {
+	eng := &heldTargetEngine{heldAttempts: 1, plan: &engine.PlanResult{NoChanges: true}}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+	logs := captureApplyLogs(client)
+	task.DDL = heldTaskDDL
+
+	action := client.runEngineTask(t.Context(), apply, task, &storage.Plan{ID: 7}, []*storage.Task{task}, nil)
+
+	assert.Equal(t, taskContinue, action)
+	assert.Equal(t, 2, eng.applies, "the task starts again with its reviewed statement")
+	assert.Equal(t, state.Task.Completed, task.State)
+	assertTimelineMentions(t, logs, unattributableStartLog)
 }

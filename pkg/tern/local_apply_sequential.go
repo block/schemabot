@@ -351,6 +351,7 @@ func (c *LocalClient) recheckTargetAfterHeldWait(ctx context.Context, logger *sl
 	case replanCannotAttribute:
 		logger.Warn("the re-plan describes the table's namespace as a unit and does not mention this shard; the task starts again with its reviewed statement and the engine decides its outcome",
 			task.LogAttrs()...)
+		c.logUnattributableTaskStart(ctx, apply, task)
 		return taskStartAgain, nil
 	case replanChangeLanded:
 		logger.Info("table reached the desired schema while the task waited for another run to release it; the task is settled without starting it again", task.LogAttrs()...)
@@ -367,6 +368,7 @@ func (c *LocalClient) recheckTargetAfterHeldWait(ctx context.Context, logger *sl
 	if landed && !replanKeyedByTaskShard(task, replanKey) {
 		logger.Warn("the re-plan describes the table's namespace as a unit and lists only sibling statements; the task starts again with its reviewed statement and the engine decides its outcome",
 			task.LogAttrs()...)
+		c.logUnattributableTaskStart(ctx, apply, task)
 		return taskStartAgain, nil
 	}
 	if landed {
