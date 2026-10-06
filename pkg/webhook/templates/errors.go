@@ -509,6 +509,29 @@ func RenderUnmanagedSchemaConfigsNotice(environments []string, configs []Unmanag
 	return offerSupportChannel(sb.String())
 }
 
+// RenderUnmanagedSchemaPassingCheck renders the title and summary of the
+// passing aggregate Check Run for a PR whose schema changes all sit under
+// configs this deployment does not manage. "No schema files changed" would be
+// false there: the PR does change schema, just none this deployment plans.
+// environment names the environment the Check Run covers, empty for a
+// deployment serving every environment. The database names and paths come
+// from the PR's own schemabot.yaml files, so each renders as a code span it
+// cannot break out of.
+func RenderUnmanagedSchemaPassingCheck(environment string, configs []UnmanagedSchemaConfigNoticeData) (title, summary string) {
+	scope := "in any environment"
+	title = "No schema changes managed by SchemaBot"
+	if environment != "" {
+		scope = "in " + inlineCode(environment)
+		title = "No schema changes managed in " + flattenIdentifier(environment)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "This PR changes schema only under paths SchemaBot does not manage %s, so there is nothing to plan or apply %s:\n\n", scope, scope)
+	for _, cfg := range configs {
+		fmt.Fprintf(&sb, "- %s declares database %s\n", inlineCode(cfg.SchemaPath), inlineCode(cfg.Database))
+	}
+	return title, sb.String()
+}
+
 // PreviewCommentUnmanagedSchemaConfigsNotice renders a sample notice for
 // schema changes under configs this deployment does not manage, with the
 // support-channel footer a configured deployment appends to it.

@@ -350,6 +350,20 @@ func TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo(t *testing.T) {
 		t.Fatal("timed out waiting for unmanaged schema config notice")
 	}
 
+	// The passing aggregate names the unmanaged schema rather than claiming
+	// the PR changed no schema files.
+	select {
+	case run := <-result.checkRuns:
+		assert.Equal(t, "completed", run.Status)
+		assert.Equal(t, "success", run.Conclusion)
+		require.NotNil(t, run.Output)
+		assert.Equal(t, "No schema changes managed by SchemaBot", run.Output.Title)
+		assert.Contains(t, run.Output.Summary, "This PR changes schema only under paths SchemaBot does not manage in any environment")
+		assert.Contains(t, run.Output.Summary, fmt.Sprintf("- `schema` declares database `%s`", dbName))
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the passing aggregate check")
+	}
+
 	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
 	require.NoError(t, err)
 	for _, plan := range plans {

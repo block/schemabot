@@ -535,6 +535,9 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// recreated on the new commit. If stale per-database check records exist,
 		// cleanupStaleChecks (above) also updates the aggregate — both converge
 		// to the same result (passing aggregate on new SHA) so the overlap is safe.
+		// Schema the PR changes under configs this deployment does not manage
+		// is named on the check, so its title does not claim no schema changed.
+		unmanaged := unmanagedSchemaConfigData(droppedDiscoveredConfigs(discovered, configs))
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -543,7 +546,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				h.logger.Error("failed to create GitHub client for passing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 				return
 			}
-			h.postPassingAggregates(ctx, c, repo, pr, headSHA)
+			h.postPassingAggregates(ctx, c, repo, pr, headSHA, unmanaged)
 		})
 		return "no schema files in PR", nil
 	}
@@ -685,18 +688,25 @@ func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installa
 			"unmanaged_configs", len(dropped))
 		return
 	}
-	notice := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))
-	for _, cfg := range dropped {
-		notice = append(notice, templates.UnmanagedSchemaConfigNoticeData{
-			Database:   cfg.Config.Database,
-			SchemaPath: cfg.SchemaDir,
-		})
-	}
+	notice := unmanagedSchemaConfigData(dropped)
 	var environments []string
 	if ok {
 		environments = config.OrderedEnvironments(config.KnownEnvironments())
 	}
 	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(environments, notice))
+}
+
+// unmanagedSchemaConfigData identifies each dropped config by its database
+// and schema directory, for the notice and the passing check that report it.
+func unmanagedSchemaConfigData(dropped []ghclient.DiscoveredConfig) []templates.UnmanagedSchemaConfigNoticeData {
+	data := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))
+	for _, cfg := range dropped {
+		data = append(data, templates.UnmanagedSchemaConfigNoticeData{
+			Database:   cfg.Config.Database,
+			SchemaPath: cfg.SchemaDir,
+		})
+	}
+	return data
 }
 
 // droppedDiscoveredConfigs returns the discovered configs the managed filter

@@ -187,6 +187,28 @@ func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
 	})
 }
 
+func TestRenderUnmanagedSchemaPassingCheck(t *testing.T) {
+	configs := []UnmanagedSchemaConfigNoticeData{
+		{Database: "merchants", SchemaPath: "services/merchants/schema"},
+		{Database: "ledger_sandbox", SchemaPath: "services/ledger/schema_sandbox"},
+	}
+
+	t.Run("names the environment the check covers", func(t *testing.T) {
+		title, summary := RenderUnmanagedSchemaPassingCheck("production", configs)
+		assert.Equal(t, "No schema changes managed in production", title)
+		assert.Equal(t, "This PR changes schema only under paths SchemaBot does not manage in `production`, so there is nothing to plan or apply in `production`:\n\n"+
+			"- `services/merchants/schema` declares database `merchants`\n"+
+			"- `services/ledger/schema_sandbox` declares database `ledger_sandbox`\n", summary)
+	})
+
+	t.Run("covers every environment for a deployment serving all of them", func(t *testing.T) {
+		title, summary := RenderUnmanagedSchemaPassingCheck("", configs[:1])
+		assert.Equal(t, "No schema changes managed by SchemaBot", title)
+		assert.Equal(t, "This PR changes schema only under paths SchemaBot does not manage in any environment, so there is nothing to plan or apply in any environment:\n\n"+
+			"- `services/merchants/schema` declares database `merchants`\n", summary)
+	})
+}
+
 func TestRenderInvalidEnv(t *testing.T) {
 	t.Run("lists the configured environments", func(t *testing.T) {
 		body := RenderInvalidEnv("apply", []string{"production", "staging"})
