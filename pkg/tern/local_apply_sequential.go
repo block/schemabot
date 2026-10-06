@@ -143,6 +143,7 @@ const (
 	taskHandover                        // This drive's context was cancelled; the apply stays active for another driver to claim
 	taskMissing                         // The task's row is gone; the drive exits without a verdict and reports the apply undriveable
 	taskTargetHeld                      // The engine was refused the target because another run holds it; the drive waits and starts the task again
+	taskStartAgain                      // A held table's wait found the task still needed; runEngineTask starts it again and never returns this
 )
 
 const (
@@ -279,7 +280,7 @@ func (c *LocalClient) runEngineTask(ctx context.Context, apply *storage.Apply, t
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
 				fmt.Sprintf("Table %s is held by another run of a schema change; waiting for it to let go before starting", task.TableName), "", "")
 		}
-		if startAgain, action := c.waitOutHeldTarget(ctx, logger, apply, plan, task, tasks, &wait); !startAgain {
+		if action := c.waitOutHeldTarget(ctx, logger, apply, plan, task, tasks, &wait); action != taskStartAgain {
 			return action
 		}
 	}
@@ -294,28 +295,29 @@ type heldTargetWait struct {
 }
 
 // waitOutHeldTarget waits for the held table and re-plans the target, until
-// the task should start again or has an outcome without starting. A re-plan
-// that fails is retried after the next wait and never starts the task; once
-// failures exhaust the poll's error budget the drive exits as its own failure.
-func (c *LocalClient) waitOutHeldTarget(ctx context.Context, logger *slog.Logger, apply *storage.Apply, plan *storage.Plan, task *storage.Task, tasks []*storage.Task, wait *heldTargetWait) (startAgain bool, action taskAction) {
+// the task should start again (taskStartAgain) or has an outcome without
+// starting. A re-plan that fails is retried after the next wait and never
+// starts the task; once failures exhaust the poll's error budget the drive
+// exits as its own failure.
+func (c *LocalClient) waitOutHeldTarget(ctx context.Context, logger *slog.Logger, apply *storage.Apply, plan *storage.Plan, task *storage.Task, tasks []*storage.Task, wait *heldTargetWait) taskAction {
 	for verifyFailures := 0; ; {
 		if wait.waits >= c.targetHeldMaxWaits() {
 			logger.Warn("the table stayed held by another run of a schema change for the whole wait; this driver exits without recording a failure, and the driver that claims the apply next re-plans the target before starting the task",
 				append(task.LogAttrs(), "waited", time.Since(wait.start).Round(time.Second), "wait_cap", targetHeldWaitCap)...)
-			return false, taskHandover
+			return taskHandover
 		}
 		wait.waits++
 		if action := c.waitForTargetRelease(ctx, logger, task); action != taskContinue {
-			return false, action
+			return action
 		}
 		if time.Since(wait.lastLog) >= targetHeldWaitLogInterval {
 			wait.lastLog = time.Now()
 			logger.Info("still waiting for another run of a schema change to release the table",
 				append(apply.LogAttrs(), "task_id", task.TaskIdentifier, "table", task.TableName, "waited", time.Since(wait.start).Round(time.Second))...)
 		}
-		startAgain, action, err := c.recheckTargetAfterHeldWait(ctx, logger, apply, plan, task, tasks)
+		action, err := c.recheckTargetAfterHeldWait(ctx, logger, apply, plan, task, tasks)
 		if err == nil {
-			return startAgain, action
+			return action
 		}
 		verifyFailures++
 		if verifyFailures >= maxConsecutiveProgressPollErrors {
@@ -323,7 +325,7 @@ func (c *LocalClient) waitOutHeldTarget(ctx context.Context, logger *slog.Logger
 				append(task.LogAttrs(), "consecutive_failures", verifyFailures, "error", err)...)
 			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventInfo, storage.LogSourceSchemaBot,
 				fmt.Sprintf("Table %s could not be checked after another run of a schema change released it; the task was not started. See server logs.", task.TableName), "", "")
-			return false, taskAbort
+			return taskAbort
 		}
 		logger.Warn("could not re-plan the target after another run held the table; the task is not started, and the drive checks again after its next wait",
 			append(task.LogAttrs(), "consecutive_failures", verifyFailures, "error", err)...)
@@ -336,23 +338,23 @@ func (c *LocalClient) waitOutHeldTarget(ctx context.Context, logger *slog.Logger
 // exactly that behind — or another schema change may have reshaped the table.
 // The task's statement runs again only while the re-plan still asks for it.
 //
-// It reports whether to start the task again; when not, action is the task's
-// outcome. An error means the target could not be verified, so the task must
-// not start.
-func (c *LocalClient) recheckTargetAfterHeldWait(ctx context.Context, logger *slog.Logger, apply *storage.Apply, plan *storage.Plan, task *storage.Task, tasks []*storage.Task) (startAgain bool, action taskAction, err error) {
+// It returns taskStartAgain when the task should start again, and otherwise
+// the task's outcome. An error means the target could not be verified, so the
+// task must not start.
+func (c *LocalClient) recheckTargetAfterHeldWait(ctx context.Context, logger *slog.Logger, apply *storage.Apply, plan *storage.Plan, task *storage.Task, tasks []*storage.Task) (taskAction, error) {
 	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
 	if err != nil {
-		return false, taskAbort, err
+		return taskAbort, err
 	}
 	verdict, replanKey := replanVerdictForTask(replanDDL, task)
 	switch verdict {
 	case replanCannotAttribute:
 		logger.Warn("the re-plan describes the table's namespace as a unit and does not mention this shard; the task starts again with its reviewed statement and the engine decides its outcome",
 			task.LogAttrs()...)
-		return true, taskAbort, nil
+		return taskStartAgain, nil
 	case replanChangeLanded:
 		logger.Info("table reached the desired schema while the task waited for another run to release it; the task is settled without starting it again", task.LogAttrs()...)
-		return false, c.settleTaskAlreadyOnTarget(ctx, logger, apply, task), nil
+		return c.settleTaskAlreadyOnTarget(ctx, logger, apply, task), nil
 	case replanNeedsChange:
 	}
 	_, landed, err := c.verifyReplannedTaskDDL(task, replanDDL[replanKey], tasks)
@@ -360,18 +362,18 @@ func (c *LocalClient) recheckTargetAfterHeldWait(ctx context.Context, logger *sl
 		logger.Error("the re-plan no longer includes the task's reviewed statement; the task fails rather than run a statement planned against the table's old shape",
 			append(task.LogAttrs(), "error", err)...)
 		message := fmt.Sprintf("Table %s was released by another run of a schema change, but a fresh plan no longer includes this task's statement, so it was not run. Plan the schema change again.", task.TableName)
-		return false, c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, message)), nil
+		return c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, message)), nil
 	}
 	if landed && !replanKeyedByTaskShard(task, replanKey) {
 		logger.Warn("the re-plan describes the table's namespace as a unit and lists only sibling statements; the task starts again with its reviewed statement and the engine decides its outcome",
 			task.LogAttrs()...)
-		return true, taskAbort, nil
+		return taskStartAgain, nil
 	}
 	if landed {
 		logger.Info("the task's statement reached the table while it waited for another run to release it; the task is settled without starting it again", task.LogAttrs()...)
-		return false, c.settleTaskAlreadyOnTarget(ctx, logger, apply, task), nil
+		return c.settleTaskAlreadyOnTarget(ctx, logger, apply, task), nil
 	}
-	return true, taskAbort, nil
+	return taskStartAgain, nil
 }
 
 // settleTaskAlreadyOnTarget records a task completed whose change reached the
@@ -431,8 +433,9 @@ func (c *LocalClient) targetHeldRetryDelay() time.Duration {
 	return targetHeldRetryInterval
 }
 
-// targetHeldMaxWaits is targetHeldWaitCap counted in retry intervals, so an
-// interval override shortens the cap with it.
+// targetHeldMaxWaits is targetHeldWaitCap counted in default retry intervals.
+// A drive waits that many times whatever its retry delay, so a test's shorter
+// poll override shortens the wall-clock cap with it.
 func (c *LocalClient) targetHeldMaxWaits() int {
 	return int(targetHeldWaitCap / targetHeldRetryInterval)
 }
