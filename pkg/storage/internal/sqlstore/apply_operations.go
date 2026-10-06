@@ -959,17 +959,16 @@ func finalizerStartGateArgs() []any {
 	return append(args, releasedFailureExemptionArgs()...)
 }
 
-// workStartGateSQL is the cutover_policy-aware gate a work row starts
-// through (see FindNextApplyOperation): no earlier-member sibling may block
-// it. Under barrier an earlier sibling stops blocking once it reaches the
-// cutover barrier or succeeds, and an earlier group_finalizer counts as at
-// the barrier while pending or running (earlierFinalizerAtBarrierSQL). Under
-// parallel there is intentionally no arm: a parallel work row matches neither
-// branch, so no earlier sibling can make the blocking EXISTS true and its copy
-// starts immediately. Under rolling, and any unrecognized value, which fails
-// closed to the serial gate via NOT IN (barrier, parallel), only a completed
-// earlier sibling stops blocking. The on_failure exemption applies to every
-// policy. The fragment references the apply_operations alias; see
+// workStartGateSQL gates a work row's first start on failure admission and
+// cutover_policy-aware phase sequencing (see FindNextApplyOperation). A failed
+// earlier member blocks under every cutover policy unless the on_failure
+// exemption releases it. Under barrier an earlier sibling stops blocking once
+// it reaches the cutover barrier or succeeds, and an earlier group_finalizer
+// counts as at the barrier while pending or running (earlierFinalizerAtBarrierSQL).
+// Parallel leaves copy start unordered, but still obeys failure admission.
+// Under rolling, and any unrecognized value, which fails closed to the serial
+// gate via NOT IN (barrier, parallel), only a completed earlier sibling stops
+// blocking. The fragment references the apply_operations alias; see
 // workStartGateArgs for its placeholders.
 func workStartGateSQL(d Dialect) string {
 	return `NOT EXISTS (
@@ -980,7 +979,8 @@ func workStartGateSQL(d Dialect) string {
 		AND ` + rolloutMembersOrderedHereSQL + `
 		AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 		AND (
-			(
+			earlier.state = ?
+			OR (
 				apply_operations.cutover_policy = ?
 				AND earlier.state NOT IN (?, ?, ?, ?)
 				AND NOT ` + earlierFinalizerAtBarrierSQL + `
@@ -998,6 +998,7 @@ func workStartGateSQL(d Dialect) string {
 // in placeholder order.
 func workStartGateArgs() []any {
 	args := []any{
+		state.ApplyOperation.Failed,
 		storage.CutoverPolicyBarrier,
 		state.ApplyOperation.WaitingForCutover,
 		state.ApplyOperation.CuttingOver,
@@ -1188,8 +1189,9 @@ func releasedFailureExemptionArgs() []any {
 //     or not yet at the barrier (pending, running, failed_retryable, stopped)
 //     — and terminal non-success states (failed, cancelled, reverted) — still
 //     block, so a failed earlier deployment still halts the rollout.
-//   - parallel: no earlier sibling gates a work row's copy start, bounded only
-//     by the fan-out cap below; the cutover claim orders the swaps.
+//   - parallel: earlier siblings do not order a work row's copy start, but a
+//     failed earlier member still gates admission under on_failure. The fan-out
+//     cap below bounds concurrent copies; the cutover claim orders the swaps.
 //
 // A group_finalizer's gate is not policy-aware. It waits for the work it
 // finalizes to complete (a namespace whose only change is its VSchema has no
@@ -1213,10 +1215,11 @@ func releasedFailureExemptionArgs() []any {
 // it; once a release control request latches the apply open (pending or
 // completed), a terminal-failed earlier sibling stops blocking and the rollout
 // proceeds like "continue". Only terminal `failed` is exempted — pending,
-// running, failed_retryable, and stopped earlier siblings still block under all
-// policies (work is in-flight or recoverable) — along with a finalizer that
-// failure orphaned, which can never start (see orphanedFinalizerSQL). The
-// exemption is shared by the work gate, the finalizer gate and the cutover
+// running, failed_retryable, and stopped earlier siblings still block wherever
+// phase sequencing requires them (work is in-flight or recoverable) — along
+// with a finalizer that failure orphaned, which can never start (see
+// orphanedFinalizerSQL). The exemption is shared by the work gate, the finalizer
+// gate and the cutover
 // claim, so a later member admitted past a failure is never parked behind it
 // at a later step. The policy governs only rollout
 // continuation; the apply's pass/fail verdict and the merge gate stay

@@ -291,6 +291,168 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		assert.Equal(t, ids[2], next.ID, "the next target in list order cuts over once the earlier one completes")
 	})
 
+	// FindNextApplyOperation_ParallelFailureAdmission verifies that parallel
+	// copy starts remain subject to on_failure. With payments-001 and payments-002
+	// occupying both drivers, payments-003 queues. When payments-001 fails, halt
+	// and unreleased pause keep payments-003 from starting despite the free slot;
+	// continue and a released pause admit it. A stop before payments-003 started
+	// uses the same gate, without preventing payments-002's already-started work
+	// from resuming.
+	t.Run("FindNextApplyOperation_ParallelFailureAdmission", func(t *testing.T) {
+		for _, stopped := range []bool{false, true} {
+			for _, tc := range []struct {
+				name          string
+				onFailure     string
+				releaseStatus storage.ControlRequestStatus
+				laterAdmitted bool
+			}{
+				{name: "halt", onFailure: storage.OnFailureHalt},
+				{name: "unrecognized", onFailure: "unknown"},
+				{name: "pause", onFailure: storage.OnFailurePause},
+				{name: "pause_release_pending", onFailure: storage.OnFailurePause, releaseStatus: storage.ControlRequestPending, laterAdmitted: true},
+				{name: "pause_release_completed", onFailure: storage.OnFailurePause, releaseStatus: storage.ControlRequestCompleted, laterAdmitted: true},
+				{name: "pause_release_failed", onFailure: storage.OnFailurePause, releaseStatus: storage.ControlRequestFailed},
+				{name: "continue", onFailure: storage.OnFailureContinue, laterAdmitted: true},
+			} {
+				t.Run(fmt.Sprintf("%s/stopped_%t", tc.name, stopped), func(t *testing.T) {
+					ctx := t.Context()
+					store := h.NewStorage(t)
+					lock := CreateLock(t, store, "parallel_failure_admission_db", storage.DatabaseTypeMySQL)
+					apply := CreateApply(t, store, lock, "apply_parallel_failure_admission", 926)
+					require.Equal(t, 2, storage.DefaultMaxDriversPerApply, "the scenario fills two drivers before a third member queues")
+					ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyParallel, tc.onFailure,
+						"payments-001", "payments-002", "payments-003")
+					for i, id := range ids[:2] {
+						claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, fmt.Sprintf("driver-%d", i))
+						require.NoError(t, err)
+						require.NotNil(t, claimed, "parallel starts both copies without waiting for completion")
+						require.Equal(t, id, claimed.ID)
+					}
+					capped, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+					require.NoError(t, err)
+					require.Nil(t, capped, "payments-003 waits while both driver slots are occupied")
+					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "duplicate key name 'idx_orders_source'"))
+
+					queuedState := state.ApplyOperation.Pending
+					if stopped {
+						moved, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+						require.NoError(t, err)
+						require.Equal(t, int64(1), moved, "stop catches only payments-003 before it started")
+						require.NoError(t, store.ApplyOperations().UpdateState(ctx, ids[1], state.ApplyOperation.Stopped))
+						requestControl(t, store, apply.ID, storage.ControlOperationStart)
+						queuedState = state.ApplyOperation.Stopped
+					}
+
+					project := func(released bool) string {
+						t.Helper()
+						ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+						require.NoError(t, err)
+						rolloutOps := make([]state.RolloutOperation, len(ops))
+						for i, op := range ops {
+							rolloutOps[i] = op.RolloutOperation(released)
+						}
+						derived := state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps))
+						swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, "", nil, nil)
+						require.NoError(t, err)
+						require.True(t, swapped)
+						apply.State = derived
+						return derived
+					}
+					wantParent := state.Apply.RunningDegraded
+					if tc.onFailure == storage.OnFailurePause {
+						wantParent = state.Apply.Paused
+					}
+					require.Equal(t, wantParent, project(false), "the parent stays open while payments-002 still owns its target")
+
+					if stopped {
+						resumed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+						require.NoError(t, err)
+						require.NotNil(t, resumed, "on_failure never blocks resuming work that already started")
+						require.Equal(t, ids[1], resumed.ID)
+					}
+					if tc.releaseStatus != "" {
+						requestControl(t, store, apply.ID, storage.ControlOperationRelease)
+						switch tc.releaseStatus {
+						case storage.ControlRequestCompleted:
+							require.NoError(t, store.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationRelease))
+						case storage.ControlRequestFailed:
+							require.NoError(t, store.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationRelease, "release refused"))
+						}
+						released := tc.releaseStatus != storage.ControlRequestFailed
+						if released {
+							wantParent = state.Apply.RunningDegraded
+						}
+						require.Equal(t, wantParent, project(released))
+					}
+
+					next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+					require.NoError(t, err)
+					if tc.laterAdmitted {
+						require.NotNil(t, next, "the policy admits payments-003 after payments-001 failed")
+						assert.Equal(t, ids[2], next.ID)
+						assert.Equal(t, queuedState, next.State, "the claim returns the pre-transition state")
+					} else {
+						assert.Nil(t, next, "a free driver slot does not override fail-closed admission")
+						queued, err := store.ApplyOperations().Get(ctx, ids[2])
+						require.NoError(t, err)
+						require.NotNil(t, queued)
+						assert.Equal(t, queuedState, queued.State)
+						assert.Nil(t, queued.StartedAt)
+					}
+					sibling, err := store.ApplyOperations().Get(ctx, ids[1])
+					require.NoError(t, err)
+					require.NotNil(t, sibling)
+					wantSibling := state.ApplyOperation.Running
+					if stopped {
+						wantSibling = state.ApplyOperation.Resuming
+					}
+					assert.Equal(t, wantSibling, sibling.State, "failure admission cancels no already-started work")
+					assert.NotNil(t, sibling.StartedAt)
+				})
+			}
+		}
+	})
+
+	// FindNextApplyOperation_DispatchedFailureAdmissionLeavesPolicyToDispatcher
+	// verifies that the data plane does not re-gate a member already admitted by
+	// its dispatcher. Even with the data plane's halt default and a failed earlier
+	// member, a dispatched member starts or resumes after a stop caught it pending.
+	t.Run("FindNextApplyOperation_DispatchedFailureAdmissionLeavesPolicyToDispatcher", func(t *testing.T) {
+		for _, cutoverPolicy := range []string{storage.CutoverPolicyRolling, storage.CutoverPolicyParallel} {
+			for _, stopped := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/stopped_%t", cutoverPolicy, stopped), func(t *testing.T) {
+					ctx := t.Context()
+					store := h.NewStorage(t)
+					lock := CreateLock(t, store, "dispatched_failure_admission_db", storage.DatabaseTypeMySQL)
+					apply := &storage.Apply{
+						ApplyIdentifier: "apply_dispatched_failure_admission", LockID: lock.ID, PlanID: 927,
+						Database: lock.DatabaseName, DatabaseType: lock.DatabaseType,
+						Repository: lock.Repository, PullRequest: lock.PullRequest, Environment: "staging",
+						Engine: storage.EngineSpirit, State: state.Apply.RunningDegraded,
+						IdempotencyKey: "schemabot:v1:dispatched-failure-admission",
+					}
+					id, err := store.Applies().Create(ctx, apply)
+					require.NoError(t, err)
+					apply.ID = id
+					ids := insertTargetMembers(t, store, apply.ID, cutoverPolicy, storage.OnFailureHalt,
+						"payments-001", "payments-002")
+					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "duplicate key name"))
+					if stopped {
+						moved, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+						require.NoError(t, err)
+						require.Equal(t, int64(1), moved)
+						requestControl(t, store, apply.ID, storage.ControlOperationStart)
+					}
+
+					next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					require.NoError(t, err)
+					require.NotNil(t, next, "the dispatcher already admitted payments-002")
+					assert.Equal(t, ids[1], next.ID)
+				})
+			}
+		}
+	})
+
 	// FindNextApplyOperation_RollingKeepsOneTargetsShardsTogether verifies that
 	// ordering by member leaves one member's own copy starts unordered. Under rolling,
 	// both shards of payments-001 start together, and payments-002's shards wait

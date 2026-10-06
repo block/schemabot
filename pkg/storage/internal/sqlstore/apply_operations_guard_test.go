@@ -1,10 +1,13 @@
 package sqlstore
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -61,6 +64,86 @@ func TestOperationWriteGuardUpdateStatement(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.want, tc.guard.updateStatement(tc.dialect, assignments))
+		})
+	}
+}
+
+// First-start admission checks an earlier member's failure independently of
+// cutover policy, while the shared release exemption and dispatched-plane
+// bypass still apply to both failure admission and phase sequencing.
+func TestWorkStartGateFailureAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		dialect Dialect
+	}{
+		{name: "mysql", dialect: MySQLDialect{}},
+		{name: "postgres", dialect: PostgresDialect{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := workStartGateSQL(tc.dialect)
+			args := workStartGateArgs()
+			assert.Equal(t, strings.Count(gate, "?"), len(args), "each admission placeholder has a positional argument")
+			assert.Contains(t, strings.Join(strings.Fields(gate), " "),
+				"AND ( earlier.state = ? OR ( apply_operations.cutover_policy = ?", "failure admission does not depend on cutover policy")
+			assert.Contains(t, gate, earlierRolloutMemberSQL, "a member's own shard copies remain unordered")
+			assert.Contains(t, gate, rolloutMembersOrderedHereSQL, "the data plane leaves admission to the dispatcher")
+			assert.True(t, strings.HasSuffix(gate, "AND "+releasedFailureExemptionSQL(tc.dialect)+"\n)"),
+				"continue and released pause exempt the failure admission arm too")
+			assert.Equal(t, []any{
+				state.ApplyOperation.Failed,
+				storage.CutoverPolicyBarrier,
+				state.ApplyOperation.WaitingForCutover,
+				state.ApplyOperation.CuttingOver,
+				state.ApplyOperation.RevertWindow,
+				state.ApplyOperation.Completed,
+				storage.ApplyOperationKindGroupFinalizer,
+				state.ApplyOperation.Pending,
+				state.ApplyOperation.Running,
+				storage.CutoverPolicyBarrier,
+				storage.CutoverPolicyParallel,
+				state.ApplyOperation.Completed,
+				state.ApplyOperation.Failed,
+				storage.ApplyOperationKindGroupFinalizer,
+				state.ApplyOperation.Pending,
+				state.ApplyOperation.Stopped,
+				storage.ApplyOperationKindWork,
+				state.ApplyOperation.Failed,
+				storage.OnFailureContinue,
+				storage.OnFailurePause,
+				storage.ControlOperationRelease,
+				storage.ControlRequestPending,
+				storage.ControlRequestCompleted,
+			}, args)
+		})
+	}
+}
+
+// The claim embeds the same first-start gate for pending and stopped-before-start
+// work. Its already-started stopped-work arm stays ungated so failure admission
+// never prevents an operator from resuming a copy already under way.
+func TestOperationClaimFirstStartGateBindings(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		dialect Dialect
+	}{
+		{name: "mysql", dialect: MySQLDialect{}},
+		{name: "postgres", dialect: PostgresDialect{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, connector := newRecordingRebindDB(t, &countingBinder{})
+			store := &applyOperationStore{db: db, dialect: tc.dialect, maxDriversPerApply: 2}
+			claimed, err := store.FindNextApplyOperation(t.Context(), "driver-a")
+			require.NoError(t, err)
+			require.Nil(t, claimed, "the recording driver returns no candidate rows")
+			require.Len(t, connector.queries, 1)
+			require.Len(t, connector.args, 1)
+			query := connector.queries[0]
+			assert.Equal(t, strings.Count(query, "?"), len(connector.args[0]), "the added failure placeholder cannot shift another claim arm's bindings")
+			assert.Equal(t, 2, strings.Count(query, operationStartGateSQL(tc.dialect)),
+				"pending and stopped-before-start rows share the admission gate")
+			assert.Contains(t, strings.Join(strings.Fields(query), " "),
+				"apply_operations.operation_kind <> ? AND apply_operations.started_at IS NOT NULL ) OR (",
+				"a stopped work row that already started resumes without the admission gate")
 		})
 	}
 }
