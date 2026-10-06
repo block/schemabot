@@ -448,15 +448,26 @@ func (c *ServerConfig) PullPerTargetRateLimit() ratelimit.Config {
 // expected check name, all uncached, on the installation the merge gate writes
 // Check Runs through.
 //
-// The sustained per-caller inspection budget per hour is approximately
+// The budget bounds one caller on one server process, not the installation:
+// every replica admits the configured rate on its own, and every admitted
+// inspection draws on the same installation quota. The most one caller can
+// spend per hour, when its requests spread across every replica, is therefore
+// approximately
 //
-//	60 × requests_per_minute × (1 + N)
+//	replicas × 60 × requests_per_minute × (1 + check names)
 //
-// GitHub calls when each lookup fits on one page, where N is the number of
-// check names the deployment publishes for the repository. Pagination
-// multiplies the Check Run reads, and the initial burst adds inspections above
-// the sustained rate. Deployments publishing more check names or observing
-// deep Check Run histories should lower requests_per_minute.
+// installation-authenticated GitHub calls when each lookup fits on one page,
+// where check names is the number the deployment publishes for the repository.
+// That ceiling is what requests_per_minute is sized against. A caller's own
+// cost is its request rate × (1 + check names) on any number of replicas, and
+// a caller that stays on one replica is refused there once it outpaces
+// requests_per_minute and has spent its burst. Pagination multiplies the Check
+// Run reads, the initial burst adds inspections above the sustained rate, and
+// every inspection resolves a fresh installation client, adding
+// app-authenticated calls that count against the App rather than the
+// installation. Deployments running more replicas, publishing more check
+// names, or observing deep Check Run histories should lower
+// requests_per_minute.
 const (
 	defaultChecksInspectPerCallerRequestsPerMinute = 6
 	defaultChecksInspectPerCallerBurst             = 10
@@ -517,10 +528,11 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 // here are merged into every locally driven MySQL database's metadata unless
 // the database sets the same key itself.
 type SpiritConfig struct {
-	// EnableExperimentalAutoscaling controls whether Spirit scales write
-	// threads dynamically from throttler feedback. Defaults to true when not
-	// configured (nil = enabled); set false as the operator kill switch when
-	// autoscaling misbehaves on a target fleet.
+	// EnableExperimentalAutoscaling controls whether Spirit scales its thread
+	// pools dynamically from throttler feedback. It engages on Aurora targets
+	// only; other MySQL targets run at fixed thread counts. Defaults to true
+	// when not configured (nil = enabled); set false as the operator kill
+	// switch when autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
 
 	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
@@ -3599,6 +3611,17 @@ func (c *ServerConfig) PromotionEnvironmentOrder() []string {
 		return slices.Clone(defaultEnvironmentOrder)
 	}
 	return slices.Clone(c.EnvironmentOrder)
+}
+
+// ServesFirstPromotionEnvironment reports whether this instance serves the
+// first environment in the server-owned promotion order, and names that
+// environment. A deployment serving every environment serves the first one.
+// Where several deployments split one repository's environments between them,
+// exactly one serves the first, which makes it the one to answer an unscoped
+// command (no -e) that only one of them should answer.
+func (c *ServerConfig) ServesFirstPromotionEnvironment() (bool, string) {
+	first := c.PromotionEnvironmentOrder()[0]
+	return c.IsEnvironmentAllowed(first), first
 }
 
 // PromotionOrderForDatabase returns the environment promotion order used by PR

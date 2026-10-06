@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	spiritflags "github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
@@ -29,13 +30,15 @@ const maxCommitLatency = 100 * time.Millisecond
 // classifyRunnerError marks runner failures that are verdicts about the data
 // as permanent, so operator retries are not spent repeating a lossy schema
 // change: the snapshot checksum found row differences on every completed
-// attempt, or the lockless checksum proved a divergence the copy cannot heal.
-// Attempts that errored before establishing row differences remain retryable,
-// and so does the lockless checksum's pass budget running out: that verdict
-// proves no divergence, only that ranges were still changing too fast to
-// verify, which a later attempt against a quieter table can resolve.
+// attempt. Everything else remains retryable:
+//   - attempts that errored before establishing row differences;
+//   - the lockless checksum's pass budget running out, which proves no
+//     divergence, only that ranges were still changing too fast to verify;
+//   - a divergence found by the continuous checksum during the deferred
+//     cutover wait. That checksum never repairs, because a cutover may be
+//     imminent; the resumed run's initial checksum repairs the range.
 func classifyRunnerError(err error) error {
-	if errors.Is(err, checksum.ErrDifferencesExhausted) || errors.Is(err, checksum.ErrPermanentDivergence) {
+	if errors.Is(err, checksum.ErrDifferencesExhausted) {
 		return &engine.PermanentError{Err: err}
 	}
 	return err
@@ -43,13 +46,13 @@ func classifyRunnerError(err error) error {
 
 // newSpiritMigration builds the Spirit migration for a statement against the
 // target with the engine's copy, durability, and throttling settings.
-// Callers layer statement-specific fields (DeferCutOver, RespectSentinel)
-// onto the result.
+// Callers layer statement-specific fields (DeferCutOver) onto the result.
 //
-// Write threads start at the target-appropriate automatic size (on Aurora,
-// the instance vCPU count) and, when autoscaling is enabled, scale
-// dynamically from there on throttler feedback, so apply throughput tracks
-// the target instance rather than a fixed constant.
+// On Aurora with autoscaling enabled, Spirit sizes the thread pools from the
+// instance and scales them on throttler feedback, so apply throughput tracks
+// the target instance rather than a fixed constant. Other MySQL targets, and
+// Aurora with autoscaling disabled, run at the configured copier threads and
+// Spirit's default write threads.
 //
 // The copy is verified under the snapshot checksum unless the lockless one is
 // enabled; cutover locking is the same either way.
@@ -61,15 +64,19 @@ func (e *Engine) newSpiritMigration(host, username, password, database, stmt str
 		Password:                           &password,
 		Database:                           database,
 		Statement:                          stmt,
-		Threads:                            threads,
-		WriteThreads:                       0, // auto-size for the target
-		LockWaitTimeout:                    lockTimeout,
-		InterpolateParams:                  true,
-		CheckpointMaxAge:                   e.checkpointMaxAge,
 		ChecksumYieldTimeout:               e.checksumYieldTimeout,
-		MaxCommitLatency:                   maxCommitLatency,
-		EnableExperimentalAutoscaling:      e.autoscaling,
 		EnableExperimentalLocklessChecksum: e.locklessChecksum,
+		Common: spiritflags.Common{
+			Threads:                       threads,
+			WriteThreads:                  spiritflags.DefaultWriteThreads, // autoscaling sizes it on Aurora
+			InterpolateParams:             true,
+			CheckpointMaxAge:              e.checkpointMaxAge,
+			MaxCommitLatency:              maxCommitLatency,
+			EnableExperimentalAutoscaling: e.autoscaling,
+		},
+		Cutover: spiritflags.Cutover{
+			LockWaitTimeout: lockTimeout,
+		},
 	}
 }
 
@@ -390,8 +397,11 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	e.reportExistingCopy(ctx, targetDSN(host, username, password, database), database, combinedStatement, tables)
 
 	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
+	// Only a deferred apply waits on the sentinel table. A sentinel left in
+	// the schema by an earlier cancelled or failed deferred apply never holds
+	// a non-deferred apply, whose cutover SchemaBot could neither surface nor
+	// release.
 	migration.DeferCutOver = deferCutover
-	migration.RespectSentinel = deferCutover // Only wait for sentinel when deferring cutover
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {

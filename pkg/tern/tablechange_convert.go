@@ -42,6 +42,7 @@ func storageTableChangeFromEngine(tc engine.TableChange, namespace string) stora
 		ShardCount:       tc.ShardCount,
 		LargestShardRows: tc.LargestShardRows,
 		EstimatedBytes:   tc.EstimatedBytes,
+		CollationChanges: storageCollationChangesFromEngine(tc.CollationChanges),
 	}
 }
 
@@ -61,6 +62,7 @@ func protoTableChangeFromEngine(tc engine.TableChange, namespace string) *ternv1
 		ShardCount:       int32(tc.ShardCount),
 		LargestShardRows: tc.LargestShardRows,
 		EstimatedBytes:   tc.EstimatedBytes,
+		CollationChanges: protoCollationChangesFromEngine(tc.CollationChanges),
 	}
 }
 
@@ -83,5 +85,63 @@ func StorageTableChangeFromProto(ch *ternv1.TableChange, namespace, table, ddlTe
 		ShardCount:       int(ch.ShardCount),
 		LargestShardRows: ch.LargestShardRows,
 		EstimatedBytes:   ch.EstimatedBytes,
+		CollationChanges: storageCollationChangesFromProto(ch.CollationChanges),
 	}
+}
+
+func storageCollationChangesFromEngine(changes []engine.CollationChange) []storage.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]storage.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = storage.CollationChange{
+			Column:         c.Column,
+			From:           c.From,
+			To:             c.To,
+			Case:           string(c.Case),
+			TrailingSpaces: string(c.TrailingSpaces),
+			CanMergeValues: c.CanMergeValues,
+			UniqueIndexes:  c.UniqueIndexes,
+		}
+	}
+	return out
+}
+
+func protoCollationChangesFromEngine(changes []engine.CollationChange) []*ternv1.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]*ternv1.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = &ternv1.CollationChange{
+			Column:                  c.Column,
+			FromCollation:           c.From,
+			ToCollation:             c.To,
+			CaseComparison:          string(c.Case),
+			TrailingSpaceComparison: string(c.TrailingSpaces),
+			CanMergeValues:          c.CanMergeValues,
+			UniqueIndexes:           c.UniqueIndexes,
+		}
+	}
+	return out
+}
+
+func storageCollationChangesFromProto(changes []*ternv1.CollationChange) []storage.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]storage.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = storage.CollationChange{
+			Column:         c.GetColumn(),
+			From:           c.GetFromCollation(),
+			To:             c.GetToCollation(),
+			Case:           c.GetCaseComparison(),
+			TrailingSpaces: c.GetTrailingSpaceComparison(),
+			CanMergeValues: c.GetCanMergeValues(),
+			UniqueIndexes:  c.GetUniqueIndexes(),
+		}
+	}
+	return out
 }

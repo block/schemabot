@@ -435,10 +435,10 @@ func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowCo
 		if logHeartbeat <= 0 {
 			logHeartbeat = logHeartbeatDefault
 		}
-		return watchApplyProgressLog(endpoint, applyID, logHeartbeat)
+		return watchApplyProgressLog(newProgressPoller(endpoint, applyID), logHeartbeat)
 	}
 	if format == OutputFormatJSON {
-		return watchApplyProgressJSON(endpoint, applyID)
+		return watchApplyProgressJSON(newProgressPoller(endpoint, applyID))
 	}
 
 	// Interactive format: use Bubbletea TUI
@@ -448,11 +448,16 @@ func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowCo
 // WatchApplyProgressAfterCutover polls the progress API after cutover has been triggered.
 // It waits for completion without showing the "waiting for cutover" instructions.
 func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
+	return watchAfterCutover(newProgressPoller(endpoint, applyID))
+}
+
+func watchAfterCutover(poller *progressPoller) error {
+	applyID := poller.applyID
 	maxTableNameLen := 0
 	headerPrinted := false
 
 	for {
-		result, err := client.GetProgress(endpoint, applyID)
+		result, err := poller.next(printProgressRetry)
 		if err != nil {
 			return err
 		}
@@ -474,30 +479,43 @@ func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
 			headerPrinted = true
 		}
 
-		// Check for terminal states
-		if state.IsState(curState, state.Apply.Completed) {
-			// Show green completion bar
-			for _, tbl := range tables {
-				bar := ui.ProgressBarComplete()
-				fmt.Printf("%*s: %s ✓ Complete\n", maxTableNameLen, tbl.TableName, bar)
-			}
-			fmt.Printf("\n\n%s\n", templates.FormatApplyCompleteWithSummary(countProgressResponseChanges(tables).summary(), applyID))
-			return nil
-		}
-
-		if state.IsState(curState, state.Apply.Failed) {
-			if result.ErrorMessage != "" {
-				return fmt.Errorf("cutover failed: %s", result.ErrorMessage)
-			}
-			return fmt.Errorf("cutover failed")
-		}
-
-		if state.IsState(curState, state.Apply.Stopped) {
-			return fmt.Errorf("schema change was stopped during cutover")
+		if state.IsTerminalApplyState(curState) {
+			return finishAfterCutover(result, tables, maxTableNameLen, applyID)
 		}
 
 		// Still processing - just wait (don't show waiting instructions since cutover was already triggered)
-		time.Sleep(2 * time.Second)
+		poller.sleep(pollInterval)
+	}
+}
+
+// finishAfterCutover renders the outcome of an apply that reached a terminal
+// state after cutover was triggered and returns the watch's exit. Only a
+// completed apply succeeds; a terminal state without its own message still
+// fails, so a state added later cannot turn into a silent success.
+func finishAfterCutover(result *apitypes.ProgressResponse, tables []*apitypes.TableProgressResponse, maxTableNameLen int, applyID string) error {
+	curState := result.State
+	switch {
+	case state.IsState(curState, state.Apply.Completed):
+		// Show green completion bar
+		for _, tbl := range tables {
+			bar := ui.ProgressBarComplete()
+			fmt.Printf("%*s: %s ✓ Complete\n", maxTableNameLen, tbl.TableName, bar)
+		}
+		fmt.Printf("\n\n%s\n", templates.FormatApplyCompleteWithSummary(countProgressResponseChanges(tables).summary(), applyID))
+		return nil
+	case state.IsState(curState, state.Apply.Failed):
+		if result.ErrorMessage != "" {
+			return fmt.Errorf("cutover failed: %s", result.ErrorMessage)
+		}
+		return fmt.Errorf("cutover failed")
+	case state.IsState(curState, state.Apply.Stopped):
+		return fmt.Errorf("schema change was stopped during cutover")
+	case state.IsState(curState, state.Apply.Cancelled):
+		return fmt.Errorf("schema change was cancelled during cutover; start a new apply to retry")
+	case state.IsState(curState, state.Apply.Reverted):
+		return fmt.Errorf("schema change was reverted after cutover; start a new apply to make it again")
+	default:
+		return fmt.Errorf("schema change ended in state %s after cutover", curState)
 	}
 }
 
@@ -826,13 +844,7 @@ func logfmtEscape(b []byte, val string) []byte {
 //   - Progress heartbeats fire after 2s (first) then every --log-heartbeat interval (default 10s), only during row copy.
 //   - Small/instant tables only get start + complete lines — no progress noise.
 //   - A summary line is emitted on terminal states.
-func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Duration) error {
-	return watchApplyProgressLogWithPoller(func() (*apitypes.ProgressResponse, error) {
-		return client.GetProgress(endpoint, applyID)
-	}, time.Sleep, heartbeatInterval)
-}
-
-func watchApplyProgressLogWithPoller(getProgress func() (*apitypes.ProgressResponse, error), wait func(time.Duration), heartbeatInterval time.Duration) error {
+func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Duration) error {
 	log := &logEmitter{}
 	tableStates := make(map[string]*tableLogState)
 	var lastGlobalState string
@@ -841,9 +853,15 @@ func watchApplyProgressLogWithPoller(getProgress func() (*apitypes.ProgressRespo
 	var revertWindowStart time.Time
 	var lastRevertHeartbeat time.Time
 	pollInterval := 500 * time.Millisecond
+	logRetry := func(r progressRetry) {
+		log.emit("msg", "Progress unavailable, retrying",
+			"attempt", fmt.Sprintf("%d/%d", r.attempt, maxConsecutiveProgressFailures),
+			"retry_in", r.wait.String(),
+			"error", r.err.Error())
+	}
 
 	for {
-		result, err := getProgress()
+		result, err := poller.next(logRetry)
 		if err != nil {
 			return err
 		}
@@ -875,14 +893,7 @@ func watchApplyProgressLogWithPoller(getProgress func() (*apitypes.ProgressRespo
 		}
 
 		if state.IsState(curState, state.NoActiveChange) {
-			// The background poller may not have updated task states yet.
-			// Keep polling unless we've already seen a terminal state.
-			if !state.IsTerminalApplyState(lastGlobalState) {
-				wait(pollInterval)
-				continue
-			}
-			log.emit("msg", "No active schema change")
-			return nil
+			return noActiveChangeError(poller.applyID)
 		}
 
 		tables := ddl.FilterInternalTablesTyped(result.Tables)
@@ -991,20 +1002,16 @@ func watchApplyProgressLogWithPoller(getProgress func() (*apitypes.ProgressRespo
 		}
 
 		// Terminal states — emit summary and exit
-		if state.IsState(curState, state.Apply.Completed) {
-			log.emitApplySummary("completed", tableStates, applyStart, "")
-			return nil
-		}
-		if state.IsState(curState, state.Apply.Failed) {
-			log.emitApplySummary("failed", tableStates, applyStart, result.ErrorMessage)
-			return ErrSilent
-		}
-		if state.IsState(curState, state.Apply.Stopped) {
-			log.emitApplySummary("stopped", tableStates, applyStart, "")
-			return nil
+		if state.IsTerminalApplyState(curState) {
+			var errorMsg string
+			if state.IsState(curState, state.Apply.Failed) {
+				errorMsg = result.ErrorMessage
+			}
+			log.emitApplySummary(state.NormalizeState(curState), tableStates, applyStart, errorMsg)
+			return terminalWatchExit(result)
 		}
 
-		wait(pollInterval)
+		poller.sleep(pollInterval)
 		// Ramp up to 5s over the first few polls to avoid hammering the API on long schema changes
 		if pollInterval < 5*time.Second {
 			pollInterval *= 2
@@ -1160,7 +1167,7 @@ func (e *logEmitter) emitProgressHeartbeat(tbl *apitypes.TableProgressResponse, 
 
 // emitApplySummary emits the final summary line when an apply reaches a terminal state.
 func (e *logEmitter) emitApplySummary(outcome string, tableStates map[string]*tableLogState, applyStart time.Time, errorMsg string) {
-	var succeeded, failed, stopped int
+	var succeeded, failed, stopped, cancelled, reverted int
 	for _, ts := range tableStates {
 		switch ts.status {
 		case state.Apply.Completed:
@@ -1169,12 +1176,16 @@ func (e *logEmitter) emitApplySummary(outcome string, tableStates map[string]*ta
 			failed++
 		case state.Apply.Stopped:
 			stopped++
+		case state.Apply.Cancelled:
+			cancelled++
+		case state.Apply.Reverted:
+			reverted++
 		}
 	}
 
 	dur := ui.FormatHumanDuration(time.Since(applyStart))
 
-	total := succeeded + failed + stopped
+	total := succeeded + failed + stopped + cancelled + reverted
 	kvs := []string{
 		"msg", "Apply " + outcome,
 		"duration", dur,
@@ -1186,6 +1197,12 @@ func (e *logEmitter) emitApplySummary(outcome string, tableStates map[string]*ta
 	if stopped > 0 {
 		kvs = append(kvs, "stopped", fmt.Sprintf("%d", stopped))
 	}
+	if cancelled > 0 {
+		kvs = append(kvs, "cancelled", fmt.Sprintf("%d", cancelled))
+	}
+	if reverted > 0 {
+		kvs = append(kvs, "reverted", fmt.Sprintf("%d", reverted))
+	}
 	if errorMsg != "" {
 		kvs = append(kvs, "error", errorMsg)
 	}
@@ -1196,7 +1213,7 @@ func (e *logEmitter) emitApplySummary(outcome string, tableStates map[string]*ta
 // isActiveStatus returns true if the table status represents an active (non-terminal) state.
 func isActiveStatus(status string) bool {
 	switch status {
-	case state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Reverted, state.Apply.RevertWindow:
+	case state.Apply.Completed, state.Apply.Failed, state.Apply.Stopped, state.Apply.Cancelled, state.Apply.Reverted, state.Apply.RevertWindow:
 		return false
 	default:
 		return true
@@ -1204,9 +1221,9 @@ func isActiveStatus(status string) bool {
 }
 
 // watchApplyProgressJSON outputs JSON lines for programmatic consumption.
-func watchApplyProgressJSON(endpoint, applyID string) error {
+func watchApplyProgressJSON(poller *progressPoller) error {
 	for {
-		result, err := client.GetProgress(endpoint, applyID)
+		result, err := poller.next(printProgressRetry)
 		if err != nil {
 			return err
 		}
@@ -1225,21 +1242,14 @@ func watchApplyProgressJSON(endpoint, applyID string) error {
 			return err
 		}
 
-		// Check for terminal states
-		if state.IsState(curState, state.Apply.Completed) {
-			return nil
-		}
-		if state.IsState(curState, state.Apply.Failed) {
-			return ErrSilent
-		}
-		if state.IsState(curState, state.Apply.Stopped) {
-			return nil
+		if state.IsTerminalApplyState(curState) {
+			return terminalWatchExit(result)
 		}
 		if state.IsState(curState, state.NoActiveChange) {
-			return nil
+			return noActiveChangeError(poller.applyID)
 		}
 
-		time.Sleep(2 * time.Second)
+		poller.sleep(pollInterval)
 	}
 }
 

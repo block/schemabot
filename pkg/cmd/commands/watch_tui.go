@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,8 +9,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/state"
@@ -60,23 +57,6 @@ var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 
 // Messages
 type tickMsg time.Time
-
-// isRetryableFetchError reports whether a fetch error is retryable.
-//
-//   - ConnectionError (server unreachable): always retryable.
-//   - APIError with error code: classified by apitypes.IsRetryableErrorCode.
-//   - APIError without error code, or unknown error types: permanent.
-func isRetryableFetchError(err error) bool {
-	var connErr *client.ConnectionError
-	if errors.As(err, &connErr) {
-		return true
-	}
-	var apiErr *client.APIError
-	if errors.As(err, &apiErr) && apiErr.ErrorCode != "" {
-		return apitypes.IsRetryableErrorCode(apiErr.ErrorCode)
-	}
-	return false
-}
 
 type progressMsg struct {
 	state        string
@@ -175,9 +155,15 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case progressMsg:
 		if msg.failed && msg.retryable {
 			// Transient error (connection refused, timeout, engine_unavailable).
-			// Preserve last known state and tables, keep polling with backoff.
+			// Preserve last known state and tables, keep polling with backoff
+			// until the same bound the non-interactive watches give up at.
 			m.consecutiveErrors++
 			m.errorMsg = msg.errorMsg
+			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
+				m.errorMsg = progressGiveUpMessage(m.applyID, m.consecutiveErrors) + ": " + msg.errorMsg
+				m.initialized = true
+				return m, tea.Quit
+			}
 			return m, nil
 		}
 		if msg.failed && !msg.retryable {

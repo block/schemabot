@@ -146,6 +146,50 @@ func PreviewCommentPlanColumnOnlyAlter() string {
 	})
 }
 
+// PreviewCommentPlanCollationChanges renders a plan that moves a table onto a
+// new default collation, which re-collates the columns the ALTER redeclares,
+// and makes one unique column case-sensitive. The collation section under the
+// sizes says what each move does to how values compare.
+func PreviewCommentPlanCollationChanges() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL, MODIFY COLUMN `title` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL, DEFAULT CHARSET=utf8mb4, COLLATE=utf8mb4_0900_ai_ci;",
+				"ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL;",
+			},
+			TableSizes: []TableSizeData{
+				{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
+				{Table: "customers", EstimatedBytes: previewBytes(2_900_000_000)},
+			},
+			CollationChanges: []CollationChangeData{
+				{
+					Table: "products", Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+					Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+					CanMergeValues: true, UniqueIndexes: []string{"uk_sku"},
+				},
+				{
+					Table: "products", Column: "title", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+					Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+					CanMergeValues: true,
+				},
+				{
+					Table: "customers", Column: "handle", From: "utf8mb4_general_ci", To: "utf8mb4_bin",
+					Case: engine.ComparisonBecomesSensitive, TrailingSpaces: engine.ComparisonUnchanged,
+				},
+			},
+		}},
+	})
+}
+
 // previewManyTableSizes is the table set PreviewCommentPlanManyTables indexes:
 // a spread of sizes from kilobytes to hundreds of gigabytes, in plan
 // (alphabetical) order, with two tables whose size probe returned nothing.
@@ -277,6 +321,35 @@ func PreviewCommentPlanBlockedPostgres() string {
 				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
 				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
 			})},
+		},
+	})
+}
+
+// PreviewCommentPlanUnsafe renders a sample plan whose changes the unsafe gate
+// holds until the apply carries --allow-unsafe. The footer states that
+// requirement under the plain command, which never carries the flag itself.
+func PreviewCommentPlanUnsafe() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` DROP COLUMN `legacy_ref`;",
+					"ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
 		},
 	})
 }
@@ -1102,6 +1175,36 @@ func PreviewCommentErrorDatabaseNotConfigured() string {
 	})
 }
 
+// PreviewCommentErrorDatabaseNotRegistered renders the error comment the
+// staging aggregate leader posts for an unscoped command on a schemabot.yaml
+// whose database it has not registered.
+func PreviewCommentErrorDatabaseNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Deployment:  "staging",
+		CommandName: action.Plan,
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+		},
+	})
+}
+
+// PreviewCommentErrorDatabasesNotRegistered renders the same error for a PR
+// carrying several such schemabot.yaml files, which one reply names together.
+func PreviewCommentErrorDatabasesNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Deployment:  "staging",
+		CommandName: action.Plan,
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+			{Database: "payments", SchemaPath: "services/payments/schema"},
+		},
+	})
+}
+
 // PreviewCommentErrorDatabaseRepoNotAllowed renders the error comment for a
 // command naming a database the SchemaBot server configures for other
 // repositories only.
@@ -1305,6 +1408,21 @@ func PreviewCommentReviewRequiredNoOperators() string {
 		RequestedBy:    previewRequestedBy,
 		OtherReviewers: []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:       previewRequestedBy,
+	})
+}
+
+// PreviewCommentReviewRequiredStaleApproval renders the "review required"
+// comment when an authorized reviewer approved an earlier commit and schema
+// files changed after it, so that approval no longer counts.
+func PreviewCommentReviewRequiredStaleApproval() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		StaleApprovers:    []string{"jdoe"},
 	})
 }
 
@@ -1870,12 +1988,14 @@ func PreviewCommentVitessPlanVSchemaRemoval() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "commerce_sharded/vschema.json",
-				Reason: `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
 			},
 			{
-				Table:  "commerce_sharded/vschema.json",
-				Reason: `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
 			},
 		},
 	})

@@ -199,6 +199,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 	writeTableSizesSection(&sb, data)
+	writeCollationChangesSection(&sb, data)
 	totalStatements, keyspaceUpdates := countChanges(summary.Changes)
 
 	writePlanSummary(&sb, summary, totalStatements, keyspaceUpdates)
@@ -209,7 +210,7 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
 	item := 0
 	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(&sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType)
+		writeUnsafeChangeItem(&sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, "")
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
@@ -259,6 +260,7 @@ func renderBlockedChangesApplyRejected(data PlanCommentData, budget *ddlBlockBud
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 	writeTableSizesSection(&sb, data)
+	writeCollationChangesSection(&sb, data)
 
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 

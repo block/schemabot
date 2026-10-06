@@ -27,10 +27,12 @@ const DefaultChecksumYieldTimeout = 12 * time.Hour
 // the corresponding default in New; fields are set only to deviate from the
 // fleet defaults.
 type Settings struct {
-	// EnableExperimentalAutoscaling scales Spirit's write threads dynamically
+	// EnableExperimentalAutoscaling scales Spirit's thread pools dynamically
 	// from throttler feedback so apply throughput tracks the target instance's
-	// capacity instead of a fixed constant. nil defaults to enabled; false is
-	// the operator kill switch when autoscaling misbehaves on a target fleet.
+	// capacity instead of a fixed constant. It engages on Aurora targets only;
+	// other MySQL targets run at fixed thread counts. nil defaults to enabled;
+	// false is the operator kill switch when autoscaling misbehaves on a
+	// target fleet.
 	EnableExperimentalAutoscaling *bool
 
 	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
@@ -39,10 +41,9 @@ type Settings struct {
 	// unchanged either way. False — the zero value — is the default, because
 	// the lockless checker changes what an unverifiable copy costs: a
 	// continuously updated row is not yet supported and keeps the verify phase
-	// running, a confirmed divergence aborts the apply where the snapshot
-	// checker repairs the chunk and continues, and the phase reports no
-	// progress until its first clean pass. docs/configuration.md states the
-	// terms an operator accepts by enabling it. Unlike the autoscaling kill
+	// running, and the phase reports no progress until its first clean pass.
+	// docs/configuration.md states the terms an operator accepts by enabling
+	// it. Unlike the autoscaling kill
 	// switch this needs no tri-state, because absent and false both mean the
 	// same thing.
 	EnableExperimentalLocklessChecksum bool

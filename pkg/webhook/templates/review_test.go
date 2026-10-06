@@ -1,6 +1,7 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,6 +31,27 @@ func TestRenderReviewRequired(t *testing.T) {
 	assert.Contains(t, result, "**Other authorized reviewers**:\n- @bob\n- @org/dba-team")
 	assert.Contains(t, result, "Request a review from anyone listed above")
 	assert.Contains(t, result, "schemabot apply -e staging")
+	assert.NotContains(t, result, "earlier commit", "no approval on an earlier commit means no explanation line")
+}
+
+// An authorized reviewer whose approval was given on an earlier commit sees
+// why that approval, still visible on the PR, does not satisfy the gate.
+func TestRenderReviewRequired_StaleApprovers(t *testing.T) {
+	data := ReviewGateData{
+		Database:          "payments",
+		Environment:       "staging",
+		RequestedBy:       "alice",
+		OperatorReviewers: []string{"org/payments-operators"},
+		OtherReviewers:    []string{"bob", "carol"},
+		PRAuthor:          "alice",
+		StaleApprovers:    []string{"bob", "carol"},
+	}
+
+	result := RenderReviewRequired(data)
+
+	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count, because schema files changed since then or SchemaBot could not confirm they did not: @bob, @carol. Ask for an approval of the latest commit.\n")
+	assert.Less(t, strings.Index(result, "Approvals on an earlier commit"), strings.Index(result, "**Operators of `payments`**"),
+		"the explanation precedes the reviewer lists")
 }
 
 // A database with no operator principals falls back to a single flat list —

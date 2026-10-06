@@ -138,6 +138,19 @@ classified unsafe when any of the following hold:
 - a lint rule raised it at error severity (for example dropping an index that
   was never made invisible).
 
+On the MySQL family, a new table is also unsafe when Spirit could not alter it
+later (the `spirit_compatible` rule, error severity). The rule applies to
+Vitess targets too: Vitess online DDL also needs a primary key and refuses
+foreign-key tables by default. Every table SchemaBot creates should stay
+changeable through an online schema change, so a
+`CREATE TABLE` is flagged when the table has no primary key, has a `FLOAT` or
+`BIT` primary key column, takes part in a foreign key at either end, or has a
+`.` or backtick in its name. Only tables the plan creates are checked. An
+existing table that Spirit cannot alter is left to the runtime checks, so a
+legacy table does not block unrelated changes. `--allow-unsafe` overrides the
+rule. Use it only for legacy cases, because the table can then only be
+changed by blocking DDL, which is limited to small tables.
+
 A Vitess VSchema change is unsafe when it removes anything from the current
 VSchema: a vindex definition, a table's routing entry, or a table's
 column-vindex association. A removal changes query routing the moment the
@@ -219,7 +232,9 @@ execute the statement at all, so an apply is guaranteed to fail on it. There is
 no flag that lets a blocked change through — the guidance is to rewrite the
 statement as a supported schema change. Blocked changes render on the plan
 comment and again on the locked apply comment, and any apply command is
-rejected up front while they are present. Local apply admission re-checks the
+rejected up front while they are present. The plan comment offers no apply
+command for an environment with a blocked change; its footer offers the
+re-plan to run once the statement is rewritten. Local apply admission re-checks the
 whole stored plan before creating or attaching apply work, so a dispatch for
 one table or shard cannot partially apply a plan whose other step is blocked.
 A deployment that did not plan locally re-plans the dispatched changes against

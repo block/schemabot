@@ -181,7 +181,27 @@ func tableChangeResponseFromProto(t *ternv1.TableChange) *apitypes.TableChangeRe
 		ShardCount:       int(t.ShardCount),
 		LargestShardRows: t.LargestShardRows,
 		EstimatedBytes:   t.EstimatedBytes,
+		CollationChanges: collationChangesFromProto(t.CollationChanges),
 	}
+}
+
+func collationChangesFromProto(changes []*ternv1.CollationChange) []apitypes.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]apitypes.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = apitypes.CollationChange{
+			Column:         c.GetColumn(),
+			From:           c.GetFromCollation(),
+			To:             c.GetToCollation(),
+			Case:           c.GetCaseComparison(),
+			TrailingSpaces: c.GetTrailingSpaceComparison(),
+			CanMergeValues: c.GetCanMergeValues(),
+			UniqueIndexes:  c.GetUniqueIndexes(),
+		}
+	}
+	return out
 }
 
 // planResponseFromProto converts a protobuf PlanResponse to an HTTP PlanResponse.

@@ -35,6 +35,7 @@ func TestMySQLDialectIndexHint(t *testing.T) {
 
 func TestMySQLDialectBinaryEquals(t *testing.T) {
 	assert.Equal(t, "owner COLLATE utf8mb4_0900_bin = ?", MySQLDialect{}.BinaryEquals("owner"))
+	assert.Equal(t, "pending_plan_id COLLATE utf8mb4_0900_bin = ?", MySQLDialect{}.BinaryEquals("pending_plan_id"))
 }
 
 func TestMySQLDialectBinaryCollation(t *testing.T) {
@@ -303,6 +304,7 @@ func TestPostgresDialect(t *testing.T) {
 
 func TestPostgresDialectBinaryEquals(t *testing.T) {
 	assert.Equal(t, "owner = ?", PostgresDialect{}.BinaryEquals("owner"))
+	assert.Equal(t, "pending_plan_id = ?", PostgresDialect{}.BinaryEquals("pending_plan_id"))
 }
 
 func TestPostgresDialectBinaryCollation(t *testing.T) {
@@ -427,7 +429,7 @@ func TestPostgresDialectJoinedDeleteRejectsJoinConditionPlaceholders(t *testing.
 // so a guarded statement's argument order is dialect-independent. MySQL's
 // joined DML already record-locks the joined row, so a plain equality
 // suffices; PostgreSQL must lock the row explicitly through the correlated
-// FOR UPDATE subquery.
+// FOR SHARE subquery.
 func TestMySQLDialectLeaseTokenFence(t *testing.T) {
 	assert.Equal(t, "a.lease_token = ?",
 		MySQLDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
@@ -448,15 +450,15 @@ func TestPostgresDialectLeaseSourceFence(t *testing.T) {
 		PostgresDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"),
 		PostgresDialect{}.LeaseSourceFence("applies", "a", "id", "lease_token"))
 	assert.Equal(t,
-		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE)",
+		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR SHARE)",
 		PostgresDialect{}.LeaseSourceFence("applies", "a", "id", "lease_token"))
 }
 
 func TestPostgresDialectLeaseTokenFence(t *testing.T) {
 	assert.Equal(t,
-		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE)",
+		"a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR SHARE)",
 		PostgresDialect{}.LeaseTokenFence("applies", "a", "id", "lease_token"))
 	assert.Equal(t,
-		"owner_op.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = owner_op.id AND fence.lease_token = ? FOR UPDATE)",
+		"owner_op.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = owner_op.id AND fence.lease_token = ? FOR SHARE)",
 		PostgresDialect{}.LeaseTokenFence("apply_operations", "owner_op", "id", "lease_token"))
 }

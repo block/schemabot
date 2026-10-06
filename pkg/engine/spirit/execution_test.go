@@ -26,16 +26,17 @@ func TestClassifyRunnerError(t *testing.T) {
 		assert.ErrorAs(t, classifiedErr, &permanentErr)
 	})
 
-	// The lockless checksum reports a proven divergence with its own sentinel,
-	// and a lossy ALTER under it fails with that verdict on every attempt, so
-	// it is permanent exactly as the snapshot checksum's verdict is.
-	t.Run("lockless permanent divergence is permanent", func(t *testing.T) {
-		runnerErr := fmt.Errorf("checksum failed: %w",
+	// The continuous checksum during the deferred cutover wait reports a
+	// divergence without repairing it, since a cutover may be imminent. The
+	// resumed run's initial checksum repairs the range, so the failure stays
+	// retryable.
+	t.Run("continuous checksum divergence remains retryable", func(t *testing.T) {
+		runnerErr := fmt.Errorf("continuous checksum: %w",
 			fmt.Errorf("%w: chunk `id` >= 1 AND `id` < 1001", checksum.ErrPermanentDivergence))
 
 		classifiedErr := classifyRunnerError(runnerErr)
 
-		assert.False(t, engine.IsRetryable(classifiedErr))
+		assert.True(t, engine.IsRetryable(classifiedErr))
 		assert.ErrorIs(t, classifiedErr, checksum.ErrPermanentDivergence)
 	})
 

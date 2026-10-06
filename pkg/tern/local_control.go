@@ -1208,6 +1208,37 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 	return true, nil
 }
 
+// failPendingRequestForSettledOutcome resolves a pending control request
+// terminally when the engine refused it because the schema change had already
+// settled on an outcome of its own, such as failed, that the operation must not
+// replace. The outcome will not change back, so leaving the request pending
+// would re-run the same refusal on every drive claim. The request is failed
+// with the engine's reason, and the apply is left for the drive to settle: its
+// next progress poll records the outcome the engine reports. Returns
+// settled=false when the error is not a settled-outcome refusal, so the caller
+// applies its normal error handling. When settled=true the operation did not
+// take effect, so a stop or cancel caller must keep its drive going, or the
+// drive loop would record the operator's command over the engine's outcome.
+func (c *LocalClient) failPendingRequestForSettledOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
+	refusal, ok := engine.AsSettledOutcome(opErr)
+	if !ok {
+		return false, nil
+	}
+	message := refusal.Error()
+	caller := controlRequestCaller(controlReq)
+	logger.Warn("rejecting pending control request: the schema change already settled on its own outcome; the drive keeps going and records that outcome",
+		"operation", string(operation),
+		"requested_by", caller,
+		"state", apply.State,
+		"error", opErr)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
+		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
+	}
+	return true, nil
+}
+
 // failRefusedControlRequest resolves a pending control request that the stop or
 // cancel path answered with an explicit refusal. The refusal is a decision, not
 // a delivery failure: the request is already recorded durably, so a later claim
@@ -1310,6 +1341,12 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if settled, settleErr := c.failPendingRequestForSettledOutcome(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); settled {
+			// The request is resolved terminally but no stop took effect: the
+			// schema change already settled, and the drive records that outcome
+			// rather than an operator stop.
+			return false, settleErr
+		}
 		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); declined {
 			// The request is resolved terminally but no stop took effect: the
 			// schema change keeps running, so the drive must not treat this as
@@ -1395,6 +1432,11 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if settled, settleErr := c.failPendingRequestForSettledOutcome(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); settled {
+			// See the stop counterpart: the change already settled, so the drive
+			// records that outcome rather than an operator cancel.
+			return false, settleErr
+		}
 		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); declined {
 			// The request is resolved terminally but no cancel took effect:
 			// the schema change keeps running, so the drive must not treat
@@ -1668,8 +1710,9 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 // (a failed probe) — surfaces the original cancel error unchanged. Typed
 // rejections with their own resolution paths also surface unchanged: an
 // already-completed rejection has the caller reconcile stored state to the
-// completed outcome, and an unsupported-operation decline resolves the durable
-// request without recording a cancel.
+// completed outcome, while an unsupported-operation decline and a
+// settled-outcome refusal each resolve the durable request without recording a
+// cancel.
 func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, cancelErr error) error {
 	if engine.IsAlreadyCompleted(cancelErr) {
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
@@ -1679,6 +1722,12 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 	// pending-request decline path resolves the request terminally without
 	// touching the running change.
 	if engine.IsUnsupportedOperation(cancelErr) {
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	// A settled-outcome refusal means the change already settled on an outcome
+	// a cancel must not replace; it surfaces so the pending-request path
+	// resolves the request and the drive records the engine's own outcome.
+	if engine.IsSettledOutcome(cancelErr) {
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
 	}
 	progress, probeErr := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
@@ -1720,8 +1769,9 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 // stopped record over an engine still executing would let the change keep
 // running unwatched. Typed rejections with their own resolution paths also
 // surface unchanged: an already-completed rejection has the caller reconcile
-// stored state to the completed outcome, and an unsupported-operation decline
-// resolves the durable request without recording a stop.
+// stored state to the completed outcome, while an unsupported-operation decline
+// and a settled-outcome refusal each resolve the durable request without
+// recording a stop.
 func (c *LocalClient) resolveFailedEngineStop(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, stopErr error) error {
 	if engine.IsAlreadyCompleted(stopErr) {
 		return c.wrapFailedEngineStop(task, stopErr)
@@ -1731,6 +1781,13 @@ func (c *LocalClient) resolveFailedEngineStop(ctx context.Context, eng engine.En
 	// pending-request decline path resolves the request terminally without
 	// touching the running change.
 	if engine.IsUnsupportedOperation(stopErr) {
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	// A settled-outcome refusal means the change already settled on an outcome
+	// a stop must not relabel as a resumable pause; it surfaces so the
+	// pending-request path resolves the request and the drive records the
+	// engine's own outcome.
+	if engine.IsSettledOutcome(stopErr) {
 		return c.wrapFailedEngineStop(task, stopErr)
 	}
 	progress, probeErr := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{

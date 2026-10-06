@@ -761,7 +761,9 @@ assigns task state. That is a consequence of OW-8: every writer of a task row is
 elected reaper, so every write either goes through this resolution or is a reaper settling a row
 no driver is touching. *Enforced:* the forward-only state resolution
 the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
-`pkg/tern/local_client.go`).
+`pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
+outcome rather than as work to re-plan (`failedTaskDecidingOutcome`,
+`pkg/tern/local_control_resume.go`).
 
 ### ST-5: Unknown engine states are visible and blocking
 
@@ -778,7 +780,9 @@ progress sync (`pkg/tern/state_converters.go`, [pkg/state/README.md](../pkg/stat
 
 ### ST-7: Stop checkpoints conservatively
 
-On stop, every non-terminal task goes `stopped` whatever its engine sub-state says. A task is
+On stop, every non-terminal task goes `stopped` whatever its engine sub-state says, unless the
+engine refuses the stop because the change already settled on its own outcome, in which case the
+drive records that outcome instead (CO-3). A task is
 never promoted to `completed` on partial engine progress, and the stop snapshot is taken only
 after the engine's own stop returns. *Enforced:* stop handling in `pkg/tern/local_control.go` and
 `pkg/tern/stop_terminality.go`.
@@ -880,7 +884,9 @@ re-asserted on the guarded write rather than trusted from the scan. Any new non-
 a precondition that actually excludes a live driver. *Enforced:* a token
 check on every lease-scoped storage write
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/apply_operations.go`,
-`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`).
+`pkg/storage/internal/sqlstore/tasks.go`, `pkg/storage/internal/sqlstore/apply_comments.go`,
+`pkg/storage/internal/sqlstore/apply_logs.go`, `pkg/storage/internal/sqlstore/checks.go`,
+`pkg/storage/internal/sqlstore/control_requests.go`).
 
 ### OW-3: A driver stops before a peer may reclaim
 
@@ -1090,10 +1096,14 @@ command may delay a drive but never wedge it. A failed request requires fresh op
 rather than being retried forever, and polling windows are bounded with visible timeout failures.
 An operation an engine declines for its whole database type is one of these doomed commands, so
 every engine states that decline in the type system rather than as a generic failure, and the
-drive resolves the request with the engine's reason instead of reattempting it.
+drive resolves the request with the engine's reason instead of reattempting it. So is an
+operation an engine refuses because the change already settled on an outcome the operation must
+not replace (CO-3), which is typed apart from a decline for the database type.
 *Breaks if violated:* an apply loops on a doomed command while holding its database lock.
 *Enforced:* request completion and bounded-retry rules in the drive loop (`pkg/api/operator.go`,
-`pkg/tern/control_requests.go`), the terminal resolution of a typed unsupported-operation
+`pkg/tern/control_requests.go`), the terminal resolution of a typed settled-outcome refusal on the
+stop and cancel paths (`failPendingRequestForSettledOutcome`, `pkg/tern/local_control.go`), the
+terminal resolution of a typed unsupported-operation
 decline (`failPendingRequestForUnsupportedOperation`, `pkg/tern/local_control.go`), reached from
 the stop and cancel paths in that file and from the revert and skip-revert paths in
 `pkg/tern/local_apply_grouped.go`, and the refusal paths of the pending control-request processors
@@ -1105,9 +1115,13 @@ When the engine's own record shows the change already settled, the drive adopts 
 instead of fighting it. A cancel against a deploy that already completed records the apply as
 completed rather than re-sending the cancel forever. Only engines whose backend holds the
 authoritative record of the change (PlanetScale, where the deploy request lives server-side) are
-consulted this way; for all others the question fails closed. And only settled outcomes are
-adopted, never a remote state still in motion. *Enforced:* terminal-truth preflights on the
-control paths (`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`).
+consulted this way before a command is sent; for all others the drive's question fails closed. An
+engine that holds the record in-process answers from it when the command arrives instead: it
+refuses a stop or cancel that would replace an outcome the change already settled on, and the
+drive resolves the request and records that outcome. And only settled outcomes are adopted, never
+a remote state still in motion. *Enforced:* terminal-truth preflights on the control paths
+(`pkg/tern/local_control.go`, `pkg/tern/grpc_control_resend.go`); the in-process engine's settled
+outcome checks on stop and cancel (`pkg/engine/spirit/control.go`).
 
 ### CO-4: Stop wins
 
@@ -1689,14 +1703,17 @@ string. A client-supplied string never proves ownership either: a scoped operato
 only when its recorded verified acquirer shared one of the operator's groups for that database, and
 a lock with no recorded acquirer is released only under a deployment-wide grant. *Enforced:* the
 trust-anchor config, which refuses to start without one, and identity-precedence rules in the auth
-layer (`pkg/auth`); the scoped lock release in `pkg/api/lock_handlers.go`, pinned to the lock row it
-checked (`ReleaseByID` in `pkg/storage/internal/sqlstore/locks.go`).
+layer (`pkg/auth`); the scoped lock release and re-acquire in `pkg/api/lock_handlers.go`, the release
+pinned to the lock row it checked and the re-acquire told which row its acquire created (`ReleaseByID`
+and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 
 ### AZ-4: Applying takes an authorized actor
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. *Enforced:* the review gate and actor authorization
+their own review requirement. An approval counts only for the schema it reviewed: it was given on
+the commit being applied, or on an earlier commit from which that commit provably changed no schema
+input; when that cannot be proved, the approval does not count. *Enforced:* the review gate and actor authorization
 (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`).
 
 ### AZ-5: Commands never guess
@@ -1707,7 +1724,10 @@ corrected into something executable, especially one carrying `--allow-unsafe`. E
 receives a response, and silence only ever means another instance owns the reply or the comment
 issues no command: a line that opens with the product name but reads as a sentence about it, not a
 command attempt, is prose. *Enforced:* command discovery, the prose-mention rule, and the
-unowned-command policy (`pkg/webhook/commands.go`).
+unowned-command policy (`pkg/webhook/commands.go`), and the fan-out silence predicates
+(`pkg/webhook/schema_source_policy.go`), under which one aggregate leader answers for a database
+its own registry lacks under no expected participant's path: the leader serving the command's
+environment, or the first environment in the promotion order when the command names none.
 
 ### AZ-6: Local hosting preserves its boundaries
 

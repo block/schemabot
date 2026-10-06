@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -57,11 +58,16 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Plan)
 	if err != nil {
-		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, err) {
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, environment, tenant, err) {
 			h.logger.Debug("unscoped fan-out plan resolves to no schema this deployment answers for; staying silent",
 				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unowned unscoped command skipped"})
 			return
+		}
+		// Answering the failure is acting on the command: the deployment that
+		// posts the answer is the one that acknowledges.
+		if !ackedEarly {
+			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 		}
 		h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Plan, err, false)
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "schema request error handled"})
@@ -323,33 +329,38 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 	if databaseName != "" {
 		config, configDir, findErr := client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 		if findErr != nil {
-			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan targets a database not found by this deployment's discovery; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", findErr)
 				return
 			}
+			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
 		if !h.configPathManagedByRepo(ctx, repo, pr, "", config, configDir, action.Plan) {
 			unownedErr := h.unownedDiscoveredConfigError(repo, config, configDir)
-			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, unownedErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, unownedErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "database", databaseName, "error", unownedErr)
 				return
 			}
+			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, unownedErr, false)
 			return
 		}
 		schemaDatabase = config.Database
 	} else {
-		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Plan)
+		config, _, findErr := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Plan)
 		if findErr != nil {
-			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, tenant, findErr) {
+			if h.silentDiscoveryFailureOnUnscopedFanOut(repo, "", tenant, findErr) {
 				h.logger.Debug("unscoped fan-out plan touches no schema this deployment owns; staying silent",
 					"repo", repo, "pr", pr, "error", findErr)
 				return
 			}
+			// Answering the failure is acting on the command: the deployment
+			// that posts the answer is the one that acknowledges.
+			h.acknowledgeCommandActPoint(repo, pr, installationID, CommandResult{Tenant: tenant, CommentID: commentID})
 			h.handleSchemaRequestError(repo, pr, installationID, "", databaseName, requestedBy, action.Plan, findErr, false)
 			return
 		}
@@ -749,6 +760,33 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		return true
 	}
 
+	var notRegisteredErr *databaseNotRegisteredError
+	if errors.As(err, &notRegisteredErr) {
+		for _, cfg := range notRegisteredErr.Configs {
+			data.UnregisteredConfigs = append(data.UnregisteredConfigs, templates.UnregisteredSchemaConfigData{
+				Database:   cfg.Database,
+				SchemaPath: cfg.SchemaPath,
+			})
+		}
+		// The claim is about this deployment's registry only, so the comment
+		// names the deployment making it.
+		data.Deployment = h.deploymentLabel()
+		// A single config names its database on the metric; several have no
+		// one database to name, the same as Multiple Databases Detected.
+		metricDatabase := databaseName
+		if len(notRegisteredErr.Configs) == 1 {
+			metricDatabase = notRegisteredErr.Configs[0].Database
+		}
+		h.logger.Warn("schema request: database not registered on this deployment and schema directory under no expected participant's paths",
+			"repo", repo, "pr", pr, "environment", environment,
+			"deployment", data.Deployment,
+			"databases", notRegisteredErr.Databases(), "schema_paths", notRegisteredErr.SchemaPaths(),
+			"action", commandName, "error", err)
+		metrics.RecordSchemaRequestError(ctx, repo, commandName, metricDatabase, environment, "database_not_registered")
+		h.postComment(repo, pr, installationID, templates.RenderDatabaseNotRegistered(data))
+		return true
+	}
+
 	var dbNotConfiguredErr *api.DatabaseNotConfiguredError
 	if errors.As(err, &dbNotConfiguredErr) {
 		// The registry miss may name a database discovered from the PR's own
@@ -1047,6 +1085,27 @@ func shardDDLByTable(shards []*apitypes.ShardPlanResponse) map[planTableRef][]st
 	return byTable
 }
 
+// planCollationChanges lists the collation changes the engine reported for a
+// namespace's table changes, in plan order.
+func planCollationChanges(sc *apitypes.SchemaChangeResponse) []templates.CollationChangeData {
+	var changes []templates.CollationChangeData
+	for _, t := range sc.TableChanges {
+		for _, c := range t.CollationChanges {
+			changes = append(changes, templates.CollationChangeData{
+				Table:          t.TableName,
+				Column:         c.Column,
+				From:           c.From,
+				To:             c.To,
+				Case:           engine.ComparisonChange(c.Case),
+				TrailingSpaces: engine.ComparisonChange(c.TrailingSpaces),
+				CanMergeValues: c.CanMergeValues,
+				UniqueIndexes:  c.UniqueIndexes,
+			})
+		}
+	}
+	return changes
+}
+
 // planTableSizes lists the size estimate of each existing table a namespace's
 // plan copies, rebuilds, or scans. Metadata-only changes get no size line,
 // since a size beside them would be noise on the plan, and neither do tables
@@ -1154,6 +1213,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			Shards:     shardsByKeyspace[sc.Namespace],
 			TableSizes: planTableSizes(schema, sc, shardDDL),
 		}
+		ksData.CollationChanges = planCollationChanges(sc)
 		for _, t := range sc.TableChanges {
 			ksData.Statements = append(ksData.Statements, t.DDL)
 		}
@@ -1191,10 +1251,11 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		}
 		for _, uc := range sc.VSchemaUnsafeChanges() {
 			unsafe = append(unsafe, templates.UnsafeChangeData{
-				Table:      uc.Table,
-				Reason:     uc.Reason,
-				DDL:        uc.DDL,
-				ChangeType: uc.ChangeType,
+				Table:            uc.Table,
+				Reason:           uc.Reason,
+				DDL:              uc.DDL,
+				ChangeType:       uc.ChangeType,
+				VSchemaNamespace: sc.Namespace,
 			})
 		}
 	}

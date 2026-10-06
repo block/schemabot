@@ -21,6 +21,7 @@ const lockColumns = `id, database_name, database_type, repository, pull_request,
 type lockStore struct {
 	db         *rebindDB
 	dialect    Dialect
+	identity   identityInserter
 	classifier ErrorClassifier
 }
 
@@ -42,7 +43,9 @@ func canonicalizeLock(lock *storage.Lock) {
 // confirm command loads, and its disclosure record travels with it. A re-acquire
 // that passes an empty PendingPlanID (CLI) leaves the existing values intact.
 // A re-acquire never changes the recorded acquirer: only the insert that
-// creates the row writes it.
+// creates the row writes it. That insert also sets lock.ID to the new row's
+// ID; a re-acquire leaves lock.ID as passed, so a caller that passes a new
+// Lock reads back a zero ID when the owner already held the lock.
 func (s *lockStore) Acquire(ctx context.Context, lock *storage.Lock) error {
 	return s.acquire(ctx, lock, nil)
 }
@@ -99,13 +102,14 @@ func (s *lockStore) acquireOnce(ctx context.Context, lock *storage.Lock, acquire
 	// constraint makes the INSERT the arbiter when two callers race past the
 	// Get above. The INSERT loser sees a duplicate-key error, not a held lock:
 	// re-read and treat a same-owner winner as success.
-	_, err = s.db.ExecContext(ctx, `
+	id, err := s.identity.InsertID(ctx, s.db, `
 		INSERT INTO locks (database_name, database_type, repository, pull_request, owner, pending_plan_id, disclosed_copy_discard,
 			acquired_by, acquired_by_operator_groups)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, lock.DatabaseName, lock.DatabaseType, lock.Repository, lock.PullRequest, lock.Owner, lock.PendingPlanID, lock.DisclosedCopyDiscard,
 		acquirer.subject, acquirer.operatorGroups)
 	if err == nil {
+		lock.ID = id
 		return nil
 	}
 	if !s.classifier.IsDuplicateKey(err) {
@@ -265,18 +269,20 @@ func (s *lockStore) Release(ctx context.Context, database, dbType, owner string)
 }
 
 // ReleaseByID deletes the lock only while the row the caller read still holds
-// it. The row ID pins everything recorded on that row, the acquirer included,
-// since only the insert that creates a row writes it; a caller that authorized
-// against the row it read therefore cannot delete a lock acquired after that
-// read. When nothing is deleted the lock is re-read, so the caller learns
-// whether it is gone, held by a new row, or held under another owner.
-func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType, owner string) error {
+// it for the pending plan the caller read. The row ID pins everything only the
+// insert writes, the acquirer included; the pending plan pins the one thing a
+// same-owner acquire rewrites in place. A caller that authorized against the
+// row it read therefore cannot delete a lock acquired, or acquired again for a
+// new plan, after that read. When nothing is deleted the lock is re-read, so
+// the caller learns whether it is gone, held by a new row, held under another
+// owner, or held for another plan.
+func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error {
 	database = storage.CanonicalKey(database)
 	dbType = storage.CanonicalKey(dbType)
 	result, err := s.db.ExecContext(ctx, `
 		DELETE FROM locks
-		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+`
-	`, id, database, dbType, owner)
+		WHERE id = ? AND database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND `+s.dialect.BinaryEquals("pending_plan_id")+`
+	`, id, database, dbType, owner, pendingPlanID)
 	if err != nil {
 		return fmt.Errorf("release lock row %d for %s/%s owner=%s: %w", id, database, dbType, owner, err)
 	}
@@ -300,7 +306,10 @@ func (s *lockStore) ReleaseByID(ctx context.Context, id int64, database, dbType,
 	if current.ID != id {
 		return storage.ErrLockReplaced
 	}
-	return storage.ErrLockNotOwned
+	if current.Owner != owner {
+		return storage.ErrLockNotOwned
+	}
+	return storage.ErrLockIntentChanged
 }
 
 // ReleaseIfPendingPlanID atomically releases only the lock intent the caller

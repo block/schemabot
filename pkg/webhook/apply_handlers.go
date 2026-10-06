@@ -99,10 +99,15 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// Discover config and fetch schema files from PR
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.Apply)
 	if err != nil {
-		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, environment, result.Tenant, err) {
 			h.logger.Debug("unscoped fan-out apply resolves to no schema this deployment answers for; staying silent",
 				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
+		}
+		// Answering the failure is acting on the command: the deployment that
+		// posts the answer is the one that acknowledges.
+		if !ackedEarly {
+			h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 		}
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.Apply, err, result.SuppressRetryComments) {
 			return false, nil
@@ -757,11 +762,14 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	// Discover database config from PR's schemabot.yaml
 	schemaResult, err := h.createManagedSchemaRequestFromPR(ctx, client, repo, pr, environment, databaseName, action.ApplyConfirm)
 	if err != nil {
-		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, result.Tenant, err) {
+		if h.silentDiscoveryFailureOnUnscopedFanOut(repo, environment, result.Tenant, err) {
 			h.logger.Debug("unscoped fan-out apply-confirm resolves to no schema this deployment answers for; staying silent",
 				"repo", repo, "pr", pr, "environment", environment, "database", databaseName, "error", err)
 			return false, nil
 		}
+		// Answering the failure is acting on the command: the deployment that
+		// posts the answer is the one that acknowledges.
+		h.acknowledgeCommandActPoint(repo, pr, installationID, result)
 		if h.handleSchemaRequestError(repo, pr, installationID, environment, databaseName, requestedBy, action.ApplyConfirm, err, result.SuppressRetryComments) {
 			return false, nil
 		}
@@ -1126,6 +1134,10 @@ func isUnlockRejection(err error) bool {
 // so a re-drive minutes later still releases only the locks the command
 // covered when it arrived — not a lock acquired since, which may be
 // protecting a fresh apply awaiting confirmation or another session's work.
+// A same-owner acquire that refreshes a still-held row for a new pending plan
+// counts as an acquisition too: a row updated after issuedAt is skipped, and
+// release is pinned to the row and pending plan that were looked up, so a
+// refresh landing after the lookup also leaves the lock held.
 // The bound is per delivery receipt, not per original comment: a GitHub
 // Redeliver reopens the stored delivery with a fresh received-at, so a
 // redelivered command may release locks acquired after the original comment,
@@ -1200,18 +1212,31 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// Release only locks that existed when the command was received. A lock
 	// acquired afterwards was never covered by the command's intent and may be
 	// protecting newer work — a fresh apply awaiting confirmation, or another
-	// session's CLI lock on a force unlock. The comparison spans two clocks
-	// (lock.CreatedAt is the storage DB's clock, issuedAt the webhook pod's);
-	// skew fails safe — a wrongly skipped lock gets the stale-command answer
-	// prompting a fresh comment, never a wrongful release.
+	// session's CLI lock on a force unlock. The release below is pinned to the
+	// row, owner, and pending plan this lookup read, which guards everything
+	// that changes after the lookup; this timestamp bound is the only guard
+	// for the window between receipt and the lookup. A lock its owner acquired
+	// again for a new pending plan in that window was read here with the new
+	// plan, so the pin alone would release it: only its UpdatedAt tells it
+	// apart. A liveness touch advances UpdatedAt too and costs such a lock a
+	// stale-command answer rather than a release, the direction that fails
+	// safe. The comparison spans two clocks (the lock timestamps are the
+	// storage DB's clock, issuedAt the webhook pod's). Storage running ahead
+	// skips a lock that did predate the command, which again only costs a
+	// stale-command answer; storage running behind narrows the bound by the
+	// skew, so a lock acquired within it after receipt but before the lookup
+	// is released as if it predated the command. The bound is as good as the
+	// clock alignment between the two hosts, never better.
 	fresh := make([]*storage.Lock, 0, len(locks))
 	var skippedNewer int
+	receiptSecond := issuedAt.Truncate(time.Second)
 	for _, lock := range locks {
-		if lock.CreatedAt.After(issuedAt) {
+		if !lock.CreatedAt.Before(receiptSecond) || !lock.UpdatedAt.Before(receiptSecond) {
 			skippedNewer++
 			h.logger.Warn("unlock will not release a lock acquired after the command was received",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
-				"owner", lock.Owner, "lock_created_at", lock.CreatedAt, "command_received_at", issuedAt)
+				"owner", lock.Owner, "lock_created_at", lock.CreatedAt, "lock_updated_at", lock.UpdatedAt,
+				"command_received_at", issuedAt)
 			continue
 		}
 		fresh = append(fresh, lock)
@@ -1219,8 +1244,7 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	locks = fresh
 	if len(locks) == 0 && skippedNewer > 0 {
 		h.logger.Info("unlock released nothing because every matched lock postdates the command", "repo", repo, "pr", pr)
-		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
-			"Every lock matched by this unlock command was acquired after the command was received, so nothing was released. Comment `schemabot unlock` again to release the current locks.")
+		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockStaleCommandMessage)
 		return false, nil
 	}
 
@@ -1292,25 +1316,42 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		}
 	}
 
-	// Release all locks. A failed release is logged and the loop continues so
-	// one failure does not strand the remaining locks; the collected errors
-	// make the delivery retryable, and a re-drive only sees the locks that are
-	// still held.
+	// Release all locks. Every release, force or not, deletes only the lock row
+	// this command looked up and vetted above: the ownership, issued-at, and
+	// authorization decisions were all made against that row, so a lock
+	// released and acquired again while they ran (for example another PR's
+	// pending-confirmation apply lock) is a different row and stays held, as
+	// does the same row acquired again for a new plan. The active-apply check
+	// is the one decision the pin does not carry: an apply that becomes durable
+	// after the check leaves the lock row unchanged, so the delete still
+	// matches. That apply's own deployment reservation keeps a second apply
+	// out; the lock row is the operator-visible signal, not the exclusion.
+	// A failed release is logged and the loop continues so one failure does
+	// not strand the remaining locks; the collected errors make the delivery
+	// retryable, and a re-drive only sees the locks that are still held.
 	var releaseErrs []error
-	var released, alreadyGone int
+	var released, alreadyGone, reacquired int
 	for _, lock := range locks {
-		var err error
-		if result.Force {
-			err = h.service.Storage().Locks().ForceRelease(ctx, lock.DatabaseName, lock.DatabaseType)
-		} else {
-			err = h.service.Storage().Locks().Release(ctx, lock.DatabaseName, lock.DatabaseType, lock.Owner)
+		err := h.service.Storage().Locks().ReleaseByID(ctx, lock.ID, lock.DatabaseName, lock.DatabaseType, lock.Owner, lock.PendingPlanID)
+		if isLockAcquiredSinceVetting(err) {
+			// The database is locked again since the lookup — the same row with
+			// a new pending plan, or a new row after the vetted one was released
+			// — so the current lock protects work this command never vetted and
+			// stays held, exactly as a lock acquired after the command was
+			// received.
+			reacquired++
+			h.logger.Warn("unlock will not release a lock acquired again after the command was vetted",
+				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+				"owner", lock.Owner, "vetted_pending_plan_id", lock.PendingPlanID, "force", result.Force, "error", err)
+			continue
 		}
-		if errors.Is(err, storage.ErrLockNotFound) || errors.Is(err, storage.ErrLockNotOwned) {
-			// The lock vanished (or changed owner) between lookup and release —
-			// a concurrent unlock or apply's own stale-lock cleanup got there
-			// first. The lock this command targeted is gone, which is the
-			// command's goal, so this is not a failure to retry; skip the
-			// success comment too, since this command did not do the releasing.
+		if isVettedLockGone(err) {
+			// The vetted lock row vanished between lookup and release — a
+			// concurrent unlock or apply's own stale-lock cleanup got there
+			// first — or is now held under another owner. The lock this command
+			// targeted is gone, which is the command's goal, so this is not a
+			// failure to retry; skip the success comment too, since this
+			// command did not do the releasing.
 			alreadyGone++
 			h.logger.Info("unlock target already released",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
@@ -1332,6 +1373,12 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	if len(releaseErrs) > 0 {
 		return true, fmt.Errorf("unlock command release locks %s#%d: %w", repo, pr, errors.Join(releaseErrs...))
 	}
+	if released == 0 && reacquired > 0 {
+		h.logger.Info("unlock released nothing because at least one current lock was acquired again after the command",
+			"repo", repo, "pr", pr, "reacquired", reacquired, "already_gone", alreadyGone)
+		h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy, unlockStaleCommandMessage)
+		return false, nil
+	}
 	if released == 0 && alreadyGone > 0 {
 		// Every matched lock was released by a concurrent operation before this
 		// command could act. The per-lock skips stay silent, so without an
@@ -1342,6 +1389,34 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 		h.postComment(repo, pr, installationID, templates.RenderLocksAlreadyReleased())
 	}
 	return false, nil
+}
+
+// unlockStaleCommandMessage answers an unlock when at least one current lock
+// was acquired, or acquired again, no earlier than the command receipt second
+// — by timestamp before the lookup, or by the row pin after it.
+const unlockStaleCommandMessage = "At least one current lock matched by this unlock command was acquired after the command was received, and this command released nothing. Comment `schemabot unlock` again to release the current locks."
+
+// isLockAcquiredSinceVetting reports whether a row-pinned release found the
+// database locked again since unlock looked the lock up: a different row now
+// holds it (ErrLockReplaced), or the vetted row was acquired again for another
+// pending plan (ErrLockIntentChanged). Either way a lock is still held and
+// this command never vetted it, so the answer is the stale-command prompt to
+// comment again, not that nothing is left to unlock. The caller logs the
+// specific error so the two causes stay distinguishable.
+func isLockAcquiredSinceVetting(err error) bool {
+	return errors.Is(err, storage.ErrLockReplaced) ||
+		errors.Is(err, storage.ErrLockIntentChanged)
+}
+
+// isVettedLockGone reports whether a row-pinned release found that the lock
+// row unlock vetted no longer holds the lock: no lock is held at all
+// (ErrLockNotFound), or the row is held under another owner (ErrLockNotOwned).
+// Each means the lock the command targeted is gone and nothing this command
+// vetted is left to release; the caller logs the specific error so the cause
+// stays distinguishable.
+func isVettedLockGone(err error) bool {
+	return errors.Is(err, storage.ErrLockNotFound) ||
+		errors.Is(err, storage.ErrLockNotOwned)
 }
 
 func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, result CommandResult) ([]*storage.Lock, error) {
@@ -1391,12 +1466,18 @@ func (h *Handler) inferUnlockDatabase(ctx context.Context, repo string, pr int, 
 		return "", err
 	}
 
-	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, action.Unlock)
+	config, _, err := h.resolveUnscopedManagedConfig(ctx, client, repo, pr, "", action.Unlock)
 	if err != nil {
 		// Schema another deployment owns — whether outside allowed_dirs or for
 		// a database not in this deployment's registry — means there is nothing
 		// for this deployment to unlock: same outcome as no config at all.
 		if isSchemaUnownedByDeploymentError(err) {
+			return "", unlockRejection(ghclient.ErrNoConfig)
+		}
+		// Schema whose database this leader never registered was never
+		// locked by it, so there is nothing to unlock here either.
+		var notRegistered *databaseNotRegisteredError
+		if errors.As(err, &notRegistered) {
 			return "", unlockRejection(ghclient.ErrNoConfig)
 		}
 		// A repo with no config, or only malformed ones, is a deterministic

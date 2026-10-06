@@ -60,7 +60,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -86,7 +86,7 @@ ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -284,7 +284,53 @@ ALTER TABLE `webhooks` ADD INDEX `idx_tenant_id`(`tenant_id`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-collation-changes"></a><strong>MySQL Plan (Collation Changes)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `products`
+    MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,
+    MODIFY COLUMN `title` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL,
+    DEFAULT CHARACTER SET = utf8mb4,
+    DEFAULT COLLATE = utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL;
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+- `customers`: ~2.9 GB
+
+🔤 **Collation changes**: these columns sort and compare under a new collation after the apply.
+- `sku`, `title` on `products`: `utf8mb4_general_ci` → `utf8mb4_0900_ai_ci`
+  - Trailing spaces become significant (NO PAD): `'abc'` and `'abc '` stop comparing equal.
+  - Values that differ only by accents or other characters can start comparing equal.
+  - `sku` is in unique index `uk_sku`: the apply fails if two existing rows collide in that index under the new collation.
+- `handle` on `customers`: `utf8mb4_general_ci` → `utf8mb4_bin`
+  - Comparisons become case-sensitive: `'abc'` and `'ABC'` stop comparing equal.
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -340,7 +386,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -369,7 +415,7 @@ CREATE TABLE app.users (id bigint PRIMARY KEY);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -431,7 +477,7 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -473,9 +519,9 @@ An apply will fail on these statements. Fix what each reason names — rewrite a
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+The engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:
 ```
-schemabot apply -e staging
+schemabot plan -e staging
 ```
 
 </details>
@@ -509,9 +555,9 @@ An apply will fail on these statements. Fix what each reason names — rewrite a
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+The engine refuses a change in this plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:
 ```
-schemabot apply -e staging
+schemabot plan -e staging
 ```
 
 </details>
@@ -553,6 +599,46 @@ Transactions blocking a table's metadata lock are killed so its statement can ta
 </details>
 
 <details>
+<summary><a name="mysql-plan-unsafe-change"></a><strong>MySQL Plan (Unsafe Change)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `orders` DROP COLUMN `legacy_ref`;
+```
+
+```sql
+ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `orders`: DROP COLUMN discards the column's data
+
+<details>
+<summary>Destructive drop guidance</summary>
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
+
+📋 **Plan**: **2** tables to alter
+
+
+---
+
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`orders`):
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-change-attributed-to-another-pr"></a><strong>MySQL Plan (Change Attributed To Another PR)</strong></summary>
 
 
@@ -570,26 +656,25 @@ ALTER TABLE `orders` DROP COLUMN `notes`;
 DROP TABLE `reconcile_state`;
 ```
 
-⚠️ **Check before applying**: 2 destructive changes SchemaBot cannot attribute to this PR
-- `orders`: changed by [block/schemabot#4820](https://github.com/block/schemabot/pull/4820), which is still open
-- `reconcile_state`: changed by [block/schemabot#4821](https://github.com/block/schemabot/pull/4821), which is still open
-
-A plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.
-
 ⚠️ **Issues**: 2 unsafe changes detected
-1. `orders`: DROP COLUMN discards the column's data
-2. `reconcile_state`: DROP TABLE removes all data
+1. `orders`: DROP COLUMN discards the column's data (changed by open PR [#4820](https://github.com/block/schemabot/pull/4820))
+2. `reconcile_state`: DROP TABLE removes all data (changed by open PR [#4821](https://github.com/block/schemabot/pull/4821))
 
-**Destructive drop guidance:**
+A plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.
+
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table and column.
+
+</details>
 
 📋 **Plan**: **1** table to alter, **1** table to drop
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`orders`, `reconcile_state`):
 ```
 schemabot apply -e staging
 ```
@@ -620,7 +705,7 @@ Applying restarts the copy from zero rows. To keep the work already done, apply 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -759,7 +844,7 @@ Applying picks up where the existing copy stopped rather than starting over.
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -794,7 +879,7 @@ Applying joins the copy already running rather than starting a new one: every ro
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -878,7 +963,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging --tenant alpha
 ```
@@ -1110,7 +1195,7 @@ ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier`(`loyalty_tier`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -1168,7 +1253,7 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`commerce_sharded` VSchema):
 ```
 schemabot apply -e staging
 ```
@@ -1209,7 +1294,7 @@ CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at)
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -1347,7 +1432,7 @@ CREATE TABLE `metrics` (
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -1671,7 +1756,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1731,7 +1816,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1791,7 +1876,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1847,7 +1932,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1906,7 +1991,7 @@ No schema changes detected
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -1965,7 +2050,7 @@ No schema changes detected
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2005,7 +2090,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2043,7 +2128,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2081,7 +2166,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2121,7 +2206,7 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -2149,9 +2234,12 @@ ALTER TABLE `customers` DROP COLUMN `nickname`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP COLUMN `nickname` ``
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -2182,9 +2270,12 @@ ALTER TABLE `customers` DROP INDEX `idx_customers_email`;
 **⛔ Apply rejected**: 1 unsafe change detected
 1. `customers`: Unsafe operation detected: `` DROP INDEX `idx_customers_email` ``
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before dropping an index in MySQL, first make the dropped index invisible and verify application queries no longer rely on it for safe performance.
+
+</details>
 
 **🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
 ```
@@ -2398,7 +2489,7 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e staging
 ```
@@ -2520,6 +2611,43 @@ This repository is too large for GitHub to return its full tree, so SchemaBot se
 This SchemaBot instance has no `payments` entry under `databases` in its server configuration, so it cannot plan or apply schema changes for it. A `schemabot.yaml` declaring `database: payments` is not enough on its own: the database also has to be configured on the SchemaBot server.
 
 Check that the database name, from `-d` or from `schemabot.yaml`, matches one this instance serves, or ask a SchemaBot operator to configure the database.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="database-not-registered"></a><strong>Database Not Registered</strong></summary>
+
+
+## ⚠️ Database Not Registered
+
+**Database**: `ledger` | **Schema directory**: `services/ledger/schema` | **Deployment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+The staging SchemaBot deployment has no `ledger` entry under `databases`, and this schema directory is not under any path it expects another deployment to report on.
+
+If `ledger` is new to SchemaBot, ask a SchemaBot operator to register it with this schema directory. If it is already registered, move the `schemabot.yaml` and its schema files under the schema directory registered for it.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="databases-not-registered"></a><strong>Databases Not Registered</strong></summary>
+
+
+## ⚠️ Databases Not Registered
+
+**Deployment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+The staging SchemaBot deployment has none of these databases under `databases`, and none of these schema directories is under a path it expects another deployment to report on:
+
+- `services/ledger/schema` declares database `ledger`
+- `services/payments/schema` declares database `payments`
+
+For each database that is new to SchemaBot, ask a SchemaBot operator to register it with its schema directory. For each one already registered, move its `schemabot.yaml` and schema files under the schema directory registered for it.
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -3859,6 +3987,33 @@ Schema changes require approval from an authorized reviewer before applying.
 Schema changes require approval from an authorized reviewer before applying.
 
 **Authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Request a review from anyone listed above
+2. Once approved, run `schemabot apply -e staging` again
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-required-approval-on-an-earlier-commit"></a><strong>Apply Blocked: Review Required (Approval On An Earlier Commit)</strong></summary>
+
+
+## Review Required
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+Schema changes require approval from an authorized reviewer before applying.
+
+Approvals on an earlier commit no longer count, because schema files changed since then or SchemaBot could not confirm they did not: @jdoe. Ask for an approval of the latest commit.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
 - @acme/schema-reviewers
 - @jdoe
 
@@ -8845,7 +9000,7 @@ ALTER TABLE `mutes`
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -8879,7 +9034,7 @@ ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -8922,7 +9077,7 @@ No schema changes detected
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, comment:
 ```
 schemabot apply -e production
 ```
@@ -8959,16 +9114,19 @@ ALTER TABLE `mutes`
 ⚠️ **Issues**: 1 unsafe change detected
 1. `mutes` (shard `40-80`): DROP COLUMN removes data and is irreversible
 
-**Destructive drop guidance:**
+<details>
+<summary>Destructive drop guidance</summary>
 
 Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped column.
+
+</details>
 
 📋 **Plan**: **1** table to alter
 
 
 ---
 
-▶️ **To apply** all schema changes from this PR, comment:
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`mutes` on shard `40-80`):
 ```
 schemabot apply -e production
 ```

@@ -251,7 +251,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("octo/repo", 7, "", "## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+		body := h.renderPRComment("octo/repo", 7, "", "## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply**, comment:\n```\nschemabot apply -e staging\n```")
 
 		assert.NotContains(t, body, "Support:")
 	})
@@ -532,8 +532,10 @@ func TestNewTestHandlerDeliversDispatchedWorkBeforeTheServerCloses(t *testing.T)
 	}
 }
 
+// A help command is answered like any other command: the help comment is
+// posted and the comment carries the eyes acknowledgment.
 func TestWebhookHelpCommand(t *testing.T) {
-	h, comments, _ := newTestHandler(t)
+	h, comments, reactions := newTestHandler(t)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot help",
@@ -552,6 +554,13 @@ func TestWebhookHelpCommand(t *testing.T) {
 		assert.Contains(t, body, "schemabot plan")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
 	}
 }
 
@@ -625,6 +634,40 @@ func TestWebhookInvalidEnvValue(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply -e <environment>")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the invalid environment comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
+	}
+}
+
+// A `schemabot` mention that names no known command is answered with the
+// Invalid Command usage comment, and the answer carries the eyes
+// acknowledgment like every other reply: a reaction-less comment would leave
+// the user unsure which deployment spoke, and a comment-less reaction would
+// promise work nobody does.
+func TestWebhookInvalidCommandAcknowledged(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid command")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Command")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the invalid command comment")
 	}
 
 	select {

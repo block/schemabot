@@ -451,13 +451,18 @@ func runLogProgress(t *testing.T, frames ...*apitypes.ProgressResponse) string {
 	t.Helper()
 	polls := 0
 	var watchErr error
-	output := captureOutput(t, func() {
-		watchErr = watchApplyProgressLogWithPoller(func() (*apitypes.ProgressResponse, error) {
+	poller := &progressPoller{
+		applyID: "apply-log-test",
+		fetch: func() (*apitypes.ProgressResponse, error) {
 			require.Less(t, polls, len(frames), "watcher must exit on the final frame")
 			frame := frames[polls]
 			polls++
 			return frame, nil
-		}, func(time.Duration) {}, logHeartbeatDefault)
+		},
+		sleep: func(time.Duration) {},
+	}
+	output := captureOutput(t, func() {
+		watchErr = watchApplyProgressLog(poller, logHeartbeatDefault)
 	})
 	require.NoError(t, watchErr)
 	require.Equal(t, len(frames), polls)
