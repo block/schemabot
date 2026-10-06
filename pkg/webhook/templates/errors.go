@@ -93,6 +93,14 @@ func (d SchemaErrorData) DeploymentSubject() string {
 	return "This SchemaBot deployment"
 }
 
+// DeploymentSubjectLower is DeploymentSubject for use mid-sentence.
+func (d SchemaErrorData) DeploymentSubjectLower() string {
+	if d.Deployment != "" {
+		return "the " + flattenIdentifier(d.Deployment) + " SchemaBot deployment"
+	}
+	return "this SchemaBot deployment"
+}
+
 // SearchedDirsCode renders the directories a scoped search probed as code
 // spans the paths cannot break out of.
 func (d SchemaErrorData) SearchedDirsCode() []string {
@@ -327,7 +335,7 @@ const configOutsideAllowedDirsTemplate = "## " + glyph.Attention + ` SchemaBot C
 
 {{.Attribution}}
 
-SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but this SchemaBot instance is not configured to manage its schema directory.
+SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but {{.DeploymentSubjectLower}} is not configured to manage its schema directory.
 
 **Schema directory**: {{.SchemaPathCode}}
 
@@ -335,11 +343,11 @@ Ask a SchemaBot operator to add this directory to {{.AllowedDirsKey}} in the ser
 
 const unmanagedSchemaConfigsNoticeTemplate = "## " + glyph.Attention + ` Schema Changes Not Managed by SchemaBot
 
-This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
+This PR changes schema under the following path(s), which this SchemaBot deployment is not configured to manage:
 
 {{range .Configs}}- {{.SchemaPath}} — declares database {{.Database}}
 {{end}}
-These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
+This deployment will **not** plan or apply these schema changes, and its checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's ` + "`allowed_dirs`" + ` in the server config; otherwise remove these schema changes from this PR.`
 
@@ -453,7 +461,7 @@ func RenderNoConfig(data SchemaErrorData) string {
 // as code spans they cannot break out of.
 func RenderConfigNotAuthorizedLine(database, schemaPath string) string {
 	return strings.Join([]string{
-		"SchemaBot found a `schemabot.yaml` configuration, but this SchemaBot instance is not configured to manage its schema directory.",
+		"SchemaBot found a `schemabot.yaml` configuration, but this SchemaBot deployment is not configured to manage its schema directory.",
 		"Schema directory: " + inlineCode(schemaPath) + ".",
 		"Ask a SchemaBot operator to add this directory to " + allowedDirsKey(database) + " in the server config, or move the schema config and files under an allowed directory.",
 	}, " ")

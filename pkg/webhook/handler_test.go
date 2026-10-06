@@ -389,29 +389,46 @@ func TestCommentObserverRendersOversizedNoticeWithTheConfiguredCLIName(t *testin
 	}
 }
 
+// A command answered with Configuration Not Authorized names the deployment
+// making the claim when it serves a single environment, since a deployment
+// serving another environment may manage the directory. A deployment with no
+// single environment speaks for itself without a name.
 func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 1)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
-
-	installClient := ghclient.NewInstallationClient(client, testLogger())
-	h := &Handler{
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+	cases := []struct {
+		name    string
+		config  *api.ServerConfig
+		subject string
+	}{
+		{name: "deployment serving every environment", config: &api.ServerConfig{}, subject: "this SchemaBot deployment is not configured to manage its schema directory"},
+		{name: "staging-scoped deployment", config: &api.ServerConfig{AllowedEnvironments: []string{"staging"}}, subject: "the staging SchemaBot deployment is not configured to manage its schema directory"},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 1)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
 
-	h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "production", "", "hubot", "apply", &schemaConfigOutsideAllowedDirsError{
-		Database:     "orders",
-		DatabaseType: "mysql",
-		SchemaPath:   "services/orders/schema",
-	}, false)
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			h := &Handler{
+				service:   api.New(nil, tc.config, nil, testLogger()),
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:    testLogger(),
+			}
 
-	body := requireComment(t, comments, "config-not-authorized comment")
-	assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
-	assert.Contains(t, body, "SchemaBot found a `schemabot.yaml` configuration")
-	assert.Contains(t, body, "`services/orders/schema`")
-	assert.Contains(t, body, "`databases.orders.allowed_dirs`")
-	assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found")
+			h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "apply", &schemaConfigOutsideAllowedDirsError{
+				Database:     "orders",
+				DatabaseType: "mysql",
+				SchemaPath:   "services/orders/schema",
+			}, false)
+
+			body := requireComment(t, comments, "config-not-authorized comment")
+			assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
+			assert.Contains(t, body, "SchemaBot found a `schemabot.yaml` configuration, but "+tc.subject+".")
+			assert.Contains(t, body, "`services/orders/schema`")
+			assert.Contains(t, body, "`databases.orders.allowed_dirs`")
+			assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found")
+		})
+	}
 }
 
 func TestCheckRunRerequestIgnoresNonSchemaBotCheck(t *testing.T) {

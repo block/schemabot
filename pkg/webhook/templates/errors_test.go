@@ -165,7 +165,8 @@ func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
 		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot")
 		assert.Contains(t, body, "- `services/inventory/schema` — declares database `inventory`")
 		assert.Contains(t, body, "- `services/billing/schema` — declares database `billing`")
-		assert.Contains(t, body, "will **not** be planned or applied")
+		assert.Contains(t, body, "which this SchemaBot deployment is not configured to manage")
+		assert.Contains(t, body, "This deployment will **not** plan or apply these schema changes, and its checks on this PR do not cover them.")
 		assert.Contains(t, body, "`allowed_dirs`")
 	})
 

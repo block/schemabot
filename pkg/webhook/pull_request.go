@@ -638,22 +638,42 @@ func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.Inst
 
 // notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan
 // discovery dropped schema configs this deployment is not configured to
-// manage. On a repo with no aggregate role this deployment is the only
-// responder, so without the notice the drop is invisible on the PR — no plan
-// comment and no check row cover the dropped config, and the author can merge
-// a schema change nothing will ever apply. On an aggregate-role repo (leader
-// or participant) a dropped config is routine cross-deployment fan-out — the
-// owning deployment plans it and posts its own comment and check — so the
-// notice stays a log line there.
+// manage. A deployment serving every environment on a repo with no aggregate
+// role is the only responder, so without the notice the drop is invisible on
+// the PR — no plan comment and no check row cover the dropped config, and the
+// author can merge a schema change nothing will ever apply. Two shapes leave
+// the dropped config to a deployment this one cannot see, so the notice stays
+// a log line there:
+//
+//   - an aggregate-role repo (leader or participant), where a dropped config is
+//     routine cross-deployment fan-out and the owning deployment plans it and
+//     posts its own comment and check
+//   - a deployment scoped to some environments (allowed_environments), where a
+//     sibling deployment serving another environment may register the
+//     database; a notice from this one would tell the author a schema change
+//     the sibling is planning will never be applied
 func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) {
 	dropped := droppedDiscoveredConfigs(discovered, managed)
 	if len(dropped) == 0 {
 		return
 	}
-	if config, ok := h.serverConfig(); ok && config.AggregateRoleForRepo(repo) != "" {
+	config, ok := h.serverConfig()
+	if ok && config.AggregateRoleForRepo(repo) != "" {
 		h.logger.Info("unmanaged schema configs in PR left to their owning deployments on aggregate repo",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
 			"unmanaged_configs", len(dropped))
+		return
+	}
+	if ok && len(config.AllowedEnvironments) > 0 {
+		// A Warn rather than an Info: when no sibling registers the database
+		// either, this line is the only trace that the PR's schema change is
+		// not covered by any deployment.
+		for _, cfg := range dropped {
+			h.logger.Warn("schema config in PR is not managed by this environment-scoped deployment; no notice posted because a deployment serving another environment may manage it",
+				"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+				"database", cfg.Config.Database, "schema_path", cfg.SchemaDir,
+				"allowed_environments", config.AllowedEnvironments)
+		}
 		return
 	}
 	// Match the plan-comment cadence: a synchronize push that changed no

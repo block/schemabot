@@ -631,6 +631,43 @@ func TestNotifyUnmanagedDiscoveredConfigsOnAggregateRepo(t *testing.T) {
 	})
 }
 
+// Auto-plan on a deployment scoped to some environments leaves a schema config
+// it does not manage to whichever deployment serves the other environments. A
+// repo split across a staging deployment and a production deployment, where a
+// database exists only in production, gets the production plan for it and no
+// notice from staging claiming that nothing will ever apply it. A deployment
+// serving every environment still posts the notice, since no sibling can own
+// the directory.
+func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testing.T) {
+	sandbox := []ghclient.DiscoveredConfig{{
+		Config:    &ghclient.SchemabotConfig{Database: "ledger_sandbox", Type: "vitess"},
+		SchemaDir: "services/ledger/schema_sandbox",
+	}}
+	notify := func(h *Handler) {
+		h.notifyUnmanagedDiscoveredConfigs("octocat/hello-world", 1, 12345, "pull_request", "abc123", func() bool { return true }, sandbox, nil)
+	}
+
+	t.Run("staging-scoped deployment posts no notice for a production-only database", func(t *testing.T) {
+		cfg := nonAggregateConfig()
+		cfg.AllowedEnvironments = []string{"staging"}
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+
+		notify(h)
+
+		assert.Empty(t, comments, "the production deployment may plan ledger_sandbox")
+	})
+
+	t.Run("deployment serving every environment posts the notice", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		notify(h)
+
+		body := requireComment(t, comments, "unmanaged schema config notice")
+		assert.Contains(t, body, "- `services/ledger/schema_sandbox` — declares database `ledger_sandbox`")
+		assert.Contains(t, body, "This deployment will **not** plan or apply these schema changes, and its checks on this PR do not cover them.")
+	})
+}
+
 // A database-scoped plan still fans out when it does not name a tenant. If a
 // participant's exhaustive local discovery cannot find that database, only
 // the leader may publish Database Not Found as the fleet-authoritative answer.

@@ -729,6 +729,9 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	if errors.As(err, &configNotAuthorizedErr) {
 		data.DatabaseName = configNotAuthorizedErr.Database
 		data.SchemaPath = configNotAuthorizedErr.SchemaPath
+		// Another deployment serving a different environment may manage the
+		// directory, so the comment names the deployment making the claim.
+		data.Deployment = h.deploymentLabel()
 		h.logger.Warn("schema request: config outside allowed_dirs",
 			"repo", repo, "pr", pr, "environment", environment,
 			"database", data.DatabaseName, "database_type", configNotAuthorizedErr.DatabaseType,
