@@ -979,6 +979,10 @@ which namespaces end with a finalizer, and the VSchema each of those writes.
 The primary target is held to the confirmed plan while the environment has
 several targets, and also when the confirmed round stored plans for other
 targets, even if the rollout has since shrunk to the primary target alone.
+If the primary member's deployment or target changed since review, confirmation
+refuses even identical DDL, releases the pending confirmation, and asks for a fresh
+apply to review the current targets. It does not remap consent between members.
+A fully converged rollout still reports no changes without creating an apply.
 So a statement on the primary target whose DDL is unchanged but that now runs as
 direct execution, or is now blocked, refuses here and releases the lock rather
 than pausing again or being rejected as blocked, as it would on a single

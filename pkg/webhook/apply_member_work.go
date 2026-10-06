@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -333,14 +334,21 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 		return false, "", fmt.Errorf("load member plans of the confirm-time round: %w", err)
 	}
 	covered, reason := roundCoversWork(pinned, current, confirmed, now)
+	if primaryTargetChanged(pinned, current) {
+		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
+	}
 	return covered, reason, nil
 }
 
 // roundCoversWork reports whether the confirm-time round runs only work the
 // confirmed round planned, with a reason naming the target and the part of its
-// work that differs when it does not. A target with no work now runs nothing,
-// so only targets with work are compared.
+// work that differs when it does not. The primary member must still be the
+// reviewed member, even when it converged while other targets still have work.
+// With that identity fixed, only targets with work are compared.
 func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*storage.Plan) (bool, string) {
+	if primaryTargetChanged(pinned, current) {
+		return false, primaryTargetDifferenceReason(workTarget)
+	}
 	if current.HasWork() {
 		if difference := memberWorkDifference(pinned, current); difference != workUnchanged {
 			return false, primaryTargetDifferenceReason(difference)
@@ -366,7 +374,24 @@ func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*s
 // whose confirm-time re-plan differs from the plan the confirmation was given
 // against, naming the part of its work that differs.
 func primaryTargetDifferenceReason(difference workDifference) string {
+	if difference == workTarget {
+		return "the primary target is not the one the confirmed plan reviewed"
+	}
 	return fmt.Sprintf("the re-plan of the primary target differs from the confirmed plan in %s", difference)
+}
+
+func primaryTargetChanged(pinned, current *storage.Plan) bool {
+	return (routing.ExecutionTarget{Deployment: pinned.Deployment, Target: pinned.Target}).MemberID() !=
+		(routing.ExecutionTarget{Deployment: current.Deployment, Target: current.Target}).MemberID()
+}
+
+func (h *Handler) logConfirmedPrimaryTargetChanged(pinned, current *storage.Plan, environment string) {
+	h.logger.Info("apply-confirm refused: the primary member changed; a fresh apply must review the current targets",
+		"repo", current.Repository, "pr", current.PullRequest, "head_sha", current.HeadSHA,
+		"database", current.Database, "database_type", current.DatabaseType, "environment", environment,
+		"pending_plan_id", pinned.PlanIdentifier, "plan_id", current.PlanIdentifier,
+		"confirmed_deployment", pinned.Deployment, "confirmed_target", pinned.Target,
+		"current_deployment", current.Deployment, "current_target", current.Target)
 }
 
 // confirmedConvergedTargetRound reports whether the pending confirmation an
@@ -414,7 +439,8 @@ func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanI
 // and a confirmed round that stored plans for other targets was a rollout's
 // even when the topology has since shrunk to the primary target alone. A
 // confirmation that neither marks as a rollout's was given for a single target,
-// whose re-plan runs under the single-target gates. A pinned or confirm-time
+// whose re-plan runs under the single-target gates only while it still addresses
+// the reviewed member. A pinned or confirm-time
 // plan that no longer loads is an error: what the comment showed, or what the
 // apply would run, cannot be told.
 func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPlanID, currentPlanID, environment string, rolloutAtConfirm bool) (workDifference, error) {
@@ -425,6 +451,17 @@ func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPla
 	}
 	if pinned == nil {
 		return workUnchanged, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
+	}
+	current, err := plans.Get(ctx, currentPlanID)
+	if err != nil {
+		return workUnchanged, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
+	}
+	if current == nil {
+		return workUnchanged, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
+	}
+	if primaryTargetChanged(pinned, current) {
+		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
+		return workTarget, nil
 	}
 	if !rolloutAtConfirm {
 		confirmedRound, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
@@ -439,23 +476,17 @@ func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPla
 		h.logger.Info("apply-confirm: the confirmed round planned other targets that the rollout no longer has; comparing the primary target's re-plan with the confirmed plan",
 			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID, "confirmed_member_plans", len(confirmedRound))
 	}
-	current, err := plans.Get(ctx, currentPlanID)
-	if err != nil {
-		return workUnchanged, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
-	}
-	if current == nil {
-		return workUnchanged, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
-	}
 	return memberWorkDifference(pinned, current), nil
 }
 
 // workDifference names the part of a target's work in which two plans for it
-// differ, in words a refusal shows the operator after "differs ... in". The
-// zero value, workUnchanged, means the plans run the same work.
+// differ, or that the plans address different primary members. The zero value,
+// workUnchanged, means the plans run the same work.
 type workDifference string
 
 const (
 	workUnchanged     workDifference = ""
+	workTarget        workDifference = "which primary target it addresses"
 	workStatements    workDifference = "its statements"
 	workExecutionMode workDifference = "how its statements run"
 	workUnsafe        workDifference = "which of its statements are unsafe"

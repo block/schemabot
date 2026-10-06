@@ -3685,6 +3685,23 @@ _Requested by @jackjackbits_
 </details>
 
 <details>
+<summary><a name="applyconfirm-refused-primary-target-changed"></a><strong>Apply-confirm Refused: Primary Target Changed</strong></summary>
+
+
+## ❌ Apply-confirm Failed
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+### Error
+
+> This confirmation no longer covers what the apply would run: the primary target is not the one the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target&#39;s own plan.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-by-prior-env-pending"></a><strong>Apply Blocked By Prior Env (Pending)</strong></summary>
 
 

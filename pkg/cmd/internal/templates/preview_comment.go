@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/schemabot/pkg/webhook"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -280,6 +281,9 @@ func previewCommentApplyFlowAllOutput() {
 		}},
 		{"APPLY-CONFIRM REFUSED: PLAN CANNOT BE LOADED", func() {
 			fmt.Print(webhooktemplates.PreviewCommentConfirmationPlanUnavailable())
+		}},
+		{"APPLY-CONFIRM REFUSED: PRIMARY TARGET CHANGED", func() {
+			fmt.Print(webhook.PreviewConfirmationPrimaryTargetChanged())
 		}},
 		{"APPLY BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
