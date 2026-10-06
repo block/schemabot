@@ -79,6 +79,11 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		return nil
 	}
 
+	// The engine can hold the target from inside Apply on, so every exit
+	// before the poll takes the work over halts it.
+	work := c.trackAcceptedEngineWork(ctx, logger)
+	defer work.haltUnlessPolled()
+
 	// Grouped mode: all DDLs in one engine call. Use the apply identifier so all
 	// table work shares one context for progress tracking.
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
@@ -191,6 +196,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, apply.State)
 
 	// Poll for completion - all tasks share the same state
+	work.handToPoll()
 	return c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 }
 
@@ -591,6 +597,38 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
 // Each table copies and cuts over independently.
+
+// acceptedEngineWork covers a grouped drive from the moment it hands work to
+// the engine until pollForCompletionAtomic takes that work over. The poll
+// halts the work on its own exit, except at the cutover barrier; before the
+// handoff a drive can still return — a storage write after acceptance fails,
+// the lease is lost — and every such exit halts the work here instead, so it
+// never outlives the drive that started it (OW-3).
+type acceptedEngineWork struct {
+	client    *LocalClient
+	ctx       context.Context
+	logger    *slog.Logger
+	handedOff bool
+}
+
+func (c *LocalClient) trackAcceptedEngineWork(ctx context.Context, logger *slog.Logger) *acceptedEngineWork {
+	return &acceptedEngineWork{client: c, ctx: ctx, logger: logger}
+}
+
+// handToPoll records that pollForCompletionAtomic owns the work's halt from
+// here on, whether it polls in this goroutine or a detached one.
+func (w *acceptedEngineWork) handToPoll() {
+	w.handedOff = true
+}
+
+// haltUnlessPolled halts the drive's engine work when the drive returns before
+// handing it to a poll.
+func (w *acceptedEngineWork) haltUnlessPolled() {
+	if w.handedOff {
+		return
+	}
+	w.client.haltEngineWorkLeftByDrive(w.ctx, w.logger)
+}
 
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
 //

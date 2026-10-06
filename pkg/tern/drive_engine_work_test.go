@@ -2,6 +2,7 @@ package tern
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -194,4 +196,52 @@ const driveHaltTestDeadline = 5 * time.Second
 // lease-guarded writes keep that halt safe, not this bound.
 func TestDriveExitHaltEndsBeforeTheClaimCanGoStale(t *testing.T) {
 	assert.Less(t, defaultHeartbeatInterval+driveHandoverHaltTimeout, storage.ApplyLeaseStaleAfter)
+}
+
+// haltRecordingControlEngine is a control engine whose in-process work can be
+// halted per owner, recording each owner a halt was scoped to.
+type haltRecordingControlEngine struct {
+	*fakeControlEngine
+	haltOwners []string
+}
+
+func (e *haltRecordingControlEngine) HaltWorkOwnedBy(_ context.Context, owner string) error {
+	e.haltOwners = append(e.haltOwners, owner)
+	return nil
+}
+
+// updateRefusingApplyStore refuses every apply write.
+type updateRefusingApplyStore struct {
+	*exactProgressApplyStore
+	err error
+}
+
+func (s *updateRefusingApplyStore) Update(context.Context, *storage.Apply) error { return s.err }
+
+// A grouped resume whose engine has accepted the reattach can still return
+// before its poll begins: here the apply's running state cannot be written.
+// The drive halts the engine work it started as it returns, scoped to its own
+// claim, rather than leave the work holding the target behind a drive that no
+// longer polls it.
+func TestLaunchAtomicResume_ExitBeforeThePollHaltsTheAcceptedWork(t *testing.T) {
+	operations := &exactProgressApplyOperationStore{data: &storage.EngineResumeState{
+		ApplyOperationID: 7,
+		MigrationContext: "ctx-reattach",
+		Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+	}}
+	accepted := &engine.ApplyResult{Accepted: true, ResumeState: &engine.ResumeState{
+		MigrationContext: "ctx-reattach",
+		Metadata:         `{"branch_name":"branch-1","deploy_request_id":5}`,
+	}}
+	client, apply, tasks, plan, applyStore := reattachResumeFixture(operations, accepted)
+	eng := &haltRecordingControlEngine{fakeControlEngine: client.planetscaleEngine.(*fakeControlEngine)}
+	client.planetscaleEngine = eng
+	client.storage.(*exactProgressStorage).applies = &updateRefusingApplyStore{exactProgressApplyStore: applyStore, err: errors.New("storage unavailable")}
+	drive := driveContext(t.Context(), "token-a")
+
+	err := client.launchAtomicResume(drive, apply, tasks, plan, apply.GetOptions().Map(), "Recovering from checkpoint", true, false, false)
+
+	require.ErrorContains(t, err, "storage unavailable")
+	assert.Equal(t, []string{driveWorkOwner(drive)}, eng.haltOwners, "the accepted work is halted under the drive's own owner")
+	assert.Equal(t, state.Apply.Recovering, applyStore.apply.State, "the apply stays recoverable for a later drive")
 }
