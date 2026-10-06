@@ -74,6 +74,31 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	return RenderPlanComment(data)
 }
 
+// PreviewCommentPlanUnmanagedSchema renders the plan comment a staging-scoped
+// deployment posts for a PR that also changes a schema directory it does not
+// manage. It posts no separate notice, since a deployment serving another
+// environment may manage that directory, so the plan closes with a note
+// naming it.
+func PreviewCommentPlanUnmanagedSchema() string {
+	plan := previewPlanData()
+	plan.LintViolations = nil
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     plan.Database,
+		SchemaName:   plan.SchemaName,
+		HeadSHA:      plan.HeadSHA,
+		Repository:   plan.Repository,
+		DatabaseType: plan.DatabaseType,
+		IsMySQL:      plan.IsMySQL,
+		RequestedBy:  plan.RequestedBy,
+		Environments: []string{"staging"},
+		Plans:        map[string]*PlanCommentData{"staging": &plan},
+		UnmanagedSchema: []UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		},
+		UnmanagedEnvironments: []string{"staging"},
+	})
+}
+
 // PreviewCommentPlanExemptTables renders a plan with archive-named live tables.
 func PreviewCommentPlanExemptTables() string {
 	return RenderPlanComment(PlanCommentData{

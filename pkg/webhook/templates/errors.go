@@ -45,9 +45,14 @@ type SchemaErrorData struct {
 	UnregisteredConfigs []UnregisteredSchemaConfigData
 	// Deployment names the SchemaBot deployment making a claim about its own
 	// registry: the one environment it serves. Empty when it serves several
-	// or every environment, and the comment then speaks for "this" deployment
-	// and renders the environment header instead.
+	// or every environment, and the comment then renders the environment
+	// header instead.
 	Deployment string
+	// DeploymentEnvironments names, in promotion order, the environments a
+	// deployment serving several but not every environment speaks for, so a
+	// claim about its registry says which environments it covers. Empty for a
+	// deployment serving one environment (Deployment names it) or every one.
+	DeploymentEnvironments []string
 }
 
 // UnregisteredSchemaConfigData identifies one schema config whose database the
@@ -87,18 +92,26 @@ func (d SchemaErrorData) DeploymentHeader() string {
 // DeploymentSubject names the deployment making the claim as the subject of a
 // sentence.
 func (d SchemaErrorData) DeploymentSubject() string {
-	if d.Deployment != "" {
+	switch {
+	case d.Deployment != "":
 		return "The " + flattenIdentifier(d.Deployment) + " SchemaBot deployment"
+	case len(d.DeploymentEnvironments) > 0:
+		return "The SchemaBot deployment serving " + joinWithAnd(inlineCodeList(d.DeploymentEnvironments))
+	default:
+		return "This SchemaBot deployment"
 	}
-	return "This SchemaBot deployment"
 }
 
 // DeploymentSubjectLower is DeploymentSubject for use mid-sentence.
 func (d SchemaErrorData) DeploymentSubjectLower() string {
-	if d.Deployment != "" {
+	switch {
+	case d.Deployment != "":
 		return "the " + flattenIdentifier(d.Deployment) + " SchemaBot deployment"
+	case len(d.DeploymentEnvironments) > 0:
+		return "the SchemaBot deployment serving " + joinWithAnd(inlineCodeList(d.DeploymentEnvironments))
+	default:
+		return "this SchemaBot deployment"
 	}
-	return "this SchemaBot deployment"
 }
 
 // SearchedDirsCode renders the directories a scoped search probed as code
@@ -530,6 +543,28 @@ func RenderUnmanagedSchemaPassingCheck(environment string, configs []UnmanagedSc
 		fmt.Fprintf(&sb, "- %s declares database %s\n", inlineCode(cfg.SchemaPath), inlineCode(cfg.Database))
 	}
 	return title, sb.String()
+}
+
+// RenderUnmanagedSchemaPlanNote renders the note a plan comment carries when
+// the PR also changes schema under configs this deployment does not manage.
+// An environment-scoped deployment posts no separate notice, since a sibling
+// serving another environment may manage those configs, so the plan comment
+// is where the PR shows that this deployment left them out. environments
+// names the environments this deployment serves, and the note makes no claim
+// about any other. It renders nothing when configs is empty. The database
+// names and paths come from the PR's own schemabot.yaml files, so each renders
+// as a code span it cannot break out of.
+func RenderUnmanagedSchemaPlanNote(environments []string, configs []UnmanagedSchemaConfigNoticeData) string {
+	if len(configs) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s This PR also changes schema under paths SchemaBot does not manage in %s, so this plan does not cover them:\n\n",
+		glyph.Info, joinWithAnd(inlineCodeList(environments)))
+	for _, cfg := range configs {
+		fmt.Fprintf(&sb, "- %s declares database %s\n", inlineCode(cfg.SchemaPath), inlineCode(cfg.Database))
+	}
+	return sb.String()
 }
 
 // PreviewCommentUnmanagedSchemaConfigsNotice renders a sample notice for

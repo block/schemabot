@@ -119,6 +119,7 @@ const (
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                         PreviewType = "comment_plan"                            // Plan comment with DDL changes + lint violations
 	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
+	PreviewCommentPlanUnmanagedSchema          PreviewType = "comment_plan_unmanaged_schema"           // Environment-scoped plan naming schema directories it does not manage
 	PreviewCommentPlanExemptTables             PreviewType = "comment_plan_exempt_tables"              // Plan with ignored live tables disclosed
 	PreviewCommentPlanIgnoreTables             PreviewType = "comment_plan_ignore_tables"              // Clean plan with a live table withheld by ignore_tables
 	PreviewCommentPlanColumnOnlyAlter          PreviewType = "comment_plan_column_only_alter"          // Plan whose alter is metadata-only, so no table-size section renders

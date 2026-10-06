@@ -18,6 +18,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // aggregateLeaderConfig returns a server config where the test repo has the
@@ -334,7 +335,7 @@ func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
 // A -t-scoped command and a non-aggregate repo still surface the error.
 func TestUnscopedMultiEnvPlanOnUnregisteredDatabase(t *testing.T) {
 	barePlan := func(h *Handler, databaseName, tenant string) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0, nil)
 	}
 
 	t.Run("leader answers for a database it has not registered", func(t *testing.T) {
@@ -635,20 +636,25 @@ func TestNotifyUnmanagedDiscoveredConfigsOnAggregateRepo(t *testing.T) {
 // it does not manage to whichever deployment serves the other environments. A
 // repo split across a staging deployment and a production deployment, where a
 // database exists only in production, gets the production plan for it and no
-// notice from staging claiming that nothing will ever apply it. A deployment
-// serving every environment still posts the notice, since no sibling can own
-// the directory.
+// notice from staging claiming that nothing will ever apply it; staging's own
+// plan comments say only that it does not manage the directory in staging. A
+// deployment serving every environment still posts the notice, since no
+// sibling can own the directory.
 func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testing.T) {
 	sandbox := []ghclient.DiscoveredConfig{{
 		Config:    &ghclient.SchemabotConfig{Database: "ledger_sandbox", Type: "vitess"},
 		SchemaDir: "services/ledger/schema_sandbox",
+	}, {
+		Config:    &ghclient.SchemabotConfig{Database: "merchants", Type: "mysql"},
+		SchemaDir: "services/merchants/schema",
 	}}
-	notify := func(h *Handler) {
-		h.notifyUnmanagedDiscoveredConfigs("octocat/hello-world", 1, 12345, "pull_request", "abc123", func() bool { return true }, sandbox, nil)
+	notify := func(h *Handler) []templates.UnmanagedSchemaConfigNoticeData {
+		return h.notifyUnmanagedDiscoveredConfigs("octocat/hello-world", 1, 12345, "pull_request", "abc123", func() bool { return true }, sandbox, nil)
 	}
 
-	// With no notice, the Warn log is the only trace when no deployment
-	// manages the config, so it carries every identifier triage needs.
+	// The staging deployment hands the dropped configs back for its plan
+	// comments to name, and logs them on one line that carries every
+	// identifier triage needs, however many configs it dropped.
 	t.Run("staging-scoped deployment posts no notice for a production-only database", func(t *testing.T) {
 		cfg := nonAggregateConfig()
 		cfg.AllowedEnvironments = []string{"staging"}
@@ -656,9 +662,13 @@ func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testin
 		var logs bytes.Buffer
 		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
-		notify(h)
+		note := notify(h)
 
 		assert.Empty(t, comments, "the production deployment may plan ledger_sandbox")
+		assert.Equal(t, []templates.UnmanagedSchemaConfigNoticeData{
+			{Database: "ledger_sandbox", SchemaPath: "services/ledger/schema_sandbox"},
+			{Database: "merchants", SchemaPath: "services/merchants/schema"},
+		}, note, "the plan comments name every dropped config")
 		var entry map[string]any
 		require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), "exactly one log entry: %s", logs.String())
 		assert.Equal(t, "WARN", entry["level"])
@@ -666,15 +676,15 @@ func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testin
 		assert.EqualValues(t, 1, entry["pr"])
 		assert.Equal(t, "abc123", entry["head_sha"])
 		assert.Equal(t, "pull_request", entry["source"])
-		assert.Equal(t, "ledger_sandbox", entry["database"])
-		assert.Equal(t, "services/ledger/schema_sandbox", entry["schema_path"])
+		assert.Equal(t, []any{"ledger_sandbox", "merchants"}, entry["databases"])
+		assert.Equal(t, []any{"services/ledger/schema_sandbox", "services/merchants/schema"}, entry["schema_paths"])
 		assert.Equal(t, []any{"staging"}, entry["allowed_environments"])
 	})
 
 	t.Run("deployment serving every environment posts the notice", func(t *testing.T) {
 		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
 
-		notify(h)
+		assert.Nil(t, notify(h), "the notice names the configs, so no plan comment repeats them")
 
 		body := requireComment(t, comments, "unmanaged schema config notice")
 		assert.Contains(t, body, "- `services/ledger/schema_sandbox` — declares database `ledger_sandbox`")
@@ -688,7 +698,7 @@ func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testin
 // the leader may publish Database Not Found as the fleet-authoritative answer.
 func TestMultiEnvPlanDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
 	barePlan := func(h *Handler) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, 0, true, 0)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, 0, true, 0, nil)
 	}
 
 	t.Run("participant stays silent", func(t *testing.T) {
@@ -1262,7 +1272,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		serveSchemaConfigForDatabase(t, mux, "orders")
 		reactions := registerReactionRecorder(t, mux)
 
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil)
 
 		select {
 		case <-reactions:
@@ -1301,7 +1311,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 					CommandResult{Action: action.ApplyConfirm, CommentID: 42})
 			},
 			"multi-env plan": func(h *Handler) {
-				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42)
+				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil)
 			},
 		} {
 			t.Run(name, func(t *testing.T) {

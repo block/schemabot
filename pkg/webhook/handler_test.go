@@ -390,9 +390,11 @@ func TestCommentObserverRendersOversizedNoticeWithTheConfiguredCLIName(t *testin
 }
 
 // A command answered with Configuration Not Authorized names the deployment
-// making the claim when it serves a single environment, since a deployment
-// serving another environment may manage the directory. A deployment with no
-// single environment speaks for itself without a name.
+// making the claim, since a deployment serving another environment may manage
+// the directory: by its environment when it serves one, and by the
+// environments it serves, in promotion order, when it serves several but not
+// every one. A deployment serving every environment speaks for itself without
+// a name.
 func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -401,6 +403,14 @@ func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
 	}{
 		{name: "deployment serving every environment", config: &api.ServerConfig{}, subject: "this SchemaBot deployment is not configured to manage its schema directory"},
 		{name: "staging-scoped deployment", config: &api.ServerConfig{AllowedEnvironments: []string{"staging"}}, subject: "the staging SchemaBot deployment is not configured to manage its schema directory"},
+		{
+			name: "deployment serving two of three environments",
+			config: &api.ServerConfig{
+				EnvironmentOrder:    []string{"sandbox", "staging", "production"},
+				AllowedEnvironments: []string{"production", "staging"},
+			},
+			subject: "the SchemaBot deployment serving `staging` and `production` is not configured to manage its schema directory",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
