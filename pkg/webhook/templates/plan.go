@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -23,6 +24,15 @@ type LintViolationData struct {
 	Table      string
 	LinterName string
 	CanAutoFix bool
+	// Targets names the rollout targets that raised this finding when only
+	// some of those it covers did: some of a target plan group's targets, or
+	// some of the targets with work in the comment's merged lint section.
+	// Empty when all of them raised it, or for a single target's plan.
+	Targets []string
+	// TotalTargets is how many targets the finding's scope holds, so a subset
+	// too wide to name reads as coverage ("3 of 12 targets"). Zero when
+	// Targets is empty.
+	TotalTargets int
 }
 
 // UnsafeChangeData represents a destructive schema change for template rendering.
@@ -41,6 +51,18 @@ type UnsafeChangeData struct {
 	// rendering too wide to name every shard can state coverage ("12 of 32
 	// shards") instead of a bare count. Zero when unknown.
 	TotalShards int
+	// Targets names the rollout targets that carry this change, for a target
+	// plan group in which only some targets do, or for a refusal that lists
+	// other targets' changes beside the primary plan's. Empty when the change
+	// is the primary plan's, or every target in its group carries it.
+	Targets []string
+	// TotalTargets is how many targets the group holds, so a subset too wide
+	// to name reads as coverage ("3 of 12 targets"). Zero when Targets names
+	// the whole list.
+	TotalTargets int
+	// VSchemaNamespace names the namespace whose VSchema this change alters.
+	// Empty for a change to a table.
+	VSchemaNamespace string
 }
 
 // BlockedChangeData is a planned change the engine deterministically refuses:
@@ -78,6 +100,14 @@ type DirectChangeData struct {
 	// rendering too wide to name every shard can state coverage ("12 of 32
 	// shards") instead of a bare count. Zero when unknown.
 	TotalShards int
+	// Targets names the rollout targets that run this change directly, for a
+	// target plan group in which only some targets do: the direct execution
+	// policy judges each target's own table. Empty when every target in the
+	// group runs it directly.
+	Targets []string
+	// TotalTargets is how many targets the group holds, so a subset too wide
+	// to name reads as coverage ("3 of 12 targets").
+	TotalTargets int
 }
 
 // AttributedChangeData is a table carrying a planned destructive change that
@@ -92,11 +122,6 @@ type AttributedChangeData struct {
 	Repository  string
 	PullRequest int
 	Unresolved  bool
-	// OutsideUnsafeGate marks a destructive change the --allow-unsafe opt-in
-	// never gated — one visible only on individual shards — so consent for it
-	// was never solicited and the disclosure must not be dropped as already
-	// consented to.
-	OutsideUnsafeGate bool
 }
 
 // PlanCommentData contains all data needed to render a plan comment.
@@ -131,10 +156,19 @@ type PlanCommentData struct {
 	// the PR's schema files.
 	PlanID string
 
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
+
 	// AgentHint is the deployment's configured guidance for AI agents reading
 	// the plan. Empty on deployments that configure none, which render an
 	// unchanged comment.
 	AgentHint string
+
+	// PlanSummaryScope names the targets a summary of several targets' plans
+	// covers, e.g. "39 of 40 targets", so a count combined across targets never
+	// reads as any one target's work. Empty when the summary is one plan's.
+	PlanSummaryScope string
 
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
@@ -213,9 +247,23 @@ type PlanCommentData struct {
 	RecoveredApplyOwnedCheckState bool
 
 	// DeploymentDrift is the review-time rollup of how every configured
-	// deployment compares to the reviewed primary plan. Nil for a single-target
+	// deployment compares to the primary plan. Nil for a single-target
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
+
+	// MemberApplyRefusal says why a PR apply cannot run the other targets'
+	// plans this comment renders, whether or not the primary target has work
+	// of its own, naming only targets, tables, and namespaces. Such an apply is
+	// refused whatever its flags, so the comment offers no apply command in its
+	// place. Empty when the apply can run them, or when the comment renders the
+	// primary plan alone.
+	MemberApplyRefusal string
+
+	// namespaceLabelsInline renders each keyspace's label as a bold line
+	// rather than a heading, for changes under a target group heading that
+	// already sits at the namespace heading's level, so the label never
+	// outranks the heading it sits under.
+	namespaceLabelsInline bool
 }
 
 // ExemptTablesData describes live tables exempt from a plan verdict.
@@ -228,13 +276,13 @@ type ExemptTablesData struct {
 // DeploymentDriftData renders the review-time drift rollup in the PR preview: a
 // uniform line when every member passed its contract, or a per-member breakdown
 // when some member diverged from — or could not be confirmed against — the
-// reviewed plan.
+// primary plan.
 type DeploymentDriftData struct {
 	// Deployments is every configured rollout member in rollout order, primary
 	// first.
 	Deployments []DeploymentDriftEntry
 	// Clean means every member passed its contract: under mirrored members, that
-	// they all match the reviewed plan; under independent members, that they all
+	// they all match the primary plan; under independent members, that they all
 	// produced a plan of their own.
 	Clean bool
 	// Computed is false when the rollup itself could not be evaluated; the check
@@ -252,6 +300,23 @@ type DeploymentDriftData struct {
 	// members — members expected to match each other say nothing by matching,
 	// and a blocked rollup describes each member on its own instead.
 	Plans []DeploymentPlanGroup
+	// TableSizes is every target's size estimate for each table its own plan
+	// changes with a statement whose cost scales with the table's size, in
+	// rollout order, primary first. Each target applies to its own data, so
+	// the size section ranks a table by its largest target rather than by the
+	// primary plan alone. Set only for a clean rollup, where every target was
+	// planned: a target missing from the list would read as one with nothing
+	// to copy.
+	TableSizes []TargetTableSize
+}
+
+// TargetTableSize is one rollout target's size estimate for one table its plan
+// changes.
+type TargetTableSize struct {
+	// Target names the target the way an operator addresses it.
+	Target   string
+	Keyspace string
+	Size     TableSizeData
 }
 
 // DeploymentPlanGroup is the members of a rollout that would run the same plan.
@@ -268,12 +333,14 @@ type DeploymentPlanGroup struct {
 	// Members names the group's members the way an operator addresses them, in
 	// rollout order.
 	Members []string
-	// Primary marks the group the reviewed primary member belongs to. Exactly
-	// one group carries it, and it is the group operators read first: the
-	// reviewed plan is the one they have already seen.
+	// Primary marks the group the primary target belongs to. Exactly one group
+	// carries it. The primary is planned first and its plan is what the
+	// comment's plan-wide sections describe, but it is no more reviewed than
+	// any other group: an approval covers every target's plan the comment
+	// shows, so the primary's group is ordered like any other.
 	Primary bool
 	// Changes is one member's plan, in the same shape the comment renders the
-	// reviewed plan itself. Empty for a group whose members are already at the
+	// primary plan itself. Empty for a group whose members are already at the
 	// desired schema.
 	//
 	// The group's members run the same work, so any member's plan describes all
@@ -285,12 +352,27 @@ type DeploymentPlanGroup struct {
 	// BlockedChanges are the group's changes the engine will refuse at apply,
 	// each naming the targets that refuse it when that is not all of them.
 	BlockedChanges []BlockedChangeData
+	// UnsafeChanges are the group's changes that need `--allow-unsafe`, each
+	// naming the targets that carry it when that is not all of them. The
+	// primary group discloses the primary plan's own, so beside them it adds
+	// only those its other targets carry without the primary target
+	// (unsafeBeyondPrimaryPlan).
+	UnsafeChanges []UnsafeChangeData
 	// PlanID is the identifier of the stored plan the group's first member
 	// would run, so DDL cut to fit the comment names the command that prints
 	// the group's plan in full. Unused for the primary's group, which runs the
-	// reviewed plan and points at PlanCommentData.PlanID. Empty when the
+	// primary's plan and points at PlanCommentData.PlanID. Empty when the
 	// member's plan was not stored.
 	PlanID string
+	// DirectChanges are the group's changes the direct execution policy routes
+	// to native DDL, each naming the targets that run it that way when that is
+	// not all of them.
+	DirectChanges []DirectChangeData
+	// LintViolations are the advisory lint findings the group's members' own
+	// plans raised, each once however many members raise it. Lint reads each
+	// target's live schema, so these are the group's, not the primary's. The
+	// comment merges every group's into its one lint section (targetLint).
+	LintViolations []LintViolationData
 }
 
 // Empty reports that the group's members are already at the desired schema and
@@ -298,7 +380,7 @@ type DeploymentPlanGroup struct {
 // naming it is the difference between a fleet that is converging and one the
 // comment has quietly left out.
 // A vschema rewrite carries no DDL and is still work, so a group is counted the
-// same way the comment counts the reviewed plan: statements and vschema
+// same way the comment counts the primary plan: statements and vschema
 // rewrites together.
 func (g DeploymentPlanGroup) Empty() bool {
 	statements, vschema := countChanges(g.Changes)
@@ -306,7 +388,7 @@ func (g DeploymentPlanGroup) Empty() bool {
 }
 
 // DeploymentDriftEntry is one rollout member's classification against the
-// reviewed primary plan.
+// primary plan.
 type DeploymentDriftEntry struct {
 	Deployment string
 	// Target is the member's target within its deployment. One deployment can
@@ -377,12 +459,39 @@ type KeyspaceChangeData struct {
 	// keyspace's only work, which keeps such a plan from reading as having no
 	// changes.
 	Finalize bool
+	// TableSizes carries plan-time size estimates for the existing tables this
+	// keyspace's changes copy, rebuild, or scan, rendered in the size section
+	// after the DDL. Tables being created have no size and are omitted. An
+	// entry without a byte estimate renders an explicit "unavailable" so a
+	// failed size probe never reads as a small table, unless no table in the
+	// plan has an estimate, in which case the section is omitted (see
+	// writeTableSizesSection).
+	TableSizes []TableSizeData
+	// CollationChanges lists the existing columns this keyspace's changes move
+	// onto another collation, rendered under the table sizes (see
+	// writeCollationChangesSection).
+	CollationChanges []CollationChangeData
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
 	// set, the DDL is rendered per shard-group ("what applies where") instead of
 	// the single Statements block — so a keyspace whose shards diverge is shown
 	// faithfully. Empty for a non-sharded keyspace.
 	Shards []KeyspaceShardChange
+}
+
+// TableSizeData is one existing table's plan-time size estimate for display.
+// The estimate is approximate — sourced from engine statistics that may be
+// stale — and is rendered as such.
+type TableSizeData struct {
+	Table string
+	// ShardCount is the number of shards the change spans. Zero when the
+	// target is not sharded or the topology is unknown, which omits the shard
+	// clause entirely.
+	ShardCount int
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes), summed across shards for a sharded target. Nil renders as
+	// explicitly unavailable.
+	EstimatedBytes *int64
 }
 
 // KeyspaceShardChange is one shard's planned statements within a keyspace.
@@ -429,13 +538,14 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 
 	// Review-time deployment drift is shown before the change list — and before
 	// the no-changes short-circuit — because a non-primary deployment can drift
-	// even when the reviewed primary plan is a clean no-op.
+	// even when the primary plan is a clean no-op.
 	writeDeploymentDrift(&sb, data.DeploymentDrift, data.Changes)
-	targetPlans := rendersTargetPlans(data.DeploymentDrift)
+	targetPlans := RendersTargetPlans(data.DeploymentDrift)
 	summary := data
 	if targetPlans {
 		writeTargetPlans(&sb, data, budget, false)
 		summary.Changes = combinedTargetPlanChanges(data)
+		summary.PlanSummaryScope = targetPlansScope(data.DeploymentDrift)
 	}
 
 	// Count changes
@@ -448,15 +558,10 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// exactly where a reviewer needs to tell a withheld namespace apart from a
 	// genuinely unchanged one.
 	//
-	// A reviewed target with nothing to run while other targets still have work
-	// summarizes their plans instead, without the apply footer: a PR apply runs
-	// from the reviewed plan, and an empty one does not run the other targets'
-	// plans.
-	if totalChanges == 0 {
-		if targetPlans {
-			writePlanSummary(&sb, summary, summaryStatements, summaryKeyspaceUpdates)
-			return appendAgentHint(sb.String(), data.AgentHint)
-		}
+	// A primary target with nothing to run while other targets still have work
+	// is not a no-op: the comment goes on to summarize their plans and offer the
+	// apply, which runs each of those targets' own plans.
+	if totalChanges == 0 && !targetPlans {
 		writeNoChangesDetected(&sb, data)
 		if len(data.IgnoredNamespaces) > 0 || hasExemptTables(data.ExemptTables) {
 			sb.WriteString("\n")
@@ -471,6 +576,13 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		writeKeyspaceChanges(&sb, data, budget)
 	}
 
+	// Sizes of the tables the DDL above copies, rebuilds, or scans.
+	writeTableSizesSection(&sb, summary)
+
+	// How the DDL above changes the way existing columns sort and compare, on
+	// the primary target.
+	writeCollationChangesSection(&sb, data)
+
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
 	// the locked apply comment too, so the operator sees the guaranteed
@@ -484,14 +596,19 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// auto-applying locked comment: the disclosure coaches re-planning ("merge
 	// that PR ... then re-plan"), which is noise once the apply is already
 	// running.
-	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) {
+	// When the unsafe warning below lists every attributed table, the
+	// attribution rides on those findings instead of a section of its own, so
+	// each change is explained once.
+	unsafeShown := data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked
+	attributionNotes, attributionFolded := unsafeAttributionNotes(data, unsafeShown)
+	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) && !attributionFolded {
 		writeAttributedChanges(&sb, data.AttributedChanges)
 	}
 
 	// Direct-execution changes — statements the policy routes to native DDL.
 	// The policy approves them, so the plan only discloses how they run; the
 	// locked apply comment repeats it so the apply shows what it is running.
-	if len(data.DirectChanges) > 0 {
+	if len(data.DirectChanges) > 0 && !targetPlansDiscloseDirect(data) {
 		writeDirectChanges(&sb, data.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
 	}
 
@@ -499,15 +616,11 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// discarding an unfinished copy destroys hours of work already done, so the
 	// disclosure must sit on the comment the confirmation acts on. The copy is
 	// read from the target at plan time, so it can appear on the apply comment
-	// without having been on the plan comment that preceded it.
-	if len(data.DiscardedCopies) > 0 {
-		writeDiscardedCopies(&sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
-	}
-	if len(data.AdoptedCopies) > 0 {
-		writeAdoptedCopies(&sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
-	}
-	if len(data.RunningCopies) > 0 {
-		writeRunningCopies(&sb, data.RunningCopies, data.applyingWithoutConfirmation())
+	// without having been on the plan comment that preceded it. Target plans
+	// disclose them under the primary target's group, the target they were
+	// read from.
+	if !targetPlans {
+		writeExistingCopies(&sb, data)
 	}
 
 	// Why the apply is waiting, when no disclosure above says so. It sits here
@@ -522,15 +635,17 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// the locked apply comment: unsafe changes only reach an apply after the
 	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
 	// and blocks otherwise), so repeating them there is noise.
-	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked {
-		writeUnsafeWarning(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
+	// Target plans disclose them under the primary target's group, whose plan
+	// they are from.
+	if unsafeShown && !targetPlans {
+		writeUnsafeWarning(&sb, data.UnsafeChanges, attributionNotes, data.DatabaseType, data.IsMySQL)
 	}
 
 	// Lint violations — shown on the plan comment for review, omitted on the
 	// locked apply comment where they are noise (the operator already reviewed
 	// them at plan time).
-	if len(data.LintViolations) > 0 && !data.IsLocked {
-		writeLintViolations(&sb, data.LintViolations)
+	if !data.IsLocked {
+		writePlanWideLint(&sb, data.LintViolations, data.DeploymentDrift, targetPlans)
 	}
 
 	// Errors
@@ -570,21 +685,173 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			// happy path; the operator can still unlock from the CLI if needed.
 			sb.WriteString("**Applying automatically**\n")
 		}
+	case data.MemberApplyRefusal != "":
+		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal)
+	case data.applyFailsOnRefusedChange():
+		writeRefusedChangeReplan(&sb, "this plan", scopedCommand("schemabot plan", data.Environment, data.ScopedDatabase, data.Tenant))
 	default:
 		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
-		writeApplyInstruction(&sb, applyCmd)
+		writeApplyInstruction(&sb, applyCmd, data)
 	}
 
 	return appendAgentHint(sb.String(), data.AgentHint)
 }
 
+// writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
+// apply cannot run every target's plan the comment renders. Offering the
+// command there would coach an apply that is refused whatever its flags.
+func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
+	refusal = escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " "))
+	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: %s.\n\n", refusal)
+	sb.WriteString("An apply runs every target or none, so nothing runs until that plan can. The schema check keeps blocking merge until every target has the change.\n")
+}
+
+// applyFailsOnRefusedChange reports whether the plan carries a change the
+// engine refuses. Its apply fails on that change whatever its flags, so the
+// comment offers a re-plan instead of an apply it knows will fail. A refused
+// change on another target is a member apply refusal, which the footer states
+// on its own.
+func (d PlanCommentData) applyFailsOnRefusedChange() bool {
+	return len(d.BlockedChanges) > 0
+}
+
+// writeRefusedChangeReplan writes, in place of the apply instruction, that the
+// named plan's apply fails on a refused change, and the command that re-plans
+// once it is fixed. The change itself is listed under Cannot apply above.
+func writeRefusedChangeReplan(sb *strings.Builder, plan, planCommand string) {
+	fmt.Fprintf(sb, "The engine refuses a change in %s (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:\n", plan)
+	fmt.Fprintf(sb, "```\n%s\n```\n", planCommand)
+}
+
 // writeApplyInstruction writes the ▶️ apply instruction with the given command.
-func writeApplyInstruction(sb *strings.Builder, command string) {
-	sb.WriteString("▶️ **To apply** all schema changes from this PR, comment:\n")
+func writeApplyInstruction(sb *strings.Builder, command string, data PlanCommentData) {
+	if consent, ok := planUnsafeConsent(data); ok {
+		fmt.Fprintf(sb, "▶️ **To apply**, %s:\n", consent.instruction())
+	} else {
+		sb.WriteString("▶️ **To apply**, comment:\n")
+	}
 	fmt.Fprintf(sb, "```\n%s\n```\n", command)
+}
+
+// unsafeConsent is what an apply of one plan would confirm with
+// --allow-unsafe. The apply instruction states it in the sentence that leads
+// into the command, so the reader meets the requirement before copying the
+// command rather than after the gate rejects it, and without scrolling back up
+// to the sections that explain it. The flag is deliberately left out of the
+// pasteable command: consenting to destroy data takes typing it, which a
+// copy-paste of the plan's own command never does.
+type unsafeConsent struct {
+	findings int
+	tables   string
+	// primaryOnly is set when the count covers the primary target alone: the
+	// flag also consents to whatever unsafe changes the other targets carry,
+	// which the comment has no per-target plan to count from.
+	primaryOnly bool
+}
+
+// planUnsafeConsent reports what the plan's apply would confirm with
+// --allow-unsafe, and false when the flag would not make the apply run: the
+// apply needs no consent, or the plan carries a change the engine refuses,
+// which fails the apply whatever its flags.
+func planUnsafeConsent(data PlanCommentData) (unsafeConsent, bool) {
+	if data.AllowUnsafe || data.applyFailsOnRefusedChange() {
+		return unsafeConsent{}, false
+	}
+	// The flag consents to every target's disclosed unsafe changes, not only
+	// the reviewed plan's, so the instruction counts and names them all.
+	var changes []UnsafeChangeData
+	if data.HasUnsafeChanges {
+		changes = append(changes, data.UnsafeChanges...)
+	}
+	changes = append(changes, TargetPlanUnsafeChanges(data.DeploymentDrift)...)
+	if len(changes) == 0 {
+		return unsafeConsent{}, false
+	}
+	return unsafeConsent{
+		findings:    countUnsafeFindings(changes),
+		tables:      unsafeChangeTables(changes),
+		primaryOnly: !unsafeCountCoversEveryTarget(data.DeploymentDrift),
+	}, true
+}
+
+// unsafeCountCoversEveryTarget reports whether the unsafe changes the comment
+// counts are every one --allow-unsafe would consent to. A single target, or a
+// clean rollup, has them all: mirrored targets run the primary plan, and
+// independent targets' own plans are counted when they render. A rollup that
+// is blocked or could not be computed carries no plan per target, so the
+// count is the primary target's alone. Such a rollup also blocks the apply,
+// but the apply plans the rollout again, and it can be clean by then.
+func unsafeCountCoversEveryTarget(drift *DeploymentDriftData) bool {
+	return drift == nil || (drift.Computed && drift.Clean)
+}
+
+// instruction is the clause that tells the reader how to apply, lower-cased
+// to continue a sentence. Where a change came from is the unsafe warning's to
+// say, on the finding itself, so the instruction stays one short clause.
+func (c unsafeConsent) instruction() string {
+	noun := "unsafe change"
+	if c.findings > 1 {
+		noun = "unsafe changes"
+	}
+	if c.primaryOnly {
+		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on the primary target (%s) and any on the other targets", c.findings, noun, c.tables)
+	}
+	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s)", c.findings, noun, c.tables)
+}
+
+// unsafeConsentTablesShown caps how many names the consent sentence lists.
+// The unsafe findings above list every one, so the rest are only counted.
+const unsafeConsentTablesShown = 5
+
+// unsafeChangeTables names what the unsafe changes touch, each once in
+// first-appearance order, comma-separated: a table by its code span, with the
+// shards it applies to when only some carry it, and a VSchema by its
+// namespace. The names match the ones the unsafe findings list above uses, so
+// the reader can match one to the other. Past unsafeConsentTablesShown the
+// rest are counted.
+func unsafeChangeTables(changes []UnsafeChangeData) string {
+	seen := make(map[string]bool, len(changes))
+	var targets []string
+	for _, c := range changes {
+		target := unsafeConsentTarget(c)
+		if seen[target] {
+			continue
+		}
+		seen[target] = true
+		targets = append(targets, target)
+	}
+	shown := targets[:min(len(targets), unsafeConsentTablesShown)]
+	// A label that lists several targets carries commas of its own, so the
+	// labels are then set apart with semicolons.
+	sep := ", "
+	for _, target := range shown {
+		if strings.Contains(target, ", ") {
+			sep = "; "
+			break
+		}
+	}
+	list := strings.Join(shown, sep)
+	if hidden := len(targets) - len(shown); hidden > 0 {
+		list += fmt.Sprintf(" and %d more", hidden)
+	}
+	return list
+}
+
+func unsafeConsentTarget(c UnsafeChangeData) string {
+	if c.VSchemaNamespace != "" {
+		return inlineCode(c.VSchemaNamespace) + " VSchema"
+	}
+	label := inlineCode(c.Table)
+	if len(c.Shards) > 0 {
+		label += " on " + planShardList(c.Shards, c.TotalShards)
+	}
+	if len(c.Targets) > 0 {
+		label += " on " + planGroupList(targetNoun, c.Targets, c.TotalTargets)
+	}
+	return label
 }
 
 // attributionStillActionable reports whether the attributed-changes
@@ -594,19 +861,13 @@ func writeApplyInstruction(sb *strings.Builder, command string) {
 // owning pull request and re-plan instead of applying. Once the locked
 // comment is applying automatically, that re-plan alternative is gone and the
 // operator consented to the destruction through --allow-unsafe, so the
-// disclosure is omitted — unless an attributed table never passed through the
-// unsafe opt-in gate, where no consent was ever solicited and this comment is
-// the operator's notice.
+// disclosure is omitted. That holds for every attributed table because the
+// unsafe gate reads the same set the attribution does, a divergent shard's
+// drops included (PlanResponse.UnsafeChanges walks the shard rows), so no
+// attributed destruction reaches an automatic apply without consent having
+// been solicited for it.
 func attributionStillActionable(data PlanCommentData) bool {
-	if !data.IsLocked || data.PendingManualConfirmation {
-		return true
-	}
-	for _, change := range data.AttributedChanges {
-		if change.OutsideUnsafeGate {
-			return true
-		}
-	}
-	return false
+	return !data.IsLocked || data.PendingManualConfirmation
 }
 
 // writeAttributedChanges writes the section for destructive changes to tables
@@ -765,7 +1026,11 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		return
 	}
 
-	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements))
+	text := planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements)
+	if data.PlanSummaryScope != "" {
+		text += " across " + data.PlanSummaryScope
+	}
+	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
 
 	// Disclosed directly under the plan summary so the exclusion reads as
 	// part of the plan result: what was counted, then what was withheld.
@@ -996,7 +1261,7 @@ const groupNoChanges = "No schema changes detected"
 //
 // It answers only for a grouped rollup, which is a clean independent one: a
 // mirrored rollup that passed has already established that every member matches
-// the reviewed plan, so an empty reviewed plan is empty everywhere, and a rollup
+// the primary plan, so an empty primary plan is empty everywhere, and a rollup
 // that did not pass carries no per-member plans to count.
 func changingTargetCount(drift *DeploymentDriftData) int {
 	if drift == nil {
@@ -1011,9 +1276,22 @@ func changingTargetCount(drift *DeploymentDriftData) int {
 	return changing
 }
 
+// targetPlansScope states how many of the rollout's targets run the work a
+// combined target-plan summary counts: "39 of 40 targets" when some targets
+// are already at the desired schema, "40 targets" when none are, matching the
+// target group headings. The summary is the union of every group's changes, so
+// each target runs some of that work, not necessarily all of it.
+func targetPlansScope(drift *DeploymentDriftData) string {
+	changing, total := changingTargetCount(drift), len(drift.Deployments)
+	if changing == total {
+		return fmt.Sprintf("%d %s", total, targetNoun.Plural)
+	}
+	return presentation.CoveragePhrase(targetNoun, changing, total)
+}
+
 // writeNoChangesDetected closes a comment with nothing to apply. It is never
-// reached while another target still has work: an empty reviewed plan is a
-// no-op only for the reviewed target, so those comments render the other
+// reached while another target still has work: an empty primary plan is a
+// no-op only for the primary target, so those comments render the other
 // targets' plans and summary instead.
 func writeNoChangesDetected(sb *strings.Builder, data PlanCommentData) {
 	sb.WriteString(noChangesDetected + "\n")
@@ -1112,7 +1390,7 @@ func countStatementTypes(changes []KeyspaceChangeData, databaseType string) ui.P
 // writeKeyspaceChanges renders each keyspace's DDL and VSchema changes, with
 // the DDL blocks drawing on the comment's shared budget.
 func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget) {
-	defer budget.pointAt(data.PlanID)()
+	defer budget.pointAt(storedPlanRef{cliName: data.CLIName, environment: data.Environment, id: data.PlanID})()
 
 	// The DDL blocks below format statements under the plan's own dialect so
 	// they are never reformatted under another family's grammar.
@@ -1150,11 +1428,11 @@ func writeKeyspaceChanges(sb *strings.Builder, data PlanCommentData, budget *ddl
 			if schemaNamespaces {
 				label = "Schema Name"
 			}
-			fmt.Fprintf(sb, "#### %s: %s\n", label, inlineCode(ks.Keyspace))
+			writeNamespaceLabel(sb, data, label, inlineCode(ks.Keyspace))
 		}
 
 		if hasVSchemaChanges {
-			sb.WriteString("#### VSchema\n")
+			writeNamespaceLabel(sb, data, "VSchema", "")
 			if ks.VSchemaDiff != "" {
 				writeVSchemaDiffFence(sb, ks.VSchemaDiff, diffBudget)
 			} else {
@@ -1204,6 +1482,256 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 	return count
 }
 
+// tableSizeEntry is one line of the size section: the table's display name,
+// qualified with its keyspace when the plan spans several, and its sizes.
+type tableSizeEntry struct {
+	name string
+	// size is the table's estimate on a single-target plan.
+	size TableSizeData
+	// perTarget is each rollout target's estimate for the table, in rollout
+	// order, on a multi-target plan. Nil on a single-target plan, which names
+	// no target.
+	perTarget []TargetTableSize
+}
+
+// multiTarget reports that the line is for a table a rollout changes.
+func (e tableSizeEntry) multiTarget() bool {
+	return e.perTarget != nil
+}
+
+// memberSizes is each target's estimate for the table, in rollout order, in
+// the shape the shared size formatter takes.
+func (e tableSizeEntry) memberSizes() []presentation.MemberTableSize {
+	sizes := make([]presentation.MemberTableSize, len(e.perTarget))
+	for i, ts := range e.perTarget {
+		sizes[i] = presentation.MemberTableSize{Member: ts.Target, EstimatedBytes: ts.Size.EstimatedBytes}
+	}
+	return sizes
+}
+
+// rankBytes is the figure the section ranks the table by: its estimate, or on
+// a multi-target plan the total across the targets that report one. Nil when
+// no estimate is known.
+func (e tableSizeEntry) rankBytes() *int64 {
+	if !e.multiTarget() {
+		return e.size.EstimatedBytes
+	}
+	total, sized := presentation.SumTableSizeBytes(e.memberSizes())
+	if sized == 0 {
+		return nil
+	}
+	return &total
+}
+
+// hasAnyEstimate reports whether the line carries a byte estimate for at
+// least one target.
+func (e tableSizeEntry) hasAnyEstimate() bool {
+	if !e.multiTarget() {
+		return hasSizeEstimate(e.size)
+	}
+	_, sized := presentation.SumTableSizeBytes(e.memberSizes())
+	return sized > 0
+}
+
+// writeTableSizesSection renders the plan's table-size info section: one line
+// per table the plan will copy, rebuild, or scan (the comment builder
+// attaches sizes only to statements whose cost scales with table size),
+// across every keyspace, placed directly under the DDL. A plan of only
+// metadata-only statements renders no section at all, and neither does a plan
+// where no table has an estimate: an engine that does not estimate sizes
+// would otherwise show "unavailable" on every line, which reads as a failed
+// probe when none ran. Table names carry
+// their keyspace when the plan spans more than one keyspace with sizes, so a
+// shared table name stays unambiguous.
+//
+// Up to presentation.TableSizesInlineLimit tables are listed in plan order;
+// past that the section collapses and lists the largest tables first. A rollout whose
+// targets were all planned shows each table across every target that changes
+// it. A rollout without per-target sizes shows the primary plan's sizes, and
+// the heading names the primary target so they are not read as the whole
+// rollout's.
+//
+// A locked comment that applies automatically renders no section: the
+// operator already saw the sizes on the plan they chose to apply. A locked
+// comment paused for apply-confirm keeps it, because its re-plan can carry
+// statements the primary plan did not, and the operator should see the size
+// of what they are confirming. The rule lives here so every renderer that
+// shows a plan applies it the same way.
+func writeTableSizesSection(sb *strings.Builder, data PlanCommentData) {
+	if data.applyingWithoutConfirmation() {
+		return
+	}
+	entries := tableSizeEntries(data.Changes)
+	var drift *DeploymentDriftData
+	switch {
+	case data.DeploymentDrift != nil && len(data.DeploymentDrift.TableSizes) > 0:
+		entries = targetTableSizeEntries(data.DeploymentDrift.TableSizes)
+	case data.DeploymentDrift != nil:
+		drift = data.DeploymentDrift
+	}
+	if !slices.ContainsFunc(entries, tableSizeEntry.hasAnyEstimate) {
+		return
+	}
+	if len(entries) <= presentation.TableSizesInlineLimit {
+		sb.WriteString("📊 **Table sizes**")
+		if scope := primaryTargetSizeScope(drift, inlineCode); scope != "" {
+			fmt.Fprintf(sb, " (%s)", scope)
+		}
+		sb.WriteString(":\n")
+		writeTableSizeLines(sb, entries)
+		sb.WriteString("\n")
+		return
+	}
+	writeCollapsedTableSizes(sb, entries, primaryTargetSizeScope(drift, summaryCode))
+}
+
+// writeCollapsedTableSizes renders the size section for a plan with more
+// tables than presentation.TableSizesInlineLimit as one collapsed block, its
+// tables largest first. Past presentation.TableSizesShown the smallest tables
+// are counted in a closing line rather than listed, and those of them with no
+// estimate counted apart, since collapsed lines still count toward GitHub's
+// comment size limit and a plan that indexes thousands of tables would
+// otherwise spend on sizes the room its DDL needs.
+func writeCollapsedTableSizes(sb *strings.Builder, entries []tableSizeEntry, scope string) {
+	listed, unlisted, unlistedUnsized := presentation.ListTableSizes(entries, tableSizeEntry.rankBytes)
+	sb.WriteString("<details>\n<summary>📊 <b>Table sizes</b>")
+	if scope != "" {
+		fmt.Fprintf(sb, " (%s)", scope)
+	}
+	sb.WriteString("</summary>\n\n")
+	writeTableSizeLines(sb, listed)
+	if unlisted > 0 {
+		fmt.Fprintf(sb, "- %s\n", presentation.UnlistedTables(unlisted, unlistedUnsized))
+	}
+	sb.WriteString("\n</details>\n\n")
+}
+
+// summaryCode renders a name inside a <summary>, which GitHub reads as HTML
+// rather than markdown: the name is escaped and set in a <code> tag, and
+// flattened first so it cannot carry a line break out of the tag.
+func summaryCode(name string) string {
+	return "<code>" + html.EscapeString(flattenIdentifier(name)) + "</code>"
+}
+
+// primaryTargetSizeScope names the target whose sizes a rollout's section
+// shows when the rollout carries no per-target sizes: the sizes come from the
+// primary plan alone, and a reader would otherwise take them for every
+// target's. The primary target is named, with code, when the rollup
+// identifies it. A plan with no rollup, or a rollup of one member, has no
+// other target, so its sizes need no scope. A rollup that could not be
+// computed names no members, so it cannot say whether other targets exist and
+// claims none.
+func primaryTargetSizeScope(drift *DeploymentDriftData, code func(string) string) string {
+	if drift == nil {
+		return ""
+	}
+	if !drift.Computed || len(drift.Deployments) == 0 {
+		return "primary target only; targets could not be listed"
+	}
+	if len(drift.Deployments) == 1 {
+		return ""
+	}
+	names := driftMemberNames(drift.Deployments)
+	for i, d := range drift.Deployments {
+		if d.Primary {
+			return fmt.Sprintf("primary target %s only; other targets not shown", code(names[i]))
+		}
+	}
+	return "primary target only; other targets not shown"
+}
+
+// tableSizeEntries flattens every keyspace's sized tables into section lines,
+// in plan order.
+func tableSizeEntries(changes []KeyspaceChangeData) []tableSizeEntry {
+	keyspacesWithSizes := 0
+	for _, ks := range changes {
+		if len(ks.TableSizes) > 0 {
+			keyspacesWithSizes++
+		}
+	}
+	qualify := keyspacesWithSizes > 1
+	var entries []tableSizeEntry
+	for _, ks := range changes {
+		for _, ts := range ks.TableSizes {
+			name := ts.Table
+			if qualify {
+				name = ks.Keyspace + "." + ts.Table
+			}
+			entries = append(entries, tableSizeEntry{name: name, size: ts})
+		}
+	}
+	return entries
+}
+
+// targetTableSizeEntries groups every target's sizes into one section line per
+// table, in the order the tables first appear in rollout order, each line
+// carrying the table's estimate on every target that changes it.
+func targetTableSizeEntries(sizes []TargetTableSize) []tableSizeEntry {
+	keyspaces := make(map[string]struct{})
+	for _, ts := range sizes {
+		keyspaces[ts.Keyspace] = struct{}{}
+	}
+	qualify := len(keyspaces) > 1
+	type tableKey struct{ keyspace, table string }
+	at := make(map[tableKey]int)
+	var entries []tableSizeEntry
+	for _, ts := range sizes {
+		key := tableKey{ts.Keyspace, ts.Size.Table}
+		i, seen := at[key]
+		if !seen {
+			name := ts.Size.Table
+			if qualify {
+				name = ts.Keyspace + "." + ts.Size.Table
+			}
+			i = len(entries)
+			at[key] = i
+			entries = append(entries, tableSizeEntry{name: name, perTarget: []TargetTableSize{}})
+		}
+		entries[i].perTarget = append(entries[i].perTarget, ts)
+	}
+	return entries
+}
+
+func writeTableSizeLines(sb *strings.Builder, entries []tableSizeEntry) {
+	for _, e := range entries {
+		fmt.Fprintf(sb, "- %s: %s\n", inlineCode(e.name), formatTableSizeEntry(e))
+	}
+}
+
+// formatTableSizeEntry renders a section line's size clause. On a multi-target
+// plan the clause is the shared rollout size clause, with each target in code.
+func formatTableSizeEntry(e tableSizeEntry) string {
+	if !e.multiTarget() {
+		return formatTableSize(e.size)
+	}
+	return presentation.FormatMemberTableSize(presentation.TargetNoun, e.memberSizes(), inlineCode)
+}
+
+// hasSizeEstimate reports that the table's on-disk footprint is known. The
+// section shows bytes alone: they track how long a copy or index build runs
+// on every engine that reports a size.
+func hasSizeEstimate(ts TableSizeData) bool {
+	return ts.EstimatedBytes != nil
+}
+
+// formatTableSize renders one table's size clause: the estimated bytes and,
+// for a sharded target, the shard span. A table with no estimate is stated
+// explicitly — operators must never mistake a failed size probe for a small
+// table.
+func formatTableSize(ts TableSizeData) string {
+	if !hasSizeEstimate(ts) {
+		if ts.ShardCount > 0 {
+			return fmt.Sprintf("size estimate unavailable · %d %s", ts.ShardCount, pluralize("shard", ts.ShardCount))
+		}
+		return "size estimate unavailable"
+	}
+	size := ui.FormatApproxBytes(*ts.EstimatedBytes)
+	if ts.ShardCount > 0 {
+		size += fmt.Sprintf(" across %d %s", ts.ShardCount, pluralize("shard", ts.ShardCount))
+	}
+	return size
+}
+
 // writePlanDDLBlocks writes one fenced SQL block per statement, in plan
 // order, so a reviewer reads each table's change on its own instead of
 // picking it out of one run of every statement in the plan. Each statement is
@@ -1215,10 +1743,17 @@ func countPlanDDLBlocks(changes []KeyspaceChangeData) int {
 // statement that is neither a single statement nor a valid create set is
 // still rendered as written, and the reason is logged for triage.
 func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema.Dialect, budget *ddlBlockBudget) {
+	writeSQLFencedBlocks(sb, formatDDLBlocks(statements, dialect), budget)
+	sb.WriteString("\n")
+}
+
+// formatDDLBlocks formats each statement as the content of its own SQL block,
+// as writePlanDDLBlocks describes.
+func formatDDLBlocks(statements []string, dialect schema.Dialect) []string {
 	blocks := make([]string, 0, len(statements))
 	parser, parserErr := ddl.ParserForDialect(dialect)
 	if parserErr != nil {
-		slog.Warn("plan DDL block cannot split create sets; multi-statement DDL will be rendered as written",
+		slog.Warn("DDL block cannot split create sets; multi-statement DDL will be rendered as written",
 			"dialect", dialect, "error", parserErr)
 	}
 	for _, stmt := range statements {
@@ -1227,7 +1762,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 			if _, _, classifyErr := parser.Classify(stmt); classifyErr != nil {
 				createSet, createSetErr := ddl.ParseCreateSet(parser, stmt)
 				if createSetErr != nil {
-					slog.Warn("plan DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
+					slog.Warn("DDL block could not classify a statement or parse it as a supported create set; it will be rendered as written",
 						"dialect", dialect, "classify_error", classifyErr, "create_set_error", createSetErr)
 				} else {
 					statementsToFormat = createSet.Statements
@@ -1240,8 +1775,7 @@ func writePlanDDLBlocks(sb *strings.Builder, statements []string, dialect schema
 		}
 		blocks = append(blocks, strings.Join(formattedCreateSet, "\n"))
 	}
-	writeSQLFencedBlocks(sb, blocks, budget)
-	sb.WriteString("\n")
+	return blocks
 }
 
 // writeShardedPlanDDL renders a sharded keyspace's DDL grouped by change: shards
@@ -1340,16 +1874,13 @@ func shardGroupSignature(s KeyspaceShardChange) string {
 // for one.
 const shardNamesInlineLimit = 8
 
-// planGroupNoun is what the members of a plan group are called: the shards of a
-// keyspace, or the targets of a rollout. Both render through the same group
-// headings, so a rollout whose targets need different work reads the way a
-// keyspace whose shards do.
-type planGroupNoun struct{ singular, plural string }
-
+// A plan group's members render through the same group headings whatever
+// they are called, so a rollout whose targets need different work reads the
+// way a keyspace whose shards do.
 var (
-	shardNoun      = planGroupNoun{singular: "shard", plural: "shards"}
-	targetNoun     = planGroupNoun{singular: "target", plural: "targets"}
-	deploymentNoun = planGroupNoun{singular: "deployment", plural: "deployments"}
+	shardNoun      = presentation.ShardNoun
+	targetNoun     = presentation.TargetNoun
+	deploymentNoun = presentation.DeploymentNoun
 )
 
 // planShardList renders a group's shards as "shard `x`" or "shards `x`, `y`"
@@ -1362,15 +1893,15 @@ func planShardList(shards []string, totalShards int) string {
 	return planGroupList(shardNoun, shards, totalShards)
 }
 
-func planGroupList(noun planGroupNoun, members []string, total int) string {
+func planGroupList(noun presentation.Noun, members []string, total int) string {
 	if len(members) > shardNamesInlineLimit {
-		return groupCoveragePhrase(noun, len(members), total)
+		return presentation.CoveragePhrase(noun, len(members), total)
 	}
 	quoted := inlineCodeList(members)
 	if len(quoted) == 1 {
-		return noun.singular + " " + quoted[0]
+		return noun.Singular + " " + quoted[0]
 	}
-	return noun.plural + " " + strings.Join(quoted, ", ")
+	return noun.Plural + " " + strings.Join(quoted, ", ")
 }
 
 // shardCoveragePhrase states how much of a keyspace a shard group covers:
@@ -1378,17 +1909,7 @@ func planGroupList(noun planGroupNoun, members []string, total int) string {
 // a subset, or a bare count when the keyspace total is unknown — a subset
 // must never read like whole-keyspace coverage.
 func shardCoveragePhrase(count, totalShards int) string {
-	return groupCoveragePhrase(shardNoun, count, totalShards)
-}
-
-func groupCoveragePhrase(noun planGroupNoun, count, total int) string {
-	if count == total {
-		return fmt.Sprintf("all %d %s", count, noun.plural)
-	}
-	if total > 0 {
-		return fmt.Sprintf("%d of %d %s", count, total, noun.plural)
-	}
-	return fmt.Sprintf("%d %s", count, noun.plural)
+	return presentation.CoveragePhrase(shardNoun, count, totalShards)
 }
 
 // writeShardGroupHeading writes a shard group's bold heading above its DDL
@@ -1401,13 +1922,55 @@ func writeShardGroupHeading(sb *strings.Builder, shards []string, totalShards in
 	writeGroupHeading(sb, shardNoun, shards, totalShards)
 }
 
-func writeGroupHeading(sb *strings.Builder, noun planGroupNoun, members []string, total int) {
+// writeNamespaceLabel labels one keyspace's changes, or its VSchema diff: a
+// heading in a plan of its own, a bold line under a target group's heading.
+// value is the keyspace the label names, empty for a bare label.
+func writeNamespaceLabel(sb *strings.Builder, data PlanCommentData, label, value string) {
+	switch {
+	case data.namespaceLabelsInline && value != "":
+		fmt.Fprintf(sb, "**%s**: %s\n\n", label, value)
+	case data.namespaceLabelsInline:
+		fmt.Fprintf(sb, "**%s**\n\n", label)
+	case value != "":
+		fmt.Fprintf(sb, "#### %s: %s\n", label, value)
+	default:
+		fmt.Fprintf(sb, "#### %s\n", label)
+	}
+}
+
+// writeTargetGroupHeading heads the targets of a rollout that run one plan, at
+// the given heading level: one level above the namespaces under it, so each
+// target group reads as its own section. A lone target is named in the
+// heading. A group is headed by how many targets it holds, and how many the
+// rollout has when it holds only some, so the heading stays one short line
+// however many targets the group holds; the names follow on their own line,
+// collapsed when too many to read inline. The names stay whole, as an
+// operator addresses each target.
+func writeTargetGroupHeading(sb *strings.Builder, level string, members []string, total int) {
+	if len(members) == 1 {
+		fmt.Fprintf(sb, "%s Target %s\n\n", level, inlineCode(members[0]))
+		return
+	}
+	count := presentation.CoveragePhrase(targetNoun, len(members), total)
+	if len(members) == total {
+		count = fmt.Sprintf("%d %s", total, targetNoun.Plural)
+	}
+	fmt.Fprintf(sb, "%s %s\n\n", level, count)
+	names := strings.Join(inlineCodeList(members), ", ")
+	if len(members) <= shardNamesInlineLimit {
+		fmt.Fprintf(sb, "%s\n\n", names)
+		return
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>Target names</summary>\n\n%s\n\n</details>\n\n", names)
+}
+
+func writeGroupHeading(sb *strings.Builder, noun presentation.Noun, members []string, total int) {
 	if len(members) <= shardNamesInlineLimit {
 		fmt.Fprintf(sb, "**%s**\n\n", planGroupList(noun, members, total))
 		return
 	}
 	fmt.Fprintf(sb, "<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
-		groupCoveragePhrase(noun, len(members), total), strings.Join(inlineCodeList(members), ", "))
+		presentation.CoveragePhrase(noun, len(members), total), strings.Join(inlineCodeList(members), ", "))
 }
 
 // writeDeploymentDrift renders the review-time drift rollup: a single uniform
@@ -1451,7 +2014,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 		// targets that run it, with any change a target will refuse disclosed
 		// under that plan, which says everything this line and the per-target
 		// list would.
-		if rendersTargetPlans(drift) {
+		if RendersTargetPlans(drift) {
 			return
 		}
 		// Independent members were deliberately never compared to each other, so
@@ -1468,7 +2031,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 		// reconcile targets that are supposed to differ.
 		sb.WriteString(glyph.Attention + " **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:\n\n")
 	default:
-		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the reviewed plan, so the plan check is failing closed:\n\n")
+		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the primary target's plan, so the plan check is failing closed:\n\n")
 	}
 	// A clean rollup has nothing more to say unless some member will refuse a
 	// change at apply, which the per-member list below is the only place to
@@ -1513,7 +2076,7 @@ func driftMemberLine(drift *DeploymentDriftData, d DeploymentDriftEntry, name st
 	}
 	switch d.Class {
 	case "match":
-		return fmt.Sprintf("- %s ✅ matches the reviewed plan%s\n", name, blockedSuffix(d.Blocked))
+		return fmt.Sprintf("- %s ✅ matches the primary target's plan%s\n", name, blockedSuffix(d.Blocked))
 	case "planned":
 		return fmt.Sprintf("- %s ✅ planned against its own schema%s\n", name, blockedSuffix(d.Blocked))
 	case "diverged":
@@ -1521,7 +2084,7 @@ func driftMemberLine(drift *DeploymentDriftData, d DeploymentDriftEntry, name st
 	default:
 		// An errored member means different things under the two contracts:
 		// a mirrored member's diff could not be confirmed against the
-		// reviewed plan, while an independent member has no plan at all.
+		// primary plan, while an independent member has no plan at all.
 		reason := "could not verify"
 		if drift.Independent {
 			reason = "could not plan"
@@ -1547,9 +2110,9 @@ func driftMemberNeedsAttention(d DeploymentDriftEntry) bool {
 // is classified under the same contract, so they share one outcome.
 func quietMembersSummary(drift *DeploymentDriftData, count int) string {
 	if drift.Independent {
-		return fmt.Sprintf("%s ✅ planned against their own schemas", groupCoveragePhrase(targetNoun, count, len(drift.Deployments)))
+		return fmt.Sprintf("%s ✅ planned against their own schemas", presentation.CoveragePhrase(targetNoun, count, len(drift.Deployments)))
 	}
-	return fmt.Sprintf("%s ✅ match the reviewed plan", groupCoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
+	return fmt.Sprintf("%s ✅ match the primary target's plan", presentation.CoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
 }
 
 func anyDeploymentBlocked(deployments []DeploymentDriftEntry) bool {
@@ -1573,15 +2136,15 @@ func blockedSuffix(blocked int) string {
 // rolloutAtThisSchema reports whether a clean rollout has nothing left to apply
 // on any member, so the comment's no-changes line speaks for all of them.
 //
-// Mirrored members run the reviewed plan, so the reviewed plan answers for all
+// Mirrored members run the primary plan, so the primary plan answers for all
 // of them. Independent members answer only through their own grouped plans; a
 // rollup that carries none has not shown that the other targets have nothing to
 // run.
-func rolloutAtThisSchema(drift *DeploymentDriftData, reviewed []KeyspaceChangeData) bool {
+func rolloutAtThisSchema(drift *DeploymentDriftData, primary []KeyspaceChangeData) bool {
 	if !drift.Clean || anyDeploymentBlocked(drift.Deployments) {
 		return false
 	}
-	statements, vschema := countChanges(reviewed)
+	statements, vschema := countChanges(primary)
 	if statements+vschema > 0 {
 		return false
 	}
@@ -1591,20 +2154,20 @@ func rolloutAtThisSchema(drift *DeploymentDriftData, reviewed []KeyspaceChangeDa
 	return true
 }
 
-// rendersTargetPlans reports whether the comment renders the rollout's plans one
-// group of targets at a time instead of the reviewed plan alone: a clean
+// RendersTargetPlans reports whether the comment renders the rollout's plans one
+// group of targets at a time instead of the primary plan alone: a clean
 // rollout of independent targets in which some target still has work.
 //
-// Each such target applies its own plan, so the reviewed plan describes only
+// Each such target applies its own plan, so the primary plan describes only
 // the targets that share it. Rendering it alone would leave a reviewer to
 // approve statements the comment never showed.
-func rendersTargetPlans(drift *DeploymentDriftData) bool {
+func RendersTargetPlans(drift *DeploymentDriftData) bool {
 	return drift != nil && drift.Computed && drift.Clean && drift.Independent && changingTargetCount(drift) > 0
 }
 
-// targetPlanChanges is the plan a group of targets renders. The reviewed
-// target's group renders the reviewed plan itself, so what a reviewer reads for
-// it is exactly what the rest of the comment describes; every other group
+// targetPlanChanges is the plan a group of targets renders. The primary
+// target's group renders the primary's plan itself, so what a reviewer reads
+// for it is exactly what the plan-wide sections describe; every other group
 // renders its own members' plan.
 func targetPlanChanges(g DeploymentPlanGroup, data PlanCommentData) []KeyspaceChangeData {
 	if g.Primary && hasChanges(data.Changes) {
@@ -1614,8 +2177,8 @@ func targetPlanChanges(g DeploymentPlanGroup, data PlanCommentData) []KeyspaceCh
 }
 
 // targetPlanID is the stored plan a target group's DDL comes from, the one a
-// reader who cannot see all of it is pointed at. The primary runs the reviewed
-// plan itself and has no member plan of its own.
+// reader who cannot see all of it is pointed at. The primary's group runs the
+// primary's own plan and has no member plan of its own.
 func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
 	if g.Primary {
 		return data.PlanID
@@ -1626,28 +2189,42 @@ func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
 // writeTargetPlans renders the rollout's plans the way a sharded keyspace
 // renders its shards: one heading per group naming the targets that run it,
 // with the group's DDL under it, and a group already at the desired schema
-// saying so in place of DDL. More than one group is introduced as divergence,
-// and a single group still names its targets, so every target is shown with
-// the plan it runs. collapse folds a plan with more than one change into a
+// saying so in place of DDL. A single group still names its targets, so every
+// target is shown with the plan it runs. collapse folds a plan with more than one change into a
 // details block, as a multi-environment section does for its own plan.
 func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget, collapse bool) {
 	drift := data.DeploymentDrift
-	if len(drift.Plans) > 1 {
-		sb.WriteString("Targets diverge — what applies where:\n\n")
-	}
 	// Targets with work lead, as changing shards do: they are what the apply
-	// will run, and the targets already at the schema follow them.
+	// will run, and the targets already at the schema follow them. Among
+	// groups with work the largest leads, since it is what most targets will
+	// run; no group leads for holding the primary, as an approval covers
+	// every group alike.
 	plans := slices.Clone(drift.Plans)
 	slices.SortStableFunc(plans, func(a, b DeploymentPlanGroup) int {
-		return compareWorkFirst(a.Empty(), b.Empty())
+		if c := compareWorkFirst(a.Empty(), b.Empty()); c != 0 {
+			return c
+		}
+		return len(b.Members) - len(a.Members)
 	})
+	// A target group sits one level above its namespaces. In a plan of its
+	// own that is a section heading over namespace headings; inside an
+	// environment's section it drops a level, and its namespaces become
+	// bold labels so none outranks the target it sits under.
+	level, namespaceLabelsInline := "###", false
+	if collapse {
+		level, namespaceLabelsInline = "####", true
+	}
 	for _, g := range plans {
-		writeGroupHeading(sb, targetNoun, g.Members, len(drift.Deployments))
+		writeTargetGroupHeading(sb, level, g.Members, len(drift.Deployments))
 		if g.Empty() {
 			sb.WriteString(groupNoChanges + "\n\n")
+			if g.Primary {
+				writePrimaryTargetDisclosures(sb, data, g)
+			}
 			continue
 		}
 		group := data
+		group.namespaceLabelsInline = namespaceLabelsInline
 		group.Changes = targetPlanChanges(g, data)
 		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)
@@ -1663,16 +2240,140 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		if len(g.BlockedChanges) > 0 {
 			writeBlockedChanges(sb, g.BlockedChanges)
 		}
+		// A direct change is disclosed the same way, naming the targets that
+		// run its write-blocking DDL.
+		if len(g.DirectChanges) > 0 {
+			writeDirectChanges(sb, g.DirectChanges, data.DatabaseType, data.IsMySQL, data.directNotesDeferCutover())
+		}
+		// So is an unsafe change, which `--allow-unsafe` consents to on every
+		// target. The primary's group discloses its own with the primary
+		// plan's, and the locked comment omits them as it omits the primary
+		// plan's: the apply reached it only under the opt-in.
+		if g.Primary {
+			writePrimaryTargetDisclosures(sb, data, g)
+		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && !data.IsLocked {
+			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL)
+		}
 	}
+}
+
+// writePrimaryTargetDisclosures writes, under the primary target's group, the
+// disclosures read from the primary target: the copies already on it and the
+// unsafe changes in its plan, with any its group's other targets carry beyond
+// them. Written after the last group instead, they would sit under whichever
+// target's heading came last and read as that target's. Copies are read from
+// the primary only, so in a group of several targets they name it. The
+// findings carry the same attribution notes the plan-wide warning would, since
+// the attribution section folds into them on the same condition.
+func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g DeploymentPlanGroup) {
+	if hasExistingCopies(data) && len(g.Members) > 1 {
+		fmt.Fprintf(sb, "On the primary target %s:\n\n", inlineCode(g.Members[0]))
+	}
+	writeExistingCopies(sb, data)
+	if data.IsLocked {
+		return
+	}
+	var unsafe []UnsafeChangeData
+	if data.HasUnsafeChanges {
+		unsafe = append(unsafe, data.UnsafeChanges...)
+	}
+	unsafe = append(unsafe, g.unsafeBeyondPrimaryPlan()...)
+	if len(unsafe) > 0 {
+		notes, _ := unsafeAttributionNotes(data, data.HasUnsafeChanges && len(data.UnsafeChanges) > 0)
+		writeUnsafeWarning(sb, unsafe, notes, data.DatabaseType, data.IsMySQL)
+	}
+}
+
+func hasExistingCopies(data PlanCommentData) bool {
+	return len(data.DiscardedCopies) > 0 || len(data.AdoptedCopies) > 0 || len(data.RunningCopies) > 0
+}
+
+// writeExistingCopies writes the copies already on the target: those applying
+// would discard, resume, or join.
+func writeExistingCopies(sb *strings.Builder, data PlanCommentData) {
+	if len(data.DiscardedCopies) > 0 {
+		writeDiscardedCopies(sb, data.DiscardedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.AdoptedCopies) > 0 {
+		writeAdoptedCopies(sb, data.AdoptedCopies, data.applyingWithoutConfirmation())
+	}
+	if len(data.RunningCopies) > 0 {
+		writeRunningCopies(sb, data.RunningCopies, data.applyingWithoutConfirmation())
+	}
+}
+
+// TargetPlanUnsafeChanges lists the unsafe changes the rendered target plans
+// carry beyond the primary plan's own, each naming the targets that carry it,
+// so the unsafe gate and its refusal cover every target an apply runs. Empty
+// when the drift renders no target plans.
+func TargetPlanUnsafeChanges(drift *DeploymentDriftData) []UnsafeChangeData {
+	if !RendersTargetPlans(drift) {
+		return nil
+	}
+	var out []UnsafeChangeData
+	for _, g := range drift.Plans {
+		for _, c := range g.unsafeBeyondPrimaryPlan() {
+			if len(c.Targets) == 0 {
+				c.Targets = slices.Clone(g.Members)
+				c.TotalTargets = 0
+			}
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// unsafeBeyondPrimaryPlan lists the group's unsafe changes the primary plan
+// does not already disclose. That is every one of a group other than the
+// primary target's. The primary target's group shares its DDL, but each
+// target's unsafe verdict is read from that target's own schema, so a sibling
+// can find a statement unsafe that the primary target does not: those are the
+// changes listed with targets that leave the primary target, its first
+// member, out.
+func (g DeploymentPlanGroup) unsafeBeyondPrimaryPlan() []UnsafeChangeData {
+	if !g.Primary {
+		return g.UnsafeChanges
+	}
+	if len(g.Members) == 0 {
+		return nil
+	}
+	primary := g.Members[0]
+	var out []UnsafeChangeData
+	for _, c := range g.UnsafeChanges {
+		// A change every member carries names no targets, and the primary
+		// target is one of them.
+		if len(c.Targets) == 0 || slices.Contains(c.Targets, primary) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// targetPlansDiscloseDirect reports whether the rendered target plans carry
+// the primary plan's direct changes under the primary target's own group, so
+// the plan-wide section would only repeat them. The primary plan whose group
+// carries none keeps the plan-wide section, so the comment never leaves a direct
+// statement unsaid because the two sources disagree.
+func targetPlansDiscloseDirect(data PlanCommentData) bool {
+	if !RendersTargetPlans(data.DeploymentDrift) {
+		return false
+	}
+	for _, g := range data.DeploymentDrift.Plans {
+		if g.Primary {
+			return len(g.DirectChanges) > 0
+		}
+	}
+	return false
 }
 
 // targetPlansDiscloseBlocked reports whether the rendered target plans carry
 // the plan's blocked changes under their own groups, so the plan-wide section
-// would only repeat them. A reviewed plan with blocked changes that no group
+// would only repeat them. The primary plan with blocked changes that no group
 // carries keeps the plan-wide section: a refused change is never left unsaid
 // because the two sources disagree.
 func targetPlansDiscloseBlocked(data PlanCommentData) bool {
-	if !rendersTargetPlans(data.DeploymentDrift) {
+	if !RendersTargetPlans(data.DeploymentDrift) {
 		return false
 	}
 	for _, g := range data.DeploymentDrift.Plans {
@@ -1736,9 +2437,9 @@ func combinedTargetPlanChanges(data PlanCommentData) []KeyspaceChangeData {
 }
 
 // countCommentDDLBlocks counts the DDL sections a plan's comment renders: the
-// reviewed plan's, or every target plan's when the rollout renders them.
+// primary plan's, or every target plan's when the rollout renders them.
 func countCommentDDLBlocks(data PlanCommentData) int {
-	if !rendersTargetPlans(data.DeploymentDrift) {
+	if !RendersTargetPlans(data.DeploymentDrift) {
 		return countPlanDDLBlocks(data.Changes)
 	}
 	count := 0
@@ -1838,6 +2539,9 @@ func writeDirectChanges(sb *strings.Builder, changes []DirectChangeData, databas
 		if len(c.Shards) > 0 {
 			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
 		}
+		if len(c.Targets) > 0 {
+			table = fmt.Sprintf("%s on %s", table, planGroupList(targetNoun, c.Targets, c.TotalTargets))
+		}
 		writeEngineReasonItem(sb, table, c.Reason)
 	}
 	sb.WriteString("\n" + footer + "\n\n")
@@ -1865,19 +2569,70 @@ func writeEngineReasonItem(sb *strings.Builder, table, reason string) {
 	}
 }
 
-func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, databaseType string, isMySQL bool) {
+// writeUnsafeWarning lists the unsafe findings. attributionNotes, keyed by
+// table, carries the attribution for tables another pull request changed, so
+// the reader learns where a change came from on the finding itself.
+func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attributionNotes map[string]string, databaseType string, isMySQL bool) {
 	n := countUnsafeFindings(changes)
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	item := 0
 	for _, c := range changes {
-		table := inlineCode(c.Table)
-		if len(c.Shards) > 0 {
-			table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
-		}
-		writeUnsafeChangeItem(sb, &item, table, c.Reason, c.ChangeType)
+		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, attributionNotes[c.Table])
+	}
+	if len(attributionNotes) > 0 {
+		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
 	}
 	sb.WriteString("\n")
 	writeUnsafeDropGuidance(sb, changes, databaseType, isMySQL)
+}
+
+// unsafeChangeLabel names an unsafe change's table, with the shards and the
+// targets that carry it when that is not all of them.
+func unsafeChangeLabel(c UnsafeChangeData) string {
+	table := inlineCode(c.Table)
+	if len(c.Shards) > 0 {
+		table = fmt.Sprintf("%s (%s)", table, planShardList(c.Shards, c.TotalShards))
+	}
+	if len(c.Targets) > 0 {
+		table = fmt.Sprintf("%s on %s", table, planGroupList(targetNoun, c.Targets, c.TotalTargets))
+	}
+	return table
+}
+
+// unsafeAttributionNotes returns, keyed by table, the note each attributed
+// table's unsafe findings carry, and whether the attribution is folded into
+// the unsafe warning. It folds only when that warning is shown and lists every
+// attributed table; otherwise the attribution keeps its own section, so no
+// disclosure is lost.
+func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (map[string]string, bool) {
+	if !unsafeShown || len(data.AttributedChanges) == 0 {
+		return nil, false
+	}
+	unsafeTables := make(map[string]bool, len(data.UnsafeChanges))
+	for _, c := range data.UnsafeChanges {
+		unsafeTables[c.Table] = true
+	}
+	notes := make(map[string]string, len(data.AttributedChanges))
+	for _, a := range data.AttributedChanges {
+		if !unsafeTables[a.Table] {
+			return nil, false
+		}
+		if a.Unresolved {
+			notes[a.Table] = "ownership could not be established"
+			continue
+		}
+		notes[a.Table] = "changed by open PR " + pullRequestRef(data.Repository, a.Repository, a.PullRequest)
+	}
+	return notes, true
+}
+
+// pullRequestRef links a pull request, by number alone when it is in the
+// repository the comment is posted on and by repo#number otherwise.
+func pullRequestRef(commentRepo, repo string, pr int) string {
+	if commentRepo != "" && repo == commentRepo {
+		return fmt.Sprintf("[#%d](%s)", pr, caller.PullRequestURL(repo, pr))
+	}
+	return caller.PullRequestMarkdownLink(repo, pr)
 }
 
 // writeUnsafeChangeItem writes one table's unsafe findings, one numbered line
@@ -1886,20 +2641,24 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, databas
 // number across tables; a change with no parseable reason still gets a line,
 // carrying the engine's change type when one is known so the finding explains
 // itself.
-func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason, changeType string) {
+func writeUnsafeChangeItem(sb *strings.Builder, n *int, table, reason, changeType, note string) {
+	suffix := ""
+	if note != "" {
+		suffix = " (" + note + ")"
+	}
 	reasons := ui.LintReasons(reason)
 	if len(reasons) == 0 {
 		*n++
 		if changeType != "" {
-			fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, changeType)
+			fmt.Fprintf(sb, "%d. %s: %s%s\n", *n, table, changeType, suffix)
 		} else {
-			fmt.Fprintf(sb, "%d. %s\n", *n, table)
+			fmt.Fprintf(sb, "%d. %s%s\n", *n, table, suffix)
 		}
 		return
 	}
 	for _, r := range reasons {
 		*n++
-		fmt.Fprintf(sb, "%d. %s: %s\n", *n, table, ui.CodeQuoteIdentifiers(r))
+		fmt.Fprintf(sb, "%d. %s: %s%s\n", *n, table, ui.CodeQuoteIdentifiers(r), suffix)
 	}
 }
 
@@ -1929,7 +2688,7 @@ func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, da
 		return
 	}
 
-	sb.WriteString("**Destructive drop guidance:**\n\n")
+	sb.WriteString("<details>\n<summary>Destructive drop guidance</summary>\n\n")
 	if hasApplicationUsageTarget {
 		fmt.Fprintf(sb, "Before allowing a destructive drop, first deploy application code that no longer reads from or writes to %s.\n\n", applicationUsageTarget)
 	}
@@ -1940,6 +2699,7 @@ func writeUnsafeDropGuidance(sb *strings.Builder, changes []UnsafeChangeData, da
 			fmt.Fprintf(sb, "Before allowing a destructive drop, verify application queries no longer rely on %s for safe performance.\n\n", indexInvisibleTarget)
 		}
 	}
+	sb.WriteString("</details>\n\n")
 }
 
 func unsafeDropApplicationUsageTarget(drops unsafeDropCounts) (string, bool) {
@@ -2055,16 +2815,15 @@ const lintWarningsFoldThreshold = 5
 // table prefixes, and identifiers as inline code.
 func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 	n := len(warnings)
+	if n == 0 {
+		return
+	}
+	count := fmt.Sprintf("%d advisory %s", n, pluralize("finding", n))
 
 	if n <= lintWarningsFoldThreshold {
-		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: %d advisory %s\n", n, pluralize("finding", n))
+		fmt.Fprintf(sb, "\U0001f4a1 **Lint Warnings**: %s\n", count)
 		for _, w := range warnings {
-			message := ui.CodeQuoteIdentifiers(w.Message)
-			if w.Table != "" {
-				fmt.Fprintf(sb, "- %s: %s\n", inlineCode(w.Table), message)
-			} else {
-				fmt.Fprintf(sb, "- %s\n", message)
-			}
+			writeLintLine(sb, w.Table, w)
 		}
 		sb.WriteString("\n")
 		return
@@ -2072,13 +2831,13 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 
 	// GitHub renders <summary> content as HTML, not markdown, so the folded
 	// header bolds with <b> tags instead of asterisks.
-	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: %d advisory %s</summary>\n\n", n, pluralize("finding", n))
+	fmt.Fprintf(sb, "<details>\n<summary>\U0001f4a1 <b>Lint Warnings</b>: %s</summary>\n\n", count)
 	for _, group := range groupLintWarningsByTable(warnings) {
 		if group.table != "" {
 			fmt.Fprintf(sb, "**%s**\n", inlineCode(group.table))
 		}
-		for _, message := range group.messages {
-			fmt.Fprintf(sb, "- %s\n", ui.CodeQuoteIdentifiers(message))
+		for _, w := range group.warnings {
+			writeLintLine(sb, "", w)
 		}
 		sb.WriteString("\n")
 	}
@@ -2087,7 +2846,117 @@ func writeLintViolations(sb *strings.Builder, warnings []LintViolationData) {
 
 type lintWarningGroup struct {
 	table    string
-	messages []string
+	warnings []LintViolationData
+}
+
+// writeLintLine writes one finding as a list item, led by its table, if
+// given, and by the targets that raised it when not every target did. Targets
+// too many to name inline read as coverage on the line, with their names
+// collapsed beneath it.
+func writeLintLine(sb *strings.Builder, table string, w LintViolationData) {
+	message := ui.CodeQuoteIdentifiers(w.Message)
+	if label := lintLabel(table, w); label != "" {
+		fmt.Fprintf(sb, "- %s: %s\n", label, message)
+	} else {
+		fmt.Fprintf(sb, "- %s\n", message)
+	}
+	if len(w.Targets) > shardNamesInlineLimit {
+		fmt.Fprintf(sb, "  <details>\n  <summary>Target names</summary>\n\n  %s\n\n  </details>\n\n",
+			strings.Join(inlineCodeList(w.Targets), ", "))
+	}
+}
+
+// lintLabel is the label a lint finding's line leads with: its table, if
+// given, and the targets that raised it when not every target did.
+func lintLabel(table string, w LintViolationData) string {
+	var label string
+	if table != "" {
+		label = inlineCode(table)
+	}
+	if len(w.Targets) == 0 {
+		return label
+	}
+	targets := planGroupList(targetNoun, w.Targets, w.TotalTargets)
+	if label == "" {
+		return "on " + targets
+	}
+	return label + " on " + targets
+}
+
+// writePlanWideLint writes the plan's lint section, after its DDL. A plan that
+// renders target plans discloses every target's findings here, in one
+// section, rather than under each target group: almost every finding is about
+// the schema all targets are brought to, so the groups would repeat it.
+func writePlanWideLint(sb *strings.Builder, own []LintViolationData, drift *DeploymentDriftData, targetPlans bool) {
+	if !targetPlans {
+		writeLintViolations(sb, own)
+		return
+	}
+	writeLintViolations(sb, targetLint(drift))
+}
+
+// targetLint merges the target groups' lint findings into one list, sorted by
+// table so a table's findings sit together. A finding every target with work
+// raised names no targets, reading as a single-target plan's would. One only
+// some targets raised, as drift in a table's other columns or a table's own
+// AUTO_INCREMENT counter can cause, names them in rollout order. A target
+// already at the desired schema has no changes to lint, so it does not keep a
+// finding from naming no targets.
+func targetLint(drift *DeploymentDriftData) []LintViolationData {
+	var merged []LintViolationData
+	var raisers [][]string
+	for _, g := range drift.Plans {
+		for _, f := range g.LintViolations {
+			i := slices.IndexFunc(merged, func(m LintViolationData) bool { return sameLintFinding(m, f) })
+			if i < 0 {
+				merged = append(merged, LintViolationData{Message: f.Message, Table: f.Table, LinterName: f.LinterName, CanAutoFix: f.CanAutoFix})
+				raisers = append(raisers, nil)
+				i = len(merged) - 1
+			}
+			raisers[i] = append(raisers[i], groupLintRaisers(g, f)...)
+		}
+	}
+	order := driftMemberNames(drift.Deployments)
+	for i := range merged {
+		if raisedByEveryTargetWithWork(drift.Plans, raisers[i]) {
+			continue
+		}
+		targets := raisers[i]
+		slices.SortStableFunc(targets, func(a, b string) int { return slices.Index(order, a) - slices.Index(order, b) })
+		merged[i].Targets = slices.Compact(targets)
+		merged[i].TotalTargets = len(drift.Deployments)
+	}
+	slices.SortStableFunc(merged, func(a, b LintViolationData) int { return strings.Compare(a.Table, b.Table) })
+	return merged
+}
+
+// groupLintRaisers names the group's targets that raised a finding: those it
+// names, or every target in the group when it names none.
+func groupLintRaisers(g DeploymentPlanGroup, f LintViolationData) []string {
+	if len(f.Targets) > 0 {
+		return f.Targets
+	}
+	return g.Members
+}
+
+// raisedByEveryTargetWithWork reports whether every target in a group with
+// work is among those that raised a finding.
+func raisedByEveryTargetWithWork(groups []DeploymentPlanGroup, raisers []string) bool {
+	for _, g := range groups {
+		if g.Empty() {
+			continue
+		}
+		for _, m := range g.Members {
+			if !slices.Contains(raisers, m) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func sameLintFinding(a, b LintViolationData) bool {
+	return a.Table == b.Table && a.Message == b.Message
 }
 
 // groupLintWarningsByTable groups warnings by table in first-appearance order,
@@ -2103,7 +2972,7 @@ func groupLintWarningsByTable(warnings []LintViolationData) []lintWarningGroup {
 			index[w.Table] = i
 			groups = append(groups, lintWarningGroup{table: w.Table})
 		}
-		groups[i].messages = append(groups[i].messages, w.Message)
+		groups[i].warnings = append(groups[i].warnings, w)
 	}
 	// Untabled warnings read as general notes; surface them first rather
 	// than wherever they happened to appear in the linter output.
@@ -2367,13 +3236,14 @@ func titleDatabaseType(databaseType string) string {
 func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, budget *ddlBlockBudget) {
 	// Deployment drift is shown before the change list and before the no-changes
 	// short-circuit: a non-primary deployment can drift even when this
-	// environment's reviewed primary plan is a clean no-op.
+	// environment's primary plan is a clean no-op.
 	writeDeploymentDrift(sb, plan.DeploymentDrift, plan.Changes)
-	targetPlans := rendersTargetPlans(plan.DeploymentDrift)
+	targetPlans := RendersTargetPlans(plan.DeploymentDrift)
 	summary := *plan
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
 		summary.Changes = combinedTargetPlanChanges(*plan)
+		summary.PlanSummaryScope = targetPlansScope(plan.DeploymentDrift)
 	}
 
 	totalStatements, keyspaceUpdates := countChanges(plan.Changes)
@@ -2382,11 +3252,16 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 
 	// The ignore_namespaces disclosure renders under each environment's
 	// summary (writePlanSummary) or no-changes message, because entries can
-	// resolve differently per environment. A reviewed target with nothing to
+	// resolve differently per environment. A primary target with nothing to
 	// run while other targets still have work summarizes their plans instead.
 	if totalChanges == 0 {
 		if targetPlans {
+			writeTableSizesSection(sb, summary)
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
+			if plan.MemberApplyRefusal != "" {
+				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+				sb.WriteString("\n")
+			}
 			return
 		}
 		sb.WriteString(noChangesDetected + "\n\n")
@@ -2405,6 +3280,8 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	default:
 		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements, budget)
 	}
+	writeTableSizesSection(sb, summary)
+	writeCollationChangesSection(sb, *plan)
 
 	// Blocked changes — statements the engine refuses; the apply will fail on
 	// them, so each environment's section discloses its own.
@@ -2415,37 +3292,32 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Destructive changes to tables another pull request owns — resolved per
 	// environment, since the task history that attributes them is per
 	// environment.
-	if len(plan.AttributedChanges) > 0 {
+	unsafeShown := plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0
+	attributionNotes, attributionFolded := unsafeAttributionNotes(*plan, unsafeShown)
+	if len(plan.AttributedChanges) > 0 && !attributionFolded {
 		writeAttributedChanges(sb, plan.AttributedChanges)
 	}
 
 	// Direct-execution changes — each environment's section discloses its own,
 	// since the policy is configured per environment.
-	if len(plan.DirectChanges) > 0 {
+	if len(plan.DirectChanges) > 0 && !targetPlansDiscloseDirect(*plan) {
 		writeDirectChanges(sb, plan.DirectChanges, plan.DatabaseType, plan.IsMySQL, plan.DeferCutover)
 	}
 
 	// Copies already on the target — read per environment, since each
-	// environment has its own target.
-	if len(plan.DiscardedCopies) > 0 {
-		writeDiscardedCopies(sb, plan.DiscardedCopies, plan.applyingWithoutConfirmation())
-	}
-	if len(plan.AdoptedCopies) > 0 {
-		writeAdoptedCopies(sb, plan.AdoptedCopies, plan.applyingWithoutConfirmation())
-	}
-	if len(plan.RunningCopies) > 0 {
-		writeRunningCopies(sb, plan.RunningCopies, plan.applyingWithoutConfirmation())
+	// environment has its own target. Target plans disclose them, and the
+	// unsafe changes below, under the primary target's group.
+	if !targetPlans {
+		writeExistingCopies(sb, *plan)
 	}
 
 	// Unsafe changes warning
-	if plan.HasUnsafeChanges && len(plan.UnsafeChanges) > 0 {
-		writeUnsafeWarning(sb, plan.UnsafeChanges, plan.DatabaseType, plan.IsMySQL)
+	if unsafeShown && !targetPlans {
+		writeUnsafeWarning(sb, plan.UnsafeChanges, attributionNotes, plan.DatabaseType, plan.IsMySQL)
 	}
 
-	// Lint violations
-	if len(plan.LintViolations) > 0 {
-		writeLintViolations(sb, plan.LintViolations)
-	}
+	// Lint violations.
+	writePlanWideLint(sb, plan.LintViolations, plan.DeploymentDrift, targetPlans)
 
 	// Errors
 	if len(plan.Errors) > 0 {
@@ -2455,6 +3327,13 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// Summary (after DDL, matching CLI layout). Target plans are summarized
 	// together, as a sharded keyspace's shards are.
 	writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
+
+	// An apply this section's other targets' plans would refuse is not offered
+	// in the footer, so the section says why.
+	if plan.MemberApplyRefusal != "" {
+		writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+		sb.WriteString("\n")
+	}
 }
 
 // writeCollapsibleKeyspaceChanges renders a plan's changes — DDL, plus VSchema
@@ -2476,11 +3355,31 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// Categorize environments
 	var envsWithChanges []string
 	var envsWithErrors []string
+	// An environment whose apply would be refused says why in its own section,
+	// so the footer neither offers its apply nor calls the PR done. The
+	// environments after it wait on it: an apply of a later environment is
+	// refused until every earlier one has succeeded, so offering one would
+	// coach an apply the promotion order refuses.
+	var envsRefused []string
+	var envsBehindRefused []string
+	// An environment whose plan carries a change the engine refuses is refused
+	// too, and is offered a re-plan in place of its apply.
+	var envsFailOnRefusedChange []string
 	for _, env := range data.Environments {
 		if _, hasErr := data.Errors[env]; hasErr {
 			envsWithErrors = append(envsWithErrors, env)
-		} else if plan, ok := data.Plans[env]; ok && plan != nil && hasChanges(plan.Changes) {
-			envsWithChanges = append(envsWithChanges, env)
+		} else if plan, ok := data.Plans[env]; ok && plan != nil {
+			switch {
+			case environmentHasWork(plan) && len(envsRefused) > 0:
+				envsBehindRefused = append(envsBehindRefused, env)
+			case environmentHasWork(plan) && plan.applyFailsOnRefusedChange():
+				envsRefused = append(envsRefused, env)
+				envsFailOnRefusedChange = append(envsFailOnRefusedChange, env)
+			case environmentHasWork(plan):
+				envsWithChanges = append(envsWithChanges, env)
+			case plan.MemberApplyRefusal != "":
+				envsRefused = append(envsRefused, env)
+			}
 		}
 	}
 
@@ -2491,17 +3390,36 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 	// Apply instructions for environments with changes.
 	switch {
 	case len(envsWithChanges) >= 2:
-		sb.WriteString("▶️ **To apply** these changes, start with the first environment:\n")
+		writeEnvApplyLeadIn(sb, "▶️ **To apply** these changes, start with the first environment", data.Plans[envsWithChanges[0]])
 		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
 		for i := 1; i < len(envsWithChanges); i++ {
-			fmt.Fprintf(sb, "\nAfter verifying %s, apply to %s:\n", envsWithChanges[i-1], envsWithChanges[i])
+			writeEnvApplyLeadIn(sb, fmt.Sprintf("\nAfter verifying %s, apply to %s", envsWithChanges[i-1], envsWithChanges[i]), data.Plans[envsWithChanges[i]])
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[i]))
 		}
 	case len(envsWithChanges) == 1:
-		sb.WriteString("▶️ **To apply** these changes, comment:\n")
+		if consent, ok := planUnsafeConsent(*data.Plans[envsWithChanges[0]]); ok {
+			fmt.Fprintf(sb, "▶️ **To apply** these changes, %s:\n", consent.instruction())
+		} else {
+			sb.WriteString("▶️ **To apply** these changes, comment:\n")
+		}
 		fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot apply", envsWithChanges[0]))
-	case len(envsWithErrors) == 0:
+	case len(envsWithErrors) == 0 && len(envsRefused) == 0:
 		sb.WriteString("No changes to apply.\n")
+	}
+
+	for _, env := range envsFailOnRefusedChange {
+		sb.WriteString("\n")
+		writeRefusedChangeReplan(sb, fmt.Sprintf("the **%s** plan", env), command("schemabot plan", env))
+	}
+
+	for _, env := range envsBehindRefused {
+		if slices.Contains(envsFailOnRefusedChange, envsRefused[0]) {
+			fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and %s's plan carries a change the engine refuses (see above).\n",
+				capitalizeFirst(env), envsRefused[0], envsRefused[0])
+			continue
+		}
+		fmt.Fprintf(sb, "\n"+glyph.Attention+" **%s** applies only after %s, and this PR cannot apply %s's other targets' plans (see above).\n",
+			capitalizeFirst(env), envsRefused[0], envsRefused[0])
 	}
 
 	// Error guidance for failed environments
@@ -2512,6 +3430,17 @@ func writeMultiEnvFooter(sb *strings.Builder, data MultiEnvPlanCommentData) {
 			fmt.Fprintf(sb, "```\n%s\n```\n", command("schemabot plan", env))
 		}
 	}
+}
+
+// writeEnvApplyLeadIn writes the sentence above one environment's apply
+// command, with the environment's own unsafe consent appended when its plan
+// needs it.
+func writeEnvApplyLeadIn(sb *strings.Builder, sentence string, plan *PlanCommentData) {
+	if consent, ok := planUnsafeConsent(*plan); ok {
+		fmt.Fprintf(sb, "%s. %s:\n", sentence, capitalizeFirst(consent.instruction()))
+		return
+	}
+	sb.WriteString(sentence + ":\n")
 }
 
 func tenantCommand(baseCommand, environment, tenant string) string {
@@ -2689,7 +3618,7 @@ func allPlansIdentical(data MultiEnvPlanCommentData) bool {
 //
 // A converging rollout passes its contract, so it is clean and says nothing here
 // on that count. It is still the one case where no environment planning changes
-// does not mean the fleet holds this schema: the reviewed target is at the
+// does not mean the fleet holds this schema: the primary target is at the
 // desired schema and another target is not. Callers consult this only when
 // nothing else would post a comment, so leaving it out is what decides whether
 // the reviewer is told at all.
@@ -2739,6 +3668,21 @@ func capitalizeEnvNames(envs []string) string {
 		caps[i] = capitalizeFirst(env)
 	}
 	return strings.Join(caps, " & ")
+}
+
+// environmentHasWork reports whether an environment's plan section offers an
+// apply: a PR apply can run the other targets' plans the section renders, and
+// its primary plan has changes, or its primary target is already at the
+// desired schema while those other targets' plans do. A section whose apply
+// would be refused says why in the section itself.
+func environmentHasWork(plan *PlanCommentData) bool {
+	if plan.MemberApplyRefusal != "" {
+		return false
+	}
+	if hasChanges(plan.Changes) {
+		return true
+	}
+	return RendersTargetPlans(plan.DeploymentDrift)
 }
 
 // hasChanges returns true if there are any schema changes.

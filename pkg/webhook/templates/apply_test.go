@@ -32,6 +32,36 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 
 	assert.Contains(t, rendered, "schemabot unlock -d example-db --force")
 	assert.NotContains(t, rendered, "schemabot unlock -d example-db -e staging --force")
+	assert.Contains(t, rendered, "Ask the lock holder to run `schemabot unlock -d example-db` from their CLI")
+
+	// The lock holder's unlock runs in their terminal, so it starts with the
+	// cli name; the force-unlock is a PR-comment command and keeps the bot's
+	// trigger word.
+	t.Run("cli name", func(t *testing.T) {
+		rendered := RenderApplyBlockedByOtherPR(ApplyLockConflictData{
+			Database:    "example-db",
+			Environment: "staging",
+			LockOwner:   "cli:testuser@example.local",
+			LockCreated: time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC),
+			CLIName:     "acme schemabot",
+		})
+		assert.Contains(t, rendered, "Ask the lock holder to run `acme schemabot unlock -d example-db` from their CLI")
+		assert.Contains(t, rendered, "```\nschemabot unlock -d example-db --force\n```")
+	})
+
+	// Locks are keyed by database and type and the CLI's unlock defaults to
+	// mysql, so the lock holder's unlock names the lock's type.
+	t.Run("database type", func(t *testing.T) {
+		rendered := RenderApplyBlockedByOtherPR(ApplyLockConflictData{
+			Database:     "example-db",
+			DatabaseType: "postgres",
+			Environment:  "staging",
+			LockOwner:    "cli:testuser@example.local",
+			LockCreated:  time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC),
+		})
+		assert.Contains(t, rendered, "Ask the lock holder to run `schemabot unlock -d example-db -t postgres` from their CLI")
+		assert.Contains(t, rendered, "```\nschemabot unlock -d example-db --force\n```")
+	})
 	assert.Contains(t, rendered, "**Locked by**: `cli:testuser`")
 	assert.NotContains(t, rendered, "example.local",
 		"the lock owner's machine is internal detail and stays out of PR markdown")
@@ -1562,6 +1592,53 @@ func TestRenderApplyStatusComment_RecoveringCopyingRows(t *testing.T) {
 	assert.NotContains(t, result, "schemabot cutover")
 }
 
+// A copying table shows its planned size beside the row counts, before the
+// ETA, and a stopped one keeps it. A table the plan had no estimate for shows
+// the row counts alone.
+func TestRenderApplyStatusComment_TableSizeBesideRows(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	for _, tt := range []struct {
+		name  string
+		table TableProgressData
+		state string
+		want  string
+	}{
+		{
+			name:  "running with ETA",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n",
+		},
+		{
+			name:  "running without ETA",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n",
+		},
+		{
+			name:  "stopped",
+			state: state.Apply.Stopped,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Stopped, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, EstimatedBytes: &bytes},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n",
+		},
+		{
+			name:  "no estimate",
+			state: state.Apply.Running,
+			table: TableProgressData{TableName: "orders", Status: state.Task.Running, RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720},
+			want:  "- Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.table.DDL = "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+			result := RenderApplyStatusComment(ApplyStatusCommentData{
+				Database: "testapp", Environment: "staging", State: tt.state, Engine: "Spirit",
+				Tables: []TableProgressData{tt.table},
+			})
+			assert.Contains(t, result, tt.want)
+		})
+	}
+}
+
 func TestRenderApplyStatusComment_CuttingOver(t *testing.T) {
 	data := ApplyStatusCommentData{
 		Database:    "testapp",
@@ -2352,6 +2429,46 @@ func TestRenderApplyBlockedByInProgressChecks(t *testing.T) {
 	assert.Contains(t, result, "schemabot apply -e staging")
 	assert.NotContains(t, result, "not reported",
 		"in-progress-only render must not surface the never-reported remediation")
+}
+
+// A check in "waiting" is an Actions job paused on an environment protection
+// rule: it will not finish until a deployment reviewer acts, so "wait and
+// retry" alone is not enough guidance. The render names the cause and the
+// configuration that lifts it (leave the check out of `required_checks`), while
+// the gate decision — still blocked, still retry — is unchanged. Rows in other
+// unfinished states do not get the note.
+func TestRenderApplyBlockedByInProgressChecks_WaitingNamesTheReviewerGate(t *testing.T) {
+	const waitingNote = "A check in `waiting` is paused for a deployment reviewer to approve or reject its environment and will not finish on its own."
+
+	t.Run("waiting row", func(t *testing.T) {
+		inProgress := []BlockingCheck{
+			{Name: "CI / unit-tests", State: "in_progress"},
+			{Name: "Deploy / production-approval", State: "waiting"},
+		}
+
+		result := RenderApplyBlockedByInProgressChecks("production", inProgress, nil)
+
+		assert.Contains(t, result, "| `Deploy / production-approval` | waiting |")
+		assert.Contains(t, result, waitingNote)
+		assert.Contains(t, result, "If the apply should not depend on that approval, leave the check out of `required_checks`.")
+		assert.Contains(t, result, "Wait for checks to complete and retry:\n```\nschemabot apply -e production\n```",
+			"the gate decision is unchanged: the apply is still blocked and still retried")
+		assert.Less(t, strings.Index(result, "| waiting |"), strings.Index(result, waitingNote),
+			"the note follows the table it explains")
+	})
+
+	t.Run("no waiting row", func(t *testing.T) {
+		inProgress := []BlockingCheck{
+			{Name: "CI / unit-tests", State: "in_progress"},
+			{Name: "CI / integration", State: "queued"},
+			{Name: "Security scan", State: "requested"},
+		}
+
+		result := RenderApplyBlockedByInProgressChecks("production", inProgress, nil)
+
+		assert.NotContains(t, result, waitingNote)
+		assert.NotContains(t, result, "deployment reviewer")
+	})
 }
 
 // A configured required check that has never reported on the commit gets

@@ -243,10 +243,13 @@ func schemaPathAllowed(allowedDirs []string, schemaPath string) bool {
 		return false
 	}
 
+	// Each entry is judged on its own: an entry that does not normalize matches
+	// nothing, and the entries after it are still consulted. Config load
+	// rejects such entries, so this only matters for lists built any other way.
 	for _, allowedDir := range allowedDirs {
 		cleanAllowedDir, err := normalizeSchemaPath(allowedDir)
 		if err != nil {
-			return false
+			continue
 		}
 		if cleanAllowedDir == "*" {
 			return true

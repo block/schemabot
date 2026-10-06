@@ -1269,6 +1269,24 @@ CREATE TABLE items (
 		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 	})
 
+	// Rolling back an ADD COLUMN drops the column, so the rollback plan is
+	// unsafe and needs the same --allow-unsafe consent as an apply would.
+	t.Run("rollback_blocked_without_allow_unsafe", func(t *testing.T) {
+		require.NotEmpty(t, applyID, "apply ID must be set by previous subtest")
+		out, err := runCLIWithErrorInDir(t, binPath, schemaDir, "rollback",
+			applyID,
+			"-e", "staging",
+			"--endpoint", endpoint,
+			"-y",
+			"--watch=false",
+		)
+		require.Error(t, err, "expected rollback to fail without --allow-unsafe")
+		assertContains(t, out, "Apply blocked")
+		assertContains(t, out, "unsafe change(s) detected")
+		assertContains(t, out, "--allow-unsafe")
+		assert.NotContains(t, out, "Rollback started")
+	})
+
 	t.Run("rollback_to_original", func(t *testing.T) {
 		require.NotEmpty(t, applyID, "apply ID must be set by previous subtest")
 		out := runCLIInDir(t, binPath, schemaDir, "rollback",
@@ -1277,8 +1295,11 @@ CREATE TABLE items (
 			"--endpoint", endpoint,
 			"-y",
 			"--watch=false",
+			"--allow-unsafe",
 		)
-		// Should show rollback plan with DROP COLUMN
+		// Should show rollback plan with DROP COLUMN, accepted under --allow-unsafe
+		assertContains(t, out, "Unsafe Changes")
+		assertContains(t, out, "--allow-unsafe enabled")
 		assertContains(t, out, "Rollback started")
 		rollbackID := parseApplyID(t, out)
 		require.NotEqual(t, applyID, rollbackID, "rollback starts a new apply")

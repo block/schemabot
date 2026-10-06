@@ -20,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	gomysql "github.com/block/mysql"
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
 	"github.com/block/schemabot/pkg/inventory"
@@ -112,6 +113,14 @@ type ServerConfig struct {
 	// Deployments use it to point agents at the preferred way to drive
 	// SchemaBot (for example, a skill or internal tool to install).
 	AgentHint string `yaml:"agent_hint,omitempty"`
+
+	// CLIName is the tool name the CLI command hints in SchemaBot's PR
+	// comments start with, such as "acme schemabot" when operators run the
+	// CLI through a wrapper. It is the server-side counterpart of the CLI's
+	// --cli-name flag and takes the same value. Commands a PR author comments
+	// on the PR keep "schemabot", the bot's trigger word. Read it through
+	// HintCLIName, which applies the default.
+	CLIName string `yaml:"cli_name,omitempty"`
 
 	// DefaultReviewers are GitHub teams/users required to review schema changes.
 	DefaultReviewers []string `yaml:"default_reviewers"`
@@ -261,6 +270,25 @@ type RateLimitsConfig struct {
 	// pull fans out to a catalog read per namespace on the target, so an
 	// unbounded caller loads the control plane and the database together.
 	Pull EndpointRateLimitConfig `yaml:"pull,omitempty"`
+
+	// ChecksInspect bounds GET /api/checks/inspect. Every inspection reads the
+	// pull request and each expected Check Run from GitHub uncached, on the
+	// same App installation SchemaBot publishes Check Runs through, so an
+	// unbounded caller spends the quota the merge gate's own writes need.
+	ChecksInspect CallerRateLimitConfig `yaml:"checks_inspect,omitempty"`
+}
+
+// CallerRateLimitConfig is the budget of an endpoint bounded per caller only.
+// It has no per-target lane because what it protects is shared by every
+// target, not owned by one.
+type CallerRateLimitConfig struct {
+	// Enabled controls enforcement for this endpoint. Defaults to true when
+	// not configured (nil = enabled); set false to admit every request.
+	Enabled *bool `yaml:"enabled"`
+
+	// PerCaller bounds a single caller, keyed the same way as the pull
+	// endpoint's per-caller lane.
+	PerCaller RateLimitBudgetConfig `yaml:"per_caller,omitempty"`
 }
 
 // EndpointRateLimitConfig is one endpoint's budget. Each lane is enforced
@@ -414,6 +442,49 @@ func (c *ServerConfig) PullPerTargetRateLimit() ratelimit.Config {
 	return c.RateLimits.Pull.PerTarget.resolve(defaultPullPerTargetRequestsPerMinute, defaultPullPerTargetBurst)
 }
 
+// The check inspection's default budget is sized against the GitHub App
+// installation's REST quota rather than against SchemaBot's own capacity: each
+// inspection costs one pull request read plus at least one Check Run read per
+// expected check name, all uncached, on the installation the merge gate writes
+// Check Runs through.
+//
+// The budget bounds one caller on one server process, not the installation:
+// every replica admits the configured rate on its own, and every admitted
+// inspection draws on the same installation quota. The most one caller can
+// spend per hour, when its requests spread across every replica, is therefore
+// approximately
+//
+//	replicas × 60 × requests_per_minute × (1 + check names)
+//
+// installation-authenticated GitHub calls when each lookup fits on one page,
+// where check names is the number the deployment publishes for the repository.
+// That ceiling is what requests_per_minute is sized against. A caller's own
+// cost is its request rate × (1 + check names) on any number of replicas, and
+// a caller that stays on one replica is refused there once it outpaces
+// requests_per_minute and has spent its burst. Pagination multiplies the Check
+// Run reads, the initial burst adds inspections above the sustained rate, and
+// every inspection resolves a fresh installation client, adding
+// app-authenticated calls that count against the App rather than the
+// installation. Deployments running more replicas, publishing more check
+// names, or observing deep Check Run histories should lower
+// requests_per_minute.
+const (
+	defaultChecksInspectPerCallerRequestsPerMinute = 6
+	defaultChecksInspectPerCallerBurst             = 10
+)
+
+// ChecksInspectRateLimitEnabled reports whether the check inspection enforces
+// its request budget. Defaults to true when not configured.
+func (c *ServerConfig) ChecksInspectRateLimitEnabled() bool {
+	return c.RateLimits.ChecksInspect.Enabled == nil || *c.RateLimits.ChecksInspect.Enabled
+}
+
+// ChecksInspectPerCallerRateLimit returns the per-caller budget for the check
+// inspection, with unset fields filled from the defaults.
+func (c *ServerConfig) ChecksInspectPerCallerRateLimit() ratelimit.Config {
+	return c.RateLimits.ChecksInspect.PerCaller.resolve(defaultChecksInspectPerCallerRequestsPerMinute, defaultChecksInspectPerCallerBurst)
+}
+
 // resolve fills unset fields from the given defaults. Validate rejects
 // negative values, so by the time a budget is resolved a zero means "unset".
 func (b RateLimitBudgetConfig) resolve(defaultRPM, defaultBurst int) ratelimit.Config {
@@ -439,6 +510,7 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 	}{
 		{"rate_limits.pull.per_caller", cfg.Pull.PerCaller},
 		{"rate_limits.pull.per_target", cfg.Pull.PerTarget},
+		{"rate_limits.checks_inspect.per_caller", cfg.ChecksInspect.PerCaller},
 	}
 	for _, lane := range lanes {
 		if lane.budget.RequestsPerMinute < 0 {
@@ -456,10 +528,11 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 // here are merged into every locally driven MySQL database's metadata unless
 // the database sets the same key itself.
 type SpiritConfig struct {
-	// EnableExperimentalAutoscaling controls whether Spirit scales write
-	// threads dynamically from throttler feedback. Defaults to true when not
-	// configured (nil = enabled); set false as the operator kill switch when
-	// autoscaling misbehaves on a target fleet.
+	// EnableExperimentalAutoscaling controls whether Spirit scales its thread
+	// pools dynamically from throttler feedback. It engages on Aurora targets
+	// only; other MySQL targets run at fixed thread counts. Defaults to true
+	// when not configured (nil = enabled); set false as the operator kill
+	// switch when autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
 
 	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
@@ -608,46 +681,120 @@ func (g GitHubConfig) PromotionCheckRunNameBase() string {
 	return name
 }
 
-// Configured returns true if the GitHub App is configured (app ID and private key are set).
-// It actually resolves the private key so that file: or secretsmanager: references that
-// point to non-existent resources cause Configured() to return false instead of crashing.
+// Configured reports whether the GitHub App's credentials resolve. It is the
+// boolean form of ResolveCredentials for callers that only need to know whether
+// GitHub is on; a caller that must tell an App that is not configured from one
+// whose credentials are unavailable or malformed uses ResolveCredentials.
 func (g *GitHubConfig) Configured() bool {
-	appID := g.ResolveAppID()
-	if appID == 0 && g.PrivateKey == "" {
+	_, err := g.ResolveCredentials()
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, ErrGitHubAppNotConfigured):
 		slog.Info("GitHub App not configured — skipping GitHub setup")
-		return false
+	default:
+		slog.Warn("GitHub App credentials not usable — skipping GitHub setup", "error", err)
 	}
-	if appID == 0 {
-		slog.Warn("GitHub App private-key is set but app-id is missing — skipping GitHub setup")
-		return false
-	}
-	if g.PrivateKey == "" {
-		slog.Warn("GitHub App app-id is set but private-key is missing — skipping GitHub setup")
-		return false
-	}
-	// Actually resolve the private key — if the file/secret doesn't exist yet,
-	// treat GitHub as not configured rather than failing startup.
-	pk, err := g.ResolvePrivateKey()
+	return false
+}
+
+// GitHubAppCredentials is what a GitHub App's config resolves to: the App ID
+// and the private key material, read once from wherever the config points.
+type GitHubAppCredentials struct {
+	AppID      int64
+	PrivateKey string
+}
+
+// ErrGitHubAppNotConfigured reports a GitHub App with neither an App ID nor a
+// private key: the deployment runs without GitHub.
+var ErrGitHubAppNotConfigured = errors.New("no GitHub App is configured")
+
+// ErrGitHubAppCredentialsUnavailable reports a GitHub App whose credentials
+// are declared but cannot be used yet: a secret reference that does not
+// resolve, a private key without an App ID or the reverse, or a key that
+// resolves to nothing. The credentials may arrive later, so the App is
+// treated as off rather than as misconfigured.
+var ErrGitHubAppCredentialsUnavailable = errors.New("GitHub App credentials are not available")
+
+// ErrInvalidGitHubAppID marks an app ID that resolved to a value that cannot
+// be an App ID: non-numeric, negative, or out of range. It is a configuration
+// error, distinct from an app ID that is not configured at all (unset or the
+// placeholder 0) or whose secret reference cannot be resolved yet.
+var ErrInvalidGitHubAppID = errors.New("invalid GitHub App ID")
+
+// ResolveCredentials resolves the App ID and private key together, each read
+// once, and classifies the outcome so a caller can tell the three ways an App
+// is not usable apart:
+//   - ErrGitHubAppNotConfigured: no App ID and no private key are set.
+//   - ErrGitHubAppCredentialsUnavailable (wrapped): credentials are declared
+//     but do not resolve to a usable pair yet.
+//   - ErrInvalidGitHubAppID (wrapped): the App ID resolved to a value that
+//     cannot be an App ID (non-numeric, negative, or out of range).
+func (g *GitHubConfig) ResolveCredentials() (GitHubAppCredentials, error) {
+	appID, err := g.ResolveAppID()
 	if err != nil {
-		slog.Warn("GitHub App credentials not resolvable — skipping GitHub setup", "error", err)
-		return false
+		if errors.Is(err, ErrInvalidGitHubAppID) {
+			return GitHubAppCredentials{}, err
+		}
+		return GitHubAppCredentials{}, fmt.Errorf("%w: %w", ErrGitHubAppCredentialsUnavailable, err)
 	}
-	if pk == "" {
-		slog.Warn("GitHub App private key resolved to empty — skipping GitHub setup")
-		return false
+	switch {
+	case appID == 0 && g.PrivateKey == "":
+		return GitHubAppCredentials{}, ErrGitHubAppNotConfigured
+	case appID == 0:
+		return GitHubAppCredentials{}, fmt.Errorf("%w: private-key is set but app-id is empty", ErrGitHubAppCredentialsUnavailable)
+	case g.PrivateKey == "":
+		return GitHubAppCredentials{}, fmt.Errorf("%w: app-id is set but private-key is missing", ErrGitHubAppCredentialsUnavailable)
 	}
-	return true
+	privateKey, err := g.ResolvePrivateKey()
+	if err != nil {
+		return GitHubAppCredentials{}, fmt.Errorf("%w: resolve private-key: %w", ErrGitHubAppCredentialsUnavailable, err)
+	}
+	if privateKey == "" {
+		return GitHubAppCredentials{}, fmt.Errorf("%w: private-key resolved to empty", ErrGitHubAppCredentialsUnavailable)
+	}
+	return GitHubAppCredentials{AppID: appID, PrivateKey: privateKey}, nil
 }
 
 // ResolveAppID resolves the app ID from config (supports secret references),
-// falling back to GITHUB_APP_ID env var.
-func (g *GitHubConfig) ResolveAppID() int64 {
-	resolved, err := secrets.Resolve(g.AppID, "GITHUB_APP_ID")
-	if err == nil && resolved != "" {
-		n, _ := strconv.ParseInt(resolved, 10, 64)
-		return n
+// falling back to GITHUB_APP_ID env var. Surrounding whitespace is trimmed,
+// since mounted secrets and env vars commonly carry a trailing newline.
+//
+// It returns 0 and a nil error when no app ID is configured: the value is
+// unset, resolves to empty, or is 0, which GitHub never issues and which the
+// deployment templates seed as the placeholder before an App exists. It
+// returns an error when the secret reference cannot be resolved, and an error
+// wrapping ErrInvalidGitHubAppID when the resolved value is not a non-negative
+// integer. The error names the setting it was read from, never the value.
+func (g *GitHubConfig) ResolveAppID() (int64, error) {
+	const fallbackEnvVar = "GITHUB_APP_ID"
+	setting := "app-id"
+	if g.AppID == "" {
+		setting = fallbackEnvVar
 	}
-	return 0
+	resolved, err := secrets.Resolve(g.AppID, fallbackEnvVar)
+	if err != nil {
+		return 0, fmt.Errorf("resolve %s: %w", setting, err)
+	}
+	resolved = strings.TrimSpace(resolved)
+	if resolved == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(resolved, 10, 64)
+	if err != nil {
+		// strconv's error quotes the input; keep only its cause so the
+		// resolved value never reaches a log line or startup error.
+		cause := err
+		var numErr *strconv.NumError
+		if errors.As(err, &numErr) {
+			cause = numErr.Err
+		}
+		return 0, fmt.Errorf("%s must be a positive integer, or 0 for no App: %w (%w)", setting, ErrInvalidGitHubAppID, cause)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("%s must be a positive integer, or 0 for no App: %w", setting, ErrInvalidGitHubAppID)
+	}
+	return n, nil
 }
 
 // ResolvePrivateKey resolves the private key value using the secrets resolver.
@@ -1154,10 +1301,17 @@ type EnvironmentConfig struct {
 	// them is drift to surface; the targets of one environment are each planned
 	// on their own, so a difference between them is ordinary and is converged.
 	//
+	// An entry is a bare target name, or a mapping that also selects which of
+	// the schema files' declared namespaces live on that target (see
+	// TargetEntry).
+	//
 	// Example:
 	//   deployment: region-a
-	//   targets: [orders-001, orders-002]
-	Targets []string `yaml:"targets,omitempty"`
+	//   targets:
+	//     - orders-001
+	//     - target: orders-002
+	//       namespaces: [orders_1]
+	Targets []TargetEntry `yaml:"targets,omitempty"`
 
 	// Deployment is the lowercase Tern deployment key for gRPC mode. Deployment
 	// names are storage identity keys compared byte-wise across storage dialects.
@@ -1764,7 +1918,71 @@ type DeploymentTarget struct {
 	//   deployments:
 	//     region-a:
 	//       targets: [orders-001, orders-002]
-	Targets []string `yaml:"targets,omitempty"`
+	Targets []TargetEntry `yaml:"targets,omitempty"`
+}
+
+// TargetEntry is one entry of a targets list: a target, and optionally which of
+// the declared namespaces it holds.
+//
+// The schema files declare a database's namespaces; an entry can only select
+// among them, never add one. Namespaces nil, from a bare-string entry or a
+// mapping without the key, means the target holds every declared namespace.
+// The target stays the rollout member either way, so a target listed twice is
+// still refused.
+//
+// Example:
+//
+//	targets:
+//	  - orders-001
+//	  - target: orders-002
+//	    namespaces: [orders_1, orders_2]
+type TargetEntry struct {
+	Target     string   `yaml:"target"`
+	Namespaces []string `yaml:"namespaces,omitempty"`
+}
+
+// UnmarshalYAML accepts an entry as a bare target name or as a mapping. The
+// decoder's strict field checking does not reach a custom unmarshaler, so the
+// mapping's keys are checked here: a misspelled "namespaces" must fail the load
+// rather than leave the target silently covering every namespace.
+//
+// For the same reason a "namespaces" key that is present but holds no list is
+// refused. A key with no value, an explicit null, or a list whose items are all
+// commented out decodes to the same nil slice as an absent key, which would
+// read as "every declared namespace" when the author wrote a selection.
+func (e *TargetEntry) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		var target string
+		if err := node.Decode(&target); err != nil {
+			return fmt.Errorf("line %d: decode targets entry: %w", node.Line, err)
+		}
+		*e = TargetEntry{Target: target}
+		return nil
+	case yaml.MappingNode:
+		var namespacesKey *yaml.Node
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			if key.Value != "target" && key.Value != "namespaces" {
+				return fmt.Errorf("line %d: field %s not found in targets entry (want target or namespaces)", key.Line, key.Value)
+			}
+			if key.Value == "namespaces" {
+				namespacesKey = key
+			}
+		}
+		type plain TargetEntry
+		var entry plain
+		if err := node.Decode(&entry); err != nil {
+			return fmt.Errorf("line %d: decode targets entry: %w", node.Line, err)
+		}
+		if namespacesKey != nil && entry.Namespaces == nil {
+			return fmt.Errorf("line %d: targets entry %q has a namespaces key with no list; list the namespaces the target holds, or omit the key to cover every namespace the schema files declare", namespacesKey.Line, entry.Target)
+		}
+		*e = TargetEntry(entry)
+		return nil
+	default:
+		return fmt.Errorf("line %d: a targets entry must be a target name or a mapping with target and namespaces", node.Line)
+	}
 }
 
 // UsesTargetsList reports whether an environment spells any of its routing as a
@@ -1820,7 +2038,12 @@ func (c EnvironmentConfig) validateMultiTargetSupport(context, databaseType stri
 // into the target it came from. Refusing the name is the only point at which
 // that is still recoverable: once such a key is written, the ambiguity is in the
 // data.
-func resolveTargetList(what, target string, targets []string) ([]string, error) {
+//
+// An entry's namespaces are checked for the same reasons: each must be a
+// non-empty name, listed once, without the delimiter. Whether each one is a
+// namespace the schema files declare is only known once a plan carries them,
+// so that is checked at plan time.
+func resolveTargetList(what, target string, targets []TargetEntry) ([]TargetEntry, error) {
 	if target != "" && targets != nil {
 		return nil, fmt.Errorf("%s cannot configure both target and targets", what)
 	}
@@ -1828,13 +2051,17 @@ func resolveTargetList(what, target string, targets []string) ([]string, error) 
 		if target == "" {
 			return nil, nil
 		}
-		return []string{target}, nil
+		return []TargetEntry{{Target: target}}, nil
 	}
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("%s targets list is empty", what)
 	}
 	seen := make(map[string]bool, len(targets))
-	for i, t := range targets {
+	for i, entry := range targets {
+		t := entry.Target
+		if err := validateTargetNamespaces(fmt.Sprintf("%s targets entry %d %q", what, i, t), entry.Namespaces); err != nil {
+			return nil, err
+		}
 		if t == "" {
 			return nil, fmt.Errorf("%s targets entry %d is empty", what, i)
 		}
@@ -1847,6 +2074,33 @@ func resolveTargetList(what, target string, targets []string) ([]string, error) 
 		seen[t] = true
 	}
 	return targets, nil
+}
+
+// validateTargetNamespaces checks one targets entry's namespace selection. Nil
+// means the entry selects every declared namespace; an explicitly empty list
+// selects none, which no target can usefully mean, so it is refused rather than
+// read as either.
+func validateTargetNamespaces(what string, namespaces []string) error {
+	if namespaces == nil {
+		return nil
+	}
+	if len(namespaces) == 0 {
+		return fmt.Errorf("%s namespaces list is empty; omit it to cover every namespace the schema files declare", what)
+	}
+	seen := make(map[string]bool, len(namespaces))
+	for i, namespace := range namespaces {
+		if strings.TrimSpace(namespace) == "" {
+			return fmt.Errorf("%s namespaces entry %d is empty", what, i)
+		}
+		if strings.Contains(namespace, storage.OperationKeyDelimiter) {
+			return fmt.Errorf("%s namespaces entry %d %q contains reserved delimiter %q; a namespace is a component of the operation keys of the work it holds, so it cannot contain the character that separates their components", what, i, namespace, storage.OperationKeyDelimiter)
+		}
+		if seen[namespace] {
+			return fmt.Errorf("%s lists namespace %q more than once", what, namespace)
+		}
+		seen[namespace] = true
+	}
+	return nil
 }
 
 var defaultEnvironmentOrder = []string{"staging", "production"}
@@ -2010,6 +2264,9 @@ func (c *ServerConfig) Validate() error {
 		return err
 	}
 	if err := validateAgentHint(c.AgentHint); err != nil {
+		return err
+	}
+	if err := validateCLIName(c.CLIName); err != nil {
 		return err
 	}
 	if err := c.validateGitHubAppsConfig(); err != nil {
@@ -2519,6 +2776,51 @@ const maxAgentHintChars = 300
 // close the comment early and render its tail on the PR page: the HTML parsing
 // spec ends a comment on the bang form as well as the plain one.
 var htmlCommentTerminators = []string{"-->", "--!>"}
+
+// maxCLINameChars bounds cli_name, which every CLI command hint in a PR
+// comment repeats.
+const maxCLINameChars = 100
+
+// HintCLIName is the tool name CLI command hints in PR comments start with:
+// the configured cli_name, or the CLI's own default when none is set.
+func (c *ServerConfig) HintCLIName() string {
+	if c == nil || c.CLIName == "" {
+		return cliname.DefaultName
+	}
+	return c.CLIName
+}
+
+// validateCLIName rejects a cli_name that cannot render as the start of an
+// inline-code command hint: one that is blank, padded, spans lines, carries a
+// backtick that would close the code span, or carries a format character (a
+// bidi override or zero-width character) that would make the hint an operator
+// sees differ from the command they copy.
+func validateCLIName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if count := utf8.RuneCountInString(name); count > maxCLINameChars {
+		return fmt.Errorf("cli_name must be at most %d characters (got %d)", maxCLINameChars, count)
+	}
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("cli_name must not be blank")
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("cli_name contains leading or trailing whitespace")
+	}
+	if strings.Contains(name, "`") {
+		return fmt.Errorf("cli_name must not contain a backtick: it would close the inline code a command hint renders in")
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) || unicode.In(r, unicode.Zl, unicode.Zp) {
+			return fmt.Errorf("cli_name must be a single line with no control characters")
+		}
+		if unicode.Is(unicode.Cf, r) {
+			return fmt.Errorf("cli_name must not contain format character %U: it would render differently from the command an operator copies", r)
+		}
+	}
+	return nil
+}
 
 func validateAgentHint(hint string) error {
 	if hint == "" {
@@ -3030,11 +3332,12 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]r
 			if len(targets) == 0 {
 				return nil, fmt.Errorf("database %q environment %q deployment %q missing target", database, environment, deployment)
 			}
-			for _, target := range targets {
+			for _, entry := range targets {
 				out = append(out, routing.ExecutionTarget{
 					DatabaseType: dbConfig.Type,
 					Deployment:   deployment,
-					Target:       target,
+					Target:       entry.Target,
+					Namespaces:   slices.Clone(entry.Namespaces),
 				})
 			}
 		}
@@ -3052,11 +3355,12 @@ func (c *ServerConfig) ResolveDatabaseTargets(database, environment string) ([]r
 		return nil, fmt.Errorf("database %q environment %q missing server-side deployment", database, environment)
 	}
 	out := make([]routing.ExecutionTarget, 0, len(targets))
-	for _, target := range targets {
+	for _, entry := range targets {
 		out = append(out, routing.ExecutionTarget{
 			DatabaseType: dbConfig.Type,
 			Deployment:   envConfig.Deployment,
-			Target:       target,
+			Target:       entry.Target,
+			Namespaces:   slices.Clone(entry.Namespaces),
 		})
 	}
 	return out, nil
@@ -3155,8 +3459,8 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 		}
 		return ResolvedGitHubApp{Name: repoConfig.GitHubApp, Config: appCfg}, nil
 	}
-	if !c.GitHub.Configured() {
-		return ResolvedGitHubApp{}, fmt.Errorf("no GitHub App is configured")
+	if _, err := c.GitHub.ResolveCredentials(); err != nil {
+		return ResolvedGitHubApp{}, fmt.Errorf("default GitHub App: %w", err)
 	}
 	return ResolvedGitHubApp{Name: "default", Config: c.GitHub}, nil
 }
@@ -3173,23 +3477,28 @@ func (c *ServerConfig) ResolveGitHubAppForRepo(repo string) (ResolvedGitHubApp, 
 //
 // Legacy single-App configs (ServerConfig.GitHub set, ServerConfig.Apps empty)
 // are also resolved so callers can use a single uniform path; the resulting
-// map will contain a single entry under name "default".
+// map will contain a single entry under name "default". The error for that
+// shape wraps the ResolveCredentials classification, so a caller can tell an
+// App that is not configured from one whose credentials are unavailable.
 func (c *ServerConfig) ResolveGitHubAppsByID() (map[int64]ResolvedGitHubApp, error) {
 	if c == nil {
 		return nil, fmt.Errorf("server config is nil")
 	}
-	apps := c.Apps
-	if len(apps) == 0 {
-		if !c.GitHub.Configured() {
-			return nil, fmt.Errorf("no GitHub App is configured")
+	if len(c.Apps) == 0 {
+		creds, err := c.GitHub.ResolveCredentials()
+		if err != nil {
+			return nil, fmt.Errorf("default GitHub App: %w", err)
 		}
-		apps = map[string]GitHubAppConfig{"default": c.GitHub}
+		return map[int64]ResolvedGitHubApp{creds.AppID: {Name: "default", Config: c.GitHub}}, nil
 	}
-	out := make(map[int64]ResolvedGitHubApp, len(apps))
-	for name, app := range apps {
-		id := app.ResolveAppID()
+	out := make(map[int64]ResolvedGitHubApp, len(c.Apps))
+	for name, app := range c.Apps {
+		id, err := app.ResolveAppID()
+		if err != nil {
+			return nil, fmt.Errorf("app %q: %w", name, err)
+		}
 		if id == 0 {
-			return nil, fmt.Errorf("app %q has empty or unparseable app-id", name)
+			return nil, fmt.Errorf("app %q has no app-id configured (empty or 0)", name)
 		}
 		if existing, ok := out[id]; ok {
 			return nil, fmt.Errorf("apps %q and %q resolve to the same app-id %d", existing.Name, name, id)
@@ -3302,6 +3611,17 @@ func (c *ServerConfig) PromotionEnvironmentOrder() []string {
 		return slices.Clone(defaultEnvironmentOrder)
 	}
 	return slices.Clone(c.EnvironmentOrder)
+}
+
+// ServesFirstPromotionEnvironment reports whether this instance serves the
+// first environment in the server-owned promotion order, and names that
+// environment. A deployment serving every environment serves the first one.
+// Where several deployments split one repository's environments between them,
+// exactly one serves the first, which makes it the one to answer an unscoped
+// command (no -e) that only one of them should answer.
+func (c *ServerConfig) ServesFirstPromotionEnvironment() (bool, string) {
+	first := c.PromotionEnvironmentOrder()[0]
+	return c.IsEnvironmentAllowed(first), first
 }
 
 // PromotionOrderForDatabase returns the environment promotion order used by PR

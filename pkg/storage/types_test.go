@@ -453,6 +453,30 @@ func TestTargetOperationKey(t *testing.T) {
 	}
 }
 
+// TestApplyOperationKeyedByTarget covers which operation rows carry the key a
+// member target's whole-target work is stored under, the shape an attach may
+// not mix with any other within one deployment of an apply.
+func TestApplyOperationKeyedByTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		op   *ApplyOperation
+		want bool
+	}{
+		{"whole-target member work", &ApplyOperation{OperationKey: "orders-002", Target: "orders-002", OperationKind: ApplyOperationKindWork}, true},
+		{"unset kind is work", &ApplyOperation{OperationKey: "orders-002", Target: "orders-002"}, true},
+		{"whole-deployment work of a target", &ApplyOperation{OperationKey: "", Target: "orders-002"}, false},
+		{"shard work of a target", &ApplyOperation{OperationKey: ShardOperationKey("main", "-80", "customers"), Target: "orders-002"}, false},
+		{"work with no target", &ApplyOperation{OperationKey: ""}, false},
+		{"finalizer whose key matches its target", &ApplyOperation{OperationKey: "group_finalizer", Target: "group_finalizer", OperationKind: ApplyOperationKindGroupFinalizer}, false},
+		{"nil operation", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.op.KeyedByTarget())
+		})
+	}
+}
+
 // TestPlanIDForOperation covers which plan a member executes: members planned
 // together share their apply's plan, a member planned against its own live
 // schema carries its own, and a member with neither is not executable and must
@@ -665,4 +689,21 @@ func TestIsComponentStateSettingKey(t *testing.T) {
 	assert.False(t, IsComponentStateSettingKey("spirit_debug_logs"))
 	assert.False(t, IsComponentStateSettingKey("octo/"+WebhookReconcileScanCursorSettingKeyPrefix+"repo"),
 		"the namespace is a prefix, not a substring")
+}
+
+// A task spanning the whole table carries the plan's estimate, copied so the
+// task does not alias the plan's value. A task scoped to one shard carries
+// none, since the plan's figure covers every shard of the table.
+func TestTableChangeTaskEstimatedBytes(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	change := TableChange{Table: "orders", EstimatedBytes: &bytes}
+
+	whole := change.TaskEstimatedBytes("")
+	require.NotNil(t, whole)
+	assert.Equal(t, bytes, *whole)
+	*whole = 1
+	assert.Equal(t, int64(23_400_000_000), *change.EstimatedBytes, "the task gets its own copy of the estimate")
+
+	assert.Nil(t, change.TaskEstimatedBytes("-80"), "a shard-scoped task carries no whole-table estimate")
+	assert.Nil(t, TableChange{Table: "users"}.TaskEstimatedBytes(""), "no estimate at plan time means none on the task")
 }

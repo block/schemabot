@@ -136,6 +136,9 @@ type Storage interface {
 type LockStore interface {
 	// Acquire attempts to acquire a lock. Returns ErrLockHeld if already held by another owner.
 	// If the same owner already holds the lock, this is a no-op (idempotent).
+	// When Acquire creates the lock row it sets lock.ID to the new row's ID; a
+	// re-acquire leaves lock.ID as passed, so a caller passing a new Lock can
+	// tell a row it created (non-zero ID) from one the owner already held.
 	Acquire(ctx context.Context, lock *Lock) error
 
 	// AcquireIfPendingPlanID acquires like Acquire, but only while the lock is
@@ -151,12 +154,14 @@ type LockStore interface {
 	Release(ctx context.Context, database, dbType, owner string) error
 
 	// ReleaseByID releases the lock only while the row with the given ID still
-	// holds it under the given owner, so a caller that authorized the release
-	// against that row's recorded acquirer can never delete a newer lock. It
+	// holds it under the given owner and pending plan, so a caller that
+	// authorized the release against the row it read can never delete a newer
+	// lock, nor a lock its owner acquired again for a new plan since. It
 	// returns ErrLockNotFound when no lock is held, ErrLockReplaced when a
-	// different row holds the lock, and ErrLockNotOwned when the row is held
-	// under another owner.
-	ReleaseByID(ctx context.Context, id int64, database, dbType, owner string) error
+	// different row holds the lock, ErrLockNotOwned when the row is held under
+	// another owner, and ErrLockIntentChanged when the row now carries another
+	// pending plan.
+	ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
 
 	// ReleaseIfPendingPlanID releases a lock only while both its owner and
 	// pending plan still match. A mismatch is a no-op so a superseding apply or
@@ -526,7 +531,7 @@ type ListPlansOptions struct {
 	// within one repository, so List errors when it is set alone.
 	PullRequest int
 	// PrimaryPlanIdentifier, when set, restricts results to the member plans
-	// produced alongside that reviewed plan — the one review round's members,
+	// produced alongside that primary plan — the one review round's members,
 	// rather than every plan stored for the pull request.
 	PrimaryPlanIdentifier string
 	// Since, when set, restricts results to plans created at or after this
@@ -560,6 +565,17 @@ type PlanStore interface {
 
 	// GetByPR returns all plans for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Plan, error)
+
+	// UpdateRoute restamps the stored plan with the rollout member it was
+	// planned for: its deployment and target, and narrowedTo, the member a
+	// narrowed plan is held to ("" for a plan of the whole rollout). It is for
+	// the service's own row write finding the row a planner sharing this
+	// storage already stored under the same identifier, stamped with the route
+	// the planner knew and no narrowing. It never replaces a narrowing the row
+	// already records with a different one, the empty one included: such a row
+	// is left unchanged and an error is returned. It changes nothing else on
+	// the row.
+	UpdateRoute(ctx context.Context, planIdentifier, deployment, target, narrowedTo string) error
 
 	// List returns plans matching opts, newest first. Ordering is
 	// deterministic on created_at ties (see the sqlstore GetByPR ordering
@@ -613,8 +629,12 @@ type ApplyStore interface {
 	// land on an apply no drive will pick up again. The (apply_id, deployment,
 	// operation_key) unique index is the idempotency guard: a concurrent attach
 	// of the same operation loses with ErrApplyOperationExists, which the
-	// caller resolves by re-reading the winner's row. On success the operation's
-	// ID and every task's ID and ApplyOperationID are populated.
+	// caller resolves by re-reading the winner's row. Under the same lock, an
+	// operation keyed by its target is refused with
+	// ErrApplyOperationKeyingMismatch when the deployment's existing work
+	// operations of the apply are not keyed that way, and the reverse, so one
+	// target's work can never attach under two keys. On success the operation's ID and every
+	// task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
 	// Get returns an apply by ID, or nil if not found.
@@ -1343,20 +1363,20 @@ type ApplyOperationStore interface {
 	// completed / failed.
 	MarkTerminal(ctx context.Context, id int64, newState string) error
 
-	// SaveExternalOperationID stores the remote data plane's apply_operation_id
-	// on the operation that owns the dispatch.
-	SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error
-
-	// SaveExternalID stores the remote data plane's apply_id on the operation
-	// that owns the dispatch. The write is atomic with its deployment
-	// invariant: in one transaction the store locks the apply's operation
-	// rows, verifies the operation's deployment records no remote apply id
-	// other than the one being stored, and only then writes. Sibling
-	// operations of one deployment persist concurrently across the driver
-	// pool, so a check outside the writing transaction cannot stop two of
-	// them from recording divergent ids. Divergence returns an error wrapping
-	// ErrRemoteApplyDeploymentIDConflict.
-	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
+	// SaveExternalID stores the remote data plane's apply_id, and its
+	// apply_operation_id when the data plane named one (externalOperationID
+	// may be empty), on the operation that owns the dispatch. Both ids land in
+	// one write, so no reader ever sees an operation correlated to a remote
+	// apply without the remote operation its progress and cutover address.
+	// The write is atomic with its deployment invariant: in one transaction
+	// the store locks the apply's operation rows, verifies the operation's
+	// deployment records no remote apply id other than the one being stored
+	// and the operation records no other remote operation id, and only then
+	// writes. Sibling operations of one deployment persist concurrently across
+	// the driver pool, so a check outside the writing transaction cannot stop
+	// two of them from recording divergent ids. Deployment divergence returns
+	// an error wrapping ErrRemoteApplyDeploymentIDConflict.
+	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID, externalOperationID string) error
 
 	// ApplyIdentifierForRemoteApply returns the identifier of the apply this
 	// control plane dispatched as the given remote apply, or "" when it

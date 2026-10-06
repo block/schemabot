@@ -445,12 +445,17 @@ func TestRollbackConfirmCommandCoreTerminalDispositions(t *testing.T) {
 	// Once the ExecuteApply dispatch is attempted, the rollback DDL may
 	// already be executing on the target, so even a dispatch failure must not
 	// be re-driven: the pinned lock survives and the user re-issues the
-	// command after triage.
+	// command after triage. The observer the command registered for the apply
+	// it did not create is withdrawn, so it cannot attach to the next apply on
+	// the target. The plan here names a deployment but no target, which the
+	// apply request rejects as missing routing metadata.
 	t.Run("dispatch failure is terminal", func(t *testing.T) {
 		client, mux := setupGitHubServer(t)
 		comments := recordComments(t, mux)
+		plan := pinnedRollbackPlan()
+		plan.Deployment = "default"
 		lockStore := &rollbackConfirmTestLockStore{locks: []*storage.Lock{pinnedRollbackLock()}}
-		st := pinnedRollbackStorage(lockStore, pinnedRollbackPlan())
+		st := pinnedRollbackStorage(lockStore, plan)
 		h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
 
 		retry, err := h.rollbackConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", 12345, "testuser", rollbackConfirmCommand())
@@ -460,5 +465,43 @@ func TestRollbackConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		assert.Zero(t, lockStore.releaseCalls, "the pinned lock must survive a dispatch failure so the user can re-issue the command")
 		body := requireComment(t, comments, "dispatch failure comment")
 		assert.Contains(t, body, "Failed to execute rollback")
+		assert.False(t, h.service.HasPendingObserver("orders", "default", "staging"),
+			"a failed dispatch must withdraw the observer it registered for the apply it did not create")
 	})
+}
+
+// A rollback-confirm that asked for deferred cutover on a database type that
+// cannot defer it is refused before anything is stored, and the refusal is
+// deterministic: the same command would be refused the same way. The comment
+// therefore carries the operator's next action — the rollback-confirm to
+// re-issue in the same environment without `--defer-cutover` — and says the
+// pinned rollback it found is still there for that re-issue, instead of only
+// naming the refused feature.
+func TestRollbackConfirmDeferredCutoverRefusalNamesTheReissue(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := recordComments(t, mux)
+	lock := pinnedRollbackLock()
+	lock.DatabaseType = storage.DatabaseTypePostgres
+	plan := pinnedRollbackPlan()
+	plan.DatabaseType = storage.DatabaseTypePostgres
+	plan.Deployment = "default"
+	plan.Target = "orders-primary"
+	lockStore := &rollbackConfirmTestLockStore{locks: []*storage.Lock{lock}}
+	st := pinnedRollbackStorage(lockStore, plan)
+	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+	cmd := rollbackConfirmCommand()
+	cmd.DeferCutover = true
+
+	retry, err := h.rollbackConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", 12345, "testuser", cmd)
+
+	require.NoError(t, err)
+	assert.False(t, retry, "a feature the database type refuses is refused the same way on every re-drive")
+	assert.Zero(t, lockStore.releaseCalls, "the pinned rollback must survive the refusal for the re-issued command")
+	body := requireComment(t, comments, "deferred cutover refusal comment")
+	assert.Contains(t, body, "deferred cutover is not supported for database_type: postgres")
+	assert.Contains(t, body, "Run `schemabot rollback-confirm -e staging` again without `--defer-cutover`.")
+	assert.Contains(t, body, "The pending rollback stays pinned for it.")
+	assert.NotContains(t, body, "Failed to execute rollback")
+	assert.False(t, h.service.HasPendingObserver("orders", "default", "staging"),
+		"the refused command must withdraw the observer it registered, or the next apply on this target would report into this PR")
 }

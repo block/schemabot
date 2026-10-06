@@ -65,6 +65,7 @@ type inspectGitHubClient struct {
 	untrustedApps map[string][]string
 	runErr        error
 	prCalls       int
+	runCalls      int
 }
 
 func (c *inspectGitHubClient) FetchPullRequestNoCache(context.Context, string, int) (*ghclient.PullRequestInfo, error) {
@@ -73,6 +74,7 @@ func (c *inspectGitHubClient) FetchPullRequestNoCache(context.Context, string, i
 }
 
 func (c *inspectGitHubClient) FindCheckRunByName(_ context.Context, _, _, name string) (*ghclient.CheckRunResult, []string, error) {
+	c.runCalls++
 	if c.runErr != nil {
 		return nil, nil, c.runErr
 	}

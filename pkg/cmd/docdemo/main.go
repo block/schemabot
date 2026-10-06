@@ -609,7 +609,7 @@ func rollbackDemo() Demo {
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				panic(err)
 			}
-			if request.PlanID != plan.PlanID || request.Environment != "staging" || request.Options["allow_unsafe"] != "true" {
+			if request.PlanID != plan.PlanID || request.Environment != "staging" || request.Options["allow_unsafe"] == "true" {
 				panic("wrong rollback apply")
 			}
 			response = apitypes.ApplyResponse{Accepted: true, ApplyID: "apply-example-86"}

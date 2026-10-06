@@ -777,6 +777,27 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	assert.Empty(t, observer.terminal, "a transient plan-load failure must not notify the terminal observer")
 }
 
+func TestResumeStoppedGroupedApplyHandlesPendingStartBeforeFailedTasks(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: storageErr})
+	apply.State = state.Apply.Stopped
+	applyStore.apply = &storage.Apply{}
+	*applyStore.apply = *apply
+	applyStore.apply.State = state.Apply.Resuming
+	tasks[0].State = state.Task.Failed
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	client.storage.(*exactProgressStorage).controlRequests = requests
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State,
+		"the stopped snapshot must not overwrite the stored start transition")
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status,
+		"the start remains deliverable after a recoverable plan read failure")
+}
+
 // A resume claim that finds a pending cancel against a schema change already
 // holding its revert window refuses the cancel — and then keeps going. The
 // refusal resolved the operator's request but paused nothing, so the claim
@@ -811,6 +832,8 @@ func TestResumeApplyContinuesPastARefusedCancelInTheRevertWindow(t *testing.T) {
 // apply with an operator-facing reason and notifies its terminal observer.
 func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{})
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+	client.storage.(*exactProgressStorage).controlRequests = requests
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
@@ -824,6 +847,9 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	assert.True(t, state.IsState(tasks[0].State, state.Task.Failed),
 		"in-flight task must fail with its apply, got %s", tasks[0].State)
 	assert.Equal(t, "plan not found during recovery", tasks[0].ErrorMessage)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
+		"the terminal outcome moots the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }
@@ -1767,4 +1793,68 @@ func TestResumeApplyWithTasks_StartStaysPendingWhenGroupedStoppedTaskRequeueFail
 	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
 	require.NoError(t, err)
 	assert.NotNil(t, startReq, "the start request stays pending for the next claim")
+}
+
+// A never-started finalizer settles for a pending command the way the database
+// type's stop settles: a stop that pauses leaves it resumable, a stop that
+// cannot pause cancels it, and a cancel always cancels it.
+func TestFinalizerSettledStateForControl(t *testing.T) {
+	cases := []struct {
+		operation    storage.ControlOperation
+		databaseType string
+		want         string
+	}{
+		{storage.ControlOperationStop, storage.DatabaseTypeStrata, state.ApplyOperation.Stopped},
+		{storage.ControlOperationStop, storage.DatabaseTypeMySQL, state.ApplyOperation.Stopped},
+		{storage.ControlOperationStop, storage.DatabaseTypeVitess, state.ApplyOperation.Cancelled},
+		{storage.ControlOperationCancel, storage.DatabaseTypeStrata, state.ApplyOperation.Cancelled},
+		{storage.ControlOperationCancel, storage.DatabaseTypeVitess, state.ApplyOperation.Cancelled},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.operation)+"/"+tc.databaseType, func(t *testing.T) {
+			assert.Equal(t, tc.want, finalizerSettledStateForControl(tc.operation, tc.databaseType))
+		})
+	}
+}
+
+// A finalizer re-drive resumes from what the engine reported, and re-applies
+// from the plan when the only stored state is the drive's own handoff record.
+func TestFinalizerEngineResumeState(t *testing.T) {
+	cases := []struct {
+		name   string
+		stored *storage.EngineResumeState
+		want   *engine.ResumeState
+	}{
+		{
+			name:   "handoff record only",
+			stored: &storage.EngineResumeState{Metadata: finalizerEngineHandoffMetadata},
+			want:   nil,
+		},
+		{
+			// A JSON storage column hands the record back re-serialized.
+			name:   "handoff record as a JSON column returns it",
+			stored: &storage.EngineResumeState{Metadata: `{"group_finalizer_engine_handoff": "true"}`},
+			want:   nil,
+		},
+		{
+			name:   "engine deploy state",
+			stored: &storage.EngineResumeState{MigrationContext: "deploy-ns-0", Metadata: `{"branch_name":"orders-ns-0"}`},
+			want:   &engine.ResumeState{MigrationContext: "deploy-ns-0", Metadata: `{"branch_name":"orders-ns-0"}`},
+		},
+		{
+			name:   "engine context alongside the handoff metadata",
+			stored: &storage.EngineResumeState{MigrationContext: "deploy-ns-0", Metadata: finalizerEngineHandoffMetadata},
+			want:   &engine.ResumeState{MigrationContext: "deploy-ns-0", Metadata: finalizerEngineHandoffMetadata},
+		},
+		{
+			name:   "empty engine metadata",
+			stored: &storage.EngineResumeState{Metadata: "{}"},
+			want:   &engine.ResumeState{Metadata: "{}"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, finalizerEngineResumeState(tc.stored))
+		})
+	}
 }

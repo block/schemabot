@@ -69,6 +69,9 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
+func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string, string) error {
+	return nil
+}
 func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
@@ -76,6 +79,18 @@ type capturingPlanStore struct {
 	mockPlanLookupStore
 	created   *storage.Plan
 	createErr error
+	// routed records each UpdateRoute call as "plan_id deployment/target",
+	// followed by " narrowed to <member>" for a narrowed plan.
+	routed []string
+}
+
+func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target, narrowedTo string) error {
+	call := planIdentifier + " " + deployment + "/" + target
+	if narrowedTo != "" {
+		call += " narrowed to " + narrowedTo
+	}
+	s.routed = append(s.routed, call)
+	return nil
 }
 
 func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int64, error) {
@@ -866,13 +881,16 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr      error
-	planResp       *ternv1.PlanResponse
-	planErr        error
-	planReq        *ternv1.PlanRequest
-	planDiffResp   *ternv1.PlanDiffResponse
-	planDiffErr    error
-	planDiffReq    *ternv1.PlanRequest
+	healthErr    error
+	planResp     *ternv1.PlanResponse
+	planErr      error
+	planReq      *ternv1.PlanRequest
+	planDiffResp *ternv1.PlanDiffResponse
+	planDiffErr  error
+	planDiffReq  *ternv1.PlanRequest
+	// planDiffMu guards planDiffReq: a rollout plan diffs its members
+	// concurrently, so one client can serve several diffs at once.
+	planDiffMu     sync.Mutex
 	pullSchemaResp *ternv1.PullSchemaResponse
 	pullSchemaErr  error
 	pullSchemaReq  *ternv1.PullSchemaRequest
@@ -949,7 +967,9 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	return nil, m.planErr
 }
 func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	m.planDiffMu.Lock()
 	m.planDiffReq = req
+	m.planDiffMu.Unlock()
 	if m.planDiffResp != nil {
 		return m.planDiffResp, m.planDiffErr
 	}
@@ -1626,9 +1646,20 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		assert.Empty(t, plans.created.SchemaPath)
 	})
 
-	t.Run("duplicate plan identifier is tolerated", func(t *testing.T) {
+	// A planner that shares the service's storage stores the row for a plan
+	// with changes first, stamped with the database it was configured with as
+	// the deployment. The service keeps that row and restamps it with the
+	// rollout member it planned, so the apply can find the primary target by it.
+	t.Run("duplicate plan identifier keeps the stored row on the planned route", func(t *testing.T) {
 		svc, _, plans := newPolicyService()
 		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     "payments",
+			Target:         "payments-staging-target",
+		}
 		pr := int32(1)
 
 		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
@@ -1646,6 +1677,52 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		require.NotNil(t, resp)
 		require.NotNil(t, plans.created)
 		assert.Equal(t, "schema/payments", plans.created.SchemaPath)
+		assert.Equal(t, []string{"plan-source-policy " + DefaultDeployment + "/payments-staging-target"}, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier already on the planned route is kept as is", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     DefaultDeployment,
+			Target:         "payments-staging-target",
+		}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.NoError(t, err)
+		assert.Empty(t, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier for another database fails the plan", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{PlanIdentifier: "plan-source-policy", Database: "orders", Environment: "staging"}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "collides with a stored plan for database \"orders\"")
+		assert.Empty(t, plans.routed)
 	})
 }
 
@@ -3400,7 +3477,11 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
+	// A rollout-wide apply runs from the rollout primary's plan.
+	plan := executeApplyTestPlan()
+	plan.Deployment = "default-a"
+	plan.Target = "testdb-a"
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -5315,6 +5396,7 @@ func TestHandleStatusDeploymentFilterProjectsMatchingOperation(t *testing.T) {
 	assert.Equal(t, "remote-operation-202", resp.Applies[0].ExternalOperationID)
 	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
 	assert.Equal(t, state.Apply.Completed, resp.Applies[0].State)
+	assert.Equal(t, state.Apply.Running, resp.Applies[0].ApplyState, "the parent's state is reported beside the operation's, since the apply still holds the deployment")
 }
 
 // A deployment applied per shard has exactly one data-plane apply, so the
@@ -5798,6 +5880,19 @@ func TestServiceClose(t *testing.T) {
 	assert.NoError(t, svc.Close())
 }
 
+// serveApplyRequest sends body to POST /api/apply through the service's routes
+// and returns the recorded response.
+func serveApplyRequest(t *testing.T, svc *Service, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	return w
+}
+
 func TestApplyHandler(t *testing.T) {
 	t.Run("returns bad request for unsupported apply feature", func(t *testing.T) {
 		plan := executeApplyTestPlan()
@@ -5819,6 +5914,108 @@ func TestApplyHandler(t *testing.T) {
 		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
 		assert.Equal(t, `apply rejected: database "testdb": deferred cutover is not supported for database_type: postgres`, resp.Error)
 		assert.Nil(t, applies.apply)
+	})
+
+	// A caller naming a plan_id SchemaBot never stored gets a 404 telling them
+	// to check the ID, not a 500 that reads like a server outage.
+	t.Run("returns not found for an unknown plan", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, tasks := newQueueApplyTestService(nil, &mockTernClient{}, applies)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-missing","environment":"staging"}`)
+
+		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Equal(t, "apply rejected: plan not found: plan-missing; check the plan_id or create a new plan", resp.Error)
+		assert.Nil(t, applies.apply, "an unknown plan must not store an apply")
+		assert.Empty(t, tasks.tasks)
+	})
+
+	// A plan store that reports a missing plan through the ErrPlanNotFound
+	// sentinel instead of a nil plan gets the same 404, not the 500 reserved
+	// for a read that actually failed.
+	t.Run("returns not found when the store reports the missing plan as an error", func(t *testing.T) {
+		logger := slog.New(slog.DiscardHandler)
+		plans := &mockPlanLookupStore{err: storage.ErrPlanNotFound}
+		svc := New(&mockStorageWithPlanLookup{plans: plans}, testServerConfig(), nil, logger)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-missing","environment":"staging"}`)
+
+		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Equal(t, "apply rejected: plan not found: plan-missing; check the plan_id or create a new plan", resp.Error)
+	})
+
+	// A plan reviewed for staging is refused when the caller asks to apply it
+	// to production: the request is wrong, so it is a 400 naming both
+	// environments, and nothing is queued against production.
+	t.Run("returns bad request when the plan was created for another environment", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, tasks := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"production"}`)
+
+		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+		assert.Equal(t, `apply rejected: plan plan-1 was created for environment "staging", not "production"; apply it to "staging" or create a plan for "production"`, resp.Error)
+		assert.Nil(t, applies.apply, "a mismatched environment must not store an apply")
+		assert.Empty(t, tasks.tasks)
+	})
+
+	// A stored plan missing either routing field is a 400 naming that field:
+	// the request cannot supply what the plan lacks, so the caller is told to
+	// create a new plan. Both fields are checked because each has its own
+	// branch, and nothing is queued for either.
+	t.Run("returns bad request when the plan lacks routing metadata", func(t *testing.T) {
+		missingDeployment := executeApplyTestPlan()
+		missingDeployment.Deployment = ""
+		missingTarget := executeApplyTestPlan()
+		missingTarget.Target = ""
+
+		cases := map[string]*storage.Plan{
+			"deployment": missingDeployment,
+			"target":     missingTarget,
+		}
+		for field, plan := range cases {
+			t.Run(field, func(t *testing.T) {
+				applies := &capturingApplyStore{}
+				svc, tasks := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+
+				w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+				require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+				var resp apitypes.ErrorResponse
+				require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+				assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+				assert.Equal(t, fmt.Sprintf(`apply rejected: plan plan-1 is missing server-side routing metadata field %q; create a new plan and retry apply`, field), resp.Error)
+				assert.Nil(t, applies.apply, "a plan without routing metadata must not store an apply")
+				assert.Empty(t, tasks.tasks)
+			})
+		}
+	})
+
+	// When the plan read itself fails, the apply is a server failure: a 500
+	// with the storage error code, and the raw storage error (which can carry
+	// hostnames) stays in the server log rather than the response.
+	t.Run("returns internal error without storage detail when the plan lookup fails", func(t *testing.T) {
+		logger := slog.New(slog.DiscardHandler)
+		storageErr := errors.New("dial tcp 10.0.0.5:3306: connect: connection refused")
+		svc := New(&mockStorageWithPlanLookup{plans: &mockPlanLookupStore{err: storageErr}}, testServerConfig(), nil, logger)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Equal(t, "apply failed: failed to get plan plan-1; see server logs, then retry", resp.Error)
+		assert.NotContains(t, w.Body.String(), "10.0.0.5")
 	})
 
 	t.Run("returns conflict when an active apply already exists", func(t *testing.T) {

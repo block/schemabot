@@ -93,11 +93,19 @@ type trackedApply struct {
 	// statement — the build has not started, has already returned, or its
 	// backend cannot be observed or signalled by this role.
 	cancelApply context.CancelFunc
-	// cancelRequested records that Cancel acted on this apply, so the drive
-	// can tell the operator's cancellation from a backend cancellation it did
-	// not ask for. It is set before the signal is sent and never reset once
-	// a signal may have reached the build.
+	// cancelRequested records that a Cancel may have reached this apply — its
+	// signal may have landed on the build backend, or it cancelled the drive's
+	// context — so the drive can tell the operator's cancellation from a
+	// backend cancellation it did not ask for. Once set it is never reset.
 	cancelRequested bool
+	// cancelsInFlight counts the Cancel calls that have committed to acting
+	// on this apply but have not yet learned whether their signal was sent.
+	// The drive reads the apply as cancelled by the operator while any is in
+	// flight, because a signal can land before the call that sent it hears
+	// back. The cost runs the other way too: while a call is in flight, a
+	// backend cancellation SchemaBot did not send is also read as the
+	// operator's.
+	cancelsInFlight int
 	done            chan struct{}
 }
 

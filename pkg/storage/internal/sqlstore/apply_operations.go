@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -499,28 +500,6 @@ func (s *applyOperationStore) MarkTerminal(ctx context.Context, id int64, newSta
 		}, newState)
 }
 
-// SaveExternalOperationID stores the remote data plane's apply_operation_id on
-// the operation row. It refuses empty IDs so callers do not convert a missing
-// remote field into an apparent successful correlation.
-func (s *applyOperationStore) SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error {
-	if externalOperationID == "" {
-		return fmt.Errorf("save external operation id for apply_operation %d: external operation id is empty", operationID)
-	}
-	guard, err := operationWriteGuardFromContext(ctx)
-	if err != nil {
-		return err
-	}
-	args := append([]any{externalOperationID, operationID}, guard.args()...)
-	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
-		{Column: "external_operation_id", Expr: "?"},
-	})
-	result, err := s.db.ExecContext(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("save external operation id for apply_operation %d: %w", operationID, err)
-	}
-	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
-}
-
 // ApplyIdentifierForRemoteApply returns the identifier of the apply this control
 // plane dispatched as externalID, or "" when it dispatched no such thing.
 //
@@ -574,9 +553,13 @@ func (s *applyOperationStore) ApplyIdentifierForRemoteApply(ctx context.Context,
 	}
 }
 
-// SaveExternalID stores the remote data plane's apply_id on the operation row.
-// It refuses empty IDs so callers do not convert a missing remote field into an
-// apparent successful correlation.
+// SaveExternalID stores the remote data plane's apply_id on the operation row,
+// together with its apply_operation_id when externalOperationID is non-empty.
+// It refuses an empty apply id so callers do not convert a missing remote field
+// into an apparent successful correlation. Both ids are written by one UPDATE:
+// an operation that recorded its remote apply but not its remote operation
+// could never be dispatched again (it already has a remote apply) nor
+// addressed apart from its sibling operations (it has no remote operation).
 //
 // The write is atomic with the deployment's one-remote-apply invariant: in one
 // transaction it locks the apply's operation rows, verifies the operation's
@@ -587,7 +570,7 @@ func (s *applyOperationStore) ApplyIdentifierForRemoteApply(ctx context.Context,
 // divergent ids. Divergence — among the siblings themselves or between the
 // siblings and this id — returns an error wrapping
 // storage.ErrRemoteApplyDeploymentIDConflict.
-func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error {
+func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, operationID int64, externalID, externalOperationID string) error {
 	if externalID == "" {
 		return fmt.Errorf("save external id for apply_operation %d: external id is empty", operationID)
 	}
@@ -622,11 +605,18 @@ func (s *applyOperationStore) SaveExternalID(ctx context.Context, applyID, opera
 	if sharedID != "" && sharedID != externalID {
 		return fmt.Errorf("deployment %q of apply %d already correlates to remote apply %q; refusing to store %q for apply_operation %d: %w", current.Deployment, applyID, sharedID, externalID, operationID, storage.ErrRemoteApplyDeploymentIDConflict)
 	}
+	if externalOperationID != "" && current.ExternalOperationID != "" && current.ExternalOperationID != externalOperationID {
+		return fmt.Errorf("apply_operation %d already records remote apply_operation id %q; refusing to overwrite it with %q", operationID, current.ExternalOperationID, externalOperationID)
+	}
 
-	args := append([]any{externalID, operationID}, guard.args()...)
-	query := guard.updateStatement(s.dialect, []JoinedUpdateAssignment{
-		{Column: "external_id", Expr: "?"},
-	})
+	assignments := []JoinedUpdateAssignment{{Column: "external_id", Expr: "?"}}
+	values := []any{externalID}
+	if externalOperationID != "" {
+		assignments = append(assignments, JoinedUpdateAssignment{Column: "external_operation_id", Expr: "?"})
+		values = append(values, externalOperationID)
+	}
+	args := append(append(values, operationID), guard.args()...)
+	query := guard.updateStatement(s.dialect, assignments)
 	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("save external id for apply_operation %d: %w", operationID, err)
@@ -738,15 +728,36 @@ func (s *applyOperationStore) SaveProgressMetadata(ctx context.Context, operatio
 	return s.checkUpdatedOrExists(ctx, result, operationID, guard, false)
 }
 
-// finalizerScopeSQL renders the scope a group_finalizer shares with the work
-// it finalizes: the leading segment of the operation key, or the whole key
-// when it has no delimiter. A finalizer and its work also share a deployment,
-// which callers match separately.
-func finalizerScopeSQL(alias string) string {
-	return `CASE
-		WHEN POSITION('/' IN ` + alias + `.operation_key) = 0 THEN ` + alias + `.operation_key
-		ELSE SUBSTRING(` + alias + `.operation_key FROM 1 FOR POSITION('/' IN ` + alias + `.operation_key) - 1)
-	END`
+// finalizerFinalizesWorkSQL matches when the group_finalizer at finalizerAlias
+// finalizes the work at workAlias: the finalizer's key ends in the
+// group_finalizer segment after a non-empty scope, and the work's key is that
+// scope or begins with it and the delimiter. It is state.FinalizerFinalizesWork
+// in SQL, so the claim query and every rollout projection agree on which work
+// a finalizer waits for and is orphaned by: one namespace of one target, in
+// both the single-target and the targets-list key shape. A finalizer and its
+// work also share a deployment, which callers match separately. Every
+// comparison is byte-exact through the dialect's binary collation, as the Go
+// rule's string comparisons are: namespaces and tables are case-significant,
+// so "orders/group_finalizer" never finalizes "Orders/-80/orders" work. The
+// fragment takes no placeholders.
+func finalizerFinalizesWorkSQL(d Dialect, finalizerAlias, workAlias string) string {
+	suffix := state.OperationKeyDelimiter + state.GroupFinalizerKeySegment
+	suffixLen := strconv.Itoa(len(suffix))
+	finalizerKey := finalizerAlias + `.operation_key`
+	workKey := workAlias + `.operation_key`
+	scopeLen := `CHAR_LENGTH(` + finalizerKey + `) - ` + suffixLen
+	// The scope with the delimiter that closes it, so ns_0 never claims
+	// ns_01's work.
+	scopeWithDelimiterLen := scopeLen + ` + ` + strconv.Itoa(len(state.OperationKeyDelimiter))
+	bin := d.BinaryCollation
+	return `(
+		CHAR_LENGTH(` + finalizerKey + `) > ` + suffixLen + `
+		AND ` + bin(`RIGHT(`+finalizerKey+`, `+suffixLen+`)`) + ` = '` + suffix + `'
+		AND (
+			` + bin(workKey) + ` = ` + bin(`LEFT(`+finalizerKey+`, `+scopeLen+`)`) + `
+			OR ` + bin(`LEFT(`+workKey+`, `+scopeWithDelimiterLen+`)`) + ` = ` + bin(`LEFT(`+finalizerKey+`, `+scopeWithDelimiterLen+`)`) + `
+		)
+	)`
 }
 
 // orphanedFinalizerSQL matches an earlier group_finalizer that nothing will
@@ -758,7 +769,8 @@ func finalizerScopeSQL(alias string) string {
 // loaded rows for every rollout state derivation. The fragment references the
 // earlier alias; its placeholders, in order, are the finalizer kind, pending, stopped,
 // the work kind and failed.
-var orphanedFinalizerSQL = `(
+func orphanedFinalizerSQL(d Dialect) string {
+	return `(
 	earlier.operation_kind = ?
 	AND earlier.state IN (?, ?)
 	AND EXISTS (
@@ -767,10 +779,11 @@ var orphanedFinalizerSQL = `(
 		WHERE orphaning.apply_id = earlier.apply_id
 			AND orphaning.deployment = earlier.deployment
 			AND orphaning.operation_kind = ?
-			AND ` + finalizerScopeSQL("orphaning") + ` = ` + finalizerScopeSQL("earlier") + `
+			AND ` + finalizerFinalizesWorkSQL(d, "earlier", "orphaning") + `
 			AND orphaning.state = ?
 	)
 )`
+}
 
 // releasedFailureExemptionSQL stops a terminal-failed earlier sibling from
 // blocking a later deployment's claim once the rollout policy says to keep
@@ -789,10 +802,11 @@ var orphanedFinalizerSQL = `(
 // Placeholders, in order: earlier-failed state, the orphanedFinalizerSQL
 // placeholders, continue, pause, release operation, pending, completed (see
 // releasedFailureExemptionArgs).
-var releasedFailureExemptionSQL = `NOT (
+func releasedFailureExemptionSQL(d Dialect) string {
+	return `NOT (
 	(
 		earlier.state = ?
-		OR ` + orphanedFinalizerSQL + `
+		OR ` + orphanedFinalizerSQL(d) + `
 	)
 	AND (
 		apply_operations.on_failure = ?
@@ -808,6 +822,7 @@ var releasedFailureExemptionSQL = `NOT (
 		)
 	)
 )`
+}
 
 // earlierRolloutMemberSQL matches an earlier sibling that belongs to a
 // different rollout member than the candidate row. A rollout member is a
@@ -828,6 +843,25 @@ const earlierRolloutMemberSQL = `(
 	OR earlier.target <> apply_operations.target
 )`
 
+// rolloutMembersOrderedHereSQL holds when this store is the plane that orders
+// the candidate's rollout members, which is every apply except one a remote
+// dispatch created. A dispatched apply carries the idempotency key its
+// dispatcher stamped, and every operation of it arrived as its own dispatch
+// that the dispatcher had already admitted under the rollout's cutover and
+// on_failure policy. Ordering those operations a second time here, under the
+// rolling and halt defaults their rows carry, would serialize a parallel
+// rollout and hold a later member pending behind an earlier one the
+// dispatcher already settled. The copy-start gate therefore leaves member
+// order to the dispatcher on such an apply; the cutovers it sends name the
+// operation they are for. The fragment references the apply_operations alias
+// and takes no placeholders.
+const rolloutMembersOrderedHereSQL = `NOT EXISTS (
+	SELECT 1
+	FROM applies AS dispatched
+	WHERE dispatched.id = apply_operations.apply_id
+		AND dispatched.idempotency_key IS NOT NULL
+)`
+
 // earlierSiblingHoldsCutoverSQL is the cutover-order rule: an earlier sibling
 // (lower created_at, id — deployment_order as materialized at apply-create)
 // holds a later operation's cutover until it has completed, unless
@@ -838,10 +872,12 @@ const earlierRolloutMemberSQL = `(
 // (FindNextApplyOperationCutover) and the manual-request turn check
 // (CutoverBlocker) evaluate the same rule. pkg/presentation blocksCutover is
 // the render-side mirror. Placeholders: see earlierSiblingHoldsCutoverArgs.
-var earlierSiblingHoldsCutoverSQL = `earlier.apply_id = apply_operations.apply_id
+func earlierSiblingHoldsCutoverSQL(d Dialect) string {
+	return `earlier.apply_id = apply_operations.apply_id
 	AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 	AND earlier.state <> ?
-	AND ` + releasedFailureExemptionSQL
+	AND ` + releasedFailureExemptionSQL(d)
+}
 
 // earlierSiblingHoldsCutoverArgs returns the positional arguments for
 // earlierSiblingHoldsCutoverSQL, in placeholder order.
@@ -888,14 +924,15 @@ func earlierFinalizerAtBarrierArgs() []any {
 // apply_operations alias; its placeholders, in order, are the work kind,
 // completed, completed, and releasedFailureExemptionArgs (see
 // finalizerStartGateArgs).
-var finalizerStartGateSQL = `(
+func finalizerStartGateSQL(d Dialect) string {
+	return `(
 	NOT EXISTS (
 		SELECT 1
 		FROM apply_operations AS sibling
 		WHERE sibling.apply_id = apply_operations.apply_id
 			AND sibling.deployment = apply_operations.deployment
 			AND sibling.operation_kind = ?
-			AND ` + finalizerScopeSQL("sibling") + ` = ` + finalizerScopeSQL("apply_operations") + `
+			AND ` + finalizerFinalizesWorkSQL(d, "apply_operations", "sibling") + `
 			AND sibling.state <> ?
 	)
 	AND NOT EXISTS (
@@ -903,11 +940,13 @@ var finalizerStartGateSQL = `(
 		FROM apply_operations AS earlier
 		WHERE earlier.apply_id = apply_operations.apply_id
 			AND ` + earlierRolloutMemberSQL + `
+			AND ` + rolloutMembersOrderedHereSQL + `
 			AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 			AND earlier.state <> ?
-			AND ` + releasedFailureExemptionSQL + `
+			AND ` + releasedFailureExemptionSQL(d) + `
 	)
 )`
+}
 
 // finalizerStartGateArgs returns the positional arguments for
 // finalizerStartGateSQL, in placeholder order.
@@ -932,11 +971,13 @@ func finalizerStartGateArgs() []any {
 // earlier sibling stops blocking. The on_failure exemption applies to every
 // policy. The fragment references the apply_operations alias; see
 // workStartGateArgs for its placeholders.
-var workStartGateSQL = `NOT EXISTS (
+func workStartGateSQL(d Dialect) string {
+	return `NOT EXISTS (
 	SELECT 1
 	FROM apply_operations AS earlier
 	WHERE earlier.apply_id = apply_operations.apply_id
 		AND ` + earlierRolloutMemberSQL + `
+		AND ` + rolloutMembersOrderedHereSQL + `
 		AND (earlier.created_at, earlier.id) < (apply_operations.created_at, apply_operations.id)
 		AND (
 			(
@@ -949,8 +990,9 @@ var workStartGateSQL = `NOT EXISTS (
 				AND earlier.state <> ?
 			)
 		)
-		AND ` + releasedFailureExemptionSQL + `
+		AND ` + releasedFailureExemptionSQL(d) + `
 )`
+}
 
 // workStartGateArgs returns the positional arguments for workStartGateSQL,
 // in placeholder order.
@@ -978,16 +1020,18 @@ func workStartGateArgs() []any {
 // caught before they ever started, so a stop and start cannot reorder the
 // rollout. The fragment references the apply_operations alias; see
 // operationStartGateArgs for its placeholders.
-var operationStartGateSQL = `(
+func operationStartGateSQL(d Dialect) string {
+	return `(
 	(
 		apply_operations.operation_kind <> ?
-		AND ` + workStartGateSQL + `
+		AND ` + workStartGateSQL(d) + `
 	)
 	OR (
 		apply_operations.operation_kind = ?
-		AND ` + finalizerStartGateSQL + `
+		AND ` + finalizerStartGateSQL(d) + `
 	)
 )`
+}
 
 // operationStartGateArgs returns the positional arguments for
 // operationStartGateSQL, in placeholder order.
@@ -1457,7 +1501,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 		WHERE (
 			(
 				state = ?
-				AND `+operationStartGateSQL+`
+				AND `+operationStartGateSQL(s.dialect)+`
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_control_requests cr
@@ -1497,7 +1541,7 @@ func (s *applyOperationStore) FindNextApplyOperation(ctx context.Context, owner 
 						AND apply_operations.started_at IS NOT NULL
 					)
 					OR (
-						`+operationStartGateSQL+`
+						`+operationStartGateSQL(s.dialect)+`
 						AND `+parentClaimable+`
 					)
 				)
@@ -1858,7 +1902,7 @@ func (s *applyOperationStore) FindNextApplyOperationCutover(ctx context.Context,
 				AND NOT EXISTS (
 					SELECT 1
 					FROM apply_operations AS earlier
-					WHERE `+earlierSiblingHoldsCutoverSQL+`
+					WHERE `+earlierSiblingHoldsCutoverSQL(s.dialect)+`
 				)
 				AND NOT EXISTS (
 					SELECT 1
@@ -1964,7 +2008,7 @@ func (s *applyOperationStore) CutoverBlocker(ctx context.Context, operationID in
 			FROM apply_operations
 			WHERE apply_operations.id = ?
 				AND `+earlierRolloutMemberSQL+`
-				AND `+earlierSiblingHoldsCutoverSQL+`
+				AND `+earlierSiblingHoldsCutoverSQL(s.dialect)+`
 		)
 		ORDER BY created_at, id
 		LIMIT 1

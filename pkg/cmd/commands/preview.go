@@ -86,6 +86,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentPlanCopyAdopted, templates.PreviewCommentPlanCopyRunning,
 		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,
+		templates.PreviewCommentPlanColumnOnlyAlter, templates.PreviewCommentPlanManyTables,
+		templates.PreviewCommentPlanCollationChanges,
 		templates.PreviewCommentPlanEmpty,
 		templates.PreviewCommentNoManagedSchema,
 		templates.PreviewCommentReconcileInProgress,

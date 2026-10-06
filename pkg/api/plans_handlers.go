@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -194,7 +193,7 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 			if change.IsUnsafe {
 				summary.UnsafeCount++
 			}
-			if change.ExecutionMode == engine.ExecutionModeBlocked {
+			if change.EngineBlocked() {
 				summary.BlockedCount++
 			}
 		}
@@ -229,6 +228,7 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 		Environment:  plan.Environment,
 		Deployment:   plan.Deployment,
 		Target:       plan.Target,
+		NarrowedTo:   plan.NarrowedTo,
 		Engine:       storage.EngineForType(plan.DatabaseType),
 		Changes:      []*apitypes.SchemaChangeResponse{},
 		LintResults:  []*apitypes.LintViolationResponse{},
@@ -296,7 +296,19 @@ func tableChangeResponseFromStorage(change storage.TableChange) *apitypes.TableC
 		ShardCount:       change.ShardCount,
 		LargestShardRows: change.LargestShardRows,
 		EstimatedBytes:   change.EstimatedBytes,
+		CollationChanges: collationChangesFromStorage(change.CollationChanges),
 	}
+}
+
+func collationChangesFromStorage(changes []storage.CollationChange) []apitypes.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]apitypes.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = apitypes.CollationChange(c)
+	}
+	return out
 }
 
 // sortedPlanNamespaces returns the plan's namespace keys in sorted order so

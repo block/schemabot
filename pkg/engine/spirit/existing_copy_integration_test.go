@@ -439,7 +439,8 @@ func TestPlannedExistingCopiesFollowsTheGroupingTheApplyWillUse(t *testing.T) {
 		target := &lazyTargetDB{dsn: dsn}
 		defer target.close()
 
-		copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+		copies, checked := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+		require.True(t, checked, "every lookup read the target, so the plan counts as checked for copies")
 		require.Len(t, copies, 1, "only the table with a copy has anything at stake")
 		assert.Equal(t, engine.CopyAdopt, copies[0].Disposition,
 			"the apply hands Spirit this table's own ALTER, which is what its checkpoint records")
@@ -452,7 +453,8 @@ func TestPlannedExistingCopiesFollowsTheGroupingTheApplyWillUse(t *testing.T) {
 		target := &lazyTargetDB{dsn: dsn}
 		defer target.close()
 
-		copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, true)
+		copies, checked := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, true)
+		require.True(t, checked, "every lookup read the target, so the plan counts as checked for copies")
 		require.Len(t, copies, 1, "the batch is one unit, so its copy is one disclosure")
 		assert.Equal(t, engine.CopyDiscard, copies[0].Disposition,
 			"Spirit rebuilds every table in the batch when one of them has no shadow table")
@@ -485,7 +487,8 @@ func TestPlannedExistingCopiesMeetsEachTableOnItsOwnTerms(t *testing.T) {
 	target := &lazyTargetDB{dsn: dsn}
 	defer target.close()
 
-	copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	copies, checked := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	require.True(t, checked, "every lookup read the target, so the plan counts as checked for copies")
 	require.Len(t, copies, 1, "only the table with a copy has anything at stake")
 	assert.Equal(t, engine.CopyAdopt, copies[0].Disposition,
 		"the copy matches its own table's ALTER, not the plan's first")
@@ -522,7 +525,8 @@ func TestPlannedExistingCopiesDisclosesEveryTableWithACopy(t *testing.T) {
 	target := &lazyTargetDB{dsn: dsn}
 	defer target.close()
 
-	copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	copies, checked := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	require.True(t, checked, "every lookup read the target, so the plan counts as checked for copies")
 	require.Len(t, copies, 2, "every table with a copy is disclosed")
 	assert.Equal(t, engine.CopyAdopt, copies[0].Disposition)
 	assert.Equal(t, []string{"xfers"}, copies[0].Tables)
@@ -557,7 +561,8 @@ func TestPlannedExistingCopiesDisclosesATableOnceAcrossItsBatches(t *testing.T) 
 	target := &lazyTargetDB{dsn: dsn}
 	defer target.close()
 
-	copies := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	copies, checked := eng.plannedExistingCopies(t.Context(), target, testDatabase, changes, false)
+	require.True(t, checked, "every lookup read the target, so the plan counts as checked for copies")
 	require.Len(t, copies, 1, "one table, one verdict, however many batches alter it")
 	assert.Equal(t, engine.CopyAdopt, copies[0].Disposition,
 		"the first batch is the one that meets the copy, and its statement matches")

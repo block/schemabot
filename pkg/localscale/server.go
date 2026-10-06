@@ -1385,6 +1385,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Deploy request CRUD endpoints
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/deploy-requests/{number}", s.handleError(s.handleGetDeployRequest))
+	mux.HandleFunc("PATCH /v1/organizations/{org}/databases/{db}/deploy-requests/{number}", s.handleError(s.handleUpdateDeployRequest))
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/deploy-requests", s.handleError(s.handleListDeployRequests))
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests", s.handleError(s.handleCreateDeployRequest))
 

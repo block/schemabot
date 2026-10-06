@@ -84,14 +84,18 @@ func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
 
 // RenderRollbackMissingApplyID renders the message posted when `schemabot rollback`
 // is invoked without an apply ID argument. Tenant is the deployment's own
-// tenant; when set, the suggested commands carry it so pasting a hint
-// addresses this deployment.
-func RenderRollbackMissingApplyID(tenant string) string {
+// tenant; when set, the rollback usage lines carry it so pasting a hint
+// addresses this deployment. The status lookup is a CLI command, so it starts
+// with cliName and is scoped to the environment the rollback named, or to the
+// placeholder when it named none. It never carries --tenant: the tenant routes
+// PR comments, the CLI has no such flag, and the CLI reaches this deployment
+// through its endpoint or profile, which cliName's wrapper selects.
+func RenderRollbackMissingApplyID(cliName, environment, tenant string) string {
 	return offerSupportChannel("## Missing Apply ID\n\n" +
 		fmt.Sprintf("Usage: `%s`\n\n", tenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
 		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", tenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
 		"You can find the apply ID in the summary comment of a completed apply, " +
-		fmt.Sprintf("or by running `%s`.", appendTenantFlag("schemabot status", tenant)))
+		fmt.Sprintf("or by running `%s`.", cliCommand(cliName, "status "+environmentFlag(environment))))
 }
 
 // RenderRollbackApplyNotFound renders the message posted when the supplied apply ID

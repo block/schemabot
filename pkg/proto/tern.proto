@@ -494,6 +494,13 @@ message PlanRequest {
   // configuration decides, which with none configured leaves every statement
   // the engine refuses blocked.
   DirectExecutionPolicy direct_execution = 14;
+  // Declared namespaces the caller left out of schema_files because the
+  // target's entry in its database's targets list selects only other
+  // namespaces. Like ignored_namespaces, they are withheld rather than
+  // removed, so the data plane refuses engine shapes that diff the whole target
+  // as one unit (a database-scoped MySQL DSN), where an unselected namespace's
+  // live tables would otherwise be planned as drops.
+  repeated string unselected_namespaces = 15;
 }
 
 // DirectExecutionPolicy permits statements an engine deterministically refuses
@@ -556,6 +563,36 @@ message TableChange {
   // across shards for sharded targets. Unset when no estimate was available.
   // Approximate like estimated_rows.
   optional int64 estimated_bytes = 13;
+  // Existing columns whose collation this change moves, so a reviewer can see
+  // what it does to how values sort and compare equal. Empty when the change
+  // re-collates no column, and for an engine that does not report it.
+  repeated CollationChange collation_changes = 14;
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+message CollationChange {
+  string column = 1;
+  // The collation the column compares under now.
+  string from_collation = 2;
+  // The collation it compares under once the change applies. Empty when the
+  // change leaves it to a server default the plan cannot read.
+  string to_collation = 3;
+  // How the comparison of values differing only in letter case, and only in
+  // trailing spaces, moves: "unchanged", "becomes_sensitive",
+  // "becomes_insensitive", or "unknown" when either collation's properties
+  // are not known. Consumers treat "unknown" as a possible change.
+  string case_comparison = 4;
+  string trailing_space_comparison = 5;
+  // Primary key and unique indexes that cover the column when
+  // can_merge_values, since those are the indexes that reject values once
+  // they compare equal.
+  repeated string unique_indexes = 6;
+  // Whether values that compare unequal now can compare equal after the
+  // move, whether or not the two comparisons above name the reason. False
+  // only for a move onto a binary collation of the same charset that does not
+  // start ignoring trailing spaces.
+  bool can_merge_values = 7;
 }
 
 // SchemaChange is a namespace-level bundle. A PlanResponse must include at most
@@ -677,6 +714,13 @@ message PlanDiffResponse {
   // Per-shard membership and drift, populated for sharded engines. Empty for
   // single-endpoint engines.
   repeated ShardPlan shards = 5;
+  // Unfinished work already on the target that applying this diff's changes
+  // would continue or destroy, the same disclosures PlanResponse carries.
+  repeated ExistingCopy existing_copies = 6;
+  // Set by a data plane that read the target for every copy applying this
+  // diff could meet, so a caller can tell a clean target from a data plane
+  // that never looked or whose lookup failed.
+  bool existing_copies_reported = 7;
 }
 
 // ApplyRequest requests execution of a previously generated plan.
@@ -796,6 +840,12 @@ message ProgressRequest {
   string apply_id = 1;
   // Environment: "staging" or "production".
   string environment = 2;
+  // When set, scopes the answer to one operation of the apply: the
+  // apply_operation_id a dispatch returned in ApplyResponse. The rollout
+  // members of one deployment share its apply, each with its own operation,
+  // so a member's progress is its operation's state and tables rather than
+  // the whole apply's. Empty asks about the whole apply.
+  string apply_operation_id = 3;
 }
 
 message LogsRequest {
@@ -868,6 +918,10 @@ message TableProgress {
   // Names the signal pausing the work, for display (e.g. "replica-lag 5s >=
   // 2s"). Empty when throttled is false.
   string throttle_reason = 18;
+  // The plan's approximate on-disk footprint of the table (data plus indexes),
+  // for display beside the row counts. Unset when the plan had no estimate and
+  // for a task scoped to one shard, since the estimate covers the whole table.
+  optional int64 estimated_bytes = 19;
 }
 
 // SettledControlRequest reports the fate of a durable control request the
@@ -906,6 +960,11 @@ message ProgressResponse {
   map<string, string> metadata = 10;
   // Control requests on this apply that have reached a terminal status.
   repeated SettledControlRequest settled_control_requests = 11;
+  // The apply_operation_id the answer is scoped to, echoed from the request.
+  // A caller that asked about one operation must refuse an answer without its
+  // id: a data plane that ignores the scope answers for the whole apply, and
+  // reading that as one member's state reports its siblings' work as its own.
+  string apply_operation_id = 12;
 }
 
 // CutoverRequest triggers the cutover phase.
@@ -919,6 +978,11 @@ message CutoverRequest {
   // may not be the one the operator talked to, and the request is what names
   // the requester in the PR notice and the apply log.
   string caller = 3;
+  // When set, cuts over only this operation of the apply: the
+  // apply_operation_id a dispatch returned in ApplyResponse. The rollout
+  // members of one deployment share its apply, and one member's turn to cut
+  // over is not its siblings' turn. Empty cuts over the apply's parked work.
+  string apply_operation_id = 4;
 }
 
 // CutoverResponse indicates whether the cutover was accepted.

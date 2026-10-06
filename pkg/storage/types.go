@@ -230,7 +230,7 @@ const (
 	// safe: an existing drift block is preserved, never silently cleared.
 	PlanDriftNotEvaluated PlanDriftState = iota
 	// PlanDriftClean means the rollup ran and every deployment matched the
-	// reviewed plan, so a stale drift block may be cleared.
+	// primary plan, so a stale drift block may be cleared.
 	PlanDriftClean
 	// PlanDriftBlocked means the rollup ran and a deployment diverged or could
 	// not be confirmed, so the write records the drift block.
@@ -243,6 +243,14 @@ const (
 // truth: UpsertPlanResult preserves a row carrying this reason on a
 // not-evaluated write instead of clearing it.
 const ReviewTimeDeploymentDriftBlockingReason = "review_time_deployment_drift"
+
+// NamespacePlacementRefusedBlockingReason is the stable Check.BlockingReason
+// value for an environment whose plan was refused because its targets entries
+// and the schema files disagree on where a namespace lives. It is written with
+// the review-time write intent (PlanDriftBlocked) and preserved on a
+// not-evaluated write exactly like a drift block, since only a plan that
+// re-evaluates placement can lift it.
+const NamespacePlacementRefusedBlockingReason = "namespace_placement_refused"
 
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
@@ -374,7 +382,7 @@ const (
 // component containing it would make the key ambiguous to split, so producers
 // refuse the delimiter inside a component rather than escaping it. It is the
 // rollout projection's delimiter, which reads a finalizer's scope back out of
-// the key (see state.OperationScope).
+// the key (see state.FinalizerFinalizesWork).
 const OperationKeyDelimiter = state.OperationKeyDelimiter
 
 // ShardOperationKey builds the operation key for one shard's work on one table
@@ -403,6 +411,21 @@ func TargetOperationKey(target, scopedKey string) string {
 		return target
 	}
 	return target + OperationKeyDelimiter + scopedKey
+}
+
+// KeyedByTarget reports whether the operation is whole-target work keyed by
+// its target alone (TargetOperationKey(target, "")), the key each target of a
+// deployment addressing several attaches its own work under. Within one apply,
+// a deployment's work operations are either all keyed this way or none are:
+// the same target's work under a second key shape would run its DDL twice. A
+// group_finalizer is never reported as keyed this way, because its key alone
+// cannot say whether it leads with a target; ApplyOptions.OperationKeysLeadWithTarget
+// records that for the apply.
+func (op *ApplyOperation) KeyedByTarget() bool {
+	if op == nil || op.Target == "" || op.OperationKind == ApplyOperationKindGroupFinalizer {
+		return false
+	}
+	return op.OperationKey == TargetOperationKey(op.Target, "")
 }
 
 // PlanIDForOperation resolves which plan an operation executes: its own when it
@@ -492,6 +515,49 @@ type TableChange struct {
 	// table (data plus indexes), summed across shards for sharded targets.
 	// Display only, like EstimatedRows. Nil when no estimate was available.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, with how each move changes the way values compare. Empty when
+	// the change re-collates no column, or the engine does not report it.
+	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string `json:"column"`
+	// From is the collation the column compares under now; To is the one it
+	// compares under once the change applies, empty when the change leaves it
+	// to a server default the plan cannot read.
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	// Case and TrailingSpaces say how the comparison of values differing only
+	// in letter case, and only in trailing spaces, moves: "unchanged",
+	// "becomes_sensitive", "becomes_insensitive", or "unknown" when either
+	// collation's properties are not known. "unknown" is a possible change.
+	Case           string `json:"case"`
+	TrailingSpaces string `json:"trailing_spaces"`
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool `json:"can_merge_values"`
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
+	UniqueIndexes []string `json:"unique_indexes,omitempty"`
+}
+
+// TaskEstimatedBytes returns the byte estimate a task created from this change
+// carries. The plan's estimate covers every shard of the table, so a task that
+// spans the whole table carries it, and a task scoped to one shard carries
+// none rather than a figure that would read as that shard's size.
+func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
+	if shard != "" || tc.EstimatedBytes == nil {
+		return nil
+	}
+	bytes := *tc.EstimatedBytes
+	return &bytes
 }
 
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
@@ -697,15 +763,15 @@ type Plan struct {
 	// invariant cannot be evaluated) rather than fail closed.
 	HeadSHA string
 
-	// PrimaryPlanIdentifier names the reviewed plan this one was produced
+	// PrimaryPlanIdentifier names the primary plan this one was produced
 	// alongside, for a rollout member planned against its own live schema. It is
 	// the durable link between a member's plan and the review round the operator
-	// approved: an apply created from the reviewed plan selects its members'
+	// approved: an apply created from the primary plan selects its members'
 	// plans by this identifier, so a plan from a later re-plan of the same commit
-	// is a different round and is never substituted for the reviewed one.
+	// is a different round and is never substituted for the one approved.
 	//
-	// Empty on the reviewed plan itself, and on every plan of an environment
-	// whose members all run the reviewed plan.
+	// Empty on the primary plan itself, and on every plan of an environment
+	// whose members all run the primary plan.
 	PrimaryPlanIdentifier string
 
 	// DirectExecution is the direct execution policy this plan's execution
@@ -721,8 +787,33 @@ type Plan struct {
 	// admission the way it always was.
 	DirectExecution *DirectExecutionPolicy
 
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed plan was made for, in an environment of several members.
+	// Empty for a plan of the whole rollout. A narrowed plan says nothing
+	// about the other members, so an apply of it runs on that member alone.
+	NarrowedTo string
+
 	// CreatedAt is when the plan was generated.
 	CreatedAt time.Time
+}
+
+// HasWork reports whether applying the plan would change anything: a table
+// change, a namespace to finalize (a VSchema document or an engine-requested
+// finalize), or a shard with changes of its own. A plan without work is the plan
+// of a target already at the desired schema.
+func (p *Plan) HasWork() bool {
+	if p == nil {
+		return false
+	}
+	if len(p.FlatDDLChanges()) > 0 || len(p.FinalizerNamespaces()) > 0 {
+		return true
+	}
+	for _, shard := range p.Shards {
+		if len(shard.Changes) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
@@ -1366,6 +1457,22 @@ type ApplyOptions struct {
 	// leave the required check action_required (the PR's change has been reverted
 	// and must not merge as-is), not success.
 	Rollback bool `json:"rollback,omitempty"`
+
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed apply ran on. Empty for an apply of the whole rollout. It is
+	// recorded at creation and never read from caller options, so a rollback
+	// can tell an apply that changed one member from one that changed them all.
+	NarrowedTo string `json:"narrowed_to,omitempty"`
+
+	// OperationKeysLeadWithTarget marks an apply whose operations are each
+	// keyed behind their own target (storage.TargetOperationKey): a data-plane
+	// apply that the targets of one deployment share, one operation each. It is
+	// recorded when the apply is created, from the dispatch that names its
+	// rollout member target, and never read from caller options. Without it a
+	// reader could not tell "orders/group_finalizer" apart as target orders'
+	// deployment-scoped finalizer or namespace orders' finalizer until a sibling
+	// target's operation had attached.
+	OperationKeysLeadWithTarget bool `json:"operation_keys_lead_with_target,omitempty"`
 }
 
 // DirectExecutionPolicy is an apply's durable record of the direct execution
@@ -1825,6 +1932,13 @@ type Task struct {
 	RowsTotal       int64 // Total rows to copy
 	ProgressPercent int   // 0-100
 	ETASeconds      int   // Estimated seconds remaining
+	// EstimatedBytes is the planner's approximate on-disk footprint of the
+	// table (data plus indexes), copied from the plan change this task was
+	// created from so progress can show the table's scale beside its row
+	// counts. Display only and written once: progress updates never change
+	// it. Nil when the plan had no estimate, and for per-shard rows, since a
+	// plan's estimate covers the whole table.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64

@@ -55,6 +55,9 @@ func previewPlanData() PlanCommentData {
 					"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `total_cents` bigint NOT NULL,\n  `status` varchar(50) NOT NULL DEFAULT 'pending',\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 					"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
 				},
+				TableSizes: []TableSizeData{
+					{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
+				},
 			},
 		},
 		LintViolations: sampleLintWarnings(),
@@ -108,6 +111,155 @@ func PreviewCommentPlanIgnoreTables() string {
 			Namespace: "testapp",
 			Tables:    []string{"flyway_schema_history"},
 			Reason:    "ignore_tables",
+		}},
+	})
+}
+
+// previewBytes returns a pointer to a sample byte estimate.
+//
+//go:fix inline
+func previewBytes(n int64) *int64 {
+	return new(n)
+}
+
+// PreviewCommentPlanColumnOnlyAlter renders a sample plan whose only alter
+// adds a plain column — a metadata-only change whose cost doesn't scale with
+// the table — so the comment carries no table-size section.
+func PreviewCommentPlanColumnOnlyAlter() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `products` ADD COLUMN `discount_cents` bigint DEFAULT NULL;",
+				},
+			},
+		},
+	})
+}
+
+// PreviewCommentPlanCollationChanges renders a plan that moves a table onto a
+// new default collation, which re-collates the columns the ALTER redeclares,
+// and makes one unique column case-sensitive. The collation section under the
+// sizes says what each move does to how values compare.
+func PreviewCommentPlanCollationChanges() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"ALTER TABLE `products` MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL, MODIFY COLUMN `title` varchar(255) COLLATE utf8mb4_0900_ai_ci DEFAULT NULL, DEFAULT CHARSET=utf8mb4, COLLATE=utf8mb4_0900_ai_ci;",
+				"ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_bin NOT NULL;",
+			},
+			TableSizes: []TableSizeData{
+				{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
+				{Table: "customers", EstimatedBytes: previewBytes(2_900_000_000)},
+			},
+			CollationChanges: []CollationChangeData{
+				{
+					Table: "products", Column: "sku", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+					Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+					CanMergeValues: true, UniqueIndexes: []string{"uk_sku"},
+				},
+				{
+					Table: "products", Column: "title", From: "utf8mb4_general_ci", To: "utf8mb4_0900_ai_ci",
+					Case: engine.ComparisonUnchanged, TrailingSpaces: engine.ComparisonBecomesSensitive,
+					CanMergeValues: true,
+				},
+				{
+					Table: "customers", Column: "handle", From: "utf8mb4_general_ci", To: "utf8mb4_bin",
+					Case: engine.ComparisonBecomesSensitive, TrailingSpaces: engine.ComparisonUnchanged,
+				},
+			},
+		}},
+	})
+}
+
+// previewManyTableSizes is the table set PreviewCommentPlanManyTables indexes:
+// a spread of sizes from kilobytes to hundreds of gigabytes, in plan
+// (alphabetical) order, with two tables whose size probe returned nothing.
+var previewManyTableSizes = []struct {
+	table string
+	bytes int64
+}{
+	{"accounts", 610_000_000},
+	{"addresses", 1_450_000_000},
+	{"api_keys", 6_100_000},
+	{"audit_events", 186_000_000_000},
+	{"carts", 3_200_000_000},
+	{"categories", 1_600_000},
+	{"coupons", 41_000_000},
+	{"customers", 2_900_000_000},
+	{"disputes", 150_000_000},
+	{"feature_flags", 180_000},
+	{"fulfillments", 11_800_000_000},
+	{"inventory", 5_300_000_000},
+	{"invoices", 17_400_000_000},
+	{"ledger_entries", 121_000_000_000},
+	{"line_items", 58_000_000_000},
+	{"locations", 4_200_000},
+	{"notifications", 44_000_000_000},
+	{"order_events", 0},
+	{"orders", 26_500_000_000},
+	{"payment_methods", 2_600_000_000},
+	{"payments", 23_100_000_000},
+	{"payouts", 820_000_000},
+	{"prices", 210_000_000},
+	{"products", 1_130_000_000},
+	{"refunds", 1_300_000_000},
+	{"reviews", 6_900_000_000},
+	{"sessions", 0},
+	{"settlements", 2_100_000_000},
+	{"shipments", 10_900_000_000},
+	{"subscriptions", 470_000_000},
+	{"tax_rates", 2_300_000},
+	{"transfers", 7_700_000_000},
+	{"users", 3_600_000_000},
+	{"webhooks", 540_000_000},
+}
+
+// PreviewCommentPlanManyTables renders a plan that adds a tenant index to every
+// table in the schema, so the size section carries more tables than it lists
+// inline and collapses, listing the tables largest first.
+func PreviewCommentPlanManyTables() string {
+	statements := make([]string, 0, len(previewManyTableSizes))
+	sizes := make([]TableSizeData, 0, len(previewManyTableSizes))
+	for _, t := range previewManyTableSizes {
+		statements = append(statements, "ALTER TABLE `"+t.table+"` ADD INDEX `idx_tenant_id` (`tenant_id`);")
+		size := TableSizeData{Table: t.table}
+		if t.bytes > 0 {
+			size.EstimatedBytes = previewBytes(t.bytes)
+		}
+		sizes = append(sizes, size)
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: statements,
+			TableSizes: sizes,
 		}},
 	})
 }
@@ -169,6 +321,35 @@ func PreviewCommentPlanBlockedPostgres() string {
 				`statement for table "users" must be rewritten into a form the engine can execute natively, then re-planned`,
 				`statement for table "users": table size 2147483648 bytes exceeds the 1073741824-byte threshold for an optimistic attempt; this threshold is SchemaBot's ceiling for a native-safe apply, not a PostgreSQL limit`,
 			})},
+		},
+	})
+}
+
+// PreviewCommentPlanUnsafe renders a sample plan whose changes the unsafe gate
+// holds until the apply carries --allow-unsafe. The footer states that
+// requirement under the plain command, which never carries the flag itself.
+func PreviewCommentPlanUnsafe() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` DROP COLUMN `legacy_ref`;",
+					"ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
 		},
 	})
 }
@@ -524,7 +705,7 @@ func PreviewCommentPlanNoChanges() string {
 }
 
 // PreviewCommentPlanDriftClean renders a plan comment whose review-time drift
-// rollup confirmed the reviewed plan on every deployment (uniform clean line).
+// rollup confirmed the primary plan on every deployment (uniform clean line).
 func PreviewCommentPlanDriftClean() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -544,12 +725,13 @@ func PreviewCommentPlanDriftClean() string {
 				{Deployment: "au", Class: "match"},
 				{Deployment: "us", Class: "match"},
 			},
+			TableSizes: previewDriftTargetSizes(),
 		},
 	})
 }
 
 // PreviewCommentPlanDriftCleanBlocked renders a plan comment whose review-time
-// drift rollup confirmed the reviewed plan on every deployment while one
+// drift rollup confirmed the primary plan on every deployment while one
 // deployment carries a change its target will refuse at apply: the uniform
 // clean line followed by a per-deployment breakdown naming that deployment.
 func PreviewCommentPlanDriftCleanBlocked() string {
@@ -571,12 +753,24 @@ func PreviewCommentPlanDriftCleanBlocked() string {
 				{Deployment: "au", Class: "match", Blocked: 1},
 				{Deployment: "us", Class: "match"},
 			},
+			TableSizes: previewDriftTargetSizes(),
 		},
 	})
 }
 
+// previewDriftTargetSizes is each deployment's size for the table the drift
+// previews' plan indexes. A clean rollup carries every target's sizes, since
+// every target was planned.
+func previewDriftTargetSizes() []TargetTableSize {
+	return []TargetTableSize{
+		previewTargetSize("eu", "products", 1_130_000_000),
+		previewTargetSize("au", "products", 412_000_000),
+		previewTargetSize("us", "products", 8_700_000_000),
+	}
+}
+
 // PreviewCommentPlanDriftDetected renders a plan comment whose review-time drift
-// rollup found deployments that no longer match the reviewed plan: a
+// rollup found deployments that no longer match the primary plan: a
 // per-deployment breakdown naming the matching, diverged, and errored targets.
 func PreviewCommentPlanDriftDetected() string {
 	return RenderPlanComment(PlanCommentData{
@@ -594,7 +788,7 @@ func PreviewCommentPlanDriftDetected() string {
 			Clean:    false,
 			Deployments: []DeploymentDriftEntry{
 				{Deployment: "eu", Primary: true, Class: "match"},
-				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the reviewed plan"},
+				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the primary target's plan"},
 				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
 			},
 		},
@@ -602,7 +796,7 @@ func PreviewCommentPlanDriftDetected() string {
 }
 
 // previewRolloutMembers is the three independent targets the rollout previews
-// below are rendered for, in rollout order with the reviewed primary first.
+// below are rendered for, in rollout order with the primary target first.
 func previewRolloutMembers() []DeploymentDriftEntry {
 	return []DeploymentDriftEntry{
 		{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
@@ -612,7 +806,7 @@ func previewRolloutMembers() []DeploymentDriftEntry {
 }
 
 // PreviewCommentPlanRolloutConverging renders a plan comment for a rollout of
-// independent targets partway through converging: the reviewed target and one
+// independent targets partway through converging: the primary target and one
 // other still need the change, and the third already holds it. The plan renders
 // under the two targets that run it, and the third is named as already there.
 func PreviewCommentPlanRolloutConverging() string {
@@ -638,9 +832,9 @@ func PreviewCommentPlanRolloutConverging() string {
 }
 
 // PreviewCommentPlanRolloutConvergedPrimary renders a plan comment for a rollout
-// whose reviewed target already holds the desired schema while other targets do
-// not. The reviewed target has no plan to show, so the comment renders the plan
-// of the targets still missing the change and names the reviewed target as
+// whose primary target already holds the desired schema while other targets do
+// not. The primary target has no plan to show, so the comment renders the plan
+// of the targets still missing the change and names the primary target as
 // already there.
 func PreviewCommentPlanRolloutConvergedPrimary() string {
 	return RenderPlanComment(PlanCommentData{
@@ -665,7 +859,7 @@ func PreviewCommentPlanRolloutConvergedPrimary() string {
 }
 
 // PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
-// independent targets that need different work: the reviewed target and one
+// independent targets that need different work: the primary target and one
 // other need the email column, and the third needs it with an index as well.
 // Each target applies its own plan, so each plan renders under its targets.
 func PreviewCommentPlanRolloutDistinctPlans() string {
@@ -691,6 +885,115 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 					Statements: []string{email, "ALTER TABLE `users` ADD INDEX `idx_email` (`email`);"},
 				}}},
 			},
+		},
+	})
+}
+
+// PreviewCommentPlanRolloutTwoTargetTableSizes renders a plan comment for a
+// rollout of two independent targets that run the same index builds. Each
+// size line gives the total and names the target with the largest size, since
+// the primary target is not always the one the build takes longest on.
+func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
+	members := previewRolloutMembers()[:2]
+	return previewRolloutTableSizes(members, []TargetTableSize{
+		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
+		previewTargetSize("primary/testapp_1", "users", 95_000_000),
+		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("primary/testapp_2", "users", 98_000_000),
+	})
+}
+
+// PreviewCommentPlanRolloutTableSizes renders a plan comment for a rollout of
+// three independent targets that run the same index builds. Each size line
+// gives the total, the largest size with its target named, and the smallest,
+// and names a target that reported no estimate, since the total then
+// understates the table.
+func PreviewCommentPlanRolloutTableSizes() string {
+	return previewRolloutTableSizes(previewRolloutMembers(), []TargetTableSize{
+		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
+		previewTargetSize("primary/testapp_1", "users", 95_000_000),
+		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("primary/testapp_2", "users", 98_000_000),
+		{Target: "primary/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
+		previewTargetSize("primary/testapp_3", "users", 104_000_000),
+	})
+}
+
+// PreviewCommentPlanRolloutPrimaryTargetTableSizes renders a plan comment for
+// a rollout whose third target could not be planned. The rollout carries no
+// per-target sizes, so the section shows the primary plan's and names the
+// primary target they were read from.
+func PreviewCommentPlanRolloutPrimaryTargetTableSizes() string {
+	members := previewRolloutMembers()
+	members[2].Class = "errored"
+	members[2].Detail = "diff failed; see server logs"
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`);",
+				"ALTER TABLE `users` ADD INDEX `idx_email` (`email`);",
+			},
+			TableSizes: []TableSizeData{
+				{Table: "orders", EstimatedBytes: previewBytes(610_000_000)},
+				{Table: "users", EstimatedBytes: previewBytes(95_000_000)},
+			},
+		}},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: false, Independent: true,
+			Deployments: members,
+		},
+	})
+}
+
+func previewTargetSize(target, table string, bytes int64) TargetTableSize {
+	return TargetTableSize{Target: target, Keyspace: "testapp", Size: TableSizeData{Table: table, EstimatedBytes: &bytes}}
+}
+
+// previewRolloutTableSizes renders a rollout whose targets all run the same
+// two index builds, with the given per-target sizes.
+func previewRolloutTableSizes(members []DeploymentDriftEntry, sizes []TargetTableSize) string {
+	var reviewedSizes []TableSizeData
+	for _, ts := range sizes {
+		if ts.Target == members[0].Deployment+"/"+members[0].Target {
+			reviewedSizes = append(reviewedSizes, ts.Size)
+		}
+	}
+	reviewed := []KeyspaceChangeData{{
+		Keyspace: "testapp",
+		Statements: []string{
+			"ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`);",
+			"ALTER TABLE `users` ADD INDEX `idx_email` (`email`);",
+		},
+		TableSizes: reviewedSizes,
+	}}
+	names := make([]string, 0, len(members))
+	for _, m := range members {
+		names = append(names, m.Deployment+"/"+m.Target)
+	}
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "production",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes:      reviewed,
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: members,
+			Plans:       []DeploymentPlanGroup{{Members: names, Primary: true, Changes: reviewed}},
+			TableSizes:  sizes,
 		},
 	})
 }
@@ -810,6 +1113,7 @@ func PreviewCommentOversized() string {
 	return RenderSupportChannelFooter(RenderOversizedComment(OversizedCommentData{
 		Title:         "## Schema Change Apply — Staging",
 		RenderedBytes: 84801,
+		Environment:   "staging",
 	}), previewSupportChannel())
 }
 
@@ -868,6 +1172,36 @@ func PreviewCommentErrorDatabaseNotConfigured() string {
 		Environment:  "staging",
 		DatabaseName: "payments",
 		CommandName:  action.Apply,
+	})
+}
+
+// PreviewCommentErrorDatabaseNotRegistered renders the error comment the
+// staging aggregate leader posts for an unscoped command on a schemabot.yaml
+// whose database it has not registered.
+func PreviewCommentErrorDatabaseNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Deployment:  "staging",
+		CommandName: action.Plan,
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+		},
+	})
+}
+
+// PreviewCommentErrorDatabasesNotRegistered renders the same error for a PR
+// carrying several such schemabot.yaml files, which one reply names together.
+func PreviewCommentErrorDatabasesNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Deployment:  "staging",
+		CommandName: action.Plan,
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+			{Database: "payments", SchemaPath: "services/payments/schema"},
+		},
 	})
 }
 
@@ -1077,6 +1411,21 @@ func PreviewCommentReviewRequiredNoOperators() string {
 	})
 }
 
+// PreviewCommentReviewRequiredStaleApproval renders the "review required"
+// comment when an authorized reviewer approved an earlier commit and schema
+// files changed after it, so that approval no longer counts.
+func PreviewCommentReviewRequiredStaleApproval() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		StaleApprovers:    []string{"jdoe"},
+	})
+}
+
 // PreviewCommentReviewGateError renders a sample review gate error comment (fail-closed).
 func PreviewCommentReviewGateError() string {
 	return RenderGenericError(SchemaErrorData{
@@ -1219,6 +1568,9 @@ func samplePlanChanges() []KeyspaceChangeData {
 				"CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  `created_at` timestamp DEFAULT CURRENT_TIMESTAMP,\n  PRIMARY KEY (`id`),\n  INDEX `idx_email` (`email`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 				"CREATE TABLE `orders` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `user_id` bigint NOT NULL,\n  `total_cents` bigint NOT NULL,\n  `status` varchar(50) NOT NULL DEFAULT 'pending',\n  PRIMARY KEY (`id`),\n  INDEX `idx_user_id` (`user_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 				"ALTER TABLE `products` ADD INDEX `idx_category_price` (`category`, `price`);",
+			},
+			TableSizes: []TableSizeData{
+				{Table: "products", EstimatedBytes: previewBytes(1_130_000_000)},
 			},
 		},
 	}
@@ -1519,6 +1871,7 @@ func sampleVitessPlanChanges() []KeyspaceChangeData {
 			Keyspace: "commerce_sharded",
 			Statements: []string{
 				"CREATE TABLE `addresses` (\n  `id` bigint unsigned NOT NULL,\n  `customer_id` bigint unsigned NOT NULL,\n  `street` varchar(255) NOT NULL,\n  `city` varchar(100) NOT NULL,\n  PRIMARY KEY (`id`),\n  INDEX `idx_customer_id` (`customer_id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+				"ALTER TABLE `customers` ADD INDEX `idx_loyalty_tier` (`loyalty_tier`);",
 			},
 			VSchemaChanged: true,
 			VSchemaDiff: `--- a/commerce_sharded.json
@@ -1635,12 +1988,14 @@ func PreviewCommentVitessPlanVSchemaRemoval() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "commerce_sharded/vschema.json",
-				Reason: `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
 			},
 			{
-				Table:  "commerce_sharded/vschema.json",
-				Reason: `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
 			},
 		},
 	})
@@ -1826,19 +2181,22 @@ func PreviewCommentMultiEnvPlanDiff() string {
 func sampleApplyTables() []TableProgressData {
 	return []TableProgressData{
 		{
-			Namespace: "testapp",
-			TableName: "orders",
-			DDL:       "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
+			Namespace:      "testapp",
+			TableName:      "orders",
+			EstimatedBytes: new(int64(438_000_000)),
+			DDL:            "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)",
 		},
 		{
-			Namespace: "testapp",
-			TableName: "users",
-			DDL:       "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+			Namespace:      "testapp",
+			TableName:      "users",
+			EstimatedBytes: new(int64(391_000_000)),
+			DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
 		},
 		{
-			Namespace: "testapp",
-			TableName: "products",
-			DDL:       "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
+			Namespace:      "testapp",
+			TableName:      "products",
+			EstimatedBytes: new(int64(157_000_000)),
+			DDL:            "ALTER TABLE `products` ADD INDEX `idx_price` (`price_cents`)",
 		},
 	}
 }

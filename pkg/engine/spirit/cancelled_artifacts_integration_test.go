@@ -178,6 +178,46 @@ func TestEngine_ReleaseCancelledArtifacts_PostCutoverPreservesBothCopies(t *test
 		"both copies keep their rows")
 }
 
+// Spirit's `_<table>_new` and `_<table>_old` names for a 44-character table
+// are both 49 characters. Shortened to fit MySQL's 64-character limit behind
+// the timestamp prefix, the two used to become the same quarantine name, and
+// MySQL refused the RENAME that would have preserved them, so a cancelled
+// post-cutover change on such a table could never be released. Each copy now
+// gets its own name and keeps its rows.
+func TestEngine_ReleaseCancelledArtifacts_PostCutoverLongNamesGetDistinctCopies(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
+
+	baseTable := strings.Repeat("t", 44)
+	releaseTestCleanup(t, db, baseTable)
+	seedArtifact(t, db, baseTable, 2)
+	seedArtifact(t, db, utils.NewTableName(baseTable), 5)
+	seedArtifact(t, db, utils.OldTableName(baseTable), 9)
+
+	eng := New(Config{})
+	result, err := eng.ReleaseCancelledArtifacts(t.Context(), &engine.ReleaseArtifactsRequest{
+		Database:    "testdb",
+		Tables:      []string{baseTable},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "ReleaseCancelledArtifacts()")
+
+	assert.True(t, tableExists(t, db, baseTable), "the live table must be left alone")
+	require.Len(t, result.Preserved, 2)
+	assert.NotEqual(t, result.Preserved[0].Destination, result.Preserved[1].Destination,
+		"each copy must be quarantined under its own name")
+
+	quarantined := listQuarantinedTables(t, db)
+	require.Len(t, quarantined, 2)
+	rowCounts := map[string]int{}
+	for _, name := range quarantined {
+		rowCounts[name] = quarantinedRowCount(t, db, name)
+	}
+	assert.ElementsMatch(t, []int{5, 9}, []int{rowCounts[quarantined[0]], rowCounts[quarantined[1]]},
+		"both copies keep their rows")
+}
+
 // A deployment that runs no quarantine also runs no cleaner to empty one, so
 // preserving a copy there would strand it in a database nothing ever sweeps.
 // The copy is dropped outright instead, the same disposal the deployment chose

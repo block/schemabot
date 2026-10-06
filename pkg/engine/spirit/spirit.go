@@ -39,9 +39,10 @@ import (
 	"github.com/block/schemabot/pkg/targetauth"
 )
 
-// DefaultThreads is the default number of concurrent copier threads. Spirit's
-// write-thread autoscaler adjusts throughput from throttler feedback during the
-// copy, so this is a starting point rather than the throughput ceiling.
+// DefaultThreads is the default number of concurrent copier threads. On
+// Aurora, Spirit's autoscaler sizes the pools from the instance and adjusts
+// them from throttler feedback during the copy, overriding this value; on
+// other MySQL targets it is the fixed copier thread count.
 const DefaultThreads = 2
 
 // DefaultLockWaitTimeout is how long Spirit waits for table locks. Spirit's
@@ -92,6 +93,11 @@ type Engine struct {
 	// exit and Drain's release of the tracked state, so tests can interleave
 	// engine activity into that window deterministically.
 	drainRaceWindow func()
+
+	// stopCheckpointWindow is a test seam invoked between Stop's checkpoint
+	// dump and its write of the stopped state, so tests can land an outcome in
+	// that window deterministically.
+	stopCheckpointWindow func()
 
 	// sizeProbeFault is a test seam invoked with the plan-time size probe's
 	// context when the probe starts. A non-nil error fails the probe, so tests
@@ -605,18 +611,22 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, err
 	}
 	// The target connection opens lazily, so a plan with no changes never
-	// opens it. The size probe, the policy bound's row estimates, and the
-	// existing-copy disclosure below all read the target through it.
+	// opens it. The size probe, the policy bound's row estimates, the
+	// collation report's charset defaults, and the existing-copy disclosure
+	// below all read the target through it.
 	defer verdicts.Close()
 	target := verdicts.target
 
 	if !plan.HasChanges() {
 		// The exemption travels on a no-changes plan too: this is exactly where
 		// a reviewer needs to tell a withheld live table from an unchanged one.
+		// A plan with nothing to apply meets no copy, so it is checked by
+		// construction.
 		return &engine.PlanResult{
-			PlanID:       engine.NewPlanID(),
-			NoChanges:    true,
-			ExemptTables: exemptTables,
+			PlanID:                engine.NewPlanID(),
+			NoChanges:             true,
+			ExistingCopiesChecked: true,
+			ExemptTables:          exemptTables,
 		}, nil
 	}
 
@@ -627,6 +637,16 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	currentByTable := make(map[string]string, len(currentSchema))
 	for _, ts := range currentSchema {
 		currentByTable[ts.Name] = ts.Schema
+	}
+	// The collation report names the unique indexes that cover a re-collated
+	// column as the desired definition leaves them.
+	desiredByTable := make(map[string]string, len(desiredSchemas))
+	for _, ts := range desiredSchemas {
+		desiredByTable[ts.Name] = ts.Schema
+	}
+	collationDefaults := &targetCollationDefaults{target: target}
+	defaultCollation := func(charset string) (string, error) {
+		return collationDefaults.defaultCollation(ctx, charset)
 	}
 
 	// Best-effort per-table size estimates for plan display, read only for the
@@ -698,6 +718,14 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			if err := verdicts.record(ctx, &change, currentCreateTable); err != nil {
 				return nil, err
 			}
+			desiredCreateTable, ok := desiredByTable[pc.TableName]
+			if !ok {
+				return nil, fmt.Errorf("plan produced an ALTER for table %q, which no schema file declares", pc.TableName)
+			}
+			change.CollationChanges, err = plannedCollationChanges(e.logger, pc.Statement, currentCreateTable, desiredCreateTable, defaultCollation)
+			if err != nil {
+				return nil, fmt.Errorf("resolve collation changes for table %q: %w", pc.TableName, err)
+			}
 		}
 
 		changes = append(changes, change)
@@ -756,15 +784,17 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		})
 	}
 
+	// Applying this plan can meet a copy an earlier schema change left on the
+	// target and continue it or destroy it. Disclose which, so that is known
+	// before anyone confirms rather than after the copy is gone.
+	existingCopies, copiesChecked := e.plannedExistingCopies(ctx, target, database, changes, req.GroupedExecution)
 	return &engine.PlanResult{
-		PlanID:         engine.NewPlanID(),
-		Changes:        schemaChanges,
-		LintViolations: lintViolations,
-		// Applying this plan can meet a copy an earlier schema change left on
-		// the target and continue it or destroy it. Disclose which, so that is
-		// known before anyone confirms rather than after the copy is gone.
-		ExistingCopies: e.plannedExistingCopies(ctx, target, database, changes, req.GroupedExecution),
-		ExemptTables:   exemptTables,
+		PlanID:                engine.NewPlanID(),
+		Changes:               schemaChanges,
+		LintViolations:        lintViolations,
+		ExistingCopies:        existingCopies,
+		ExistingCopiesChecked: copiesChecked,
+		ExemptTables:          exemptTables,
 	}, nil
 }
 

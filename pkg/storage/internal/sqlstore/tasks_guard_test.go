@@ -44,7 +44,7 @@ func TestTaskUpdateStatement(t *testing.T) {
 			name:    "operation lease joins the task's operation row on PostgreSQL and locks it",
 			guard:   taskGuardOperation,
 			dialect: PostgresDialect{},
-			want:    "UPDATE tasks t SET " + sets + " FROM apply_operations ao WHERE (ao.id = t.apply_operation_id) AND (t.id = ? AND ao.id = ? AND ao.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = ao.id AND fence.lease_token = ? FOR UPDATE))",
+			want:    "UPDATE tasks t SET " + sets + " FROM apply_operations ao WHERE (ao.id = t.apply_operation_id) AND (t.id = ? AND ao.id = ? AND ao.id = (SELECT fence.id FROM apply_operations fence WHERE fence.id = ao.id AND fence.lease_token = ? FOR SHARE))",
 		},
 		{
 			name:    "apply lease joins the parent applies row on MySQL",
@@ -56,7 +56,7 @@ func TestTaskUpdateStatement(t *testing.T) {
 			name:    "apply lease joins the parent applies row on PostgreSQL and locks it",
 			guard:   taskGuardApply,
 			dialect: PostgresDialect{},
-			want:    "UPDATE tasks t SET " + sets + " FROM applies a WHERE (a.id = t.apply_id) AND (t.id = ? AND a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR UPDATE))",
+			want:    "UPDATE tasks t SET " + sets + " FROM applies a WHERE (a.id = t.apply_id) AND (t.id = ? AND a.id = (SELECT fence.id FROM applies fence WHERE fence.id = a.id AND fence.lease_token = ? FOR SHARE))",
 		},
 		{
 			name:    "operation lease absence pins the task to its operation and admits it only while the operation is unleased on MySQL",

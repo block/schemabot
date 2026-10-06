@@ -1,6 +1,7 @@
 package ddl
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -176,6 +177,10 @@ func TestFormatSchemaFileForDialectPreservesMySQLTableOptions(t *testing.T) {
 		"DELAY_KEY_WRITE = 1",
 		"MIN_ROWS = 10",
 		"STATS_AUTO_RECALC = 0",
+		"STATS_PERSISTENT = 0",
+		"STATS_PERSISTENT = 1",
+		"PACK_KEYS = 0",
+		"PACK_KEYS = 1",
 	} {
 		t.Run(option, func(t *testing.T) {
 			input := "CREATE TABLE t (id int) ENGINE=InnoDB " + option + " COMMENT='Keep INT, comma' PARTITION BY HASH (id) PARTITIONS 4"
@@ -190,14 +195,12 @@ func TestFormatSchemaFileForDialectPreservesMySQLTableOptions(t *testing.T) {
 	}
 }
 
-func TestFormatSchemaFileForDialectRefusesLossyMySQLCanonicalization(t *testing.T) {
-	for _, option := range []string{"STATS_PERSISTENT=0", "STATS_PERSISTENT=1", "PACK_KEYS=0", "PACK_KEYS=1"} {
-		t.Run(option, func(t *testing.T) {
-			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE t (id int) ENGINE=InnoDB "+option)
-			require.ErrorContains(t, err, "canonical SQL contains comments")
-			assert.Empty(t, got)
-		})
-	}
+// A canonical form in which Restore wrote a placeholder comment instead of an
+// option's value is flagged, while comment openers inside quoted content are not.
+func TestContainsMySQLCommentFlagsRestorePlaceholders(t *testing.T) {
+	assert.True(t, containsMySQLComment("CREATE TABLE `t` (`id` INT) ENGINE = InnoDB /* TableOptionStatsPersistent is not supported */ ", false))
+	assert.False(t, containsMySQLComment("CREATE TABLE `t` (`id` INT) COMMENT = '/* TableOptionStatsPersistent is not supported */'", false))
+	assert.False(t, containsMySQLComment("CREATE TABLE `/* -- # */` (`id` INT)", false))
 }
 
 func TestFormatSchemaFileForDialectPreservesMultilineMySQL(t *testing.T) {
@@ -277,6 +280,23 @@ func TestFormatDDL(t *testing.T) {
 				"    ADD INDEX `a`(`a`),\n" +
 				"    ADD INDEX `b`(`b`),\n" +
 				"    ADD INDEX `c`(`c`);",
+		},
+		{
+			name: "table options each on their own line",
+			input: "ALTER TABLE `products` MODIFY COLUMN `sku` VARCHAR(64) COLLATE utf8mb4_0900_ai_ci NOT NULL, " +
+				"DEFAULT CHARSET = utf8mb4, COLLATE = utf8mb4_0900_ai_ci",
+			expected: "ALTER TABLE `products`\n" +
+				"    MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,\n" +
+				"    DEFAULT CHARACTER SET = utf8mb4,\n" +
+				"    DEFAULT COLLATE = utf8mb4_0900_ai_ci;",
+		},
+		{
+			name:  "engine and auto-increment options on their own lines",
+			input: "ALTER TABLE `t` ADD COLUMN `a` INT, ENGINE = InnoDB, AUTO_INCREMENT = 10",
+			expected: "ALTER TABLE `t`\n" +
+				"    ADD COLUMN `a` int,\n" +
+				"    ENGINE = InnoDB,\n" +
+				"    AUTO_INCREMENT = 10;",
 		},
 		{
 			name:     "CREATE TABLE single column unchanged",
@@ -963,4 +983,150 @@ func TestDisplayFormattingPreservesSQL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A displayed ENUM or SET list too long for a line of its own wraps onto
+// indented lines no wider than valueListWrapWidth, so the DDL reads without
+// scrolling and GitHub still highlights it. Short lists stay inline, and the
+// wrapped statement parses to the same SQL.
+func TestFormatDDLForDialectWrapsLongValueLists(t *testing.T) {
+	values := func(n int) string {
+		v := make([]string, n)
+		for i := range v {
+			v[i] = fmt.Sprintf("'STATUS_%02d_VALUE'", i)
+		}
+		return strings.Join(v, ",")
+	}
+	tests := []struct {
+		name     string
+		dialect  schema.Dialect
+		input    string
+		expected string
+	}{
+		{
+			name:    "single-clause ALTER wraps under the statement",
+			dialect: schema.DialectMySQL,
+			input:   "ALTER TABLE `orders` MODIFY COLUMN `status` enum(" + values(12) + ") NOT NULL",
+			expected: "ALTER TABLE `orders` MODIFY COLUMN `status` enum(\n" +
+				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
+				"    'STATUS_05_VALUE', 'STATUS_06_VALUE', 'STATUS_07_VALUE', 'STATUS_08_VALUE', 'STATUS_09_VALUE',\n" +
+				"    'STATUS_10_VALUE', 'STATUS_11_VALUE'\n" +
+				") NOT NULL;",
+		},
+		{
+			name:    "multi-clause ALTER wraps under its clause",
+			dialect: schema.DialectMySQL,
+			input:   "ALTER TABLE `orders` MODIFY COLUMN `status` enum(" + values(8) + ") NOT NULL, ADD COLUMN `note` text",
+			expected: "ALTER TABLE `orders`\n" +
+				"    MODIFY COLUMN `status` enum(\n" +
+				"        'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE',\n" +
+				"        'STATUS_04_VALUE', 'STATUS_05_VALUE', 'STATUS_06_VALUE', 'STATUS_07_VALUE'\n" +
+				"    ) NOT NULL,\n" +
+				"    ADD COLUMN `note` text;",
+		},
+		{
+			name:    "CREATE TABLE SET column with list-like comment",
+			dialect: schema.DialectMySQL,
+			input:   "CREATE TABLE `orders` (`id` bigint NOT NULL, `flags` set(" + values(6) + ") NOT NULL COMMENT 'enum(a,b)', PRIMARY KEY (`id`))",
+			expected: "CREATE TABLE `orders` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `flags` SET(\n" +
+				"        'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE',\n" +
+				"        'STATUS_04_VALUE', 'STATUS_05_VALUE'\n" +
+				"    ) NOT NULL COMMENT 'enum(a,b)',\n" +
+				"    PRIMARY KEY(`id`)\n" +
+				");",
+		},
+		{
+			name:    "values holding commas and quotes stay whole",
+			dialect: schema.DialectMySQL,
+			input:   "ALTER TABLE `orders` MODIFY COLUMN `status` enum('a,b','it''s'," + values(5) + ") NOT NULL",
+			expected: "ALTER TABLE `orders` MODIFY COLUMN `status` enum(\n" +
+				"    'a,b', 'it''s', 'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE',\n" +
+				"    'STATUS_04_VALUE'\n" +
+				") NOT NULL;",
+		},
+		{
+			name:     "short list on a long line stays inline",
+			dialect:  schema.DialectMySQL,
+			input:    "ALTER TABLE `orders` MODIFY COLUMN `status` enum('A','B') NOT NULL COMMENT '" + strings.Repeat("x", 100) + "'",
+			expected: "ALTER TABLE `orders` MODIFY COLUMN `status` enum('A','B') NOT NULL COMMENT '" + strings.Repeat("x", 100) + "';",
+		},
+		{
+			name:    "postgres enum type",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE TYPE order_status AS ENUM (" + values(6) + ")",
+			expected: "CREATE TYPE order_status AS ENUM (\n" +
+				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
+				"    'STATUS_05_VALUE'\n" +
+				");",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			formatted := FormatDDLForDialect(tc.dialect, tc.input)
+			assert.Equal(t, tc.expected, formatted)
+			for line := range strings.SplitSeq(formatted, "\n") {
+				if !strings.Contains(line, strings.Repeat("x", 100)) {
+					assert.LessOrEqual(t, len(line), valueListWrapWidth, "line %q", line)
+				}
+			}
+			parser, err := ParserForDialect(tc.dialect)
+			require.NoError(t, err)
+			assert.Equal(t, parser.Canonicalize(tc.input), parser.Canonicalize(formatted), "wrapping must not change the statement")
+		})
+	}
+}
+
+// The wrap scanner reads one line at a time and knows only single, double,
+// and backtick quotes, so list-like text inside a PostgreSQL literal that
+// spans lines, or inside a dollar-quoted body, looks like a value list to it.
+// Wrapping that text would change the literal; the displayed statement keeps
+// its unwrapped form instead.
+func TestFormatDDLForDialectKeepsUnwrappedFormWhenWrappingChangesSQL(t *testing.T) {
+	listText := func(quote string) string {
+		v := make([]string, 8)
+		for i := range v {
+			v[i] = quote + fmt.Sprintf("STATUS_%02d_VALUE", i) + quote
+		}
+		return "enum(" + strings.Join(v, ",") + ")"
+	}
+	tests := []struct {
+		name    string
+		dialect schema.Dialect
+		input   string
+	}{
+		{
+			name:    "postgres comment literal spanning lines",
+			dialect: schema.DialectPostgres,
+			input:   "COMMENT ON TABLE orders IS 'allowed values:\n" + listText("''") + "\nend of list'",
+		},
+		{
+			name:    "postgres dollar-quoted function body",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE FUNCTION order_statuses() RETURNS text LANGUAGE sql AS $$ SELECT 'statuses' WHERE " + listText("'") + " IS NOT NULL $$",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			parser, err := ParserForDialect(tc.dialect)
+			require.NoError(t, err)
+			unwrapped, equivalent := formatDDLForDialect(tc.dialect, parser, tc.input, false)
+			require.True(t, equivalent)
+			wrapped := wrapLongValueLists(unwrapped, valueListPatternFor(tc.dialect))
+			require.NotEqual(t, unwrapped, wrapped, "the scanner must misread the literal for this case to exercise the guard")
+			require.NotEqual(t, parser.Canonicalize(unwrapped), parser.Canonicalize(wrapped), "wrapping must change the literal for this case to exercise the guard")
+
+			assert.Equal(t, unwrapped, FormatDDLForDialect(tc.dialect, tc.input))
+		})
+	}
+}
+
+// SET is a column type only in the MySQL family. A long PostgreSQL SET (...)
+// storage-parameter list is not a value list and stays on its line.
+func TestFormatDDLForDialectLeavesPostgresSetParametersInline(t *testing.T) {
+	input := "ALTER TABLE orders SET (fillfactor = 70, autovacuum_vacuum_scale_factor = 0.01, autovacuum_analyze_scale_factor = 0.005, toast_tuple_target = 4096)"
+	formatted := FormatDDLForDialect(schema.DialectPostgres, input)
+	assert.NotContains(t, formatted, "\n", "storage parameters must not wrap")
+	assert.Contains(t, formatted, "toast_tuple_target")
 }

@@ -50,10 +50,10 @@ func TestPlannedDestructiveTables_CollectsUnsafeAlters(t *testing.T) {
 		"an additive alter stays out; a destructive one is attributed by its table")
 }
 
-// The unsafe gate reads only the namespace-level changes: a destructive change
-// visible only on an individual shard is outside it, so applying never
-// solicits --allow-unsafe consent for that table.
-func TestUnsafeGateTables_OmitsShardOnlyDestruction(t *testing.T) {
+// The --allow-unsafe gate and the attribution read the same set: a drop
+// confined to one divergent shard is a table the gate solicits consent for,
+// so no attributed destruction reaches an automatic apply unconsented.
+func TestUnsafeGateCoversEveryAttributedTable(t *testing.T) {
 	planResp := &apitypes.PlanResponse{
 		Changes: []*apitypes.SchemaChangeResponse{{
 			Namespace: "keyspace",
@@ -72,11 +72,13 @@ func TestUnsafeGateTables_OmitsShardOnlyDestruction(t *testing.T) {
 		}},
 	}
 
-	gated := unsafeGateTables(planResp)
+	gated := make([]string, 0)
+	for _, unsafe := range planResp.UnsafeChanges() {
+		gated = append(gated, unsafe.Table)
+	}
 
-	assert.Contains(t, gated, "orders", "a namespace-level drop passes through the opt-in gate")
-	assert.NotContains(t, gated, "audit_log", "a shard-only drop never solicits consent")
-	assert.NotContains(t, gated, "users", "an additive alter is not gated at all")
+	assert.ElementsMatch(t, plannedDestructiveTables(planResp), gated,
+		"a shard-only drop solicits consent, an additive alter is not gated at all")
 }
 
 func TestPlannedDestructiveTables_NoDestructiveChanges(t *testing.T) {
@@ -172,37 +174,6 @@ func TestRenderPlanComment_LockedApplyCommentOmitsAttributedChanges(t *testing.T
 
 	assert.Contains(t, planRendered, "⚠️ **Check before applying**")
 	assert.Contains(t, planRendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
-}
-
-// A destructive change confined to individual shards never passes through the
-// --allow-unsafe opt-in gate, so consent for it was never solicited: the
-// locked auto-apply comment keeps the disclosure — it is the operator's only
-// notice of that destruction.
-func TestRenderPlanComment_LockedApplyCommentKeepsUngatedAttributedChange(t *testing.T) {
-	data := templates.PlanCommentData{
-		Database:    "testdb",
-		Environment: "staging",
-		IsMySQL:     true,
-		Changes: []templates.KeyspaceChangeData{{
-			Keyspace:   "testdb",
-			Statements: []string{"ALTER TABLE `drinks` DROP COLUMN `test`"},
-		}},
-		AttributedChanges: []templates.AttributedChangeData{{
-			Table:             "drinks",
-			Repository:        "block/schemabot",
-			PullRequest:       42,
-			OutsideUnsafeGate: true,
-		}},
-		IsLocked:     true,
-		LockOwner:    "block/schemabot#7",
-		LockAcquired: "2026-08-22 00:13:52 UTC",
-	}
-
-	rendered := templates.RenderPlanComment(data)
-
-	assert.Contains(t, rendered, "🔒 **Lock acquired by**")
-	assert.Contains(t, rendered, "⚠️ **Check before applying**")
-	assert.Contains(t, rendered, "[block/schemabot#42](https://github.com/block/schemabot/pull/42)")
 }
 
 // A locked comment downgraded to manual confirmation pauses for apply-confirm,
@@ -312,4 +283,31 @@ func TestRenderMultiEnvPlanComment_AttributedChangeAnnotatesItsOwnEnvironmentOnl
 	// attribution belongs to staging's drop, not to production's unrelated add.
 	assert.Contains(t, rendered, "▶️ **To apply**")
 	assert.Contains(t, rendered, "schemabot apply -e staging")
+}
+
+// A target that runs its own plan can drop something on a table the primary
+// plan leaves alone, so the ownership lookup covers the tables of every
+// unsafe change the rendered target plans carry beyond the primary plan's,
+// each once, and leaves out VSchema changes, which are no table's. A rollout
+// the comment does not render target plans for adds nothing.
+func TestTargetPlanDestructiveTables(t *testing.T) {
+	drift := &templates.DeploymentDriftData{
+		Computed: true, Clean: true, Independent: true,
+		Deployments: []templates.DeploymentDriftEntry{{Deployment: "primary", Target: "eu", Primary: true}, {Deployment: "primary", Target: "us"}, {Deployment: "primary", Target: "ap"}},
+		Plans: []templates.DeploymentPlanGroup{
+			{Members: []string{"primary/eu"}, Primary: true},
+			{Members: []string{"primary/us", "primary/ap"}, Changes: []templates.KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` DROP COLUMN `legacy`"}}},
+				UnsafeChanges: []templates.UnsafeChangeData{
+					{Table: "users", Reason: "DROP COLUMN removes data", ChangeType: "alter"},
+					{Table: "users", Reason: "DROP INDEX removes an index", ChangeType: "alter", Targets: []string{"primary/ap"}, TotalTargets: 2},
+					{Table: "reconcile_state", Reason: "DROP TABLE removes all data", ChangeType: "drop", Targets: []string{"primary/us"}, TotalTargets: 2},
+					{Table: "testapp/vschema.json", Reason: "removes vindex", ChangeType: apitypes.VSchemaChangeType},
+				}},
+		},
+	}
+	assert.Equal(t, []string{"reconcile_state", "users"}, targetPlanDestructiveTables(drift))
+
+	drift.Clean = false
+	assert.Empty(t, targetPlanDestructiveTables(drift), "a blocked rollup renders no target plans")
+	assert.Empty(t, targetPlanDestructiveTables(nil))
 }
