@@ -281,6 +281,23 @@ func TestFormatDDL(t *testing.T) {
 				"    ADD INDEX `c`(`c`);",
 		},
 		{
+			name: "table options each on their own line",
+			input: "ALTER TABLE `products` MODIFY COLUMN `sku` VARCHAR(64) COLLATE utf8mb4_0900_ai_ci NOT NULL, " +
+				"DEFAULT CHARSET = utf8mb4, COLLATE = utf8mb4_0900_ai_ci",
+			expected: "ALTER TABLE `products`\n" +
+				"    MODIFY COLUMN `sku` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL,\n" +
+				"    DEFAULT CHARACTER SET = utf8mb4,\n" +
+				"    DEFAULT COLLATE = utf8mb4_0900_ai_ci;",
+		},
+		{
+			name:  "engine and auto-increment options on their own lines",
+			input: "ALTER TABLE `t` ADD COLUMN `a` INT, ENGINE = InnoDB, AUTO_INCREMENT = 10",
+			expected: "ALTER TABLE `t`\n" +
+				"    ADD COLUMN `a` int,\n" +
+				"    ENGINE = InnoDB,\n" +
+				"    AUTO_INCREMENT = 10;",
+		},
+		{
 			name:     "CREATE TABLE single column unchanged",
 			input:    "CREATE TABLE `users` (`id` INT PRIMARY KEY)",
 			expected: "CREATE TABLE `users` (`id` int PRIMARY KEY);",

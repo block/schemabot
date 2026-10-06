@@ -467,6 +467,10 @@ type KeyspaceChangeData struct {
 	// plan has an estimate, in which case the section is omitted (see
 	// writeTableSizesSection).
 	TableSizes []TableSizeData
+	// CollationChanges lists the existing columns this keyspace's changes move
+	// onto another collation, rendered under the table sizes (see
+	// writeCollationChangesSection).
+	CollationChanges []CollationChangeData
 
 	// Shards carries this keyspace's per-shard changes for a sharded plan. When
 	// set, the DDL is rendered per shard-group ("what applies where") instead of
@@ -574,6 +578,10 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 
 	// Sizes of the tables the DDL above copies, rebuilds, or scans.
 	writeTableSizesSection(&sb, summary)
+
+	// How the DDL above changes the way existing columns sort and compare, on
+	// the primary target.
+	writeCollationChangesSection(&sb, data)
 
 	// Blocked changes — statements the engine refuses. Unlike unsafe changes,
 	// these cannot be acknowledged away: the apply will fail on them. Shown on
@@ -3273,6 +3281,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 		writeCollapsibleKeyspaceChanges(sb, *plan, totalStatements, budget)
 	}
 	writeTableSizesSection(sb, summary)
+	writeCollationChangesSection(sb, *plan)
 
 	// Blocked changes — statements the engine refuses; the apply will fail on
 	// them, so each environment's section discloses its own.
