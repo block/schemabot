@@ -1387,7 +1387,8 @@ func (e *Engine) RegistersWorkSynchronously() bool {
 }
 
 // Drain blocks until every background apply goroutine has finished, then stops
-// tracking every schema change so the next Progress reports the idle sentinel.
+// tracking the schema changes it waited out so the next Progress reports the
+// idle sentinel.
 // Resume and recovery paths call this before re-planning so a statement still
 // in flight from a lost lease cannot race the next drive's view of the schema,
 // and so the next poll reads a clean engine instead of the previous change's
@@ -1396,14 +1397,16 @@ func (e *Engine) RegistersWorkSynchronously() bool {
 // Drain waits without a bound, for a caller that owns the engine outright. A
 // drive waits through DrainContext instead, so it never outlives its claim.
 func (e *Engine) Drain() {
+	drained := e.trackedAtDrainStart()
 	e.wg.Wait()
-	e.clearDrainedProgress()
+	e.clearDrainedProgress(drained)
 }
 
 // DrainContext is Drain bounded by ctx. When ctx ends before every apply
 // goroutine has finished, it returns an error and leaves the schema changes
 // tracked, so the engine still reports them as holding the target.
 func (e *Engine) DrainContext(ctx context.Context) error {
+	drained := e.trackedAtDrainStart()
 	done := make(chan struct{})
 	go func() {
 		e.wg.Wait()
@@ -1411,17 +1414,49 @@ func (e *Engine) DrainContext(ctx context.Context) error {
 	}()
 	select {
 	case <-done:
-		e.clearDrainedProgress()
+		e.clearDrainedProgress(drained)
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("drain PostgreSQL schema changes: still running after %w", ctx.Err())
 	}
 }
 
-func (e *Engine) clearDrainedProgress() {
+// trackedAtDrainStart snapshots the schema changes a drain is waiting out.
+// Only these are the drain's to clear: an apply accepted while the drain waits
+// belongs to the drive that started it, and its poller must still find it.
+func (e *Engine) trackedAtDrainStart() map[string]*trackedApply {
 	e.mu.Lock()
-	e.progress = nil
-	e.mu.Unlock()
+	defer e.mu.Unlock()
+	drained := make(map[string]*trackedApply, len(e.progress))
+	maps.Copy(drained, e.progress)
+	return drained
+}
+
+// clearDrainedProgress stops tracking the schema changes the drain started
+// with whose apply goroutine has exited. An entry replaced since the snapshot
+// is a newer apply and stays, as does one whose goroutine is still running.
+func (e *Engine) clearDrainedProgress(drained map[string]*trackedApply) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for key, tracked := range drained {
+		if e.progress[key] == tracked && applyGoroutineExited(tracked) {
+			delete(e.progress, key)
+		}
+	}
+}
+
+// applyGoroutineExited reports whether the goroutine executing a tracked apply
+// has returned. An entry with no goroutine has nothing left to run.
+func applyGoroutineExited(tracked *trackedApply) bool {
+	if tracked.done == nil {
+		return true
+	}
+	select {
+	case <-tracked.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // HaltForShutdown brings this instance's in-flight concurrent index builds
