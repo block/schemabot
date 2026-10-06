@@ -1360,10 +1360,11 @@ func TestPostgresTaskUpdateHonorsOperationLeaseAbsence(t *testing.T) {
 	assert.Equal(t, state.Task.Failed, reloaded.State)
 }
 
-// The ETA bound and the rejected-value report hold on PostgreSQL too: an ETA
-// past the integer column's range is stored at its largest value, and a value
-// the column refuses comes back as storage.ErrValueRejected.
-func TestPostgresTaskUpdateBoundsETAAndReportsRejectedValues(t *testing.T) {
+// The engine-value bounds and the rejected-value report hold on PostgreSQL
+// too: an ETA past the integer column's range is stored at its largest value, a
+// throttle reason past its column is cut to fit, and a value the column refuses
+// comes back as storage.ErrValueRejected.
+func TestPostgresTaskUpdateBoundsEngineReportedValuesAndReportsRejectedValues(t *testing.T) {
 	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_task_eta")
 	db, err := postgresconn.Open(dsn)
 	require.NoError(t, err)
@@ -1390,12 +1391,15 @@ func TestPostgresTaskUpdateBoundsETAAndReportsRejectedValues(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, task)
 	task.ETASeconds = math.MaxInt32 + 1_000_000
-	require.NoError(t, store.Tasks().Update(t.Context(), task), "an ETA past the column's range does not refuse the progress write")
+	task.ThrottleReason = strings.Repeat("é", 300)
+	require.NoError(t, store.Tasks().Update(t.Context(), task), "engine values past their columns do not refuse the progress write")
 	stored, err := store.Tasks().Get(t.Context(), "task-eta")
 	require.NoError(t, err)
 	assert.Equal(t, math.MaxInt32, stored.ETASeconds)
+	assert.Equal(t, strings.Repeat("é", 254)+"…", stored.ThrottleReason, "the reason is cut on a character boundary")
+	assert.Equal(t, stored.ThrottleReason, task.ThrottleReason, "the caller's task holds what the row holds")
 
-	stored.ThrottleReason = strings.Repeat("x", 300)
+	stored.ExecutionMode = strings.Repeat("x", 60)
 	require.ErrorIs(t, store.Tasks().Update(t.Context(), stored), storage.ErrValueRejected,
 		"a value the column cannot hold is reported as rejected")
 }
