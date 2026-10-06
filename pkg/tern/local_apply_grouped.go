@@ -92,6 +92,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		Changes:      changes,
 		TargetShards: taskTargetShards(tasks),
 		SchemaFiles:  plan.SchemaFiles,
+		IgnoreTables: plan.IgnoreTables(),
 		Options:      options,
 		ResumeState:  &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
 		Credentials:  creds,
@@ -104,15 +105,18 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			applyEventStateTransition(apply, event, func(a *storage.Apply) error {
 				return c.storage.Applies().Update(ctx, a)
 			}, logger)
+			c.mirrorEngineEventLiveness(ctx, logger, tasks)
 		},
-		OnStateChange: func(rs *engine.ResumeState) {
+		OnStateChange: func(rs *engine.ResumeState) error {
 			if rs == nil {
 				logger.Debug("OnStateChange: nil resume state")
-				return
+				return nil
 			}
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, rs); saveErr != nil {
 				logger.Warn("OnStateChange: failed to persist opaque resume state", append(apply.MutableLogAttrs(), "error", saveErr)...)
+				return fmt.Errorf("persist engine resume state for apply %s: %w", apply.ApplyIdentifier, saveErr)
 			}
+			return nil
 		},
 	})
 
@@ -198,6 +202,29 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	// Poll for completion - all tasks share the same state
 	work.handToPoll()
 	return c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+}
+
+// mirrorEngineEventLiveness persists every task row when the engine reports an
+// event during its Apply call. The operator reads tasks.updated_at as the
+// drive's liveness signal (ApplyDriveStallAfter), and no poll loop mirrors the
+// tasks until the engine call returns, so an engine phase that legitimately
+// runs past the stall window — preparing a branch for a large sharded
+// database — would otherwise read as a wedged drive and be cancelled over and
+// over. An event is the engine speaking from inside the call, which is the
+// evidence of life the check asks for; an engine call that is truly blocked
+// emits nothing and is still cancelled.
+func (c *LocalClient) mirrorEngineEventLiveness(ctx context.Context, logger *slog.Logger, tasks []*storage.Task) {
+	for _, task := range tasks {
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			if errors.Is(err, storage.ErrApplyLeaseLost) {
+				logger.Warn("engine event liveness write was refused because the drive's lease was lost; the drive stops at its next lease check",
+					append(task.LogAttrs(), "error", err)...)
+				return
+			}
+			logger.Warn("failed to persist engine event liveness for task; the operator cancels the drive if no task write lands within the stall window",
+				append(task.LogAttrs(), "error", err)...)
+		}
+	}
 }
 
 func (c *LocalClient) saveEngineResumeState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, resumeState *engine.ResumeState) error {

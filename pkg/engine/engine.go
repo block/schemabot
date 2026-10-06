@@ -920,6 +920,12 @@ type ApplyRequest struct {
 	ResumeState  *ResumeState       // Fresh context or full resume state after restart
 	Credentials  *Credentials       // Resolved credentials (from discovery)
 
+	// IgnoreTables lists the live tables the plan was reviewed under the
+	// ignore_tables config withholding (see PlanRequest.IgnoreTables). An engine
+	// that compares a target's live schema against SchemaFiles during apply
+	// leaves these tables out of the comparison, as the plan did.
+	IgnoreTables []string
+
 	// Logger is an optional logger scoped to this schema change, already bound with
 	// the caller's triage identity (apply id, repo, PR, environment). Engines
 	// use it for every log line about this schema change so engine lines stay
@@ -932,7 +938,9 @@ type ApplyRequest struct {
 	// This enables crash recovery: if the driver dies mid-Apply, the tern layer can
 	// resume from the last persisted state instead of starting over.
 	// Nil means no persistence (state is only returned at the end of Apply).
-	OnStateChange func(state *ResumeState)
+	// The returned error reports whether the state was durably saved, so an
+	// engine never relies on a record that did not land.
+	OnStateChange func(state *ResumeState) error
 
 	// OnEvent is called by the engine to emit structured lifecycle events during Apply.
 	// These events are recorded in apply_logs so operators can see intermediate progress

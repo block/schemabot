@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,6 +98,9 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// persistState is a no-op in this window — if the driver crashes before Apply returns,
 	// there's no ResumeState to recover from. The tern layer handles this by retrying
 	// the full Apply on the next heartbeat recovery cycle.
+	// recordedBranch is the branch the persisted resume state names, if any:
+	// the branch a resuming driver will look for.
+	var recordedBranch string
 	persistState := func(meta *psMetadata) {
 		if migCtx == "" || req.OnStateChange == nil {
 			return
@@ -105,10 +110,19 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			e.logger.Warn("failed to encode apply metadata for persistence", "error", err)
 			return
 		}
-		req.OnStateChange(&engine.ResumeState{
+		if err := req.OnStateChange(&engine.ResumeState{
 			MigrationContext: migCtx,
 			Metadata:         encoded,
-		})
+		}); err != nil {
+			// The apply carries on: a failed save only costs crash recovery.
+			// The branch is not treated as recorded, so a drive that ends
+			// before its deploy request deletes it rather than keeping a
+			// branch no successor can find.
+			e.logger.Warn("resume state was not saved; a resuming driver will not find this branch",
+				"database", req.Database, "branch", meta.BranchName, "error", err)
+			return
+		}
+		recordedBranch = meta.BranchName
 	}
 
 	// Capture the per-keyspace VSchema diffs carried on the plan annotations so
@@ -142,9 +156,22 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// ever drive it. Should the API refuse to delete a branch while its deploy
 	// request is open, the refusal surfaces on the cleanup's error path with
 	// the identifiers for manual reclamation.
+	//
+	// A drive whose context ends is handing the apply back, not failing it: the
+	// operator cancels a drive when its lease is lost, when it looks stalled,
+	// or when the instance shuts down, and in each case another driver resumes
+	// the apply from its stored state. When that state names this branch, the
+	// branch is the resume's starting point, and after a lost lease a peer may
+	// already be preparing it, so it is kept. A branch the stored state does
+	// not name can never be resumed, so it is deleted like any other failure's.
 	ownedBranch := ""
 	defer func() {
 		if retErr == nil || ownedBranch == "" {
+			return
+		}
+		if ctx.Err() != nil && recordedBranch == ownedBranch {
+			e.logger.Info("drive ended before the deploy request was created; keeping the branch for the driver that resumes the apply",
+				"organization", org, "database", req.Database, "branch", ownedBranch, "apply_error", retErr)
 			return
 		}
 		e.deleteOwnedBranch(ctx, client, org, req.Database, ownedBranch, retErr)
@@ -171,7 +198,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		}
 
 		// Wait for branch to be ready (may be initializing from a prior create)
-		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("wait for branch %s: %w", branchName, err)
 		}
 
@@ -185,7 +212,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		}
 
 		// Wait for sync to complete
-		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("wait for schema refresh %s: %w", branchName, err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
@@ -212,7 +239,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		ownedBranch = branchName
 
 		// Wait for branch to be ready
-		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName); err != nil {
+		if err := e.waitForBranchReady(ctx, client, org, req.Database, branchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("wait for branch: %w", err)
 		}
 		elapsed := time.Since(branchStart).Round(time.Second)
@@ -232,7 +259,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		Database:     req.Database,
 		Branch:       branchName,
 		Role:         "admin",
-		TTL:          3600,
+		TTL:          branchPasswordTTL(len(req.SchemaFiles)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create branch password: %w", err)
@@ -278,7 +305,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// PlanetScale API which may return stale data after UpdateKeyspaceVSchema.
 	// Retry up to 30s to allow the API to converge.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, password); err != nil {
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, engine.NewIgnoredTables(req.IgnoreTables), password); err != nil {
 		return nil, fmt.Errorf("branch validation failed after DDL apply: %w", err)
 	}
 	emitEvent(engine.ApplyEvent{
@@ -318,7 +345,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		VSchemaDiffs:          vschemaDiffs,
 		ExistingMigrationCtxs: existingContexts,
 	})
-	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -447,7 +474,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// Deploy (starts the schema change). PlanetScale may still be validating
 	// the deploy request even after it leaves the pending state, and transient
 	// API errors may occur; deployDeployRequest absorbs both.
-	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant, emitEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -518,7 +545,7 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 	g.SetLimit(maxConcurrentKeyspaces)
 	for _, sc := range changes {
 		g.Go(func() error {
-			if err := e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
+			if err := e.applyKeyspaceChanges(gCtx, sc, schemaFiles, password, client, org, database, branchName, safeEmit); err != nil {
 				return err
 			}
 			n := int(applied.Add(1))
@@ -533,8 +560,13 @@ func (e *Engine) applyChangesToBranch(ctx context.Context, changes []engine.Sche
 }
 
 // applyKeyspaceChanges applies VSchema and DDL for a single keyspace with retries.
-// Uses longer backoff when PlanetScale reports a schema snapshot is in progress.
-func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string) error {
+// A transient failure is retried until maxRetries of them occur in a row. A
+// rejection because PlanetScale is taking a schema snapshot of the branch is
+// retried with a longer backoff for up to snapshotRetryWait from the first such
+// rejection: a snapshot of a large sharded branch can outlast any small attempt
+// count, and it clears on its own. The two budgets are independent, so a
+// snapshot rejection between transient failures starts their count again.
+func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChange, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword, client psclient.PSClient, org, database, branchName string, emitEvent func(engine.ApplyEvent)) error {
 	start := time.Now()
 	e.logger.Info(fmt.Sprintf("applying changes to keyspace %s on branch %s", sc.Namespace, branchName),
 		"keyspace", sc.Namespace,
@@ -543,37 +575,76 @@ func (e *Engine) applyKeyspaceChanges(ctx context.Context, sc engine.SchemaChang
 		"branch", branchName,
 	)
 
-	maxAttempts := maxRetries
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			delay := retryDelay(attempt, lastErr)
-			e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
+	var snapshotSince time.Time
+	transientFailures := 0
+	for attempt := 1; ; attempt++ {
+		err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName)
+		if err == nil {
+			e.logger.Info(fmt.Sprintf("keyspace %s changes applied (%s)", sc.Namespace, time.Since(start).Round(time.Second)), "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
+			return nil
+		}
+		lastErr = err
+		e.logger.Error(fmt.Sprintf("keyspace %s apply attempt %d failed", sc.Namespace, attempt), "keyspace", sc.Namespace, "database", database, "branch", branchName, "attempt", attempt, "error", err)
+		if !isRetryableEngineError(err) {
+			return engine.NewPermanentError("apply keyspace %s: %w", sc.Namespace, err)
 		}
 
-		if err := e.applyKeyspaceChangesOnce(ctx, sc, schemaFiles, password, client, org, database, branchName); err != nil {
-			lastErr = err
-			e.logger.Error(fmt.Sprintf("keyspace %s apply attempt %d failed", sc.Namespace, attempt+1), "keyspace", sc.Namespace, "database", database, "branch", branchName, "attempt", attempt+1, "error", err)
-			if !isRetryableEngineError(err) {
-				return engine.NewPermanentError("apply keyspace %s: %w", sc.Namespace, err)
+		delay := retryDelay(attempt, lastErr)
+		var reason string
+		if isSnapshotInProgress(err) {
+			if snapshotSince.IsZero() {
+				snapshotSince = time.Now()
 			}
-			if isSnapshotInProgress(err) && maxAttempts == maxRetries {
-				maxAttempts = maxSnapshotRetries
-				e.logger.Info("schema snapshot in progress, extending retries",
-					"keyspace", sc.Namespace, "max_attempts", maxAttempts)
+			transientFailures = 0
+			left := snapshotRetryWait - time.Since(snapshotSince)
+			if delay > left {
+				return fmt.Errorf("apply keyspace %s: PlanetScale was still taking a schema snapshot of branch %s after %s (%d attempts): %w", sc.Namespace, branchName, snapshotRetryWait, attempt, lastErr)
 			}
-			continue
+			reason = snapshotRetryReason(left)
+		} else {
+			transientFailures++
+			if transientFailures >= maxRetries {
+				return fmt.Errorf("apply keyspace %s (after %d transient failures in a row, %d attempts in all): %w", sc.Namespace, transientFailures, attempt, lastErr)
+			}
+			reason = transientRetryReason(maxRetries - transientFailures)
 		}
-		e.logger.Info(fmt.Sprintf("keyspace %s changes applied (%s)", sc.Namespace, time.Since(start).Round(time.Second)), "keyspace", sc.Namespace, "elapsed", time.Since(start).Round(time.Second))
-		return nil
+
+		e.logger.Warn("retrying keyspace apply", "keyspace", sc.Namespace, "attempt", attempt+1, "delay", delay.Round(time.Millisecond), "error", lastErr)
+		emitEvent(keyspaceRetryEvent(sc.Namespace, branchName, attempt+1, delay, reason))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
 	}
-	finalErr := fmt.Errorf("apply keyspace %s (after %d attempts): %w", sc.Namespace, maxAttempts, lastErr)
-	return finalErr
+}
+
+// keyspaceRetryEvent puts a keyspace retry on the apply's timeline. A schema
+// snapshot can defer a keyspace's changes for minutes, and saying so is what
+// tells an operator, and the driver, that the apply is waiting rather than
+// wedged. The reason is a fixed phrase: the raw error stays in the server log.
+func keyspaceRetryEvent(keyspace, branch string, attempt int, delay time.Duration, reason string) engine.ApplyEvent {
+	return engine.ApplyEvent{
+		Message:  fmt.Sprintf("Retrying keyspace %s on branch %s in %s (attempt %d): %s", keyspace, branch, delay.Round(time.Second), attempt, reason),
+		Metadata: map[string]string{"keyspace": keyspace, "branch": branch},
+	}
+}
+
+// snapshotRetryReason says how much of the snapshot window is left, so a retry
+// late in the window does not read as though the whole window were still ahead.
+func snapshotRetryReason(left time.Duration) string {
+	return fmt.Sprintf("PlanetScale is taking a schema snapshot of the branch, retrying for up to %s more", left.Round(time.Second))
+}
+
+// transientRetryReason says how many more transient failures in a row the
+// keyspace can take before it fails.
+func transientRetryReason(left int) string {
+	retries := "times"
+	if left == 1 {
+		retries = "time"
+	}
+	return fmt.Sprintf("the previous attempt failed with a transient error, retrying up to %d more %s; see server logs", left, retries)
 }
 
 // applyKeyspaceChangesOnce applies VSchema and DDL for a single keyspace in one attempt.
@@ -663,57 +734,137 @@ func (e *Engine) updateBranchVSchema(ctx context.Context, client psclient.PSClie
 	return nil
 }
 
-// diffBranchForResume fetches the working branch's current schema and diffs it
-// against the desired schema to find DDL that wasn't applied before the crash.
-func (e *Engine) diffBranchForResume(ctx context.Context, client psclient.PSClient, org, database, branch string, schemaFiles schema.SchemaFiles) ([]engine.SchemaChange, error) {
-	currentSchema, err := e.fetchDatabaseSchema(ctx, client, org, database, branch, sortedKeyspaces(schemaFiles))
-	if err != nil {
-		return nil, fmt.Errorf("fetch branch schema: %w", err)
-	}
-
-	var changes []engine.SchemaChange
+// diffBranchForResume diffs the working branch's current schema against the
+// desired schema, keyed by keyspace. The result is what the branch differs by,
+// not what the resume may run: remainingPlannedChanges bounds it by the plan.
+func (e *Engine) diffBranchForResume(currentSchema map[string][]table.TableSchema, schemaFiles schema.SchemaFiles) (map[string][]engine.TableChange, error) {
+	diff := make(map[string][]engine.TableChange)
 	for _, keyspace := range sortedKeyspaces(schemaFiles) {
-		ns := schemaFiles[keyspace]
-
-		// Build current table schemas from branch
-		var currentTableSchemas []table.TableSchema
-		if tables, ok := currentSchema[keyspace]; ok {
-			currentTableSchemas = append(currentTableSchemas, tables...)
-		}
-
-		// Build desired table schemas from files
-		desiredTableSchemas, err := parseDesiredSchemas(keyspace, ns)
+		desiredTableSchemas, err := parseDesiredSchemas(keyspace, schemaFiles[keyspace])
 		if err != nil {
 			return nil, err
 		}
 
-		// Diff: what DDL is needed to bring branch from current to desired?
-		plan, err := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
+		plan, err := lint.PlanChanges(currentSchema[keyspace], desiredTableSchemas, nil, e.linter.SpiritConfig())
 		if err != nil {
 			return nil, fmt.Errorf("diff keyspace %s for resume: %w", keyspace, err)
-		}
-		if !plan.HasChanges() {
-			continue
-		}
-
-		sc := engine.SchemaChange{
-			Namespace: keyspace,
-			Metadata:  make(map[string]string),
 		}
 		for _, pc := range plan.Changes {
 			stmtType, _, classifyErr := ddl.ClassifyStatement(pc.Statement)
 			if classifyErr != nil {
 				return nil, fmt.Errorf("classify statement in keyspace %s: %w", keyspace, classifyErr)
 			}
-			sc.TableChanges = append(sc.TableChanges, engine.TableChange{
+			diff[keyspace] = append(diff[keyspace], engine.TableChange{
 				Table:     pc.TableName,
 				Operation: stmtType,
 				DDL:       pc.Statement,
 			})
 		}
-		changes = append(changes, sc)
 	}
-	return changes, nil
+	return diff, nil
+}
+
+// saveResumeState records a resume milestone through OnStateChange. A save
+// that does not land costs only crash recovery: the apply carries on, and the
+// result it returns carries the same state for the caller to store.
+func (e *Engine) saveResumeState(req *engine.ApplyRequest, rs *engine.ResumeState, milestone string) {
+	if req.OnStateChange == nil {
+		return
+	}
+	if err := req.OnStateChange(rs); err != nil {
+		e.logger.Warn("resume state was not saved; the apply continues and returns the state with its result",
+			"database", req.Database, "milestone", milestone, "error", err)
+	}
+}
+
+// remainingPlannedChanges returns the planned changes a resumed branch still
+// needs: each planned table change whose table the branch still differs on,
+// with the DDL the plan approved, plus each keyspace whose planned VSchema
+// change still has to be written. VSchema writes overwrite the whole VSchema,
+// so re-sending one that already landed is harmless.
+//
+// A branch that differs on a table the plan does not change is refused. The
+// branch was cut from main to carry exactly the planned DDL, so such a
+// difference means main moved or the branch was touched, and running DDL for
+// it would apply a schema change nobody reviewed. For the same reason a
+// planned table is refused when what the branch still lacks on it is not the
+// reviewed DDL: a table change lands whole, so a planned table either already
+// matches or still needs exactly the planned statement, and anything else is a
+// change on that table nobody reviewed.
+func remainingPlannedChanges(planned []engine.SchemaChange, branchDiff map[string][]engine.TableChange, schemaFiles schema.SchemaFiles) ([]engine.SchemaChange, error) {
+	plannedDDL := make(map[string]map[string]string, len(planned))
+	for _, sc := range planned {
+		tables := make(map[string]string, len(sc.TableChanges))
+		for _, tc := range sc.TableChanges {
+			name, err := plannedTableName(sc.Namespace, tc)
+			if err != nil {
+				return nil, err
+			}
+			tables[name] = tc.DDL
+		}
+		plannedDDL[sc.Namespace] = tables
+	}
+
+	var unplanned, unreviewed []string
+	differing := make(map[string]map[string]bool, len(branchDiff))
+	for _, keyspace := range slices.Sorted(maps.Keys(branchDiff)) {
+		differing[keyspace] = make(map[string]bool, len(branchDiff[keyspace]))
+		for _, tc := range branchDiff[keyspace] {
+			reviewed, ok := plannedDDL[keyspace][tc.Table]
+			if !ok {
+				unplanned = append(unplanned, fmt.Sprintf("%s.%s", keyspace, tc.Table))
+				continue
+			}
+			if ddl.Canonicalize(tc.DDL) != ddl.Canonicalize(reviewed) {
+				unreviewed = append(unreviewed, fmt.Sprintf("%s.%s", keyspace, tc.Table))
+				continue
+			}
+			differing[keyspace][tc.Table] = true
+		}
+	}
+	if len(unplanned) > 0 {
+		return nil, engine.NewPermanentError("branch differs from the declared schema on tables the plan does not change (%s); refusing to run DDL outside the plan — re-plan and apply again",
+			strings.Join(unplanned, ", "))
+	}
+	if len(unreviewed) > 0 {
+		return nil, engine.NewPermanentError("branch still needs changes on planned tables that differ from the reviewed DDL (%s); refusing to run DDL outside the plan — re-plan and apply again",
+			strings.Join(unreviewed, ", "))
+	}
+
+	var remaining []engine.SchemaChange
+	for _, sc := range planned {
+		pending := engine.SchemaChange{Namespace: sc.Namespace, Metadata: sc.Metadata}
+		for _, tc := range sc.TableChanges {
+			name, err := plannedTableName(sc.Namespace, tc)
+			if err != nil {
+				return nil, err
+			}
+			if differing[sc.Namespace][name] {
+				pending.TableChanges = append(pending.TableChanges, tc)
+			}
+		}
+		if len(pending.TableChanges) == 0 && getVSchemaContent(sc, schemaFiles) == "" {
+			continue
+		}
+		remaining = append(remaining, pending)
+	}
+	return remaining, nil
+}
+
+// plannedTableName names the table a planned change targets, reading it from
+// the DDL when the change does not carry it.
+func plannedTableName(keyspace string, tc engine.TableChange) (string, error) {
+	if tc.Table != "" {
+		return tc.Table, nil
+	}
+	_, name, err := ddl.ClassifyStatement(tc.DDL)
+	if err != nil {
+		return "", fmt.Errorf("classify planned statement in keyspace %s: %w", keyspace, err)
+	}
+	if name == "" {
+		return "", fmt.Errorf("planned statement in keyspace %s names no table: %s", keyspace, tc.DDL)
+	}
+	return name, nil
 }
 
 // eventEmitter returns a closure that logs a lifecycle event and sends it to
@@ -771,51 +922,71 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 
 	// No deploy request yet — driver crashed after branch creation but before
 	// the deploy request was created. Diff the branch against desired schema
-	// to find DDL that wasn't applied before the crash, then apply only the
-	// missing changes.
+	// to find which planned changes the branch still lacks, then apply only
+	// those.
 	e.logger.Info("resuming from branch (no deploy request yet)", "branch", meta.BranchName)
 
-	// Check if the branch still exists — it may have been deleted by TTL
-	// between the crash and recovery. If so, start fresh.
-	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName); err != nil {
-		e.logger.Warn("branch no longer available on resume, starting fresh", "branch", meta.BranchName, "error", err)
-		req.ResumeState = nil
-		return e.Apply(ctx, req)
+	// The branch may have been deleted (by TTL, or by an operator) between the
+	// crash and recovery; only then does the resume start fresh. A cancelled
+	// drive or a wait that ran out says nothing about the branch, and starting
+	// fresh on either would create a branch the drive cannot finish preparing.
+	if err := e.waitForBranchReady(ctx, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
+		if ctx.Err() == nil && isNotFound(err) {
+			e.logger.Warn("branch no longer exists on resume, starting fresh", "branch", meta.BranchName, "error", err)
+			req.ResumeState = nil
+			return e.Apply(ctx, req)
+		}
+		return nil, fmt.Errorf("wait for branch %s on resume: %w", meta.BranchName, err)
 	}
 
-	// Diff branch's current state against desired to find un-applied DDL
-	remainingChanges, err := e.diffBranchForResume(ctx, client, org, req.Database, meta.BranchName, req.SchemaFiles)
+	resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer resumePwCancel()
+	password, err := client.CreateBranchPassword(resumePwCtx, &ps.DatabaseBranchPasswordRequest{
+		Organization: org, Database: req.Database, Branch: meta.BranchName, Role: "admin", TTL: branchPasswordTTL(len(req.SchemaFiles)),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create branch password on resume: %w", err)
+	}
+
+	// The branch schema is read over MySQL, not through the PlanetScale schema
+	// API: for a branch that has only just become ready the API can still
+	// report its keyspaces as missing, which would turn every existing table
+	// into a CREATE.
+	// Tables the plan was reviewed with ignore_tables withholding are left out,
+	// as the plan left them out.
+	keyspaces := sortedKeyspaces(req.SchemaFiles)
+	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
+	if err != nil {
+		return nil, fmt.Errorf("fetch branch %s schema via MySQL on resume: %w", meta.BranchName, err)
+	}
+	branchDiff, err := e.diffBranchForResume(withoutIgnoredTables(branchSchema, ignored), req.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("diff branch for resume: %w", err)
 	}
+	remainingChanges, err := remainingPlannedChanges(req.Changes, branchDiff, req.SchemaFiles)
+	if err != nil {
+		return nil, fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
+	}
 
 	if len(remainingChanges) > 0 {
-		e.logger.Info("applying remaining DDL on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
-		resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer resumePwCancel()
-
-		password, err := client.CreateBranchPassword(resumePwCtx, &ps.DatabaseBranchPasswordRequest{
-			Organization: org, Database: req.Database, Branch: meta.BranchName, Role: "admin", TTL: 3600,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("create branch password on resume: %w", err)
-		}
+		e.logger.Info("applying remaining planned changes on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
 		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
-			return nil, fmt.Errorf("apply remaining DDL on resume: %w", err)
+			return nil, fmt.Errorf("apply remaining changes on resume: %w", err)
 		}
 	} else {
-		e.logger.Info("all DDL already applied on branch", "branch", meta.BranchName)
+		e.logger.Info("all planned changes already applied on branch", "branch", meta.BranchName)
 	}
 
-	// VSchema may not have been applied before the crash — re-apply
-	// (VSchema updates are idempotent, they overwrite the entire VSchema)
-	for _, sc := range req.Changes {
-		if vschemaContent := getVSchemaContent(sc, req.SchemaFiles); vschemaContent != "" {
-			if err := e.updateBranchVSchema(ctx, client, org, req.Database, meta.BranchName, sc.Namespace, vschemaContent); err != nil {
-				return nil, fmt.Errorf("update vschema for %s on resume: %w", sc.Namespace, err)
-			}
-		}
+	// The resumed branch must match the declared schema before a deploy request
+	// carries it to main, exactly as a fresh apply's branch must.
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, meta.BranchName, keyspaces, req.SchemaFiles, ignored, password); err != nil {
+		return nil, fmt.Errorf("branch validation failed on resume: %w", err)
 	}
+	emitEvent(engine.ApplyEvent{
+		Message:  "Branch schema validated — matches desired state",
+		Metadata: map[string]string{"branch": meta.BranchName},
+	})
 
 	// Create deploy request
 	main := mainBranch(req.Credentials)
@@ -835,7 +1006,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
-	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("wait for deploy request on resume: %w", err)
 	}
@@ -885,12 +1056,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		if encErr != nil {
 			return nil, fmt.Errorf("encode metadata for deferred deploy on resume: %w", encErr)
 		}
-		if req.OnStateChange != nil {
-			req.OnStateChange(&engine.ResumeState{
-				MigrationContext: req.ResumeState.MigrationContext,
-				Metadata:         persistMeta,
-			})
-		}
+		e.saveResumeState(req, &engine.ResumeState{
+			MigrationContext: req.ResumeState.MigrationContext,
+			Metadata:         persistMeta,
+		}, "deferred deploy on resume")
 		suffix := ""
 		if useInstant {
 			suffix = " (instant DDL)"
@@ -909,18 +1078,16 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("encode metadata on resume: %w", err)
 	}
-	if req.OnStateChange != nil {
-		req.OnStateChange(&engine.ResumeState{
-			MigrationContext: req.ResumeState.MigrationContext,
-			Metadata:         persistMeta,
-		})
-	}
+	e.saveResumeState(req, &engine.ResumeState{
+		MigrationContext: req.ResumeState.MigrationContext,
+		Metadata:         persistMeta,
+	}, "deploy request created on resume")
 
 	// Capture the migration_context baseline before deploying so the new Vitess
 	// context can be identified once Vitess creates migrations for this deploy.
 	existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
+	dr, err = e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("deploy on resume: %w", err)
 	}
@@ -975,7 +1142,7 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 	if dr.DeploymentState == deployState.Pending {
 		e.logger.Info("recovered deploy request is still computing its schema diff, waiting before resuming",
 			"database", req.Database, "deploy_request", dr.Number)
-		dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr)
+		dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, e.eventEmitter(req))
 		if err != nil {
 			return nil, fmt.Errorf("wait for recovered deploy request #%d on resume: %w", meta.DeployRequestID, err)
 		}
@@ -1082,7 +1249,7 @@ func (e *Engine) resumeExistingDeployRequest(ctx context.Context, client psclien
 		// Vitess context can be identified after Vitess creates migrations.
 		existingContexts := e.captureExistingContexts(ctx, client, req.Database, req.Credentials)
 
-		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant)
+		deployed, deployErr := e.deployDeployRequest(ctx, client, org, req.Database, dr.Number, useInstant, e.eventEmitter(req))
 		if deployErr != nil {
 			return nil, fmt.Errorf("recovered deploy request on resume: %w", deployErr)
 		}
@@ -1227,7 +1394,7 @@ func (e *Engine) recordRecoveredDeferredDeploy(ctx context.Context, client pscli
 		Metadata:         persistMeta,
 	}
 	if req.OnStateChange != nil {
-		req.OnStateChange(resumeState)
+		e.saveResumeState(req, resumeState, fmt.Sprintf("recovered deferred deploy request #%d", dr.Number))
 	} else {
 		e.logger.Warn("recovered deferred deploy recorded only in the returned resume state: no OnStateChange callback",
 			"database", req.Database, "deploy_request", dr.Number)
@@ -1304,8 +1471,8 @@ func (e *Engine) persistResumeSchemaChangeContext(req *engine.ApplyRequest, migr
 	}
 	e.logger.Info("persisting rediscovered Vitess context on resume",
 		"database", req.Database, "context", migrationContext)
-	req.OnStateChange(&engine.ResumeState{
+	e.saveResumeState(req, &engine.ResumeState{
 		MigrationContext: migrationContext,
 		Metadata:         metadata,
-	})
+	}, "rediscovered Vitess context")
 }
