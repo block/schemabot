@@ -447,6 +447,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// cannot be re-planned is unverified, so the task is not started on it.
 		replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
 		if err != nil {
+			if c.driveCancelled(ctx, apply, "while re-planning the target before resuming a task") {
+				return nil
+			}
 			logger.Error("could not re-plan the target before resuming the task; the resume stops without starting it, and the apply stays active for a later drive",
 				append(task.LogAttrs(), "error", err)...)
 			return fmt.Errorf("re-plan before resuming task %s on table %s: %w", task.TaskIdentifier, task.TableName, err)

@@ -252,6 +252,39 @@ func TestResumeApplySequential_CancelledDriveStopsWaitingOnEngineWork(t *testing
 	assert.Equal(t, state.Task.Pending, task.State)
 }
 
+// cancellingPlanEngine fails Plan because the drive was cancelled while the
+// target was being re-planned.
+type cancellingPlanEngine struct {
+	*replanTargetEngine
+	cancelDrive context.CancelFunc
+}
+
+func (e *cancellingPlanEngine) Plan(ctx context.Context, _ *engine.PlanRequest) (*engine.PlanResult, error) {
+	e.planCalls++
+	e.cancelDrive()
+	return nil, fmt.Errorf("read target schema: %w", ctx.Err())
+}
+
+// A drive cancelled while it re-plans the target hands the apply back: the
+// re-plan's error describes the cancellation, not the target, so the resume
+// returns no failure and starts nothing.
+func TestResumeApplySequential_CancelledDuringReplanHandsTheApplyBack(t *testing.T) {
+	driveCtx, cancelDrive := context.WithCancel(t.Context())
+	defer cancelDrive()
+	eng := &cancellingPlanEngine{replanTargetEngine: &replanTargetEngine{}, cancelDrive: cancelDrive}
+	client, apply, task, _ := lostWorkPollFixtureInState(eng, lostWorkTrustBudgetAmple, state.Task.Pending)
+	client.heartbeatInterval = 10 * time.Second
+	task.Shard = ""
+	task.DDL = resumeTaskDDL
+
+	err := client.resumeApplySequential(driveCtx, apply, []*storage.Task{task}, &storage.Plan{ID: 7}, nil)
+
+	require.NoError(t, err, "a cancelled drive hands the apply back")
+	assert.Equal(t, 1, eng.planCalls)
+	assert.Zero(t, eng.applies, "the task is not started once the drive is cancelled")
+	assert.Equal(t, state.Task.Pending, task.State)
+}
+
 // resumeTestDeadline bounds a wait on the drive under test.
 const resumeTestDeadline = 5 * time.Second
 
