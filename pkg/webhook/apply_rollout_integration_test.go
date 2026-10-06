@@ -917,6 +917,70 @@ func TestE2EApplyConfirmRefusesAChangedPrimaryWithIdenticalDDL(t *testing.T) {
 	}
 }
 
+// The reviewed primary (eu) needs ADD email, us needs MODIFY email, and ap
+// needs ADD email. By confirm, eu has converged, us needs the same ADD the
+// comment showed for eu, and ap still needs its reviewed ADD. Reordering the
+// rollout so us leads leaves other-target work, so the confirmation is judged
+// against every target's work: identical DDL on us must not inherit eu's
+// consent, and nothing runs on us or ap.
+func TestE2EApplyConfirmRefusesAChangedPrimaryWhileAnotherTargetHasWork(t *testing.T) {
+	const dbName = "webhook_primary_moved_member_work"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+		{name: "us", liveSchema: strings.Replace(usersWithEmailSchema, "varchar(255) DEFAULT NULL", "varchar(16) DEFAULT NULL", 1)},
+		{name: "ap", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "Confirmation required")
+	require.Contains(t, body, "MODIFY COLUMN `email`")
+
+	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
+	_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(255) DEFAULT NULL")
+	require.NoError(t, err)
+	us := openDriftDB(t, driftDSN(t, dbName+"_us"))
+	_, err = us.ExecContext(t.Context(), "ALTER TABLE `users` DROP COLUMN `email`")
+	require.NoError(t, err)
+	changed := rolloutServiceOver(t, svc, dbName, "us", "eu", "ap")
+
+	confirm := runRolloutCommand(t, changed, dbName, "schemabot apply-confirm -e "+driftEnv)
+	body = awaitCommentContaining(t, confirm, "nothing was applied")
+	assert.Contains(t, body, "the primary target is not the one the confirmed plan reviewed")
+	requireNoApplies(t, changed, dbName)
+	requireNoApplyLock(t, changed, dbName)
+}
+
+// The reviewed primary (eu) already has email, so the comment shows only us's
+// ADD. The rollout is then reordered so us leads, with the same ADD. The
+// refusal names the moved primary rather than claiming the primary target
+// gained changes the comment did not show, and releases the confirmation.
+func TestE2EApplyConfirmConvergedPrimaryMovedNamesTheMovedPrimary(t *testing.T) {
+	const dbName = "webhook_converged_primary_moved"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "Confirmation required")
+	require.Contains(t, body, "The primary target already has this schema")
+	require.Contains(t, body, "ADD COLUMN `email`")
+	changed := rolloutServiceOver(t, svc, dbName, "us", "eu")
+
+	confirm := runRolloutCommand(t, changed, dbName, "schemabot apply-confirm -e "+driftEnv)
+	body = awaitCommentContaining(t, confirm, "nothing was applied")
+	assert.Contains(t, body, "the primary target is not the one the confirmed plan reviewed")
+	assert.NotContains(t, body, "now has changes of its own")
+	requireNoApplies(t, changed, dbName)
+	requireNoApplyLock(t, changed, dbName)
+}
+
 // rolloutServiceOver builds a service over svc's storage whose environment
 // routes dbName to the named deployments alone, as a server whose rollout
 // topology changed after a confirmation was given would. The deployments'

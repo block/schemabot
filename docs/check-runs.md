@@ -981,7 +981,12 @@ several targets, and also when the confirmed round stored plans for other
 targets, even if the rollout has since shrunk to the primary target alone.
 If the primary member's deployment or target changed since review, confirmation
 refuses even identical DDL, releases the pending confirmation, and asks for a fresh
-apply to review the current targets. It does not remap consent between members.
+apply to review the current targets. It does not remap consent between members,
+and the same refusal, with the same reason, applies whichever comment the
+confirmation acts on, a single target's included: a target whose deployment or
+target changed is not the one the comment reviewed. An automatic apply plans and
+re-plans within one command against one configuration, so its primary target
+cannot change between the comment it posts and the apply it creates.
 A fully converged rollout still reports no changes without creating an apply.
 So a statement on the primary target whose DDL is unchanged but that now runs as
 direct execution, or is now blocked, refuses here and releases the lock rather
