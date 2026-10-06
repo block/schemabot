@@ -1057,7 +1057,11 @@ func agentExplanationBody(lastLine string) string {
 
 // An explanation whose closing line opens with the product name, in any case,
 // is a sentence about SchemaBot. It runs nothing and gets no answer, while the
-// same comment with a command alone on a line still runs that command.
+// same comment with a command alone on a line still runs that command. The
+// letter-case variants are the point: the mention match ignores case, so each
+// spelling must reach the prose rule. The wording of the rest of the closing
+// line is illustrative; every variant is prose for the same reason, a plain
+// word after the product name.
 func TestParseCommand_ExplanationOpeningWithTheProductName(t *testing.T) {
 	parser := NewCommandParser()
 	const withApplySteps = "will then comment the exact DDL it plans for staging and production, " +
