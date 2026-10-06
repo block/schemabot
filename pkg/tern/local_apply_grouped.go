@@ -772,6 +772,11 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"The target is held by another run of a schema change; the apply is handed back to start again once it lets go", "", "")
 		return true
 	}
+	if engineGotPastTheRefusal(result) {
+		// The work started and holds the target itself, so any earlier hold
+		// is over; a later refusal is measured as a new one.
+		c.targetHeld.clear(apply.ID)
+	}
 	var saveErr error
 	ps.lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(ps.lastProgressMetadata, result.Metadata, &ps.progressMetadataLeaseLost, func(metadata map[string]string) error {
 		return c.saveApplyProgressMetadata(ctx, apply, tasks, metadata)

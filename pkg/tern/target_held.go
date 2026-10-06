@@ -102,3 +102,9 @@ func (c *LocalClient) observeTargetHeld(ctx context.Context, logger *slog.Logger
 func engineRefusedTheTarget(result *engine.ProgressResult) bool {
 	return result.State == engine.StateFailed && result.TargetHeld
 }
+
+// engineGotPastTheRefusal reports a poll whose run has started on the target:
+// one the engine reports past pending and not refused.
+func engineGotPastTheRefusal(result *engine.ProgressResult) bool {
+	return result.State != "" && result.State != engine.StatePending && !engineRefusedTheTarget(result)
+}
