@@ -1419,6 +1419,28 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
+		// A rollout member's refusal is matched before the plan refusals it may
+		// wrap: its kind decides the response, and the log names the member
+		// whose plan stopped the apply.
+		if refused, ok := errors.AsType[*MemberPlanRefusedError](err); ok {
+			status, code := memberPlanRefusalResponse(refused.Refusal)
+			s.logger.Warn("apply rejected: a rollout member's own plan cannot run in an apply created from the primary's plan",
+				"plan_id", req.PlanID, "environment", req.Environment, "member", refused.MemberID, "refusal", refused.Refusal.String(), "error", err)
+			s.writeErrorCode(w, status, code, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*unsafeOptInRequiredError](err); ok {
+			s.logger.Warn("apply rejected because the plan carries an unsafe change without allow_unsafe",
+				"plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeUnsafeOptInRequired, "apply rejected: "+err.Error())
+			return
+		}
+		if _, ok := errors.AsType[*blockedPlanError](err); ok {
+			s.logger.Warn("apply rejected because the plan carries a change the engine refuses",
+				"plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusUnprocessableEntity, apitypes.ErrCodePlanBlocked, "apply rejected: "+err.Error())
+			return
+		}
 		if _, ok := errors.AsType[*RolloutMemberSelectionError](err); ok {
 			s.logger.Warn("apply rejected for a target that names no single rollout member", "plan_id", req.PlanID, "environment", req.Environment, "selector", req.Target, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
@@ -1426,11 +1448,6 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := errors.AsType[*PlanMemberMismatchError](err); ok {
 			s.logger.Warn("apply rejected because its plan was made for a different rollout member than the apply would run on", "plan_id", req.PlanID, "environment", req.Environment, "selector", req.Target, "error", err)
-			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
-			return
-		}
-		if refused, ok := errors.AsType[*MemberPlanRefusedError](err); ok {
-			s.logger.Warn("apply rejected: a rollout member's own plan cannot run in an apply created from the primary's plan", "plan_id", req.PlanID, "environment", req.Environment, "member", refused.MemberID, "error", err)
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
@@ -1454,11 +1471,31 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, resp)
 }
 
+// applyMetricStatusRejected is the apply metric status for a request refused
+// because its plan carries a change the caller has to resolve. It is kept
+// apart from "error" so server-failure alerting does not count it.
+const applyMetricStatusRejected = "rejected"
+
 func applyMetricStatusForError(err error) string {
 	if errors.Is(err, storage.ErrActiveApplyExists) {
 		return "conflict"
 	}
+	if isPlanAdmissionRefusal(err) {
+		return applyMetricStatusRejected
+	}
 	return "error"
+}
+
+// isPlanAdmissionRefusal reports whether apply creation refused the request
+// because a plan, the apply's own or a rollout member's, carries a blocked
+// change or an unsafe change the request did not consent to. Only the request
+// can resolve either, so neither is a server failure.
+func isPlanAdmissionRefusal(err error) bool {
+	if _, ok := errors.AsType[*blockedPlanError](err); ok {
+		return true
+	}
+	_, ok := errors.AsType[*unsafeOptInRequiredError](err)
+	return ok
 }
 
 // UnsupportedFeatureError identifies an apply option that the target database
@@ -1738,9 +1775,14 @@ func (s *Service) queueValidatedApply(ctx context.Context, span trace.Span, plan
 		metrics.RecordApplyDuration(ctx, time.Since(enqueueStart), plan.Repository, plan.Database, plan.Deployment, req.Environment, status)
 	}
 	recordApplyError := func(status string, err error) {
+		metricStatus := applyMetricStatusForError(err)
 		span.RecordError(err)
-		span.SetStatus(otelcodes.Error, status)
-		recordApplyResult(applyMetricStatusForError(err))
+		// A refused request is the caller's to resolve, so the span keeps an
+		// unset status rather than counting as a server error.
+		if metricStatus != applyMetricStatusRejected {
+			span.SetStatus(otelcodes.Error, status)
+		}
+		recordApplyResult(metricStatus)
 	}
 
 	attachObserver := func(storedApplyID int64) {
@@ -1835,7 +1877,7 @@ func (s *Service) createStoredApply(
 	applyOpts.DirectExecution = directExecution
 	// Blocked changes reject before unsafe changes because no opt-in can make a
 	// statement the engine refuses executable.
-	if err := plan.BlockedApplyError(); err != nil {
+	if err := rejectBlockedStoredPlan(plan); err != nil {
 		return nil, 0, err
 	}
 	if err := rejectUnsafeStoredPlanWithoutOptIn(plan, applyOpts); err != nil {
@@ -1992,6 +2034,36 @@ const (
 	// without the unsafe opt-in.
 	MemberPlanUnsafeWithoutOptIn
 )
+
+// String names the refusal kind for logs.
+func (r MemberPlanRefusal) String() string {
+	switch r {
+	case MemberPlanBlocked:
+		return "blocked"
+	case MemberPlanUndisclosedUnsafe:
+		return "undisclosed_unsafe"
+	case MemberPlanUnsafeWithoutOptIn:
+		return "unsafe_without_opt_in"
+	}
+	return fmt.Sprintf("unknown(%d)", int(r))
+}
+
+// memberPlanRefusalResponse is the HTTP status and error code for a refused
+// rollout member's plan. A blocked or unconsented unsafe member change gets
+// the status and code the apply's own plan would, because the caller's remedy
+// is the same. An undisclosed unsafe change has no opt-in remedy, so it never
+// carries the code that tells the caller to retry with allow_unsafe=true.
+func memberPlanRefusalResponse(refusal MemberPlanRefusal) (int, string) {
+	switch refusal {
+	case MemberPlanBlocked:
+		return http.StatusUnprocessableEntity, apitypes.ErrCodePlanBlocked
+	case MemberPlanUnsafeWithoutOptIn:
+		return http.StatusBadRequest, apitypes.ErrCodeUnsafeOptInRequired
+	case MemberPlanUndisclosedUnsafe:
+		return http.StatusBadRequest, apitypes.ErrCodeInvalidRequest
+	}
+	return http.StatusBadRequest, apitypes.ErrCodeInvalidRequest
+}
 
 // MemberPlanRefusedError is apply creation refusing one rollout member's own
 // plan. It names the member the way an operator addresses it and the table or
@@ -2203,7 +2275,7 @@ func planMemberID(plan *storage.Plan) string {
 // no opt-in can make a statement the engine refuses executable. A member's
 // unsafe change then needs the opt-in the apply's plan needs for its own.
 func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *storage.Plan, applyOpts storage.ApplyOptions) error {
-	if err := member.Plan.BlockedApplyError(); err != nil {
+	if err := rejectBlockedStoredPlan(member.Plan); err != nil {
 		return &MemberPlanRefusedError{
 			MemberID: member.MemberID(), Target: target, Refusal: MemberPlanBlocked,
 			Table: member.Plan.BlockedChanges()[0].Table, Err: err,
@@ -2224,6 +2296,46 @@ func rejectUnapplyableMemberPlan(member applyMember, target string, applyPlan *s
 		return refused
 	}
 	return nil
+}
+
+// blockedPlanError identifies an apply refused because its plan carries a
+// change the engine will not execute. No retry or apply option can make that
+// statement executable, so the caller has to change the schema and plan again;
+// it is a refusal of the request, not a server failure.
+type blockedPlanError struct {
+	cause error
+}
+
+func (e *blockedPlanError) Error() string { return e.cause.Error() }
+
+func (e *blockedPlanError) Unwrap() error { return e.cause }
+
+// rejectBlockedStoredPlan returns the plan's blocked-change refusal as a
+// blockedPlanError, or nil when the plan has no blocked change.
+func rejectBlockedStoredPlan(plan *storage.Plan) error {
+	if err := plan.BlockedApplyError(); err != nil {
+		return &blockedPlanError{cause: err}
+	}
+	return nil
+}
+
+// unsafeOptInRequiredError identifies an apply refused because its plan
+// carries an unsafe change and the request did not consent to it. The same
+// request with allow_unsafe=true can succeed, so the caller is told exactly
+// that. A table change names its table; a VSchema change names its namespace.
+type unsafeOptInRequiredError struct {
+	PlanID    string
+	VSchema   bool
+	Table     string
+	Namespace string
+	Reason    string
+}
+
+func (e *unsafeOptInRequiredError) Error() string {
+	if e.VSchema {
+		return fmt.Sprintf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", e.PlanID, e.Namespace, e.Reason)
+	}
+	return fmt.Sprintf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", e.PlanID, e.Table, e.Reason)
 }
 
 // rejectUnconfirmedMemberDirectExecution refuses a member planned on its own
@@ -2429,11 +2541,11 @@ func rejectUnsafeStoredPlanWithoutOptIn(plan *storage.Plan, applyOpts storage.Ap
 	}
 	if unsafeChanges := plan.UnsafeDDLChanges(); len(unsafeChanges) > 0 {
 		change := unsafeChanges[0]
-		return fmt.Errorf("stored plan %s contains unsafe change for table %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Table, change.UnsafeOptInReason())
+		return &unsafeOptInRequiredError{PlanID: plan.PlanIdentifier, Table: change.Table, Reason: change.UnsafeOptInReason()}
 	}
 	if vschemaChanges := plan.UnsafeVSchemaChanges(); len(vschemaChanges) > 0 {
 		change := vschemaChanges[0]
-		return fmt.Errorf("stored plan %s contains an unsafe VSchema change in namespace %q: %s; retry with allow_unsafe=true", plan.PlanIdentifier, change.Namespace, change.Reason)
+		return &unsafeOptInRequiredError{PlanID: plan.PlanIdentifier, VSchema: true, Namespace: change.Namespace, Reason: change.Reason}
 	}
 	return nil
 }
