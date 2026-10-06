@@ -458,6 +458,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		if verdict == replanCannotAttribute {
 			logger.Warn("the re-plan describes the table's namespace as a unit and does not mention this shard; the task resumes with its reviewed statement and the engine decides its outcome",
 				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
 		} else if verdict == replanChangeLanded {
 			logger.Info("table already has desired schema, skipping",
 				"task_id", task.TaskIdentifier, "table", task.TableName)
@@ -492,6 +493,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		} else if landed && !replanKeyedByTaskShard(task, replanKey) {
 			logger.Warn("the re-plan describes the table's namespace as a unit and lists only sibling statements; the task resumes with its reviewed statement and the engine decides its outcome",
 				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
 		} else if landed {
 			// The table still has pending statements, but every one of them
 			// is the reviewed DDL of a sibling task that is not yet terminal:
@@ -664,10 +666,15 @@ const (
 // normally.
 //
 // A namespace-unit re-plan that still lists the table is read as needing the
-// change on the task's shard too. That can be wrong for a shard that already
-// has it, but it is wrong in the direction that runs the reviewed statement,
-// where the engine refuses or no-ops a change the shard already has, rather
-// than the direction that reports a change as made.
+// change on the task's shard too, and an unattributable task runs its reviewed
+// statement again. Either can be wrong for a shard that already has the
+// change, but it is wrong in the direction that runs the statement rather than
+// the direction that reports a change as made. Running it is not free: an
+// engine whose statement is not idempotent, such as MySQL adding a column the
+// shard already has, fails the task, and the apply fails on a change that may
+// have landed. The operator plans the schema change again to see the target as
+// it is. Callers record each such start in the apply's timeline
+// (logUnattributableTaskStart), so that failure traces back to this decision.
 //
 // The returned key is where the re-plan's statements for the task live when
 // it needs the change. When that is the namespace unit's key rather than the
@@ -694,6 +701,14 @@ func replanVerdictForTask(replanDDL map[shardTableKey][]string, task *storage.Ta
 // Only then does the task's statement missing from them mean it landed.
 func replanKeyedByTaskShard(task *storage.Task, replanKey shardTableKey) bool {
 	return replanKey.shard == task.Shard
+}
+
+// logUnattributableTaskStart records in the apply's timeline that a task runs
+// its reviewed statement on a re-plan that could not say whether the task's
+// shard already has the change.
+func (c *LocalClient) logUnattributableTaskStart(ctx context.Context, apply *storage.Apply, task *storage.Task) {
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("A fresh plan could not tell whether table %s on shard %s already has its change, so the task runs its reviewed statement again. If the engine reports the change as already present, plan the schema change again to see the target as it is.", task.TableName, task.Shard), "", "")
 }
 
 // replanCoversShards reports whether a re-plan described the namespace one
@@ -797,6 +812,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// engine decides its outcome.
 			c.logger.Warn("resume re-plan describes the table's namespace as a unit and does not mention this shard; keeping the task active with its reviewed statement",
 				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
 			activeTasks = append(activeTasks, task)
 			continue
 		}
@@ -836,6 +852,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 				// reviewed statement, and the engine decides its outcome.
 				c.logger.Warn("resume re-plan describes the table's namespace as a unit and lists only sibling statements; keeping the task active with its reviewed statement",
 					task.LogAttrs()...)
+				c.logUnattributableTaskStart(ctx, apply, task)
 				activeTasks = append(activeTasks, task)
 				continue
 			}

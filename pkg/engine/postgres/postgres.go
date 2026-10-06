@@ -1405,6 +1405,12 @@ func (e *Engine) Drain() {
 // DrainContext is Drain bounded by ctx. When ctx ends before every apply
 // goroutine has finished, it returns an error and leaves the schema changes
 // tracked, so the engine still reports them as holding the target.
+//
+// The snapshot scopes only what a finished drain clears. The wait itself is on
+// every apply goroutine, including one accepted after the drain began, so a
+// drive draining behind a newly started apply waits for that apply too, up to
+// ctx. Giving up does not release the wait: its goroutine stays parked until
+// the applies it was waiting on exit, then closes a channel no one reads.
 func (e *Engine) DrainContext(ctx context.Context) error {
 	drained := e.trackedAtDrainStart()
 	done := make(chan struct{})

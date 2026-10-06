@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,6 +89,29 @@ func shardTaskFixture(eng *replanTargetEngine) (*LocalClient, *storage.Apply, *s
 	return client, apply, task
 }
 
+// unattributableStartLog is the timeline line a resume writes when it runs a
+// task's reviewed statement without evidence of whether the change landed.
+const unattributableStartLog = "could not tell whether table orders on shard"
+
+// captureApplyLogs records the timeline lines the client writes.
+func captureApplyLogs(client *LocalClient) *capturingApplyLogStore {
+	logs := &capturingApplyLogStore{}
+	client.storage.(*exactProgressStorage).logs = logs
+	return logs
+}
+
+// assertTimelineMentions asserts a timeline line contains text.
+func assertTimelineMentions(t *testing.T, logs *capturingApplyLogStore, text string) {
+	t.Helper()
+	for _, entry := range logs.entries {
+		if strings.Contains(entry.Message, text) {
+			assert.Equal(t, storage.LogLevelWarn, entry.Level)
+			return
+		}
+	}
+	assert.Failf(t, "timeline line missing", "no apply log contains %q", text)
+}
+
 // A resume never completes a shard's task because a namespace-unit re-plan no
 // longer mentions the table: that silence says nothing about the shard. The
 // task stays active with its reviewed statement, so the engine decides its
@@ -95,6 +119,7 @@ func shardTaskFixture(eng *replanTargetEngine) (*LocalClient, *storage.Apply, *s
 func TestReplanAndFilterTasks_ShardTaskIsNotCompletedByTheUnitsSilence(t *testing.T) {
 	eng := &replanTargetEngine{plan: &engine.PlanResult{NoChanges: true}}
 	client, apply, task := shardTaskFixture(eng)
+	logs := captureApplyLogs(client)
 
 	rp, err := client.replanAndFilterTasks(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7})
 
@@ -103,6 +128,7 @@ func TestReplanAndFilterTasks_ShardTaskIsNotCompletedByTheUnitsSilence(t *testin
 	require.Len(t, rp.ActiveTasks, 1)
 	assert.Equal(t, resumeTaskDDL, rp.ActiveTasks[0].DDL, "the reviewed statement is kept")
 	assert.Equal(t, state.Task.Pending, task.State)
+	assertTimelineMentions(t, logs, unattributableStartLog)
 }
 
 // A namespace-unit re-plan that still lists the shard task's table is checked
@@ -121,6 +147,24 @@ func TestReplanAndFilterTasks_ShardTaskIsVerifiedAgainstTheUnitsStatements(t *te
 	_, err = client.replanAndFilterTasks(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted from the reviewed plan")
+}
+
+// A namespace-unit re-plan that refuses the statement it still lists is the
+// target's verdict on the shard task that will run it, so the resumed drive's
+// blocked-row gate refuses the task rather than sending it to the engine.
+func TestReplanAndFilterTasks_ShardTaskTakesTheUnitsRefusal(t *testing.T) {
+	plan := resumeTaskReplan(resumeTaskDDL)
+	plan.Changes[0].TableChanges[0].ExecutionMode = engine.ExecutionModeBlocked
+	plan.Changes[0].TableChanges[0].ModeReason = "table exceeds the direct-execution bound"
+	eng := &replanTargetEngine{plan: plan}
+	client, apply, task := shardTaskFixture(eng)
+
+	rp, err := client.replanAndFilterTasks(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7})
+
+	require.NoError(t, err)
+	require.Len(t, rp.ActiveTasks, 1)
+	assert.Equal(t, engine.ExecutionModeBlocked, task.ExecutionMode)
+	assert.Equal(t, "table exceeds the direct-execution bound", task.ModeReason)
 }
 
 // siblingStatementDDL is the reviewed statement of a second task on the same
@@ -145,6 +189,7 @@ func withPendingSibling(task *storage.Task) []*storage.Task {
 func TestReplanAndFilterTasks_ShardTaskIsNotSettledByTheUnitsSiblingStatement(t *testing.T) {
 	eng := &replanTargetEngine{plan: resumeTaskReplan(siblingStatementDDL)}
 	client, apply, task := shardTaskFixture(eng)
+	logs := captureApplyLogs(client)
 	tasks := withPendingSibling(task)
 
 	rp, err := client.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{ID: 7})
@@ -155,6 +200,7 @@ func TestReplanAndFilterTasks_ShardTaskIsNotSettledByTheUnitsSiblingStatement(t 
 	assert.Equal(t, resumeTaskDDL, rp.ActiveTasks[0].DDL, "the task keeps its reviewed statement")
 	assert.Equal(t, siblingStatementDDL, rp.ActiveTasks[1].DDL)
 	assert.Equal(t, state.Task.Pending, task.State)
+	assertTimelineMentions(t, logs, unattributableStartLog)
 }
 
 // The sequential resume runs a shard task with its reviewed statement when a
@@ -162,6 +208,7 @@ func TestReplanAndFilterTasks_ShardTaskIsNotSettledByTheUnitsSiblingStatement(t 
 func TestResumeApplySequential_ShardTaskRunsWhenTheUnitListsOnlyASibling(t *testing.T) {
 	eng := &replanTargetEngine{plan: resumeTaskReplan(siblingStatementDDL)}
 	client, apply, task := shardTaskFixture(eng)
+	logs := captureApplyLogs(client)
 	tasks := withPendingSibling(task)
 	client.storage.(*exactProgressStorage).tasks.(*stateRecordingTaskStore).tasks = tasks
 
@@ -171,6 +218,7 @@ func TestResumeApplySequential_ShardTaskRunsWhenTheUnitListsOnlyASibling(t *test
 	assert.Equal(t, 2, eng.applies, "the engine runs both tasks and decides their outcomes")
 	assert.Equal(t, state.Task.Completed, task.State)
 	assert.Equal(t, state.Task.Completed, tasks[1].State)
+	assertTimelineMentions(t, logs, unattributableStartLog)
 }
 
 // The sequential resume re-plans each table right before it runs. A target
@@ -194,12 +242,14 @@ func TestResumeApplySequential_UnverifiedTargetIsNotStarted(t *testing.T) {
 func TestResumeApplySequential_ShardTaskRunsWhenTheUnitIsSilent(t *testing.T) {
 	eng := &replanTargetEngine{plan: &engine.PlanResult{NoChanges: true}}
 	client, apply, task := shardTaskFixture(eng)
+	logs := captureApplyLogs(client)
 
 	err := client.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7}, nil)
 
 	require.NoError(t, err)
 	assert.Equal(t, 1, eng.applies, "the engine runs the task and decides its outcome")
 	assert.Equal(t, state.Task.Completed, task.State)
+	assertTimelineMentions(t, logs, unattributableStartLog)
 }
 
 // blockedDrainEngine is an engine whose in-process work from an earlier drive
