@@ -47,7 +47,7 @@ const foreignKeyRefusalReason = "foreign key constraints are not supported"
 // MySQL (real-time) and fails fast on mismatch. Only VSchema errors are
 // retried, since GetKeyspaceVSchema may return stale data after
 // UpdateKeyspaceVSchema.
-func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword) error {
+func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
 	const maxAttempts = 18
 	const pollInterval = 5 * time.Second
 
@@ -63,7 +63,7 @@ func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client
 			}
 		}
 
-		lastErr = e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, password)
+		lastErr = e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, ignored, password)
 		if lastErr == nil {
 			if attempt > 0 {
 				e.logger.Info("branch schema validated after retry",
@@ -89,11 +89,14 @@ func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client
 // MySQL (LoadSchemaFromDB) to avoid PlanetScale's GetBranchSchema API, which
 // returns stale schema until an asynchronous schema snapshot completes after
 // DDL execution.
-func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword) error {
+func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
 	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
 	if err != nil {
 		return fmt.Errorf("fetch branch schema via MySQL for validation: %w", err)
 	}
+	// The branch is a copy of main, so it carries the tables ignore_tables
+	// withheld from the plan; they are not part of what is validated.
+	branchSchema = withoutIgnoredTables(branchSchema, ignored)
 
 	for _, ks := range keyspaces {
 		ns := schemaFiles[ks]
@@ -141,6 +144,26 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 		"keyspaces", len(keyspaces),
 	)
 	return nil
+}
+
+// withoutIgnoredTables drops the tables ignore_tables withholds from a live
+// schema, so a comparison against the declared schema leaves them out the way
+// the plan did.
+func withoutIgnoredTables(live map[string][]table.TableSchema, ignored engine.IgnoredTables) map[string][]table.TableSchema {
+	if ignored.Empty() {
+		return live
+	}
+	kept := make(map[string][]table.TableSchema, len(live))
+	for keyspace, tables := range live {
+		kept[keyspace] = make([]table.TableSchema, 0, len(tables))
+		for _, ts := range tables {
+			if ignored.Withholds(ts.Name) {
+				continue
+			}
+			kept[keyspace] = append(kept[keyspace], ts)
+		}
+	}
+	return kept
 }
 
 // fetchBranchSchemaViaMySQL connects to the branch via MySQL using the branch

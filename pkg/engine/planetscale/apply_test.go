@@ -412,8 +412,9 @@ func resumeRequest(t *testing.T, meta *psMetadata, migrationContext string) *eng
 // rediscovered Vitess context rather than only returning it in the ApplyResult.
 func captureStateChanges(req *engine.ApplyRequest) *[]*engine.ResumeState {
 	var persisted []*engine.ResumeState
-	req.OnStateChange = func(state *engine.ResumeState) {
+	req.OnStateChange = func(state *engine.ResumeState) error {
 		persisted = append(persisted, state)
+		return nil
 	}
 	return &persisted
 }

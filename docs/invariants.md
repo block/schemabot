@@ -1520,7 +1520,8 @@ from the sequential and grouped drives). The resume, held-target and lost-work p
 re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), which judges whether
 the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on the branch-resume
 path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
-tables the branch still lacks and refuses a branch that differs outside the plan. The
+tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
+validates the branch against the declared schema before creating the deploy request. The
 cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the

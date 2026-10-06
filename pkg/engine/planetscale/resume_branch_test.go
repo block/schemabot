@@ -59,11 +59,34 @@ func TestDiffBranchForResume_DiffsFromTheBranchesRealSchema(t *testing.T) {
 	assert.Contains(t, diff["commerce"][0].DDL, "CREATE TABLE `orders`")
 }
 
+// The branch is a copy of main, so it carries the tables ignore_tables withheld
+// from the plan. They are left out of the resume's diff as the plan left them
+// out, rather than proposed for DROP TABLE and refused as unplanned.
+func TestDiffBranchForResume_LeavesOutIgnoredTables(t *testing.T) {
+	e := &Engine{linter: lint.New(), logger: slog.New(slog.NewTextHandler(os.Stdout, nil))}
+	current := map[string][]table.TableSchema{
+		"commerce": {{Name: "users", Schema: resumeUsersTable}, {Name: "legacy_audit", Schema: "CREATE TABLE `legacy_audit` (\n  `id` bigint NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+	}
+	desired := schema.SchemaFiles{
+		"commerce": {Files: map[string]string{"users.sql": resumeUsersTable + ";"}},
+	}
+
+	unfiltered, err := e.diffBranchForResume(current, desired)
+	require.NoError(t, err)
+	require.Len(t, unfiltered["commerce"], 1, "without the filter the ignored table reads as a drop")
+	assert.Equal(t, ddl.StatementDropTable, unfiltered["commerce"][0].Operation)
+
+	diff, err := e.diffBranchForResume(withoutIgnoredTables(current, engine.NewIgnoredTables([]string{"legacy_audit"})), desired)
+	require.NoError(t, err)
+	assert.Empty(t, diff["commerce"])
+}
+
 // A resume runs only what the plan approved. Planned tables the branch already
 // has are skipped, planned tables it still lacks run with the planned DDL, a
 // keyspace whose only remaining work is its planned VSchema keeps that work,
-// and a branch that differs on a table the plan never changes is refused
-// outright rather than "repaired" with DDL nobody reviewed.
+// and a branch that differs on a table the plan never changes, or on a planned
+// table in a way the plan never reviewed, is refused outright rather than
+// "repaired" with DDL nobody reviewed.
 func TestRemainingPlannedChanges(t *testing.T) {
 	createOrders := engine.TableChange{Table: "orders", Operation: ddl.StatementCreateTable, DDL: resumeOrdersTable}
 	createItems := engine.TableChange{Table: "items", Operation: ddl.StatementCreateTable, DDL: resumeItemsTable}
@@ -86,12 +109,37 @@ func TestRemainingPlannedChanges(t *testing.T) {
 				TableChanges: []engine.TableChange{createOrders, createItems},
 			}},
 			branchDiff: map[string][]engine.TableChange{
-				"commerce": {{Table: "items", Operation: ddl.StatementCreateTable, DDL: "CREATE TABLE `items` (`id` bigint)"}},
+				"commerce": {{Table: "items", Operation: ddl.StatementCreateTable, DDL: resumeItemsTable}},
 			},
 			want: []engine.SchemaChange{{
 				Namespace:    "commerce",
 				TableChanges: []engine.TableChange{createItems},
 			}},
+		},
+		{
+			name: "the reviewed DDL is matched by meaning, not by its formatting",
+			planned: []engine.SchemaChange{{
+				Namespace:    "commerce",
+				TableChanges: []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}},
+			}},
+			branchDiff: map[string][]engine.TableChange{
+				"commerce": {{Table: "users", Operation: ddl.StatementAlterTable, DDL: "alter table users add column email varchar(255)"}},
+			},
+			want: []engine.SchemaChange{{
+				Namespace:    "commerce",
+				TableChanges: []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}},
+			}},
+		},
+		{
+			name: "a planned table that also differs in a way nobody reviewed is refused",
+			planned: []engine.SchemaChange{{
+				Namespace:    "commerce",
+				TableChanges: []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}},
+			}},
+			branchDiff: map[string][]engine.TableChange{
+				"commerce": {{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255), DROP COLUMN `admin`"}},
+			},
+			wantRefusal: "differ from the reviewed DDL (commerce.users)",
 		},
 		{
 			name: "a branch with every planned table has nothing left",

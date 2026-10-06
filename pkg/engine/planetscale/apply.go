@@ -110,10 +110,18 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			e.logger.Warn("failed to encode apply metadata for persistence", "error", err)
 			return
 		}
-		req.OnStateChange(&engine.ResumeState{
+		if err := req.OnStateChange(&engine.ResumeState{
 			MigrationContext: migCtx,
 			Metadata:         encoded,
-		})
+		}); err != nil {
+			// The apply carries on: a failed save only costs crash recovery.
+			// The branch is not treated as recorded, so a drive that ends
+			// before its deploy request deletes it rather than keeping a
+			// branch no successor can find.
+			e.logger.Warn("resume state was not saved; a resuming driver will not find this branch",
+				"database", req.Database, "branch", meta.BranchName, "error", err)
+			return
+		}
 		recordedBranch = meta.BranchName
 	}
 
@@ -297,7 +305,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// PlanetScale API which may return stale data after UpdateKeyspaceVSchema.
 	// Retry up to 30s to allow the API to converge.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, password); err != nil {
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, engine.NewIgnoredTables(req.IgnoreTables), password); err != nil {
 		return nil, fmt.Errorf("branch validation failed after DDL apply: %w", err)
 	}
 	emitEvent(engine.ApplyEvent{
@@ -747,28 +755,37 @@ func (e *Engine) diffBranchForResume(currentSchema map[string][]table.TableSchem
 // A branch that differs on a table the plan does not change is refused. The
 // branch was cut from main to carry exactly the planned DDL, so such a
 // difference means main moved or the branch was touched, and running DDL for
-// it would apply a schema change nobody reviewed.
+// it would apply a schema change nobody reviewed. For the same reason a
+// planned table is refused when what the branch still lacks on it is not the
+// reviewed DDL: a table change lands whole, so a planned table either already
+// matches or still needs exactly the planned statement, and anything else is a
+// change on that table nobody reviewed.
 func remainingPlannedChanges(planned []engine.SchemaChange, branchDiff map[string][]engine.TableChange, schemaFiles schema.SchemaFiles) ([]engine.SchemaChange, error) {
-	plannedTables := make(map[string]map[string]bool, len(planned))
+	plannedDDL := make(map[string]map[string]string, len(planned))
 	for _, sc := range planned {
-		tables := make(map[string]bool, len(sc.TableChanges))
+		tables := make(map[string]string, len(sc.TableChanges))
 		for _, tc := range sc.TableChanges {
 			name, err := plannedTableName(sc.Namespace, tc)
 			if err != nil {
 				return nil, err
 			}
-			tables[name] = true
+			tables[name] = tc.DDL
 		}
-		plannedTables[sc.Namespace] = tables
+		plannedDDL[sc.Namespace] = tables
 	}
 
-	var unplanned []string
+	var unplanned, unreviewed []string
 	differing := make(map[string]map[string]bool, len(branchDiff))
 	for _, keyspace := range slices.Sorted(maps.Keys(branchDiff)) {
 		differing[keyspace] = make(map[string]bool, len(branchDiff[keyspace]))
 		for _, tc := range branchDiff[keyspace] {
-			if !plannedTables[keyspace][tc.Table] {
+			reviewed, ok := plannedDDL[keyspace][tc.Table]
+			if !ok {
 				unplanned = append(unplanned, fmt.Sprintf("%s.%s", keyspace, tc.Table))
+				continue
+			}
+			if ddl.Canonicalize(tc.DDL) != ddl.Canonicalize(reviewed) {
+				unreviewed = append(unreviewed, fmt.Sprintf("%s.%s", keyspace, tc.Table))
 				continue
 			}
 			differing[keyspace][tc.Table] = true
@@ -777,6 +794,10 @@ func remainingPlannedChanges(planned []engine.SchemaChange, branchDiff map[strin
 	if len(unplanned) > 0 {
 		return nil, engine.NewPermanentError("branch differs from the declared schema on tables the plan does not change (%s); refusing to run DDL outside the plan — re-plan and apply again",
 			strings.Join(unplanned, ", "))
+	}
+	if len(unreviewed) > 0 {
+		return nil, engine.NewPermanentError("branch still needs changes on planned tables that differ from the reviewed DDL (%s); refusing to run DDL outside the plan — re-plan and apply again",
+			strings.Join(unreviewed, ", "))
 	}
 
 	var remaining []engine.SchemaChange
@@ -900,12 +921,15 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// API: for a branch that has only just become ready the API can still
 	// report its keyspaces as missing, which would turn every existing table
 	// into a CREATE.
+	// Tables the plan was reviewed with ignore_tables withholding are left out,
+	// as the plan left them out.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
+	ignored := engine.NewIgnoredTables(req.IgnoreTables)
 	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
 	if err != nil {
 		return nil, fmt.Errorf("fetch branch %s schema via MySQL on resume: %w", meta.BranchName, err)
 	}
-	branchDiff, err := e.diffBranchForResume(branchSchema, req.SchemaFiles)
+	branchDiff, err := e.diffBranchForResume(withoutIgnoredTables(branchSchema, ignored), req.SchemaFiles)
 	if err != nil {
 		return nil, fmt.Errorf("diff branch for resume: %w", err)
 	}
@@ -922,6 +946,16 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	} else {
 		e.logger.Info("all planned changes already applied on branch", "branch", meta.BranchName)
 	}
+
+	// The resumed branch must match the declared schema before a deploy request
+	// carries it to main, exactly as a fresh apply's branch must.
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, meta.BranchName, keyspaces, req.SchemaFiles, ignored, password); err != nil {
+		return nil, fmt.Errorf("branch validation failed on resume: %w", err)
+	}
+	emitEvent(engine.ApplyEvent{
+		Message:  "Branch schema validated — matches desired state",
+		Metadata: map[string]string{"branch": meta.BranchName},
+	})
 
 	// Create deploy request
 	main := mainBranch(req.Credentials)

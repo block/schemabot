@@ -92,6 +92,7 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		Changes:      changes,
 		TargetShards: taskTargetShards(tasks),
 		SchemaFiles:  plan.SchemaFiles,
+		IgnoreTables: plan.IgnoreTables(),
 		Options:      options,
 		ResumeState:  &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
 		Credentials:  creds,
@@ -106,14 +107,16 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			}, logger)
 			c.mirrorEngineEventLiveness(ctx, logger, tasks)
 		},
-		OnStateChange: func(rs *engine.ResumeState) {
+		OnStateChange: func(rs *engine.ResumeState) error {
 			if rs == nil {
 				logger.Debug("OnStateChange: nil resume state")
-				return
+				return nil
 			}
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, rs); saveErr != nil {
 				logger.Warn("OnStateChange: failed to persist opaque resume state", append(apply.MutableLogAttrs(), "error", saveErr)...)
+				return fmt.Errorf("persist engine resume state for apply %s: %w", apply.ApplyIdentifier, saveErr)
 			}
+			return nil
 		},
 	})
 

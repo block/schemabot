@@ -111,16 +111,19 @@ func (c *handbackClient) CreateBranchPassword(ctx context.Context, _ *ps.Databas
 // another driver, which resumes from the branch the stored resume state names.
 // Deleting that branch would discard the resume's starting point, and after a
 // lost lease would pull it from under a peer already preparing it. A branch
-// the stored state never named cannot be resumed, so it is still deleted.
+// the stored state never named, because no state was recorded or because
+// storage refused the save, cannot be resumed, so it is still deleted.
 func TestApplyKeepsItsBranchForTheDriverThatResumesIt(t *testing.T) {
 	shortenEngineWaits(t)
 	tests := []struct {
 		name        string
 		recorded    bool
+		saveErr     error
 		wantDeleted bool
 	}{
 		{name: "a branch the stored resume state names is kept", recorded: true, wantDeleted: false},
 		{name: "a branch the stored resume state never named is deleted", recorded: false, wantDeleted: true},
+		{name: "a branch whose resume state storage refused is deleted", recorded: true, saveErr: errors.New("apply apply-0123456789abcdef: storage unavailable"), wantDeleted: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -135,7 +138,13 @@ func TestApplyKeepsItsBranchForTheDriverThatResumesIt(t *testing.T) {
 			}
 			if tt.recorded {
 				req.ResumeState = &engine.ResumeState{MigrationContext: "apply-0123456789abcdef"}
-				req.OnStateChange = func(rs *engine.ResumeState) { stored = append(stored, rs) }
+				req.OnStateChange = func(rs *engine.ResumeState) error {
+					if tt.saveErr != nil {
+						return tt.saveErr
+					}
+					stored = append(stored, rs)
+					return nil
+				}
 			}
 
 			_, err := conformanceEngine(client).Apply(ctx, req)

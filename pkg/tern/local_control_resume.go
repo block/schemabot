@@ -1405,18 +1405,21 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		Changes:      groupedResumeChanges(tasks, plan),
 		TargetShards: taskTargetShards(tasks),
 		SchemaFiles:  plan.SchemaFiles,
+		IgnoreTables: plan.IgnoreTables(),
 		Options:      options,
 		ResumeState:  resumeState,
 		Credentials:  creds,
 		Logger:       c.logger.With(apply.IdentityLogAttrs()...),
-		OnStateChange: func(rs *engine.ResumeState) {
+		OnStateChange: func(rs *engine.ResumeState) error {
 			if rs == nil {
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
-				return
+				return nil
 			}
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, rs); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist opaque resume state", append(apply.LogAttrs(), "error", saveErr)...)
+				return fmt.Errorf("persist engine resume state for apply %s: %w", apply.ApplyIdentifier, saveErr)
 			}
+			return nil
 		},
 	})
 	if err != nil {
@@ -2000,9 +2003,12 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		}
 		return cause
 	}
-	persistResume := func(rs *engine.ResumeState) {
+	// saveResume reports whether the finalizer's resume state landed, which is
+	// what the engine's OnStateChange needs; persistResume is the log-only form
+	// for the polls that save the latest state as they go.
+	saveResume := func(rs *engine.ResumeState) error {
 		if rs == nil {
-			return
+			return nil
 		}
 		if saveErr := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
 			ApplyOperationID: op.ID,
@@ -2011,6 +2017,14 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		}); saveErr != nil {
 			c.logger.Warn("group_finalizer: failed to persist engine resume state",
 				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", saveErr)
+			return fmt.Errorf("persist group finalizer resume state for apply %s: %w", apply.ApplyIdentifier, saveErr)
+		}
+		return nil
+	}
+	persistResume := func(rs *engine.ResumeState) {
+		if err := saveResume(rs); err != nil {
+			c.logger.Debug("group_finalizer: resume state save failed and was logged; the next poll saves the latest state again",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID)
 		}
 	}
 
@@ -2077,11 +2091,12 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		PlanID:        plan.PlanIdentifier,
 		Changes:       changes,
 		SchemaFiles:   plan.SchemaFiles,
+		IgnoreTables:  plan.IgnoreTables(),
 		Options:       apply.GetOptions().Map(),
 		ResumeState:   resumeState,
 		Credentials:   creds,
 		Logger:        c.logger.With(apply.IdentityLogAttrs()...),
-		OnStateChange: persistResume,
+		OnStateChange: saveResume,
 	})
 	if err != nil {
 		return failClosed(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))

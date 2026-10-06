@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
@@ -175,7 +176,7 @@ func loadBranchSchema(t *testing.T, ctx context.Context, branch, keyspace string
 // resume created, so it never deploys to main.
 func closeDeferredDeployRequest(t *testing.T, eng *planetscale.Engine, rs *engine.ResumeState) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), cleanupTimeout)
+	ctx, cancel := testutil.CleanupContext(cleanupTimeout)
 	defer cancel()
 	_, err := eng.Cancel(ctx, &engine.ControlRequest{
 		Database:    testDB,
