@@ -619,8 +619,12 @@ operations with their deployment, target, state, and cutover policy. A rollout's
 table entries carry `deployment` and `target`, naming the member whose copy the
 row reports. Attribute a table by the pair, never by `deployment` alone: one
 deployment can address several targets, each running its own copy of the change,
-so several rows for the same table share a deployment and differ only in their
+so several rows for the same table share a deployment and differ in their
 target. Both fields are absent on an apply that runs against a single target.
+`task_id`, when present, identifies the individual task, including repeated
+statements against the same member and table. Log-mode watching tracks that
+identity; legacy rows without it are scoped by keyspace, deployment, target,
+and table name.
 The top-level `metadata` object carries engine-specific display fields when the
 engine reports them: PostgreSQL applies report their position through `phase`,
 `step`, `steps_total`, and `statement`; PlanetScale applies report deploy
@@ -715,11 +719,34 @@ Response excerpt (illustrative values):
 }
 ```
 
-Both rows report the same table under the same deployment, and only `target`
-tells them apart. Each row's `estimated_bytes` is that target's own copy of the
-table.
+Both rows report the same table under the same deployment; `target` names
+which member owns each copy. Each row's `estimated_bytes` is that target's own
+copy of the table.
 
 </details>
+
+For event-based output while applying a rollout, use log mode:
+
+```sh
+schemabot apply -s ./schema -e production -y -o log
+```
+
+Progress log excerpt for two completed `orders` tasks (illustrative timestamps
+and durations):
+
+```text
+03:02:00 Apply started apply_id=apply-example-75
+03:02:00 Table started table=orders deployment=commerce-a target=shop-001 ddl="ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+03:02:00 Table complete table=orders deployment=commerce-a target=shop-001 duration="< 1s"
+03:02:00 Table started table=orders deployment=commerce-a target=shop-002 ddl="ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+03:02:00 Table complete table=orders deployment=commerce-a target=shop-002 duration="< 1s"
+03:02:00 Apply completed duration=2m tables="2/2 succeeded"
+```
+
+Each task gets its own start and completion, even when the table names match.
+Table log lines include `deployment` and `target` only when the response supplies
+them; single-target output without those fields is unchanged. Task IDs are used
+for tracking but are not printed.
 
 <details>
 <summary>PostgreSQL response example</summary>

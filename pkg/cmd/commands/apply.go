@@ -635,7 +635,7 @@ const (
 	logHeartbeatDefault = 10 * time.Second
 )
 
-// tableLogState tracks the last-emitted state for a single table to detect changes.
+// tableLogState tracks the last-emitted state for a single task to detect changes.
 type tableLogState struct {
 	status         string    // last emitted status (normalized)
 	lastEmit       time.Time // last time a line was emitted for this table
@@ -827,6 +827,12 @@ func logfmtEscape(b []byte, val string) []byte {
 //   - Small/instant tables only get start + complete lines — no progress noise.
 //   - A summary line is emitted on terminal states.
 func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Duration) error {
+	return watchApplyProgressLogWithPoller(func() (*apitypes.ProgressResponse, error) {
+		return client.GetProgress(endpoint, applyID)
+	}, time.Sleep, heartbeatInterval)
+}
+
+func watchApplyProgressLogWithPoller(getProgress func() (*apitypes.ProgressResponse, error), wait func(time.Duration), heartbeatInterval time.Duration) error {
 	log := &logEmitter{}
 	tableStates := make(map[string]*tableLogState)
 	var lastGlobalState string
@@ -837,7 +843,7 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 	pollInterval := 500 * time.Millisecond
 
 	for {
-		result, err := client.GetProgress(endpoint, applyID)
+		result, err := getProgress()
 		if err != nil {
 			return err
 		}
@@ -872,7 +878,7 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 			// The background poller may not have updated task states yet.
 			// Keep polling unless we've already seen a terminal state.
 			if !state.IsTerminalApplyState(lastGlobalState) {
-				time.Sleep(pollInterval)
+				wait(pollInterval)
 				continue
 			}
 			log.emit("msg", "No active schema change")
@@ -883,10 +889,11 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 
 		// Emit per-table events
 		for _, tbl := range tables {
-			ts, ok := tableStates[tbl.TableName]
+			key := tableLogKey(tbl)
+			ts, ok := tableStates[key]
 			if !ok {
 				ts = &tableLogState{startedAt: time.Now()}
-				tableStates[tbl.TableName] = ts
+				tableStates[key] = ts
 			}
 
 			tblStatus := state.NormalizeState(tbl.Status)
@@ -997,7 +1004,7 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 			return nil
 		}
 
-		time.Sleep(pollInterval)
+		wait(pollInterval)
 		// Ramp up to 5s over the first few polls to avoid hammering the API on long schema changes
 		if pollInterval < 5*time.Second {
 			pollInterval *= 2
@@ -1008,7 +1015,17 @@ func watchApplyProgressLog(endpoint, applyID string, heartbeatInterval time.Dura
 	}
 }
 
-// tableKVs returns the common key-value pairs for a table log line (table name + task_id if known).
+// tableLogKey uses the durable task identity, which distinguishes repeated
+// statements on the same member and table. Legacy responses without task IDs
+// are scoped by namespace and rollout member; quoting keeps the tuple unambiguous.
+func tableLogKey(tbl *apitypes.TableProgressResponse) string {
+	if tbl.TaskID != "" {
+		return "task:" + tbl.TaskID
+	}
+	return fmt.Sprintf("legacy:%q/%q/%q/%q", tbl.Keyspace, tbl.Deployment, tbl.Target, tbl.TableName)
+}
+
+// tableKVs returns the common identity and provenance fields for a table log line.
 func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState) []string {
 	kvs := []string{"msg", msg, "table", tbl.TableName}
 	taskID := ts.taskID
@@ -1020,6 +1037,12 @@ func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState
 	}
 	if tbl.Keyspace != "" {
 		kvs = append(kvs, "keyspace", tbl.Keyspace)
+	}
+	if tbl.Deployment != "" {
+		kvs = append(kvs, "deployment", tbl.Deployment)
+	}
+	if tbl.Target != "" {
+		kvs = append(kvs, "target", tbl.Target)
 	}
 	return kvs
 }
