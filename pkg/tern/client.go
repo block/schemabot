@@ -27,6 +27,51 @@ var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation
 // as an engine failure.
 var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after heartbeat failures spanning the staleness window")
 
+// ErrOperatorShutdown is the cause the operator cancels its drives with when the
+// process shuts down. A drive handing its apply back for any other reason halts
+// the engine work it started in this process before it returns; one ended by
+// shutdown leaves that to the shutdown, which halts every in-process engine
+// itself once the drives have returned.
+var ErrOperatorShutdown = errors.New("operator is shutting down")
+
+type operatorContextKey struct{}
+
+// WithOperatorContext attaches the operator's own context to the contexts its
+// drives run under. A drive's context can be cancelled for its own reasons —
+// a lost lease, a stall, a hand-back — before the operator shuts down, and
+// then its cause never says shutdown. The operator's context still does, so a
+// drive tearing down after its own cancellation can still see a shutdown
+// begin and leave the teardown to it.
+func WithOperatorContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, operatorContextKey{}, ctx)
+}
+
+// operatorShuttingDown reports whether the operator running this drive has
+// begun shutting down, read from the drive's own cancellation cause and from
+// the operator context WithOperatorContext attached.
+func operatorShuttingDown(ctx context.Context) bool {
+	if errors.Is(context.Cause(ctx), ErrOperatorShutdown) {
+		return true
+	}
+	operator, ok := ctx.Value(operatorContextKey{}).(context.Context)
+	return ok && errors.Is(context.Cause(operator), ErrOperatorShutdown)
+}
+
+// afterOperatorShutdown arranges for f to run once the operator running this
+// drive begins shutting down, and returns a function that stops the
+// arrangement. A drive with no operator context never runs f.
+func afterOperatorShutdown(ctx context.Context, f func()) (stop func() bool) {
+	operator, ok := ctx.Value(operatorContextKey{}).(context.Context)
+	if !ok {
+		return func() bool { return true }
+	}
+	return context.AfterFunc(operator, func() {
+		if errors.Is(context.Cause(operator), ErrOperatorShutdown) {
+			f()
+		}
+	})
+}
+
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps

@@ -274,7 +274,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 	}
-	result, err := eng.Start(ctx, controlReq)
+	result, err := eng.Start(withDriveWorkOwner(ctx), controlReq)
 	if err != nil {
 		return nil, fmt.Errorf("start deferred deploy: %w", err)
 	}
@@ -392,6 +392,11 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	// Mutable attrs (task state, apply state) stay per-call so they are never
 	// frozen stale into the bound logger.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// Registered after the heartbeat, so on a return the drive was not
+	// cancelled for it runs while the claim is still renewed. A cancelled
+	// drive's heartbeat has already stopped; the halt's bound keeps it inside
+	// the claim's staleness window.
+	defer c.haltEngineWorkLeftByDrive(ctx, logger)
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
@@ -513,12 +518,12 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			continue
 		}
 
-		action = c.runEngineTask(ctx, apply, task, options)
-
 		taskID := task.ID
 		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Task %s resumed (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
-			state.Task.Stopped, state.Task.Running)
+			task.State, state.Task.Running)
+
+		action = c.runEngineTask(ctx, apply, task, options)
 
 		if action == taskFailed {
 			failedTask = task

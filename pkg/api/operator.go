@@ -71,7 +71,9 @@ func (s *Service) StartOperator(ctx context.Context) {
 
 	stop := make(chan struct{})
 	wake := make(chan struct{}, driverCount)
-	driverCtx, cancel := context.WithCancel(ctx)
+	driverCtx, cancelCause := context.WithCancelCause(ctx)
+	driverCtx = tern.WithOperatorContext(driverCtx)
+	cancel := func() { cancelCause(tern.ErrOperatorShutdown) }
 	reaperEvery := s.strandedReaperEvery
 	if reaperEvery <= 0 {
 		reaperEvery = StrandedReaperInterval

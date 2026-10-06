@@ -1,0 +1,165 @@
+package tern
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/storage"
+)
+
+// ownedWorkEngine records the owner each start ran under and each owner a
+// halt was scoped to. A halt blocks until its context ends when block is set,
+// standing in for work that is slow to come down.
+type ownedWorkEngine struct {
+	engine.Engine
+	block bool
+
+	mu          sync.Mutex
+	startOwners []string
+	haltOwners  []string
+	shutdowns   int
+}
+
+func (e *ownedWorkEngine) Name() string { return "owned-work" }
+
+func (e *ownedWorkEngine) Apply(ctx context.Context, _ *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.startOwners = append(e.startOwners, engine.WorkOwnerFromContext(ctx))
+	return &engine.ApplyResult{Accepted: true}, nil
+}
+
+func (e *ownedWorkEngine) HaltForShutdown(context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.shutdowns++
+	return nil
+}
+
+func (e *ownedWorkEngine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
+	e.mu.Lock()
+	e.haltOwners = append(e.haltOwners, owner)
+	block := e.block
+	e.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (e *ownedWorkEngine) halts() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.haltOwners...)
+}
+
+func newOwnedWorkClient(eng engine.Engine) *LocalClient {
+	return &LocalClient{
+		config:       LocalConfig{Database: "appdb", Type: "owned-work"},
+		customEngine: eng,
+		logger:       slog.Default(),
+	}
+}
+
+// driveContext is the context a drive of apply 1 runs under for the claim
+// with token.
+func driveContext(ctx context.Context, token string) context.Context {
+	return storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: 1, Owner: "driver", Token: token})
+}
+
+// Two drives of the same apply hold different claims, so they are different
+// owners; a drive's nested calls share its claim and so its owner.
+func TestDriveWorkOwnerNamesTheClaim(t *testing.T) {
+	driveA := driveContext(t.Context(), "token-a")
+	driveB := driveContext(t.Context(), "token-b")
+
+	assert.NotEqual(t, driveWorkOwner(driveA), driveWorkOwner(driveB))
+	assert.Equal(t, driveWorkOwner(driveA), driveWorkOwner(context.WithoutCancel(driveA)))
+	dual := storage.WithOperationLease(driveA, storage.OperationLease{ApplyID: 1, OperationID: 2, Owner: "driver", Token: "op-token"})
+	assert.NotEqual(t, driveWorkOwner(driveA), driveWorkOwner(dual), "the operation claim is part of the drive's identity")
+	assert.Empty(t, driveWorkOwner(t.Context()), "a caller with no claim is the empty owner")
+}
+
+// The engine is shared by every drive of the target in this process. Drive A
+// hands its apply back, and drive B claims it here and starts its own run
+// before A's exit halt runs. A's halt reaches only the run A started, so B's
+// run keeps going under B's claim.
+func TestDriveExitHaltReachesOnlyTheDrivesOwnWork(t *testing.T) {
+	eng := &ownedWorkEngine{}
+	client := newOwnedWorkClient(eng)
+	driveA := driveContext(t.Context(), "token-a")
+	driveB := driveContext(t.Context(), "token-b")
+
+	_, err := client.applyWithEngine(driveA, eng, &engine.ApplyRequest{Database: "appdb"})
+	require.NoError(t, err)
+	_, err = client.applyWithEngine(driveB, eng, &engine.ApplyRequest{Database: "appdb"})
+	require.NoError(t, err)
+	client.haltEngineWorkLeftByDrive(driveA, slog.Default())
+
+	assert.Equal(t, []string{driveWorkOwner(driveA), driveWorkOwner(driveB)}, eng.startOwners, "each run is started under its drive's owner")
+	assert.Equal(t, []string{driveWorkOwner(driveA)}, eng.halts(), "drive A's exit halt is scoped to drive A's work")
+	assert.Zero(t, eng.shutdowns, "a drive's exit never halts every run on the engine")
+}
+
+// A drive that was cancelled for its own reasons and is still halting its
+// work when the operator begins shutting down gives the halt up to the
+// shutdown. The shutdown waits for its drives for less than the halt's bound,
+// so a drive that kept halting would cost every drive its engine halt and
+// claim hand-back.
+func TestShutdownTakesOverADriveHaltAlreadyUnderway(t *testing.T) {
+	eng := &ownedWorkEngine{block: true}
+	client := newOwnedWorkClient(eng)
+	operatorCtx, shutDown := context.WithCancelCause(t.Context())
+	defer shutDown(nil)
+	drive, stall := context.WithCancel(driveContext(WithOperatorContext(operatorCtx), "token-a"))
+	stall()
+
+	halted := make(chan struct{})
+	go func() {
+		defer close(halted)
+		client.haltEngineWorkLeftByDrive(drive, slog.Default())
+	}()
+	require.Eventually(t, func() bool { return len(eng.halts()) == 1 }, driveHaltTestDeadline, time.Millisecond,
+		"the stalled drive halts its own work")
+
+	shutDown(ErrOperatorShutdown)
+	select {
+	case <-halted:
+	case <-time.After(driveHaltTestDeadline):
+		require.FailNow(t, "the drive kept halting after the operator began shutting down")
+	}
+}
+
+// A drive whose own cancellation came first, but which returns after the
+// operator has begun shutting down, leaves the halt to the shutdown.
+func TestDriveReturningDuringShutdownLeavesTheHaltToIt(t *testing.T) {
+	eng := &ownedWorkEngine{}
+	client := newOwnedWorkClient(eng)
+	operatorCtx, shutDown := context.WithCancelCause(t.Context())
+	drive, stall := context.WithCancel(driveContext(WithOperatorContext(operatorCtx), "token-a"))
+	stall()
+	shutDown(ErrOperatorShutdown)
+
+	client.haltEngineWorkLeftByDrive(drive, slog.Default())
+
+	assert.Empty(t, eng.halts())
+}
+
+// driveHaltTestDeadline bounds a wait on a drive's exit halt.
+const driveHaltTestDeadline = 5 * time.Second
+
+// A drive's exit halt runs on the claim the drive held. However long the halt
+// takes, it gives up before that claim can go stale: the last renewal is at
+// most one heartbeat interval old when the drive is cancelled, so a peer is
+// never invited onto a target the halt is still bringing down.
+func TestDriveExitHaltEndsBeforeTheClaimCanGoStale(t *testing.T) {
+	assert.Less(t, defaultHeartbeatInterval+driveHandoverHaltTimeout, storage.ApplyLeaseStaleAfter)
+}

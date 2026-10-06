@@ -6,6 +6,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1356,4 +1358,44 @@ func TestPostgresTaskUpdateHonorsOperationLeaseAbsence(t *testing.T) {
 	reloaded, err = store.Tasks().Get(t.Context(), "task-absence")
 	require.NoError(t, err)
 	assert.Equal(t, state.Task.Failed, reloaded.State)
+}
+
+// The ETA bound and the rejected-value report hold on PostgreSQL too: an ETA
+// past the integer column's range is stored at its largest value, and a value
+// the column refuses comes back as storage.ErrValueRejected.
+func TestPostgresTaskUpdateBoundsETAAndReportsRejectedValues(t *testing.T) {
+	dsn, fixtureDB := testutil.StartPostgres(t, "sqlstore_task_eta")
+	db, err := postgresconn.Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	require.NoError(t, db.PingContext(t.Context()))
+	applyPostgresTestSchema(t, fixtureDB)
+	store := postgresHarness{db: db, dsn: dsn}.NewStorage(t)
+
+	var applyID int64
+	require.NoError(t, db.QueryRowContext(t.Context(), `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type,
+			repository, pull_request, environment, engine, state, options)
+		VALUES ('apply-eta', 1, 1, 'testdb', 'mysql', 'org/repo', 7, 'staging', 'spirit', $1, '{}')
+		RETURNING id`, state.Apply.Running).Scan(&applyID))
+	_, err = db.ExecContext(t.Context(), `
+		INSERT INTO tasks (task_identifier, apply_id, plan_id, database_name, database_type, engine,
+			repository, pull_request, environment, state, table_name, ddl, ddl_action, options)
+		VALUES ('task-eta', $1, 1, 'testdb', 'mysql', 'spirit', 'org/repo', 7, 'staging', $2,
+			'events', 'ALTER TABLE events ADD COLUMN c int', 'ALTER', '{}')`,
+		applyID, state.Task.Running)
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(t.Context(), "task-eta")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	task.ETASeconds = math.MaxInt32 + 1_000_000
+	require.NoError(t, store.Tasks().Update(t.Context(), task), "an ETA past the column's range does not refuse the progress write")
+	stored, err := store.Tasks().Get(t.Context(), "task-eta")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt32, stored.ETASeconds)
+
+	stored.ThrottleReason = strings.Repeat("x", 300)
+	require.ErrorIs(t, store.Tasks().Update(t.Context(), stored), storage.ErrValueRejected,
+		"a value the column cannot hold is reported as rejected")
 }

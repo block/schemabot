@@ -618,6 +618,15 @@ func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storag
 		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
 	}
 
+	// Every exit but the cutover barrier's leaves no engine work running behind
+	// the drive (OW-3).
+	defer func() {
+		if ps.parkedAtCutoverBarrier {
+			return
+		}
+		c.haltEngineWorkLeftByDrive(ctx, c.logger.With(apply.IdentityLogAttrs()...))
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -837,7 +846,25 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 
 	// Update all tasks with engine progress
-	c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled)
+	if syncErr := c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled); syncErr != nil {
+		if errors.Is(syncErr, storage.ErrApplyLeaseLost) {
+			logger.Warn("task progress write was refused because the drive's lease was lost; this driver exits",
+				append(apply.MutableLogAttrs(), "error", syncErr)...)
+			return true
+		}
+		ps.progressWriteFailures++
+		if progressWriteRejectedForGood(syncErr, ps.progressWriteFailures) {
+			logger.Error("task progress could not be persisted; this driver halts the engine and exits, leaving the apply for a later drive",
+				append(apply.MutableLogAttrs(), "consecutive_write_failures", ps.progressWriteFailures, "value_rejected", errors.Is(syncErr, storage.ErrValueRejected), "error", syncErr)...)
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventInfo, storage.LogSourceSchemaBot,
+				"Task progress could not be recorded; the drive stopped the schema change and handed the apply back. See server logs.", "", "")
+			return true
+		}
+		logger.Warn("failed to persist task progress; the drive retries the write at the next poll",
+			append(apply.MutableLogAttrs(), "consecutive_write_failures", ps.progressWriteFailures, "error", syncErr)...)
+	} else {
+		ps.progressWriteFailures = 0
+	}
 	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
@@ -862,7 +889,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		logger.Info("auto-triggering deploy (not in defer-deploy mode)")
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventDeployTriggered, storage.LogSourceSchemaBot,
 			"Auto-triggering deploy (defer_deploy not set)", "", "")
-		if _, err := eng.Start(ctx, controlReq); err != nil {
+		if _, err := eng.Start(withDriveWorkOwner(ctx), controlReq); err != nil {
 			logger.Error("auto-deploy failed", append(apply.MutableLogAttrs(), "error", err)...)
 		}
 	}
@@ -1009,6 +1036,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
 			logger.Info("operation parked at cutover barrier; exiting operation drive",
 				"mode", groupedApplyMode(apply, options), "operation_state", opState)
+			ps.parkedAtCutoverBarrier = true
 			return true
 		}
 		if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
@@ -1186,6 +1214,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
 		logger.Info("operation parked at cutover barrier; exiting copy drive",
 			"mode", groupedApplyMode(apply, options), "operation_state", opState, "apply_state", apply.State)
+		ps.parkedAtCutoverBarrier = true
 		return true
 	}
 	if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
@@ -1621,9 +1650,13 @@ func (p enginePoll) retryableFailure() bool {
 // tick to tick. A task the poll does not speak for is one already settled from
 // a more authoritative source earlier in the tick, and it took its persisted
 // write from that settlement.
-func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) {
+//
+// It returns the writes that did not land, joined, after attempting every
+// task, so one refused row does not keep the others from updating.
+func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) error {
 	tableProgress := indexEngineTableProgress(result.Tables)
 	poll := enginePoll{result: result, newState: newState, now: now}
+	var writeErrs []error
 	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
 		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
 			poll.instantFromMetadata = meta.IsInstant
@@ -1648,8 +1681,12 @@ func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.L
 			c.unrecognizedStatuses.observeTaskStatus(ctx, logger, task, tp.State)
 		}
 		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, poll)
-		c.advanceTaskFromEngineProgress(ctx, task, tp, poll)
+		if err := c.advanceTaskFromEngineProgress(ctx, task, tp, poll); err != nil {
+			logger.Warn("failed to persist task progress", append(task.LogAttrs(), "error", err)...)
+			writeErrs = append(writeErrs, err)
+		}
 	}
+	return errors.Join(writeErrs...)
 }
 
 // refreshTaskDisplayFromEngine projects a progress poll onto the fields the
@@ -1706,8 +1743,9 @@ func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *
 // policy for whether the claim is allowed to move the stored state.
 //
 // This is also where the tick reaches storage, for the task's stamps and for
-// the display fields the refresh left in memory.
-func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, tp *engine.TableProgress, poll enginePoll) {
+// the display fields the refresh left in memory. A write that does not land is
+// returned with the task's state left as it arrived.
+func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, tp *engine.TableProgress, poll enginePoll) error {
 	retryableFailure := poll.retryableFailure()
 	if tp != nil {
 		if tp.StartedAt != nil && task.StartedAt == nil {
@@ -1728,7 +1766,7 @@ func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *s
 			task.ErrorMessage = msg
 		}
 	}
-	c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp)), "")
+	return c.persistTaskStateTransition(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp)), "")
 }
 
 // engineTaskStateClaim is the state a progress poll claims for one task: the

@@ -169,7 +169,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 	// engine itself can end the drive — a cancel of last resort, and the
 	// halt on shutdown.
 	applyCtx, cancelApply := context.WithCancel(context.WithoutCancel(ctx))
-	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.concurrentIndex, cancelApply)
+	done := e.claimProgress(key, progressResult(engine.StateRunning, "preflight", started, change, ""), tracker, logger, change.concurrentIndex, cancelApply, engine.WorkOwnerFromContext(ctx))
 	conn := targetConn{dsn: req.Credentials.DSN, caCertPath: caPath}
 	e.wg.Go(func() {
 		defer close(done)
@@ -2018,7 +2018,7 @@ func progressResult(state engine.State, phase string, started time.Time, change 
 //
 // The returned channel is the drive's to close once its terminal result is
 // published; Cancel waits on it for the outcome.
-func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, concurrentIndex bool, cancelApply context.CancelFunc) chan struct{} {
+func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracker *progress.Tracker, logger *slog.Logger, concurrentIndex bool, cancelApply context.CancelFunc, owner string) chan struct{} {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.progress == nil {
@@ -2033,6 +2033,7 @@ func (e *Engine) claimProgress(key string, result *engine.ProgressResult, tracke
 	e.progress[key] = &trackedApply{
 		result: result, tracker: tracker, logger: logger,
 		concurrentIndex: concurrentIndex, cancelApply: cancelApply, done: done,
+		owner: owner,
 	}
 	return done
 }

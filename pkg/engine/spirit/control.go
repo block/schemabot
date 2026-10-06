@@ -330,18 +330,17 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		"tables", tables,
 	)
 
+	// The resumed run's cancel is published with its running state, before
+	// the run starts, so a halt that finds the run active always reaches it.
+	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	e.mu.Lock()
 	rm.state = engine.StateRunning
+	rm.cancelFunc = cancel
+	rm.owner = engine.WorkOwnerFromContext(ctx)
 	e.mu.Unlock()
 
-	rm.wg.Go(func() {
-		bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	rm.goRun(func() {
 		defer cancel()
-		e.mu.Lock()
-		if e.runningSchemaChange != nil {
-			e.runningSchemaChange.cancelFunc = cancel
-		}
-		e.mu.Unlock()
 		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 

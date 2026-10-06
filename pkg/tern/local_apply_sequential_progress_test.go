@@ -691,6 +691,55 @@ func TestPollTaskToCompletion_RefusedProgressWrite(t *testing.T) {
 		assert.Equal(t, 1, refusing.refused)
 		assert.Equal(t, []string{state.Task.Running, state.Task.Completed}, recording.states, "the retried progress write lands, then the terminal one")
 	})
+	t.Run("rejected value exits", func(t *testing.T) {
+		eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}, {State: engine.StateCompleted}}}
+		client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+		refusing := &progressRefusingTaskStore{
+			stateRecordingTaskStore: recording,
+			err:                     fmt.Errorf("update task %s: %w: out of range value for column 'eta_seconds'", task.TaskIdentifier, storage.ErrValueRejected),
+			refusals:                -1,
+		}
+		client.storage.(*exactProgressStorage).tasks = refusing
+
+		action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+		assert.Equal(t, taskAbort, action, "a write storage refuses outright ends the drive instead of freezing the task row")
+		assert.Equal(t, 1, refusing.refused, "the refused value is not written again")
+		assert.Equal(t, 1, eng.calls, "no further poll after the refusal")
+		assert.Empty(t, recording.states)
+		assertApplyLogContains(t, client, "Progress for table orders could not be recorded")
+	})
+	t.Run("persistent failure exits", func(t *testing.T) {
+		eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}}}
+		client, apply, task, recording := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+		refusing := &progressRefusingTaskStore{
+			stateRecordingTaskStore: recording,
+			err:                     errors.New("storage down"),
+			refusals:                -1,
+		}
+		client.storage.(*exactProgressStorage).tasks = refusing
+
+		action := client.pollTaskToCompletion(t.Context(), apply, task, nil, nil)
+
+		assert.Equal(t, taskAbort, action, "a write that keeps failing ends the drive as its own failure, not as a stalled row")
+		assert.Equal(t, maxConsecutiveProgressPollErrors, refusing.refused, "the drive spends the poll's error budget before giving up")
+		assert.Equal(t, maxConsecutiveProgressPollErrors, eng.calls)
+		assert.Empty(t, recording.states)
+		assertApplyLogContains(t, client, "Progress for table orders could not be recorded")
+	})
+}
+
+// assertApplyLogContains asserts the drive recorded a durable apply log whose
+// message contains want.
+func assertApplyLogContains(t *testing.T, client *LocalClient, want string) {
+	t.Helper()
+	logs := client.storage.(*exactProgressStorage).logs.(*mockApplyLogStore)
+	for _, entry := range logs.logs {
+		if strings.Contains(entry.Message, want) {
+			return
+		}
+	}
+	assert.Failf(t, "apply log not recorded", "no apply log contains %q", want)
 }
 
 // The terminal-write budget counts consecutive refusals, not refusals over the
@@ -1127,4 +1176,25 @@ func TestPollTaskToCompletion_RefusedProgressWriteDoesNotRestartTerminalBudget(t
 	assert.Equal(t, refusalsPerRun+2, eng.calls, "the tenth refused terminal write aborts; the refused progress write in between restarts nothing")
 	assert.Equal(t, refusalsPerRun+2, refusing.refused, "every write the drive attempted was refused")
 	assert.Empty(t, recording.states, "nothing landed")
+}
+
+// The durable record of a task finishing names the state the task left and the
+// one it reached, so an operator reading the apply log sees running ->
+// completed rather than a transition from a state to itself.
+func TestPollTaskToCompletion_FinishedTransitionNamesTheStateLeft(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateCompleted}}}
+	client, apply, task, _ := lostWorkPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	require.Equal(t, taskContinue, client.pollTaskToCompletion(t.Context(), apply, task, nil, nil))
+
+	logs := client.storage.(*exactProgressStorage).logs.(*mockApplyLogStore)
+	var finished *storage.ApplyLog
+	for _, entry := range logs.logs {
+		if strings.Contains(entry.Message, "finished") {
+			finished = entry
+		}
+	}
+	require.NotNil(t, finished, "the drive records the task finishing")
+	assert.Equal(t, state.Task.Running, finished.OldState)
+	assert.Equal(t, state.Task.Completed, finished.NewState)
 }

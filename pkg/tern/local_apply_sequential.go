@@ -27,6 +27,11 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	// Mutable attrs (task state, apply state) stay per-call so they are never
 	// frozen stale into the bound logger.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// Registered after the heartbeat, so on a return the drive was not
+	// cancelled for it runs while the claim is still renewed. A cancelled
+	// drive's heartbeat has already stopped; the halt's bound keeps it inside
+	// the claim's staleness window.
+	defer c.haltEngineWorkLeftByDrive(ctx, logger)
 
 	logger.Info("executeApplySequential starting",
 		"task_count", len(tasks),
@@ -137,6 +142,14 @@ const (
 	taskMissing                         // The task's row is gone; the drive exits without a verdict and reports the apply undriveable
 )
 
+const (
+	// driveHandoverHaltTimeout bounds how long a drive giving up its apply
+	// waits for the engine work it started in this process to come down. It
+	// stays well inside storage.ApplyLeaseStaleAfter, so the teardown never
+	// outlasts the claim it runs on.
+	driveHandoverHaltTimeout = 20 * time.Second
+)
+
 // checkTaskReady verifies a task is ready to execute by checking context cancellation
 // and re-fetching the task's current state from storage. The caller passes its
 // identity-bound drive logger so these lines stay filterable by apply/PR.
@@ -221,6 +234,89 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 		req.TargetShards = []string{task.Shard}
 	}
 	return req
+}
+
+// haltEngineWorkLeftByDrive runs as a drive returns and brings down any engine
+// work the drive started in this process that is still running (OW-3). Work
+// that reached its outcome is only waited for. However the drive ends — a lost
+// lease, a stall, an abort for a later retry, a storage error — the work must
+// not outlive the claim it ran under: left running, it keeps writing to the
+// target with nothing renewing the lease, and a peer that reclaims the apply is
+// refused the target.
+//
+// The halt reaches only the work this drive started. The engine is shared by
+// every drive of the target in this process, and the apply this drive hands
+// back can already be claimed again here, so the run on the engine may be the
+// next drive's.
+//
+// A drive ended by the operator shutting down leaves the halt to the shutdown,
+// which halts every in-process engine once the drives have returned. So does a
+// drive already halting when the shutdown begins: the shutdown waits for the
+// drives for less than this halt's bound, and a drive still halting would
+// make it give up on the engine halts and the claim hand-back for every drive.
+func (c *LocalClient) haltEngineWorkLeftByDrive(ctx context.Context, logger *slog.Logger) {
+	if operatorShuttingDown(ctx) {
+		logger.Info("drive returned for shutdown; the shutdown halts the engine")
+		return
+	}
+	haltCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), driveHandoverHaltTimeout)
+	defer cancel()
+	stop := afterOperatorShutdown(ctx, cancel)
+	defer stop()
+	if err := c.haltEngineWorkOwnedBy(haltCtx, driveWorkOwner(ctx)); err != nil {
+		if operatorShuttingDown(ctx) {
+			logger.Info("operator began shutting down while the drive was halting the engine work it started; the shutdown halts the engine",
+				"error", err)
+			return
+		}
+		logger.Error("engine work the drive started did not come down as the drive returned; the target stays held until that work exits",
+			"halt_timeout", driveHandoverHaltTimeout, "error", err)
+	}
+}
+
+// haltEngineWorkOwnedBy halts the in-process engine work owner started on this
+// client's engine.
+func (c *LocalClient) haltEngineWorkOwnedBy(ctx context.Context, owner string) error {
+	eng := c.getEngine()
+	if eng == nil {
+		c.logger.Debug("no engine to halt drive work on",
+			"database", c.config.Database, "database_type", c.config.Type)
+		return nil
+	}
+	supported, err := engine.HaltEngineWorkOwnedBy(ctx, eng, owner)
+	if !supported {
+		c.logger.Debug("engine drives its schema changes outside this process; nothing to halt as the drive returns",
+			"database", c.config.Database, "database_type", c.config.Type, "engine", eng.Name())
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("halt engine %s work for database %s (%s) as the drive returns: %w", eng.Name(), c.config.Database, c.config.Type, err)
+	}
+	return nil
+}
+
+// driveWorkOwner names the drive running under ctx by the lease tokens of its
+// claim. Every claim gets fresh tokens, so two drives of the same apply in this
+// process never share an owner. A caller that drives without a claim is the
+// empty owner.
+func driveWorkOwner(ctx context.Context) string {
+	var applyToken, operationToken string
+	if lease, ok := storage.ApplyLeaseFromContext(ctx); ok {
+		applyToken = lease.Token
+	}
+	if lease, ok := storage.OperationLeaseFromContext(ctx); ok {
+		operationToken = lease.Token
+	}
+	if applyToken == "" && operationToken == "" {
+		return ""
+	}
+	return "apply:" + applyToken + "/operation:" + operationToken
+}
+
+// withDriveWorkOwner marks the engine work started under ctx as this drive's,
+// so the drive's exit halt reaches it and no other drive's does.
+func withDriveWorkOwner(ctx context.Context) context.Context {
+	return engine.WithWorkOwner(ctx, driveWorkOwner(ctx))
 }
 
 // runEngineTask calls the engine for a single DDL, marks the task running, and polls to completion.
@@ -355,6 +451,15 @@ type atomicPollState struct {
 	lastLoggedState string
 	lastProgressLog time.Time
 	terminalErr     error
+
+	// parkedAtCutoverBarrier is set when the drive exits with its engine work
+	// parked at the cutover barrier for the deployment-ordered cutover claim.
+	// That is the one exit that leaves the work running by design.
+	parkedAtCutoverBarrier bool
+
+	// progressWriteFailures counts consecutive ticks whose task progress
+	// writes did not all land; see pollTaskToCompletion's counterpart.
+	progressWriteFailures int
 
 	// stateEnteredAt tracks when the current waiting state was entered,
 	// used for timeout enforcement on deferred cutover and revert window.
@@ -668,6 +773,11 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 	// attempted a bounded number of times whatever the engine reports between
 	// attempts.
 	var totalTerminalWriteFailures int
+	// progressWriteFailures counts consecutive failed writes of the task's
+	// progress. A write that keeps failing freezes the task row, so the drive
+	// ends on it as its own failure instead of polling on until the frozen row
+	// reads as a stalled drive.
+	var progressWriteFailures int
 	var resumeEventLogged bool
 	var lastProgressMetadata map[string]string
 	var progressMetadataLeaseLost bool
@@ -834,7 +944,10 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 				// outcome is durable: a later task's DDL must never run while
 				// storage still records this one in flight, and the apply must
 				// never finalize over a task row that never settled.
+				// The transition is recorded from the state storage holds, so the
+				// durable log names the state the task actually left.
 				terminalState := task.State
+				task.State = prevState
 				if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, terminalState, logMsg); err != nil {
 					task.State = prevState
 					task.CompletedAt = prevCompletedAt
@@ -895,18 +1008,22 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 						append(attrs, "error", err)...)
 					return taskAbort
 				}
-				// The write is retried without a budget of its own: a progress row
-				// that stops landing freezes tasks.updated_at, and the operator's
-				// drive liveness check (operationDriveStalled) cancels a drive whose
-				// rows stop advancing for the full ApplyDriveStallAfter window, so a
-				// persistently refused progress write is ended from outside the
-				// loop. The observer is not told about progress that did not
-				// persist; it sees the row the next landed write produces.
+				// The observer is not told about progress that did not persist; it
+				// sees the row the next landed write produces.
+				progressWriteFailures++
+				if progressWriteRejectedForGood(err, progressWriteFailures) {
+					c.logger.Error("task progress could not be persisted; this driver halts the engine and exits, leaving the apply for a later drive",
+						append(attrs, "consecutive_write_failures", progressWriteFailures, "value_rejected", errors.Is(err, storage.ErrValueRejected), "error", err)...)
+					c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventInfo, storage.LogSourceSchemaBot,
+						fmt.Sprintf("Progress for table %s could not be recorded; the drive stopped the schema change and handed the apply back. See server logs.", task.TableName), "", "")
+					return taskAbort
+				}
 				c.logger.Warn("failed to persist task progress; the drive retries the write at the next poll",
-					append(attrs, "error", err)...)
+					append(attrs, "consecutive_write_failures", progressWriteFailures, "error", err)...)
 				continue
 			}
 			terminalWriteFailures = 0
+			progressWriteFailures = 0
 
 			// Notify observer with full apply + tasks context
 			if obs := c.getObserver(task.ApplyID); obs != nil {
@@ -918,6 +1035,17 @@ func (c *LocalClient) pollTaskToCompletion(ctx context.Context, apply *storage.A
 			}
 		}
 	}
+}
+
+// progressWriteRejectedForGood reports that a failed progress write will not
+// land by being retried: storage refused a value outright, which it does the
+// same way every time, or transient failures ran through the poll's error
+// budget.
+func progressWriteRejectedForGood(err error, consecutiveFailures int) bool {
+	if errors.Is(err, storage.ErrValueRejected) {
+		return true
+	}
+	return consecutiveFailures >= maxConsecutiveProgressPollErrors
 }
 
 // markTaskFailed sets a task to FAILED state with the given error message and

@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -418,4 +419,36 @@ func TestPollForCompletionAtomic_LostEngineWorkSettlesShardTasksOnPerShardReplan
 	assert.Equal(t, state.Task.Completed, payments.State, "a shard-keyed re-plan settles the table whose change landed on that shard")
 	require.NotNil(t, payments.CompletedAt)
 	assert.Equal(t, 100, payments.ProgressPercent)
+}
+
+// Every grouped tick persists each task row, and the operator reads those rows
+// as the drive's liveness. A write that storage refuses outright, or one that
+// keeps failing, ends the drive with its own error instead of polling on until
+// the frozen rows read as a stalled drive. The apply is left active for a later
+// drive.
+func TestPollForCompletionAtomic_ProgressWriteThatCannotLandEndsTheDrive(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantPolls int
+	}{
+		{"rejected value", fmt.Errorf("update task: %w: out of range value for column 'eta_seconds'", storage.ErrValueRejected), 1},
+		{"persistent failure", errors.New("storage down"), maxConsecutiveProgressPollErrors},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}}}
+			client, apply, tasks, recording := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+			refusing := &progressRefusingTaskStore{stateRecordingTaskStore: recording, err: tc.err, refusals: -1}
+			client.storage.(*exactProgressStorage).tasks = refusing
+
+			require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+			assert.Equal(t, tc.wantPolls, eng.calls)
+			assert.Equal(t, tc.wantPolls*len(tasks), refusing.refused, "every task's write is attempted on every tick")
+			assert.Equal(t, state.Apply.Running, apply.State, "the apply stays active for a later drive")
+			assert.Empty(t, recording.states)
+			assertApplyLogContains(t, client, "Task progress could not be recorded")
+		})
+	}
 }

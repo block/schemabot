@@ -5,6 +5,8 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -426,6 +428,54 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 	assert.Empty(t, cleared.ThrottleReason)
 	assert.Equal(t, "blocked", cleared.ExecutionMode, "the admitting verdict survives an update that touched other columns")
 	assert.Equal(t, "requires privileges unavailable to the engine", cleared.ModeReason)
+}
+
+// An engine's ETA is an estimate it may report past what the column holds, as
+// a copy over a sparse primary key can. The progress write stores the largest
+// ETA the column holds instead of being refused, so the row keeps updating.
+// A value storage refuses outright comes back as storage.ErrValueRejected, so
+// the drive can tell it apart from a write a retry would land.
+func TestTaskStore_UpdateBoundsETAAndReportsRejectedValues(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testapp", "mysql")
+	apply := createTestApply(t, store, lock, "apply_eta", 1)
+	now := time.Now()
+	_, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_eta",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Running,
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+		DDLAction:      "ALTER",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	task.ETASeconds = math.MaxInt32 + 1_000_000
+	task.RowsCopied = 42
+	require.NoError(t, store.Tasks().Update(ctx, task), "an ETA past the column's range does not refuse the progress write")
+
+	stored, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt32, stored.ETASeconds)
+	assert.Equal(t, int64(42), stored.RowsCopied, "the rest of the progress lands with it")
+
+	stored.ThrottleReason = strings.Repeat("x", 300)
+	err = store.Tasks().Update(ctx, stored)
+	require.ErrorIs(t, err, storage.ErrValueRejected, "a value the column cannot hold is reported as rejected")
 }
 
 // A sharded work operation's operation key identifies which shard task is real

@@ -48,7 +48,7 @@ func TestDrainKeepsAnApplyAcceptedWhileItWaits(t *testing.T) {
 	}
 
 	drained := eng.trackedAtDrainStart()
-	acceptedDone := eng.claimProgress("accepted", &engine.ProgressResult{State: engine.StateRunning}, nil, slog.Default(), false, func() {})
+	acceptedDone := eng.claimProgress("accepted", &engine.ProgressResult{State: engine.StateRunning}, nil, slog.Default(), false, func() {}, "")
 	close(acceptedDone)
 	eng.clearDrainedProgress(drained)
 

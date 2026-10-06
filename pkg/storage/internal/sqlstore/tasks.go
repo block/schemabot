@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -45,10 +46,11 @@ var terminalTaskStatesSQL = func() string {
 
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
-	db       *rebindDB
-	dialect  Dialect
-	identity identityInserter
-	locker   namedlock.Locker
+	db         *rebindDB
+	dialect    Dialect
+	identity   identityInserter
+	locker     namedlock.Locker
+	classifier ErrorClassifier
 }
 
 func canonicalizeTaskIdentity(task *storage.Task) {
@@ -86,7 +88,7 @@ func insertTask(ctx context.Context, exec queryExecer, identity identityInserter
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
 		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
+		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, storedETASeconds(task.ETASeconds), task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 	)
@@ -106,6 +108,20 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 	`, taskIdentifier)
 
 	return scanTask(row)
+}
+
+// maxStoredETASeconds is the largest value the tasks.eta_seconds column holds,
+// a signed 32-bit integer in every dialect.
+const maxStoredETASeconds = math.MaxInt32
+
+// storedETASeconds bounds an engine-reported ETA to what the column holds. The
+// ETA is an engine's estimate and has no upper bound of its own: one paced on
+// key distance rather than rows reports decades for a table whose keys have a
+// wide gap. Writing it unbounded would refuse every progress write for the task
+// and freeze the row, so a larger value is stored as the column's maximum,
+// which still reads as far beyond any useful estimate.
+func storedETASeconds(eta int) int {
+	return min(eta, maxStoredETASeconds)
 }
 
 // taskUpdateAssignments is the SET list Update writes from the caller's task.
@@ -212,7 +228,7 @@ func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
+		task.RowsCopied, task.RowsTotal, task.ProgressPercent, storedETASeconds(task.ETASeconds), task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID), task.DDL,
 		task.StartedAt, task.CompletedAt,
 		task.ID,
@@ -244,6 +260,9 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 
 	result, err := s.db.ExecContext(ctx, taskUpdateStatement(s.dialect, guard), args...)
 	if err != nil {
+		if s.classifier != nil && s.classifier.IsValueRejected(err) {
+			return fmt.Errorf("update task %d (%s): %w: %w", task.ID, task.TaskIdentifier, storage.ErrValueRejected, err)
+		}
 		return fmt.Errorf("update task %d (%s): %w", task.ID, task.TaskIdentifier, err)
 	}
 	if verifyLeaseStillOwned == nil {
@@ -391,7 +410,7 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
 			task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
+			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, storedETASeconds(task.ETASeconds), task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 			task.IsInstant, nullString(task.EngineMigrationID),
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 		}
