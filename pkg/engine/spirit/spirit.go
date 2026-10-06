@@ -130,6 +130,7 @@ type runningSchemaChange struct {
 	state             engine.State
 	errorMessage      string // Error details when state is StateFailed
 	permanentFailure  bool   // The failure reproduces on every retry, so it is reported as not retryable
+	targetHeld        bool   // The run was refused the table because another run holds it (engine.ErrTargetHeld)
 	started           time.Time
 	deferCutover      bool // Whether to defer cutover until manual trigger
 
@@ -440,6 +441,7 @@ type drainedOutcome struct {
 	message      string
 	errorMessage string // Failure details when state is StateFailed
 	permanent    bool   // The failure reproduces on every retry
+	targetHeld   bool   // The run was refused the table because another run holds it
 	tables       []engine.TableProgress
 }
 
@@ -502,6 +504,7 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 		message:      fmt.Sprintf("Schema change %s", rm.state),
 		errorMessage: rm.errorMessage,
 		permanent:    rm.permanentFailure,
+		targetHeld:   rm.targetHeld,
 		tables:       tables,
 	}
 }
@@ -1040,6 +1043,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 				Message:      d.message,
 				ErrorMessage: d.errorMessage,
 				Retryable:    failureIsRetryable(d.state, d.permanent),
+				TargetHeld:   d.state == engine.StateFailed && d.targetHeld,
 				Tables:       slices.Clone(d.tables),
 				ResumeState:  req.ResumeState,
 			}, nil
@@ -1104,6 +1108,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		Message:               message,
 		ErrorMessage:          rm.errorMessage,
 		Retryable:             failureIsRetryable(state, rm.permanentFailure),
+		TargetHeld:            state == engine.StateFailed && rm.targetHeld,
 		Tables:                tableProgress,
 		ResumeState:           req.ResumeState,
 		ResumedFromCheckpoint: spiritProgress.Resume,

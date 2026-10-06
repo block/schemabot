@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn"
 	spiritflags "github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
@@ -37,9 +38,16 @@ const maxCommitLatency = 100 * time.Millisecond
 //   - a divergence found by the continuous checksum during the deferred
 //     cutover wait. That checksum never repairs, because a cutover may be
 //     imminent; the resumed run's initial checksum repairs the range.
+//
+// A run refused the table's advisory lock is marked ErrTargetHeld: another run
+// is still working on the table, so the refusal says nothing about this schema
+// change and it can start once that run lets go.
 func classifyRunnerError(err error) error {
 	if errors.Is(err, checksum.ErrDifferencesExhausted) {
 		return &engine.PermanentError{Err: err}
+	}
+	if errors.Is(err, dbconn.ErrLockHeld) {
+		return fmt.Errorf("%w: %w", engine.ErrTargetHeld, err)
 	}
 	return err
 }
@@ -488,6 +496,7 @@ func (e *Engine) setSchemaChangeFailed(err error) {
 		if err != nil {
 			e.runningSchemaChange.errorMessage = failureReason(err)
 			e.runningSchemaChange.permanentFailure = !engine.IsRetryable(err)
+			e.runningSchemaChange.targetHeld = errors.Is(err, engine.ErrTargetHeld)
 		}
 	}
 }

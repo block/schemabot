@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -59,6 +60,19 @@ func TestClassifyRunnerError(t *testing.T) {
 		classifiedErr := classifyRunnerError(runnerErr)
 
 		require.Same(t, runnerErr, classifiedErr)
+		assert.True(t, engine.IsRetryable(classifiedErr))
+	})
+
+	// Another run of a schema change holding the table's advisory lock is not
+	// this run failing: the refusal is classified so the drive waits for the
+	// holder instead of recording a failed attempt.
+	t.Run("lock held by another run is a held target", func(t *testing.T) {
+		runnerErr := fmt.Errorf("could not acquire advisory lock for orders.line_items: %w", dbconn.ErrLockHeld)
+
+		classifiedErr := classifyRunnerError(runnerErr)
+
+		assert.ErrorIs(t, classifiedErr, engine.ErrTargetHeld)
+		assert.ErrorIs(t, classifiedErr, dbconn.ErrLockHeld)
 		assert.True(t, engine.IsRetryable(classifiedErr))
 	})
 
@@ -126,6 +140,48 @@ func TestFailedProgressCarriesRunnerRetryClassification(t *testing.T) {
 			assert.Equal(t, engine.StateFailed, drained.State)
 			assert.Equal(t, live.ErrorMessage, drained.ErrorMessage)
 			assert.Equal(t, tc.retryable, drained.Retryable, "drained progress")
+		})
+	}
+}
+
+// A run refused the table's lock reaches the drive through progress as a held
+// target, before and after the engine drains it, so the drive waits for the
+// holder rather than recording the refusal as a failed attempt. Any other
+// failure is not a held target.
+func TestFailedProgressReportsAHeldTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		held bool
+	}{
+		{
+			name: "lock held by another run",
+			err: fmt.Errorf("schema change failed: %w", classifyRunnerError(
+				fmt.Errorf("could not acquire advisory lock for testdb.line_items: %w", dbconn.ErrLockHeld))),
+			held: true,
+		},
+		{
+			name: "lost connection",
+			err:  fmt.Errorf("schema change failed: %w", classifyRunnerError(errors.New("connection reset"))),
+			held: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := New(Config{})
+			registerRunningSchemaChange(eng)
+
+			eng.setSchemaChangeFailed(tc.err)
+
+			live := pollProgress(t, eng)
+			assert.Equal(t, engine.StateFailed, live.State)
+			assert.Equal(t, tc.held, live.TargetHeld, "live progress")
+
+			eng.Drain()
+
+			drained := pollProgress(t, eng)
+			assert.Equal(t, engine.StateFailed, drained.State)
+			assert.Equal(t, tc.held, drained.TargetHeld, "drained progress")
 		})
 	}
 }

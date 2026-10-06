@@ -532,7 +532,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			fmt.Sprintf("Resuming task %s (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
 			"", "")
 
-		action = c.runEngineTask(ctx, apply, task, options)
+		action = c.runEngineTask(ctx, apply, task, plan, tasks, options)
 
 		if action == taskFailed {
 			failedTask = task

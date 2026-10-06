@@ -362,7 +362,7 @@ func TestRunEngineTask_CancelledDriveRecordsNoVerdictForTheEnginesError(t *testi
 	task.Shard = ""
 	task.DDL = resumeTaskDDL
 
-	action := client.runEngineTask(driveCtx, apply, task, nil)
+	action := client.runEngineTask(driveCtx, apply, task, &storage.Plan{ID: 7}, []*storage.Task{task}, nil)
 
 	assert.Equal(t, taskHandover, action)
 	assert.Equal(t, 1, eng.applies)

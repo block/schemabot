@@ -261,3 +261,69 @@ func TestLaunchAtomicResume_ExitBeforeThePollHaltsTheAcceptedWork(t *testing.T) 
 	assert.Equal(t, []string{driveWorkOwner(drive)}, eng.haltOwners, "the accepted work is halted under the drive's own owner")
 	assert.Equal(t, state.Apply.Recovering, applyStore.apply.State, "the apply stays recoverable for a later drive")
 }
+
+// A hold is escalated once it has lasted past the bound, and once per hold.
+// The grouped drive's refusals come a lease-staleness window apart, and they
+// still read as one hold.
+func TestTargetHeldWaitsEscalateOncePerHold(t *testing.T) {
+	var waits targetHeldWaits
+	start := time.Now()
+
+	_, escalate := waits.observe(1, "", start)
+	assert.False(t, escalate)
+	_, escalate = waits.observe(1, "", start.Add(storage.ApplyLeaseStaleAfter))
+	assert.False(t, escalate, "a hand-back cycle later, the hold has not yet lasted past the bound")
+	heldFor, escalate := waits.observe(1, "", start.Add(targetHeldEscalationAfter))
+	assert.True(t, escalate)
+	assert.Equal(t, targetHeldEscalationAfter, heldFor)
+	_, escalate = waits.observe(1, "", start.Add(targetHeldEscalationAfter+time.Second))
+	assert.False(t, escalate, "the hold is escalated once")
+
+	_, escalate = waits.observe(2, "", start)
+	assert.False(t, escalate, "another apply's hold is measured on its own")
+
+	later := start.Add(targetHeldEscalationAfter + targetHeldRefusalGap + time.Minute)
+	heldFor, escalate = waits.observe(1, "", later)
+	assert.False(t, escalate)
+	assert.Zero(t, heldFor, "a refusal long after the last one starts a new hold")
+
+	waits.clear(1)
+	heldFor, _ = waits.observe(1, "", later.Add(time.Second))
+	assert.Zero(t, heldFor, "a start that got past the refusal ends the hold")
+}
+
+// A sequential apply refused on one table and then another is two holds. The
+// first table's escalation, and the time it was held, do not carry over to the
+// second, which escalates under its own name once it has been held past the
+// bound itself, even when the first settled without starting again.
+func TestTargetHeldWaitsMeasureEachRefusedTableOnItsOwn(t *testing.T) {
+	var waits targetHeldWaits
+	start := time.Now()
+
+	_, escalate := waits.observe(1, "orders", start)
+	assert.False(t, escalate)
+	_, escalate = waits.observe(1, "orders", start.Add(targetHeldEscalationAfter))
+	require.True(t, escalate, "orders is escalated once it has been held past the bound")
+
+	paymentsStart := start.Add(targetHeldEscalationAfter + 31*time.Second)
+	heldFor, escalate := waits.observe(1, "payments", paymentsStart)
+	assert.False(t, escalate)
+	assert.Zero(t, heldFor, "payments is measured from its own first refusal, not from orders'")
+	heldFor, escalate = waits.observe(1, "payments", paymentsStart.Add(targetHeldEscalationAfter))
+	assert.True(t, escalate, "payments escalates on its own, although orders already did")
+	assert.Equal(t, targetHeldEscalationAfter, heldFor)
+}
+
+// A hold past the bound reaches the apply's timeline, naming the table and
+// what the operator can do, so a wait no drive will end on its own does not
+// sit behind its first warning.
+func TestObserveTargetHeldEscalatesToTheTimeline(t *testing.T) {
+	client, apply, _, _ := lostWorkPollFixture(&phaseSequenceEngine{}, lostWorkTrustBudgetAmple)
+	now := time.Now()
+	client.targetHeld.waits = map[targetHeldKey]*targetHeldWait{{applyID: apply.ID, table: "orders"}: {since: now.Add(-targetHeldEscalationAfter), lastSeen: now}}
+
+	client.observeTargetHeld(t.Context(), slog.Default(), apply, "orders")
+
+	assertApplyLogContains(t, client, "Table orders has been held by another run of a schema change for 2m0s")
+	assertApplyLogContains(t, client, "Find the run holding it, or stop the apply.")
+}

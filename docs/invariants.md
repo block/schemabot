@@ -801,8 +801,9 @@ completeness test over it (`pkg/state/metadata.go`).
 `failed_retryable` is active, not terminal: recovery re-drives it automatically. Only
 `failed_retryable` tasks reset to `pending`, so completed tasks are never re-run, and the apply
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
-*Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`) and the expiry sweep
-(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
+*Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
+starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), and the
+expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -1512,11 +1513,12 @@ sibling was reviewed with refuses the resume instead, since nothing will run it 
 `dispatchScopeForApply` on the apply path (`pkg/tern/local_plan_drift.go`, called from
 `pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
-`replanAndFilterTasks` and `resumeApplySequential`); `settleLostVerifiedTask` on the lost-work
-path (`pkg/tern/local_apply_sequential.go`, reached from the sequential and grouped drives).
-The resume and lost-work paths read the re-plan through `replanVerdictForTask`
-(`pkg/tern/local_control_resume.go`), which judges whether the re-plan speaks for a
-shard-tagged task at all. The cross-deployment comparison a plan is reviewed against
+`replanAndFilterTasks` and `resumeApplySequential`, and from the re-plan before a drive starts
+again a task another run held the table from in `pkg/tern/local_apply_sequential.go`);
+`settleLostVerifiedTask` on the lost-work path (`pkg/tern/local_apply_sequential.go`, reached
+from the sequential and grouped drives). The resume, held-target and lost-work paths read the
+re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), which judges whether
+the re-plan speaks for a shard-tagged task at all. The cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced

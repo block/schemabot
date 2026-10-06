@@ -220,14 +220,19 @@ type LocalClient struct {
 	// at the drive's ingest points. Zero value is ready.
 	unrecognizedStatuses unrecognizedStatusReporter
 
+	// targetHeld measures how long each apply's drives have been refused the
+	// target by another run, so a hold that persists is escalated. Zero value
+	// is ready.
+	targetHeld targetHeldWaits
+
 	// heartbeatInterval controls how often the apply heartbeat updates updated_at.
 	// Defaults to defaultHeartbeatInterval. Tests may lower this to verify
 	// heartbeat behavior.
 	heartbeatInterval time.Duration
 
 	// taskPollIntervalOverride, when positive, replaces defaultTaskPollInterval
-	// as the sequential drive's progress poll cadence. Tests may lower it to
-	// drive many polls quickly.
+	// as the sequential drive's progress poll cadence, and targetHeldRetryInterval
+	// as its wait on a held target. Tests may lower it to drive many polls quickly.
 	taskPollIntervalOverride time.Duration
 
 	// taskStallWarnIntervalOverride, when positive, replaces

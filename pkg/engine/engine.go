@@ -1002,6 +1002,12 @@ type ProgressResult struct {
 	// False for engines without checkpoint resume.
 	ResumedFromCheckpoint bool
 
+	// TargetHeld reports that a failed result is the engine being refused the
+	// target because another run holds it (ErrTargetHeld), not the schema
+	// change failing. The drive waits for the holder instead of recording a
+	// failure.
+	TargetHeld bool
+
 	// Metadata carries engine-specific display fields for the progress response
 	// (e.g. PlanetScale branch_name, deploy_request_url, is_instant). It lets the
 	// engine surface structured status to the renderer without core decoding the
