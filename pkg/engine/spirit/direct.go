@@ -147,7 +147,7 @@ func measureTableSize(ctx context.Context, db *sql.DB, schema, tableName string,
 	}
 	stats, ok := all[tableName]
 	if !ok {
-		return measuredTableSize{}, fmt.Errorf("table `%s`.`%s` not found in information_schema", schema, tableName)
+		return measuredTableSize{}, fmt.Errorf("table %s.%s not found in information_schema", sqlescape.EscapeIdentifier(schema), sqlescape.EscapeIdentifier(tableName))
 	}
 	var size measuredTableSize
 	if policy.MaxTableRows > 0 {
@@ -177,10 +177,10 @@ func measureTableSize(ctx context.Context, db *sql.DB, schema, tableName string,
 // unavailable rather than compared against the bound.
 func usableStatistic(v sql.NullInt64, column, schema, tableName string) (int64, error) {
 	if !v.Valid {
-		return 0, fmt.Errorf("%s for `%s`.`%s` is unavailable", column, schema, tableName)
+		return 0, fmt.Errorf("%s for %s.%s is unavailable", column, sqlescape.EscapeIdentifier(schema), sqlescape.EscapeIdentifier(tableName))
 	}
 	if v.Int64 < 0 {
-		return 0, fmt.Errorf("%s for `%s`.`%s` is negative (%d), treating it as unavailable", column, schema, tableName, v.Int64)
+		return 0, fmt.Errorf("%s for %s.%s is negative (%d), treating it as unavailable", column, sqlescape.EscapeIdentifier(schema), sqlescape.EscapeIdentifier(tableName), v.Int64)
 	}
 	return v.Int64, nil
 }
@@ -193,7 +193,7 @@ func exactRowCountWithin(ctx context.Context, db *sql.DB, schema, tableName stri
 	query := boundedRowCountQuery(schema, tableName, limit)
 	var count int64
 	if err := db.QueryRowContext(ctx, query).Scan(&count); err != nil {
-		return 0, fmt.Errorf("count rows of `%s`.`%s` (bounded at %d): %w", schema, tableName, limit+1, err)
+		return 0, fmt.Errorf("count rows of %s.%s (bounded at %d): %w", sqlescape.EscapeIdentifier(schema), sqlescape.EscapeIdentifier(tableName), limit+1, err)
 	}
 	return count, nil
 }

@@ -90,7 +90,7 @@ func dropTablesOnCleanup(t *testing.T, db *sql.DB, tables ...string) {
 	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
 		for _, table := range tables {
-			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+sqlescape.EscapeIdentifier(table))
 			assert.NoError(t, err, "drop table %s", table)
 		}
 	})
@@ -564,6 +564,40 @@ func TestExactRowCountWithin(t *testing.T) {
 
 	_, err = exactRowCountWithin(t.Context(), db, "testdb", "exact_count_absent", 10)
 	require.Error(t, err, "a missing table is an error, never a zero count")
+}
+
+// The exact bounded count counts the table a name containing a backtick
+// names: a legal name is not a syntax error, and a name shaped like SQL
+// cannot turn the count into a query over something else.
+func TestExactRowCountWithinEscapesIdentifiers(t *testing.T) {
+	_, db := setupTestMySQL(t)
+	const plain = "ord`ers"
+	const crafted = "big` WHERE 0) x #"
+	dropTablesOnCleanup(t, db, plain, crafted)
+
+	for _, name := range []string{plain, crafted} {
+		_, err := db.ExecContext(t.Context(), "CREATE TABLE "+sqlescape.EscapeIdentifier(name)+" (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)")
+		require.NoError(t, err, "create %s", name)
+		var inserts strings.Builder
+		inserts.WriteString("INSERT INTO " + sqlescape.EscapeIdentifier(name) + " (v) VALUES (1)")
+		for range 19 {
+			inserts.WriteString(",(1)")
+		}
+		_, err = db.ExecContext(t.Context(), inserts.String())
+		require.NoError(t, err, "seed %s", name)
+	}
+
+	count, err := exactRowCountWithin(t.Context(), db, "testdb", plain, 100)
+	require.NoError(t, err, "a name containing a backtick is counted, not a syntax error")
+	assert.Equal(t, int64(20), count)
+
+	count, err = exactRowCountWithin(t.Context(), db, "testdb", crafted, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), count, "a table above the bound reports limit+1 whatever its name")
+
+	_, err = exactRowCountWithin(t.Context(), db, "testdb", "ord`ers_absent", 10)
+	require.Error(t, err, "a missing table is an error, never a zero count")
+	assert.Contains(t, err.Error(), "count rows of `testdb`.`ord``ers_absent` (bounded at 11)")
 }
 
 // With the policy enabled, an apply routes a statement the engine refuses —

@@ -10,10 +10,10 @@ package spirit
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/block/mysql"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -347,7 +347,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	// Drop the sentinel table - Spirit will detect this and proceed with cutover.
 	// Cutover is asynchronous — Spirit performs the table swap in its goroutine.
 	// The caller should poll Progress() for state transitions.
-	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(database), quoteIdentifier(deferredCutoverSentinelTable)))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", sqlescape.EscapeIdentifier(database), sqlescape.EscapeIdentifier(deferredCutoverSentinelTable)))
 	if err != nil {
 		return nil, fmt.Errorf("drop sentinel table: %w", err)
 	}
@@ -398,10 +398,6 @@ func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.De
 		return false, fmt.Errorf("query deferred cutover signal for database %s: %w", database, err)
 	}
 	return count > 0, nil
-}
-
-func quoteIdentifier(name string) string {
-	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
 // Revert rolls back a completed schema change. Spirit has no revert window: the

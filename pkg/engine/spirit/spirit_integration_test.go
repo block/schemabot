@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/table"
@@ -1087,10 +1088,10 @@ func TestEngine_CancelledArtifactCleanup(t *testing.T) {
 		"_spirit_checkpoint",
 	}
 
-	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", quoteIdentifier(baseTable)))
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", sqlescape.EscapeIdentifier(baseTable)))
 	require.NoError(t, err)
 	for _, artifact := range append(copies, metadata...) {
-		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", quoteIdentifier(artifact)))
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", sqlescape.EscapeIdentifier(artifact)))
 		require.NoError(t, err, "create artifact %s", artifact)
 	}
 

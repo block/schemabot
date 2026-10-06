@@ -227,6 +227,11 @@ func TestUsableStatistic(t *testing.T) {
 	_, err = usableStatistic(sql.NullInt64{Int64: -1, Valid: true}, "INDEX_LENGTH", "shop", "orders")
 	require.Error(t, err)
 	assert.Equal(t, "INDEX_LENGTH for `shop`.`orders` is negative (-1), treating it as unavailable", err.Error())
+
+	_, err = usableStatistic(sql.NullInt64{}, "TABLE_ROWS", "shop", "ord`ers")
+	require.Error(t, err)
+	assert.Equal(t, "TABLE_ROWS for `shop`.`ord``ers` is unavailable", err.Error(),
+		"the name is quoted the way MySQL reads it, so the message names one table unambiguously")
 }
 
 // The bounded row count caps its scan at one row past the policy bound and
