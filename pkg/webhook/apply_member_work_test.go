@@ -3,6 +3,7 @@ package webhook
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 
@@ -377,6 +378,44 @@ func TestConfirmationRequiresTheReviewedPrimaryMember(t *testing.T) {
 			}
 		})
 	}
+}
+
+type failingMemberListPlanStore struct {
+	rollbackConfirmTestPlanStore
+}
+
+func (s *failingMemberListPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
+	return nil, errors.New("member plan listing unavailable")
+}
+
+// The primary member's identity is settled by the two plans alone, so a
+// confirmation whose primary moved is refused even when the member plans cannot
+// be read: the pending confirmation is released rather than preserved behind a
+// read failure that can tell the operator nothing more.
+func TestChangedPrimaryIsRefusedBeforeMemberPlansAreRead(t *testing.T) {
+	pinned := storedPlan(1, "plan_reviewed", addEmail)
+	pinned.Deployment, pinned.Target = "eu", "payments"
+	current := storedPlan(2, "plan_current", addEmail)
+	current.Deployment, current.Target = "us", "payments"
+	store := &failingMemberListPlanStore{rollbackConfirmTestPlanStore: rollbackConfirmTestPlanStore{
+		plans: map[string]*storage.Plan{pinned.PlanIdentifier: pinned, current.PlanIdentifier: current},
+	}}
+	var logs bytes.Buffer
+	h := &Handler{
+		service: api.New(&rollbackConfirmTestStorage{plans: store}, &api.ServerConfig{}, nil, testLogger()),
+		logger:  slog.New(slog.NewTextHandler(&logs, nil)),
+	}
+
+	covered, reason, err := h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production")
+	require.NoError(t, err)
+	assert.False(t, covered)
+	assert.Equal(t, "the primary target is not the one the confirmed plan reviewed", reason)
+	assert.Contains(t, logs.String(), "confirmed_deployment=eu confirmed_target=payments")
+	assert.Contains(t, logs.String(), "current_deployment=us current_target=payments")
+
+	current.Deployment = "eu"
+	_, _, err = h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production")
+	require.ErrorContains(t, err, "member plan listing unavailable", "an unchanged primary still needs the member plans to decide")
 }
 
 // When the primary target has work too, the refusal counts every target that

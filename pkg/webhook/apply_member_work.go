@@ -325,6 +325,13 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	if current == nil {
 		return false, "", fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
 	}
+	// The two plans alone settle the primary member's identity, so a changed
+	// primary is refused before the member plans are read: a read that fails
+	// afterwards would keep a confirmation already known not to cover the work.
+	if primaryTargetChanged(pinned, current) {
+		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
+		return false, primaryTargetDifferenceReason(workTarget), nil
+	}
 	confirmed, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
 	if err != nil {
 		return false, "", fmt.Errorf("load member plans of the confirmed round: %w", err)
@@ -334,9 +341,6 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 		return false, "", fmt.Errorf("load member plans of the confirm-time round: %w", err)
 	}
 	covered, reason := roundCoversWork(pinned, current, confirmed, now)
-	if primaryTargetChanged(pinned, current) {
-		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
-	}
 	return covered, reason, nil
 }
 
