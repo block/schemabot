@@ -8034,3 +8034,73 @@ func TestSetRevertSkippedMetadata(t *testing.T) {
 	setRevertSkippedMetadata(resp, &storage.Apply{RevertSkippedAt: &now})
 	assert.Equal(t, "true", resp.Metadata["revert_skipped"], "flag set once revert_skipped_at is present")
 }
+
+// A gRPC apply is polled from two sources over its life: control-plane storage
+// while it is queued and once it is terminal, and the data plane's own progress
+// while it runs. The data plane mints its own task identifiers and knows
+// nothing of the control plane's operation rows, so a watcher keying its
+// per-table state on task_id would otherwise see the same statement under two
+// identities. Every source must report the stored task's identity and rollout
+// member.
+func TestProgressByApplyIDReportsOneTaskIdentityAcrossProgressSources(t *testing.T) {
+	const (
+		reviewed = "ALTER TABLE orders ADD COLUMN status INT"
+		rendered = "alter table `orders` add column `status` int"
+	)
+	opID := int64(41)
+	mock := &mockTernClient{
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			ApplyId: "remote-apply-identity",
+			State:   ternv1.State_STATE_RUNNING,
+			Tables: []*ternv1.TableProgress{
+				{Namespace: "testdb", TableName: "orders", Ddl: rendered, Status: state.Task.Running, TaskId: "task-data-plane", PercentComplete: 40},
+			},
+		},
+	}
+	apply := activeTestApply("apply-task-identity")
+	apply.ExternalID = ""
+	tasks := []*storage.Task{
+		{ID: 1, TaskIdentifier: "task-control-plane", ApplyID: apply.ID, ApplyOperationID: &opID, Namespace: "testdb", TableName: "orders", DDL: reviewed, State: state.Task.Pending},
+	}
+	operations := []*storage.ApplyOperation{
+		{ID: opID, ApplyID: apply.ID, Deployment: "commerce-a", Target: "shop-001", State: state.ApplyOperation.Running},
+	}
+	svc := newControlTestServiceWithOperations(mock, apply, tasks, operations)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	poll := func(t *testing.T) *apitypes.TableProgressResponse {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-task-identity", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var resp apitypes.ProgressResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		require.Len(t, resp.Tables, 1)
+		return resp.Tables[0]
+	}
+	assertIdentity := func(t *testing.T, tbl *apitypes.TableProgressResponse) {
+		t.Helper()
+		assert.Equal(t, "task-control-plane", tbl.TaskID)
+		assert.Equal(t, "commerce-a", tbl.Deployment)
+		assert.Equal(t, "shop-001", tbl.Target)
+	}
+
+	queued := poll(t)
+	require.Nil(t, mock.progressReq, "a queued remote apply is served from storage")
+	assertIdentity(t, queued)
+
+	apply.ExternalID = "remote-apply-identity"
+	tasks[0].State = state.Task.Running
+	active := poll(t)
+	require.NotNil(t, mock.progressReq, "an active remote apply is proxied to the data plane")
+	assert.Equal(t, rendered, active.DDL, "the projection keeps the deployment's own spelling")
+	assert.Equal(t, int32(40), active.PercentComplete, "live figures come from the data plane")
+	assertIdentity(t, active)
+
+	apply.State = state.Apply.Completed
+	tasks[0].State = state.Task.Completed
+	assertIdentity(t, poll(t))
+}

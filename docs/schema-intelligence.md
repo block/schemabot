@@ -620,9 +620,13 @@ table entries carry `deployment` and `target`, naming the member whose copy the
 row reports. Attribute a table by the pair, never by `deployment` alone: one
 deployment can address several targets, each running its own copy of the change,
 so several rows for the same table share a deployment and differ in their
-target. Both fields are absent on an apply that runs against a single target.
+target. The pair is read from the stored task's operation row, so a
+single-target apply reports its one member the same way, and a row the server
+cannot match to a stored task carries neither field.
 `task_id`, when present, identifies the individual task, including repeated
-statements against the same member and table. Log-mode watching tracks that
+statements against the same member and table. It names the control plane's
+task and stays the same on every poll, whether the server answers from its
+storage or relays the data plane's own progress. Log-mode watching tracks that
 identity; legacy rows without it are scoped by keyspace, deployment, target,
 and table name.
 The top-level `metadata` object carries engine-specific display fields when the
@@ -744,9 +748,10 @@ and durations):
 ```
 
 Each task gets its own start and completion, even when the table names match.
-Table log lines include `deployment` and `target` only when the response supplies
-them; single-target output without those fields is unchanged. Task IDs are used
-for tracking but are not printed.
+Table log lines include `deployment` and `target` when the response supplies
+them, which it does for every row the server can attribute to its stored task,
+on a single-target apply as well as a rollout. Task IDs are used for tracking
+but are not printed.
 
 <details>
 <summary>PostgreSQL response example</summary>
