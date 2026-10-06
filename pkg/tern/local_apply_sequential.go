@@ -256,16 +256,25 @@ func sequentialEngineApplyRequest(task *storage.Task, options map[string]string,
 // drive already halting when the shutdown begins: the shutdown waits for the
 // drives for less than this halt's bound, and a drive still halting would
 // make it give up on the engine halts and the claim hand-back for every drive.
+//
+// A drive with no claim halts nothing. Its owner is the empty owner every run
+// started without a claim shares, so halting by it would reach work that is not
+// this drive's.
 func (c *LocalClient) haltEngineWorkLeftByDrive(ctx context.Context, logger *slog.Logger) {
 	if operatorShuttingDown(ctx) {
 		logger.Info("drive returned for shutdown; the shutdown halts the engine")
+		return
+	}
+	owner := driveWorkOwner(ctx)
+	if owner == "" {
+		logger.Warn("drive returned without a claim; halting no engine work, since its empty owner would reach every run started without a claim")
 		return
 	}
 	haltCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), driveHandoverHaltTimeout)
 	defer cancel()
 	stop := afterOperatorShutdown(ctx, cancel)
 	defer stop()
-	if err := c.haltEngineWorkOwnedBy(haltCtx, driveWorkOwner(ctx)); err != nil {
+	if err := c.haltEngineWorkOwnedBy(haltCtx, owner); err != nil {
 		if operatorShuttingDown(ctx) {
 			logger.Info("operator began shutting down while the drive was halting the engine work it started; the shutdown halts the engine",
 				"error", err)

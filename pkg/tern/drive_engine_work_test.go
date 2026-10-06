@@ -87,7 +87,7 @@ func TestDriveWorkOwnerNamesTheClaim(t *testing.T) {
 	assert.Equal(t, driveWorkOwner(driveA), driveWorkOwner(context.WithoutCancel(driveA)))
 	dual := storage.WithOperationLease(driveA, storage.OperationLease{ApplyID: 1, OperationID: 2, Owner: "driver", Token: "op-token"})
 	assert.NotEqual(t, driveWorkOwner(driveA), driveWorkOwner(dual), "the operation claim is part of the drive's identity")
-	assert.Empty(t, driveWorkOwner(t.Context()), "a caller with no claim is the empty owner")
+	assert.Empty(t, driveWorkOwner(t.Context()), "a caller with no claim is the empty owner, which halts nothing")
 }
 
 // The engine is shared by every drive of the target in this process. Drive A
@@ -109,6 +109,22 @@ func TestDriveExitHaltReachesOnlyTheDrivesOwnWork(t *testing.T) {
 	assert.Equal(t, []string{driveWorkOwner(driveA), driveWorkOwner(driveB)}, eng.startOwners, "each run is started under its drive's owner")
 	assert.Equal(t, []string{driveWorkOwner(driveA)}, eng.halts(), "drive A's exit halt is scoped to drive A's work")
 	assert.Zero(t, eng.shutdowns, "a drive's exit never halts every run on the engine")
+}
+
+// Every run started without a claim belongs to the same empty owner, so a
+// drive that returns with no claim on its context has no work of its own to
+// name. Its exit halt reaches nothing rather than every unowned run.
+func TestDriveExitHaltWithoutAClaimHaltsNothing(t *testing.T) {
+	eng := &ownedWorkEngine{}
+	client := newOwnedWorkClient(eng)
+
+	_, err := client.applyWithEngine(t.Context(), eng, &engine.ApplyRequest{Database: "appdb"})
+	require.NoError(t, err)
+	client.haltEngineWorkLeftByDrive(t.Context(), slog.Default())
+
+	assert.Equal(t, []string{""}, eng.startOwners, "the run is started under the empty owner")
+	assert.Empty(t, eng.halts(), "the exit halt does not reach the unowned run")
+	assert.Zero(t, eng.shutdowns)
 }
 
 // A drive that was cancelled for its own reasons and is still halting its
