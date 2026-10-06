@@ -1055,6 +1055,52 @@ func TestWebhookProseMentionIsNotAnswered(t *testing.T) {
 	}
 }
 
+// An agent's explanation of how to land a schema change closes with a line
+// that opens with the product name, in any case, and mentions apply commands
+// only inline. SchemaBot leaves it unanswered rather than replying with the
+// invalid-command help.
+func TestWebhookExplanationOpeningWithTheProductNameIsNotAnswered(t *testing.T) {
+	const onThisPR = " will then comment the exact DDL it plans for staging and production on this PR."
+	tests := []struct {
+		name     string
+		lastLine string
+	}{
+		{
+			name: "inline apply commands",
+			lastLine: "SchemaBot will then comment the exact DDL it plans for staging and production, " +
+				"and you apply it with `schemabot apply -e staging`, then `schemabot apply -e production`.",
+		},
+		{name: "mixed case", lastLine: "SchemaBot" + onThisPR},
+		{name: "title case", lastLine: "Schemabot" + onThisPR},
+		{name: "upper case", lastLine: "SCHEMABOT" + onThisPR},
+		{name: "lower case", lastLine: "schemabot" + onThisPR},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, comments, _ := newTestHandler(t)
+
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: agentExplanationBody(tt.lastLine),
+				isPR:    true,
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+			// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+			select {
+			case body := <-comments:
+				require.Failf(t, "unexpected comment posted", "%s", body)
+			default:
+			}
+		})
+	}
+}
+
 func TestWebhookIgnoresSchemaBotProse(t *testing.T) {
 	h, comments, _ := newTestHandler(t)
 
