@@ -520,10 +520,12 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			continue
 		}
 
+		// The task row moves to running only once the engine accepts the task,
+		// so this records that the resume is starting it, not a transition.
 		taskID := task.ID
-		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Task %s resumed (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
-			task.State, state.Task.Running)
+		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Resuming task %s (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
+			"", "")
 
 		action = c.runEngineTask(ctx, apply, task, options)
 
