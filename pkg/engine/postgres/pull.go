@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/postgresconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -142,9 +143,11 @@ type baselinePolicy struct {
 	// — even though the renderer would happily render its columns and
 	// indexes without them.
 	refuseUnmodeledObjects bool
-	// skipArchiveTables leaves archive-named tables out of the baseline, the
-	// same tables the plan leaves in place instead of dropping.
-	skipArchiveTables bool
+	// skipUndeclaredArchiveTables leaves archive-named tables out only when
+	// no forward schema file declares them. Declared archives are managed.
+	skipUndeclaredArchiveTables bool
+	declaredTables              map[string]bool
+	ignoredTables               engine.IgnoredTables
 }
 
 // pulledBaseline becomes the owner's declared schema, so a table the format
@@ -156,9 +159,25 @@ var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecu
 // rollbackBaseline is read only by a rollback re-plan, which manages the
 // same table set the forward plan did. Objects the differ cannot see are
 // left in place by any apply and by any rollback, so they cost the
-// namespace nothing; an archive table sits outside management on both
-// plans, so its shape — renderable or not — is not the baseline's concern.
-var rollbackBaseline = baselinePolicy{skipArchiveTables: true}
+// namespace nothing. Ignored tables and undeclared archives sit outside
+// management, so their shapes are not the baseline's concern.
+func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) baselinePolicy {
+	return baselinePolicy{
+		skipUndeclaredArchiveTables: true,
+		declaredTables:              declared,
+		ignoredTables:               ignored,
+	}
+}
+
+func (p baselinePolicy) includesTable(table string) bool {
+	if p.ignoredTables.Withholds(table) {
+		return false
+	}
+	if p.skipUndeclaredArchiveTables && !p.declaredTables[table] && spirittable.IsArchiveTable(table) {
+		return false
+	}
+	return true
+}
 
 // baselineIntrospectionConcurrency caps how many tables a baseline render
 // introspects at once. Each introspection is one read-only transaction of
@@ -207,8 +226,8 @@ func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace str
 	}
 	managedTables := make([]string, 0, len(tables))
 	for _, table := range tables {
-		if policy.skipArchiveTables && spirittable.IsArchiveTable(table) {
-			slog.Debug("PostgreSQL archive table is outside management and left out of the rendered baseline",
+		if !policy.includesTable(table) {
+			slog.Debug("PostgreSQL table is outside management and left out of the rendered baseline",
 				"namespace", namespace,
 				"table", table)
 			continue

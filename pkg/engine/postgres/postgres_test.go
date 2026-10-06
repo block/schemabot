@@ -29,6 +29,31 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
+func TestBaselinePolicyTableMembership(t *testing.T) {
+	declared := map[string]bool{"users": true, "audit_log_archive_2019": true}
+	ignored := engine.NewIgnoredTables([]string{"flyway_schema_history", "audit_log_archive_2018"})
+	tests := []struct {
+		table        string
+		wantRollback bool
+	}{
+		{table: "users", wantRollback: true},
+		{table: "legacy_users", wantRollback: true},
+		{table: "flyway_schema_history"},
+		{table: "Flyway_schema_history", wantRollback: true},
+		{table: "audit_log_archive_2019", wantRollback: true},
+		{table: "audit_log_archive_2020"},
+		{table: "audit_log_archive_2018"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.table, func(t *testing.T) {
+			assert.Equal(t, tt.wantRollback, rollbackBaseline(declared, ignored).includesTable(tt.table))
+			assert.True(t, pulledBaseline.includesTable(tt.table), "pull exports every enumerated table")
+		})
+	}
+	assert.False(t, rollbackBaseline(declared, engine.NewIgnoredTables([]string{"audit_log_archive_2019"})).includesTable("audit_log_archive_2019"),
+		"the exact ignore policy withholds a named table before introspection; the plan separately refuses declared contradictions")
+}
+
 func TestExecutionVerdict(t *testing.T) {
 	tests := []struct {
 		name             string

@@ -335,7 +335,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			// Only a namespace with changes needs a rollback baseline, so
 			// the render is paid once per changed namespace rather than for
 			// every namespace the schema files declare.
-			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace)
+			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
 			if err != nil {
 				return nil, err
 			}
@@ -371,7 +371,9 @@ func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
 
 // captureOriginalFiles renders the live namespace as the plan's rollback
 // baseline, keyed by schema file name. The baseline is every managed table
-// in the namespace except the archive tables the plan exempts, so it is
+// in the namespace except ignored tables and undeclared archives. Declared
+// archives keep their originals. Exclusions are applied before introspection,
+// so only tables the forward plan manages decide capture completeness. It is
 // complete or it is nothing, and the two ways it can fall short end
 // differently. A table the engine read but pg-sprite's renderer refuses —
 // each shape it refuses is named by one of its ErrUnrenderable errors,
@@ -390,8 +392,8 @@ func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
 // not, so its cost grows with the namespace rather than with the change; the
 // introspections run concurrently within the pool's ceiling, so the wall
 // time grows more slowly than the table count does.
-func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string) (files map[string]string, captured bool, err error) {
-	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, rollbackBaseline)
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, captured bool, err error) {
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, rollbackBaseline(declared, ignored))
 	if err != nil {
 		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}

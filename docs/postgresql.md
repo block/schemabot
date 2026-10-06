@@ -106,9 +106,9 @@ or drop policies. Explicit RLS declarations use the atomic path above,
 which refuses mixed structural and RLS changes. A no-change result
 for a table-only file says nothing about whether its access policies match.
 
-New plans for a namespace containing RLS tables remain rollback-incapable until
-complete RLS definitions can be applied during recovery. Pull still exports the
-full definition; rollback capture never strips access policies to claim support.
+New plans for a namespace containing managed RLS tables remain rollback-incapable
+until complete RLS definitions can be applied during recovery. Pull still exports
+the full definition; rollback capture never strips access policies to claim support.
 
 For example, an existing table can pull as:
 
@@ -467,11 +467,14 @@ incompletely; and a drop has to take the referencing constraints with it. The
 plan names those constraints too, so both sides of one relationship explain
 themselves.
 
-Archive tables named `<table>_archive_YYYY[_MM[_DD]]` are exempt from the
-verdict, as they are in the MySQL engine's view of a live schema: an archive
-is a retired copy kept outside declarative schema files. That naming
-convention is the only per-table exemption — a leading underscore means
-nothing on PostgreSQL — and `ignore_namespaces` is the per-namespace one. The
+Archive tables named `<table>_archive_YYYY[_MM[_DD]]` with no schema file are
+exempt from the verdict, as they are in the MySQL engine's view of a live schema:
+an archive is a retired copy kept outside declarative schema files. An archive
+that a file explicitly declares is managed like any other declared table.
+That naming convention is the only naming-based per-table exemption — a leading
+underscore means nothing on PostgreSQL. Exact `ignore_tables` matches also
+withhold live tables; a file declaring an ignored table is refused as a
+contradiction. `ignore_namespaces` is the per-namespace exemption. The
 plan discloses the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output, so a reviewer can tell an
 archive the verdict skipped from a table it found declared.
@@ -674,10 +677,21 @@ it commits or fails, and recovery re-plans against the live target before
 further work. A privilege refusal is a permanent failed task, includes the
 required provisioning advice, and leaves the target unchanged.
 
-Rollback baseline capture refuses namespaces containing RLS tables until
-recovery can restore their complete access rules alongside sibling tables.
-It never strips policies to mark a plan rollback-capable. [RV-7](invariants.md#rv-7-rollback-needs-the-originals)
-requires complete originals before rollback can proceed.
+Rollback captures the same live table set the forward plan manages. Exact,
+case-sensitive `ignore_tables` matches are excluded before introspection, as are
+archive-named tables with no schema file. An explicitly declared archive remains
+managed and keeps its original definition, so rollback can reverse its changes.
+Pull still exports archive-named tables; these capture exclusions do not change
+pull behavior or permit a table to be both ignored and declared.
+
+Capture is complete for that managed set or the plan is rollback-incapable;
+an unrenderable ignored table or undeclared archive does not prevent capture.
+Managed RLS tables still prevent capture until recovery can restore their
+complete access rules alongside sibling tables. Capture never strips policies to
+mark a plan rollback-capable, and a catalog read failure or cancellation still
+ends planning. [RV-7](https://github.com/block/schemabot/blob/main/docs/invariants.md#rv-7-rollback-needs-the-originals)
+requires complete originals before rollback can proceed; missing originals in
+older plans are never reconstructed from the current target.
 
 ## Configuration and credentials
 
