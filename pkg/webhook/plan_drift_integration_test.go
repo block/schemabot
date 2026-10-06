@@ -3,7 +3,7 @@
 // Review-time deployment drift webhook integration tests. These exercise the
 // full plan flow against real MySQL deployments: a database that fans out to
 // several deployments is planned once against the primary, every deployment's
-// live schema is diffed against that reviewed plan, and any deployment whose
+// live schema is diffed against that primary plan, and any deployment whose
 // live schema diverges — or that cannot be diffed — fails the plan check closed
 // before an apply is ever attempted.
 
@@ -229,13 +229,13 @@ func runDriftPlan(t *testing.T, svc *api.Service, dbName string) {
 
 // A non-primary deployment whose live schema already carries the reviewed change
 // diffs to a no-op while the primary plans the change, so the deployment
-// diverges from the reviewed plan and the plan check fails closed with a
+// diverges from the primary plan and the plan check fails closed with a
 // review-time deployment drift block.
 func TestE2EReviewDriftBlocksWhenDeploymentDiverges(t *testing.T) {
 	dbName := "webhook_drift_diverge"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},      // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},      // matches the reviewed plan
+		{name: "au", liveSchema: usersBaseSchema},      // matches the primary target's plan
 		{name: "us", liveSchema: usersWithEmailSchema}, // drifted: already has email
 	})
 
@@ -251,13 +251,13 @@ func TestE2EReviewDriftBlocksWhenDeploymentDiverges(t *testing.T) {
 }
 
 // A deployment that cannot be diffed (its physical database is gone) cannot be
-// confirmed to match the reviewed plan, so it is treated as blocking rather than
+// confirmed to match the primary plan, so it is treated as blocking rather than
 // agreement and the plan check fails closed.
 func TestE2EReviewDriftBlocksWhenDeploymentUnreachable(t *testing.T) {
 	dbName := "webhook_drift_unreachable"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},                     // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},                     // matches the reviewed plan
+		{name: "au", liveSchema: usersBaseSchema},                     // matches the primary target's plan
 		{name: "us", liveSchema: usersBaseSchema, dropDatabase: true}, // undiffable
 	})
 
@@ -272,7 +272,7 @@ func TestE2EReviewDriftBlocksWhenDeploymentUnreachable(t *testing.T) {
 		"the check must carry a durable review-time deployment drift block")
 }
 
-// When every deployment's live schema matches the reviewed plan, the rollup is
+// When every deployment's live schema matches the primary plan, the rollup is
 // clean: the plan check reflects the reviewed change (action_required, changes
 // pending) with no drift block, so drift never spuriously blocks a uniform
 // rollout.
@@ -305,7 +305,7 @@ func TestE2EReviewDriftClearsBlockAfterDeploymentReconciled(t *testing.T) {
 	dbName := "webhook_drift_unblock"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},      // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},      // matches the reviewed plan
+		{name: "au", liveSchema: usersBaseSchema},      // matches the primary target's plan
 		{name: "us", liveSchema: usersWithEmailSchema}, // drifted: already has email
 	})
 

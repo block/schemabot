@@ -156,6 +156,14 @@ const (
 	PullRateLimitSharedReason = "too many pull requests; this server does not authenticate callers, so every client shares one request budget"
 )
 
+// The reasons a check inspection is refused for exceeding its request budget,
+// split the same way as the pull reasons: the shared form replaces the
+// per-caller one on a server that does not authenticate callers.
+const (
+	ChecksInspectRateLimitCallerReason = "too many check inspections from this caller"
+	ChecksInspectRateLimitSharedReason = "too many check inspections; this server does not authenticate callers, so every client shares one request budget"
+)
+
 // NewRateLimitedResponse builds the body of a 429 refusal from the budget that
 // ran out and how long the caller must wait.
 //
@@ -731,6 +739,15 @@ type PlanRequest struct {
 	// Target narrows the plan to one rollout member of the environment, named
 	// by its target or by deployment/target. Empty plans the rollout primary.
 	Target string `json:"target,omitempty"`
+	// RendersRollout is a client capability flag: it says this client reads
+	// the plan's rollout block, shows the operator what applies on every
+	// member, and refuses an apply for the members the rollout lists as
+	// needing attention or as refused. It is not operator consent, since any
+	// caller can set it. The server refuses a rollout-wide plan of an
+	// environment with more than one member from a caller that does not set
+	// it, since such a caller would present the primary's plan as the whole
+	// rollout's.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 // ApplyRequest is the HTTP request body for POST /api/apply.
@@ -742,6 +759,17 @@ type ApplyRequest struct {
 	// Target narrows the apply to one rollout member, named by its target or
 	// by deployment/target. Empty applies the whole rollout.
 	Target string `json:"target,omitempty"`
+	// RendersRollout is a client capability flag: it says this client shows
+	// the plan every rollout member runs before applying, each member's plan
+	// from the rollout block (see PlanRequest.RendersRollout), or for a
+	// rollback its one rollback plan, which every member of a mirrored
+	// environment runs and which the server refuses to run rollout-wide where
+	// members are planned on their own. It is not operator consent: any
+	// caller can set it, so it only keeps a client that shows the primary's
+	// plan as the whole rollout's from applying one. The server refuses a
+	// rollout-wide apply of an environment with more than one member from a
+	// caller that does not set it.
+	RendersRollout bool `json:"renders_rollout,omitempty"`
 }
 
 // ControlRequest is the HTTP request body for control operations
@@ -804,6 +832,208 @@ type PlanResponse struct {
 	// on the response to the plan request only; a stored plan does not retain
 	// it. Empty when nothing was exempted, which is the ordinary case.
 	ExemptTables []*ExemptTablesResponse `json:"exempt_tables,omitempty"`
+	// Rollout describes the plan of every member of the rollout when the
+	// environment fans out to more than one: the members grouped by the plan
+	// each runs, and the members that need attention before an apply can run
+	// on them. Nil when the environment has a single member. The top-level
+	// Changes and Shards are the primary member's plan.
+	Rollout *PlanRolloutResponse `json:"rollout,omitempty"`
+}
+
+// PlanRolloutResponse is the plan of every member of a rollout.
+type PlanRolloutResponse struct {
+	// Members is how many members the rollout has.
+	Members int `json:"members"`
+	// Independent is true when each member was planned against its own live
+	// schema, so members are expected to differ. False means every member is
+	// expected to run the primary's plan.
+	Independent bool `json:"independent,omitempty"`
+	// Groups holds one entry per distinct plan, naming the members that run
+	// it, with the primary's group first.
+	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
+	// Attention lists the members an apply cannot run on as planned: a member
+	// that could not be planned, every member but the primary when the
+	// primary's plan reported errors and so no other member was planned, or
+	// one that diverged from the plan it is expected to mirror.
+	Attention []*PlanMemberAttentionResponse `json:"attention,omitempty"`
+	// Refused lists the members whose own plans apply creation refuses when
+	// this plan is applied rollout-wide through the API, which refuses the
+	// whole apply. Set only when no member needs attention.
+	Refused []*PlanMemberRefusalResponse `json:"refused,omitempty"`
+	// TableSizes is each member's size estimate for each existing table its
+	// own plan copies, rebuilds, or scans, in rollout order, primary first.
+	// A group's changes are its first member's plan, so sizes are listed per
+	// member rather than read from a group: each member applies to its own
+	// data. Members listed for attention are not included.
+	TableSizes []*PlanMemberTableSizeResponse `json:"table_sizes,omitempty"`
+}
+
+// PlanMemberTableSizeResponse is one rollout member's plan-time size estimate
+// for one table its plan changes.
+type PlanMemberTableSizeResponse struct {
+	// Member is the member's operator-facing display name, as Groups and
+	// Attention name it: the deployment alone for a single-target deployment,
+	// deployment/target when a deployment addresses several targets.
+	Member    string `json:"member"`
+	Namespace string `json:"namespace"`
+	Table     string `json:"table"`
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes) on this member, summed across shards for a sharded member.
+	// Nil when the engine reported no estimate.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+}
+
+// PlanMemberRefusalResponse is a rollout member whose own plan a rollout-wide
+// apply through the API refuses, and how to run it instead.
+type PlanMemberRefusalResponse struct {
+	// Member is the member's operator-facing name, as in Groups.
+	Member string `json:"member"`
+	// Target is the selector that names the member in a plan or apply
+	// request's target, and in the CLI's --target. It can differ from Member:
+	// a deployment with one target is named by its deployment, and selected by
+	// its target.
+	Target string `json:"target"`
+	// Reason is PlanMemberNeedsTarget or PlanMemberBlocked.
+	Reason string `json:"reason"`
+	// Detail is a short description of the refused change, naming only
+	// tables and namespaces.
+	Detail string `json:"detail"`
+	// AllowUnsafe is true when the member's own plan carries an unsafe
+	// change, so an apply narrowed to it needs the unsafe opt-in.
+	AllowUnsafe bool `json:"allow_unsafe,omitempty"`
+}
+
+// Rollout member refusal reasons.
+const (
+	// PlanMemberNeedsTarget is a member whose own plan runs when the apply is
+	// narrowed to it, where its own plan is the one the operator reviews and
+	// consents to.
+	PlanMemberNeedsTarget = "needs_target"
+	// PlanMemberBlocked is a member whose own plan carries work no apply
+	// runs, the one narrowed to it included: a change its engine refuses, or
+	// work the apply has no operation to run from.
+	PlanMemberBlocked = "blocked"
+)
+
+// PlanMemberGroupResponse is the rollout members that run one plan.
+type PlanMemberGroupResponse struct {
+	// Members are the members' operator-facing names, in rollout order.
+	Members []string `json:"members"`
+	// Primary is true for the group holding the rollout's primary member,
+	// whose plan is the response's own.
+	Primary bool                    `json:"primary,omitempty"`
+	Changes []*SchemaChangeResponse `json:"changes"`
+	Shards  []*ShardPlanResponse    `json:"shards,omitempty"`
+}
+
+// PlanMemberAttentionResponse is a rollout member an apply cannot run on as
+// planned, and why.
+type PlanMemberAttentionResponse struct {
+	Member string `json:"member"`
+	// Reason is PlanMemberDiverged or PlanMemberUnplanned.
+	Reason string `json:"reason"`
+	// Detail is a short, sanitized description of the reason.
+	Detail string `json:"detail,omitempty"`
+}
+
+// Rollout member attention reasons.
+const (
+	PlanMemberDiverged  = "diverged"
+	PlanMemberUnplanned = "unplanned"
+)
+
+// UnmarshalJSON refuses a rollout block that lists a null group, attention
+// entry, refusal or table size. Each list is read as the members an apply
+// runs on, needs attention for, or refuses, or as what each member's tables
+// weigh, so a null entry is a malformed response rather than an empty one,
+// and decoding it fails instead of handing a reader an entry it would have
+// to guess the meaning of.
+func (r *PlanRolloutResponse) UnmarshalJSON(data []byte) error {
+	type plain PlanRolloutResponse
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("decode rollout block: %w", err)
+	}
+	if i := slices.Index(decoded.Groups, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: group %d is null", i)
+	}
+	if i := slices.Index(decoded.Attention, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: attention entry %d is null", i)
+	}
+	if i := slices.Index(decoded.Refused, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: refusal %d is null", i)
+	}
+	if i := slices.Index(decoded.TableSizes, nil); i >= 0 {
+		return fmt.Errorf("decode rollout block: table size %d is null", i)
+	}
+	*r = PlanRolloutResponse(decoded)
+	return nil
+}
+
+// WholeRollout returns the plan of every rollout member the response
+// describes, or nil when it describes one member: an environment with a single
+// member, or a plan narrowed to one member. A narrowed plan says nothing about
+// the other members, so it is never read as the rollout's plan even if it
+// carries a rollout block.
+func (r *PlanResponse) WholeRollout() *PlanRolloutResponse {
+	if r == nil || r.NarrowedTo != "" {
+		return nil
+	}
+	return r.Rollout
+}
+
+// MemberPlans returns the plan of each group of rollout members, in the
+// order of Rollout.Groups, or the response itself when it covers one member.
+// Each group's plan carries the response's identity and engine with the
+// group's own changes; lint results and errors describe the schema files and
+// stay on the response.
+func (r *PlanResponse) MemberPlans() []*PlanResponse {
+	if r == nil {
+		return nil
+	}
+	rollout := r.WholeRollout()
+	if rollout == nil || len(rollout.Groups) == 0 {
+		return []*PlanResponse{r}
+	}
+	plans := make([]*PlanResponse, 0, len(rollout.Groups))
+	for _, g := range rollout.Groups {
+		plans = append(plans, &PlanResponse{
+			PlanID:       r.PlanID,
+			Database:     r.Database,
+			DatabaseType: r.DatabaseType,
+			Environment:  r.Environment,
+			Engine:       r.Engine,
+			Changes:      g.Changes,
+			Shards:       g.Shards,
+		})
+	}
+	return plans
+}
+
+// RolloutHasChanges reports whether an apply of the rollout would run work on
+// any member, not only the primary.
+func (r *PlanResponse) RolloutHasChanges() bool {
+	return slices.ContainsFunc(r.MemberPlans(), (*PlanResponse).HasChanges)
+}
+
+// RolloutUnsafeChanges returns the unsafe changes of every plan in the
+// rollout, each once however many groups of members run it. A change is the
+// same when it is the same namespace's table, statement and reason, so one
+// table dropped in two namespaces is two changes.
+func (r *PlanResponse) RolloutUnsafeChanges() []UnsafeChange {
+	var result []UnsafeChange
+	seen := make(map[string]bool)
+	for _, plan := range r.MemberPlans() {
+		plan.eachUnsafeChange(func(namespace string, c UnsafeChange) {
+			key := strings.Join([]string{namespace, c.Table, c.DDL, c.Reason}, "\x00")
+			if seen[key] {
+				return
+			}
+			seen[key] = true
+			result = append(result, c)
+		})
+	}
+	return result
 }
 
 // ExemptTablesResponse describes live tables in one namespace that no schema
@@ -983,6 +1213,19 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 		return nil
 	}
 	var result []UnsafeChange
+	r.eachUnsafeChange(func(_ string, c UnsafeChange) {
+		result = append(result, c)
+	})
+	return result
+}
+
+// eachUnsafeChange calls fn with each unsafe change in the plan and the
+// namespace it is in, in plan order: the namespace-level changes, then the
+// per-shard changes that do not repeat one of them.
+func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange)) {
+	if r == nil {
+		return
+	}
 	type statement struct{ namespace, table, ddl string }
 	seen := make(map[statement]struct{})
 	add := func(namespace string, t *TableChangeResponse) {
@@ -995,7 +1238,7 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 			return
 		}
 		seen[key] = struct{}{}
-		result = append(result, unsafeChange)
+		fn(namespace, unsafeChange)
 	}
 	for _, sc := range r.Changes {
 		if sc == nil {
@@ -1004,7 +1247,9 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 		for _, t := range sc.TableChanges {
 			add(sc.Namespace, t)
 		}
-		result = append(result, sc.VSchemaUnsafeChanges()...)
+		for _, c := range sc.VSchemaUnsafeChanges() {
+			fn(sc.Namespace, c)
+		}
 	}
 	for _, sp := range r.Shards {
 		if sp == nil {
@@ -1014,7 +1259,6 @@ func (r *PlanResponse) UnsafeChanges() []UnsafeChange {
 			add(sp.Namespace, t)
 		}
 	}
-	return result
 }
 
 // HasBlockedChanges reports whether any planned change carries the blocked
@@ -1241,10 +1485,12 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 }
 
 // HasChanges reports whether the plan carries any work an apply would execute:
-// table DDL in any namespace, a VSchema update, or a finalizer the engine asked
-// for. Gates that decide whether a plan is actionable must use this rather than
-// counting table changes alone — a VSchema-only or finalizer-only plan has zero
-// table changes but still requires an apply.
+// table DDL in any namespace or on any shard, a VSchema update, or a finalizer
+// the engine asked for. Gates that decide whether a plan is actionable must use
+// this rather than counting table changes alone — a VSchema-only or
+// finalizer-only plan has zero table changes but still requires an apply. A
+// shard row's DDL is work even when the namespace view carries none, since the
+// shard rows are the authoritative representation of a sharded namespace.
 func (r *PlanResponse) HasChanges() bool {
 	for _, sc := range r.Changes {
 		if sc == nil {
@@ -1254,7 +1500,9 @@ func (r *PlanResponse) HasChanges() bool {
 			return true
 		}
 	}
-	return false
+	return slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && len(sp.Changes) > 0
+	})
 }
 
 // SchemaChangeResponse groups changes for a single namespace.
@@ -1300,6 +1548,37 @@ type TableChangeResponse struct {
 	// table (data plus indexes), summed across shards for sharded targets.
 	// Display only, like EstimatedRows. Nil when no estimate was available.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, with how each move changes the way values compare. Empty when
+	// the change re-collates no column, or the engine does not report it.
+	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string `json:"column"`
+	// From is the collation the column compares under now; To is the one it
+	// compares under once the change applies, empty when the change leaves it
+	// to a server default the plan cannot read.
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	// Case and TrailingSpaces say how the comparison of values differing only
+	// in letter case, and only in trailing spaces, moves: "unchanged",
+	// "becomes_sensitive", "becomes_insensitive", or "unknown" when either
+	// collation's properties are not known. "unknown" is a possible change.
+	Case           string `json:"case"`
+	TrailingSpaces string `json:"trailing_spaces"`
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool `json:"can_merge_values"`
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
+	UniqueIndexes []string `json:"unique_indexes,omitempty"`
 }
 
 // Execution-mode verdicts a planner records on a table change. These mirror

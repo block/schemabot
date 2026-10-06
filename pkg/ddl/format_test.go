@@ -176,6 +176,10 @@ func TestFormatSchemaFileForDialectPreservesMySQLTableOptions(t *testing.T) {
 		"DELAY_KEY_WRITE = 1",
 		"MIN_ROWS = 10",
 		"STATS_AUTO_RECALC = 0",
+		"STATS_PERSISTENT = 0",
+		"STATS_PERSISTENT = 1",
+		"PACK_KEYS = 0",
+		"PACK_KEYS = 1",
 	} {
 		t.Run(option, func(t *testing.T) {
 			input := "CREATE TABLE t (id int) ENGINE=InnoDB " + option + " COMMENT='Keep INT, comma' PARTITION BY HASH (id) PARTITIONS 4"
@@ -190,14 +194,12 @@ func TestFormatSchemaFileForDialectPreservesMySQLTableOptions(t *testing.T) {
 	}
 }
 
-func TestFormatSchemaFileForDialectRefusesLossyMySQLCanonicalization(t *testing.T) {
-	for _, option := range []string{"STATS_PERSISTENT=0", "STATS_PERSISTENT=1", "PACK_KEYS=0", "PACK_KEYS=1"} {
-		t.Run(option, func(t *testing.T) {
-			got, err := FormatSchemaFileForDialect(schema.DialectMySQL, "CREATE TABLE t (id int) ENGINE=InnoDB "+option)
-			require.ErrorContains(t, err, "canonical SQL contains comments")
-			assert.Empty(t, got)
-		})
-	}
+// A canonical form in which Restore wrote a placeholder comment instead of an
+// option's value is flagged, while comment openers inside quoted content are not.
+func TestContainsMySQLCommentFlagsRestorePlaceholders(t *testing.T) {
+	assert.True(t, containsMySQLComment("CREATE TABLE `t` (`id` INT) ENGINE = InnoDB /* TableOptionStatsPersistent is not supported */ ", false))
+	assert.False(t, containsMySQLComment("CREATE TABLE `t` (`id` INT) COMMENT = '/* TableOptionStatsPersistent is not supported */'", false))
+	assert.False(t, containsMySQLComment("CREATE TABLE `/* -- # */` (`id` INT)", false))
 }
 
 func TestFormatSchemaFileForDialectPreservesMultilineMySQL(t *testing.T) {

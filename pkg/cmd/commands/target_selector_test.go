@@ -145,6 +145,7 @@ func TestApplyCmd_TargetNarrowsPlanAndApply(t *testing.T) {
 	recorded.mu.Lock()
 	defer recorded.mu.Unlock()
 	assert.Equal(t, "payments-002", recorded.planReq.Target)
+	assert.True(t, recorded.planReq.RendersRollout, "the plan says the CLI renders the rollout")
 	assert.Equal(t, "plan-narrowed", recorded.applyReq.PlanID)
 	assert.Equal(t, "prod/payments-002", recorded.applyReq.Target)
 	assert.Equal(t, []string{"/api/plan", "/api/status", "/api/apply"}, recorded.paths, "a targeted apply checks for active schema changes after planning resolves its member")

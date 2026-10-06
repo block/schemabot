@@ -230,7 +230,7 @@ const (
 	// safe: an existing drift block is preserved, never silently cleared.
 	PlanDriftNotEvaluated PlanDriftState = iota
 	// PlanDriftClean means the rollup ran and every deployment matched the
-	// reviewed plan, so a stale drift block may be cleared.
+	// primary plan, so a stale drift block may be cleared.
 	PlanDriftClean
 	// PlanDriftBlocked means the rollup ran and a deployment diverged or could
 	// not be confirmed, so the write records the drift block.
@@ -243,6 +243,14 @@ const (
 // truth: UpsertPlanResult preserves a row carrying this reason on a
 // not-evaluated write instead of clearing it.
 const ReviewTimeDeploymentDriftBlockingReason = "review_time_deployment_drift"
+
+// NamespacePlacementRefusedBlockingReason is the stable Check.BlockingReason
+// value for an environment whose plan was refused because its targets entries
+// and the schema files disagree on where a namespace lives. It is written with
+// the review-time write intent (PlanDriftBlocked) and preserved on a
+// not-evaluated write exactly like a drift block, since only a plan that
+// re-evaluates placement can lift it.
+const NamespacePlacementRefusedBlockingReason = "namespace_placement_refused"
 
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
@@ -507,6 +515,37 @@ type TableChange struct {
 	// table (data plus indexes), summed across shards for sharded targets.
 	// Display only, like EstimatedRows. Nil when no estimate was available.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, with how each move changes the way values compare. Empty when
+	// the change re-collates no column, or the engine does not report it.
+	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string `json:"column"`
+	// From is the collation the column compares under now; To is the one it
+	// compares under once the change applies, empty when the change leaves it
+	// to a server default the plan cannot read.
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	// Case and TrailingSpaces say how the comparison of values differing only
+	// in letter case, and only in trailing spaces, moves: "unchanged",
+	// "becomes_sensitive", "becomes_insensitive", or "unknown" when either
+	// collation's properties are not known. "unknown" is a possible change.
+	Case           string `json:"case"`
+	TrailingSpaces string `json:"trailing_spaces"`
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool `json:"can_merge_values"`
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
+	UniqueIndexes []string `json:"unique_indexes,omitempty"`
 }
 
 // TaskEstimatedBytes returns the byte estimate a task created from this change
@@ -724,15 +763,15 @@ type Plan struct {
 	// invariant cannot be evaluated) rather than fail closed.
 	HeadSHA string
 
-	// PrimaryPlanIdentifier names the reviewed plan this one was produced
+	// PrimaryPlanIdentifier names the primary plan this one was produced
 	// alongside, for a rollout member planned against its own live schema. It is
 	// the durable link between a member's plan and the review round the operator
-	// approved: an apply created from the reviewed plan selects its members'
+	// approved: an apply created from the primary plan selects its members'
 	// plans by this identifier, so a plan from a later re-plan of the same commit
-	// is a different round and is never substituted for the reviewed one.
+	// is a different round and is never substituted for the one approved.
 	//
-	// Empty on the reviewed plan itself, and on every plan of an environment
-	// whose members all run the reviewed plan.
+	// Empty on the primary plan itself, and on every plan of an environment
+	// whose members all run the primary plan.
 	PrimaryPlanIdentifier string
 
 	// DirectExecution is the direct execution policy this plan's execution

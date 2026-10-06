@@ -95,6 +95,12 @@ type Operation struct {
 
 	// Error is the operation's error detail, set when State is failed.
 	Error string
+
+	// ExternalID and ExternalOperationID are the data-plane apply and
+	// operation this operation runs as, for an operator to look up when it
+	// needs attention.
+	ExternalID          string
+	ExternalOperationID string
 }
 
 // continuesPastFailure reports whether a terminal-failed earlier sibling stops
@@ -176,6 +182,16 @@ type Deployment struct {
 	// Error is the operation's error detail when it failed, for the renderer to
 	// surface in the failed deployment's section.
 	Error string
+
+	// ExternalID and ExternalOperationID are the data-plane apply and
+	// operation the member runs as. They are carried on the member, beside
+	// its state and error, so a surface that names a member needing attention
+	// reads its identifiers from the same row rather than pairing two lists.
+	ExternalID          string
+	ExternalOperationID string
+
+	// NeverStarted is whether no driver ever claimed the member's operation.
+	NeverStarted bool
 }
 
 // NextActionKind is the semantic operator action the aggregate suggests. The
@@ -420,7 +436,10 @@ func memberNames(ops []Operation) []string {
 // as sibling j's own section is labelled.
 func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	op := ops[i]
-	d := Deployment{Deployment: op.Deployment, Target: op.Target, Name: names[i], State: op.State, Error: op.Error}
+	d := Deployment{
+		Deployment: op.Deployment, Target: op.Target, Name: names[i], State: op.State, Error: op.Error,
+		ExternalID: op.ExternalID, ExternalOperationID: op.ExternalOperationID, NeverStarted: op.NeverStarted,
+	}
 
 	switch op.State {
 	case state.ApplyOperation.Completed:

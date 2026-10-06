@@ -881,13 +881,16 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr      error
-	planResp       *ternv1.PlanResponse
-	planErr        error
-	planReq        *ternv1.PlanRequest
-	planDiffResp   *ternv1.PlanDiffResponse
-	planDiffErr    error
-	planDiffReq    *ternv1.PlanRequest
+	healthErr    error
+	planResp     *ternv1.PlanResponse
+	planErr      error
+	planReq      *ternv1.PlanRequest
+	planDiffResp *ternv1.PlanDiffResponse
+	planDiffErr  error
+	planDiffReq  *ternv1.PlanRequest
+	// planDiffMu guards planDiffReq: a rollout plan diffs its members
+	// concurrently, so one client can serve several diffs at once.
+	planDiffMu     sync.Mutex
 	pullSchemaResp *ternv1.PullSchemaResponse
 	pullSchemaErr  error
 	pullSchemaReq  *ternv1.PullSchemaRequest
@@ -964,7 +967,9 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	return nil, m.planErr
 }
 func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	m.planDiffMu.Lock()
 	m.planDiffReq = req
+	m.planDiffMu.Unlock()
 	if m.planDiffResp != nil {
 		return m.planDiffResp, m.planDiffErr
 	}
@@ -1644,7 +1649,7 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 	// A planner that shares the service's storage stores the row for a plan
 	// with changes first, stamped with the database it was configured with as
 	// the deployment. The service keeps that row and restamps it with the
-	// rollout member it planned, so the apply can find the reviewed target by it.
+	// rollout member it planned, so the apply can find the primary target by it.
 	t.Run("duplicate plan identifier keeps the stored row on the planned route", func(t *testing.T) {
 		svc, _, plans := newPolicyService()
 		plans.createErr = storage.ErrPlanIDExists

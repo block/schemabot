@@ -17,6 +17,8 @@ func previewCommentErrorsOutput() {
 		{"DATABASE NOT FOUND", webhooktemplates.PreviewCommentErrorNotFound},
 		{"DATABASE NOT FOUND (REPOSITORY TOO LARGE TO SEARCH IN FULL)", webhooktemplates.PreviewCommentErrorNotFoundScoped},
 		{"DATABASE NOT CONFIGURED", webhooktemplates.PreviewCommentErrorDatabaseNotConfigured},
+		{"DATABASE NOT REGISTERED", webhooktemplates.PreviewCommentErrorDatabaseNotRegistered},
+		{"DATABASES NOT REGISTERED", webhooktemplates.PreviewCommentErrorDatabasesNotRegistered},
 		{"DATABASE NOT AVAILABLE TO THIS REPOSITORY", webhooktemplates.PreviewCommentErrorDatabaseRepoNotAllowed},
 		{"REPOSITORY TOO LARGE TO SEARCH", webhooktemplates.PreviewCommentErrorRepositoryTruncated},
 		{"INVALID CONFIG", webhooktemplates.PreviewCommentErrorInvalid},
@@ -96,7 +98,7 @@ func previewCommentAllOutput() {
 		{"ROLLOUT PLANS (TABLE SIZES, TWO TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTwoTargetTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, THREE TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, REVIEWED TARGET ONLY)", func() {
-			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutReviewedTargetTableSizes())
+			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutPrimaryTargetTableSizes())
 		}},
 		{"HELP COMMENT", func() { fmt.Print(webhooktemplates.PreviewCommentHelp()) }},
 		{"SUPPORT CHANNEL FOOTER", func() { fmt.Print(webhooktemplates.PreviewCommentSupportChannel()) }},
@@ -107,6 +109,8 @@ func previewCommentAllOutput() {
 		{"DATABASE NOT FOUND", func() { fmt.Print(webhooktemplates.PreviewCommentErrorNotFound()) }},
 		{"DATABASE NOT FOUND (REPOSITORY TOO LARGE TO SEARCH IN FULL)", func() { fmt.Print(webhooktemplates.PreviewCommentErrorNotFoundScoped()) }},
 		{"DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentErrorDatabaseNotConfigured()) }},
+		{"DATABASE NOT REGISTERED", func() { fmt.Print(webhooktemplates.PreviewCommentErrorDatabaseNotRegistered()) }},
+		{"DATABASES NOT REGISTERED", func() { fmt.Print(webhooktemplates.PreviewCommentErrorDatabasesNotRegistered()) }},
 		{"DATABASE NOT AVAILABLE TO THIS REPOSITORY", func() { fmt.Print(webhooktemplates.PreviewCommentErrorDatabaseRepoNotAllowed()) }},
 		{"REPOSITORY TOO LARGE TO SEARCH", func() { fmt.Print(webhooktemplates.PreviewCommentErrorRepositoryTruncated()) }},
 		{"INVALID CONFIG", func() { fmt.Print(webhooktemplates.PreviewCommentErrorInvalid()) }},
@@ -177,6 +181,7 @@ func previewCommentPlanAllOutput() {
 		{"MYSQL PLAN (ENGINE-BLOCKED CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlocked()) }},
 		{"POSTGRES PLAN (ENGINE-BLOCKED CHANGE, TWO CAUSES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanBlockedPostgres()) }},
 		{"MYSQL PLAN (DIRECT-EXECUTION CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanDirect()) }},
+		{"MYSQL PLAN (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnsafe()) }},
 		{"MYSQL PLAN (CHANGE ATTRIBUTED TO ANOTHER PR)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanAttributedChange()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCopyDiscarded()) }},
 		{"MYSQL PLAN (EXISTING COPY DISCARDED, APPLYING)", func() {
@@ -219,7 +224,7 @@ func previewCommentPlanAllOutput() {
 		{"ROLLOUT PLANS (TABLE SIZES, TWO TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTwoTargetTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, THREE TARGETS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanRolloutTableSizes()) }},
 		{"ROLLOUT PLANS (TABLE SIZES, REVIEWED TARGET ONLY)", func() {
-			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutReviewedTargetTableSizes())
+			fmt.Print(webhooktemplates.PreviewCommentPlanRolloutPrimaryTargetTableSizes())
 		}},
 		{"DROP COLUMN BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropColumnBlocked()) }},
 		{"DROP INDEX BLOCKED", func() { fmt.Print(webhooktemplates.PreviewCommentDropIndexBlocked()) }},
@@ -233,6 +238,8 @@ func previewCommentPlanAllOutput() {
 		{"DATABASE NOT FOUND", func() { fmt.Print(webhooktemplates.PreviewCommentErrorNotFound()) }},
 		{"DATABASE NOT FOUND (REPOSITORY TOO LARGE TO SEARCH IN FULL)", func() { fmt.Print(webhooktemplates.PreviewCommentErrorNotFoundScoped()) }},
 		{"DATABASE NOT CONFIGURED", func() { fmt.Print(webhooktemplates.PreviewCommentErrorDatabaseNotConfigured()) }},
+		{"DATABASE NOT REGISTERED", func() { fmt.Print(webhooktemplates.PreviewCommentErrorDatabaseNotRegistered()) }},
+		{"DATABASES NOT REGISTERED", func() { fmt.Print(webhooktemplates.PreviewCommentErrorDatabasesNotRegistered()) }},
 		{"DATABASE NOT AVAILABLE TO THIS REPOSITORY", func() { fmt.Print(webhooktemplates.PreviewCommentErrorDatabaseRepoNotAllowed()) }},
 		{"REPOSITORY TOO LARGE TO SEARCH", func() { fmt.Print(webhooktemplates.PreviewCommentErrorRepositoryTruncated()) }},
 		{"INVALID CONFIG", func() { fmt.Print(webhooktemplates.PreviewCommentErrorInvalid()) }},
@@ -291,6 +298,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: ENVIRONMENT NOT IN PROMOTION ORDER", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByUnlistedEnvironment()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequired()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (NO OPERATORS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredNoOperators()) }},
+		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApproval()) }},
 		{"APPLY BLOCKED: REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
 		{"APPLY BLOCKED: CHECKS NOT PASSING", func() {
 			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{

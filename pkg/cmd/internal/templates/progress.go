@@ -451,22 +451,37 @@ func isInstantAlter(t TableProgress) bool {
 	return t.IsInstant && ddl.OpToStatementType(t.ChangeType) == ddl.StatementAlterTable
 }
 
+// writeTableLine writes a table's status line: the table, then its state as
+// format renders it. A table rolled up across targets ends the line with its
+// target counts, so the bar, which sums the rows of the targets that have
+// started, is never read as the whole rollout's progress.
+func writeTableLine(b *strings.Builder, t TableProgress, format string, args ...any) {
+	fmt.Fprintf(b, indentTable+progressSymbol(t.ChangeType)+"%s: ", t.TableName)
+	fmt.Fprintf(b, format, args...)
+	b.WriteString(acrossTargetsCounts(t))
+	b.WriteString("\n")
+}
+
 // FormatTableProgressWithActivity returns progress for a single table using the
 // provided activity bar and label when row-copy progress has exceeded its
 // estimate.
 func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel string) string {
+	if isHaltedAcrossTargets(t) {
+		return formatHaltedAcrossTargets(t)
+	}
+
 	var b strings.Builder
 
 	// Handle special states first - all use format: tablename: [bar] [status]
 	switch t.Status {
 	case state.Apply.Pending:
 		// Pending = queued, not yet started
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Queued\n", t.TableName)
+		writeTableLine(&b, t, "⏳ Queued")
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Completed:
 		bar := ui.ProgressBarComplete()
@@ -474,19 +489,19 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if isInstantAlter(t) {
 			label = "⚡ Applied instantly"
 		}
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
+		writeTableLine(&b, t, "%s %s", bar, label)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Task.CatchingUp:
 		// Row copy is done; the engine is applying the changes that accumulated
 		// from live traffic during the copy. On a busy source this catch-up can
 		// run for a long time, so name the phase instead of showing a serene
 		// full bar that looks finished.
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Catching up on accumulated changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
+		writeTableLine(&b, t, "%s ⏩ Catching up on accumulated changes...", ui.ProgressBarRowCopy(100))
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
@@ -494,7 +509,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Task.Checksumming:
 		// Row copy is done; the engine is verifying the copied data against the
@@ -503,7 +518,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.ChecksumRowsTotal > 0 {
 			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
 			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data (%s)%s\n", t.TableName, ui.ProgressBarRowCopy(pct),
+			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data (%s)%s", ui.ProgressBarRowCopy(pct),
 				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
@@ -511,20 +526,20 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentDetail+"Rows verified: %s / %s\n",
 				ui.FormatNumber(ui.ClampRows(t.ChecksumRowsChecked, t.ChecksumRowsTotal)), ui.FormatNumber(t.ChecksumRowsTotal))
 		} else {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🔍 Checksumming to verify data...%s\n", t.TableName, ui.ProgressBarRowCopy(100), throttledSuffix(t))
+			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data...%s", ui.ProgressBarRowCopy(100), throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 		}
 		writeThrottleTooltip(&b, t)
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Task.PostChecksum:
 		// The verify passed and the engine is applying the changes that
 		// accumulated while it ran. Named separately from the pre-checksum
 		// catch-up so the display doesn't rewind to an earlier phase.
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏩ Data verified, applying final changes...\n", t.TableName, ui.ProgressBarRowCopy(100))
+		writeTableLine(&b, t, "%s ⏩ Data verified, applying final changes...", ui.ProgressBarRowCopy(100))
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
@@ -532,38 +547,38 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentDetail+"Rows copied: %s\n", ui.FormatNumber(t.RowsCopied))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Task.WaitingForCutover:
 		bar := ui.ProgressBarWaitingCutover()
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Waiting for cutover\n", t.TableName, bar)
+		writeTableLine(&b, t, "%s Waiting for cutover", bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Recovering:
 		if recoveringIsCopyingRows(t) {
 			pct := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Row copy in progress (%s)\n", t.TableName, bar,
+			writeTableLine(&b, t, "%s Row copy in progress (%s)", bar,
 				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 			if t.DDL != "" {
 				b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 			}
 			writeStructuredRowsAndETA(&b, t)
 			b.WriteString("\n")
-			b.WriteString(FormatShardProgress(t.Shards))
+			b.WriteString(formatTableParts(t))
 			return b.String()
 		}
 		bar := ui.ProgressBarRowCopy(t.PercentComplete)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Recovering state...\n", t.TableName, bar)
+		writeTableLine(&b, t, "%s Recovering state...", bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.CuttingOver:
 		bar := ui.ProgressBarRowCopy(100) // blue — still in progress
@@ -572,89 +587,89 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if op == ddl.StatementCreateTable || op == ddl.StatementDropTable {
 			label = "Applying..."
 		}
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s\n", t.TableName, bar, label)
+		writeTableLine(&b, t, "%s %s", bar, label)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Failed:
 		bar := ui.ProgressBarFailed(ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied))
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s "+glyph.Failed+" Failed\n", t.TableName, bar)
+		writeTableLine(&b, t, "%s "+glyph.Failed+" Failed", bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.FailedRetryable:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			retryPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(retryPercent, ui.ColorYellow)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Retrying\n", t.TableName, bar)
+			writeTableLine(&b, t, "%s Retrying", bar)
 		} else {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: Retrying\n", t.TableName)
+			writeTableLine(&b, t, "Retrying")
 		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.RevertWindow:
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete but revert available
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Complete (revert window open)\n", t.TableName, bar)
+		writeTableLine(&b, t, "%s Complete (revert window open)", bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.SkippingRevert:
 		bar := ui.ProgressBarWaitingCutover() // yellow — complete, revert window closing
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ✓ Complete (finalizing)\n", t.TableName, bar)
+		writeTableLine(&b, t, "%s ✓ Complete (finalizing)", bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Reverting:
 		bar := ui.ProgressBarWaitingCutover() // yellow — undoing the change
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverting\n", t.TableName, bar)
+		writeTableLine(&b, t, "%s ↩️ Reverting", bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Reverted:
 		// The change was applied, then undone at operator request — a
 		// successful revert, not a failure. Full orange bar: terminal,
 		// change not in effect.
 		bar := ui.ProgressBar(100, ui.ColorOrange)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ↩️ Reverted\n", t.TableName, bar)
+		writeTableLine(&b, t, "%s ↩️ Reverted", bar)
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Cancelled:
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s 🚫 Cancelled at %s\n", t.TableName, bar,
+			writeTableLine(&b, t, "%s 🚫 Cancelled at %s", bar,
 				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		} else {
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: 🚫 Cancelled (not started)\n", t.TableName)
+			writeTableLine(&b, t, "🚫 Cancelled (not started)")
 		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	case state.Apply.Stopped:
 		// Show orange progress bar with current progress when stopped
@@ -663,12 +678,12 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		switch {
 		case t.PercentComplete >= 100:
 			// At 100% = was waiting for cutover when stopped
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped (was waiting for cutover)\n", t.TableName, bar)
+			writeTableLine(&b, t, "%s ⏹️ Stopped (was waiting for cutover)", bar)
 		case t.PercentComplete > 0 || t.RowsCopied > 0:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s ⏹️ Stopped at %s\n", t.TableName, bar,
+			writeTableLine(&b, t, "%s ⏹️ Stopped at %s", bar,
 				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
 		default:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏹️ Stopped (not started)\n", t.TableName)
+			writeTableLine(&b, t, "⏹️ Stopped (not started)")
 		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
@@ -677,7 +692,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatTableSizeClause(t.EstimatedBytes))
 		}
 		b.WriteString("\n")
-		b.WriteString(FormatShardProgress(t.Shards))
+		b.WriteString(formatTableParts(t))
 		return b.String()
 	}
 
@@ -689,7 +704,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// (Vitess VReplication / Spirit ramp-up — can take a while on a large
 		// table). Show a starting indicator and the row total instead of a 0%
 		// bar that reads as stuck.
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ⏳ Starting copy...%s\n", t.TableName, throttledSuffix(t))
+		writeTableLine(&b, t, "⏳ Starting copy...%s", throttledSuffix(t))
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
 		}
@@ -704,7 +719,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// Row copy in progress — show progress bar with structured fields
 		displayPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 		bar := ui.ProgressBarRowCopy(displayPercent)
-		fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s %s%s\n", t.TableName, bar,
+		writeTableLine(&b, t, "%s %s%s", bar,
 			ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), throttledSuffix(t))
 
 		if t.DDL != "" {
@@ -724,11 +739,11 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		op := ddl.OpToStatementType(t.ChangeType)
 		switch {
 		case isInstantAlter(t):
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying instantly...%s\n", t.TableName, bar, throttledSuffix(t))
+			writeTableLine(&b, t, "%s Applying instantly...%s", bar, throttledSuffix(t))
 		case op == ddl.StatementCreateTable || op == ddl.StatementDropTable:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Applying...%s\n", t.TableName, bar, throttledSuffix(t))
+			writeTableLine(&b, t, "%s Applying...%s", bar, throttledSuffix(t))
 		default:
-			fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: %s Running...%s\n", t.TableName, bar, throttledSuffix(t))
+			writeTableLine(&b, t, "%s Running...%s", bar, throttledSuffix(t))
 		}
 		if t.DDL != "" {
 			b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
@@ -739,7 +754,7 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	if len(t.Shards) == 0 {
 		b.WriteString("\n")
 	}
-	b.WriteString(FormatShardProgress(t.Shards))
+	b.WriteString(formatTableParts(t))
 	return b.String()
 }
 

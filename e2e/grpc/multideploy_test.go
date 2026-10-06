@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/mysql"
 	"github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/e2eutil"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -947,4 +948,99 @@ func TestGRPCMultiDeploy_BarrierReleaseBounded(t *testing.T) {
 	)
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+}
+
+// TestGRPCMultiDeploy_TargetsRolloutThroughCLI runs a multi-target rollout
+// through the CLI end to end.
+//
+// Scenario: testapp/production-targets addresses one target in each of the
+// eu and us deployments through a targets list, so each member is planned
+// against its own live schema. The two targets hold different versions of the
+// same table, so the plan says what applies where: eu adds one column, us adds
+// two. The CLI applies the environment as one rollout, each target runs its
+// own plan, and progress reports one completed section per deployment.
+func TestGRPCMultiDeploy_TargetsRolloutThroughCLI(t *testing.T) {
+	requireMultiDeploy(t)
+	bin := grpcCLIBuildOrFind(t)
+	endpoint := grpcSchemabotURL(t)
+
+	const (
+		database = "testapp"
+		env      = "production-targets"
+	)
+	tableName := uniqueGRPCTableName("md_targets")
+	multiDeployCreateTestTable(t, "eu", tableName, fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL)", tableName))
+	multiDeployCreateTestTable(t, "us", tableName, fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)", tableName))
+	multiDeployEnsureNoActiveChange(t, database, env, "eu", "us")
+
+	schemaDir := grpcCLISchemaDir(t, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) DEFAULT NULL);", tableName),
+	})
+
+	out := e2eutil.RunCLIInDir(t, bin, schemaDir, "plan",
+		"-s", ".",
+		"-e", env,
+		"--endpoint", endpoint,
+	)
+	e2eutil.AssertContains(t, out, "▸ target eu")
+	e2eutil.AssertContains(t, out, "▸ target us")
+	e2eutil.AssertContains(t, out, "ADD COLUMN")
+	e2eutil.AssertContains(t, out, "`email`")
+	e2eutil.AssertContains(t, out, "`name`")
+
+	out = e2eutil.RunCLIInDir(t, bin, schemaDir, "apply",
+		"-s", ".",
+		"-e", env,
+		"--endpoint", endpoint,
+		"-y",
+		"--watch=false",
+	)
+	e2eutil.AssertContains(t, out, "Apply started")
+	applyID := parseApplyID(t, out)
+
+	testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, orderedCutoverDeadline)
+
+	out = e2eutil.RunCLIInDir(t, bin, schemaDir, "progress",
+		applyID,
+		"--endpoint", endpoint,
+		"--watch=false",
+	)
+	// Each deployment addresses one target, so each is its own section naming
+	// that target; a deployment of several targets rolls up instead, which
+	// TestProgressCmd_MultiTargetDeploymentsRenderAsRollups covers.
+	e2eutil.AssertContains(t, out, "Deployments:  2 completed")
+	e2eutil.AssertContains(t, out, "✅ eu — completed (testapp)")
+	e2eutil.AssertContains(t, out, "✅ us — completed (testapp)")
+	e2eutil.AssertContains(t, out, "~ "+tableName+":")
+
+	for _, deployment := range []string{"eu", "us"} {
+		for _, column := range []string{"name", "email"} {
+			assert.Truef(t, multiDeployColumnExists(t, deployment, tableName, column),
+				"expected column %s.%s on %s after the rollout", tableName, column, deployment)
+		}
+	}
+
+	multiDeployEnsureNoActiveChange(t, database, env, "eu", "us")
+}
+
+// multiDeployColumnExists reports whether a column exists on one deployment's
+// target MySQL.
+func multiDeployColumnExists(t *testing.T, deployment, tableName, columnName string) bool {
+	t.Helper()
+	db, err := sql.Open("block-mysql", multiDeployTernMySQLDSN(t, deployment))
+	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
+	defer utils.CloseAndLog(db)
+	require.NoErrorf(t, db.PingContext(t.Context()), "ping tern mysql (%s)", deployment)
+
+	var count int
+	err = db.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM information_schema.COLUMNS
+		 WHERE TABLE_SCHEMA = 'testapp' AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+		tableName, columnName,
+	).Scan(&count)
+	require.NoErrorf(t, err, "check column %s.%s on %s", tableName, columnName, deployment)
+	return count > 0
 }

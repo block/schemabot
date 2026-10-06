@@ -17,11 +17,12 @@ import (
 )
 
 // namespaceSelectingTernClient answers the primary's plan and every member's
-// diff with the same engine and no changes, recording which namespaces each
-// request carried.
+// diff with the same engine, recording which namespaces each request carried.
+// The plan carries planChanges, and the diff no changes.
 type namespaceSelectingTernClient struct {
 	tern.Client
 	mu             sync.Mutex
+	planChanges    []*ternv1.SchemaChange
 	planNamespaces []string
 	diffNamespaces []string
 }
@@ -30,7 +31,7 @@ func (c *namespaceSelectingTernClient) Plan(_ context.Context, req *ternv1.PlanR
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.planNamespaces = slices.Sorted(maps.Keys(req.GetSchemaFiles()))
-	return &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT}, nil
+	return &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT, Changes: c.planChanges}, nil
 }
 
 func (c *namespaceSelectingTernClient) PlanDiff(_ context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {

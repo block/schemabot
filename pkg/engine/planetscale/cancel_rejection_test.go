@@ -27,10 +27,13 @@ func TestClassifyCancelRejection_EveryDeploymentStateIsClassified(t *testing.T) 
 		state.DeployRequest.Complete:  cancelRejectionAlreadyCompleted,
 		state.DeployRequest.NoChanges: cancelRejectionAlreadyCompleted,
 
+		// Not yet deployed: cancel has nothing to reach, so the deploy request
+		// is closed instead.
+		state.DeployRequest.Pending: cancelRejectionUndeployed,
+		state.DeployRequest.Ready:   cancelRejectionUndeployed,
+
 		// Still live: a rejected cancel here is a backend surprise that must
 		// surface as an error naming the state.
-		state.DeployRequest.Pending:           cancelRejectionStateError,
-		state.DeployRequest.Ready:             cancelRejectionStateError,
 		state.DeployRequest.Submitting:        cancelRejectionStateError,
 		state.DeployRequest.Queued:            cancelRejectionStateError,
 		state.DeployRequest.InProgress:        cancelRejectionStateError,

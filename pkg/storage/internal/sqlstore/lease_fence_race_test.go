@@ -127,10 +127,10 @@ func TestTaskStore_OperationLeaseDoesNotWriteASiblingOperationsTask(t *testing.T
 }
 
 // testLeaseFencedWritesFailClosedAgainstConcurrentSteal pins that a displaced
-// driver's task and comment writes never land once another driver has taken
-// the lease. The steal is applied but left uncommitted while the displaced
-// driver writes, so the write's statement snapshot still holds the token the
-// steal is replacing. The write must wait on the lease row, fail closed with
+// driver's task, comment, log, control request and check writes never land once another driver
+// has taken the lease. The steal is applied but left uncommitted while the
+// displaced driver writes, so the write's statement snapshot still holds the
+// token the steal is replacing. The write must wait on the lease row, fail closed with
 // ErrApplyLeaseLost once the steal commits, and leave the row as it was; the
 // driver that took the lease then writes normally.
 func testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t *testing.T, newStore func(t *testing.T) *Storage, waiting lockWaiter) {
@@ -232,6 +232,193 @@ func testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t *testing.T, newStor
 			require.NotNil(t, persisted)
 			assert.Equal(t, int64(300), persisted.GitHubCommentID)
 		})
+	}
+
+	// A new per-shard progress row is inserted from its lease row, so the fence
+	// gates the insert under either lease a drive may hold.
+	t.Run("shard progress insert under an operation lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_shard_op_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateApplyWithTask(t, store, lock, "apply_fence_shard_op", 935)
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-a", Target: "payments"})
+		require.NoError(t, err)
+		_, err = store.db.ExecContext(ctx, `UPDATE apply_operations SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-a", "tok-a", opID)
+		require.NoError(t, err)
+
+		displacedCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opID, Owner: "driver-a", Token: "tok-a"})
+		err = writeDuringUncommittedSteal(t, store, waiting, "INSERT INTO tasks",
+			func() error {
+				return store.Tasks().UpsertShardProgress(displacedCtx, newShardProgressTask(apply, opID, "-80"))
+			},
+			`UPDATE apply_operations SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", opID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		rows, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		assert.Empty(t, rows, "a displaced driver must not insert a shard progress row")
+
+		ownerCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opID, Owner: "driver-b", Token: "tok-b"})
+		require.NoError(t, store.Tasks().UpsertShardProgress(ownerCtx, newShardProgressTask(apply, opID, "-80")))
+		rows, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		assert.Equal(t, "-80", rows[0].Shard)
+	})
+
+	t.Run("shard progress insert under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_shard_apply_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_shard_apply", 936, "driver-a")
+		opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: apply.ID, Deployment: "region-a", Target: "payments"})
+		require.NoError(t, err)
+
+		displacedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken})
+		err = writeDuringUncommittedSteal(t, store, waiting, "INSERT INTO tasks",
+			func() error {
+				return store.Tasks().UpsertShardProgress(displacedCtx, newShardProgressTask(apply, opID, "-80"))
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		rows, err := store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		assert.Empty(t, rows, "a displaced driver must not insert a shard progress row")
+
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-b", Token: "tok-b"})
+		require.NoError(t, store.Tasks().UpsertShardProgress(ownerCtx, newShardProgressTask(apply, opID, "-80")))
+		rows, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		assert.Equal(t, "-80", rows[0].Shard)
+	})
+
+	t.Run("apply log append under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_log_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_log", 937, "driver-a")
+		before, err := store.ApplyLogs().GetByApply(ctx, apply.ID)
+		require.NoError(t, err)
+
+		displacedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken})
+		err = writeDuringUncommittedSteal(t, store, waiting, "INSERT INTO apply_logs",
+			func() error {
+				return store.ApplyLogs().Append(displacedCtx, &storage.ApplyLog{
+					ApplyID: apply.ID, Level: storage.LogLevelInfo, EventType: storage.LogEventStateTransition, Message: "displaced driver",
+				})
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		logs, err := store.ApplyLogs().GetByApply(ctx, apply.ID)
+		require.NoError(t, err)
+		assert.Len(t, logs, len(before), "a displaced driver must not append to the apply's log")
+
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-b", Token: "tok-b"})
+		require.NoError(t, store.ApplyLogs().Append(ownerCtx, &storage.ApplyLog{
+			ApplyID: apply.ID, Level: storage.LogLevelInfo, EventType: storage.LogEventStateTransition, Message: "current driver",
+		}))
+		logs, err = store.ApplyLogs().GetByApply(ctx, apply.ID)
+		require.NoError(t, err)
+		require.Len(t, logs, len(before)+1)
+		assert.Equal(t, "current driver", logs[len(logs)-1].Message)
+	})
+
+	// A control request is settled by joining its apply's lease row, the same
+	// statement shape as the apply-lease task update, so the fence has to make
+	// a displaced driver's settlement wait on that row and fail closed.
+	t.Run("control request completion under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_control_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_control", 940, "driver-a")
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID: apply.ID, Operation: storage.ControlOperationStop, RequestedBy: "operator",
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+
+		displacedCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: apply.LeaseOwner, Token: apply.LeaseToken})
+		err = writeDuringUncommittedSteal(t, store, waiting, "UPDATE apply_control_requests",
+			func() error {
+				return store.ControlRequests().CompletePending(displacedCtx, apply.ID, storage.ControlOperationStop)
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		pending, err := store.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "a displaced driver must not settle the request")
+		assert.Equal(t, storage.ControlRequestPending, pending.Status)
+
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-b", Token: "tok-b"})
+		require.NoError(t, store.ControlRequests().CompletePending(ownerCtx, apply.ID, storage.ControlOperationStop))
+		pending, err = store.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		assert.Nil(t, pending, "the driver holding the lease settles the request")
+	})
+
+	t.Run("check completion under an apply lease", func(t *testing.T) {
+		ctx := t.Context()
+		store := newStore(t)
+		lock := storagetest.CreateLock(t, store, "fence_check_db", storage.DatabaseTypeMySQL)
+		apply := storagetest.CreateClaimedApply(t, store, lock, "apply_fence_check", 938, "driver-a")
+		check := &storage.Check{
+			Repository: lock.Repository, PullRequest: lock.PullRequest, HeadSHA: "abc",
+			Environment: apply.Environment, DatabaseType: lock.DatabaseType, DatabaseName: lock.DatabaseName,
+			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
+		}
+		require.NoError(t, store.Checks().Upsert(ctx, check))
+		completion := *check
+		completion.HasChanges = false
+		completion.Status = "completed"
+		completion.Conclusion = "success"
+
+		err := writeDuringUncommittedSteal(t, store, waiting, "UPDATE checks",
+			func() error {
+				_, err := store.Checks().CompleteForApply(ctx, &completion, apply)
+				return err
+			},
+			`UPDATE applies SET lease_owner = ?, lease_token = ? WHERE id = ?`, "driver-b", "tok-b", apply.ID)
+		require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+		stored, err := store.Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "in_progress", stored.Status, "a displaced driver must not complete the check")
+
+		current := *apply
+		current.LeaseOwner = "driver-b"
+		current.LeaseToken = "tok-b"
+		updated, err := store.Checks().CompleteForApply(ctx, &completion, &current)
+		require.NoError(t, err)
+		assert.True(t, updated)
+		stored, err = store.Checks().Get(ctx, check.Repository, check.PullRequest, check.Environment, check.DatabaseType, check.DatabaseName)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "completed", stored.Status)
+	})
+}
+
+// newShardProgressTask builds a per-shard progress row for operation opID of
+// apply.
+func newShardProgressTask(apply *storage.Apply, opID int64, shard string) *storage.Task {
+	now := time.Now()
+	return &storage.Task{
+		TaskIdentifier:   "task_shard_" + apply.ApplyIdentifier + shard,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		PlanID:           apply.PlanID,
+		Database:         apply.Database,
+		DatabaseType:     apply.DatabaseType,
+		Engine:           storage.EnginePlanetScale,
+		Environment:      apply.Environment,
+		State:            state.Task.Running,
+		Namespace:        "payments",
+		TableName:        "users",
+		Shard:            shard,
+		DDL:              "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:        "ALTER",
+		ProgressPercent:  20,
+		CreatedAt:        now,
+		UpdatedAt:        now,
 	}
 }
 

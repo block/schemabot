@@ -264,8 +264,9 @@ Users can control a running schema change via CLI, PR comments, or PlanetScale U
 Not every engine supports every operation — [Engines](engines.md) has the per-engine
 capability matrix and where in a change's life each operation acts.
 
-SchemaBot exposes no throughput control. On Spirit, the copy autoscales its write
-threads from live throttler feedback. On Vitess, throughput is a property of the
+SchemaBot exposes no throughput control. On Spirit, the copy autoscales its
+thread pools from live throttler feedback on Aurora targets; on other MySQL
+targets it runs at fixed thread counts. On Vitess, throughput is a property of the
 deploy request itself: adjust its throttle directly in the PlanetScale console,
 where the setting is the one the platform actually applies.
 

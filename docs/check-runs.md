@@ -752,11 +752,11 @@ records become `success` and the aggregate passes. Auto-plan skips the PR
 comment when no member in any environment has changes and nothing errored,
 but it still writes the check state.
 
-Two cases keep the comment even though no environment's reviewed plan has
+Two cases keep the comment even though no environment's primary target has
 changes, because the reviewer needs to be told why the check is not passing. A
 deployment that diverged or could not be verified fails the check closed, and
 the comment explains the failure. A rollout of independent targets whose
-reviewed target is already at the desired schema, while another target is not,
+primary target is already at the desired schema, while another target is not,
 keeps the check pending (MG-12), and the comment is the only place that shows
 the plans those targets still need. It offers `schemabot apply` for them, unless
 a PR apply would refuse one of those plans whatever its flags (see
@@ -917,7 +917,7 @@ result writes per-database records and updates the aggregate.
 
 If the plan finds no changes on any rollout member, that environment's record
 becomes `success`. If it finds changes on any member, the record becomes
-`action_required`, including when the reviewed primary is already at the desired
+`action_required`, including when the primary target is already at the desired
 schema and only another target still needs the change (MG-12). If planning fails, SchemaBot
 posts a failure comment; when every environment in a multi-environment plan
 fails, it also publishes a failing aggregate check.
@@ -926,12 +926,12 @@ fails, it also publishes a failing aggregate check.
 
 `schemabot apply -e <environment>` re-plans before acquiring a lock, then plans
 the environment's other rollout members before answering, whether or not the
-reviewed plan has changes. A target planned against a schema of its own runs
-the plan this round stores for it; a target that mirrors the reviewed one runs
-the reviewed plan.
+primary target's plan has changes. A target planned against a schema of its own runs
+the plan this round stores for it; a target that mirrors the primary runs
+the primary target's plan.
 
-When no target other than the reviewed one has work under a plan of its own,
-and the reviewed plan has changes that pass safety checks, SchemaBot acquires a lock, stores `action_required`, updates the
+When no target other than the primary has work under a plan of its own,
+and the primary target's plan has changes that pass safety checks, SchemaBot acquires a lock, stores `action_required`, updates the
 aggregate, posts the plan comment, and submits the apply in the same step. If
 storing `action_required` fails, nothing is submitted: SchemaBot releases the
 lock and posts an error, and the command can be retried. It pauses for
@@ -943,12 +943,12 @@ change to direct execution that the stored plan did not. When no target has
 work, SchemaBot posts a no-change plan comment and does not acquire a lock.
 
 When other targets have work under plans of their own, whether or not the
-reviewed target does,
+primary target does,
 SchemaBot stores `action_required` before anything else can end the apply, so
 an apply that loses the lock race or fails a later gate still leaves the record
 blocking. It then acquires the lock and pauses for `apply-confirm` behind a
 comment that renders each target's own plan, since the one-step gates read only
-the reviewed plan. Confirming runs each target's plan on that target, and the
+the primary target's plan. Confirming runs each target's plan on that target, and the
 record keeps blocking merge until every target has the change (MG-12).
 
 The apply is refused instead, with nothing run and the record left
@@ -956,30 +956,30 @@ The apply is refused instead, with nothing run and the record left
 confirmed, when the comment cannot render every target's plan, or when a
 target's plan carries work that comment cannot disclose for confirmation. That
 is a change its engine refuses, an unfinished copy it would discard, work the
-apply's operation shape has no place for, or an unsafe change the reviewed plan
-does not carry. An unsafe change the reviewed plan carries too, in the same
+apply's operation shape has no place for, or an unsafe change the primary target's plan
+does not carry. An unsafe change the primary target's plan carries too, in the same
 statement up to its schema qualifier, runs under `--allow-unsafe` like the
-reviewed plan's. When the reviewed target is already at the desired schema, any
+primary target's own. When the primary target is already at the desired schema, any
 unsafe, per-shard or finalizer change on another target is refused, since the
-reviewed plan discloses none. A target's direct-execution change is not
+primary target's plan discloses none. A target's direct-execution change is not
 refused: the comment discloses it under that target, and confirming runs it
 there as native DDL that blocks writes to the table until it finishes. It runs
 only from that apply-confirm; an apply created any other way, such as a
-`POST /api/apply` of the reviewed plan, refuses it. A target whose data plane
+`POST /api/apply` of the primary target's plan, refuses it. A target whose data plane
 could not say whether it holds an unfinished copy, because it does not look or
 its lookup failed, is refused the same way. The plan comment offers no apply
 for a rollout it knows would be refused, and says why in its place.
 
 Apply-confirm asks all of this again against the rollout as it is at confirm,
 and also refuses when a target's work differs from what the confirmed comment
-showed, the reviewed target's included, or when a reviewed target confirmed as
+showed, the primary target's included, or when a primary target confirmed as
 already converged has since gained changes of its own. A target's work is its
-whole plan: its table statements and how each runs, each shard's own changes,
+whole plan: its table statements, how each runs and whether each is unsafe and why, each shard's own changes,
 which namespaces end with a finalizer, and the VSchema each of those writes.
-The reviewed target is held to the confirmed plan while the environment has
+The primary target is held to the confirmed plan while the environment has
 several targets, and also when the confirmed round stored plans for other
-targets, even if the rollout has since shrunk to the reviewed target alone.
-So a reviewed-target statement whose DDL is unchanged but that now runs as
+targets, even if the rollout has since shrunk to the primary target alone.
+So a statement on the primary target whose DDL is unchanged but that now runs as
 direct execution, or is now blocked, refuses here and releases the lock rather
 than pausing again or being rejected as blocked, as it would on a single
 target. The refusal names the target whose plan changed and the part of its

@@ -78,6 +78,10 @@ type PSClient interface {
 	DeployDeployRequest(ctx context.Context, req *ps.PerformDeployRequest) (*ps.DeployRequest, error)
 	GetDeployRequest(ctx context.Context, req *ps.GetDeployRequestRequest) (*ps.DeployRequest, error)
 	CancelDeployRequest(ctx context.Context, req *ps.CancelDeployRequestRequest) (*ps.DeployRequest, error)
+	// CloseDeployRequest closes a deploy request that has not been deployed.
+	// Cancel only reaches a deploy that is queued or running; an undeployed
+	// deploy request is retired by closing it instead.
+	CloseDeployRequest(ctx context.Context, req *ps.CloseDeployRequestRequest) (*ps.DeployRequest, error)
 	ApplyDeployRequest(ctx context.Context, req *ps.ApplyDeployRequestRequest) (*ps.DeployRequest, error)
 	RevertDeployRequest(ctx context.Context, req *ps.RevertDeployRequestRequest) (*ps.DeployRequest, error)
 	SkipRevertDeployRequest(ctx context.Context, req *ps.SkipRevertDeployRequestRequest) (*ps.DeployRequest, error)
@@ -452,6 +456,10 @@ func (w *psClientWrapper) GetDeployRequest(ctx context.Context, req *ps.GetDeplo
 
 func (w *psClientWrapper) CancelDeployRequest(ctx context.Context, req *ps.CancelDeployRequestRequest) (*ps.DeployRequest, error) {
 	return w.client.DeployRequests.CancelDeploy(ctx, req)
+}
+
+func (w *psClientWrapper) CloseDeployRequest(ctx context.Context, req *ps.CloseDeployRequestRequest) (*ps.DeployRequest, error) {
+	return w.client.DeployRequests.CloseDeploy(ctx, req)
 }
 
 func (w *psClientWrapper) ApplyDeployRequest(ctx context.Context, req *ps.ApplyDeployRequestRequest) (*ps.DeployRequest, error) {

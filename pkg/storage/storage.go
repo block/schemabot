@@ -136,6 +136,9 @@ type Storage interface {
 type LockStore interface {
 	// Acquire attempts to acquire a lock. Returns ErrLockHeld if already held by another owner.
 	// If the same owner already holds the lock, this is a no-op (idempotent).
+	// When Acquire creates the lock row it sets lock.ID to the new row's ID; a
+	// re-acquire leaves lock.ID as passed, so a caller passing a new Lock can
+	// tell a row it created (non-zero ID) from one the owner already held.
 	Acquire(ctx context.Context, lock *Lock) error
 
 	// AcquireIfPendingPlanID acquires like Acquire, but only while the lock is
@@ -151,12 +154,14 @@ type LockStore interface {
 	Release(ctx context.Context, database, dbType, owner string) error
 
 	// ReleaseByID releases the lock only while the row with the given ID still
-	// holds it under the given owner, so a caller that authorized the release
-	// against that row's recorded acquirer can never delete a newer lock. It
+	// holds it under the given owner and pending plan, so a caller that
+	// authorized the release against the row it read can never delete a newer
+	// lock, nor a lock its owner acquired again for a new plan since. It
 	// returns ErrLockNotFound when no lock is held, ErrLockReplaced when a
-	// different row holds the lock, and ErrLockNotOwned when the row is held
-	// under another owner.
-	ReleaseByID(ctx context.Context, id int64, database, dbType, owner string) error
+	// different row holds the lock, ErrLockNotOwned when the row is held under
+	// another owner, and ErrLockIntentChanged when the row now carries another
+	// pending plan.
+	ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
 
 	// ReleaseIfPendingPlanID releases a lock only while both its owner and
 	// pending plan still match. A mismatch is a no-op so a superseding apply or
@@ -526,7 +531,7 @@ type ListPlansOptions struct {
 	// within one repository, so List errors when it is set alone.
 	PullRequest int
 	// PrimaryPlanIdentifier, when set, restricts results to the member plans
-	// produced alongside that reviewed plan — the one review round's members,
+	// produced alongside that primary plan — the one review round's members,
 	// rather than every plan stored for the pull request.
 	PrimaryPlanIdentifier string
 	// Since, when set, restricts results to plans created at or after this

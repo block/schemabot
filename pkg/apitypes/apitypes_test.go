@@ -1,6 +1,7 @@
 package apitypes
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -679,4 +680,33 @@ func TestPlanResponse_RenderedTablesHandlesNilInputs(t *testing.T) {
 
 	resp := &PlanResponse{Changes: []*SchemaChangeResponse{nil, {Namespace: "app"}}}
 	assert.Empty(t, resp.RenderedTables())
+}
+
+// A rollout block lists the members an apply runs on, needs attention for, or
+// refuses, so a null entry in any of those lists fails the decode of the whole
+// plan response rather than reaching a reader as an entry with no member.
+func TestPlanResponse_RolloutBlockWithANullEntryFailsToDecode(t *testing.T) {
+	for _, tc := range []struct {
+		list, want string
+	}{
+		{list: "groups", want: "group 1 is null"},
+		{list: "attention", want: "attention entry 1 is null"},
+		{list: "refused", want: "refusal 1 is null"},
+		{list: "table_sizes", want: "table size 1 is null"},
+	} {
+		t.Run(tc.list, func(t *testing.T) {
+			body := fmt.Sprintf(`{"plan_id":"plan-orders-1","rollout":{"members":2,%q:[{"member":"prod/payments-001","members":["prod/payments-001"]},null]}}`, tc.list)
+			var resp PlanResponse
+			err := json.Unmarshal([]byte(body), &resp)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "decode rollout block: "+tc.want)
+		})
+	}
+
+	var resp PlanResponse
+	require.NoError(t, json.Unmarshal([]byte(`{"plan_id":"plan-orders-1","rollout":{"members":2,"groups":[{"members":["prod/payments-001","prod/payments-002"],"primary":true,"changes":[]}]}}`), &resp))
+	require.NotNil(t, resp.Rollout)
+	assert.Equal(t, 2, resp.Rollout.Members)
+	require.Len(t, resp.Rollout.Groups, 1)
+	assert.Equal(t, []string{"prod/payments-001", "prod/payments-002"}, resp.Rollout.Groups[0].Members)
 }

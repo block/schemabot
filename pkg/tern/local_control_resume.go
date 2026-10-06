@@ -474,7 +474,9 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 			// DDL.
 			logger.Error("resume aborting task: the re-plan no longer includes the task's reviewed DDL",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-			c.markTaskFailed(ctx, task, err.Error())
+			if verdictAction := c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, err.Error())); verdictAction != taskFailed {
+				return nil
+			}
 			failedTask = task
 			break
 		} else if landed {
@@ -2262,6 +2264,80 @@ func (c *LocalClient) drivePlanID(apply *storage.Apply, op *storage.ApplyOperati
 	return storage.PlanIDForOperation(apply, op)
 }
 
+// failedTaskDecidingOutcome returns the failed task that already decides the
+// apply's outcome, or nil when none does. When every loaded task is terminal,
+// any failed task fails the apply. A grouped drive runs its tasks as one
+// engine operation, so there a single failed task fails the apply even while
+// siblings read non-terminal — a sibling whose failed write was refused is
+// still part of the operation that failed.
+//
+// Tasks spanning more than one operation never decide: the whole-apply drive
+// that loads every task of a rollout sees a sibling deployment's recorded
+// failure next to deployments that have not started, and that failure is the
+// rollout projection's to weigh under the apply's failure policy, not this
+// drive's unrecorded outcome. Reading it as one would fail a never-started
+// sibling with a failure that is not its own and turn a pending stop into a
+// permanent failure (ST-10, CO-4).
+func failedTaskDecidingOutcome(tasks []*storage.Task, grouped bool) *storage.Task {
+	if !tasksShareOneOperation(tasks) {
+		return nil
+	}
+	var failed *storage.Task
+	allTerminal := true
+	for _, task := range tasks {
+		if !state.IsTerminalTaskState(task.State) {
+			allTerminal = false
+		}
+		if failed == nil && state.IsState(task.State, state.Task.Failed) {
+			failed = task
+		}
+	}
+	if allTerminal || grouped {
+		return failed
+	}
+	return nil
+}
+
+// failedTaskDecidingResume returns the failed task that decides the outcome of
+// the apply this drive is resuming, or nil when the drive must go on to its
+// pending requests and re-plan. A stopped apply is claimed only to deliver a
+// pending control request, so its failed tasks never decide: the stop already
+// settled them, and the pending start or cancel is answered first.
+func (c *LocalClient) failedTaskDecidingResume(apply *storage.Apply, tasks []*storage.Task, options map[string]string) *storage.Task {
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		return nil
+	}
+	return failedTaskDecidingOutcome(tasks, c.usesGroupedApply(apply, options))
+}
+
+// tasksShareOneOperation reports whether every task belongs to the same
+// operation, so a failed task among them is that operation's outcome. Tasks
+// that name no operation are one operation's work.
+func tasksShareOneOperation(tasks []*storage.Task) bool {
+	if len(tasks) == 0 {
+		return true
+	}
+	first := tasks[0].ApplyOperationID
+	for _, task := range tasks[1:] {
+		if (first == nil) != (task.ApplyOperationID == nil) {
+			return false
+		}
+		if first != nil && *first != *task.ApplyOperationID {
+			return false
+		}
+	}
+	return true
+}
+
+// settledTaskFailureMessage is the apply's failure message derived from its
+// failed task: the task's own error when it recorded one.
+func settledTaskFailureMessage(task *storage.Task) string {
+	if task.ErrorMessage != "" {
+		return task.ErrorMessage
+	}
+	return fmt.Sprintf("task %s failed", task.TaskIdentifier)
+}
+
 // planIDForTasks resolves the plan a drive's tasks were built from, for the
 // paths that judge those tasks against their reviewed schema without an
 // operation in hand. Each task records its plan, and the rollout member
@@ -2306,6 +2382,18 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	// Mutable attrs (state, deployment) stay per-call so the bound logger
 	// never freezes stale values.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// A drive that failed its tasks and then could not record the apply failed
+	// leaves the apply active over failed task rows, some of them possibly
+	// still non-terminal where a task write was refused. The failed task
+	// already carries the outcome, so the apply fails from it, its remaining
+	// tasks fail with it, and it owes the same terminal side effects as the
+	// drive that failed it; re-planning instead would read the failed tasks as
+	// work to settle or re-run.
+	if failed := c.failedTaskDecidingResume(apply, tasks, options); failed != nil {
+		logger.Warn("a failed task decides the outcome of an apply that is still active; recording the apply failed from its tasks",
+			append(apply.MutableLogAttrs(), "failed_task_id", failed.TaskIdentifier)...)
+		return c.failApplyAndNotify(ctx, apply, tasks, settledTaskFailureMessage(failed))
+	}
 	// Before consuming a pending stop/cancel, learn whether the engine's
 	// backend already drove the change to a terminal outcome. If it did, the
 	// command can no longer act — the drive adopts the engine's truth and the
@@ -2358,9 +2446,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if plan == nil {
 		logger.Warn("plan row does not exist for apply; recovery cannot rebuild the reviewed DDL, marking apply failed",
 			apply.MutableLogAttrs()...)
-		c.failApplyWithTasks(ctx, apply, tasks, "plan not found during recovery")
-		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, "plan not found during recovery")
 	}
 	if len(tasks) == 0 && !isTasklessVSchemaOnlyPlan(tasks, plan) {
 		// A task-less apply has no per-table work to drive — e.g. a sharded
@@ -2460,7 +2546,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 							"error", err)
 						return fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err)
 					}
-					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err), false)
+					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err))
 				}
 				return ctx.Err()
 			}
@@ -2479,19 +2565,15 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	activeTasks := rp.ActiveTasks
+	// The apply is terminal from here, so it owes every terminal side effect
+	// now: the start that admitted this claim is answered, the requests the
+	// outcome moots are swept, and the summary posts. Nothing later re-claims
+	// a failed apply to do any of them.
 	if deferredCutoverSignalAbsent && len(activeTasks) > 0 {
 		message := "deferred cutover signal is absent but live schema does not match desired schema; manual reconciliation required"
 		logger.Error("deferred cutover recovery cannot reconcile absent cutover signal",
 			"active_task_count", len(activeTasks))
-		c.failApplyWithTasks(ctx, apply, activeTasks, message)
-		// A multi-operation drive owns only its operation; the operator's
-		// projection settles the parent and posts the terminal summary.
-		// failApplyWithTasks already logged the suppressed settle.
-		if suppressParentApplyWrites(ctx) {
-			return nil
-		}
-		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, message)
 	}
 	startControlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
 	if err != nil {
@@ -2535,25 +2617,8 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	// Task rows carry the admitting deployment's verdict, tightened to the
 	// re-plan's where this target refuses the statement now, allowing a
 	// resumed drive to fail closed without trusting whichever plan it loaded.
-	// The apply is terminal from here, so the start request that admitted this
-	// claim is settled and the observer posts the summary now; nothing later
-	// re-claims a failed apply to do either.
 	if err := blockedTaskError(activeTasks); err != nil {
-		c.failApplyWithTasks(ctx, apply, activeTasks, err.Error())
-		// A multi-operation drive owns only its operation; the operator's
-		// projection settles the parent, resolves pending control requests,
-		// and posts the terminal summary. failApplyWithTasks already logged
-		// the suppressed settle.
-		if suppressParent {
-			return nil
-		}
-		if startRequested {
-			if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
-				return failErr
-			}
-		}
-		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, err.Error())
 	}
 	// A revert-phase task is settled only by reattaching to the engine that
 	// holds its revert window or is unwinding it, and only the grouped drive
@@ -2607,7 +2672,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 					"error", err)
 				return err
 			}
-			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err, startRequested)
+			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err)
 		}
 	} else {
 		// Sequential mode: process each task one at a time
@@ -2646,7 +2711,21 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	return ctx.Err()
 }
 
-func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error, startRequested bool) error {
+// handleGroupedResumeFailure settles a grouped resume the engine refused. A
+// retryable refusal pauses the apply for operator retry; a permanent one fails
+// it through failApplyAndNotify, which owes the stored failure every terminal
+// side effect, and the engine's error is returned so the drive reports why it
+// ended. A failure write that did not land is returned instead, with nothing
+// settled, for the claim that picks the apply up next to record.
+//
+// A multi-operation drive owns only its operation: its failed tasks carry the
+// outcome, and the operator's projection settles the parent, resolves pending
+// control requests, and posts the terminal summary. The drive itself returns
+// nil there — the failure is already durably settled in the tasks, and an
+// error would read as a transient drive failure that leaves the operation
+// claimable, re-leasing already-settled work instead of letting the claim loop
+// persist the operation row from its now-failed tasks immediately.
+func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error) error {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	// A cancelled drive is why the resume returned, so the error describes the
 	// driver rather than the schema change it was reattaching to.
@@ -2656,30 +2735,17 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	if c.shouldRetryEngineError(err) {
 		logger.Warn("engine apply failed during recovery, pausing apply for operator retry",
 			"error", err)
-		c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
-		return nil
+		return c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
 	}
 
 	logger.Error("engine apply failed during recovery",
 		"error", err)
-	c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-	// A multi-operation drive owns only its operation: its failed tasks carry
-	// the outcome, and the operator's projection settles the parent, resolves
-	// pending control requests, and posts the terminal summary. The drive
-	// itself returns nil — the failure is already durably settled in the
-	// tasks, and an error here would read as a transient drive failure that
-	// leaves the operation claimable, re-leasing already-settled work instead
-	// of letting the claim loop persist the operation row from its now-failed
-	// tasks immediately. failApplyWithTasks already logged the suppressed settle.
+	if failErr := c.failApplyAndNotify(ctx, apply, tasks, err.Error()); failErr != nil {
+		return failErr
+	}
 	if suppressParentApplyWrites(ctx) {
 		return nil
 	}
-	if startRequested {
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
-			return failErr
-		}
-	}
-	c.notifyTerminalObserver(apply, tasks)
 	return err
 }
 

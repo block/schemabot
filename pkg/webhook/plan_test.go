@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -244,7 +245,7 @@ func TestBuildPlanCommentData_PostgresDropGuidanceClassifiedFromDDL(t *testing.T
 	assert.Equal(t, ddl, data.UnsafeChanges[0].DDL, "the DDL is threaded so the guidance can parse it")
 
 	rendered := templates.RenderPlanComment(data)
-	assert.Contains(t, rendered, "**Destructive drop guidance:**")
+	assert.Contains(t, rendered, "<summary>Destructive drop guidance</summary>")
 	assert.Contains(t, rendered, "no longer reads from or writes to the dropped column.")
 }
 
@@ -279,7 +280,7 @@ func TestRenderMultiEnvPlanComment_PostgresDropGuidanceClassifiedFromDDL(t *test
 
 	rendered := templates.RenderMultiEnvPlanComment(data)
 
-	assert.Contains(t, rendered, "**Destructive drop guidance:**")
+	assert.Contains(t, rendered, "<summary>Destructive drop guidance</summary>")
 	assert.Contains(t, rendered, "no longer reads from or writes to the dropped table.")
 }
 
@@ -443,6 +444,9 @@ func TestBuildPlanCommentData_VSchemaDeletionsAndMutationsPopulated(t *testing.T
 	assert.Equal(t, "testapp_sharded/vschema.json", data.UnsafeChanges[1].Table)
 	assert.Contains(t, data.UnsafeChanges[1].Reason, "user_idx")
 	assert.Contains(t, data.UnsafeChanges[1].Reason, "changes type")
+	for _, uc := range data.UnsafeChanges {
+		assert.Equal(t, "testapp_sharded", uc.VSchemaNamespace, "the apply instruction names a VSchema change by its namespace")
+	}
 }
 
 func TestBuildPlanCommentData_NoUnsafeChanges(t *testing.T) {
@@ -1421,4 +1425,21 @@ func TestBuildPlanCommentData_TableSizesReadEveryShard(t *testing.T) {
 	assert.Equal(t, 2, size.ShardCount)
 	require.NotNil(t, size.EstimatedBytes)
 	assert.Equal(t, bytes, *size.EstimatedBytes)
+}
+
+// Every refusal the environment's namespace placement owns stores a failing
+// check for the environment, so a later fold cannot read an older passing row
+// in its place: a namespace no targets entry selects, a plan proposing drops in
+// a namespace the target's entry does not select, and drops that could not be
+// checked. Any other plan failure is not stored as a placement block.
+func TestPlanRefusedByNamespacePlacement(t *testing.T) {
+	coverage := &api.NamespaceCoverageError{Database: "orders", Environment: "production", Uncovered: []string{"ns_1"}}
+	drop := &api.UnselectedTableDropError{Deployment: "eu", Target: "orders-001", Placed: []string{"payments"}, PlacedNamespaces: []string{"ns_1"}}
+	check := &api.UnselectedTableDropCheckError{Database: "orders", Environment: "production", Target: "orders-001", Err: errors.New("split schema file ns_1/payments.sql: syntax error")}
+
+	assert.True(t, planRefusedByNamespacePlacement(coverage), "a namespace no targets entry selects")
+	assert.True(t, planRefusedByNamespacePlacement(fmt.Errorf("plan: %w", drop)), "a drop in an unselected namespace, wrapped")
+	assert.True(t, planRefusedByNamespacePlacement(check), "drops that could not be checked")
+	assert.False(t, planRefusedByNamespacePlacement(errors.New("tern unavailable")), "an unrelated plan failure")
+	assert.False(t, planRefusedByNamespacePlacement(nil), "a plan that succeeded")
 }

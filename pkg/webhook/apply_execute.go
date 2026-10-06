@@ -114,16 +114,16 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// A confirmation given against the comment saying the reviewed target
+	// A confirmation given against the comment saying the primary target
 	// already had this schema, which showed only the other targets' plans, does
-	// not cover changes the reviewed target has gained since: none of them were
+	// not cover changes the primary target has gained since: none of them were
 	// on that comment, so they never run on the strength of it. Any other
-	// confirmation was given against the reviewed target's own plan, and the
+	// confirmation was given against the primary target's own plan, and the
 	// gates below re-check that.
 	if storedPlan == nil && planResp.HasChanges() {
 		confirmedConverged, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, environment)
 		if roundErr != nil {
-			h.logger.Error("apply-confirm rejected: could not load the confirmed plan and its review round to compare with the reviewed target's changes; the pending confirmation is preserved",
+			h.logger.Error("apply-confirm rejected: could not load the confirmed plan and its review round to compare with the primary target's changes; the pending confirmation is preserved",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", roundErr)
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
@@ -131,12 +131,12 @@ func (h *Handler) executeApply(
 			return
 		}
 		if confirmedConverged {
-			h.logger.Info("apply-confirm refused: the reviewed target has changes the confirmed comment did not show",
+			h.logger.Info("apply-confirm refused: the primary target has changes the confirmed comment did not show",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
-			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the reviewed target has changes the confirmation did not cover")
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the primary target has changes the confirmation did not cover")
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				"The comment this confirmation acts on showed the reviewed target already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.")
+				"The comment this confirmation acts on showed the primary target already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.")
 			return
 		}
 	}
@@ -147,7 +147,7 @@ func (h *Handler) executeApply(
 	// for the primary where members hold schemas of their own, so the other
 	// members are planned first and their work, if any, answers.
 	//
-	// The rollout round runs for a reviewed target with work too: the apply is
+	// The rollout round runs for a primary target with work too: the apply is
 	// created from this re-plan, and each other target runs the plan this round
 	// stores for it, bound to this re-plan.
 	//
@@ -156,10 +156,10 @@ func (h *Handler) executeApply(
 	// reaching here with other targets' work saw it appear after its comment was
 	// posted without it, so it refuses.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
-	reviewedTargetConverged := !planResp.HasChanges()
+	primaryTargetConverged := !planResp.HasChanges()
 	refuseRollout := func(reason string) {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
-		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, reviewedTargetConverged)
+		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged)
 	}
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
 	// confirmedMemberWork records that this confirmation was checked against
@@ -184,14 +184,14 @@ func (h *Handler) executeApply(
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rollout's work is not what was confirmed")
-			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, reviewedTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
 			return
 		}
 		// The statements match the confirmed round's, but a copy can appear on
 		// a target after the comment was posted, and work the apply cannot run
 		// is refused here, releasing the confirmation, rather than at apply
 		// creation, which would leave it pinned.
-		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, reviewedTargetConverged)
+		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
 		if refusalErr != nil {
 			h.logger.Error("apply-confirm rejected: could not verify that the other targets' plans can run from this apply; the pending confirmation is preserved",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
@@ -202,23 +202,23 @@ func (h *Handler) executeApply(
 		}
 		if refusal != "" {
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
-			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, reviewedTargetConverged, memberWorkRefusalMessage(refusal, reviewedTargetConverged))
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return
 		}
 		confirmedMemberWork = true
 		h.logger.Info("apply-confirm: running the confirmed plans of the other targets that still need the change",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-			"plan_id", planResp.PlanID, "reviewed_target_converged", reviewedTargetConverged, "pending_targets", rollout.work.names)
+			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names)
 	case runsMemberWork:
 		refuseRollout("other targets' work was not on the comment this automatic apply acts on")
 		return
 	case rollout.blocks():
 		refuseRollout("the rollout round could not confirm every target's plan")
 		return
-	case reviewedTargetConverged && rolloutStillPending(rollout):
+	case primaryTargetConverged && rolloutStillPending(rollout):
 		refuseRollout("the rest of the rollout is not at the desired schema")
 		return
-	case reviewedTargetConverged:
+	case primaryTargetConverged:
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "no changes to apply")
 		// The target already matches the PR schema — apply found nothing to do.
 		// Record the passing (no-change) check result and refresh the aggregate so
@@ -233,14 +233,14 @@ func (h *Handler) executeApply(
 		h.postComment(repo, pr, installationID, templates.RenderApplyConfirmNoChanges(database, environment))
 		return
 	default:
-		// The reviewed target's re-plan runs from this confirmation even when
+		// The primary target's re-plan runs from this confirmation even when
 		// no other target has work left, so in a rollout it must be the work
 		// the confirmed comment showed. A rollout that has since shrunk to the
-		// reviewed target is still checked against its confirmed round.
+		// primary target is still checked against its confirmed round.
 		if storedPlan == nil {
-			difference, coverErr := h.confirmationCoversReviewedTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
+			difference, coverErr := h.confirmationCoversPrimaryTarget(ctx, expectedPendingPlanID, planResp.PlanID, environment, rollout.work.members > 1)
 			if coverErr != nil {
-				h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its round, or the re-plan to compare the reviewed target's work; the pending confirmation is preserved",
+				h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its round, or the re-plan to compare the primary target's work; the pending confirmation is preserved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", coverErr)
 				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
@@ -248,8 +248,8 @@ func (h *Handler) executeApply(
 				return
 			}
 			if difference != workUnchanged {
-				reason := reviewedTargetDifferenceReason(difference)
-				h.logger.Info("apply-confirm refused: the reviewed target would run work the confirmed plan did not show",
+				reason := primaryTargetDifferenceReason(difference)
+				h.logger.Info("apply-confirm refused: the primary target would run work the confirmed plan did not show",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
 				h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
@@ -258,11 +258,11 @@ func (h *Handler) executeApply(
 				return
 			}
 		}
-		h.logger.Debug("apply: only the reviewed target's own plan runs",
+		h.logger.Debug("apply: only the primary target's own plan runs",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
 	}
 	// Engine-blocked changes reject the apply outright — the re-plan may have
-	// resolved a change to blocked even if the reviewed plan had none (e.g.
+	// resolved a change to blocked even if the primary plan had none (e.g.
 	// the direct execution policy changed, or the table grew past its bound).
 	// Release the lock: no retry of this command can succeed, so holding it
 	// would only force a manual unlock after the schema is rewritten. An
@@ -303,7 +303,7 @@ func (h *Handler) executeApply(
 	// confirming it is checked against the comment that disclosed the direct
 	// statements rather than stopping again on the old one. An apply-confirm
 	// given on a rollout's comment never reaches here with such a change: the
-	// reviewed target is held to its whole confirmed plan above, how each
+	// primary target is held to its whole confirmed plan above, how each
 	// statement runs included, so a statement newly routed to direct execution
 	// refuses there and releases the lock, and the operator reviews the rollout
 	// again with a fresh apply.
@@ -389,13 +389,9 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// Block unsafe changes on confirm (re-plan may have detected new unsafe changes)
-	if len(planResp.UnsafeChanges()) > 0 && !result.AllowUnsafe {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
-		commentData.ScopedDatabase = result.Database
-		h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
-		h.logger.Info("apply blocked by unsafe changes", "repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
+	// Block unsafe changes on confirm (re-plan may have detected new unsafe
+	// changes), on every target the apply runs.
+	if blocked := h.blockUnsafeWithoutOptIn(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, result, runsMemberWork, rolloutPreview); blocked {
 		return
 	}
 
@@ -575,6 +571,8 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 			return templates.MemberPlanBlockedDetail(refused.Target, refused.Table)
 		case api.MemberPlanUndisclosedUnsafe:
 			return templates.MemberPlanUndisclosedUnsafeDetail(refused.Target, refused.Table, refused.Namespace)
+		case api.MemberPlanUnsafeWithoutOptIn:
+			return templates.MemberPlanUnsafeWithoutOptInDetail(refused.Target, refused.Table, refused.Namespace)
 		}
 		// A refusal kind with no line of its own takes the generic one below,
 		// never the error text.
@@ -613,7 +611,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
-	h.annotateAttributedChanges(ctx, client, &commentData, planResp, repo, pr, environment)
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
 	commentData.AllowUnsafe = result.AllowUnsafe

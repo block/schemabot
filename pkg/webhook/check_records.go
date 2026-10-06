@@ -26,7 +26,7 @@ const (
 	// plan). Zero value so an unset outcome fails safe — it preserves, never
 	// clears, an existing drift block.
 	driftNotEvaluated reviewDriftState = iota
-	// driftClean: the rollup ran and every deployment matched the reviewed plan.
+	// driftClean: the rollup ran and every deployment matched the primary plan.
 	driftClean
 	// driftBlocked: the rollup ran and a deployment diverged or could not be
 	// confirmed, so the plan check fails closed.
@@ -35,7 +35,7 @@ const (
 
 // reviewDriftOutcome carries the review-time per-deployment drift outcome into
 // the plan check record. When the state is driftBlocked the plan check fails
-// closed regardless of whether the reviewed primary plan itself had changes,
+// closed regardless of whether the primary plan itself had changes,
 // because a deployment's live schema no longer matches what was reviewed (or
 // could not be confirmed to match). summary explains why for the check's Change
 // column and logs.
@@ -43,10 +43,22 @@ type reviewDriftOutcome struct {
 	state   reviewDriftState
 	summary string
 	// work is how many rollout members still need the change, read from the
-	// same rollup. The reviewed primary plan speaks only for the primary, so a
+	// same rollup. The primary plan speaks only for the primary, so a
 	// primary already at the desired schema says nothing about members planned
 	// against schemas of their own.
 	work memberWork
+	// block is the durable reason a blocked outcome is stored under, so the
+	// apply it refuses names the right fix. Unset is review-time deployment
+	// drift, which is what the rollup reports.
+	block checkBlockReason
+}
+
+// blockingReason is the stored reason for a blocked outcome.
+func (o reviewDriftOutcome) blockingReason() string {
+	if o.block.blockingReason != "" {
+		return o.block.blockingReason
+	}
+	return reviewTimeDeploymentDriftBlock.blockingReason
 }
 
 // memberWork counts the rollout members, primary included, whose own plan
@@ -61,8 +73,8 @@ type memberWork struct {
 	// discard an unfinished copy, or could not say whether it would, and why.
 	// Empty when no member with work puts a copy at stake.
 	copyAtStake string
-	// others counts the members with work other than the reviewed primary,
-	// whose work runs from plans of their own rather than the reviewed plan.
+	// others counts the members with work other than the primary target,
+	// whose work runs from plans of their own rather than the primary plan.
 	others int
 }
 
@@ -96,7 +108,7 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 }
 
 // summary says how many targets still need the change, for a check whose
-// reviewed primary plan has nothing of its own to summarize.
+// primary plan has nothing of its own to summarize.
 func (w memberWork) summary() string {
 	return fmt.Sprintf("%d of %d targets need this change", w.pending, w.members)
 }
@@ -143,16 +155,27 @@ func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.Ins
 // refusal in full.
 const namespacePlacementCheckSummary = "namespace placement refused the plan; see the plan comment"
 
+// namespacePlacementUnstoredSummary is the failing aggregate's summary when an
+// environment's namespace placement refusal could not be stored. The aggregate
+// then carries the placement block itself, and a stored aggregate block is
+// released only by the auto-plan guards re-verifying the whole PR, never by a
+// plan command: the block does not record which database and environment set
+// it, so a plan of one of them cannot prove the refusal no longer stands
+// anywhere. A re-run of the check or a new commit re-plans every environment,
+// which clears the block once the placement agrees and stores the refusal
+// again where it does not.
+const namespacePlacementUnstoredSummary = "namespace placement refused the plan and SchemaBot could not record it; see the plan comment, then re-run this check or push a commit to re-plan every environment"
+
 // storeNamespacePlacementCheck stores a failing check for an environment whose
 // plan was refused because its targets entries and the schema files disagree on
 // namespace placement (api.NamespacePlacementRefused). That environment has no
 // plan, so without this row the aggregate folds only the environments that did
 // plan and can pass while a namespace is planned and applied nowhere (MG-12).
-// The row carries the review-time drift block: the rollout cannot be confirmed
-// to converge, and a later plan whose placement agrees clears it the way a
-// clean rollup clears drift.
+// The row carries its own review-time block, so an apply it refuses is told to
+// fix the placement, and a later plan whose placement agrees clears it the way
+// a clean rollup clears drift.
 func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) (string, error) {
-	blocked := reviewDriftOutcome{state: driftBlocked, summary: namespacePlacementCheckSummary}
+	blocked := reviewDriftOutcome{state: driftBlocked, summary: namespacePlacementCheckSummary, block: namespacePlacementRefusedBlock}
 	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
 	return headSHA, err
 }
@@ -207,9 +230,9 @@ func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclie
 
 // planCheckConclusion decides a plan check's stored conclusion. Review-time
 // drift fails the check closed ahead of the plan's own outcome: a deployment
-// whose live schema no longer matches the reviewed plan (or that could not be
+// whose live schema no longer matches the primary plan (or that could not be
 // confirmed to match) must block the PR even when the primary's diff is clean or
-// empty. A primary plan that reported errors or a final engine refusal likewise
+// empty. The primary plan that reported errors or a final engine refusal likewise
 // fails. Destructive changes remain action-required: the apply path requires
 // the separate --allow-unsafe acknowledgement before they can proceed.
 func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocked bool) string {
@@ -312,7 +335,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	}
 
 	// A check passes only when no rollout member has work (MG-12), so work on a
-	// member counts even when the reviewed primary plan is empty.
+	// member counts even when the primary plan is empty.
 	hasChanges := planResp.HasChanges() || drift.work.pending > 0
 	driftBlocked := drift.blocks()
 
@@ -329,7 +352,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 	blockingReason := ""
 	if driftBlocked {
 		changeSummary = drift.summary
-		blockingReason = reviewTimeDeploymentDriftBlock.blockingReason
+		blockingReason = drift.blockingReason()
 	}
 
 	check := &storage.Check{

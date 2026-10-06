@@ -58,7 +58,7 @@ func (h *Handler) planRetryDelay() time.Duration {
 // the gRPC client's retry budget while still surfacing sustained outages
 // within seconds.
 //
-// It returns the reviewed primary plan proto alongside the API response so
+// It returns the primary plan proto alongside the API response so
 // callers can feed it to the review-time drift rollup without re-planning or
 // reconstructing it from storage.
 func (h *Handler) executePlanProtoWithTransientRetry(ctx context.Context, planReq api.PlanRequest, repo string, pr int) (*ternv1.PlanResponse, *apitypes.PlanResponse, error) {

@@ -270,6 +270,25 @@ type RateLimitsConfig struct {
 	// pull fans out to a catalog read per namespace on the target, so an
 	// unbounded caller loads the control plane and the database together.
 	Pull EndpointRateLimitConfig `yaml:"pull,omitempty"`
+
+	// ChecksInspect bounds GET /api/checks/inspect. Every inspection reads the
+	// pull request and each expected Check Run from GitHub uncached, on the
+	// same App installation SchemaBot publishes Check Runs through, so an
+	// unbounded caller spends the quota the merge gate's own writes need.
+	ChecksInspect CallerRateLimitConfig `yaml:"checks_inspect,omitempty"`
+}
+
+// CallerRateLimitConfig is the budget of an endpoint bounded per caller only.
+// It has no per-target lane because what it protects is shared by every
+// target, not owned by one.
+type CallerRateLimitConfig struct {
+	// Enabled controls enforcement for this endpoint. Defaults to true when
+	// not configured (nil = enabled); set false to admit every request.
+	Enabled *bool `yaml:"enabled"`
+
+	// PerCaller bounds a single caller, keyed the same way as the pull
+	// endpoint's per-caller lane.
+	PerCaller RateLimitBudgetConfig `yaml:"per_caller,omitempty"`
 }
 
 // EndpointRateLimitConfig is one endpoint's budget. Each lane is enforced
@@ -423,6 +442,49 @@ func (c *ServerConfig) PullPerTargetRateLimit() ratelimit.Config {
 	return c.RateLimits.Pull.PerTarget.resolve(defaultPullPerTargetRequestsPerMinute, defaultPullPerTargetBurst)
 }
 
+// The check inspection's default budget is sized against the GitHub App
+// installation's REST quota rather than against SchemaBot's own capacity: each
+// inspection costs one pull request read plus at least one Check Run read per
+// expected check name, all uncached, on the installation the merge gate writes
+// Check Runs through.
+//
+// The budget bounds one caller on one server process, not the installation:
+// every replica admits the configured rate on its own, and every admitted
+// inspection draws on the same installation quota. The most one caller can
+// spend per hour, when its requests spread across every replica, is therefore
+// approximately
+//
+//	replicas × 60 × requests_per_minute × (1 + check names)
+//
+// installation-authenticated GitHub calls when each lookup fits on one page,
+// where check names is the number the deployment publishes for the repository.
+// That ceiling is what requests_per_minute is sized against. A caller's own
+// cost is its request rate × (1 + check names) on any number of replicas, and
+// a caller that stays on one replica is refused there once it outpaces
+// requests_per_minute and has spent its burst. Pagination multiplies the Check
+// Run reads, the initial burst adds inspections above the sustained rate, and
+// every inspection resolves a fresh installation client, adding
+// app-authenticated calls that count against the App rather than the
+// installation. Deployments running more replicas, publishing more check
+// names, or observing deep Check Run histories should lower
+// requests_per_minute.
+const (
+	defaultChecksInspectPerCallerRequestsPerMinute = 6
+	defaultChecksInspectPerCallerBurst             = 10
+)
+
+// ChecksInspectRateLimitEnabled reports whether the check inspection enforces
+// its request budget. Defaults to true when not configured.
+func (c *ServerConfig) ChecksInspectRateLimitEnabled() bool {
+	return c.RateLimits.ChecksInspect.Enabled == nil || *c.RateLimits.ChecksInspect.Enabled
+}
+
+// ChecksInspectPerCallerRateLimit returns the per-caller budget for the check
+// inspection, with unset fields filled from the defaults.
+func (c *ServerConfig) ChecksInspectPerCallerRateLimit() ratelimit.Config {
+	return c.RateLimits.ChecksInspect.PerCaller.resolve(defaultChecksInspectPerCallerRequestsPerMinute, defaultChecksInspectPerCallerBurst)
+}
+
 // resolve fills unset fields from the given defaults. Validate rejects
 // negative values, so by the time a budget is resolved a zero means "unset".
 func (b RateLimitBudgetConfig) resolve(defaultRPM, defaultBurst int) ratelimit.Config {
@@ -448,6 +510,7 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 	}{
 		{"rate_limits.pull.per_caller", cfg.Pull.PerCaller},
 		{"rate_limits.pull.per_target", cfg.Pull.PerTarget},
+		{"rate_limits.checks_inspect.per_caller", cfg.ChecksInspect.PerCaller},
 	}
 	for _, lane := range lanes {
 		if lane.budget.RequestsPerMinute < 0 {
@@ -465,10 +528,11 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 // here are merged into every locally driven MySQL database's metadata unless
 // the database sets the same key itself.
 type SpiritConfig struct {
-	// EnableExperimentalAutoscaling controls whether Spirit scales write
-	// threads dynamically from throttler feedback. Defaults to true when not
-	// configured (nil = enabled); set false as the operator kill switch when
-	// autoscaling misbehaves on a target fleet.
+	// EnableExperimentalAutoscaling controls whether Spirit scales its thread
+	// pools dynamically from throttler feedback. It engages on Aurora targets
+	// only; other MySQL targets run at fixed thread counts. Defaults to true
+	// when not configured (nil = enabled); set false as the operator kill
+	// switch when autoscaling misbehaves on a target fleet.
 	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
 
 	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
@@ -3550,6 +3614,17 @@ func (c *ServerConfig) PromotionEnvironmentOrder() []string {
 		return slices.Clone(defaultEnvironmentOrder)
 	}
 	return slices.Clone(c.EnvironmentOrder)
+}
+
+// ServesFirstPromotionEnvironment reports whether this instance serves the
+// first environment in the server-owned promotion order, and names that
+// environment. A deployment serving every environment serves the first one.
+// Where several deployments split one repository's environments between them,
+// exactly one serves the first, which makes it the one to answer an unscoped
+// command (no -e) that only one of them should answer.
+func (c *ServerConfig) ServesFirstPromotionEnvironment() (bool, string) {
+	first := c.PromotionEnvironmentOrder()[0]
+	return c.IsEnvironmentAllowed(first), first
 }
 
 // PromotionOrderForDatabase returns the environment promotion order used by PR

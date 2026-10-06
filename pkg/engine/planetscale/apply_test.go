@@ -778,6 +778,68 @@ func TestResumeExistingDeployRequest_DeferredIsNotDeployed(t *testing.T) {
 	assert.Contains(t, result.Message, "Resumed deploy request #9")
 }
 
+// A deploy request closed before it was deployed still reads "ready". A
+// non-deferred recovery that read only the deployment state would try to deploy
+// it, be refused by the backend, and fail the apply with a message about a
+// closed deploy request; a deferred one would reattach and wait for a deploy
+// that can never come. Both must reattach without deploying, so the next
+// Progress poll reports the cancelled outcome; nothing is rediscovered or
+// persisted because no schema change ran. A closed request that reports a
+// deploy is not treated this way.
+func TestResumeExistingDeployRequest_ClosedUndeployedReattachesWithoutDeploying(t *testing.T) {
+	tests := []struct {
+		name     string
+		deferred bool
+	}{
+		{name: "non-deferred", deferred: false},
+		{name: "deferred", deferred: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+			client := &resumeDeployClient{
+				recovered: &ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.Ready, HtmlURL: "https://app/dr/42"},
+			}
+
+			meta := &psMetadata{BranchName: "schemabot-testdb-abc", DeployRequestID: 42, DeferredDeploy: tt.deferred}
+			req := resumeRequest(t, meta, "apply-1a2b3c4d5e6f7890")
+			persisted := captureStateChanges(req)
+
+			result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			assert.True(t, result.Accepted)
+			assert.Equal(t, 0, client.deployCalls, "a closed deploy request must never be deployed")
+			assert.Equal(t, "Deploy request #42 was closed before it was deployed", result.Message)
+			require.NotNil(t, result.ResumeState)
+			assert.Equal(t, "apply-1a2b3c4d5e6f7890", result.ResumeState.MigrationContext)
+			decoded, err := decodePSMetadata(result.ResumeState.Metadata)
+			require.NoError(t, err)
+			assert.Equal(t, uint64(42), decoded.DeployRequestID, "the resume state still addresses the closed deploy request so Progress can report it")
+			assert.Equal(t, "https://app/dr/42", decoded.DeployRequestURL)
+			assert.Empty(t, *persisted, "no schema change ran, so there is no context to persist")
+		})
+	}
+
+	t.Run("closed deploy request that reports a deploy is deployed-state, not cancelled", func(t *testing.T) {
+		e := New(slog.New(slog.NewTextHandler(os.Stdout, nil)))
+		deployedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		client := &resumeDeployClient{
+			recovered: &ps.DeployRequest{State: deployRequestClosed, DeploymentState: deployState.InProgress, DeployedAt: &deployedAt, HtmlURL: "https://app/dr/42"},
+		}
+
+		meta := &psMetadata{BranchName: "schemabot-testdb-abc", DeployRequestID: 42}
+		req := resumeRequest(t, meta, "singularity:real-context")
+
+		result, err := e.resumeExistingDeployRequest(t.Context(), client, "org", req, meta)
+
+		require.NoError(t, err)
+		assert.Equal(t, 0, client.deployCalls)
+		assert.Contains(t, result.Message, "Resumed deploy request #42")
+	})
+}
+
 // A driver that stops after creating a non-deferred deploy request, while
 // PlanetScale is still computing its schema diff, recovers the request in
 // "pending". Resume waits for the diff to finish and then starts the deploy,

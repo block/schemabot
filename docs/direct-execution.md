@@ -314,7 +314,7 @@ confirmation step:
   `apply-confirm` against a comment that discloses it, the same way a
   re-plan whose DDL changed does. An `apply-confirm` given on a comment that
   rendered several targets' plans does not pause again: a statement on the
-  reviewed target that now runs differently, as direct execution or blocked,
+  primary target that now runs differently, as direct execution or blocked,
   refuses the apply and releases the lock, because how each statement runs
   is part of the plan that confirmation covers. A fresh `schemabot apply`
   reviews the rollout as it is now.
@@ -325,6 +325,16 @@ confirmation step:
   statements only. The disclosure on the apply's comment says so, and so
   does the disclosure on a paused comment, since the flag can still be
   passed to `apply-confirm`.
+
+`schemabot plan` and `schemabot apply` in the terminal disclose the same
+routing: a plan with a direct-execution change names each table and the
+policy's reason under a "Direct execution" notice. For an environment with
+several targets, the notice sits under the targets that run the change
+natively. Targets that plan the same statement but run it differently are
+shown as separate groups, so a target running the change through Spirit never
+appears under the notice. So are targets that run it natively for different
+reasons, such as tables of different sizes, so each notice names its own
+target's measurement.
 
 ## Observability
 

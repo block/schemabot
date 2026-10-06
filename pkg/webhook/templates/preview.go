@@ -281,6 +281,35 @@ func PreviewCommentPlanBlockedPostgres() string {
 	})
 }
 
+// PreviewCommentPlanUnsafe renders a sample plan whose changes the unsafe gate
+// holds until the apply carries --allow-unsafe. The footer states that
+// requirement under the plain command, which never carries the flag itself.
+func PreviewCommentPlanUnsafe() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{
+			{
+				Keyspace: "testapp",
+				Statements: []string{
+					"ALTER TABLE `orders` DROP COLUMN `legacy_ref`;",
+					"ALTER TABLE `refunds` ADD COLUMN `reason_code` varchar(32) NULL;",
+				},
+			},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: "DROP COLUMN discards the column's data", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy_ref`;"},
+		},
+	})
+}
+
 // PreviewCommentPlanAttributedChange renders a sample plan whose destructive
 // changes target tables another open pull request applied but has not merged
 // yet, so each entry is annotated with its owner. Attribution is table-grained,
@@ -632,7 +661,7 @@ func PreviewCommentPlanNoChanges() string {
 }
 
 // PreviewCommentPlanDriftClean renders a plan comment whose review-time drift
-// rollup confirmed the reviewed plan on every deployment (uniform clean line).
+// rollup confirmed the primary plan on every deployment (uniform clean line).
 func PreviewCommentPlanDriftClean() string {
 	return RenderPlanComment(PlanCommentData{
 		Database:     "testapp",
@@ -658,7 +687,7 @@ func PreviewCommentPlanDriftClean() string {
 }
 
 // PreviewCommentPlanDriftCleanBlocked renders a plan comment whose review-time
-// drift rollup confirmed the reviewed plan on every deployment while one
+// drift rollup confirmed the primary plan on every deployment while one
 // deployment carries a change its target will refuse at apply: the uniform
 // clean line followed by a per-deployment breakdown naming that deployment.
 func PreviewCommentPlanDriftCleanBlocked() string {
@@ -697,7 +726,7 @@ func previewDriftTargetSizes() []TargetTableSize {
 }
 
 // PreviewCommentPlanDriftDetected renders a plan comment whose review-time drift
-// rollup found deployments that no longer match the reviewed plan: a
+// rollup found deployments that no longer match the primary plan: a
 // per-deployment breakdown naming the matching, diverged, and errored targets.
 func PreviewCommentPlanDriftDetected() string {
 	return RenderPlanComment(PlanCommentData{
@@ -715,7 +744,7 @@ func PreviewCommentPlanDriftDetected() string {
 			Clean:    false,
 			Deployments: []DeploymentDriftEntry{
 				{Deployment: "eu", Primary: true, Class: "match"},
-				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the reviewed plan"},
+				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the primary target's plan"},
 				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
 			},
 		},
@@ -723,7 +752,7 @@ func PreviewCommentPlanDriftDetected() string {
 }
 
 // previewRolloutMembers is the three independent targets the rollout previews
-// below are rendered for, in rollout order with the reviewed primary first.
+// below are rendered for, in rollout order with the primary target first.
 func previewRolloutMembers() []DeploymentDriftEntry {
 	return []DeploymentDriftEntry{
 		{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
@@ -733,7 +762,7 @@ func previewRolloutMembers() []DeploymentDriftEntry {
 }
 
 // PreviewCommentPlanRolloutConverging renders a plan comment for a rollout of
-// independent targets partway through converging: the reviewed target and one
+// independent targets partway through converging: the primary target and one
 // other still need the change, and the third already holds it. The plan renders
 // under the two targets that run it, and the third is named as already there.
 func PreviewCommentPlanRolloutConverging() string {
@@ -759,9 +788,9 @@ func PreviewCommentPlanRolloutConverging() string {
 }
 
 // PreviewCommentPlanRolloutConvergedPrimary renders a plan comment for a rollout
-// whose reviewed target already holds the desired schema while other targets do
-// not. The reviewed target has no plan to show, so the comment renders the plan
-// of the targets still missing the change and names the reviewed target as
+// whose primary target already holds the desired schema while other targets do
+// not. The primary target has no plan to show, so the comment renders the plan
+// of the targets still missing the change and names the primary target as
 // already there.
 func PreviewCommentPlanRolloutConvergedPrimary() string {
 	return RenderPlanComment(PlanCommentData{
@@ -786,7 +815,7 @@ func PreviewCommentPlanRolloutConvergedPrimary() string {
 }
 
 // PreviewCommentPlanRolloutDistinctPlans renders a plan comment for a rollout of
-// independent targets that need different work: the reviewed target and one
+// independent targets that need different work: the primary target and one
 // other need the email column, and the third needs it with an index as well.
 // Each target applies its own plan, so each plan renders under its targets.
 func PreviewCommentPlanRolloutDistinctPlans() string {
@@ -819,7 +848,7 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 // PreviewCommentPlanRolloutTwoTargetTableSizes renders a plan comment for a
 // rollout of two independent targets that run the same index builds. Each
 // size line gives the total and names the target with the largest size, since
-// the reviewed target is not always the one the build takes longest on.
+// the primary target is not always the one the build takes longest on.
 func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 	members := previewRolloutMembers()[:2]
 	return previewRolloutTableSizes(members, []TargetTableSize{
@@ -846,11 +875,11 @@ func PreviewCommentPlanRolloutTableSizes() string {
 	})
 }
 
-// PreviewCommentPlanRolloutReviewedTargetTableSizes renders a plan comment for
+// PreviewCommentPlanRolloutPrimaryTargetTableSizes renders a plan comment for
 // a rollout whose third target could not be planned. The rollout carries no
-// per-target sizes, so the section shows the reviewed plan's and names the
-// reviewed target they were read from.
-func PreviewCommentPlanRolloutReviewedTargetTableSizes() string {
+// per-target sizes, so the section shows the primary plan's and names the
+// primary target they were read from.
+func PreviewCommentPlanRolloutPrimaryTargetTableSizes() string {
 	members := previewRolloutMembers()
 	members[2].Class = "errored"
 	members[2].Detail = "diff failed; see server logs"
@@ -1102,6 +1131,36 @@ func PreviewCommentErrorDatabaseNotConfigured() string {
 	})
 }
 
+// PreviewCommentErrorDatabaseNotRegistered renders the error comment the
+// staging aggregate leader posts for an unscoped command on a schemabot.yaml
+// whose database it has not registered.
+func PreviewCommentErrorDatabaseNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Deployment:  "staging",
+		CommandName: action.Plan,
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+		},
+	})
+}
+
+// PreviewCommentErrorDatabasesNotRegistered renders the same error for a PR
+// carrying several such schemabot.yaml files, which one reply names together.
+func PreviewCommentErrorDatabasesNotRegistered() string {
+	return RenderDatabaseNotRegistered(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Timestamp:   "2026-01-15 14:30:00",
+		Deployment:  "staging",
+		CommandName: action.Plan,
+		UnregisteredConfigs: []UnregisteredSchemaConfigData{
+			{Database: "ledger", SchemaPath: "services/ledger/schema"},
+			{Database: "payments", SchemaPath: "services/payments/schema"},
+		},
+	})
+}
+
 // PreviewCommentErrorDatabaseRepoNotAllowed renders the error comment for a
 // command naming a database the SchemaBot server configures for other
 // repositories only.
@@ -1305,6 +1364,21 @@ func PreviewCommentReviewRequiredNoOperators() string {
 		RequestedBy:    previewRequestedBy,
 		OtherReviewers: []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:       previewRequestedBy,
+	})
+}
+
+// PreviewCommentReviewRequiredStaleApproval renders the "review required"
+// comment when an authorized reviewer approved an earlier commit and schema
+// files changed after it, so that approval no longer counts.
+func PreviewCommentReviewRequiredStaleApproval() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		StaleApprovers:    []string{"jdoe"},
 	})
 }
 
@@ -1870,12 +1944,14 @@ func PreviewCommentVitessPlanVSchemaRemoval() string {
 		HasUnsafeChanges: true,
 		UnsafeChanges: []UnsafeChangeData{
 			{
-				Table:  "commerce_sharded/vschema.json",
-				Reason: `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `lookup vindex "customers_email_lookup" is removed: Vitess immediately stops maintaining its rows in backing table "customers_email_lookup", queries routed through it can fail or scatter, and the lookup data goes stale`,
 			},
 			{
-				Table:  "commerce_sharded/vschema.json",
-				Reason: `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
+				Table:            "commerce_sharded/vschema.json",
+				VSchemaNamespace: "commerce_sharded",
+				Reason:           `table "customers" no longer uses vindex "customers_email_lookup": routing for queries on its columns changes immediately and lookup rows stop being maintained`,
 			},
 		},
 	})

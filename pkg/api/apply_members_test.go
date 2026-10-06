@@ -81,7 +81,7 @@ func primaryPlanRow(target string) *storage.Plan {
 }
 
 // memberPlanRow is a plan stored for a non-primary member, stamped with the
-// reviewed plan it was produced alongside.
+// primary plan it was produced alongside.
 func memberPlanRow(identifier, target, primaryPlanIdentifier string) *storage.Plan {
 	plan := primaryPlanRow(target)
 	plan.ID = 0
@@ -108,7 +108,7 @@ func TestResolveApplyMembers_MirroredMembersShareTheApplyPlan(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, members, 2)
 	for _, member := range members {
-		assert.Same(t, plan, member.Plan, "member %s must run the reviewed plan", member.MemberID())
+		assert.Same(t, plan, member.Plan, "member %s must run the primary target's plan", member.MemberID())
 	}
 }
 
@@ -151,7 +151,7 @@ func TestResolveApplyMembers_SingleMemberMustBeThePlansOwnTarget(t *testing.T) {
 }
 
 // Each target of a multi-target environment runs the plan stored for that
-// target in the review round the apply's own plan is the reviewed plan of.
+// target in the review round the apply's own plan is the primary plan of.
 func TestResolveApplyMembers_IndependentMembersRunTheirOwnPlans(t *testing.T) {
 	plan := primaryPlanRow("testapp-001")
 	secondPlan := memberPlanRow("plan-second", "testapp-002", "plan-primary")
@@ -193,10 +193,10 @@ func TestResolveApplyMembers_MissingMemberPlanFailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), "no stored plan for rollout member eu/testapp-002")
 }
 
-// Member plans are only written by a pull request review, so a CLI apply against
-// a multi-target environment has none and fails closed rather than running the
-// primary's DDL against every target.
-func TestResolveApplyMembers_PlanWithoutPullRequestReviewFailsClosed(t *testing.T) {
+// A plan made outside a pull request plans its members the same way, and an
+// apply from one whose round stored no member plan fails closed rather than
+// running the primary's DDL against every target.
+func TestResolveApplyMembers_CLIPlanWithoutMemberPlansFailsClosed(t *testing.T) {
 	plan := primaryPlanRow("testapp-001")
 	plan.HeadSHA = ""
 	plans := &listingPlanStore{}
@@ -204,13 +204,14 @@ func TestResolveApplyMembers_PlanWithoutPullRequestReviewFailsClosed(t *testing.
 
 	_, err := svc.resolveApplyMembers(t.Context(), plan, "production", targetsFor(t, svc))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "was not produced by a pull request review")
+	assert.Contains(t, err.Error(), "no stored plan for rollout member eu/testapp-002")
+	assert.Contains(t, err.Error(), "plan the environment again")
 }
 
 // An environment respelled as mirrored after its review still applies what was
 // reviewed: the round stored a plan per member, and those plans are what the
 // operator approved. Current config cannot reinterpret a finished review.
-func TestResolveApplyMembers_ReviewedRoundOutranksCurrentConfig(t *testing.T) {
+func TestResolveApplyMembers_PlanRoundOutranksCurrentConfig(t *testing.T) {
 	plan := primaryPlanRow("testapp")
 	secondPlan := memberPlanRow("plan-second", "testapp", "plan-primary")
 	secondPlan.Deployment = "us"
@@ -221,7 +222,7 @@ func TestResolveApplyMembers_ReviewedRoundOutranksCurrentConfig(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, members, 2)
 	assert.Same(t, plan, members[0].Plan, "the primary runs the plan the apply was created from")
-	assert.Same(t, secondPlan, members[1].Plan, "a member planned on its own keeps its reviewed plan")
+	assert.Same(t, secondPlan, members[1].Plan, "a member planned on its own keeps its primary target's plan")
 }
 
 // A storage failure while loading member plans is not an absence of members: it
@@ -460,9 +461,9 @@ func TestCreateStoredApply_BlockedMemberPlanIsRefused(t *testing.T) {
 }
 
 // The unsafe opt-in is the operator's, given against the disclosure on the
-// comment it confirms, and that disclosure lists the reviewed plan's unsafe
-// changes. A member whose own plan drops the same table the reviewed plan drops
-// runs it under the opt-in, and needs the opt-in exactly as the reviewed plan
+// comment it confirms, and that disclosure lists the primary plan's unsafe
+// changes. A member whose own plan drops the same table the primary plan drops
+// runs it under the opt-in, and needs the opt-in exactly as the primary plan
 // does.
 func TestCreateStoredApply_DisclosedUnsafeMemberChangeNeedsTheOptIn(t *testing.T) {
 	drop := storage.TableChange{
@@ -486,8 +487,8 @@ func TestCreateStoredApply_DisclosedUnsafeMemberChangeNeedsTheOptIn(t *testing.T
 }
 
 // A member planned against a schema of its own can carry an unsafe change the
-// reviewed plan does not: us has drifted and drops a column eu never had. The
-// comment's unsafe disclosure names only the reviewed plan's changes, so the
+// primary plan does not: us has drifted and drops a column eu never had. The
+// comment's unsafe disclosure names only the primary plan's changes, so the
 // operator's opt-in was never given for us's drop, and apply creation refuses
 // it even under the opt-in, rather than give retry advice that could never
 // succeed.
@@ -509,9 +510,9 @@ func TestCreateStoredApply_UndisclosedUnsafeMemberChangeIsRefusedUnderTheOptIn(t
 		map[string]string{"allow_unsafe": "true"}, "apply-undisclosed-unsafe")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
-	assert.Contains(t, err.Error(), "carries an unsafe change for table \"users\" whose statement differs from the one the reviewed plan discloses for that table",
-		"the reviewed plan drops a column from users too, so the refusal says the statements differ")
-	assert.Contains(t, err.Error(), "the disclosure on reviewed plan plan-primary never named it")
+	assert.Contains(t, err.Error(), "carries an unsafe change for table \"users\" whose statement differs from the one the primary target's plan discloses for that table",
+		"the primary target's plan drops a column from users too, so the refusal says the statements differ")
+	assert.Contains(t, err.Error(), "the disclosure on the primary target's plan plan-primary never named it")
 	assert.NotContains(t, err.Error(), "retry with allow_unsafe", "no opt-in covers a change the disclosure never named")
 	refused, ok := errors.AsType[*MemberPlanRefusedError](err)
 	require.True(t, ok, "the refusal is typed so a caller can name the target without rendering the error")
@@ -525,9 +526,60 @@ func TestCreateStoredApply_UndisclosedUnsafeMemberChangeIsRefusedUnderTheOptIn(t
 	assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
 }
 
+// A pull request apply-confirm runs on a comment that discloses each target's
+// unsafe changes under that target, so a member's unsafe change runs whether
+// or not the primary plan carries it, and whether or not the primary plan has
+// work at all. It still needs the opt-in, as the primary plan's own does: one
+// --allow-unsafe consents for every target.
+func TestCreateStoredApply_ConfirmedMemberUnsafeChangeNeedsOnlyTheOptIn(t *testing.T) {
+	memberDrop := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` DROP COLUMN `legacy_id`",
+		IsUnsafe:  true,
+	}
+	alter := storage.TableChange{
+		Namespace: "testapp",
+		Table:     "users",
+		Operation: "alter",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}
+	withWork := primaryPlanRow("testapp-001")
+	withWork.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
+	for _, tc := range []struct {
+		name     string
+		reviewed *storage.Plan
+	}{
+		{name: "primary target already at the schema", reviewed: primaryPlanRow("testapp-001")},
+		{name: "primary plan without the member's unsafe change", reviewed: withWork},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := ApplyRequest{Environment: "production", ConfirmedMemberWork: true}
+
+			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(memberDrop)}})
+			_, _, err := svc.createStoredApply(t.Context(), tc.reviewed, req, nil, "apply-member-unsafe-no-opt-in")
+			require.Error(t, err)
+			refused, ok := errors.AsType[*MemberPlanRefusedError](err)
+			require.True(t, ok, "the refusal is typed so a caller can name the target without rendering the error")
+			assert.Equal(t, MemberPlanUnsafeWithoutOptIn, refused.Refusal)
+			assert.Equal(t, "eu/testapp-002", refused.Target)
+			assert.Equal(t, "users", refused.Table)
+			assert.Contains(t, err.Error(), "retry with allow_unsafe=true")
+
+			svc = multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(memberDrop)}})
+			_, _, err = svc.createStoredApply(t.Context(), tc.reviewed, req, map[string]string{"allow_unsafe": "true"}, "apply-member-unsafe-opted-in")
+			require.NoError(t, err, "the opt-in consents to the member's disclosed unsafe change")
+			applies, ok := svc.storage.Applies().(*capturingApplyStore)
+			require.True(t, ok)
+			require.NotNil(t, applies.apply)
+		})
+	}
+}
+
 // The preflight a PR apply runs before it pauses asks of each member what apply
 // creation asks, so a confirmation is never pinned for work creation refuses.
-func TestMemberWorkTheReviewedPlanCannotRun(t *testing.T) {
+func TestMemberWorkThePrimaryPlanCannotRun(t *testing.T) {
 	alter := storage.TableChange{Namespace: "testapp", Table: "users", Operation: "alter", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}
 	drop := storage.TableChange{Namespace: "testapp", Table: "legacy_orders", Operation: "drop", DDL: "DROP TABLE `legacy_orders`"}
 	planWith := func(changes ...storage.TableChange) *storage.Plan {
@@ -550,14 +602,14 @@ func TestMemberWorkTheReviewedPlanCannotRun(t *testing.T) {
 	}{
 		{name: "same work", reviewed: planWith(alter), member: planWith(alter), want: ""},
 		{name: "disclosed unsafe change", reviewed: planWith(alter, drop), member: planWith(alter, drop), want: ""},
-		{name: "undisclosed unsafe change", reviewed: planWith(alter), member: planWith(alter, drop), want: `carries an unsafe change for table "legacy_orders" that the reviewed plan does not carry`},
+		{name: "an unsafe change only the member carries", reviewed: planWith(alter), member: planWith(alter, drop), want: ""},
 		{name: "disclosed direct execution", reviewed: planWith(alter), member: planWith(direct), want: ""},
-		{name: "disclosed direct execution the reviewed plan runs too", reviewed: planWith(direct), member: planWith(direct), want: ""},
+		{name: "disclosed direct execution the primary target's plan runs too", reviewed: planWith(direct), member: planWith(direct), want: ""},
 		{name: "blocked change", reviewed: planWith(alter), member: planWith(blocked), want: "carries changes its target's engine refuses"},
 		{name: "work outside the shape", reviewed: planWith(alter), member: shardOnly, want: "has per-shard changes in namespaces [testapp]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := MemberWorkTheReviewedPlanCannotRun(tc.reviewed, tc.member)
+			got := MemberWorkThePrimaryPlanCannotRun(tc.reviewed, tc.member)
 			if tc.want == "" {
 				assert.Empty(t, got)
 				return
@@ -633,10 +685,10 @@ func TestBuildApplyOperationGroups_ApplyWithNoWorkStaysPending(t *testing.T) {
 	}
 }
 
-// An apply created from a reviewed plan with no work runs each other member's
+// An apply created from the primary plan with no work runs each other member's
 // own plan. The members that already hold the schema are settled at creation
 // and the one that needs the column is driven from its own DDL.
-func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.T) {
+func TestCreateStoredApply_EmptyPrimaryPlanRunsTheOtherMembersPlans(t *testing.T) {
 	member := memberPlanWithChange(storage.TableChange{
 		Namespace: "testapp",
 		Table:     "users",
@@ -655,7 +707,7 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.
 	for _, op := range applies.operations {
 		byTarget[op.Target] = op
 	}
-	assert.Equal(t, state.ApplyOperation.Completed, byTarget["testapp-001"].State, "the reviewed target already holds the schema")
+	assert.Equal(t, state.ApplyOperation.Completed, byTarget["testapp-001"].State, "the primary target already holds the schema")
 	assert.Equal(t, state.ApplyOperation.Pending, byTarget["testapp-002"].State)
 
 	tasks := applies.taskStore.tasks
@@ -665,10 +717,10 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsTheOtherMembersPlans(t *testing.
 }
 
 // A member's own plan can run a statement as direct-execution DDL while the
-// reviewed target is already converged. The plan comment discloses that change
+// primary target is already converged. The plan comment discloses that change
 // under the member that runs it, so an apply-confirm of that comment builds the
 // member's task with the direct verdict intact.
-func TestCreateStoredApply_EmptyReviewedPlanRunsAMembersDirectChange(t *testing.T) {
+func TestCreateStoredApply_EmptyPrimaryPlanRunsAMembersDirectChange(t *testing.T) {
 	member := memberPlanWithChange(storage.TableChange{
 		Namespace:     "testapp",
 		Table:         "users",
@@ -691,11 +743,11 @@ func TestCreateStoredApply_EmptyReviewedPlanRunsAMembersDirectChange(t *testing.
 	assert.Equal(t, "table is 12 MiB, within the direct execution bound", tasks[0].ModeReason)
 }
 
-// An apply created from a reviewed plan with no work gives every member one work
+// An apply created from the primary plan with no work gives every member one work
 // operation, so member work that needs another shape is refused rather than
-// settled as done. So are unsafe changes, even under the opt-in, whose consent
-// is given against a disclosure the empty reviewed plan does not carry.
-func TestCreateStoredApply_EmptyReviewedPlanRefusesMemberWorkItCannotCarry(t *testing.T) {
+// settled as done. So is an unsafe change, even under the opt-in, for a caller
+// that was shown only the empty primary plan's disclosure.
+func TestCreateStoredApply_EmptyPrimaryPlanRefusesMemberWorkItCannotCarry(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
 		Table:     "users",
@@ -824,11 +876,11 @@ func TestBuildApplyOperationGroups_MemberWorkTheApplyShapeCannotCarryIsRefused(t
 	}
 }
 
-// The reviewed plan chooses the apply's shape, and outside the per-shard shape
+// The primary plan chooses the apply's shape, and outside the per-shard shape
 // its own per-shard changes are only carried by table statements for the same
-// namespace. A reviewed plan whose shards change with no such statement would
-// build an operation with nothing to run on the reviewed target, so apply
-// creation refuses it, naming the reviewed target.
+// namespace. The primary plan whose shards change with no such statement would
+// build an operation with nothing to run on the primary target, so apply
+// creation refuses it, naming the primary target.
 func TestBuildApplyOperationGroups_ReviewedShardWorkTheApplyShapeCannotCarryIsRefused(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
@@ -856,7 +908,7 @@ func TestBuildApplyOperationGroups_ReviewedShardWorkTheApplyShapeCannotCarryIsRe
 // A finalizer-only apply gives every member a finalizer. A member planned on
 // its own that already holds the change has no namespace to finalize, so its
 // finalizer is recorded as settled at creation rather than left pending for a
-// driver that could not run it, while the reviewed target's finalizer waits to
+// driver that could not run it, while the primary target's finalizer waits to
 // be driven.
 func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation(t *testing.T) {
 	applyPlan := primaryPlanRow("testapp-001")
@@ -881,7 +933,7 @@ func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation
 		assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, group.Operation.OperationKind)
 		byTarget[group.Operation.Target] = group.Operation
 	}
-	assert.Equal(t, state.ApplyOperation.Pending, byTarget["testapp-001"].State, "the reviewed target's finalizer is driven")
+	assert.Equal(t, state.ApplyOperation.Pending, byTarget["testapp-001"].State, "the primary target's finalizer is driven")
 	assert.Nil(t, byTarget["testapp-001"].CompletedAt)
 	assert.Equal(t, state.ApplyOperation.Completed, byTarget["testapp-002"].State, "the converged member has nothing to finalize")
 	require.NotNil(t, byTarget["testapp-002"].CompletedAt)
@@ -889,13 +941,13 @@ func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation
 	assert.Nil(t, byTarget["testapp-002"].StartedAt, "nothing ran on the converged member")
 }
 
-// The reviewed target and another target both add a column, and the other
+// The primary target and another target both add a column, and the other
 // target's own plan runs it as direct-execution DDL because its table is within
 // the direct execution bound. The verdict belongs to the target that runs the
 // statement, and the comment the operator confirms discloses it under that
 // target, so apply creation builds each target's task with its own verdict: the
-// reviewed target's through Spirit, the other target's direct.
-func TestCreateStoredApply_ReviewedPlanWithWorkRunsAMembersDirectChange(t *testing.T) {
+// primary target's through Spirit, the other target's direct.
+func TestCreateStoredApply_PrimaryPlanWithWorkRunsAMembersDirectChange(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
 		Table:     "users",
@@ -932,12 +984,13 @@ func TestCreateStoredApply_ReviewedPlanWithWorkRunsAMembersDirectChange(t *testi
 		"each target's task carries its own plan's verdict")
 }
 
-// A caller other than a pull request apply-confirm was shown the reviewed plan
-// alone: a direct API caller that posts the reviewed plan's id never saw the
-// other target's own plan, nor that it runs orders as write-blocking native
-// DDL. Apply creation refuses that member's direct change for it, whether or
-// not the reviewed target has work, even when the reviewed plan runs the same
-// statement directly, and stores nothing.
+// A caller other than a pull request apply-confirm confirms no other target's
+// direct-execution verdict: whatever it showed the operator, nothing in an
+// apply of the primary plan's id confirms that the other target's own plan
+// runs orders as write-blocking native DDL. Apply creation refuses that
+// member's direct change for it, whether or not the primary target has work,
+// even when the primary plan runs the same statement directly, and stores
+// nothing.
 func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) {
 	alter := storage.TableChange{
 		Namespace: "testapp",
@@ -950,16 +1003,16 @@ func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) 
 	direct.ModeReason = "table is 12 MiB, within the direct execution bound"
 	withWork := primaryPlanRow("testapp-001")
 	withWork.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{alter}}}
-	// The reviewed plan names the reviewed target's table at the size measured
-	// there, so the reviewed plan running the identical statement directly
+	// The primary plan names the primary target's table at the size measured
+	// there, so the primary plan running the identical statement directly
 	// discloses nothing about the other target's copy of the table.
 	withDirect := primaryPlanRow("testapp-001")
 	withDirect.Namespaces = map[string]*storage.NamespacePlanData{"testapp": {Tables: []storage.TableChange{direct}}}
 
 	for name, reviewed := range map[string]*storage.Plan{
-		"reviewed target has work":             withWork,
-		"reviewed target runs it directly too": withDirect,
-		"reviewed target converged":            primaryPlanRow("testapp-001"),
+		"primary target has work":             withWork,
+		"primary target runs it directly too": withDirect,
+		"primary target converged":            primaryPlanRow("testapp-001"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			svc := multiTargetApplyService(t, &listingPlanStore{plans: []*storage.Plan{memberPlanWithChange(direct)}})
@@ -968,7 +1021,8 @@ func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) 
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "rollout member eu/testapp-002")
 			assert.Contains(t, err.Error(), "runs table \"orders\" as direct-execution DDL")
-			assert.Contains(t, err.Error(), "shown only the reviewed plan plan-primary")
+			assert.Contains(t, err.Error(), "an apply of the whole rollout from plan plan-primary runs another target's direct-execution DDL only from a pull request apply-confirm")
+			assert.Contains(t, err.Error(), "plan and apply the member with its target to run its own plan")
 			applies, ok := svc.storage.Applies().(*capturingApplyStore)
 			require.True(t, ok)
 			assert.Nil(t, applies.apply, "nothing is stored for a refused apply")
@@ -979,9 +1033,14 @@ func TestCreateStoredApply_UnconfirmedMemberDirectChangeIsRefused(t *testing.T) 
 // Every entry point that creates an apply without a pull request apply-confirm
 // refuses another target's direct-execution change: the HTTP API that the CLI
 // and direct callers post to, ExecuteApply, which a rollback-confirm also calls
-// without the flag, and the trusted EnqueueAuthorizedApply. Each was shown the
-// reviewed plan alone, and none can assert the confirmation, including through
-// the JSON body of POST /api/apply, which rejects the field as unknown.
+// without the flag, and the trusted EnqueueAuthorizedApply. The HTTP caller
+// here says it renders the rollout, as the CLI does, and the CLI shows
+// eu/testapp-002's direct-execution notice under that target. Showing it is not
+// confirming it: only a pull request apply-confirm confirms another target's
+// direct-execution verdict, and none of these entry points can assert that
+// confirmation, including through the JSON body of POST /api/apply, which
+// rejects the field as unknown. The member's change runs from an apply
+// narrowed to it.
 func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
 	direct := storage.TableChange{
 		Namespace:     "testapp",
@@ -1024,12 +1083,12 @@ func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
 		want  string
 	}{
 		{"POST /api/apply", func(t *testing.T, svc *Service) string {
-			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production"}`)
-			assert.Equal(t, http.StatusInternalServerError, code)
+			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
+			assert.Equal(t, http.StatusBadRequest, code)
 			return msg
 		}, refused},
 		{"POST /api/apply asserting the confirmation", func(t *testing.T, svc *Service) string {
-			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","ConfirmedMemberWork":true}`)
+			code, msg := postApply(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true,"ConfirmedMemberWork":true}`)
 			assert.Equal(t, http.StatusBadRequest, code)
 			return msg
 		}, `unknown field "ConfirmedMemberWork"`},
@@ -1056,11 +1115,11 @@ func TestApplyEntryPoints_RefuseAnUnconfirmedMemberDirectChange(t *testing.T) {
 
 // Two PostgreSQL targets map the namespace to differently named physical
 // schemas, so each plan qualifies the same drop with its own schema. The comment
-// groups them as one change, and the reviewed plan's unsafe disclosure names it,
+// groups them as one change, and the primary plan's unsafe disclosure names it,
 // so the member's copy runs under the opt-in. A drop of another column on the
 // same table is a different statement, and the refusal says the statements
 // differ.
-func TestUndisclosedMemberUnsafeChange_SchemaQualifierIsNotADifference(t *testing.T) {
+func TestFirstUndisclosedMemberUnsafeChange_SchemaQualifierIsNotADifference(t *testing.T) {
 	planWith := func(ddl string) *storage.Plan {
 		plan := primaryPlanRow("testapp-001")
 		plan.DatabaseType = storage.DatabaseTypePostgres
@@ -1071,10 +1130,11 @@ func TestUndisclosedMemberUnsafeChange_SchemaQualifierIsNotADifference(t *testin
 	}
 	reviewed := planWith(`ALTER TABLE "app_eu".users DROP COLUMN legacy`)
 
-	assert.Empty(t, UndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN legacy`)),
-		"the same drop rendered against another physical schema is the change the disclosure named")
-	assert.Equal(t, `carries an unsafe change for table "users" whose statement differs from the one the reviewed plan discloses for that table`,
-		UndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN nickname`)))
+	_, undisclosed := firstUndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN legacy`))
+	assert.False(t, undisclosed, "the same drop rendered against another physical schema is the change the disclosure named")
+	change, undisclosed := firstUndisclosedMemberUnsafeChange(reviewed, planWith(`ALTER TABLE "app_us".users DROP COLUMN nickname`))
+	require.True(t, undisclosed)
+	assert.Equal(t, `carries an unsafe change for table "users" whose statement differs from the one the primary target's plan discloses for that table`, change.description())
 }
 
 // A sharded apply builds every member into per-shard operations. A member
@@ -1105,7 +1165,7 @@ func TestBuildShardedApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t
 	}
 	require.Len(t, byDeployment["eu"], 1)
 	assert.Equal(t, pershardNamespace+"/-80/mutes", byDeployment["eu"][0].Operation.OperationKey)
-	assert.Equal(t, state.ApplyOperation.Pending, byDeployment["eu"][0].Operation.State, "the reviewed target's shard work is driven")
+	assert.Equal(t, state.ApplyOperation.Pending, byDeployment["eu"][0].Operation.State, "the primary target's shard work is driven")
 	require.Len(t, byDeployment["us"], 1, "the converged member stays in the apply")
 	settled := byDeployment["us"][0]
 	assert.Empty(t, settled.Tasks, "the converged member has nothing to run")
@@ -1115,4 +1175,23 @@ func TestBuildShardedApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t
 	assert.Equal(t, now, *settled.Operation.CompletedAt)
 	assert.Nil(t, settled.Operation.StartedAt, "nothing ran on the converged member")
 	assert.Equal(t, int64(11), settled.Operation.PlanID)
+}
+
+// A review round is selected by its stamp. The pull request narrows the scan
+// only beside its repository: a CLI plan can carry a pull request number with
+// no repository, and storage refuses a pull request filter without one.
+func TestReviewRoundListing_PullRequestOnlyWithItsRepository(t *testing.T) {
+	webhook := primaryPlanRow("testapp-001")
+	assert.Equal(t, storage.ListPlansOptions{
+		Database: "testapp", Environment: "production",
+		Repository: "org/repo", PullRequest: 7,
+		PrimaryPlanIdentifier: "plan-primary",
+	}, reviewRoundListing(webhook, "production"))
+
+	cli := primaryPlanRow("testapp-001")
+	cli.Repository = ""
+	assert.Equal(t, storage.ListPlansOptions{
+		Database: "testapp", Environment: "production",
+		PrimaryPlanIdentifier: "plan-primary",
+	}, reviewRoundListing(cli, "production"))
 }

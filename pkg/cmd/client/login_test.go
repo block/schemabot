@@ -28,6 +28,7 @@ type fakeOIDC struct {
 	mu           sync.Mutex
 	challenges   map[string]string // authorization code -> code_challenge
 	refreshCalls int
+	refreshedFor string // client ID presented with the last refresh_token grant
 	lastMethod   string // code_challenge_method seen at the authz endpoint
 
 	// Provider response knobs are configured before the first request and then
@@ -119,8 +120,15 @@ func (f *fakeOIDC) handleToken(w http.ResponseWriter, r *http.Request) {
 		if f.beforeRefresh != nil {
 			f.beforeRefresh()
 		}
+		// A public client presents its ID either as the Basic auth user or as a
+		// form field, depending on the auth style the OAuth2 library settles on.
+		clientID := r.Form.Get("client_id")
+		if user, _, ok := r.BasicAuth(); ok {
+			clientID = user
+		}
 		f.mu.Lock()
 		f.refreshCalls++
+		f.refreshedFor = clientID
 		f.mu.Unlock()
 		if r.Form.Get("refresh_token") == "" {
 			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)

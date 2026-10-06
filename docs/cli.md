@@ -334,7 +334,7 @@ $ schemabot pull -d shop -e staging -o json
   "namespaces": {
     "shop": {
       "tables": {
-        "orders": "CREATE TABLE orders (id bigint NOT NULL) STATS_PERSISTENT=0"
+        "orders": "CREATE TABLE orders (id bigint NOT NULL) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */"
       }
     }
   },
@@ -358,7 +358,7 @@ without changing options, comments, or statements. The example becomes
 ```sql
 CREATE TABLE orders (
     id bigint NOT NULL
-) STATS_PERSISTENT=0;
+) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */;
 ```
 
 Copy namespace artifacts such as `vschema.json` into the same namespace
@@ -485,23 +485,37 @@ deployments address a target of the same name; an ambiguous bare name is
 refused. An unknown name is refused with the list of valid targets. `plan`
 takes the same flag and needs `-e` with it.
 
-A narrowed plan speaks for its one target. It never records a GitHub check
-result, so a narrowed plan or apply cannot pass a PR merge gate while other
-targets still need the change. The server records the narrowing on the stored
-plan and refuses to apply it anywhere but the target it was made for, and a
-narrowed apply cannot be rolled back with `rollback`: restore that target by
-planning and applying the previous schema with the same `--target`. In an
-environment with a single target, `--target` names the whole rollout, so the
-plan and apply are not narrowed.
+A narrowed plan speaks for its one target. It shows only that target's
+changes, never the whole rollout's split of what applies where, and it is
+never gated on another target that needs attention. It never records a GitHub
+check result, so a narrowed plan or apply cannot pass a PR merge gate while
+other targets still need the change. The server records the narrowing on the
+stored plan and refuses to apply it anywhere but the target it was made for,
+and a narrowed apply cannot be rolled back with `rollback`: restore that
+target by planning and applying the previous schema with the same `--target`.
+In an environment with a single target, `--target` names the whole rollout,
+so the plan and apply are not narrowed.
 
-A plan of the whole rollout is made against its first target, and the other
-targets run that plan. When the first target is already at the desired schema,
-the server also diffs every other target against its own live schema. The plan
-reports no changes only when every target is converged, so a re-run of an
-`apply` that already landed, or the verification step of `onboard`, reads as up
-to date. When a target still needs the change, for example after an apply
-narrowed to the first target, or a target cannot be diffed, the plan fails with
-an error that lists those targets. Plan and apply each of them with `--target`.
+A plan of the whole rollout plans every target beside the first one and shows
+what applies where. It reports no changes only when every target is at the
+desired schema, so a re-run of an `apply` that already landed, or the
+verification step of `onboard`, reads as up to date. When the first target is
+already at the desired schema, for example after an apply narrowed to it,
+another target can still need the change, and the plan says so rather than
+reading as up to date from the first target alone. A target planned against
+its own schema shows that work under its own heading. A deployment expected to
+mirror the first target is listed as needing attention instead, with the
+`--target` that applies it on its own, since its plan differs from the one it
+mirrors. A target that cannot be planned is listed as needing attention too.
+`apply` of the whole rollout refuses while any target needs attention, and
+`onboard` fails its verification.
+
+A plan or apply of a whole rollout of more than one target needs a CLI that
+renders every target's plan. The server refuses one from an older CLI, which
+would show only the first target's plan, with `upgrade the schemabot CLI to
+plan or apply a multi-target environment`; `--target` still works from it.
+Upgrade the server before the CLI, as [releases](release.md) describes: an
+older server refuses a request from a newer CLI as an unknown field.
 
 A targeted apply checks for a schema change already in progress on its
 target's deployment, which every target of a `targets:` list shares, and
@@ -510,13 +524,37 @@ refuses to start while one is queued or running there.
 A rollback of a rollout-wide apply is made against the first target the apply
 ran from. If the rollout order changed since, the rollback is refused rather
 than reverting that one target alone: restore the order the apply ran under,
-then retry it.
+then retry it. A rollout of a `targets:` list plans each target against its own
+schema, and a rollback is one plan, so its rollback is refused before anything
+is planned: restore each target by planning and applying the previous schema
+with `--target`. The refusal follows how the apply ran, as recorded with its
+plan, not how the environment is configured now, so respelling the targets as
+mirrored deployments, or removing all but the first, does not let the rollback
+through. An apply that ran one plan on every target is refused only if its
+targets are now each planned against their own schema.
 
 ### Understand a refusal
 
 Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
 Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
+
+An apply of the whole rollout runs each target's own plan, but holds every
+target to what the first target's plan discloses, since that is the plan you
+review and consent against. So the server refuses, whatever the flags,
+`--allow-unsafe` included, a target whose own plan carries an unsafe change
+the first target's plan does not, a change the engine runs as direct-execution
+DDL there, or work the apply, laid out from the first target's plan, has no
+operation to run. It returns those targets with the plan, and `apply` refuses
+before it takes a lock or prompts. For each target it prints the
+`apply --target <target>` that applies that target's own plan, with
+`--allow-unsafe` when that plan is unsafe; once those have landed, apply the
+rollout again for the rest. A target whose plan no apply runs, because its
+engine refuses a change or its own plan's work has no operation to run from,
+gets no such command: change the schema files instead. These refused targets
+are listed only once no target needs attention, since a target needing
+attention refuses the apply first. So after you fix a target that needed
+attention and plan again, the plan can still list a target the apply refuses.
 
 A database lock can also block a new apply. Inspect the owner and ongoing
 work before releasing it. Locks span the database's environments; forcing
@@ -910,7 +948,10 @@ environments were not read."), because a clean answer for one environment is
 not a clean answer for the pull request. `--json` gives each row a stable
 `reason` code to branch on. The inspection only reads, so any token that can
 already see a pull request's status can run it; recreating a Check Run with
-`checks backfill` is the admin operation.
+`checks backfill` is the admin operation. Every inspection reads GitHub
+through the App installation, so each caller has a
+[request budget](configuration.md#check-inspection); a loop that exceeds it is
+refused with a retry delay rather than spending the quota the merge gate needs.
 
 ### Recover missing GitHub checks
 
@@ -1002,6 +1043,17 @@ For agents and automated processes, `apply --no-watch` and `rollback --no-watch`
 return after submission without opening an interactive watcher. Retain the new
 apply ID and check its status; submission alone does not confirm completion.
 Interactive operators should keep the default automatic watcher.
+
+A watching `apply -o log` or `apply -o json` returns as soon as the apply
+reaches a final state. It exits 0 only when the apply completed, and non-zero
+when it was stopped, failed, was cancelled, or was reverted, because in each of
+those the schema change is not on the target. For a stopped apply the error
+names the `start` command that resumes it. A watcher that cannot reach the
+server retries with backoff, and exits non-zero once polls have kept failing
+for a few minutes in a row; the interactive watcher gives up on the same
+schedule. Giving up does not affect the apply. The error tells the operator to
+rerun the original watch command, preserving its output format and connection
+flags, or to run `progress` with the apply ID to see its current state.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

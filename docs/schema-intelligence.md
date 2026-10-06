@@ -397,8 +397,19 @@ but it will not call two different schemas equal.
 
 A target whose entry [selects namespaces](configuration.md#selecting-namespaces-per-target)
 is pulled for exactly those namespaces, by name, and an explicitly requested
-namespace it does not select is left out of its pull. The response shape does
-not change, but the comparison is still keyed by namespace and table: two
+namespace it does not select is left out of its pull. When every entry of the
+environment selects namespaces, a requested namespace none of them selects is
+rejected with `400` naming it and the selectable ones, rather than answered
+with an empty schema:
+
+```json
+{
+  "error": "database \"orders\" environment \"production\" has no targets entry selecting namespaces [shop_l]; the selectable namespaces are [shop_0, shop_1]",
+  "error_code": ""
+}
+```
+
+The response shape does not change, but the comparison is still keyed by namespace and table: two
 targets holding different namespaces report each other's tables as
 `only_on_primary` and `only_on_target`, because neither holds the other's
 namespace.
@@ -1056,6 +1067,49 @@ creates, a failed or timed-out size read, and any shard reporting nothing
 (which omits that table's total rather than undercounting it). MySQL targets
 planned by Spirit report rows and bytes for every existing table the plan
 touches; other engines omit the fields for now.
+
+A table change that moves existing columns onto another collation lists them
+in `collation_changes`, one entry per column: `from` and `to` name the
+collations, and `case` and `trailing_spaces` say how comparing values that
+differ only in letter case, or only in trailing spaces, moves. Each is
+`unchanged`, `becomes_sensitive` (such values stop comparing equal),
+`becomes_insensitive` (they start comparing equal), or `unknown`, which a
+caller treats as a possible change. A definition that names a charset without
+a collation takes the target server's default collation for that charset,
+which the plan reads from the target. `to` is omitted when the plan cannot
+read that default. `can_merge_values` says whether values that compare unequal
+now can compare equal after the move, whether or not `case` and
+`trailing_spaces` name the reason: collations also weigh accents and other
+characters differently. It is `false` only for a move onto the charset's binary
+collation that does not start ignoring trailing spaces. `unique_indexes` names
+the primary key and unique indexes covering the column when
+`can_merge_values` is `true`, since the apply fails on such an index if
+existing rows collide. The field is omitted when the change re-collates no
+column. MySQL targets planned by Spirit report it; other engines omit it for
+now.
+
+For example, a table change that moves a unique column onto a UCA 9.0.0
+collation, where trailing spaces start to count and other characters can
+compare differently (illustrative values):
+
+```json
+{
+  "table_name": "customers",
+  "ddl": "ALTER TABLE `customers` MODIFY COLUMN `handle` varchar(64) COLLATE utf8mb4_0900_ai_ci NOT NULL",
+  "change_type": "alter",
+  "collation_changes": [
+    {
+      "column": "handle",
+      "from": "utf8mb4_general_ci",
+      "to": "utf8mb4_0900_ai_ci",
+      "case": "unchanged",
+      "trailing_spaces": "becomes_sensitive",
+      "can_merge_values": true,
+      "unique_indexes": ["uk_handle"]
+    }
+  ]
+}
+```
 
 Each entry in the plan's `changes` is one namespace, and its `metadata`
 carries the namespace-level work the engine planned alongside the table DDL.

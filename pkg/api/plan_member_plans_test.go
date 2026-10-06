@@ -33,6 +33,28 @@ func (s *recordingPlanStore) Create(_ context.Context, plan *storage.Plan) (int6
 	return int64(len(s.created)), nil
 }
 
+// Get returns a plan this store created under the identifier, or the seeded
+// lookup plan, which stands in for the primary plan its planner stored.
+func (s *recordingPlanStore) Get(ctx context.Context, planIdentifier string) (*storage.Plan, error) {
+	for _, plan := range s.created {
+		if plan.PlanIdentifier == planIdentifier {
+			return plan, nil
+		}
+	}
+	return s.mockPlanLookupStore.Get(ctx, planIdentifier)
+}
+
+// List returns the created plans of the review round the options name.
+func (s *recordingPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	var matched []*storage.Plan
+	for _, plan := range s.created {
+		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
+			matched = append(matched, plan)
+		}
+	}
+	return matched, nil
+}
+
 // multiTargetService builds a database whose production environment addresses
 // two distinct targets through one deployment, which is the shape that makes its
 // members independently planned.
@@ -90,7 +112,7 @@ func multiTargetMember(target string) routing.ExecutionTarget {
 }
 
 // Each target of a multi-target environment holds its own schema, so the second
-// target legitimately plans different DDL than the reviewed primary. The review
+// target legitimately plans different DDL than the primary target. The review
 // stays clean and the second target's plan is persisted as a row of its own, so
 // an apply has something to run for it.
 func TestRollupReviewTimeDrift_IndependentMemberPlanIsPersisted(t *testing.T) {
@@ -125,11 +147,11 @@ func TestRollupReviewTimeDrift_IndependentMemberPlanIsPersisted(t *testing.T) {
 	assert.Equal(t, "users", stored.Namespaces["testapp"].Tables[0].Table)
 	assert.Contains(t, stored.Namespaces["testapp"].Tables[0].DDL, "ADD COLUMN `phone`")
 	assert.Equal(t, reviewed.PlanId, stored.PrimaryPlanIdentifier,
-		"a member's plan is bound to the reviewed plan it was produced alongside")
+		"a member's plan is bound to the primary target's plan it was produced alongside")
 }
 
 // A commit can be planned more than once, and each round stores its own plan per
-// member with the same route and the same head SHA. The reviewed plan's
+// member with the same route and the same head SHA. The primary plan's
 // identifier is what tells the rounds apart, so a member plan that cannot be
 // attributed to one is not stored at all: the member then has no plan for the
 // round and blocks the review, rather than being paired with a plan from a round
@@ -243,14 +265,14 @@ func TestRollupReviewTimeDrift_MirroredMembersStoreNoMemberPlan(t *testing.T) {
 	require.Len(t, rollup.Entries, 2)
 	assert.Equal(t, DeploymentMatch, rollup.Entries[1].Class)
 	assert.Empty(t, rollup.Entries[1].PlanIdentifier)
-	assert.Empty(t, plans.created, "mirrored members run the reviewed plan")
+	assert.Empty(t, plans.created, "mirrored members run the primary target's plan")
 }
 
 // A rollout member's plan row records the policy its own diff was judged
 // under, the same as the primary's. The apply dispatches each member against
 // its stored plan, so a member row without the policy would have its
 // statements resolved from configuration at apply while the primary's ran
-// under the reviewed one.
+// under the primary plan's.
 func TestRollupReviewTimeDrift_MemberPlanRecordsTheDirectExecutionPolicy(t *testing.T) {
 	reviewed := reviewedUsersPlan("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
 	plans := &recordingPlanStore{}

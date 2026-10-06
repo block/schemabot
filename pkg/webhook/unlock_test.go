@@ -39,10 +39,8 @@ type unlockTestLockStore struct {
 	getByPRErr  error
 	releaseErrs map[string]error
 
-	releaseCalls      int
-	forceReleaseCalls int
-	released          []string
-	forceReleased     []string
+	releaseCalls int
+	released     []string
 }
 
 func (s *unlockTestLockStore) GetByPR(_ context.Context, _ string, _ int) ([]*storage.Lock, error) {
@@ -56,21 +54,12 @@ func (s *unlockTestLockStore) List(_ context.Context) ([]*storage.Lock, error) {
 	return s.locks, nil
 }
 
-func (s *unlockTestLockStore) Release(_ context.Context, database, _, _ string) error {
+func (s *unlockTestLockStore) ReleaseByID(_ context.Context, _ int64, database, _, _, _ string) error {
 	s.releaseCalls++
 	if err := s.releaseErrs[database]; err != nil {
 		return err
 	}
 	s.released = append(s.released, database)
-	return nil
-}
-
-func (s *unlockTestLockStore) ForceRelease(_ context.Context, database, _ string) error {
-	s.forceReleaseCalls++
-	if err := s.releaseErrs[database]; err != nil {
-		return err
-	}
-	s.forceReleased = append(s.forceReleased, database)
 	return nil
 }
 
@@ -152,7 +141,6 @@ func TestUnlockRefusedWhenActiveApplyLookupFails(t *testing.T) {
 	h.handleUnlockCommand("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 	assert.Equal(t, 0, lockStore.releaseCalls, "unlock must not release any lock when apply state is unknown")
-	assert.Equal(t, 0, lockStore.forceReleaseCalls, "unlock must not force-release any lock when apply state is unknown")
 
 	select {
 	case body := <-comments:
@@ -186,7 +174,6 @@ func TestUnlockReleasesLockWhenNoActiveApplies(t *testing.T) {
 	h.handleUnlockCommand("octocat/hello-world", 1, 12345, "testuser", CommandResult{Action: action.Unlock})
 
 	assert.Equal(t, 1, lockStore.releaseCalls, "exactly one owned-lock release expected")
-	assert.Equal(t, 0, lockStore.forceReleaseCalls, "non-force unlock must not force-release")
 
 	select {
 	case body := <-comments:

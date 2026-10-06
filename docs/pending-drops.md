@@ -58,6 +58,11 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
 2. **Apply** — the Spirit engine intercepts the `DROP TABLE` and renames the
    table into `_pending_drops` with a UTC timestamp prefix
    (`YYYYMMDDHHmmSSmmm_<table>`, capped at MySQL's 64-character name limit).
+   A table name too long to fit is shortened by characters and ends in
+   `_<hash>`, derived from its schema and full name. A name that would otherwise
+   match another table quarantined in the same rename (the same table name in
+   two schemas, say) uses progressively more hash characters until it is
+   unique, so every table gets its own copy.
    The rename is atomic and metadata-only, so it completes immediately
    regardless of table size. The apply log records the quarantine table name.
 3. **Retention** — the table sits in `_pending_drops` with its data intact.
@@ -110,6 +115,16 @@ WHERE table_schema = '_pending_drops' ORDER BY table_name DESC;
 -- Restore it.
 RENAME TABLE `_pending_drops`.`20260610143022123_users` TO `app`.`users`;
 ```
+
+A quarantined name does not record which schema the table came from, and a
+name that was shortened to fit the 64-character limit (one ending in `_<hash>`)
+does not carry the full table name either, so neither can be mapped back to
+its source from `information_schema` alone. The apply log is the map: for every
+table it quarantines, the apply writes a line of the form
+``table `app`.`users` quarantined as `_pending_drops`.`20260610143022123_users`; recoverable until the pending drops retention period expires``,
+and that line is the authoritative source-to-copy pairing. Look the table up
+there first; the query above only identifies a copy by its own (possibly
+shortened) name.
 
 Also restore the table's `.sql` file in the schema repository, otherwise the
 next plan will produce another `DROP TABLE` for it.

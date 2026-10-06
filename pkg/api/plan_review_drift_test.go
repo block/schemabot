@@ -96,7 +96,7 @@ func TestRollupReviewTimeDrift_UnresolvedTargetsError(t *testing.T) {
 }
 
 // A diverged deployment's warn log carries the comparator's diff so an operator
-// can tell what the deployment would run that the reviewed plan does not say —
+// can tell what the deployment would run that the primary plan does not say —
 // table and operation per item, never the DDL body, capped with a "+N more"
 // overflow so a badly drifted deployment cannot flood the log line.
 func TestDriftDiffLogAttrs(t *testing.T) {

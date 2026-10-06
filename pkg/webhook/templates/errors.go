@@ -39,6 +39,58 @@ type SchemaErrorData struct {
 	// limited to when GitHub truncated the repository tree. Empty when the
 	// whole repository was searched.
 	SearchedDirs []string
+	// UnregisteredConfigs lists the schema configs whose database this
+	// deployment has not registered and whose schema directory is under no
+	// path it expects another deployment to report on.
+	UnregisteredConfigs []UnregisteredSchemaConfigData
+	// Deployment names the SchemaBot deployment making a claim about its own
+	// registry: the one environment it serves. Empty when it serves several
+	// or every environment, and the comment then speaks for "this" deployment
+	// and renders the environment header instead.
+	Deployment string
+}
+
+// UnregisteredSchemaConfigData identifies one schema config whose database the
+// deployment posting the comment has not registered.
+type UnregisteredSchemaConfigData struct {
+	Database   string
+	SchemaPath string
+}
+
+// MultipleUnregisteredConfigs reports whether the error names more than one
+// unregistered schema config, which renders them as a list.
+func (d SchemaErrorData) MultipleUnregisteredConfigs() bool {
+	return len(d.UnregisteredConfigs) > 1
+}
+
+// UnregisteredConfigLines renders each unregistered schema config as its
+// schema directory and the database it declares, as code spans the
+// PR-supplied values cannot break out of.
+func (d SchemaErrorData) UnregisteredConfigLines() []string {
+	lines := make([]string, 0, len(d.UnregisteredConfigs))
+	for _, cfg := range d.UnregisteredConfigs {
+		lines = append(lines, inlineCode(cfg.SchemaPath)+" declares database "+inlineCode(cfg.Database))
+	}
+	return lines
+}
+
+// DeploymentHeader renders the header segment naming the deployment that
+// makes the claim, falling back to the environment header when the
+// deployment serves more than one environment.
+func (d SchemaErrorData) DeploymentHeader() string {
+	if d.Deployment != "" {
+		return "**Deployment**: " + inlineCode(d.Deployment)
+	}
+	return d.EnvironmentHeader()
+}
+
+// DeploymentSubject names the deployment making the claim as the subject of a
+// sentence.
+func (d SchemaErrorData) DeploymentSubject() string {
+	if d.Deployment != "" {
+		return "The " + flattenIdentifier(d.Deployment) + " SchemaBot deployment"
+	}
+	return "This SchemaBot deployment"
 }
 
 // SearchedDirsCode renders the directories a scoped search probed as code
@@ -169,6 +221,22 @@ const databaseNotConfiguredTemplate = "## " + glyph.Attention + ` Database Not C
 This SchemaBot instance has no {{.DatabaseNameCode}} entry under ` + "`databases`" + ` in its server configuration, so it cannot plan or apply schema changes for it. A ` + "`schemabot.yaml`" + ` declaring {{.DatabaseDeclarationCode}} is not enough on its own: the database also has to be configured on the SchemaBot server.
 
 Check that the database name, from ` + "`-d`" + ` or from ` + "`schemabot.yaml`" + `, matches one this instance serves, or ask a SchemaBot operator to configure the database.`
+
+const databaseNotRegisteredTemplate = "## " + glyph.Attention + ` {{if .MultipleUnregisteredConfigs}}Databases Not Registered{{else}}Database Not Registered{{end}}
+
+{{if .MultipleUnregisteredConfigs}}{{with .DeploymentHeader}}{{.}}
+
+{{end}}{{else}}**Database**: {{.DatabaseNameCode}} | **Schema directory**: {{.SchemaPathCode}}{{with .DeploymentHeader}} | {{.}}{{end}}
+
+{{end}}{{.Attribution}}
+
+{{if .MultipleUnregisteredConfigs}}{{.DeploymentSubject}} has none of these databases under ` + "`databases`" + `, and none of these schema directories is under a path it expects another deployment to report on:
+
+{{range .UnregisteredConfigLines}}- {{.}}
+{{end}}
+For each database that is new to SchemaBot, ask a SchemaBot operator to register it with its schema directory. For each one already registered, move its ` + "`schemabot.yaml`" + ` and schema files under the schema directory registered for it.{{else}}{{.DeploymentSubject}} has no {{.DatabaseNameCode}} entry under ` + "`databases`" + `, and this schema directory is not under any path it expects another deployment to report on.
+
+If {{.DatabaseNameCode}} is new to SchemaBot, ask a SchemaBot operator to register it with this schema directory. If it is already registered, move the ` + "`schemabot.yaml`" + ` and its schema files under the schema directory registered for it.{{end}}`
 
 const databaseRepoNotAllowedTemplate = "## " + glyph.Attention + ` Database Not Available to This Repository
 
@@ -307,17 +375,18 @@ const genericErrorTemplate = "## " + glyph.Failed + ` {{.CommandName}} Failed
 
 // Compiled templates.
 var (
-	tmplDatabaseNotFound     = template.Must(template.New("databaseNotFound").Parse(databaseNotFoundTemplate))
-	tmplDatabaseNotConfig    = template.Must(template.New("databaseNotConfigured").Parse(databaseNotConfiguredTemplate))
-	tmplRepoTreeTruncated    = template.Must(template.New("repositoryTreeTruncated").Parse(repositoryTreeTruncatedTemplate))
-	tmplDatabaseRepoDenied   = template.Must(template.New("databaseRepoNotAllowed").Parse(databaseRepoNotAllowedTemplate))
-	tmplInvalidConfig        = template.Must(template.New("invalidConfig").Parse(invalidConfigTemplate))
-	tmplNoConfigNoDatabase   = template.Must(template.New("noConfigNoDatabase").Parse(noConfigNoDatabaseTemplate))
-	tmplNoConfigWithDatabase = template.Must(template.New("noConfigWithDatabase").Parse(noConfigWithDatabaseTemplate))
-	tmplConfigNotAuthorized  = template.Must(template.New("configOutsideAllowedDirs").Parse(configOutsideAllowedDirsTemplate))
-	tmplUnmanagedNotice      = template.Must(template.New("unmanagedSchemaConfigsNotice").Parse(unmanagedSchemaConfigsNoticeTemplate))
-	tmplMultipleConfigs      = template.Must(template.New("multipleConfigs").Parse(multipleConfigsTemplate))
-	tmplGenericError         = template.Must(template.New("genericError").Parse(genericErrorTemplate))
+	tmplDatabaseNotFound      = template.Must(template.New("databaseNotFound").Parse(databaseNotFoundTemplate))
+	tmplDatabaseNotConfig     = template.Must(template.New("databaseNotConfigured").Parse(databaseNotConfiguredTemplate))
+	tmplDatabaseNotRegistered = template.Must(template.New("databaseNotRegistered").Parse(databaseNotRegisteredTemplate))
+	tmplRepoTreeTruncated     = template.Must(template.New("repositoryTreeTruncated").Parse(repositoryTreeTruncatedTemplate))
+	tmplDatabaseRepoDenied    = template.Must(template.New("databaseRepoNotAllowed").Parse(databaseRepoNotAllowedTemplate))
+	tmplInvalidConfig         = template.Must(template.New("invalidConfig").Parse(invalidConfigTemplate))
+	tmplNoConfigNoDatabase    = template.Must(template.New("noConfigNoDatabase").Parse(noConfigNoDatabaseTemplate))
+	tmplNoConfigWithDatabase  = template.Must(template.New("noConfigWithDatabase").Parse(noConfigWithDatabaseTemplate))
+	tmplConfigNotAuthorized   = template.Must(template.New("configOutsideAllowedDirs").Parse(configOutsideAllowedDirsTemplate))
+	tmplUnmanagedNotice       = template.Must(template.New("unmanagedSchemaConfigsNotice").Parse(unmanagedSchemaConfigsNoticeTemplate))
+	tmplMultipleConfigs       = template.Must(template.New("multipleConfigs").Parse(multipleConfigsTemplate))
+	tmplGenericError          = template.Must(template.New("genericError").Parse(genericErrorTemplate))
 )
 
 // RenderDatabaseNotFound renders the "database not found" error comment. When
@@ -334,6 +403,20 @@ func RenderDatabaseNotFound(data SchemaErrorData) string {
 // schemabot.yaml, and the remedy is server-side.
 func RenderDatabaseNotConfigured(data SchemaErrorData) string {
 	return offerSupportChannel(renderTemplate(tmplDatabaseNotConfig, data))
+}
+
+// RenderDatabaseNotRegistered renders the error the aggregate leader posts
+// when the PR's schema config declares a database its own registry lacks and
+// sits under no path it expects another deployment to report on. The claim is
+// scoped to the deployment posting it: another deployment on the repository
+// may still register the database. data.UnregisteredConfigs names every such
+// config; one config renders in the header, several as a list.
+func RenderDatabaseNotRegistered(data SchemaErrorData) string {
+	if len(data.UnregisteredConfigs) == 1 {
+		data.DatabaseName = data.UnregisteredConfigs[0].Database
+		data.SchemaPath = data.UnregisteredConfigs[0].SchemaPath
+	}
+	return offerSupportChannel(renderTemplate(tmplDatabaseNotRegistered, data))
 }
 
 // RenderRepositoryTreeTruncated renders the error shown when GitHub truncated
@@ -522,16 +605,30 @@ func FormatAvailableDatabases(errMsg string) string {
 // one rollout target's own plan for a change its engine refuses. It is built
 // from the target's name and the table rather than from the refusal's error
 // text, and it names the target so the operator looks for the change under
-// that target's plan instead of in the reviewed one.
+// that target's plan instead of in the primary plan.
 func MemberPlanBlockedDetail(target, table string) string {
 	return fmt.Sprintf("Target %s has a change on table %s that its engine refuses to execute, so nothing was applied. Fix what that target's plan names as the reason, then run the command again.",
 		inlineCode(target), inlineCode(table))
 }
 
+// MemberPlanUnsafeWithoutOptInDetail is the error line for an apply whose
+// creation refused one rollout target's own plan for an unsafe change, on an
+// apply created without `--allow-unsafe`. Like MemberPlanBlockedDetail, it is
+// built from names SchemaBot controls; table is empty for a VSchema change in
+// namespace.
+func MemberPlanUnsafeWithoutOptInDetail(target, table, namespace string) string {
+	subject := "table " + inlineCode(table)
+	if table == "" {
+		subject = "the VSchema of namespace " + inlineCode(namespace)
+	}
+	return fmt.Sprintf("Target %s has an unsafe change on %s, so nothing was applied. Run the command again with `--allow-unsafe` to apply it.",
+		inlineCode(target), subject)
+}
+
 // MemberPlanUndisclosedUnsafeDetail is the error line for an apply whose
 // creation refused one rollout target's own plan for an unsafe change the
-// reviewed plan does not carry. The comment's unsafe disclosure names only the
-// reviewed plan's changes, so no `--allow-unsafe` covers it, and the line does
+// primary plan does not carry. The comment's unsafe disclosure names only the
+// primary plan's changes, so no `--allow-unsafe` covers it, and the line does
 // not suggest one. Like MemberPlanBlockedDetail, it is built from names
 // SchemaBot controls; table is empty for a VSchema change in namespace.
 func MemberPlanUndisclosedUnsafeDetail(target, table, namespace string) string {
@@ -539,6 +636,6 @@ func MemberPlanUndisclosedUnsafeDetail(target, table, namespace string) string {
 	if table == "" {
 		subject = "the VSchema of namespace " + inlineCode(namespace)
 	}
-	return fmt.Sprintf("Target %s has an unsafe change on %s that the reviewed plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the reviewed plan carries the same change.",
+	return fmt.Sprintf("Target %s has an unsafe change on %s that the primary target's plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the primary target's plan carries the same change.",
 		inlineCode(target), subject)
 }

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	spiritflags "github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/table"
@@ -2385,7 +2386,10 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	assert.False(t, m.EnableExperimentalLocklessChecksum,
 		"the copy is verified under the snapshot checksum until an operator opts in")
 	assert.True(t, m.InterpolateParams)
-	assert.Zero(t, m.WriteThreads, "write threads auto-size for the target")
+	assert.Equal(t, DefaultThreads, m.Threads, "copier threads carry the engine setting")
+	assert.Equal(t, DefaultLockWaitTimeout, m.LockWaitTimeout, "the cutover lock wait carries the engine setting")
+	assert.Equal(t, spiritflags.DefaultWriteThreads, m.WriteThreads,
+		"write threads start at Spirit's default; autoscaling sizes them on Aurora")
 	assert.Equal(t, maxCommitLatency, m.MaxCommitLatency,
 		"commit-latency throttle must be set explicitly; Spirit disables the throttler on zero")
 

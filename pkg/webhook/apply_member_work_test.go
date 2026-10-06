@@ -16,7 +16,7 @@ import (
 )
 
 // A PR apply runs the other targets' plans only when the rollout passed its
-// contract, a target other than the reviewed one has work, and the comment
+// contract, a target other than the primary has work, and the comment
 // renders every target's plan. Anything else refuses, since the apply would
 // otherwise run statements its comment never showed.
 func TestRolloutRunsMemberWork(t *testing.T) {
@@ -44,13 +44,13 @@ func TestRolloutRunsMemberWork(t *testing.T) {
 	assert.False(t, rolloutRunsMemberWork(converged, targetPlans()), "a rollout with no work left has nothing to run")
 
 	reviewedOnly := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 1, members: 3, names: []string{"payments-001"}}}
-	assert.False(t, rolloutRunsMemberWork(reviewedOnly, targetPlans()), "work on the reviewed target alone runs the reviewed plan")
+	assert.False(t, rolloutRunsMemberWork(reviewedOnly, targetPlans()), "work on the primary target alone runs the primary target's plan")
 
 	assert.False(t, rolloutRunsMemberWork(pending, nil), "no preview means the comment showed no target's plan")
 
 	mirrored := targetPlans()
 	mirrored.Independent = false
-	assert.False(t, rolloutRunsMemberWork(pending, mirrored), "mirrored targets render the reviewed plan alone")
+	assert.False(t, rolloutRunsMemberWork(pending, mirrored), "mirrored targets render the primary target's plan alone")
 
 	diverged := targetPlans()
 	diverged.Clean = false
@@ -94,6 +94,17 @@ func TestMemberWorkDifference(t *testing.T) {
 		c.ExecutionMode = "blocked"
 	})), "the same statement, now blocked")
 	assert.Equal(t, workStatements, memberWorkDifference(plan(nil), &storage.Plan{}), "work the confirmed round did not plan")
+	assert.Equal(t, workUnsafe, memberWorkDifference(plan(nil), plan(func(c *storage.TableChange) {
+		c.IsUnsafe = true
+		c.UnsafeReason = "drop_index: index idx_email is visible"
+	})), "the same statement, now unsafe on this target's schema")
+	assert.Equal(t, workUnsafe, memberWorkDifference(plan(func(c *storage.TableChange) {
+		c.IsUnsafe = true
+		c.UnsafeReason = "has_timestamp: column created_at uses TIMESTAMP"
+	}), plan(func(c *storage.TableChange) {
+		c.IsUnsafe = true
+		c.UnsafeReason = "drop_index: index idx_email is visible"
+	})), "the same statement, unsafe for another reason")
 
 	sharded := plan(nil)
 	sharded.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "payments", Changes: sharded.FlatDDLChanges()}}
@@ -102,6 +113,10 @@ func TestMemberWorkDifference(t *testing.T) {
 	directShard.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "payments", Changes: directShard.FlatDDLChanges()}}
 	directShard.Shards[0].Changes[0].ExecutionMode = "direct"
 	assert.Equal(t, workExecutionMode, memberWorkDifference(sharded, directShard), "a shard's change that now runs as direct execution")
+	unsafeShard := plan(nil)
+	unsafeShard.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "payments", Changes: unsafeShard.FlatDDLChanges()}}
+	unsafeShard.Shards[0].Changes[0].IsUnsafe = true
+	assert.Equal(t, workUnsafe, memberWorkDifference(sharded, unsafeShard), "a shard's change that is now unsafe")
 
 	finalized := plan(nil)
 	finalized.Namespaces["payments"].Finalize = true
@@ -154,7 +169,7 @@ func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
 	assert.Empty(t, memberWorkOf(&rollup).copyAtStake, "a member that reported a clean target puts nothing at stake")
 }
 
-// A PostgreSQL targets rollout whose reviewed target already has the schema
+// A PostgreSQL targets rollout whose primary target already has the schema
 // while another target still needs a column. The engine does not read a target
 // for unfinished copies, so the member's plan comes back without that
 // disclosure, and a PR apply refuses its work whatever its flags. The plan
@@ -190,7 +205,7 @@ func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 
 	single := templates.RenderPlanComment(data)
 	assert.Contains(t, single, "ALTER TABLE orders ADD COLUMN region varchar(16)", "the other target's plan is still shown")
-	assert.Contains(t, single, "**This PR cannot apply the other targets' plans**: the reviewed target already has this schema, but target primary/payments-002: its data plane did not report")
+	assert.Contains(t, single, "**This PR cannot apply every target's plan**: target primary/payments-002: its data plane did not report")
 	assert.NotContains(t, single, "schemabot apply", "an apply that is refused whatever its flags is never offered")
 
 	staging := &templates.PlanCommentData{Database: "payments", DatabaseType: "postgres", Environment: "staging"}
@@ -199,13 +214,13 @@ func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*templates.PlanCommentData{"staging": staging, "production": &data},
 	})
-	assert.Contains(t, multi, "**This PR cannot apply the other targets' plans**")
+	assert.Contains(t, multi, "**This PR cannot apply every target's plan**")
 	assert.NotContains(t, multi, "schemabot apply")
 	assert.NotContains(t, multi, "No changes to apply", "a target still needs the change")
 }
 
 // A confirmation covers the statements its comment showed on every target,
-// the reviewed one included. The reviewed target's re-plan at confirm must run
+// the primary included. The primary target's re-plan at confirm must run
 // what the confirmed plan showed, unless it now runs nothing; each other target
 // with work must run what the confirmed round planned for it.
 func TestRoundCoversWork(t *testing.T) {
@@ -226,21 +241,21 @@ func TestRoundCoversWork(t *testing.T) {
 	assert.True(t, covered, reason)
 
 	covered, reason = roundCoversWork(plan(region), &storage.Plan{}, members(region), members(region))
-	assert.True(t, covered, "a reviewed target that converged since runs nothing: %s", reason)
+	assert.True(t, covered, "a primary target that converged since runs nothing: %s", reason)
 
 	covered, reason = roundCoversWork(plan(region), plan(wider), members(region), members(region))
 	assert.False(t, covered)
-	assert.Equal(t, "the re-plan of the reviewed target differs from the confirmed plan in its statements", reason)
+	assert.Equal(t, "the re-plan of the primary target differs from the confirmed plan in its statements", reason)
 
 	covered, reason = roundCoversWork(&storage.Plan{}, plan(region), members(region), members(region))
-	assert.False(t, covered, "work on a reviewed target the confirmed plan showed as converged")
-	assert.Equal(t, "the re-plan of the reviewed target differs from the confirmed plan in its statements", reason)
+	assert.False(t, covered, "work on a primary target the confirmed plan showed as converged")
+	assert.Equal(t, "the re-plan of the primary target differs from the confirmed plan in its statements", reason)
 
 	reviewedDirect := plan(region)
 	reviewedDirect.Namespaces["payments"].Tables[0].ExecutionMode = "direct"
 	covered, reason = roundCoversWork(plan(region), reviewedDirect, members(region), members(region))
 	assert.False(t, covered, "a reviewed-target statement that turned direct since the confirmed round is refused")
-	assert.Equal(t, "the re-plan of the reviewed target differs from the confirmed plan in how its statements run", reason)
+	assert.Equal(t, "the re-plan of the primary target differs from the confirmed plan in how its statements run", reason)
 
 	covered, reason = roundCoversWork(plan(region), plan(region), members(region), members(wider))
 	assert.False(t, covered)
@@ -260,19 +275,19 @@ func TestRoundCoversWork(t *testing.T) {
 	assert.Equal(t, "target eu/payments-002 has work the confirmed round did not plan", reason)
 }
 
-// When the reviewed target has work too, the refusal counts every target that
-// needs the change, the reviewed one included, and never calls that list the
-// targets other than the reviewed one.
+// When the primary target has work too, the refusal counts every target that
+// needs the change, the primary included, and never calls that list the
+// targets other than the primary.
 func TestPendingRolloutMessageNamesTheTargetsThatNeedTheChange(t *testing.T) {
 	outcome := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 2, members: 2, others: 1, names: []string{"eu", "us"}}}
 
 	assert.Equal(t,
-		"2 of 2 targets need this change: eu, us. The plans of the targets other than the reviewed one were not on the comment this apply acts on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+		"2 of 2 targets need this change: eu, us. The plans of the targets other than the primary were not on the comment this apply acts on, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
 		pendingRolloutMessage(outcome, false))
 }
 
 // An apply-confirm refused because a plan changed after the confirmation tells
-// the operator which target's plan changed. When it is the reviewed target's own
+// the operator which target's plan changed. When it is the primary target's own
 // re-plan, the message says so rather than blaming the other targets' plans.
 func TestUnconfirmedWorkMessageNamesTheTargetWhosePlanChanged(t *testing.T) {
 	plan := func(ddl string) *storage.Plan {
@@ -287,7 +302,7 @@ func TestUnconfirmedWorkMessageNamesTheTargetWhosePlanChanged(t *testing.T) {
 	require.False(t, covered)
 	message := unconfirmedWorkMessage(memberWork{pending: 2, members: 2, names: []string{"eu/payments-001", "us/payments-002"}}, reason)
 	assert.Equal(t,
-		"2 of 2 targets need this change: eu/payments-001, us/payments-002. This confirmation no longer covers what the apply would run: the re-plan of the reviewed target differs from the confirmed plan in its statements, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+		"2 of 2 targets need this change: eu/payments-001, us/payments-002. This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in its statements, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
 		message)
-	assert.NotContains(t, message, "other than the reviewed one")
+	assert.NotContains(t, message, "other than the primary")
 }

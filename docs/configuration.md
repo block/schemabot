@@ -234,7 +234,7 @@ A single environment can fan out to multiple Tern deployments by replacing the s
 
 `Validate()` accepts a `deployments` map with any number of entries, and `ResolveDatabaseTargets` returns one execution target per entry in rollout order. An apply resolves that whole set and creates one `apply_operations` row per deployment. The driver claims each row and sequences the rollout along `deployment_order` under the environment's `cutover_policy` and `on_failure` policies. Control requests (stop, cutover, cancel) are recorded durably and consumed per operation, and progress, PR comments, and CLI output render per deployment.
 
-Review does not fan out the same way. See [Review and the Primary Deployment](#review-and-the-primary-deployment).
+Planning fans out too, and every deployment is held to the same plan. See [Planning and the Primary Deployment](#planning-and-the-primary-deployment).
 
 ```yaml
 storage:
@@ -274,13 +274,13 @@ Rules:
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
 - `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
-### Review and the Primary Deployment
+### Planning and the Primary Deployment
 
-An apply fans out across every deployment. Review does not: the plan reviewers see, and the plan SchemaBot persists and later applies from, is computed against the **primary deployment** only, meaning the first entry in rollout order.
+Planning fans out like the apply. At review time SchemaBot plans every deployment against its own live schema, and the plan check covers all of them: approving the pull request approves the change on every deployment, not on one of them.
 
-The remaining deployments are diffed against that reviewed plan at review time, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose schema diverges from the reviewed plan, and a deployment that cannot be diffed at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
+The deployments of a `deployments` map are expected to hold the same schema, so they are expected to plan the same changes. The first deployment in rollout order is the **primary deployment**. Its plan is the one SchemaBot stores, and every deployment runs that plan at apply time. Each other deployment's plan is compared against it, using a diff that is not persisted. The plan check fails closed on two distinct conditions: a deployment whose plan differs from the primary deployment's, and a deployment that cannot be planned at all. An unreachable deployment therefore blocks the merge rather than passing quietly.
 
-A multi-deployment environment is gated on every deployment agreeing with one reviewed plan, not on one reviewed plan per deployment.
+Being primary decides which plan is stored, not which deployment is reviewed. A multi-deployment environment is gated on every deployment planning the same changes, because every deployment runs the one stored plan.
 
 ### Deployment Order
 
@@ -340,6 +340,8 @@ When a database's namespaces are spread across its targets, an entry can be a ma
 
 The schema directory declares the namespace set; `namespaces` only selects from it and can never add one. Each target's plan, stored plan, and apply cover only its selected namespaces. A pull of the whole environment asks each target for its selected namespaces by name rather than discovering them on the cluster, and an explicitly requested namespace a target does not select is left out of that target's pull.
 
+A namespace that the schema files declare but a target's entry does not select is an *unselected namespace* of that target. In the example above, `payments_2` and `payments_3` are unselected namespaces of `payments-001`. They still exist, on another target, so they are withheld from that target's plan rather than removed. SchemaBot sends the target's plan only the files of its selected namespaces. It names the rest in the plan request's `unselected_namespaces`, so the Tern deployment knows those namespaces are left out on purpose. Their live tables are never treated as tables to drop.
+
 Rules:
 
 - `targets` requires `type: mysql`. Configuring it on a `vitess`, `strata`, or `postgres` database fails validation at startup.
@@ -357,7 +359,10 @@ Rules:
 - Every declared namespace must be selected by some target; a target without `namespaces` selects all of them. A declared namespace no entry selects fails every plan of the environment, whether from a pull request or the CLI, since no target would plan or apply it. On a pull request that environment's check fails; the API answers `400 Bad Request` naming the namespaces. To keep one out of the rollout on purpose, list it in `ignore_namespaces`.
 - Selecting namespaces needs a target whose DSN does not name a database. A database-scoped DSN is diffed as one unit, so the namespaces an entry does not select would have their live tables planned as `DROP TABLE`; the plan refuses instead, as it does for `ignore_namespaces`.
 
-Rollout order: upgrade the Tern deployments serving an environment before adding `namespaces` to its entries. SchemaBot tells the Tern deployment which declared namespaces a target's entry leaves out, and the refusal above for a database-scoped DSN happens there. There is no version check between the two, so a Tern deployment from an earlier release drops that list without error and plans the left-out namespaces' live tables as `DROP TABLE` instead of refusing. Those drops are still unsafe changes that an apply refuses without `--allow-unsafe`, but the plan is wrong until the upgrade lands.
+Rollout order: upgrade the Tern deployments serving an environment before adding `namespaces` to its entries. The refusal above for a database-scoped DSN happens in the Tern deployment, which needs `unselected_namespaces` to make it. There is no version check between SchemaBot and Tern. A Tern deployment from an earlier release discards `unselected_namespaces` without error and plans the unselected namespaces' live tables as `DROP TABLE`. SchemaBot reads every plan that comes back and refuses one that drops an unselected namespace's tables, with or without `--allow-unsafe`, so such a plan fails rather than going to review:
+
+- A drop the plan places in an unselected namespace is refused, and the error asks for the Tern deployment to be upgraded.
+- A drop placed in a selected namespace, or in none, is refused when an unselected namespace declares a table of that name, ignoring case. This is the MySQL case, where the engine attributes every drop to the namespace it was sent. A live table that no schema file declares is not caught this way, and is reviewed like any other unsafe drop.
 
 `targets` and `deployments` both fan an environment out across several members, and both expect every member to end up holding the schema the files describe for it: every declared namespace, or, for a target whose entry selects namespaces, only those. What differs is what a difference between members means when one is found.
 
@@ -642,6 +647,56 @@ enforcement off, set `enabled: false`.
 Budgets are enforced per server process, so a deployment running N replicas
 admits up to N times the configured rate overall. Size the numbers as a
 per-replica ceiling.
+
+### Check inspection
+
+`GET /api/checks/inspect` (`schemabot checks show`) reads the pull request
+and each expected Check Run from GitHub on every call, uncached, through the
+same GitHub App installation SchemaBot publishes its Check Runs through. A
+caller polling it in a loop can spend the installation's hourly REST quota, and
+then SchemaBot's own Check Run writes start failing and the merge gate goes
+stale. The endpoint therefore has a per-caller budget, also **on by default**:
+
+```yaml
+rate_limits:
+  checks_inspect:
+    enabled: true             # default: true
+    per_caller:
+      requests_per_minute: 6  # default: 6
+      burst: 10               # default: 10
+```
+
+The budget limits each caller on each replica, not the installation. Every
+replica admits the configured rate on its own, and every admitted inspection
+draws on the one installation quota, so size it against the whole deployment.
+Each inspection costs one installation-authenticated GitHub read for the pull
+request plus at least one per expected check name. The most one caller can be
+admitted, when its requests spread across every replica, is approximately
+`replicas × 60 × requests_per_minute × (1 + check names)` calls an hour; size
+`requests_per_minute` so that ceiling, across the callers you expect, stays
+inside the installation quota. On the defaults, a deployment of three replicas
+publishing two check names admits one caller up to 3,240 calls an hour, about
+two thirds of the 5,000 an hour the smallest installation quota allows. Check
+Run pagination multiplies those reads, the initial burst permits additional
+inspections, and resolving the installation client adds three
+app-authenticated calls per inspection (the App, the repository's
+installation, and a fresh installation token) that count against the App
+rather than the installation. A client's own cost does not grow with the
+replica count: it is the client's request rate × (1 + check names). A
+dashboard polling three pull requests every 30 seconds makes 6 requests a
+minute and spends `360 × (1 + check names)` calls an hour, 1,080 with two
+check names, on any number of replicas. A client that holds its connection
+open usually stays on one replica, so it needs `requests_per_minute` of at
+least its own poll rate there; the default of 6 fits that dashboard. A
+deployment that runs more replicas, publishes more check names, or has deep
+Check Run histories should lower `requests_per_minute`, but not below the poll
+rate of the clients it serves.
+
+`per_caller` is keyed the same way as the pull endpoint's. With API auth
+disabled, every caller shares one budget. There is no `per_target` lane. A
+refusal is the same `429` with `error_code: rate_limited` and `Retry-After`, and
+it is returned before any GitHub call is made. Set `enabled: false` to turn
+enforcement off.
 
 ## Pending Drops
 
@@ -1009,15 +1064,16 @@ spirit:
 
 The defaults, and why they were chosen:
 
-- **Write threads are auto-sized and autoscaled** (not configurable as a fixed
-  count). Spirit starts write threads at a size appropriate for the target
-  instance and, with `enable_experimental_autoscaling` on, scales them
+- **Thread pools are autoscaled on Aurora** (not configurable as a fixed
+  count). With `enable_experimental_autoscaling` on, Spirit sizes the copy,
+  apply, and checksum thread pools from the Aurora instance and scales them
   dynamically from throttler feedback. A fixed thread count is the classic
   failure mode on large targets — throughput that made sense on one instance
   class silently starves or overloads another, and autoscaling is why there is
-  no operator knob for copy aggressiveness. Set
-  `enable_experimental_autoscaling: false` only as an incident kill switch when
-  autoscaling misbehaves on a target fleet.
+  no operator knob for copy aggressiveness. Autoscaling needs Aurora's load
+  signal: on other MySQL targets Spirit leaves it disengaged and runs at fixed
+  default thread counts. Set `enable_experimental_autoscaling: false` only as
+  an incident kill switch when autoscaling misbehaves on a target fleet.
 - **The copy is verified under the snapshot checksum** unless
   `enable_experimental_lockless_checksum: true` is set. The lockless checker
   verifies with optimistic reads, retries, and hot-range splitting instead of a
@@ -1025,11 +1081,6 @@ The defaults, and why they were chosen:
   keeps a long checksum from pinning InnoDB purge on the target. Cutover locking
   is the same either way. It is experimental and off by default, and these are
   the terms an operator accepts by turning it on:
-  - **A confirmed divergence fails the apply instead of being repaired.** The
-    snapshot checker rewrites a mismatched chunk from the source and carries on.
-    The lockless checker treats a chunk that mismatches twice with the source
-    unchanged as real divergence and aborts the apply — where the snapshot
-    checker would have self-healed, this one stops.
   - **A continuously updated row can keep the verify phase running.** Such a
     row is not yet supported: its chunk is deferred at the end of every pass, no
     pass ever comes back clean, and passes repeat until an operator stops the
@@ -1535,7 +1586,9 @@ CODEOWNERS support is opt-in because CODEOWNERS is repo-controlled while review 
 
 The base branch is used, not the PR's head branch, to prevent a PR from relaxing its own approval requirements by modifying CODEOWNERS.
 
-Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. If a PR is force-pushed after approval, GitHub may dismiss approvals; `apply-confirm` re-checks the gate and blocks if the approval no longer satisfies the policy. Team membership and CODEOWNERS are evaluated fresh at each gate check.
+Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. Team membership and CODEOWNERS are evaluated fresh at each gate check.
+
+An approval counts only for the schema it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit when GitHub shows the head descends from it and no schema input changed in between: no `.sql`, `vschema.json`, or `schemabot.yaml` file anywhere in the repository, and no file under the database's schema directory. If that cannot be shown (GitHub cannot find the approved commit, a force-push rewrote it out of the branch's history, or GitHub truncates the list of changed files), the approval does not count and the reviewer must approve the current head; the Review Required comment names the reviewers whose approvals no longer count. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
 
 ## Authentication
 
@@ -1562,7 +1615,7 @@ auth:
 
 A valid token clears the read tier. The write tier additionally requires the token's groups to include an admin team from `pr_command_authorization.admin_teams`. Machine callers pass a token via `--token` / `SCHEMABOT_TOKEN`; a group-less service token (client-credentials grant) gets read access.
 
-The browser login command caches the ID token as the bearer credential. Login and refresh use that token's `exp` claim for the cached `token_expiry`, independently of the access token's `expires_in`. Commands refresh within 60 seconds of the ID token expiry when a refresh token and OIDC settings are available. For OIDC profiles, commands read `exp` from the cached token on every load, so profiles saved by older versions automatically use the correct lifetime without another browser login.
+The browser login command caches the ID token as the bearer credential. Login and refresh use that token's `exp` claim for the cached `token_expiry`, independently of the access token's `expires_in`. Commands refresh within 60 seconds of the ID token expiry when a refresh token and its OIDC issuer and client ID are available. For OIDC profiles, commands read `exp` from the cached token on every load, so profiles saved by older versions automatically use the correct lifetime without another browser login.
 
 The ID token must have a positive numeric `exp` value in Unix seconds; fractional seconds and exponent notation are supported and truncated to whole seconds for refresh timing. Login and refresh return an error for a missing, malformed, or out-of-range value; neither falls back to the access token's lifetime. An ordinary command that loads a malformed cached ID token attempts to repair the session using the refresh token. If no refresh token is available, or refresh fails, the command warns and preserves the existing cache. The CLI reads `exp` only to schedule renewal and does not reject login based on its local clock; the server still verifies every bearer token before granting access. Keep the client and server clocks synchronized: a fast client clock can cause a refresh and cache rewrite on every command, and a slow one can delay refresh until the server rejects the credential. When a refreshed token is already expired according to the client clock, the CLI saves the rotated session but warns to check the local clock and the provider's ID token lifetime. Explicit `--token` and `SCHEMABOT_TOKEN` credentials are not refreshed automatically.
 
@@ -1579,7 +1632,7 @@ profiles:
       redirect_port: 8765
 ```
 
-The provider must register `http://127.0.0.1:8765/callback` as a redirect URI for that client and allow refresh tokens. Login flags override settings for that login attempt; they do not save the `oidc:` block. Keep the block configured for subsequent commands to refresh automatically.
+The provider must register `http://127.0.0.1:8765/callback` as a redirect URI for that client and allow refresh tokens. Login flags override settings for that login attempt; they do not save the `oidc:` block. Login records the issuer and client ID the tokens came from as `token_issuer` and `token_client_id` next to the cached tokens, and refresh uses that pair, because a refresh token is valid only at the issuer and for the client that issued it. A login with `--issuer` and `--client-id` therefore keeps refreshing against that provider without an `oidc:` block, and the next login replaces the pair along with the tokens. Editing `oidc:` does not change where an existing session refreshes; run `schemabot login` after switching providers. `schemabot configure show` prints the recorded pair under each profile that has one. A profile that does not record the pair refreshes with its `oidc:` settings.
 
 ### Forward-auth (authenticating proxy)
 
@@ -1649,7 +1702,7 @@ The decision has two halves. The middleware admits any caller in `write_groups` 
 
 Two consequences of the environment-less lock grant are worth stating outright. First, a scoped operator's lock holds applies off **every** environment of their database, including environments outside `operator_environments` — an operator scoped to staging can still freeze production applies of their own database. That direction is fail-safe (a lock only ever prevents changes), so the grant deliberately allows it. Second, the reverse direction is not: force release (`force: true`) bypasses the lock ownership check, so it could undo another holder's safety brake — for example an admin's incident lock. Force release therefore stays admin-only (`write_groups`).
 
-A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, or a lock taken by a server version that did not record acquirers) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. `write_groups` members, and every caller on a deployment without `operator_groups`, release by owner alone.
+A scoped operator's normal release is held to who took the lock, not to the owner string it carries: that string is visible to anyone who can list locks, so sending it proves nothing. A lock acquired through `POST /api/locks/acquire` records its verified acquirer and which of the database's `operator_groups` that acquirer belonged to, and a scoped operator may release it only when they share at least one of those groups — a teammate can release a lock another member of their group took, and nobody outside the group can. A lock that records no acquirer (a PR apply's lock, a lock taken on a deployment with no `operator_groups`, a lock taken by a server version that did not record acquirers, or one taken through the loopback break-glass lane, whose identity headers are not proxy-verified) or whose acquirer held none of the database's operator groups belongs to no group, so a scoped operator cannot release it; a `write_groups` member can, by owner or with `force`. A refused release is a `403` naming the groups that may release the lock, and the lock stays held. The release is decided against the lock row it read and deletes only that row, so a lock released and acquired again while the release runs is reported as a `409` and the new lock stays held. The same rule decides whether a scoped operator who acquires a lock already held under the owner they sent is told they hold it: re-acquiring a lock their own group took succeeds without changing it, and sending the owner of another group's lock, or of a lock that belongs to no group, is a `403` naming the groups that may release it, with the lock unchanged. `write_groups` members, and every caller on a deployment without `operator_groups`, re-acquire and release by owner alone. A lock records its acquirer's groups when it is taken, while the caller's groups are read from the current configuration, so editing `operator_groups` strands locks: after a group is renamed, no scoped operator can release or re-acquire a lock taken under its old name, and an operator moved out of every group a lock recorded can no longer release or re-acquire the lock they took, until a `write_groups` member (or, for a moved operator, a remaining member of one of those groups) releases it.
 
 The grant fails closed everywhere: an unconfigured database or an environment outside `operator_environments` denies scoped callers with a `403` naming the groups that would grant access, and a target that cannot be resolved at decision time — a stored plan or apply lookup failure — surfaces as the operation's own `500`, never as an authorization. Misconfiguration is a startup error, not a silent no-op: any `operator_groups` grant requires a non-empty `operator_environments` (and the reverse), requires `auth.type: forward_auth`, and every granted database must have at least one of its environments in `operator_environments` — a grant that could never authorize anything is rejected at startup.
 

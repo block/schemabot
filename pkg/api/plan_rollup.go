@@ -12,7 +12,7 @@ import (
 )
 
 // DeploymentClassification is how a deployment's review-time diff compares to the
-// reviewed primary plan.
+// primary plan.
 type DeploymentClassification int
 
 const (
@@ -26,7 +26,7 @@ const (
 	// compared. It must be treated as blocking, never as agreement.
 	DeploymentErrored
 	// DeploymentPlanned means the member was planned against its own live
-	// schema and was never compared to the reviewed plan, because its
+	// schema and was never compared to the primary plan, because its
 	// environment's members are not expected to hold the same schema. Its
 	// changes are its own and do not block.
 	DeploymentPlanned
@@ -53,7 +53,7 @@ type MemberPlanning int
 
 const (
 	// PlanMirrored means the members are expected to hold the same schema, so
-	// each is compared to the reviewed plan and any difference is drift that
+	// each is compared to the primary plan and any difference is drift that
 	// blocks the review. This is the default: an environment opts out of it, and
 	// never into it, so a config that does not say otherwise keeps blocking.
 	PlanMirrored MemberPlanning = iota
@@ -76,7 +76,7 @@ func (p MemberPlanning) String() string {
 }
 
 // DeploymentRollupEntry is one deployment's place in the review-time rollup: how
-// it classified against the reviewed plan, the diff when it diverged, and the
+// it classified against the primary plan, the diff when it diverged, and the
 // error when it could not be computed or compared.
 type DeploymentRollupEntry struct {
 	DatabaseType string
@@ -91,7 +91,7 @@ type DeploymentRollupEntry struct {
 	Err     error
 
 	// ChangeSet is what this member would run: the change set its own diff
-	// produced, or the reviewed plan's for the primary. Empty for a member that
+	// produced, or the primary plan's for the primary. Empty for a member that
 	// errored, which has no plan to describe.
 	//
 	// It holds the caller's own change and shard messages rather than copies of
@@ -125,6 +125,12 @@ type DeploymentRollupEntry struct {
 	// disclosures through unchanged; see DeploymentPlanDiff.
 	ExistingCopies         []*ternv1.ExistingCopy
 	ExistingCopiesReported bool
+
+	// LintViolations are the lint findings the member's own plan raised. Lint
+	// reads each target's live schema beside the changes it would run, so a
+	// member's findings are its own, not the primary's. Empty for a member that
+	// errored, which has no plan for them to describe.
+	LintViolations []*ternv1.LintViolation
 }
 
 // markErrored classifies a member as errored and drops the plan it was
@@ -143,11 +149,12 @@ func (e *DeploymentRollupEntry) markErrored(err error) {
 	e.Err = err
 	e.ChangeSet = tern.ChangeSet{}
 	e.PlanFingerprint = ""
+	e.LintViolations = nil
 }
 
 // PlanRollup aggregates every rollout member's review-time classification for a
 // database. Clean means every member passed the contract it was classified
-// under: under PlanMirrored that each matches the reviewed plan, under
+// under: under PlanMirrored that each matches the primary plan, under
 // PlanIndependent that each produced a usable plan of its own. Any divergence,
 // error, or the primary baseline itself being unusable makes it false so the
 // review gate fails closed.
@@ -164,7 +171,7 @@ type PlanRollup struct {
 }
 
 // RollupDeploymentDiffs classifies each rollout member's review-time diff
-// against the reviewed primary plan and reports whether the rollup is clean.
+// against the primary plan and reports whether the rollup is clean.
 //
 // expectedMembers is the configured member set in rollout order, primary first
 // — the same order PlanDeploymentDiffs produces. The diffs must match it
@@ -236,18 +243,19 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			Target:                 d.Target,
 			ExistingCopies:         d.ExistingCopies,
 			ExistingCopiesReported: d.ExistingCopiesReported,
+			LintViolations:         d.LintViolations,
 		}
 		switch {
 		case d.Err != nil:
 			entry.markErrored(d.Err)
 			clean = false
 		case i == 0:
-			// The reviewed primary plan is the baseline. It matches itself only when
+			// The primary plan is the baseline. It matches itself only when
 			// its own content is well-formed; malformed content makes it unusable.
 			// A producer error on the primary was already handled above, so a cause
 			// here is a content error.
 			if baselineCause != nil {
-				entry.markErrored(fmt.Errorf("reviewed primary plan is not a usable baseline: %w", baselineCause))
+				entry.markErrored(fmt.Errorf("primary target's plan is not a usable baseline: %w", baselineCause))
 				clean = false
 			} else {
 				entry.Class = DeploymentMatch
@@ -256,7 +264,7 @@ func RollupDeploymentDiffs(diffs []DeploymentPlanDiff, expectedMembers []routing
 			// Without a usable baseline no deployment can be confirmed to match, so
 			// every deployment blocks. Wrap the primary's root cause so each entry is
 			// self-contained for triage without cross-referencing the primary's.
-			entry.markErrored(fmt.Errorf("primary reviewed plan is not a usable baseline, cannot confirm deployment matches the reviewed changes: %w", baselineCause))
+			entry.markErrored(fmt.Errorf("primary target's plan is not a usable baseline, cannot confirm deployment matches the primary target's changes: %w", baselineCause))
 			clean = false
 		case schema.DialectForDatabaseType(d.DatabaseType) != baselineDialect:
 			// Change sets canonicalized under different grammars cannot be compared:
@@ -346,6 +354,7 @@ func rollupIndependentMembers(diffs []DeploymentPlanDiff) PlanRollup {
 			Target:                 d.Target,
 			ExistingCopies:         d.ExistingCopies,
 			ExistingCopiesReported: d.ExistingCopiesReported,
+			LintViolations:         d.LintViolations,
 		}
 		switch {
 		case d.Err != nil:
