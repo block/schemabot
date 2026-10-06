@@ -456,12 +456,12 @@ func TestPollForCompletionAtomic_StartedWorkEndsTheHold(t *testing.T) {
 	}}
 	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
 	earlier := time.Now().Add(-90 * time.Second)
-	client.targetHeld.waits = map[int64]*targetHeldWait{apply.ID: {since: earlier, lastSeen: earlier, escalated: true}}
+	client.targetHeld.waits = map[targetHeldKey]*targetHeldWait{{applyID: apply.ID}: {since: earlier, lastSeen: earlier, escalated: true}}
 
 	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
 
 	require.Equal(t, 2, eng.calls, "the drive polls the started work, then hands back at the refusal")
-	hold := client.targetHeld.waits[apply.ID]
+	hold := client.targetHeld.waits[targetHeldKey{applyID: apply.ID}]
 	require.NotNil(t, hold, "the later refusal is recorded")
 	assert.Less(t, time.Since(hold.since), time.Minute, "the new hold is measured from its own refusal")
 	assert.False(t, hold.escalated, "the earlier hold's escalation does not carry over")

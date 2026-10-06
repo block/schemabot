@@ -26,13 +26,23 @@ const targetHeldEscalationAfter = 2 * time.Minute
 // hold read as one hold rather than each restarting the measure.
 const targetHeldRefusalGap = 2 * storage.ApplyLeaseStaleAfter
 
-// targetHeldWaits measures, per apply, how long its drives in this process
-// have been refused the target. The measure survives a hand-back, so the
-// grouped drive that hands the apply back on every refusal is measured across
-// the drives that claim it here; a drive in another process measures its own.
+// targetHeldWaits measures, per apply and refused table, how long its drives
+// in this process have been refused the target. The measure survives a
+// hand-back, so the grouped drive that hands the apply back on every refusal
+// is measured across the drives that claim it here; a drive in another
+// process measures its own. Each table is its own hold, so a sequential apply
+// refused on one table and then another escalates the second under its own
+// name and duration.
 type targetHeldWaits struct {
 	mu    sync.Mutex
-	waits map[int64]*targetHeldWait
+	waits map[targetHeldKey]*targetHeldWait
+}
+
+// targetHeldKey names one hold: the apply, and the refused table, which is
+// empty when the refused work spans the apply.
+type targetHeldKey struct {
+	applyID int64
+	table   string
 }
 
 type targetHeldWait struct {
@@ -41,25 +51,26 @@ type targetHeldWait struct {
 	escalated bool
 }
 
-// observe records a refusal of the apply's start at now. It returns how long
-// the apply has been refused, and whether this refusal is the one that crosses
-// targetHeldEscalationAfter, which is reported once per hold. A refusal more
-// than targetHeldRefusalGap after the last one starts a new hold.
-func (w *targetHeldWaits) observe(applyID int64, now time.Time) (heldFor time.Duration, escalate bool) {
+// observe records a refusal of the apply's start on table at now. It returns
+// how long that table has been refused, and whether this refusal is the one
+// that crosses targetHeldEscalationAfter, which is reported once per hold. A
+// refusal more than targetHeldRefusalGap after the last one starts a new hold.
+func (w *targetHeldWaits) observe(applyID int64, table string, now time.Time) (heldFor time.Duration, escalate bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.waits == nil {
-		w.waits = make(map[int64]*targetHeldWait)
+		w.waits = make(map[targetHeldKey]*targetHeldWait)
 	}
-	for id, wait := range w.waits {
+	for key, wait := range w.waits {
 		if now.Sub(wait.lastSeen) > targetHeldRefusalGap {
-			delete(w.waits, id)
+			delete(w.waits, key)
 		}
 	}
-	wait, ok := w.waits[applyID]
+	key := targetHeldKey{applyID: applyID, table: table}
+	wait, ok := w.waits[key]
 	if !ok {
 		wait = &targetHeldWait{since: now}
-		w.waits[applyID] = wait
+		w.waits[key] = wait
 	}
 	wait.lastSeen = now
 	heldFor = now.Sub(wait.since)
@@ -70,12 +81,16 @@ func (w *targetHeldWaits) observe(applyID int64, now time.Time) (heldFor time.Du
 	return heldFor, false
 }
 
-// clear ends the apply's hold: the refused work was started again and was not
-// refused.
+// clear ends the apply's holds: the refused work was started again and was
+// not refused.
 func (w *targetHeldWaits) clear(applyID int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	delete(w.waits, applyID)
+	for key := range w.waits {
+		if key.applyID == applyID {
+			delete(w.waits, key)
+		}
+	}
 }
 
 // observeTargetHeld records a refusal of the apply's start and escalates the
@@ -83,7 +98,7 @@ func (w *targetHeldWaits) clear(applyID int64) {
 // refused table when the drive starts one table at a time, and is empty when
 // the refused work spans the apply.
 func (c *LocalClient) observeTargetHeld(ctx context.Context, logger *slog.Logger, apply *storage.Apply, table string) {
-	heldFor, escalate := c.targetHeld.observe(apply.ID, time.Now())
+	heldFor, escalate := c.targetHeld.observe(apply.ID, table, time.Now())
 	if !escalate {
 		return
 	}
