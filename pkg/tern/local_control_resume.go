@@ -627,6 +627,10 @@ const (
 	// replanCannotAttribute: the re-plan does not speak for this task's scope,
 	// so its silence is not evidence either way.
 	replanCannotAttribute
+
+	// replanVerdictCount is not a verdict. It stays last so a test can range
+	// over every verdict and prove each one settles a task to a real state.
+	replanVerdictCount
 )
 
 // replanVerdictForTask judges one task against a target re-plan.
