@@ -228,15 +228,17 @@ const blockedSizeUnknownReason = "; direct execution is enabled but the table's 
 // blockedForceKillUnavailableReason is the mode-reason suffix when the target
 // denies SchemaBot a grant the kill needs to end the sessions blocking a direct
 // statement's metadata lock: SELECT on the performance_schema lock tables,
-// PROCESS for information_schema.innodb_trx, or CONNECTION_ADMIN (or SUPER) to
-// kill another user's session. The denial itself stays in the server log; the
+// PROCESS for information_schema.innodb_trx, or a way to kill another user's
+// session: CONNECTION_ADMIN (or SUPER) for KILL, or on RDS, EXECUTE on
+// mysql.rds_kill, which Spirit calls when KILL is denied. The denial itself
+// stays in the server log; the
 // reason names the grants that fix it and the fresh plan that picks them up.
-const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and CONNECTION_ADMIN (or SUPER), then plan again"
+const blockedForceKillUnavailableReason = "; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and either CONNECTION_ADMIN (or SUPER) or, on RDS, EXECUTE on mysql.rds_kill, then plan again"
 
 // blockedForceKillUnknownReason is the mode-reason suffix when checking those
 // grants failed for a reason other than a denial, such as a lost connection, a
-// deadline, or a failed read of the server's role settings. Nothing is known to be missing, so the reason asks
-// for a fresh plan rather than naming a grant.
+// deadline, or a failed lookup of mysql.rds_kill. Nothing is known to be
+// missing, so the reason asks for a fresh plan rather than naming a grant.
 const blockedForceKillUnknownReason = "; direct execution is enabled but SchemaBot could not check that it can end sessions blocking the statement: plan again"
 
 // Access-denied errors MySQL returns when a grant the kill depends on is
