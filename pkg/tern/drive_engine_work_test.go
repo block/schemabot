@@ -156,10 +156,13 @@ func TestDriveReturningDuringShutdownLeavesTheHaltToIt(t *testing.T) {
 // driveHaltTestDeadline bounds a wait on a drive's exit halt.
 const driveHaltTestDeadline = 5 * time.Second
 
-// A drive's exit halt runs on the claim the drive held. However long the halt
-// takes, it gives up before that claim can go stale: the last renewal is at
-// most one heartbeat interval old when the drive is cancelled, so a peer is
-// never invited onto a target the halt is still bringing down.
+// A drive's exit halt runs on the claim the drive held. For a drive cancelled
+// while its heartbeat still renews the claim, the last renewal is at most one
+// heartbeat interval old, so however long the halt takes it gives up before
+// the claim can go stale and a peer is never invited onto a target the halt is
+// still bringing down. A drive ended because its heartbeat failed for the
+// whole window starts the halt with a stale claim; owner scoping and
+// lease-guarded writes keep that halt safe, not this bound.
 func TestDriveExitHaltEndsBeforeTheClaimCanGoStale(t *testing.T) {
 	assert.Less(t, defaultHeartbeatInterval+driveHandoverHaltTimeout, storage.ApplyLeaseStaleAfter)
 }

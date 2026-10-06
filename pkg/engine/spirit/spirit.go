@@ -184,6 +184,7 @@ func (rm *runningSchemaChange) goRun(run func()) {
 var _ engine.Engine = (*Engine)(nil)
 var _ engine.Drainer = (*Engine)(nil)
 var _ engine.ShutdownHalter = (*Engine)(nil)
+var _ engine.OwnedWorkHalter = (*Engine)(nil)
 var _ engine.DeferredCutoverSignalChecker = (*Engine)(nil)
 var _ engine.CancelledArtifactReleaser = (*Engine)(nil)
 

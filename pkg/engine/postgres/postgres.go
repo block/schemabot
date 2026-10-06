@@ -1585,5 +1585,7 @@ var _ engine.Engine = (*Engine)(nil)
 // Compile-time check that Engine implements engine.Drainer.
 var _ engine.Drainer = (*Engine)(nil)
 
-// Compile-time check that Engine implements engine.ShutdownHalter.
+// Compile-time check that Engine implements engine.ShutdownHalter and
+// engine.OwnedWorkHalter.
 var _ engine.ShutdownHalter = (*Engine)(nil)
+var _ engine.OwnedWorkHalter = (*Engine)(nil)

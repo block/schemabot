@@ -1376,6 +1376,7 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 var optionalCapabilityVerdicts = map[reflect.Type]bool{
 	reflect.TypeFor[engine.Drainer]():                         true,
 	reflect.TypeFor[engine.ShutdownHalter]():                  true,
+	reflect.TypeFor[engine.OwnedWorkHalter]():                 true,
 	reflect.TypeFor[engine.SynchronousWorkRegistration]():     true,
 	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    false,
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,

@@ -99,11 +99,21 @@ type ShutdownHalter interface {
 	// so a caller can report that the target may still be held. Work that has
 	// already ended leaves nothing to halt.
 	HaltForShutdown(ctx context.Context) error
+}
 
-	// HaltWorkOwnedBy halts the same way, but only the work started under
-	// owner (see WithWorkOwner). One engine serves every drive of a target in
-	// this process, so the drive that hands an apply back must not bring down
-	// the run a later drive has already started in its place.
+// OwnedWorkHalter is an optional capability, alongside ShutdownHalter, for an
+// engine that can halt one drive's in-process work without touching another's.
+// A drive that hands its apply back halts through it, so its run does not keep
+// holding the target under nobody's claim.
+//
+// It is separate from ShutdownHalter so an engine that only halts for shutdown
+// keeps that halt. Such an engine's drives hand the apply back without halting
+// anything, as they did before this capability existed.
+type OwnedWorkHalter interface {
+	// HaltWorkOwnedBy halts like HaltForShutdown, but only the work started
+	// under owner (see WithWorkOwner). One engine serves every drive of a
+	// target in this process, so the drive that hands an apply back must not
+	// bring down the run a later drive has already started in its place.
 	HaltWorkOwnedBy(ctx context.Context, owner string) error
 }
 
@@ -119,10 +129,10 @@ func HaltEngineForShutdown(ctx context.Context, eng Engine) (supported bool, err
 	return true, halter.HaltForShutdown(ctx)
 }
 
-// HaltEngineWorkOwnedBy is HaltEngineForShutdown scoped to the work started
-// under owner.
+// HaltEngineWorkOwnedBy halts the work eng started under owner when eng
+// implements OwnedWorkHalter, and reports whether it does.
 func HaltEngineWorkOwnedBy(ctx context.Context, eng Engine, owner string) (supported bool, err error) {
-	halter, ok := eng.(ShutdownHalter)
+	halter, ok := eng.(OwnedWorkHalter)
 	if !ok {
 		return false, nil
 	}

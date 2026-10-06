@@ -906,9 +906,11 @@ Stopping includes the engine work. A drive that ends, for whatever reason, has t
 down the in-process work it started, and only that work, and waits for it before it returns, so the
 target is released for the next driver rather than left running under nobody's claim. Work the
 engine lets finish rather than interrupt, because interrupting it would leave a partial change, is
-waited for the same way. The wait is bounded well inside the staleness window, so the drive's own
-teardown does not let its claim go stale, and work still running when the bound expires is reported
-as still holding the target. The one exception is a drive that parks at a cutover barrier, which
+waited for the same way. The wait is bounded well inside the staleness window, so a drive cancelled
+while its claim is fresh does not let the claim go stale during its own teardown, and work still
+running when the bound expires is reported as still holding the target. A drive ended because its
+heartbeat failed for the whole window begins the halt with its claim already stale; the halt still
+reaches only its own work, and its writes stay lease-guarded (OW-2). The one exception is a drive that parks at a cutover barrier, which
 leaves its work waiting there by design.
 
 Storage writes are lease-guarded either way (OW-2), so a displaced driver cannot corrupt state
@@ -921,7 +923,7 @@ instead (OW-4). *Enforced:* one staleness constant (`ApplyLeaseStaleAfter` in
 query, at the apply level (`pkg/storage/internal/sqlstore/applies.go`) and the operation level
 (`pkg/storage/internal/sqlstore/apply_operations.go`); the halt at drive exit in
 `pkg/tern/local_apply_sequential.go`, `pkg/tern/local_apply_grouped.go` and
-`pkg/tern/local_control_resume.go`, through the engine's `ShutdownHalter.HaltWorkOwnedBy`
+`pkg/tern/local_control_resume.go`, through the engine's `OwnedWorkHalter.HaltWorkOwnedBy`
 (`pkg/engine/engine.go`).
 
 ### OW-4: Lease loss is proven, never inferred

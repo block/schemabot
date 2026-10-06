@@ -30,7 +30,9 @@ func (c *LocalClient) executeApplySequential(ctx context.Context, apply *storage
 	// Registered after the heartbeat, so on a return the drive was not
 	// cancelled for it runs while the claim is still renewed. A cancelled
 	// drive's heartbeat has already stopped; the halt's bound keeps it inside
-	// the claim's staleness window.
+	// the claim's staleness window unless the heartbeat's own failure ended
+	// the drive, in which case the claim is already stale and only the
+	// halt's owner scope keeps it to this drive's work.
 	defer c.haltEngineWorkLeftByDrive(ctx, logger)
 
 	logger.Info("executeApplySequential starting",
