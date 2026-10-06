@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/storage"
@@ -30,6 +35,39 @@ func postApplyForRefusal(t *testing.T, svc *Service, body string) (int, apitypes
 	var resp apitypes.ErrorResponse
 	require.NoError(t, json.NewDecoder(w.Body).Decode(&resp), "refusal body must be an error response")
 	return w.Code, resp
+}
+
+// applyOutcomeRecorder captures the apply counter and the ExecuteApply spans a
+// request records.
+type applyOutcomeRecorder struct {
+	metrics *sdkmetric.ManualReader
+	spans   *tracetest.InMemoryExporter
+}
+
+func recordApplyOutcomes(t *testing.T) applyOutcomeRecorder {
+	t.Helper()
+	return applyOutcomeRecorder{metrics: installManualMetricReader(t), spans: setupTraceTest(t)}
+}
+
+// statuses returns the apply counter's total per status attribute.
+func (r applyOutcomeRecorder) statuses(t *testing.T) map[string]int64 {
+	t.Helper()
+	totals := make(map[string]int64)
+	for _, dp := range collectCounterPoints(t, r.metrics, "schemabot.applies.total") {
+		totals[attributeValue(t, dp, "status")] += dp.Value
+	}
+	return totals
+}
+
+// spanStatuses returns the status code of every ExecuteApply span.
+func (r applyOutcomeRecorder) spanStatuses() []codes.Code {
+	var statuses []codes.Code
+	for _, span := range r.spans.GetSpans() {
+		if span.Name == "ExecuteApply" {
+			statuses = append(statuses, span.Status.Code)
+		}
+	}
+	return statuses
 }
 
 // multiTargetApplyHTTPService serves the multi-target testapp/production
@@ -70,6 +108,7 @@ func TestApplyHandler_BlockedPlanIsUnprocessable(t *testing.T) {
 	plan.Namespaces["testdb"].Tables[0].ModeReason = "requires privileges unavailable to the engine"
 	applies := &capturingApplyStore{}
 	svc, tasks := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+	outcomes := recordApplyOutcomes(t)
 
 	// allow_unsafe cannot unlock a blocked change, so the refusal is the same
 	// with or without it.
@@ -86,6 +125,8 @@ func TestApplyHandler_BlockedPlanIsUnprocessable(t *testing.T) {
 	assert.False(t, apitypes.IsRetryableErrorCode(apitypes.ErrCodePlanBlocked))
 	assert.Nil(t, applies.apply, "a blocked plan must not store an apply")
 	assert.Empty(t, tasks.tasks)
+	assert.Equal(t, map[string]int64{"rejected": 2}, outcomes.statuses(t), "a refusal is counted apart from server errors")
+	assert.Equal(t, []codes.Code{codes.Unset, codes.Unset}, outcomes.spanStatuses(), "a refusal does not mark the span as an error")
 }
 
 // An apply on a plan with an unsafe change that did not consent to it is the
@@ -102,6 +143,7 @@ func TestApplyHandler_UnsafePlanWithoutOptInIsBadRequest(t *testing.T) {
 		}
 		applies := &capturingApplyStore{}
 		svc, tasks := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+		outcomes := recordApplyOutcomes(t)
 
 		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
 
@@ -110,6 +152,8 @@ func TestApplyHandler_UnsafePlanWithoutOptInIsBadRequest(t *testing.T) {
 		assert.Equal(t, `apply rejected: stored plan plan-1 contains unsafe change for table "legacy_users": DROP TABLE removes all data; retry with allow_unsafe=true`, resp.Error)
 		assert.Nil(t, applies.apply, "an unconsented unsafe change must not store an apply")
 		assert.Empty(t, tasks.tasks)
+		assert.Equal(t, map[string]int64{"rejected": 1}, outcomes.statuses(t), "a refusal is counted apart from server errors")
+		assert.Equal(t, []codes.Code{codes.Unset}, outcomes.spanStatuses(), "a refusal does not mark the span as an error")
 	})
 
 	t.Run("VSchema change", func(t *testing.T) {
@@ -130,10 +174,36 @@ func TestApplyHandler_UnsafePlanWithoutOptInIsBadRequest(t *testing.T) {
 	assert.False(t, apitypes.IsRetryableErrorCode(apitypes.ErrCodeUnsafeOptInRequired))
 }
 
+// refusalLog captures the service's warnings as JSON lines, so a test can read
+// the fields an operator filters on.
+func refusalLog(svc *Service) *bytes.Buffer {
+	var buf bytes.Buffer
+	svc.logger = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	return &buf
+}
+
+// memberRefusalLogFields decodes the one warning a refused member plan logs.
+func memberRefusalLogFields(t *testing.T, logs *bytes.Buffer) map[string]any {
+	t.Helper()
+	var fields map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), "log line must be JSON: %s", line)
+		if entry["msg"] == "apply rejected: a rollout member's own plan cannot run in an apply created from the primary's plan" {
+			require.Nil(t, fields, "a refused member plan logs one warning")
+			fields = entry
+		}
+	}
+	require.NotNil(t, fields, "a refused member plan logs a warning; got: %s", logs.String())
+	return fields
+}
+
 // A rollout member planned against its own live schema can carry a change the
-// primary's plan does not. Its refusal names the member and gets the same
-// status and code as the primary's would, because the caller's remedy is the
-// same.
+// primary's plan does not. Its refusal names the member, in the response and
+// in the warning an operator filters on, and its kind decides the status and
+// code: a blocked or unconsented unsafe change gets what the primary's would,
+// because the caller's remedy is the same, while an unsafe change the caller
+// was never shown is never answered with a code that invites the opt-in.
 func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 	primary := primaryPlanRow("testapp-001")
 	primary.Environment = "production"
@@ -148,6 +218,8 @@ func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 			ModeReason:    "the engine refuses this statement",
 		})
 		svc, applies, tasks := multiTargetApplyHTTPService(primary, []*storage.Plan{member})
+		logs := refusalLog(svc)
+		outcomes := recordApplyOutcomes(t)
 
 		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
 
@@ -156,6 +228,12 @@ func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 		assert.Equal(t, `apply rejected: rollout member eu/testapp-002: stored plan plan-second contains a blocked change for table "orders": the engine refuses this statement`, resp.Error)
 		assert.Nil(t, applies.apply, "a blocked member plan must not store an apply")
 		assert.Empty(t, tasks.tasks)
+		fields := memberRefusalLogFields(t, logs)
+		assert.Equal(t, "eu/testapp-002", fields["member"])
+		assert.Equal(t, "blocked", fields["refusal"])
+		assert.Equal(t, "plan-primary", fields["plan_id"])
+		assert.Equal(t, map[string]int64{"rejected": 1}, outcomes.statuses(t), "a refusal is counted apart from server errors")
+		assert.Equal(t, []codes.Code{codes.Unset}, outcomes.spanStatuses(), "a refusal does not mark the span as an error")
 	})
 
 	t.Run("unsafe member plan without opt-in", func(t *testing.T) {
@@ -166,6 +244,7 @@ func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 			DDL:       "DROP TABLE `legacy_orders`",
 		})
 		svc, applies, tasks := multiTargetApplyHTTPService(primary, []*storage.Plan{member})
+		logs := refusalLog(svc)
 
 		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
 
@@ -174,5 +253,50 @@ func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 		assert.Equal(t, `apply rejected: rollout member eu/testapp-002: stored plan plan-second contains unsafe change for table "legacy_orders": DROP TABLE removes all data; retry with allow_unsafe=true`, resp.Error)
 		assert.Nil(t, applies.apply, "an unconsented unsafe member plan must not store an apply")
 		assert.Empty(t, tasks.tasks)
+		fields := memberRefusalLogFields(t, logs)
+		assert.Equal(t, "eu/testapp-002", fields["member"])
+		assert.Equal(t, "unsafe_without_opt_in", fields["refusal"])
 	})
+
+	t.Run("undisclosed unsafe member plan under the opt-in", func(t *testing.T) {
+		member := memberPlanWithChange(storage.TableChange{
+			Namespace: "testapp",
+			Table:     "legacy_orders",
+			Operation: "drop",
+			DDL:       "DROP TABLE `legacy_orders`",
+		})
+		svc, applies, tasks := multiTargetApplyHTTPService(primary, []*storage.Plan{member})
+		logs := refusalLog(svc)
+
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true,"options":{"allow_unsafe":"true"}}`)
+
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode, "no opt-in covers a change the caller was never shown")
+		assert.Equal(t, `apply rejected: rollout member eu/testapp-002: plan plan-second carries an unsafe change for table "legacy_orders" that the primary target's plan does not carry, so the disclosure on the primary target's plan plan-primary never named it and no opt-in covers it`, resp.Error)
+		assert.Nil(t, applies.apply, "an undisclosed unsafe member plan must not store an apply")
+		assert.Empty(t, tasks.tasks)
+		fields := memberRefusalLogFields(t, logs)
+		assert.Equal(t, "eu/testapp-002", fields["member"])
+		assert.Equal(t, "undisclosed_unsafe", fields["refusal"])
+	})
+}
+
+// A storage failure while queueing an apply is the server's fault, not the
+// caller's: it stays a 500 with no refusal code and is counted and traced as an
+// apply error, so a client keeps treating it as a server error rather than as
+// a request it has to change.
+func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
+	plan := executeApplyTestPlan()
+	applies := &capturingApplyStore{err: errors.New("storage unavailable")}
+	svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+	outcomes := recordApplyOutcomes(t)
+
+	status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+	assert.Equal(t, http.StatusInternalServerError, status)
+	assert.NotEqual(t, apitypes.ErrCodeUnsafeOptInRequired, resp.ErrorCode)
+	assert.NotEqual(t, apitypes.ErrCodePlanBlocked, resp.ErrorCode)
+	assert.Equal(t, "apply failed: store apply and tasks: storage unavailable", resp.Error)
+	assert.Equal(t, map[string]int64{"error": 1}, outcomes.statuses(t))
+	assert.Equal(t, []codes.Code{codes.Error}, outcomes.spanStatuses())
 }
