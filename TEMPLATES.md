@@ -394,6 +394,64 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-unmanaged-schema-alongside"></a><strong>MySQL Plan (Unmanaged Schema Alongside)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+ℹ️ This PR also changes schema under paths SchemaBot does not manage in `staging`, so this plan does not cover them:
+
+- `services/inventory/schema` declares database `inventory`
+
+</details>
+
+<details>
 <summary><a name="postgres-plan-exempt-tables"></a><strong>Postgres Plan (Exempt Tables)</strong></summary>
 
 
@@ -2717,11 +2775,13 @@ type: mysql
 
 ## ⚠️ Schema Changes Not Managed by SchemaBot
 
-This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
+**Environments**: `staging`, `production`
+
+This PR changes schema under the following path(s), which SchemaBot is not configured to manage in any environment:
 
 - `services/inventory/schema` — declares database `inventory`
 
-These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
+These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's `allowed_dirs` in the server config; otherwise remove these schema changes from this PR.
 <!-- schemabot:offer-support-channel -->

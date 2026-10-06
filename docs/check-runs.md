@@ -154,6 +154,13 @@ do not touch managed schema files. For those PRs, SchemaBot publishes a passing
 and allow the PR to merge. Skipping check creation would leave the required
 check missing, which GitHub treats as not passing.
 
+A PR whose schema changes all sit under directories the deployment does not
+manage gets a passing aggregate too, titled for what it covers instead:
+`No schema changes managed in <environment>` on a deployment scoped to some
+environments, or `No schema changes managed by SchemaBot` on one serving every
+environment. Its summary lists each unmanaged schema directory and the database
+it declares.
+
 When all environments are owned by one SchemaBot deployment, require this check:
 
 ```text

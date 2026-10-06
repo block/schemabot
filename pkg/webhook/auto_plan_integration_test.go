@@ -345,15 +345,94 @@ func TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo(t *testing.T) {
 		assert.Contains(t, body, "Schema Changes Not Managed by SchemaBot")
 		assert.Contains(t, body, "`schema`")
 		assert.Contains(t, body, fmt.Sprintf("declares database `%s`", dbName))
-		assert.Contains(t, body, "will **not** be planned or applied")
+		assert.Contains(t, body, "will **not** be planned or applied in any environment")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for unmanaged schema config notice")
+	}
+
+	// The passing aggregate names the unmanaged schema rather than claiming
+	// the PR changed no schema files.
+	select {
+	case run := <-result.checkRuns:
+		assert.Equal(t, "completed", run.Status)
+		assert.Equal(t, "success", run.Conclusion)
+		require.NotNil(t, run.Output)
+		assert.Equal(t, "No schema changes managed by SchemaBot", run.Output.Title)
+		assert.Contains(t, run.Output.Summary, "This PR changes schema only under paths SchemaBot does not manage in any environment")
+		assert.Contains(t, run.Output.Summary, fmt.Sprintf("- `schema` declares database `%s`", dbName))
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the passing aggregate check")
 	}
 
 	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
 	require.NoError(t, err)
 	for _, plan := range plans {
 		assert.NotEqual(t, dbName, plan.Database, "unmanaged config must not produce a plan")
+	}
+}
+
+// TestE2EAutoPlanNamesUnmanagedSchemaOnEnvironmentScopedPlanComment verifies a
+// PR that changes one directory a staging-scoped deployment manages and one it
+// does not. The deployment posts no separate notice, since a deployment serving
+// another environment may manage the second directory, so its plan comment is
+// where the PR shows what was left out: the comment plans the managed database
+// and names the other directory and its database beneath the plan.
+func TestE2EAutoPlanNamesUnmanagedSchemaOnEnvironmentScopedPlanComment(t *testing.T) {
+	dbName := "webhook_autoplan_mixed_scoped"
+	svc := setupE2EService(t, dbName)
+	svc.Config().AllowedEnvironments = []string{"staging"}
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema/" + dbName}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	configs := map[string]string{
+		"schema/" + dbName + "/schemabot.yaml": fmt.Sprintf("database: %s\ntype: mysql\n", dbName),
+		"schema/ledger_sandbox/schemabot.yaml": "database: ledger_sandbox\ntype: mysql\n",
+	}
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":        "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"ledger_sandbox/entries.sql": "CREATE TABLE `entries` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlanWithConfigs(t, mux, schemaFiles, configs, dbName, nil)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		require.Contains(t, body, "Schema Change Plan", "the first comment is the plan, not a separate notice")
+		assert.Contains(t, body, "`users`")
+		assert.NotContains(t, body, "`entries`", "the unmanaged directory is not planned")
+		assert.NotContains(t, body, "Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "This PR also changes schema under paths SchemaBot does not manage in `staging`, so this plan does not cover them:")
+		assert.Contains(t, body, "- `schema/ledger_sandbox` declares database `ledger_sandbox`")
+		assert.Less(t, strings.Index(body, "`users`"), strings.Index(body, "does not manage in `staging`"), "the note follows the plan")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the auto-plan comment")
+	}
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected the plan comment alone, got another comment: %s", body)
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 

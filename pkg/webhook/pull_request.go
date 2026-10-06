@@ -466,7 +466,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	shouldPostComment := sync.OnceValue(func() bool {
 		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA, configs)
 	})
-	h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
+	unmanagedPlanNote := h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
 
 	// Config discovery and the managed-directory guard just re-verified this
 	// commit, and the clear re-checks allowed-environment coverage for every
@@ -535,6 +535,9 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// recreated on the new commit. If stale per-database check records exist,
 		// cleanupStaleChecks (above) also updates the aggregate — both converge
 		// to the same result (passing aggregate on new SHA) so the overlap is safe.
+		// Schema the PR changes under configs this deployment does not manage
+		// is named on the check, so its title does not claim no schema changed.
+		unmanaged := unmanagedSchemaConfigData(droppedDiscoveredConfigs(discovered, configs))
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -543,7 +546,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				h.logger.Error("failed to create GitHub client for passing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 				return
 			}
-			h.postPassingAggregates(ctx, c, repo, pr, headSHA)
+			h.postPassingAggregates(ctx, c, repo, pr, headSHA, unmanaged)
 		})
 		return "no schema files in PR", nil
 	}
@@ -577,7 +580,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0)
+			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote)
 		})
 	}
 
@@ -638,23 +641,47 @@ func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.Inst
 
 // notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan
 // discovery dropped schema configs this deployment is not configured to
-// manage. On a repo with no aggregate role this deployment is the only
-// responder, so without the notice the drop is invisible on the PR — no plan
-// comment and no check row cover the dropped config, and the author can merge
-// a schema change nothing will ever apply. On an aggregate-role repo (leader
-// or participant) a dropped config is routine cross-deployment fan-out — the
-// owning deployment plans it and posts its own comment and check — so the
-// notice stays a log line there.
-func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) {
+// manage. A deployment serving every environment on a repo with no aggregate
+// role is the only responder, so without the notice the drop is invisible on
+// the PR — no plan comment and no check row cover the dropped config, and the
+// author can merge a schema change nothing will ever apply. Two shapes leave
+// the dropped config to a deployment this one cannot see, so the notice stays
+// a log line there:
+//
+//   - an aggregate-role repo (leader or participant), where a dropped config is
+//     routine cross-deployment fan-out and the owning deployment plans it and
+//     posts its own comment and check
+//   - a deployment scoped to some environments (allowed_environments), where a
+//     sibling deployment serving another environment may register the
+//     database; a notice from this one would tell the author a schema change
+//     the sibling is planning will never be applied
+//
+// An environment-scoped deployment still shows the dropped configs on the PR,
+// scoped to the environments it serves: it returns them, and each plan comment
+// it posts for the PR names them. A PR that changes nothing this deployment
+// manages posts no plan comment, so its passing check names them instead.
+func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) []templates.UnmanagedSchemaConfigNoticeData {
 	dropped := droppedDiscoveredConfigs(discovered, managed)
 	if len(dropped) == 0 {
-		return
+		return nil
 	}
-	if config, ok := h.serverConfig(); ok && config.AggregateRoleForRepo(repo) != "" {
+	config, ok := h.serverConfig()
+	if ok && config.AggregateRoleForRepo(repo) != "" {
 		h.logger.Info("unmanaged schema configs in PR left to their owning deployments on aggregate repo",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
 			"unmanaged_configs", len(dropped))
-		return
+		return nil
+	}
+	notice := unmanagedSchemaConfigData(dropped)
+	if ok && len(config.AllowedEnvironments) > 0 {
+		// A Warn rather than an Info: when no sibling registers the database
+		// either, nothing will ever apply this schema change, and this line is
+		// where an operator finds which directories were left out.
+		h.logger.Warn("schema configs in PR are not managed by this environment-scoped deployment; no notice posted because a deployment serving another environment may manage them, and the plan comment or passing check names them",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+			"databases", unmanagedSchemaDatabases(notice), "schema_paths", unmanagedSchemaPaths(notice),
+			"allowed_environments", config.AllowedEnvironments)
+		return notice
 	}
 	// Match the plan-comment cadence: a synchronize push that changed no
 	// schema inputs re-verifies checks without re-posting comments, and the
@@ -663,16 +690,43 @@ func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installa
 		h.logger.Info("unmanaged schema config notice suppressed by comment cadence; PR was already noticed on an earlier commit",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
 			"unmanaged_configs", len(dropped))
-		return
+		return nil
 	}
-	notice := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))
+	var environments []string
+	if ok {
+		environments = config.OrderedEnvironments(config.KnownEnvironments())
+	}
+	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(environments, notice))
+	return nil
+}
+
+func unmanagedSchemaDatabases(configs []templates.UnmanagedSchemaConfigNoticeData) []string {
+	databases := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		databases = append(databases, cfg.Database)
+	}
+	return databases
+}
+
+func unmanagedSchemaPaths(configs []templates.UnmanagedSchemaConfigNoticeData) []string {
+	paths := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		paths = append(paths, cfg.SchemaPath)
+	}
+	return paths
+}
+
+// unmanagedSchemaConfigData identifies each dropped config by its database
+// and schema directory, for the notice and the passing check that report it.
+func unmanagedSchemaConfigData(dropped []ghclient.DiscoveredConfig) []templates.UnmanagedSchemaConfigNoticeData {
+	data := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))
 	for _, cfg := range dropped {
-		notice = append(notice, templates.UnmanagedSchemaConfigNoticeData{
+		data = append(data, templates.UnmanagedSchemaConfigNoticeData{
 			Database:   cfg.Config.Database,
 			SchemaPath: cfg.SchemaDir,
 		})
 	}
-	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(notice))
+	return data
 }
 
 // droppedDiscoveredConfigs returns the discovered configs the managed filter

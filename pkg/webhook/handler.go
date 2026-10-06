@@ -551,7 +551,7 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 		// asked for an apply, not for a plan. The stored check state it writes
 		// is the whole point. It re-plans the one database the settled apply
 		// held the check for.
-		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0)
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil)
 	})
 }
 
