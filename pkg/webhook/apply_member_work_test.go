@@ -478,3 +478,45 @@ func TestUnconfirmedWorkMessageNamesTheTargetWhosePlanChanged(t *testing.T) {
 		message)
 	assert.NotContains(t, message, "other than the primary")
 }
+
+// --defer-cutover has a cutover to defer when any target the apply runs
+// carries an engine-driven change, whichever target that is. A target already
+// at the desired schema runs nothing, so it decides nothing either way.
+func TestRolloutAllChangesDirect(t *testing.T) {
+	directPrimary := &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ExecutionMode: "direct"}},
+	}}}
+	enginePrimary := &apitypes.PlanResponse{Changes: []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders"}},
+	}}}
+	convergedPrimary := &apitypes.PlanResponse{}
+	plan := func(mode string) *storage.Plan {
+		return &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+			"orders": {Tables: []storage.TableChange{{Table: "orders", Operation: "alter", ExecutionMode: mode}}},
+		}}
+	}
+	converged := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"orders": {}}}
+
+	tests := []struct {
+		name    string
+		primary *apitypes.PlanResponse
+		members map[string]*storage.Plan
+		want    bool
+	}{
+		{name: "the primary target alone runs direct changes", primary: directPrimary, want: true},
+		{name: "the primary target is converged and another target runs only direct changes",
+			primary: convergedPrimary, members: map[string]*storage.Plan{"us": plan("direct"), "eu": converged}, want: true},
+		{name: "the primary target runs direct changes and another target runs an engine change",
+			primary: directPrimary, members: map[string]*storage.Plan{"us": plan("")}, want: false},
+		{name: "another target runs direct changes and the primary target runs an engine change",
+			primary: enginePrimary, members: map[string]*storage.Plan{"us": plan("direct")}, want: false},
+		{name: "every target runs only direct changes",
+			primary: directPrimary, members: map[string]*storage.Plan{"us": plan("direct")}, want: true},
+		{name: "no target has work", primary: convergedPrimary, members: map[string]*storage.Plan{"us": converged}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, rolloutAllChangesDirect(tt.primary, tt.members))
+		})
+	}
+}

@@ -386,20 +386,32 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// --defer-cutover only affects engine-driven statements; an all-direct
-	// plan has no cutover to defer, so reject the flag instead of silently
-	// ignoring it. Only apply-confirm reaches this gate (the apply command
-	// rejects the flag before locking on an all-direct plan, and an apply whose
-	// re-plan routes changes to direct execution that the disclosed plan did
-	// not stops above), so keep the lock: it still
-	// pins the plan the operator confirmed against, and re-running
-	// apply-confirm without the flag executes it.
-	if result.DeferCutover && planResp.AllChangesDirect() {
-		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan; the pending confirmation is preserved",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-			fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
-		return
+	// --defer-cutover only affects engine-driven statements; an apply whose
+	// every target runs only direct statements has no cutover to defer, so
+	// reject the flag instead of silently ignoring it. Only apply-confirm
+	// reaches this gate (the apply command rejects the flag before locking on
+	// such an apply, and an apply whose re-plan routes changes to direct
+	// execution that the disclosed plan did not stops above), so keep the
+	// lock: it still pins the plan the operator confirmed against, and
+	// re-running apply-confirm without the flag executes it.
+	if result.DeferCutover {
+		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+		if deferErr != nil {
+			h.logger.Error("apply rejected: could not read every target's plan to tell whether --defer-cutover has a cutover to defer; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"action", actionName, "plan_id", planResp.PlanID, "error", deferErr)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+			return
+		}
+		if nothingToDefer {
+			h.logger.Info("apply rejected: --defer-cutover on an apply whose every target runs only direct changes; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName,
+				"plan_id", planResp.PlanID, "runs_other_targets", runsMemberWork)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
+			return
+		}
 	}
 
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe

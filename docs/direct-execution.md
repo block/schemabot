@@ -312,7 +312,9 @@ confirmation step:
 - Other gates still apply: a direct statement that is also an unsafe change,
   such as dropping a primary key, still needs `--allow-unsafe`.
 - `--defer-cutover` is rejected on an all-direct plan — a direct statement has
-  no cutover to defer. On a mixed plan it applies to the engine-driven
+  no cutover to defer. For an environment with several targets, the plan is
+  all-direct when every target with work runs only direct statements, whichever
+  target that is. On a mixed plan it applies to the engine-driven
   statements only. The disclosure on the apply's comment says so, and so
   does the disclosure on a paused comment, since the flag can still be
   passed to `apply-confirm`.

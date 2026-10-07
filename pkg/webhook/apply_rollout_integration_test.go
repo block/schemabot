@@ -292,14 +292,9 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 // task carries us's own direct verdict.
 func TestE2EApplyConfirmRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 	dbName := "webhook_rollout_direct"
-	preReshape := "CREATE TABLE `users` (\n" +
-		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
-		"  `tenant_id` bigint unsigned NOT NULL,\n" +
-		"  PRIMARY KEY (`id`)\n" +
-		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
-		{name: "eu", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
-		{name: "us", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
+		{name: "eu", liveSchema: usersPreReshapeSchema, engineMetadata: directPolicyMetadata},
+		{name: "us", liveSchema: usersPreReshapeSchema, engineMetadata: directPolicyMetadata},
 	}, api.PlanIndependent)
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
@@ -335,6 +330,55 @@ func TestE2EApplyConfirmRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 		modes[deploymentOf[*task.ApplyOperationID]] = task.ExecutionMode
 	}
 	assert.Equal(t, map[string]string{"eu": "direct", "us": "direct"}, modes, "each target's task carries its own plan's verdict")
+}
+
+// usersPreReshapeSchema is the live `users` table pkSwapSchema reshapes: the
+// primary key gains `tenant_id`, which the schema change engine refuses and the
+// direct execution policy routes to native DDL.
+const usersPreReshapeSchema = "CREATE TABLE `users` (\n" +
+	"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+	"  `tenant_id` bigint unsigned NOT NULL,\n" +
+	"  PRIMARY KEY (`id`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+// The primary target (eu) already has the reshaped primary key, and us, on the
+// direct execution policy, still needs it, so the only change the apply would
+// run is us's native DDL, which has no cutover. --defer-cutover has nothing to
+// act on there, though the primary plan alone shows no direct change: the apply
+// command refuses the flag before taking a lock, and apply-confirm refuses it
+// while keeping the pending confirmation, as they do for one target.
+func TestE2EDeferCutoverRefusedWhenOnlyAnotherTargetRunsDirectChanges(t *testing.T) {
+	dbName := "webhook_rollout_direct_defer"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: strings.TrimSuffix(pkSwapSchema, ";"), engineMetadata: directPolicyMetadata},
+		{name: "us", liveSchema: usersPreReshapeSchema, engineMetadata: directPolicyMetadata},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	files := map[string]string{"users.sql": pkSwapSchema}
+
+	deferred := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	body := awaitCommentContaining(t, deferred, "has no effect on this plan")
+	assert.Contains(t, body, msgDeferCutoverAllDirect)
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+
+	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
+	body = awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
+		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied") || strings.Contains(body, "Failed to execute apply")
+	})
+	require.Contains(t, body, "Confirmation required", "another target's work pauses for apply-confirm")
+	assert.Contains(t, body, "**Direct execution**", "the comment discloses us's direct change")
+
+	confirm := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	body = awaitCommentContaining(t, confirm, "has no effect on this plan")
+	assert.Contains(t, body, fmt.Sprintf(msgDeferCutoverAllDirectConfirm, driftEnv))
+	requireNoApplies(t, svc, dbName)
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the refused flag keeps the pending confirmation")
+	assert.NotEmpty(t, lock.PendingPlanID)
 }
 
 // Two targets planned against schemas of their own, both needing the column.

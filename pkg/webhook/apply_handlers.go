@@ -446,15 +446,30 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// --defer-cutover only affects engine-driven statements; an all-direct
-	// plan has no cutover to defer, so reject the flag instead of silently
-	// ignoring it.
-	if result.DeferCutover && planResp.AllChangesDirect() {
-		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-			msgDeferCutoverAllDirect)
-		return false, nil
+	// --defer-cutover only affects engine-driven statements; an apply whose
+	// every target runs only direct statements has no cutover to defer, so
+	// reject the flag instead of silently ignoring it. No lock is held yet, so
+	// a plan that cannot be read leaves the command retryable.
+	if result.DeferCutover {
+		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+		if deferErr != nil {
+			h.logger.Error("apply rejected: could not read every target's plan to tell whether --defer-cutover has a cutover to defer",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", deferErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+			}
+			return true, fmt.Errorf("apply command defer-cutover check %s#%d: %w", repo, pr, deferErr)
+		}
+		if nothingToDefer {
+			h.logger.Info("apply rejected: --defer-cutover on an apply whose every target runs only direct changes",
+				"repo", repo, "pr", pr, "database", database, "environment", environment,
+				"plan_id", planResp.PlanID, "runs_other_targets", runsMemberWork)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				msgDeferCutoverAllDirect)
+			return false, nil
+		}
 	}
 
 	// Block unsafe changes unless --allow-unsafe was specified, on every target
