@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -324,6 +325,13 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	if current == nil {
 		return false, "", fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
 	}
+	// The two plans alone settle the primary member's identity, so a changed
+	// primary is refused before the member plans are read: a read that fails
+	// afterwards would keep a confirmation already known not to cover the work.
+	if primaryTargetChanged(pinned, current) {
+		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
+		return false, primaryTargetDifferenceReason(workTarget), nil
+	}
 	confirmed, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
 	if err != nil {
 		return false, "", fmt.Errorf("load member plans of the confirmed round: %w", err)
@@ -338,9 +346,19 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 
 // roundCoversWork reports whether the confirm-time round runs only work the
 // confirmed round planned, with a reason naming the target and the part of its
-// work that differs when it does not. A target with no work now runs nothing,
-// so only targets with work are compared.
+// work that differs when it does not. The primary member must still be the
+// reviewed member, even when it converged while other targets still have work.
+// With that identity fixed, only targets with work are compared.
+//
+// The identity check is part of what this comparison means, so it is made here
+// as well as by confirmationCoversMemberWork, which refuses a changed primary
+// before reading the member plans this function compares. That earlier refusal
+// is the enforcement point; this one keeps the comparison complete on its own
+// for any caller that has the plans already.
 func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*storage.Plan) (bool, string) {
+	if primaryTargetChanged(pinned, current) {
+		return false, primaryTargetDifferenceReason(workTarget)
+	}
 	if current.HasWork() {
 		if difference := memberWorkDifference(pinned, current); difference != workUnchanged {
 			return false, primaryTargetDifferenceReason(difference)
@@ -366,42 +384,103 @@ func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*s
 // whose confirm-time re-plan differs from the plan the confirmation was given
 // against, naming the part of its work that differs.
 func primaryTargetDifferenceReason(difference workDifference) string {
+	if difference == workTarget {
+		return "the primary target is not the one the confirmed plan reviewed"
+	}
 	return fmt.Sprintf("the re-plan of the primary target differs from the confirmed plan in %s", difference)
 }
 
-// confirmedConvergedTargetRound reports whether the pending confirmation an
-// apply-confirm acts on was given against the comment an apply posts when the
-// primary target is already at the desired schema and other targets still have
-// work. That comment pins the primary target's empty plan and renders the plans
-// the review round stored for the other targets, so both are read from storage:
-// an empty pinned plan alone is not that comment, since a database with one
-// target has no round of other targets' plans for it to have shown. A pinned
-// plan that no longer loads is an error: what its comment showed cannot be told.
-func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanID, environment string) (bool, error) {
-	pinned, err := h.service.Storage().Plans().Get(ctx, pinnedPlanID)
+func primaryTargetChanged(pinned, current *storage.Plan) bool {
+	return (routing.ExecutionTarget{Deployment: pinned.Deployment, Target: pinned.Target}).MemberID() !=
+		(routing.ExecutionTarget{Deployment: current.Deployment, Target: current.Target}).MemberID()
+}
+
+func (h *Handler) logConfirmedPrimaryTargetChanged(pinned, current *storage.Plan, environment string) {
+	h.logger.Info("apply-confirm refused: the primary member changed; a fresh apply must review the current targets",
+		"repo", current.Repository, "pr", current.PullRequest, "head_sha", current.HeadSHA,
+		"database", current.Database, "database_type", current.DatabaseType, "environment", environment,
+		"pending_plan_id", pinned.PlanIdentifier, "plan_id", current.PlanIdentifier,
+		"confirmed_deployment", pinned.Deployment, "confirmed_target", pinned.Target,
+		"current_deployment", current.Deployment, "current_target", current.Target)
+}
+
+// convergedRoundRefusal is why an apply-confirm whose primary target has
+// changes is refused against the comment it acts on, when that comment showed
+// the primary target already at the desired schema.
+type convergedRoundRefusal int
+
+const (
+	// convergedRoundAccepts means the confirmed comment showed the primary
+	// target's own plan, so the gates that hold the re-plan to that plan decide.
+	convergedRoundAccepts convergedRoundRefusal = iota
+	// convergedRoundPrimaryMoved means the primary target is not the member the
+	// confirmed comment showed as converged: the changes it has now are another
+	// target's, which the comment may well have shown, but under that target.
+	convergedRoundPrimaryMoved
+	// convergedRoundPrimaryGainedWork means the primary target the comment
+	// showed as converged has gained changes of its own since.
+	convergedRoundPrimaryGainedWork
+)
+
+// confirmedConvergedTargetRound judges the pending confirmation an
+// apply-confirm acts on when the primary target has changes, against the
+// comment an apply posts when the primary target is already at the desired
+// schema and other targets still have work. That comment pins the primary
+// target's empty plan and renders the plans the review round stored for the
+// other targets, so both are read from storage: an empty pinned plan alone is
+// not that comment, since a database with one target has no round of other
+// targets' plans for it to have shown. Having found that comment, the
+// confirm-time plan, stored as currentPlanID, tells whether the primary target
+// with changes is still the member the comment showed as converged, or another
+// one that leads the rollout now. A pinned or confirm-time plan that no longer
+// loads is an error: what the comment showed, or what the apply would run,
+// cannot be told.
+func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanID, currentPlanID, environment string) (convergedRoundRefusal, error) {
+	plans := h.service.Storage().Plans()
+	pinned, err := plans.Get(ctx, pinnedPlanID)
 	if err != nil {
-		return false, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
+		return convergedRoundAccepts, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
 	}
 	if pinned == nil {
-		return false, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
+		return convergedRoundAccepts, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
 	}
 	if pinned.HasWork() {
 		h.logger.Debug("apply-confirm: the confirmed plan has work on the primary target, so its comment was not a converged-target confirmation",
 			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID)
-		return false, nil
+		return convergedRoundAccepts, nil
 	}
 	members, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
 	if err != nil {
-		return false, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
+		return convergedRoundAccepts, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
 	}
+	if !anyMemberHasWork(members) {
+		h.logger.Debug("apply-confirm: the confirmed round planned no other target with work, so its comment was not a converged-target confirmation",
+			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "member_plans", len(members))
+		return convergedRoundAccepts, nil
+	}
+	current, err := plans.Get(ctx, currentPlanID)
+	if err != nil {
+		return convergedRoundAccepts, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
+	}
+	if current == nil {
+		return convergedRoundAccepts, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
+	}
+	if primaryTargetChanged(pinned, current) {
+		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
+		return convergedRoundPrimaryMoved, nil
+	}
+	return convergedRoundPrimaryGainedWork, nil
+}
+
+// anyMemberHasWork reports whether any plan of a review round's other targets
+// has work for its target.
+func anyMemberHasWork(members map[string]*storage.Plan) bool {
 	for _, member := range members {
 		if member.HasWork() {
-			return true, nil
+			return true
 		}
 	}
-	h.logger.Debug("apply-confirm: the confirmed round planned no other target with work, so its comment was not a converged-target confirmation",
-		"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "member_plans", len(members))
-	return false, nil
+	return false
 }
 
 // confirmationCoversPrimaryTarget reports how the primary target's
@@ -414,7 +493,8 @@ func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanI
 // and a confirmed round that stored plans for other targets was a rollout's
 // even when the topology has since shrunk to the primary target alone. A
 // confirmation that neither marks as a rollout's was given for a single target,
-// whose re-plan runs under the single-target gates. A pinned or confirm-time
+// whose re-plan runs under the single-target gates only while it still addresses
+// the reviewed member. A pinned or confirm-time
 // plan that no longer loads is an error: what the comment showed, or what the
 // apply would run, cannot be told.
 func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPlanID, currentPlanID, environment string, rolloutAtConfirm bool) (workDifference, error) {
@@ -425,6 +505,17 @@ func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPla
 	}
 	if pinned == nil {
 		return workUnchanged, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
+	}
+	current, err := plans.Get(ctx, currentPlanID)
+	if err != nil {
+		return workUnchanged, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
+	}
+	if current == nil {
+		return workUnchanged, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
+	}
+	if primaryTargetChanged(pinned, current) {
+		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
+		return workTarget, nil
 	}
 	if !rolloutAtConfirm {
 		confirmedRound, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
@@ -439,23 +530,17 @@ func (h *Handler) confirmationCoversPrimaryTarget(ctx context.Context, pinnedPla
 		h.logger.Info("apply-confirm: the confirmed round planned other targets that the rollout no longer has; comparing the primary target's re-plan with the confirmed plan",
 			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "plan_id", currentPlanID, "confirmed_member_plans", len(confirmedRound))
 	}
-	current, err := plans.Get(ctx, currentPlanID)
-	if err != nil {
-		return workUnchanged, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
-	}
-	if current == nil {
-		return workUnchanged, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
-	}
 	return memberWorkDifference(pinned, current), nil
 }
 
 // workDifference names the part of a target's work in which two plans for it
-// differ, in words a refusal shows the operator after "differs ... in". The
-// zero value, workUnchanged, means the plans run the same work.
+// differ, or that the plans address different primary members. The zero value,
+// workUnchanged, means the plans run the same work.
 type workDifference string
 
 const (
 	workUnchanged     workDifference = ""
+	workTarget        workDifference = "which primary target it addresses"
 	workStatements    workDifference = "its statements"
 	workExecutionMode workDifference = "how its statements run"
 	workUnsafe        workDifference = "which of its statements are unsafe"

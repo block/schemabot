@@ -117,20 +117,32 @@ func (h *Handler) executeApply(
 	// A confirmation given against the comment saying the primary target
 	// already had this schema, which showed only the other targets' plans, does
 	// not cover changes the primary target has gained since: none of them were
-	// on that comment, so they never run on the strength of it. Any other
-	// confirmation was given against the primary target's own plan, and the
-	// gates below re-check that.
+	// on that comment, so they never run on the strength of it. Nor does it
+	// cover a primary target that is another member now, even one whose plan
+	// that comment showed: consent given under one target does not transfer to
+	// the target that leads the rollout since. Any other confirmation was given
+	// against the primary target's own plan, and the gates below re-check that.
 	if storedPlan == nil && planResp.HasChanges() {
-		confirmedConverged, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, environment)
+		refusal, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, planResp.PlanID, environment)
 		if roundErr != nil {
-			h.logger.Error("apply-confirm rejected: could not load the confirmed plan and its review round to compare with the primary target's changes; the pending confirmation is preserved",
+			h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its review round, or the re-plan to compare with the primary target's changes; the pending confirmation is preserved",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", roundErr)
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
 				"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
 			return
 		}
-		if confirmedConverged {
+		switch refusal {
+		case convergedRoundPrimaryMoved:
+			reason := primaryTargetDifferenceReason(workTarget)
+			h.logger.Info("apply-confirm refused: the primary target is not the one the confirmed comment showed as converged",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				unconfirmedWorkMessage(memberWork{}, reason))
+			return
+		case convergedRoundPrimaryGainedWork:
 			h.logger.Info("apply-confirm refused: the primary target has changes the confirmed comment did not show",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
@@ -138,6 +150,7 @@ func (h *Handler) executeApply(
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
 				"The comment this confirmation acts on showed the primary target already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.")
 			return
+		case convergedRoundAccepts:
 		}
 	}
 
@@ -180,10 +193,10 @@ func (h *Handler) executeApply(
 			return
 		}
 		if !covered {
-			h.logger.Info("apply-confirm refused: the other targets' work is not what the confirmation was given against",
+			h.logger.Info("apply-confirm refused: the confirmation does not cover the work the rollout would run",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
-			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rollout's work is not what was confirmed")
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
 			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
 			return
 		}
