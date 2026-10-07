@@ -435,6 +435,30 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want: wantChanged,
 		},
 		{
+			name: "the PR editing a config outside the schema directory after the approval does not count",
+			base: func() map[string]string {
+				files := maps.Clone(baseFiles)
+				files["schemabot.yaml"] = "database: orders\n"
+				return files
+			}(),
+			prChange: addVotes,
+			headChange: addVotesAnd(func(files map[string]string) {
+				files["schemabot.yaml"] = "database: orders\nignore_tables:\n  - orders\n"
+			}),
+			configPath: "schemabot.yaml",
+			want:       wantChanged,
+		},
+		{
+			name:     "schema files and a config the PR adds outside the database's inputs after the approval do not affect it",
+			prChange: addVotes,
+			headChange: addVotesAnd(func(files map[string]string) {
+				files["schema/payments/refunds.sql"] = "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+				files["schema/payments/schemabot.yaml"] = "database: payments\n"
+				files["db/stray.sql"] = "DROP TABLE `orders`"
+			}),
+			want: wantCovers,
+		},
+		{
 			name:     "the PR changing a symlinked namespace's target after the approval does not count",
 			prChange: addVotes,
 			headChange: addVotesAnd(func(files map[string]string) {

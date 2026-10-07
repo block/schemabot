@@ -1117,7 +1117,12 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 // maxSchemaSymlinkReads bounds how many distinct symlinks a schema change
 // comparison reads, so a directory full of links or a chain of them cannot
 // turn one comparison into an unbounded number of GitHub reads. Links with
-// the same target text share one read.
+// the same target text share one read. The value is a safety valve, not a
+// measured limit: schema directories normally hold a handful of links (an
+// environment link, a few shared namespaces), so it leaves wide headroom
+// while keeping a comparison's reads small. A comparison that passes half of
+// it logs a warning, so a repository growing toward it is visible before its
+// earlier approvals stop counting.
 const maxSchemaSymlinkReads = 64
 
 // SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
@@ -1235,6 +1240,9 @@ type schemaChangeComparer struct {
 	// symlinkText caches each symlink object's target text by blob SHA, so
 	// links with the same target text cost one read.
 	symlinkText map[string]string
+	// warnedSymlinkBudget is set once the comparison has logged that it read
+	// more than half of maxSchemaSymlinkReads.
+	warnedSymlinkBudget bool
 }
 
 type schemaChangeItem struct {
@@ -1399,9 +1407,16 @@ func (c *schemaChangeComparer) resolveSymlinks(ctx context.Context, links []Tree
 			unread[link.SHA] = true
 		}
 	}
-	if len(c.symlinkText)+len(unread) > maxSchemaSymlinkReads {
+	distinct := len(c.symlinkText) + len(unread)
+	if distinct > maxSchemaSymlinkReads {
 		return nil, fmt.Errorf("schema paths in repo %s hold %d distinct symlinks, more than the %d a comparison reads",
-			c.repo, len(c.symlinkText)+len(unread), maxSchemaSymlinkReads)
+			c.repo, distinct, maxSchemaSymlinkReads)
+	}
+	if distinct > maxSchemaSymlinkReads/2 && !c.warnedSymlinkBudget {
+		c.warnedSymlinkBudget = true
+		c.ic.logger.Warn("review gate comparison read more than half of its symlink budget; past the budget, approvals on earlier commits stop counting",
+			"repo", c.repo, "approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead],
+			"distinct_symlinks", distinct, "symlink_budget", maxSchemaSymlinkReads)
 	}
 	targets := make([]string, 0, len(links))
 	for _, link := range links {

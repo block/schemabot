@@ -350,7 +350,11 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 
 // reviewGateInputPaths lists the database's schema inputs the gate protects:
 // the schema paths the base schema freshness guard compares, and the config
-// file, which can sit outside them.
+// file, which can sit outside them. Symlinks inside them are followed by the
+// comparison. This list is the whole definition of what an approval on an
+// earlier commit must still match, so it must name every repository input
+// that can change the database's plan: an input missing from it can change
+// after an approval without the approval being re-earned, weakening AZ-4.
 func reviewGateInputPaths(schema *ghclient.SchemaRequestResult) []string {
 	var paths []string
 	for _, p := range []string{schema.SchemaPath, schema.SchemaLinkPath, schema.ConfigPath} {
