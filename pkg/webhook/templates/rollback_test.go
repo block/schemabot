@@ -249,7 +249,9 @@ func TestRenderRollbackBlockedByLock(t *testing.T) {
 		assert.Contains(t, rendered, "`staging`")
 		assert.Contains(t, rendered, "[block/myapp#42](https://github.com/block/myapp/pull/42)")
 		assert.Contains(t, rendered, "The lock is held until that PR is merged or closed, even after its apply finishes. "+
-			"To release it sooner, ask the lock holder to comment `schemabot unlock` on that PR.")
+			"To release it sooner, ask the lock holder to comment `schemabot unlock` on that PR. "+
+			"Neither releases the lock while that PR's apply is still running; "+
+			"if the PR was merged or closed during its apply, comment the unlock on it once the apply finishes.")
 		assert.NotContains(t, rendered, "to complete")
 		assert.NotContains(t, rendered, "--tenant")
 		assert.NotContains(t, rendered, "`block/myapp#42`",

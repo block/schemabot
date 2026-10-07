@@ -97,7 +97,9 @@ func TestRenderApplyBlockedByOtherPRNamesWhenTheLockIsReleased(t *testing.T) {
 	rendered := RenderApplyBlockedByOtherPR(data)
 	assert.Contains(t, rendered, "**Locked by**: [acme/storefront#42](https://github.com/acme/storefront/pull/42)")
 	assert.Contains(t, rendered, "The lock is held until that PR is merged or closed, even after its apply finishes. "+
-		"To release it sooner, ask the lock holder to comment `schemabot unlock` on that PR.\n")
+		"To release it sooner, ask the lock holder to comment `schemabot unlock` on that PR. "+
+		"Neither releases the lock while that PR's apply is still running; "+
+		"if the PR was merged or closed during its apply, comment the unlock on it once the apply finishes.\n")
 	assert.NotContains(t, rendered, "to complete")
 
 	t.Run("tenant deployment", func(t *testing.T) {

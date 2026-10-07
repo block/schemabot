@@ -3801,7 +3801,7 @@ Another PR currently holds the lock for this database.
 **Locked by**: [block/myapp#42](https://github.com/block/myapp/pull/42)
 **Since**: 2026-03-15 12:30:00 UTC
 
-The lock is held until that PR is merged or closed, even after its apply finishes. To release it sooner, ask the lock holder to comment `schemabot unlock` on that PR.
+The lock is held until that PR is merged or closed, even after its apply finishes. To release it sooner, ask the lock holder to comment `schemabot unlock` on that PR. Neither releases the lock while that PR's apply is still running; if the PR was merged or closed during its apply, comment the unlock on it once the apply finishes.
 <!-- schemabot:offer-support-channel -->
 
 </details>

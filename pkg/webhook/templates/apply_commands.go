@@ -370,10 +370,14 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 // otherPRLockReleaseHint tells the requester when another PR's lock goes away.
 // A PR's lock outlives its apply: it is released when that PR is merged or
 // closed, or when someone comments the unlock command on it, so "wait for it
-// to finish" would send the requester to watch the wrong event.
+// to finish" would send the requester to watch the wrong event. Neither
+// releases a lock whose apply is still running, and a PR closed mid-apply
+// keeps its lock after the apply finishes, so the hint names that case too.
 func otherPRLockReleaseHint(unlockCommand string) string {
 	return "The lock is held until that PR is merged or closed, even after its apply finishes. " +
-		"To release it sooner, ask the lock holder to comment `" + unlockCommand + "` on that PR."
+		"To release it sooner, ask the lock holder to comment `" + unlockCommand + "` on that PR. " +
+		"Neither releases the lock while that PR's apply is still running; " +
+		"if the PR was merged or closed during its apply, comment the unlock on it once the apply finishes."
 }
 
 // cliUnlockArgs renders the CLI unlock arguments for the lock on database.
