@@ -16,7 +16,6 @@ CREATE TABLE apply_operations (
   cutover_policy varchar(16) NOT NULL DEFAULT 'rolling',
   on_failure varchar(16) NOT NULL DEFAULT 'halt',
   attempt integer NOT NULL DEFAULT 0,
-  already_converged boolean NOT NULL DEFAULT FALSE,
   lease_owner varchar(255) NOT NULL DEFAULT '',
   lease_token varchar(64) NOT NULL DEFAULT '',
   lease_acquired_at timestamp DEFAULT NULL,
@@ -24,6 +23,7 @@ CREATE TABLE apply_operations (
   completed_at timestamp DEFAULT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  already_converged boolean NOT NULL DEFAULT FALSE,
   PRIMARY KEY (id)
 );
 CREATE UNIQUE INDEX idx_apply_operations_apply_deployment_key ON apply_operations (apply_id, deployment, operation_key);
