@@ -2,6 +2,7 @@ package ddl
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1369,4 +1370,82 @@ func TestFormatDDLWrapsLongPartitionList(t *testing.T) {
 	assert.Equal(t, "ALTER TABLE `events` PARTITION BY RANGE COLUMNS (`settlement_date`) (\n"+
 		strings.Join(expected, ",\n")+"\n);", formatted)
 	assert.Equal(t, Canonicalize(input), Canonicalize(formatted))
+}
+
+// A LIST partition's VALUES IN list too long for a line of its own wraps onto
+// indented lines under its definition, the way a long ENUM list does. A LIST
+// COLUMNS partition's tuples pack whole, and short lists stay inline.
+func TestFormatDDLWrapsLongListPartitionValues(t *testing.T) {
+	codes := func(from, n int) string {
+		v := make([]string, 0, n)
+		for i := from; i < from+n; i++ {
+			v = append(v, strconv.Itoa(1000+i))
+		}
+		return strings.Join(v, ",")
+	}
+	tuples := func(region string, n int) string {
+		v := make([]string, 0, n)
+		for i := range n {
+			v = append(v, fmt.Sprintf("('%s',%d)", region, i))
+		}
+		return strings.Join(v, ",")
+	}
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name: "LIST wraps a long value list and keeps a short one inline",
+			input: "CREATE TABLE `stores` (`id` bigint NOT NULL, `store_code` int NOT NULL) PARTITION BY LIST (`store_code`) (" +
+				"PARTITION p_west VALUES IN (" + codes(0, 30) + "), PARTITION p_east VALUES IN (" + codes(30, 3) + "))",
+			expected: "CREATE TABLE `stores` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `store_code` int NOT NULL\n" +
+				") PARTITION BY LIST (`store_code`) (\n" +
+				"    PARTITION `p_west` VALUES IN (\n" +
+				"        1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014,\n" +
+				"        1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029\n" +
+				"    ),\n" +
+				"    PARTITION `p_east` VALUES IN (1030, 1031, 1032)\n" +
+				");",
+		},
+		{
+			name: "LIST COLUMNS packs whole tuples",
+			input: "CREATE TABLE `stores` (`id` bigint NOT NULL, `region` varchar(8) NOT NULL, `tier` int NOT NULL) " +
+				"PARTITION BY LIST COLUMNS (`region`,`tier`) (" +
+				"PARTITION p_west VALUES IN (" + tuples("west", 12) + "), PARTITION p_east VALUES IN (('east',1)))",
+			expected: "CREATE TABLE `stores` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `region` varchar(8) NOT NULL,\n" +
+				"    `tier` int NOT NULL\n" +
+				") PARTITION BY LIST COLUMNS (`region`,`tier`) (\n" +
+				"    PARTITION `p_west` VALUES IN (\n" +
+				"        ('west', 0), ('west', 1), ('west', 2), ('west', 3), ('west', 4), ('west', 5), ('west', 6),\n" +
+				"        ('west', 7), ('west', 8), ('west', 9), ('west', 10), ('west', 11)\n" +
+				"    ),\n" +
+				"    PARTITION `p_east` VALUES IN (('east', 1))\n" +
+				");",
+		},
+		{
+			name:  "ADD PARTITION of one long LIST definition",
+			input: "ALTER TABLE `stores` ADD PARTITION (PARTITION p_north VALUES IN (" + codes(50, 30) + "))",
+			expected: "ALTER TABLE `stores` ADD PARTITION (\n" +
+				"    PARTITION `p_north` VALUES IN (\n" +
+				"        1050, 1051, 1052, 1053, 1054, 1055, 1056, 1057, 1058, 1059, 1060, 1061, 1062, 1063, 1064,\n" +
+				"        1065, 1066, 1067, 1068, 1069, 1070, 1071, 1072, 1073, 1074, 1075, 1076, 1077, 1078, 1079\n" +
+				"    )\n" +
+				");",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			formatted := FormatDDL(tc.input)
+			assert.Equal(t, tc.expected, formatted)
+			for line := range strings.SplitSeq(formatted, "\n") {
+				assert.LessOrEqual(t, len(line), valueListWrapWidth, "line %q", line)
+			}
+			assert.Equal(t, Canonicalize(tc.input), Canonicalize(formatted), "wrapping must not change the statement")
+		})
+	}
 }

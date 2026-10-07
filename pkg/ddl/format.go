@@ -16,8 +16,8 @@ import (
 // It first canonicalizes using Spirit's parser, then formats:
 //   - ALTER statements: each clause on its own line
 //   - CREATE TABLE statements: each column/index on its own line
-//   - ENUM and SET value lists too long for a line of their own: wrapped
-//     onto indented lines
+//   - ENUM and SET value lists, and LIST partition value lists, too long for
+//     a line of their own: wrapped onto indented lines
 //   - partition definition lists: each definition on its own indented line
 //   - Data types, functions, and charset/collate values are lowercased
 //     while SQL keywords remain uppercase (PlanetScale style).
@@ -413,9 +413,11 @@ func wrapLinePartitionDefinitions(line string) string {
 const valueListWrapWidth = 100
 
 // mysqlValueListPattern matches the opening of a MySQL ENUM or SET column
-// type's value list. A MySQL statement only opens a parenthesis directly after
-// SET in that type; CHARACTER SET and SET DEFAULT never take one.
-var mysqlValueListPattern = regexp.MustCompile(`(?i)^(enum|set)\s*\(`)
+// type's value list, or of a LIST partition's VALUES IN list. A MySQL
+// statement only opens a parenthesis directly after SET in that type;
+// CHARACTER SET and SET DEFAULT never take one. A LIST COLUMNS partition's
+// values are tuples, which pack whole.
+var mysqlValueListPattern = regexp.MustCompile(`(?i)^(enum|set|values\s+in)\s*\(`)
 
 // enumValueListPattern matches the opening of an ENUM value list. Outside the
 // MySQL family SET is not a type, and SET ( opens a parameter list such as a
