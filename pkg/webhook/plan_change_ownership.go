@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/ddl"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -129,7 +130,8 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 
 // plannedDestructiveTables returns the distinct tables the plan would destroy
 // something on — a dropped table, column, or index — in a stable order. Each
-// table is judged by the same predicate --allow-unsafe is gated on, but over a
+// table is judged by the same predicate --allow-unsafe is gated on, less the
+// changes that create a table (createsTable), but over a
 // wider view: both the namespace-level changes and the per-shard ones are read,
 // where the unsafe gate reads only the namespace-level ones. A sharded plan can
 // carry a destructive change on individual shards that the collapsed view
@@ -145,7 +147,7 @@ func plannedDestructiveTables(planResp *apitypes.PlanResponse) []string {
 		if t.TableName == "" {
 			return
 		}
-		if _, unsafe := t.UnsafeChange(); !unsafe {
+		if _, unsafe := t.UnsafeChange(); !unsafe || createsTable(t.ChangeType) {
 			return
 		}
 		seen[t.TableName] = struct{}{}
@@ -174,16 +176,27 @@ func plannedDestructiveTables(planResp *apitypes.PlanResponse) []string {
 	return tables
 }
 
+// createsTable reports whether a change of this type creates its table. Such a
+// change can carry an unsafe finding, such as a lint error on one of its
+// columns, but it destroys nothing: the table is not on the target yet. So it
+// is never something another pull request applied showing up as one to undo,
+// and the attribution notice leaves it out. Every other unsafe change keeps
+// the notice, since over-attributing is the safe direction.
+func createsTable(changeType string) bool {
+	return ddl.OpToStatementType(changeType) == ddl.StatementCreateTable
+}
+
 // targetPlanDestructiveTables returns the distinct tables the rendered target
 // plans destroy something on beyond the primary plan, in a stable order. They
 // are the tables of the unsafe changes the unsafe gate counts for those plans
 // (templates.TargetPlanUnsafeChanges), so a table a target's plan drops, or
 // drops a column or index on, is looked up the way the primary plan's are. A
-// VSchema change is not a table's, and is left out as the primary plan's are.
+// VSchema change is not a table's, and a change that creates its table
+// destroys nothing, so both are left out as the primary plan's are.
 func targetPlanDestructiveTables(rollout *templates.DeploymentDriftData) []string {
 	var tables []string
 	for _, change := range templates.TargetPlanUnsafeChanges(rollout) {
-		if change.Table == "" || change.ChangeType == apitypes.VSchemaChangeType || slices.Contains(tables, change.Table) {
+		if change.Table == "" || change.ChangeType == apitypes.VSchemaChangeType || createsTable(change.ChangeType) || slices.Contains(tables, change.Table) {
 			continue
 		}
 		tables = append(tables, change.Table)
