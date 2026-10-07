@@ -401,6 +401,7 @@ func previewCommentMultiDeployAllOutput() {
 		{"BARRIER ROLLOUT IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyInProgress()) }},
 		{"ROLLOUT WHERE PLANS DIFFER", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyDivergentPlans()) }},
 		{"MULTI-TARGET ROLLOUT (TWO DEPLOYMENTS, 64 TARGETS EACH)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiTargetApplyInProgress()) }},
+		{"MULTI-TARGET ROLLOUT IN PROGRESS (ONE DEPLOYMENT)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiTargetApplyInProgressOneDeployment()) }},
 		{"SUMMARY: MULTI-TARGET ROLLOUT WITH A TARGET THAT ALREADY HAD IT", func() { fmt.Print(webhooktemplates.PreviewCommentMultiTargetApplySummaryAlreadyHadIt()) }},
 		{"BARRIER ROLLOUT WITH DEFERRED CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyDeferredCutover()) }},
 		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyFailed()) }},

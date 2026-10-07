@@ -28,8 +28,10 @@ type targetWork struct {
 // sharded apply comment writes a keyspace: one line per table across the
 // targets, each change's DDL once, a heading per group of targets when they
 // diverge, and a row per failed target. Its size grows with distinct changes
-// and failures, not with the number of targets.
-func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
+// and failures, not with the number of targets. standalone is true when the
+// rollup is the whole comment body, whose status line already counts the
+// targets that had the change.
+func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget, standalone bool) {
 	work := targetWorkGroups(data, g)
 	silent := unreportedTargets(data, g)
 	// A target that already had the change ran nothing and never reports
@@ -63,7 +65,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		restorePlan()
 		restoreGroup()
 	}
-	if converged := alreadyAppliedTargets(data, g); converged > 0 {
+	if converged := alreadyAppliedTargets(data, g); converged > 0 && !standalone {
 		fmt.Fprintf(sb, "_%d of %d targets already had this schema; nothing ran there._\n", converged, len(g.Members))
 	}
 	writeFailedTargets(sb, data.Model, g)

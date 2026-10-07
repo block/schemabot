@@ -812,3 +812,38 @@ func (d *Deployment) set(ps PresentationState, label, emoji string, open bool) {
 	d.Emoji = emoji
 	d.Open = open
 }
+
+// TargetProgress is a multi-target group's progress as one status line reads
+// it: how many of its targets finished running the change, how many already
+// had it, and the histogram of the rest.
+type TargetProgress struct {
+	// Total is every target the group addresses.
+	Total int
+	// Done is the targets that ran the change to completion.
+	Done int
+	// AlreadyHad is the targets that already held the change, so ran nothing.
+	AlreadyHad int
+	// Others is the histogram of the remaining targets, in display order.
+	Others []StateCount
+}
+
+// TargetProgress counts g's targets for its status line. Done and AlreadyHad
+// are counted apart from the rest, so Done + AlreadyHad plus the Others counts
+// is always Total.
+func (a Apply) TargetProgress(g Group) TargetProgress {
+	p := TargetProgress{Total: len(g.Members)}
+	var rest []Deployment
+	for _, i := range g.Members {
+		d := a.Deployments[i]
+		switch d.Presentation {
+		case StateCompleted:
+			p.Done++
+		case StateAlreadyApplied:
+			p.AlreadyHad++
+		default:
+			rest = append(rest, d)
+		}
+	}
+	p.Others = summaryCounts(rest)
+	return p
+}

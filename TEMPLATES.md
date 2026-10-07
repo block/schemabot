@@ -8442,6 +8442,39 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="multitarget-rollout-in-progress-one-deployment"></a><strong>Multi-target Rollout In Progress (One Deployment)</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+🔄 Rolling out: 1 of 4 targets done, 1 running, 1 queued (1 already had it)
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 81% · 1 complete, 1 running
+- Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
+- Running: `orders_001`
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+_1 of 4 targets have not reported progress yet._
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
 <summary><a name="summary-multitarget-rollout-with-a-target-that-already-had-it"></a><strong>Summary: Multi-target Rollout With A Target That Already Had It</strong></summary>
 
 
@@ -8451,13 +8484,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-**Targets**: 3 completed, 1 already had it
-
-- ✅ `us` — 3 completed, 1 already had it (4 targets)
-
-<details>
-<summary>✅ us — 3 completed, 1 already had it (4 targets)</summary>
-<dl><dd>
+✅ Rolled out to 3 of 4 targets (1 already had it)
 
 **`orders`**: ✅ Complete (3 targets)
 
@@ -8465,10 +8492,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-_1 of 4 targets already had this schema; nothing ran there._
-
-</dd></dl>
-</details>
 
 </details>
 

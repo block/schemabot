@@ -2870,6 +2870,44 @@ func PreviewCommentMultiTargetApplySummaryAlreadyHadIt() string {
 	})
 }
 
+// PreviewCommentMultiTargetApplyInProgressOneDeployment renders a rollout
+// whose one deployment addresses four targets: one done, one copying, one
+// queued, and one that already had the change. With no other deployment to
+// tell it apart from, the status is one line and the table lines sit under it.
+func PreviewCommentMultiTargetApplyInProgressOneDeployment() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const rows = 1_466_232
+	target := func(i int, opState string) presentation.Operation {
+		return presentation.Operation{Deployment: "us", Target: fmt.Sprintf("orders_%03d", i), State: opState, Parallel: true, ContinueOnFailure: true}
+	}
+	detail := func(i int, opState, taskState string, copied, eta int64) *ApplyStatusCommentData {
+		return sampleDeploymentDetail(fmt.Sprintf("orders_%03d", i), opState, []TableProgressData{
+			{TableName: "orders", DDL: addIndex, Status: taskState, RowsCopied: copied, RowsTotal: rows, ETASeconds: eta},
+		})
+	}
+	converged := target(3, state.ApplyOperation.Completed)
+	converged.NeverStarted = true
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			target(0, state.ApplyOperation.Completed),
+			target(1, state.ApplyOperation.Running),
+			target(2, state.ApplyOperation.Pending),
+			converged,
+		}),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		Details: []*ApplyStatusCommentData{
+			detail(0, state.ApplyOperation.Completed, state.Task.Completed, rows, 0),
+			detail(1, state.ApplyOperation.Running, state.Task.Running, 914_707, 195),
+			nil,
+			sampleDeploymentDetail("orders_003", state.ApplyOperation.Completed, nil),
+		},
+	})
+}
+
 // PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
 // members were planned independently and so run different plans: `eu` is
 // already at the desired schema bar one index, while `us` still needs all
