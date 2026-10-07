@@ -8461,7 +8461,6 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
 
-_1 of 4 targets have not reported progress yet._
 
 ---
 

@@ -199,7 +199,8 @@ func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, 
 // targets run again once it resumes. An apply can settle as cancelled while a
 // target is still running, and that target keeps the line in the present
 // tense. A rollback says "Rolled back on" and "Rolling back" instead. Every
-// count is out of all the targets, so the parts add up.
+// count is out of all the targets, so the parts add up. A settled rollout
+// where every target already had the change ran nothing, and says so.
 func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) string {
 	ongoing, finished := "Rolling out:", "Rolled out to"
 	if rollback {
@@ -209,6 +210,8 @@ func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) 
 	switch {
 	case !settled || p.Unsettled > 0:
 		line = fmt.Sprintf("%s %d of %d targets done", ongoing, p.Done, p.Total)
+	case p.AlreadyHad == p.Total:
+		return fmt.Sprintf("All %d targets already had this schema", p.Total)
 	case p.Done == p.Total:
 		line = fmt.Sprintf("%s all %d targets", finished, p.Total)
 	case p.Done == 0:

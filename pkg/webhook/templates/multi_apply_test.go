@@ -1513,8 +1513,8 @@ func TestRenderMultiDeploymentApplyComment_TargetThatAlreadyHadTheChangeIsCounte
 		}
 		out := renderTargets(presentation.Derive(ops), nil, nil, nil, nil)
 
-		assert.Contains(t, out, "<summary>✅ primary — 4 already had it (4 targets)</summary>")
-		assert.Contains(t, out, "\n_4 of 4 targets already had this schema; nothing ran there._\n")
+		assert.Contains(t, out, "\n✅ All 4 targets already had this schema\n")
+		assert.NotContains(t, out, "Rolled out", "nothing ran, so the line claims no rollout:\n%s", out)
 		assert.NotContains(t, out, "No details available yet", "nothing ran, so no target is still to report details:\n%s", out)
 	})
 
