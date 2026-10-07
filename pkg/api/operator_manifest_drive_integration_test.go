@@ -138,8 +138,14 @@ func TestOperatorRemoteManifestConvergedMemberSettlesAndAcceptsNextApply(t *test
 	require.NoError(t, err)
 	grpcServer := grpc.NewServer()
 	tern.NewServer(dpClient, logger).Register(grpcServer)
-	go func() { _ = grpcServer.Serve(listener) }()
-	t.Cleanup(grpcServer.Stop)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- grpcServer.Serve(listener) }()
+	t.Cleanup(func() {
+		// Stop returns nil from Serve, so any other result is a server failure
+		// the fixture would otherwise report only as a later timeout.
+		grpcServer.Stop()
+		assert.NoError(t, <-serveErr)
+	})
 	cpClient, err := tern.NewGRPCClient(tern.Config{Address: listener.Addr().String(), Storage: cpStor, Logger: logger})
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(cpClient) })
