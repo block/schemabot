@@ -711,9 +711,11 @@ func TestDeploymentPlanGroups_DiscloseEachTargetsUnsafeChanges(t *testing.T) {
 		"the gate's list names the targets, since it renders beside the primary plan's changes")
 }
 
-// An engine joins a table's findings into one unsafe reason in the order its
-// linters reported them, and that order can differ from one target to the
-// next. Targets whose findings are the same set share one unsafe change, so
+// A table's findings can reach the comment joined into one unsafe reason in
+// different orders on different targets: a plan stored before its engine
+// normalized reasons, or an engine that does not normalize, keeps the order
+// its linters reported. Targets whose findings are the same set share one
+// unsafe change, so
 // the comment lists each finding once rather than once per order. A target
 // with a different set of findings keeps a change of its own.
 func TestDeploymentPlanGroups_TargetsWithTheSameFindingsInAnotherOrderShareOneUnsafeChange(t *testing.T) {

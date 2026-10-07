@@ -615,10 +615,11 @@ func sameUnsafeVerdict(a, b storage.TableChange) bool {
 }
 
 // sameUnsafeReason reports whether two unsafe reasons name the same set of
-// findings. A reason joins a table's findings in the order the engine reported
-// them, and an engine may report the same findings in a different order on
-// another target, so two reasons are compared as the sets of findings the
-// comment renders from them, each on its own line.
+// findings, compared as the sets the comment renders from them, each on its
+// own line. Engines that normalize their reasons already sort and deduplicate
+// the findings, but a reason can also come from a plan stored before that, or
+// from an engine that does not normalize, so the order of a reason's findings
+// is never taken to mean anything.
 func sameUnsafeReason(a, b string) bool {
 	return slices.Equal(unsafeReasonFindings(a), unsafeReasonFindings(b))
 }
