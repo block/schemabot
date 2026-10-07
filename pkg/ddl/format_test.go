@@ -1489,3 +1489,77 @@ func TestFormatDDLWrapsLongListPartitionValues(t *testing.T) {
 		})
 	}
 }
+
+// A PostgreSQL partition's bound is told apart from a column list by the
+// FOR VALUES keywords right before its first parenthesis, never by text
+// inside a quoted name. A table whose quoted name mentions "for values" still
+// gets its columns one per line.
+func TestFormatDDLForDialectPartitionBoundIgnoresQuotedNames(t *testing.T) {
+	tests := []struct {
+		name     string
+		dialect  schema.Dialect
+		input    string
+		expected string
+	}{
+		{
+			name:     "postgres quoted table name",
+			dialect:  schema.DialectPostgres,
+			input:    `CREATE TABLE "audit for values log" (id bigint NOT NULL, note text)`,
+			expected: "CREATE TABLE \"audit for values log\" (\n    id bigint NOT NULL,\n    note text\n);",
+		},
+		{
+			name:     "postgres quoted table name ending in a bound keyword",
+			dialect:  schema.DialectPostgres,
+			input:    `CREATE TABLE "audit for values in" (id bigint NOT NULL, note text)`,
+			expected: "CREATE TABLE \"audit for values in\" (\n    id bigint NOT NULL,\n    note text\n);",
+		},
+		{
+			name:     "mysql quoted table name",
+			dialect:  schema.DialectMySQL,
+			input:    "CREATE TABLE `audit for values in` (`id` bigint NOT NULL, `note` text)",
+			expected: "CREATE TABLE `audit for values in` (\n    `id` bigint NOT NULL,\n    `note` text\n);",
+		},
+		{
+			name:     "postgres range bound stays on the statement line",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE orders_2026 PARTITION OF orders FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+			expected: "CREATE TABLE orders_2026 PARTITION OF orders FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');",
+		},
+		{
+			name:     "postgres hash bound stays on the statement line",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE orders_h0 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
+			expected: "CREATE TABLE orders_h0 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 0);",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, FormatDDLForDialect(tc.dialect, tc.input))
+		})
+	}
+}
+
+// The display wrappings are checked by canonicalizing both forms, which
+// fails closed only because a parser returns a statement it cannot read
+// unchanged. Through every registered parser, a wrap of an unparseable
+// statement is discarded rather than kept unverified.
+func TestKeepEquivalentWrapDiscardsWrapOfUnparseableStatement(t *testing.T) {
+	tests := []struct {
+		dialect   schema.Dialect
+		formatted string
+	}{
+		{schema.DialectMySQL, "ALTER TABLE `events` FROB PARTITION (PARTITION `p1` VALUES LESS THAN (1), PARTITION `p2` VALUES LESS THAN (2));"},
+		{schema.DialectPostgres, "ALTER TABLE events FROB PARTITION (PARTITION p1 VALUES IN (1), PARTITION p2 VALUES IN (2));"},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.dialect), func(t *testing.T) {
+			parser, err := ParserForDialect(tc.dialect)
+			require.NoError(t, err)
+			require.Equal(t, tc.formatted, parser.Canonicalize(tc.formatted), "the parser must return a statement it cannot read unchanged")
+			wrapped := wrapPartitionDefinitions(tc.formatted)
+			require.NotEqual(t, tc.formatted, wrapped, "the scanner must wrap the statement for this case to exercise the guard")
+
+			assert.Equal(t, tc.formatted, keepEquivalentWrap(tc.dialect, parser, tc.formatted, wrapped, "partition-definition"))
+		})
+	}
+}

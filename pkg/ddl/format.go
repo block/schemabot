@@ -321,6 +321,12 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 // keepEquivalentWrap returns wrapped when the dialect's parser reads it as the
 // same statement as formatted, and formatted otherwise. kind names the
 // wrapping in the diagnostic logged when it is discarded.
+//
+// The comparison fails closed on a statement the parser cannot read only
+// because StatementParser.Canonicalize returns its input unchanged on a parse
+// failure: wrapped and formatted then canonicalize to two different strings,
+// and the wrap is discarded. A Canonicalize that returned a fixed value on
+// failure would make the two sides equal and keep an unverified wrap.
 func keepEquivalentWrap(dialect schema.Dialect, parser StatementParser, formatted, wrapped, kind string) string {
 	if wrapped == formatted {
 		return formatted
@@ -351,6 +357,12 @@ func keepEquivalentWrap(dialect schema.Dialect, parser StatementParser, formatte
 // normalized clause string, which does not expose them. It only inserts
 // whitespace at commas between definitions, and FormatDDLForDialect keeps
 // the result only when the parser reads it as the same statement.
+//
+// Each line is scanned on its own, so a list is wrapped only when it opens
+// and closes on one line, as it does in canonical text. A list an earlier
+// step had already broken across lines is left as it is: its opening line
+// has no matching parenthesis. A quoted literal that spans lines can still be
+// misread, which the equivalence check catches.
 func wrapPartitionDefinitions(ddl string) string {
 	lines := strings.Split(ddl, "\n")
 	for i, line := range lines {
@@ -706,11 +718,35 @@ func formatCreateTableWithOptions(ddl string, multiline bool) string {
 }
 
 // opensPartitionBound reports whether the CREATE TABLE text before its first
-// parenthesis ends in a PostgreSQL partition bound, as in PARTITION OF
-// orders FOR VALUES IN (, so that parenthesis is the bound's and not the
-// start of a column list.
+// parenthesis ends in a PostgreSQL partition bound, FOR VALUES IN, FROM or
+// WITH, as in PARTITION OF orders FOR VALUES IN (, so that parenthesis is the
+// bound's and not the start of a column list. Quoted regions are skipped, so
+// a table named "audit for values log" is not taken for a bound; an
+// unterminated quote reports false.
 func opensPartitionBound(beforeParen string) bool {
-	return strings.Contains(strings.ToUpper(beforeParen), " FOR VALUES ")
+	var unquoted strings.Builder
+	for i := 0; i < len(beforeParen); i++ {
+		if isQuote(beforeParen[i]) {
+			end, ok := quotedEnd(beforeParen, i)
+			if !ok {
+				return false
+			}
+			unquoted.WriteString(" quoted ")
+			i = end - 1
+			continue
+		}
+		unquoted.WriteByte(beforeParen[i])
+	}
+	words := strings.Fields(strings.ToUpper(unquoted.String()))
+	if len(words) < 3 || words[len(words)-3] != "FOR" || words[len(words)-2] != "VALUES" {
+		return false
+	}
+	switch words[len(words)-1] {
+	case "IN", "FROM", "WITH":
+		return true
+	default:
+		return false
+	}
 }
 
 // splitPartitionClause separates the trailing PARTITION BY clause, if any,
