@@ -243,17 +243,19 @@ func testLeaseTakeoverDoesNotOrphanTheEngineRun(t *testing.T, deferCutover bool)
 
 	// Heartbeats stop landing and the lease ages past the staleness window. The
 	// window is a fixed minute, so it is aged in storage rather than waited out.
+	// Any write to the rows refreshes their updated_at, including a heartbeat
+	// that passed the gate just before it closed, so the rows are aged again on
+	// every poll until the peer holds the apply.
 	heartbeatsBlocked.Store(true)
-	_, err = storageDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", apply.ID)
-	require.NoError(t, err)
-	_, err = storageDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_id = ?", apply.ID)
-	require.NoError(t, err)
-
 	peer.service.StartOperator(ctx)
 	testutil.Poll(t, leaseTakeoverPollDeadline, 50*time.Millisecond, func() bool {
 		current, err := shared.Applies().Get(ctx, apply.ID)
 		require.NoError(t, err)
-		return current != nil && current.LeaseToken != originalLease
+		if current != nil && current.LeaseToken != originalLease {
+			return true
+		}
+		ageLeaseTakeoverRows(t, storageDB, apply.ID)
+		return false
 	}, func() string { return "the peer never reclaimed the stale apply" })
 
 	// The original instance's storage is reachable again, so its next heartbeat
@@ -291,10 +293,7 @@ func testLeaseTakeoverDoesNotOrphanTheEngineRun(t *testing.T, deferCutover bool)
 		// copy has let go.
 		if deferCutover && !originalAlive && !refusedClaimAged &&
 			applyLogMentions(t, shared, apply.ID, "the apply is handed back to start again once it lets go") {
-			_, err = storageDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", apply.ID)
-			require.NoError(t, err)
-			_, err = storageDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_id = ?", apply.ID)
-			require.NoError(t, err)
+			ageLeaseTakeoverRows(t, storageDB, apply.ID)
 			refusedClaimAged = true
 		}
 		if deferCutover && !originalAlive && !cutoverRequested && state.IsState(current.State, state.Apply.WaitingForCutover) {
@@ -334,4 +333,15 @@ func applyLogMentions(t *testing.T, store storage.Storage, applyID int64, text s
 		}
 	}
 	return false
+}
+
+// ageLeaseTakeoverRows moves the apply's and its operations' last write past
+// the lease staleness window, so a claim treats their leases as stale without
+// the test waiting the window out.
+func ageLeaseTakeoverRows(t *testing.T, storageDB *sql.DB, applyID int64) {
+	t.Helper()
+	_, err := storageDB.ExecContext(t.Context(), "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", applyID)
+	require.NoError(t, err)
+	_, err = storageDB.ExecContext(t.Context(), "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_id = ?", applyID)
+	require.NoError(t, err)
 }
