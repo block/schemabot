@@ -156,7 +156,10 @@ func (h *Handler) reviewRoundPlans(ctx context.Context, planID, environment stri
 // act on in an apply: every target it runs carries only direct-execution
 // changes, which have no cutover, and at least one carries a change. When the
 // apply runs other targets' own plans, their plans are read too, since the
-// primary plan speaks only for the primary target.
+// primary plan speaks only for the primary target. When it does not, the
+// primary plan alone decides: runsMemberWork is the same answer that decides
+// whether the apply runs the other targets' plans, so a plan this check skips
+// is one the apply does not run.
 func (h *Handler) deferCutoverHasNothingToDefer(ctx context.Context, planResp *apitypes.PlanResponse, environment string, runsMemberWork bool) (bool, error) {
 	if !runsMemberWork {
 		return planResp.AllChangesDirect(), nil
@@ -168,21 +171,21 @@ func (h *Handler) deferCutoverHasNothingToDefer(ctx context.Context, planResp *a
 	return rolloutAllChangesDirect(planResp, members), nil
 }
 
-// confirmCommandAllChangesDirect reports whether the apply-confirm a paused
+// confirmCommandHasNoCutoverToDefer reports whether the apply-confirm a paused
 // apply's comment suggests leaves out --defer-cutover, because no target the
 // apply runs has a cutover to defer. The primary plan alone cannot say so when
 // other targets run engine-driven changes of their own. A target plan that
 // cannot be read keeps the flag: apply-confirm refuses a flag with nothing to
 // defer and keeps the pending confirmation, while a dropped flag would let a
 // cutover run without the pause the operator asked for.
-func (h *Handler) confirmCommandAllChangesDirect(ctx context.Context, repo string, pr int, planResp *apitypes.PlanResponse, environment string, runsMemberWork bool) bool {
-	allDirect, err := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+func (h *Handler) confirmCommandHasNoCutoverToDefer(ctx context.Context, repo string, pr int, planResp *apitypes.PlanResponse, environment string, runsMemberWork bool) bool {
+	nothingToDefer, err := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
 	if err != nil {
 		h.logger.Warn("could not read every target's plan for the comment's apply-confirm command; it keeps --defer-cutover, which apply-confirm refuses if no target has a cutover to defer",
 			"repo", repo, "pr", pr, "environment", environment, "plan_id", planResp.PlanID, "error", err)
 		return false
 	}
-	return allDirect
+	return nothingToDefer
 }
 
 // rolloutAllChangesDirect reports whether every target with work, the

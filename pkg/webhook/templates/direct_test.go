@@ -69,7 +69,7 @@ func TestRenderPlanComment_DirectNotesDeferCutoverOnlyWhenPassed(t *testing.T) {
 func TestRenderPlanComment_PausedAllDirectConfirmOmitsDeferCutover(t *testing.T) {
 	data := PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
-		PendingManualConfirmation: true, DeferCutover: true, AllChangesDirect: true,
+		PendingManualConfirmation: true, DeferCutover: true, NoCutoverToDefer: true,
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "testapp",
 			Statements: []string{"ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"},
@@ -83,7 +83,7 @@ func TestRenderPlanComment_PausedAllDirectConfirmOmitsDeferCutover(t *testing.T)
 	assert.Contains(t, paused, "```\nschemabot apply-confirm -e staging\n```")
 	assert.Contains(t, paused, "`--defer-cutover` does not apply to these direct statements: they have no cutover to defer.")
 
-	data.AllChangesDirect = false
+	data.NoCutoverToDefer = false
 	assert.Contains(t, RenderPlanComment(data), "```\nschemabot apply-confirm -e staging --defer-cutover\n```",
 		"a plan with engine-driven changes keeps the flag the operator passed")
 }

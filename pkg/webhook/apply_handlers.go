@@ -393,7 +393,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"plan_id", planResp.PlanID, "error", refusalErr)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+					otherTargetPlansUnverifiedMessage(action.Apply, environment))
 			}
 			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
 		}
@@ -450,7 +450,6 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// every target runs only direct statements has no cutover to defer, so
 	// reject the flag instead of silently ignoring it. No lock is held yet, so
 	// a plan that cannot be read leaves the command retryable.
-	rolloutAllDirect := planResp.AllChangesDirect()
 	if result.DeferCutover {
 		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
 		if deferErr != nil {
@@ -459,7 +458,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"plan_id", planResp.PlanID, "error", deferErr)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+					otherTargetPlansUnverifiedMessage(action.Apply, environment))
 			}
 			return true, fmt.Errorf("apply command defer-cutover check %s#%d: %w", repo, pr, deferErr)
 		}
@@ -471,7 +470,6 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				msgDeferCutoverAllDirect)
 			return false, nil
 		}
-		rolloutAllDirect = nothingToDefer
 	}
 
 	// Block unsafe changes unless --allow-unsafe was specified, on every target
@@ -539,12 +537,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
+	// The check above refused --defer-cutover when no target has a cutover to
+	// defer, so the apply-confirm the comment suggests keeps the flag.
 	commentData.DeferCutover = result.DeferCutover
-	// The apply-confirm the comment suggests drops --defer-cutover only when no
-	// target has a cutover to defer, which the primary plan alone cannot tell
-	// on a rollout; the check above read every target's plan when the flag
-	// was given, and the footer reads this only then.
-	commentData.AllChangesDirect = rolloutAllDirect
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeploymentDrift = rolloutPreview

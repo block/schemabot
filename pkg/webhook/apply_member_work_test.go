@@ -16,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -477,6 +478,41 @@ func TestUnconfirmedWorkMessageNamesTheTargetWhosePlanChanged(t *testing.T) {
 		"2 of 2 targets need this change: eu/payments-001, us/payments-002. This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in its statements, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
 		message)
 	assert.NotContains(t, message, "other than the primary")
+}
+
+// An apply that does not run the other targets' plans runs the primary plan
+// alone, so the primary plan alone decides whether --defer-cutover has anything
+// to defer, and no other target's plan is read. The handler has no storage, so
+// reading one would fail the test.
+func TestDeferCutoverHasNothingToDefer_PrimaryPlanDecidesWhenNoOtherTargetRuns(t *testing.T) {
+	h := &Handler{}
+	direct := &apitypes.PlanResponse{PlanID: "plan-1", Changes: []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders", ExecutionMode: "direct"}},
+	}}}
+	engine := &apitypes.PlanResponse{PlanID: "plan-2", Changes: []*apitypes.SchemaChangeResponse{{
+		Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{{TableName: "orders"}},
+	}}}
+
+	nothingToDefer, err := h.deferCutoverHasNothingToDefer(t.Context(), direct, "staging", false)
+	require.NoError(t, err)
+	assert.True(t, nothingToDefer, "a primary plan of direct changes has no cutover to defer")
+
+	nothingToDefer, err = h.deferCutoverHasNothingToDefer(t.Context(), engine, "staging", false)
+	require.NoError(t, err)
+	assert.False(t, nothingToDefer, "a primary plan with an engine-driven change has a cutover to defer")
+}
+
+// A command that could not read the other targets' plans tells the operator
+// how to recover from where it stopped: apply-confirm kept the pending
+// confirmation, so it is re-run as apply-confirm; apply held nothing, so it is
+// retried.
+func TestOtherTargetPlansUnverifiedMessage_NamesTheRecovery(t *testing.T) {
+	assert.Equal(t,
+		"SchemaBot could not verify the other targets' plans, so nothing was applied. The pending confirmation is preserved; re-run `schemabot apply-confirm -e production` with the same flags, and see server logs if it persists.",
+		otherTargetPlansUnverifiedMessage(action.ApplyConfirm, "production"))
+	assert.Equal(t,
+		"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.",
+		otherTargetPlansUnverifiedMessage(action.Apply, "production"))
 }
 
 // --defer-cutover has a cutover to defer when any target the apply runs

@@ -196,11 +196,14 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
-	// AllChangesDirect marks a plan whose every change runs as direct
-	// execution. Such a plan has no cutover to defer, so the apply-confirm
-	// command a paused comment suggests leaves out --defer-cutover, which
-	// apply-confirm rejects on it.
-	AllChangesDirect bool
+	// NoCutoverToDefer marks a paused apply where no target it runs has a
+	// cutover to defer, so the apply-confirm command the comment suggests
+	// leaves out --defer-cutover, which apply-confirm rejects on it. Only a
+	// caller that read every target's plan can say so; the primary plan alone
+	// cannot on a rollout. The zero value keeps the flag, the safe side: a kept
+	// flag costs a refusal, while a dropped one runs a cutover the operator
+	// asked to hold.
+	NoCutoverToDefer bool
 
 	// Unfinished copies already on the target that the apply will throw away
 	// and copy again from the start.
@@ -666,7 +669,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		applyConfirmCmd := scopedApplyCommand("schemabot apply-confirm", data.Environment, data.ScopedDatabase, ApplyCommandOptions{
 			Tenant:       data.Tenant,
 			AllowUnsafe:  data.AllowUnsafe,
-			DeferCutover: data.DeferCutover && !data.AllChangesDirect,
+			DeferCutover: data.DeferCutover && !data.NoCutoverToDefer,
 			SkipRevert:   data.SkipRevert,
 		})
 
