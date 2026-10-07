@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,6 +26,49 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		return id
 	}
+
+	// Insert_AlreadyConvergedRoundTrips verifies that an operation recorded as
+	// a target that already held the change reads back marked, and that the
+	// mark is refused on any row that is not completed work no driver started:
+	// on such a row it would tell an operator a target already had the change
+	// when work was still to run there, or did run.
+	t.Run("Insert_AlreadyConvergedRoundTrips", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_converged_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_converged", 931)
+
+		completedAt := time.Date(2026, 10, 7, 7, 0, 0, 0, time.UTC)
+		convergedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.Completed,
+			CompletedAt: &completedAt, AlreadyConverged: true,
+		})
+		require.NoError(t, err)
+		ranID := createOperation(t, store, apply.ID, "region-b", "")
+
+		converged, err := store.ApplyOperations().Get(ctx, convergedID)
+		require.NoError(t, err)
+		require.NotNil(t, converged)
+		assert.True(t, converged.AlreadyConverged)
+		assert.Equal(t, state.ApplyOperation.Completed, converged.State)
+		assert.Nil(t, converged.StartedAt)
+
+		ran, err := store.ApplyOperations().Get(ctx, ranID)
+		require.NoError(t, err)
+		require.NotNil(t, ran)
+		assert.False(t, ran.AlreadyConverged)
+
+		_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-c", AlreadyConverged: true,
+		})
+		require.ErrorContains(t, err, "an already converged operation must be completed and never started")
+
+		_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "region-d", State: state.ApplyOperation.Completed,
+			StartedAt: &completedAt, CompletedAt: &completedAt, AlreadyConverged: true,
+		})
+		require.ErrorContains(t, err, "an already converged operation must be completed and never started")
+	})
 
 	// FindNextApplyOperation_ClaimsInDeploymentOrder verifies the operation
 	// ladder: a pending operation is claimed into running with a fresh lease,

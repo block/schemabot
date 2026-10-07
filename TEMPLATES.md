@@ -8442,6 +8442,37 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 </details>
 
 <details>
+<summary><a name="summary-multitarget-rollout-with-a-target-that-already-had-it"></a><strong>Summary: Multi-target Rollout With A Target That Already Had It</strong></summary>
+
+
+## ✅ Schema Change Applied — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+**Targets**: 3 completed, 1 already had it
+
+- ✅ `us` — 3 completed, 1 already had it (4 targets)
+
+<details>
+<summary>✅ us — 3 completed, 1 already had it (4 targets)</summary>
+<dl><dd>
+
+**`orders`**: ✅ Complete (3 targets)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+_1 of 4 targets already had this schema; nothing ran there._
+
+</dd></dl>
+</details>
+
+</details>
+
+<details>
 <summary><a name="barrier-rollout-with-deferred-cutover"></a><strong>Barrier Rollout With Deferred Cutover</strong></summary>
 
 

@@ -2834,6 +2834,42 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 	})
 }
 
+// PreviewCommentMultiTargetApplySummaryAlreadyHadIt renders the summary of a
+// finished rollout across four targets, one of which already had the change
+// when the apply was created: it ran nothing, so it reports no table progress
+// and is counted apart from the targets that ran.
+func PreviewCommentMultiTargetApplySummaryAlreadyHadIt() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const rows = 1_466_232
+	var ops []presentation.Operation
+	var details []*ApplyStatusCommentData
+	for i := range 4 {
+		target := fmt.Sprintf("orders_%03d", i)
+		op := presentation.Operation{Deployment: "us", Target: target, State: state.ApplyOperation.Completed, Parallel: true, ContinueOnFailure: true}
+		if i == 3 {
+			op.NeverStarted = true
+			op.AlreadyConverged = true
+			ops = append(ops, op)
+			details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, nil))
+			continue
+		}
+		ops = append(ops, op)
+		details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, []TableProgressData{
+			{TableName: "orders", DDL: addIndex, Status: state.Task.Completed, RowsCopied: rows, RowsTotal: rows},
+		}))
+	}
+
+	return RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       presentation.Derive(ops),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().UTC().Format(time.RFC3339),
+		Details:     details,
+	})
+}
+
 // PreviewCommentMultiDeploymentApplyDivergentPlans renders a rollout whose
 // members were planned independently and so run different plans: `eu` is
 // already at the desired schema bar one index, while `us` still needs all

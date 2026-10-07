@@ -773,7 +773,6 @@ func TestRenderMultiDeploymentApplyComment_SoleGroupCutDDLSpeaksOnlyForReporting
 		out := renderTargets(model, reporting("testapp_001", "plan_001"), reporting("testapp_002", "plan_002"), reporting("testapp_003", "plan_003"))
 
 		assert.Contains(t, out, pointer+" (every target runs the same DDL)._\n")
-		assert.NotContains(t, out, "have not reported progress yet")
 	})
 
 	t.Run("a silent target is not claimed", func(t *testing.T) {
@@ -782,7 +781,6 @@ func TestRenderMultiDeploymentApplyComment_SoleGroupCutDDLSpeaksOnlyForReporting
 		assert.Contains(t, out, pointer+" (every target that has reported runs the same DDL)._\n")
 		assert.NotContains(t, out, "every target runs the same DDL")
 		assert.NotContains(t, out, "every target in this group")
-		assert.Contains(t, out, "\n_1 of 3 targets have not reported progress yet._\n")
 	})
 
 	t.Run("one reporting target is named and speaks for no other", func(t *testing.T) {
@@ -791,7 +789,6 @@ func TestRenderMultiDeploymentApplyComment_SoleGroupCutDDLSpeaksOnlyForReporting
 		assert.Contains(t, out, pointer+"._\n")
 		assert.NotContains(t, out, "for this target", "no heading names the target, so the pointer does")
 		assert.NotContains(t, out, "runs the same DDL")
-		assert.Contains(t, out, "\n_2 of 3 targets have not reported progress yet._\n")
 	})
 }
 
@@ -894,8 +891,7 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailureKeepsTheOthersProgress
 	assert.Contains(t, out, "across 2 of 4 targets · ETA: ≥ "+ui.FormatETA(500)+"\n")
 
 	// A target with no detail at all is still one of the deployment's targets:
-	// the rows cover fewer than all of them, the ETA is a floor, and the section
-	// says how many have not reported.
+	// the rows cover fewer than all of them and the ETA is a floor.
 	out = renderTargets(presentation.Derive(append(ops, parallelTarget("primary", "testapp-004", so.Pending))),
 		targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
 		targetDetail("testapp_002", state.Task.Running, addNote, 500),
@@ -903,7 +899,6 @@ func TestRenderMultiDeploymentApplyComment_RolledUpFailureKeepsTheOthersProgress
 		nil,
 	)
 	assert.Contains(t, out, "across 2 of 4 targets · ETA: ≥ "+ui.FormatETA(500)+"\n")
-	assert.Contains(t, out, "\n_1 of 4 targets have not reported progress yet._\n")
 }
 
 // A target retrying its table on its own is not a failure: the table's line
@@ -940,8 +935,8 @@ func TestRenderMultiDeploymentApplyComment_RolledUpCompletedEmptyTableHasReporte
 
 // When a deployment's targets run different changes, a target that has not
 // reported is not known to run either one, so each change's line counts only
-// its own targets and the deployment says once how many have not reported.
-func TestRenderMultiDeploymentApplyComment_DivergedTargetsCountSilentTargetsOnce(t *testing.T) {
+// its own targets.
+func TestRenderMultiDeploymentApplyComment_DivergedTargetsCountOnlyTheirOwnTargets(t *testing.T) {
 	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_note`(`note`)"
 	out := renderTargets(presentation.Derive([]presentation.Operation{
 		parallelTarget("primary", "testapp-001", so.Running),
@@ -958,8 +953,6 @@ func TestRenderMultiDeploymentApplyComment_DivergedTargetsCountSilentTargetsOnce
 	assert.Contains(t, out, "- Rows: 1,000 / 2,000 · ETA: "+ui.FormatETA(600)+"\n")
 	assert.Contains(t, out, "- Rows: 300 / 1,000 · ETA: "+ui.FormatETA(300)+"\n")
 	assert.NotContains(t, out, "across")
-	assert.Equal(t, 1, strings.Count(out, "have not reported progress yet"))
-	assert.Contains(t, out, "\n_1 of 4 targets have not reported progress yet._\n")
 }
 
 // A table changed by two statements on each target gets a line per statement,
@@ -1446,4 +1439,100 @@ func TestRenderMultiDeploymentApplySummaryComment_MemberSectionNamesItsPlan(t *t
 	assert.Contains(t, out, "**Database**: `orders_eu` | **Plan**: `plan_3344`\n")
 	assert.Contains(t, out, "**Database**: `orders` | **Plan**: `plan_reviewed`\n")
 	assertRolloutHeaderNotRepeated(t, out)
+}
+
+// A target that already held the change is settled completed without a driver
+// ever starting it, so it ran nothing and reports no table progress. The
+// deployment counts it as already having the change and says so once, and the
+// table lines cover only the targets that ran. A target settled without
+// starting but not marked as already holding the change, as a reaper settles
+// one to its apply's outcome, counts as completed.
+func TestRenderMultiDeploymentApplyComment_TargetThatAlreadyHadTheChangeIsCountedApart(t *testing.T) {
+	converged := parallelTarget("primary", "testapp-004", so.Completed)
+	converged.NeverStarted = true
+	converged.AlreadyConverged = true
+
+	t.Run("finished", func(t *testing.T) {
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Completed),
+			parallelTarget("primary", "testapp-003", so.Completed),
+			converged,
+		}),
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_003", state.Task.Completed, addNote, 1000),
+			nil,
+		)
+
+		assert.Contains(t, out, "<summary>✅ primary — 3 completed, 1 already had it (4 targets)</summary>")
+		assert.Contains(t, out, "\n_1 of 4 targets already had this schema; nothing ran there._\n")
+		assert.NotContains(t, out, "across", "the rows cover every target that ran")
+	})
+
+	t.Run("finished with a target that failed before reporting", func(t *testing.T) {
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Completed),
+			parallelTarget("primary", "testapp-003", so.Failed),
+			converged,
+		}),
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Completed, addNote, 1000),
+			nil,
+			nil,
+		)
+
+		assert.Contains(t, out, "| `testapp-003` | ❌ failed |")
+	})
+
+	t.Run("running", func(t *testing.T) {
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Running),
+			parallelTarget("primary", "testapp-003", so.Pending),
+			converged,
+		}),
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Running, addNote, 500),
+			nil,
+			nil,
+		)
+
+		assert.Contains(t, out, "\n_1 of 4 targets already had this schema; nothing ran there._\n")
+	})
+
+	t.Run("every target already had it", func(t *testing.T) {
+		ops := make([]presentation.Operation, 0, 4)
+		for _, name := range []string{"testapp-001", "testapp-002", "testapp-003", "testapp-004"} {
+			op := parallelTarget("primary", name, so.Completed)
+			op.NeverStarted = true
+			op.AlreadyConverged = true
+			ops = append(ops, op)
+		}
+		out := renderTargets(presentation.Derive(ops), nil, nil, nil, nil)
+
+		assert.Contains(t, out, "<summary>✅ primary — 4 already had it (4 targets)</summary>")
+		assert.Contains(t, out, "\n_4 of 4 targets already had this schema; nothing ran there._\n")
+		assert.NotContains(t, out, "No details available yet", "nothing ran, so no target is still to report details:\n%s", out)
+	})
+
+	t.Run("settled without starting", func(t *testing.T) {
+		reaped := parallelTarget("primary", "testapp-004", so.Completed)
+		reaped.NeverStarted = true
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Completed),
+			parallelTarget("primary", "testapp-003", so.Completed),
+			reaped,
+		}),
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_003", state.Task.Completed, addNote, 1000),
+			nil,
+		)
+
+		assert.Contains(t, out, "<summary>✅ primary — 4 completed (4 targets)</summary>")
+		assert.NotContains(t, out, "already had", "a target settled without the mark is not one that already had the change:\n%s", out)
+	})
 }

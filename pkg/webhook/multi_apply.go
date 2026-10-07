@@ -163,6 +163,7 @@ func applyOperationToPresentation(op *storage.ApplyOperation, released bool) pre
 		Work:              rollout.Work,
 		Finalizer:         rollout.Finalizer,
 		NeverStarted:      rollout.NeverStarted,
+		AlreadyConverged:  op.AlreadyConverged,
 		Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
 		Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
 		ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,

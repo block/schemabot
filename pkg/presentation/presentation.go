@@ -56,6 +56,10 @@ type Operation struct {
 	Finalizer    bool
 	NeverStarted bool
 
+	// AlreadyConverged carries the stored row's mark that its target already
+	// held the change when the apply was created, so nothing ran there.
+	AlreadyConverged bool
+
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
 	// by the caller from storage.CutoverPolicyBarrier). Under barrier an earlier
 	// sibling stops blocking a later copy once it reaches the cutover barrier or
@@ -141,6 +145,10 @@ const (
 	StateRevertWindow
 	StateCancelled
 	StateReverted
+	// StateAlreadyApplied is a member whose target already held the change
+	// when the apply was created, so nothing ran there. It is neither a
+	// completed rollout member nor one still to report.
+	StateAlreadyApplied
 )
 
 // Deployment is the derived presentation for one deployment of the apply.
@@ -192,6 +200,10 @@ type Deployment struct {
 
 	// NeverStarted is whether no driver ever claimed the member's operation.
 	NeverStarted bool
+
+	// AlreadyConverged is whether the member's operation was recorded as a
+	// target that already held the change when the apply was created.
+	AlreadyConverged bool
 }
 
 // NextActionKind is the semantic operator action the aggregate suggests. The
@@ -343,7 +355,7 @@ var attentionOrder = []PresentationState{
 	StateFailed, StateRetrying, StatePaused, StateHalted, StateStopped,
 	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
 	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
-	StateCancelled, StateReverted, StateCompleted,
+	StateCancelled, StateReverted, StateCompleted, StateAlreadyApplied,
 }
 
 // attentionRank is ps's position in attentionOrder; unnamed states rank last.
@@ -439,10 +451,15 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	d := Deployment{
 		Deployment: op.Deployment, Target: op.Target, Name: names[i], State: op.State, Error: op.Error,
 		ExternalID: op.ExternalID, ExternalOperationID: op.ExternalOperationID, NeverStarted: op.NeverStarted,
+		AlreadyConverged: op.AlreadyConverged,
 	}
 
 	switch op.State {
 	case state.ApplyOperation.Completed:
+		if d.AlreadyApplied() {
+			d.set(StateAlreadyApplied, "already had it", "✅", false)
+			break
+		}
 		d.set(StateCompleted, "completed", "✅", false)
 	case state.ApplyOperation.Running:
 		d.set(StateRunningCopy, "running table copy", "🔄", true)
@@ -725,6 +742,7 @@ var summaryCategoryOrder = []struct {
 	states []PresentationState
 }{
 	{"completed", []PresentationState{StateCompleted}},
+	{"already had it", []PresentationState{StateAlreadyApplied}},
 	{"cutting over", []PresentationState{StateCuttingOver}},
 	{"ready for cutover", []PresentationState{StateReadyForCutoverNext, StateReadyForCutoverWaiting}},
 	{"running", []PresentationState{StateRunningCopy}},
@@ -777,6 +795,15 @@ func firstWithPresentation(deps []Deployment, ps PresentationState) (Deployment,
 		}
 	}
 	return Deployment{}, false
+}
+
+// AlreadyApplied reports whether the member's target already held the change
+// when the apply was created, so nothing ran there. It reads the stored mark the
+// apply records, never a missing start: an operation a reaper settled to its
+// parent's outcome is completed without a start too, and its target may never
+// have received the change.
+func (d Deployment) AlreadyApplied() bool {
+	return state.IsState(d.State, state.ApplyOperation.Completed) && d.AlreadyConverged
 }
 
 func (d *Deployment) set(ps PresentationState, label, emoji string, open bool) {

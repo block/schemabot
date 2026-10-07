@@ -23,6 +23,7 @@ CREATE TABLE apply_operations (
   completed_at timestamp DEFAULT NULL,
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  already_converged boolean NOT NULL DEFAULT FALSE,
   PRIMARY KEY (id)
 );
 CREATE UNIQUE INDEX idx_apply_operations_apply_deployment_key ON apply_operations (apply_id, deployment, operation_key);

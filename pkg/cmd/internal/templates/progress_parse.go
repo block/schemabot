@@ -49,6 +49,7 @@ type ProgressOperation struct {
 	OnFailure           string
 	ErrorMessage        string
 	ErrorCode           string
+	AlreadyConverged    bool
 	StartedAt           string
 	CompletedAt         string
 }
@@ -165,6 +166,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			OnFailure:           op.OnFailure,
 			ErrorMessage:        op.ErrorMessage,
 			ErrorCode:           op.ErrorCode,
+			AlreadyConverged:    op.AlreadyConverged,
 			StartedAt:           op.StartedAt,
 			CompletedAt:         op.CompletedAt,
 		})
