@@ -86,13 +86,43 @@ func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, 
 	preview := reviewDriftPreview(rollup,
 		"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)
 	if rollup.Clean {
-		return reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup)}, preview
+		return reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup), allChangesDirect: rolloutAllChangesDirect(rollup)}, preview
 	}
 	return reviewDriftOutcome{
 		state:   driftBlocked,
 		summary: summarizeReviewDrift(rollup),
 		work:    memberWorkOf(&rollup),
 	}, preview
+}
+
+// rolloutAllChangesDirect reports whether the round has work but no member's
+// plan has engine work to defer. A converged member runs nothing and does not
+// affect the verdict; an unknown member never establishes an all-direct round.
+func rolloutAllChangesDirect(rollup api.PlanRollup) bool {
+	if !rollup.Clean {
+		return false
+	}
+	hasWork := false
+	for _, entry := range rollup.Entries {
+		if entry.Class == api.DeploymentErrored {
+			return false
+		}
+		if !entry.ChangeSet.HasWork() {
+			continue
+		}
+		hasWork = true
+		for _, sc := range entry.ChangeSet.Changes {
+			if apitypes.HasVSchemaWork(sc.GetMetadata()) || sc.GetMetadata()[apitypes.NeedsFinalizerMetadataKey] == "true" {
+				return false
+			}
+		}
+		for _, change := range entry.ChangeSet.AuthoritativeTableChanges() {
+			if !strings.EqualFold(change.GetExecutionMode(), engine.ExecutionModeDirect) {
+				return false
+			}
+		}
+	}
+	return hasWork
 }
 
 // erroredDriftDetail is the sanitized detail shown in the PR preview for a

@@ -308,11 +308,13 @@ confirmation step:
   reviews the rollout as it is now.
 - Other gates still apply: a direct statement that is also an unsafe change,
   such as dropping a primary key, still needs `--allow-unsafe`.
-- `--defer-cutover` is rejected on an all-direct plan — a direct statement has
-  no cutover to defer. On a mixed plan it applies to the engine-driven
-  statements only. The disclosure on the apply's comment says so, and so
-  does the disclosure on a paused comment, since the flag can still be
-  passed to `apply-confirm`.
+- `--defer-cutover` is rejected when every nonempty target plan is all-direct —
+  a direct statement has no cutover to defer. A primary target with only direct
+  changes does not prevent deferring another target's engine-driven changes;
+  a target already at the desired schema runs nothing. On a mixed rollout the
+  flag applies to the engine-driven statements only, and the paused comment's
+  suggested `apply-confirm` command keeps it. The direct disclosure says so,
+  since the flag can also be passed for the first time to `apply-confirm`.
 
 `schemabot plan` and `schemabot apply` in the terminal disclose the same
 routing: a plan with a direct-execution change names each table and the

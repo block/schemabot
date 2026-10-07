@@ -284,6 +284,177 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 	assert.Contains(t, byOperation, byDeployment["us"].ID)
 }
 
+// eu reshapes a small users primary key directly, while us builds an orders
+// index through Spirit. Deferred cutover is accepted at apply and confirm, and
+// the confirmation footer keeps it even though eu is all-direct. It can also
+// be added only at confirm, or used when eu already has both changes.
+func TestE2ERolloutDefersAnotherTargetsEngineChange(t *testing.T) {
+	const preReshape = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `tenant_id` bigint unsigned NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	const ordersBase = "CREATE TABLE `orders` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `user_id` bigint unsigned NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	ordersIndexed := strings.Replace(ordersBase, "  PRIMARY KEY (`id`)", "  PRIMARY KEY (`id`),\n  KEY `idx_user_id` (`user_id`)", 1)
+	files := map[string]string{"users.sql": pkSwapSchema, "orders.sql": ordersIndexed}
+
+	for _, tc := range []struct {
+		name      string
+		dbName    string
+		primary   string
+		applyFlag string
+	}{
+		{name: "defer at both steps", dbName: "webhook_rollout_mixed_defer", primary: preReshape, applyFlag: " --defer-cutover"},
+		{name: "defer added at confirm", dbName: "webhook_rollout_confirm_defer", primary: preReshape},
+		{name: "converged primary", dbName: "webhook_rollout_converged_defer", primary: pkSwapSchema, applyFlag: " --defer-cutover"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := setupE2ERolloutService(t, tc.dbName, []deploymentSpec{
+				{name: "eu", liveSchema: tc.primary + ordersIndexed, engineMetadata: directPolicyMetadata},
+				{name: "us", liveSchema: pkSwapSchema + ordersBase, engineMetadata: directPolicyMetadata},
+			}, api.PlanIndependent)
+			t.Cleanup(func() {
+				_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), tc.dbName, "mysql")
+			})
+			us := openDriftDB(t, driftDSN(t, tc.dbName+"_us"))
+			_, err := us.ExecContext(t.Context(), "INSERT INTO `orders` (`user_id`) VALUES (1), (2), (3)")
+			require.NoError(t, err, "the index build has rows to copy")
+
+			apply := runRolloutCommandWithFiles(t, svc, tc.dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe"+tc.applyFlag, files)
+			body := awaitCapture(t, apply.comments, "the mixed rollout's answer", func(body string) bool {
+				return strings.Contains(body, "Confirmation required") || strings.Contains(body, "has no effect") || strings.Contains(body, "nothing was applied")
+			})
+			require.Contains(t, body, "Confirmation required")
+			assert.Contains(t, body, "ADD INDEX `idx_user_id`", "us's engine work is disclosed")
+			if tc.primary == preReshape {
+				assert.Contains(t, body, "**Direct execution**", "eu's direct work is disclosed")
+			} else {
+				assert.Contains(t, body, "The primary target already has this schema")
+			}
+			assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe"+tc.applyFlag+"\n")
+			requireNoApplies(t, svc, tc.dbName)
+
+			confirm := runRolloutCommandWithFiles(t, svc, tc.dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+			created := awaitRolloutApply(t, svc, tc.dbName, confirm)
+			assert.True(t, created.GetOptions().DeferCutover, "the engine member receives deferred cutover")
+			operations, err := svc.Storage().ApplyOperations().ListByApply(t.Context(), created.ID)
+			require.NoError(t, err)
+			byDeployment := map[string]*storage.ApplyOperation{}
+			for _, op := range operations {
+				byDeployment[op.Deployment] = op
+			}
+			require.Contains(t, byDeployment, "eu")
+			require.Contains(t, byDeployment, "us")
+			tasks, err := svc.Storage().Tasks().GetByApplyID(t.Context(), created.ID)
+			require.NoError(t, err)
+			if tc.primary == preReshape {
+				require.Len(t, tasks, 2)
+			} else {
+				require.Len(t, tasks, 1)
+				assert.Equal(t, state.ApplyOperation.Completed, byDeployment["eu"].State, "a converged primary runs nothing")
+			}
+			for _, task := range tasks {
+				require.NotNil(t, task.ApplyOperationID)
+				switch *task.ApplyOperationID {
+				case byDeployment["eu"].ID:
+					assert.Equal(t, "users", task.TableName)
+					assert.Equal(t, "direct", task.ExecutionMode)
+				case byDeployment["us"].ID:
+					assert.Equal(t, "orders", task.TableName)
+					assert.Contains(t, task.DDL, "ADD INDEX `idx_user_id`")
+					assert.Empty(t, task.ExecutionMode, "the index build runs through Spirit, not direct execution")
+				default:
+					require.FailNow(t, "task belongs to an unexpected rollout member")
+				}
+			}
+		})
+	}
+}
+
+// With eu already converged and us reshaping its primary key directly, the
+// whole rollout has no engine cutover. apply rejects defer before locking;
+// apply-confirm preserves a confirmation created without it when it is added.
+func TestE2ERolloutAllDirectRejectsDeferredCutover(t *testing.T) {
+	const preReshape = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `tenant_id` bigint unsigned NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	dbName := "webhook_rollout_all_direct_defer"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: pkSwapSchema, engineMetadata: directPolicyMetadata},
+		{name: "us", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	files := map[string]string{"users.sql": pkSwapSchema}
+	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	body := awaitCommentContaining(t, apply, "has no effect")
+	assert.Contains(t, body, "Re-run without the flag")
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+
+	apply = runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
+	body = awaitCommentContaining(t, apply, "Confirmation required")
+	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe\n")
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+
+	confirm := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	body = awaitCommentContaining(t, confirm, "has no effect")
+	assert.Contains(t, body, "The pending confirmation is preserved")
+	requireNoApplies(t, svc, dbName)
+	stillPinned, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, stillPinned)
+	assert.Equal(t, lock.PendingPlanID, stillPinned.PendingPlanID)
+}
+
+// A direct primary plan never substitutes for an unknown secondary plan.
+// Deferred apply and confirm both refuse when us cannot be planned, with the
+// check failing closed and no schema work dispatched.
+func TestE2ERolloutDeferredCutoverRefusesUnknownMember(t *testing.T) {
+	const preReshape = "CREATE TABLE `users` (\n" +
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+		"  `tenant_id` bigint unsigned NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	dbName := "webhook_rollout_defer_unknown"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
+		{name: "us", liveSchema: preReshape, engineMetadata: directPolicyMetadata},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	files := map[string]string{"users.sql": pkSwapSchema}
+	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
+	awaitCommentContaining(t, apply, "Confirmation required")
+
+	admin := openDriftDB(t, driftDSN(t, ""))
+	_, err := admin.ExecContext(t.Context(), "DROP DATABASE `"+dbName+"_us`")
+	require.NoError(t, err)
+	confirm := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	body := awaitCommentContaining(t, confirm, "nothing was applied")
+	assert.Contains(t, body, "SchemaBot could not confirm the plan of every target")
+	assert.NotContains(t, body, "has no effect", "unknown work is not all-direct work")
+	requireNoApplyLock(t, svc, dbName)
+
+	apply = runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	body = awaitCommentContaining(t, apply, "nothing was applied")
+	assert.Contains(t, body, "SchemaBot could not confirm the plan of every target")
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+	assert.Equal(t, "failure", rolloutCheck(t, svc, dbName).Conclusion)
+	assert.Equal(t, []string{"id"}, appPrimaryKeyColumns(t, dbName+"_eu", "users"))
+}
+
 // Two targets planned against schemas of their own, both on the direct
 // execution policy, both reshaping the users primary key: the schema change
 // engine refuses the reshape and the policy routes it to native DDL on each

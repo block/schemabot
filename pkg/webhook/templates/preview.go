@@ -1781,6 +1781,42 @@ func PreviewCommentApplyPlanOptions() string {
 	})
 }
 
+// PreviewCommentApplyRolloutDeferred renders a paused rollout in which eu runs
+// a direct primary-key reshape and us builds an index through Spirit. The
+// suggested confirmation keeps deferred cutover for us's engine work.
+func PreviewCommentApplyRolloutDeferred() string {
+	const reshape = "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `tenant_id`)"
+	return RenderPlanComment(PlanCommentData{
+		Database: "testapp", SchemaName: "testapp", Environment: "production",
+		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
+		IsMySQL: true, DatabaseType: "mysql", IsLocked: true,
+		LockOwner: previewRepository + "#42", LockAcquired: "2026-03-14 10:30:00 UTC",
+		PendingManualConfirmation: true, DeferCutover: true, AllowUnsafe: true,
+		Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{reshape}}},
+		PausedApplyCause: &PausedApplyCauseData{
+			Heading: "Each target runs its own plan",
+			Remedy: "Nothing has run. Confirming runs each target's own plan shown above; " +
+				"a target already at the desired schema runs nothing.",
+		},
+		DeploymentDrift: &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{{Deployment: "eu", Primary: true}, {Deployment: "us"}},
+			Plans: []DeploymentPlanGroup{
+				{
+					Members: []string{"eu"}, Primary: true,
+					Changes:       []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{reshape}}},
+					DirectChanges: []DirectChangeData{{Table: "users", Reason: "the table has ~1,240 rows"}},
+					UnsafeChanges: []UnsafeChangeData{{Table: "users", Reason: "the primary key is being reshaped", DDL: reshape, ChangeType: "alter"}},
+				},
+				{
+					Members: []string{"us"},
+					Changes: []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"}}},
+				},
+			},
+		},
+	})
+}
+
 // PreviewCommentApplyPlanUnsafe renders a sample locked apply-plan with unsafe warning.
 func PreviewCommentApplyPlanUnsafe() string {
 	return RenderPlanComment(PlanCommentData{

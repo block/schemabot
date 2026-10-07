@@ -446,10 +446,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// --defer-cutover only affects engine-driven statements; an all-direct
-	// plan has no cutover to defer, so reject the flag instead of silently
-	// ignoring it.
-	if result.DeferCutover && planResp.AllChangesDirect() {
+	// --defer-cutover only affects engine-driven statements; a rollout whose
+	// every nonempty member plan is direct has no cutover to defer.
+	if result.DeferCutover && rollout.allChangesDirect {
 		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
@@ -526,6 +525,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeploymentDrift = rolloutPreview
+	commentData.AllChangesDirect = rollout.allChangesDirect
 
 	// Re-evaluate the checks gate against the freshness-checked HEAD before
 	// executing. The early gate at the top of applyCommandCore ran against

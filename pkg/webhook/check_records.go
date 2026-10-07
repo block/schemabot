@@ -47,6 +47,9 @@ type reviewDriftOutcome struct {
 	// primary already at the desired schema says nothing about members planned
 	// against schemas of their own.
 	work memberWork
+	// allChangesDirect is true only when every nonempty member plan in a clean
+	// round runs entirely as direct execution, so no member has a cutover to defer.
+	allChangesDirect bool
 	// block is the durable reason a blocked outcome is stored under, so the
 	// apply it refuses names the right fix. Unset is review-time deployment
 	// drift, which is what the rollup reports.

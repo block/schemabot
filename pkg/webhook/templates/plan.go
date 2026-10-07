@@ -196,8 +196,8 @@ type PlanCommentData struct {
 	// Changes the direct execution policy routes to native MySQL DDL.
 	DirectChanges []DirectChangeData
 
-	// AllChangesDirect marks a plan whose every change runs as direct
-	// execution. Such a plan has no cutover to defer, so the apply-confirm
+	// AllChangesDirect marks an apply whose every nonempty target plan runs as
+	// direct execution. Such an apply has no cutover to defer, so the apply-confirm
 	// command a paused comment suggests leaves out --defer-cutover, which
 	// apply-confirm rejects on it.
 	AllChangesDirect bool

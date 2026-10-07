@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -55,6 +56,82 @@ func TestRolloutRunsMemberWork(t *testing.T) {
 	diverged := targetPlans()
 	diverged.Clean = false
 	assert.False(t, rolloutRunsMemberWork(pending, diverged), "a diverged rollout renders no target plans")
+}
+
+// Deferred cutover is meaningful whenever a runnable target has engine work,
+// even if the primary is all-direct or converged. All-direct rollouts omit the
+// flag from the confirmation footer, and unknown targets never establish that
+// verdict or make the rollout runnable.
+func TestRolloutAllChangesDirect(t *testing.T) {
+	direct := independentMemberDiff("eu", "ALTER TABLE `orders` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `user_id`)", false)
+	direct.Changes[0].TableChanges[0].ExecutionMode = "direct"
+	engine := independentMemberDiff("us", "ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)", false)
+	otherDirect := direct
+	otherDirect.Target = "us"
+	converged := direct
+	converged.Changes = nil
+	unknown := engine
+	unknown.Err = errors.New("target diff unavailable")
+	sharded := engine
+	sharded.Shards = []*ternv1.ShardPlan{{Namespace: "orders", Shard: "-80", Changes: engine.Changes[0].TableChanges}}
+	finalizer := converged
+	finalizer.Target = "us"
+	finalizer.Changes = []*ternv1.SchemaChange{{Namespace: "orders", Metadata: map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"}}}
+	vschema := converged
+	vschema.Target = "us"
+	vschema.Changes = []*ternv1.SchemaChange{{Namespace: "orders", Metadata: map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}}}
+
+	for _, tc := range []struct {
+		name  string
+		diffs []api.DeploymentPlanDiff
+		want  bool
+		clean bool
+	}{
+		{name: "primary direct secondary engine", diffs: []api.DeploymentPlanDiff{direct, engine}, clean: true},
+		{name: "all direct", diffs: []api.DeploymentPlanDiff{direct, otherDirect}, want: true, clean: true},
+		{name: "converged primary secondary direct", diffs: []api.DeploymentPlanDiff{converged, otherDirect}, want: true, clean: true},
+		{name: "converged primary secondary engine", diffs: []api.DeploymentPlanDiff{converged, engine}, clean: true},
+		{name: "converged rollout", diffs: []api.DeploymentPlanDiff{converged}, clean: true},
+		{name: "single direct", diffs: []api.DeploymentPlanDiff{direct}, want: true, clean: true},
+		{name: "unknown secondary", diffs: []api.DeploymentPlanDiff{direct, unknown}},
+		{name: "engine work on a shard", diffs: []api.DeploymentPlanDiff{direct, sharded}, clean: true},
+		{name: "member finalizer", diffs: []api.DeploymentPlanDiff{direct, finalizer}, clean: true},
+		{name: "member vschema", diffs: []api.DeploymentPlanDiff{direct, vschema}, clean: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rollup, err := api.RollupDeploymentDiffs(tc.diffs, driftMembers(tc.diffs), api.PlanIndependent)
+			require.NoError(t, err)
+			require.Equal(t, tc.clean, rollup.Clean)
+			allDirect := rolloutAllChangesDirect(rollup)
+			assert.Equal(t, tc.want, allDirect)
+			preview := deploymentDriftPreview(rollup)
+			outcome := reviewDriftOutcome{state: driftClean, work: memberWorkOf(&rollup)}
+			if !rollup.Clean {
+				outcome.state = driftBlocked
+				assert.False(t, rolloutRunsMemberWork(outcome, preview), "an unknown member fails closed")
+				return
+			}
+			if outcome.work.pending == 0 {
+				return
+			}
+			var statements []string
+			for _, change := range rollup.Entries[0].ChangeSet.AuthoritativeTableChanges() {
+				statements = append(statements, change.GetDdl())
+			}
+			body := templates.RenderPlanComment(templates.PlanCommentData{
+				Database: "orders", Environment: "production", DatabaseType: "mysql", IsMySQL: true,
+				IsLocked: true, PendingManualConfirmation: true, DeferCutover: true,
+				AllChangesDirect: allDirect, DeploymentDrift: preview,
+				Changes: []templates.KeyspaceChangeData{{Keyspace: "orders", Statements: statements}},
+			})
+			if tc.want {
+				assert.Contains(t, body, "schemabot apply-confirm -e production\n")
+			} else {
+				assert.Contains(t, body, "schemabot apply-confirm -e production --defer-cutover\n")
+			}
+		})
+	}
+	assert.False(t, rolloutAllChangesDirect(api.PlanRollup{Clean: true}), "an empty round has no direct work")
 }
 
 // Confirming an apply covers the work its comment showed. A member planned

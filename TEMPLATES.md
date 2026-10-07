@@ -3444,6 +3444,60 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 </details>
 
 <details>
+<summary><a name="rollout-apply-direct-primary-deferred-engine-member"></a><strong>Rollout Apply (Direct Primary, Deferred Engine Member)</strong></summary>
+
+
+## Schema Change Apply — Production
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+🔒 **Lock acquired by** `block/schemabot#42` at 2026-03-14 10:30:00 UTC
+
+### Target `eu`
+
+```sql
+ALTER TABLE `users`
+    DROP PRIMARY KEY,
+    ADD PRIMARY KEY(`id`, `tenant_id`);
+```
+
+⚙️ **Direct execution**: 1 change will run as native MySQL DDL, not through Spirit
+- `users`: the table has ~1,240 rows
+
+Transactions blocking a table's metadata lock are killed so its statement can take the lock, and writes to each table are blocked until its statement finishes. `--defer-cutover` does not apply to these direct statements: they have no cutover to defer.
+
+### Target `us`
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+⚠️ **Each target runs its own plan**
+
+Nothing has run. Confirming runs each target's own plan shown above; a target already at the desired schema runs nothing.
+
+📋 **Plan**: **2** tables to alter across 2 targets
+
+
+**Options**: ⏸️ Defer Cutover
+
+---
+
+**Confirmation required** — review the plan above, then confirm manually:
+```
+schemabot apply-confirm -e production --allow-unsafe --defer-cutover
+```
+
+🔓 To discard this plan and unlock, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
 <summary><a name="schema-change-apply-downgraded"></a><strong>Schema Change Apply (Downgraded)</strong></summary>
 
 

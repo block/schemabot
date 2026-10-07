@@ -111,6 +111,16 @@ func TestRenderPlanComment_PausedDirectNotesDeferCutover(t *testing.T) {
 	assert.Contains(t, paused, "```\nschemabot apply-confirm -e staging\n```", "the suggested command adds no flag the operator did not pass")
 }
 
+func TestPreviewCommentApplyRolloutDeferred(t *testing.T) {
+	out := PreviewCommentApplyRolloutDeferred()
+	assert.Contains(t, out, "### Target `eu`")
+	assert.Contains(t, out, "### Target `us`")
+	assert.Contains(t, out, "DROP PRIMARY KEY")
+	assert.Contains(t, out, "ADD INDEX `idx_user_id`")
+	assert.Contains(t, out, "`--defer-cutover` does not apply to these direct statements")
+	assert.Contains(t, out, "schemabot apply-confirm -e production --allow-unsafe --defer-cutover\n")
+}
+
 func TestRenderPlanComment_DirectEscapesReasonMarkdown(t *testing.T) {
 	out := RenderPlanComment(PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
