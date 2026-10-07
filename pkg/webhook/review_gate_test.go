@@ -375,6 +375,28 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want: wantChanged,
 		},
 		{
+			name:     "a head that restores a schema file the default branch changed does not count",
+			prChange: addVotes,
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, PRIMARY KEY (`id`))"
+			},
+			headChange: addVotesAnd(func(files map[string]string) { files["schema/testdb/orders/orders.sql"] = ordersTable }),
+			want:       wantChanged,
+		},
+		{
+			name: "a rebase that kept the PR's version of a file over the default branch's does not count",
+			prChange: func(files map[string]string) {
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"
+			},
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, PRIMARY KEY (`id`))"
+			},
+			headChange: func(files map[string]string) {
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `note` text, PRIMARY KEY (`id`))"
+			},
+			want: wantChanged,
+		},
+		{
 			name:     "the PR changing the config after the approval does not count",
 			prChange: addVotes,
 			headChange: addVotesAnd(func(files map[string]string) {

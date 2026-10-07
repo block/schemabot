@@ -1139,9 +1139,11 @@ type SchemaChangeComparison struct {
 //
 // Each commit is measured against its merge base with the base branch's
 // current tip: the base branch content it was built on. A path is unchanged
-// when its content is identical at both commits, or when the pull request
-// leaves it as its base branch has it at both commits, so any difference came
-// from the base branch rather than from the pull request. Rebasing onto, or
+// when the pull request turns the same base content into the same result at
+// both commits, or when it leaves the path as its base branch has it at both
+// commits, so any difference came from the base branch rather than from the
+// pull request. Identical content on different bases is not unchanged: the
+// head would undo or overwrite the base branch's change. Rebasing onto, or
 // merging in, a newer base branch therefore leaves the change unchanged; a
 // path the pull request edits, adds, deletes, or resolves differently at the
 // head does not. Directories that satisfy neither are compared entry by entry.
@@ -1253,9 +1255,8 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 
 		s := item.sides
 		identical := sameGitObject(s[sideApproved], s[sideHead])
-		fromBaseOnly := sameGitObject(s[sideApproved], s[sideApprovedBase]) && sameGitObject(s[sideHead], s[sideHeadBase])
 		switch {
-		case identical || fromBaseOnly:
+		case sameChange(s) || untouchedByPR(s):
 			sides := []gitSide{s[sideHead]}
 			if !identical {
 				sides = append(sides, s[sideApproved])
@@ -1281,6 +1282,21 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 		}
 	}
 	return "", nil
+}
+
+// sameChange reports whether the pull request turns the same base content
+// into the same result at both commits. Identical results on different bases
+// are not the same change: the head would then undo, or overwrite, what the
+// base branch changed there.
+func sameChange(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideApprovedBase], sides[sideHeadBase]) && sameGitObject(sides[sideApproved], sides[sideHead])
+}
+
+// untouchedByPR reports whether the pull request leaves the path as its base
+// branch has it at both commits, so any difference between them came from the
+// base branch.
+func untouchedByPR(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideApproved], sides[sideApprovedBase]) && sameGitObject(sides[sideHead], sides[sideHeadBase])
 }
 
 // onlyTrees reports whether every side where the path exists is a directory,

@@ -606,6 +606,7 @@ func TestCreateSchemaRequestFromPRUsesEnvironmentSymlinkSchemaRoot(t *testing.T)
 	assert.Equal(t, "orders", result.Database)
 	assert.Equal(t, "mysql", result.Type)
 	assert.Equal(t, "services/orders/schema/base", result.SchemaPath)
+	assert.Equal(t, "services/orders/schema/schemabot.yaml", result.ConfigPath, "the config sits outside the environment schema root and is still carried")
 	require.Contains(t, result.SchemaFiles, "orders_001")
 	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["orders_001"].Files["orders.sql"])
 }
@@ -636,6 +637,7 @@ func TestCreateSchemaRequestFromPRUsesRepoRootEnvironmentSymlinkSchemaRoot(t *te
 	require.NoError(t, err)
 	assert.Equal(t, "orders", result.Database)
 	assert.Equal(t, "base", result.SchemaPath)
+	assert.Equal(t, "schemabot.yaml", result.ConfigPath, "a repository-root config is carried as a repo-relative path")
 	require.Contains(t, result.SchemaFiles, "orders_001")
 	assert.Equal(t, "CREATE TABLE orders (id bigint primary key);\n", result.SchemaFiles["orders_001"].Files["orders.sql"])
 }
@@ -801,6 +803,7 @@ func TestCreateSchemaRequestFromPRFallsBackWhenEnvironmentSchemaRootMissing(t *t
 
 	require.NoError(t, err)
 	assert.Equal(t, "apps/widgets/schema", result.SchemaPath)
+	assert.Equal(t, "apps/widgets/schema/schemabot.yaml", result.ConfigPath)
 	require.Contains(t, result.SchemaFiles, "main")
 	assert.Equal(t, "CREATE TABLE widgets (id bigint primary key);\n", result.SchemaFiles["main"].Files["widgets.sql"])
 }
