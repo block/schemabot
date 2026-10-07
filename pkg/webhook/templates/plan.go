@@ -602,7 +602,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// When the unsafe warning below lists every attributed table, the
 	// attribution rides on those findings instead of a section of its own, so
 	// each change is explained once.
-	unsafeShown := data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.IsLocked
+	unsafeShown := data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && !data.applyingWithoutConfirmation()
 	attributionNotes, attributionFolded := unsafeAttributionNotes(data, unsafeShown)
 	if len(data.AttributedChanges) > 0 && attributionStillActionable(data) && !attributionFolded {
 		writeAttributedChanges(&sb, data.AttributedChanges)
@@ -634,10 +634,12 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		writePausedApplyCause(&sb, data.PausedApplyCause)
 	}
 
-	// Unsafe changes warning — shown on the plan comment for review, omitted on
-	// the locked apply comment: unsafe changes only reach an apply after the
-	// operator acknowledged them with --allow-unsafe (apply-confirm re-checks
-	// and blocks otherwise), so repeating them there is noise.
+	// Unsafe changes warning — shown on the plan comment for review and on a
+	// paused comment, whose apply-confirm carries --allow-unsafe forward and so
+	// must show what it consents to: the plan may have changed since the
+	// operator first opted in. Omitted on the locked comment of an apply already
+	// running, which reached it only under the opt-in, so repeating them there
+	// is noise.
 	// Target plans disclose them under the primary target's group, whose plan
 	// they are from.
 	if unsafeShown && !targetPlans {
@@ -2250,11 +2252,11 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		}
 		// So is an unsafe change, which `--allow-unsafe` consents to on every
 		// target. The primary's group discloses its own with the primary
-		// plan's, and the locked comment omits them as it omits the primary
-		// plan's: the apply reached it only under the opt-in.
+		// plan's, and the comment of an apply already running omits them as it
+		// omits the primary plan's: the apply reached it only under the opt-in.
 		if g.Primary {
 			writePrimaryTargetDisclosures(sb, data, g)
-		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && !data.IsLocked {
+		} else if unsafe := g.unsafeBeyondPrimaryPlan(); len(unsafe) > 0 && !data.applyingWithoutConfirmation() {
 			writeUnsafeWarning(sb, unsafe, nil, data.DatabaseType, data.IsMySQL)
 		}
 	}
@@ -2273,7 +2275,7 @@ func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g 
 		fmt.Fprintf(sb, "On the primary target %s:\n\n", inlineCode(g.Members[0]))
 	}
 	writeExistingCopies(sb, data)
-	if data.IsLocked {
+	if data.applyingWithoutConfirmation() {
 		return
 	}
 	var unsafe []UnsafeChangeData
