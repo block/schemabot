@@ -106,6 +106,14 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, renderedAt)
 	groups := data.Model.Groups()
+	if g, ok := soleTargetRollout(groups); ok {
+		writeTargetRolloutBody(&sb, data, g, budget)
+		writeRolloutFooter(&sb, data)
+		if !state.IsTerminalApplyState(data.Model.State) {
+			writeLastUpdatedFooter(&sb, renderedAt)
+		}
+		return sb.String()
+	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 
@@ -144,6 +152,11 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, currentTimestamp())
 	groups := data.Model.Groups()
+	if g, ok := soleTargetRollout(groups); ok {
+		writeTargetRolloutBody(&sb, data, g, budget)
+		writeRolloutFooter(&sb, data)
+		return sb.String()
+	}
 	writeDeploymentCounts(&sb, data.Model.Counts, groups)
 	writeAggregateFirstFailure(&sb, data.Model.FirstFailure)
 
@@ -154,6 +167,65 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 	writeRolloutFooter(&sb, data)
 
 	return sb.String()
+}
+
+// soleTargetRollout returns the apply's one deployment when it addresses
+// several targets. Such an apply has no other deployment to tell it apart
+// from, so its comment carries no per-deployment wrapper: the status is stated
+// once, and the table lines sit directly under it rather than in a section that
+// collapses once the rollout finishes.
+func soleTargetRollout(groups []presentation.Group) (presentation.Group, bool) {
+	if len(groups) == 1 && len(groups[0].Members) > 1 {
+		return groups[0], true
+	}
+	return presentation.Group{}, false
+}
+
+// writeTargetRolloutBody writes a sole multi-target deployment's comment body:
+// its status line, the first failure, and the rolled-up table lines.
+func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
+	settled := state.IsState(data.Model.State, state.SettledApplyStates...)
+	status := targetRolloutStatus(data.Model.TargetProgress(g), settled, data.Rollback)
+	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
+	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
+	sb.WriteString("\n")
+	writeTargetRollup(sb, data, g, budget, true)
+}
+
+// targetRolloutStatus states a multi-target rollout's progress in one line:
+// "Rolled out to 3 of 4 targets (1 already had it)" once the apply has
+// settled and no target can still run, and "Rolling out: 1 of 4 targets done,
+// 1 running, 1 queued" until then. A stopped apply has not settled: its
+// targets run again once it resumes. An apply can settle as cancelled while a
+// target is still running, and that target keeps the line in the present
+// tense. A rollback says "Rolled back on" and "Rolling back" instead. Every
+// count is out of all the targets, so the parts add up. A settled rollout
+// where every target already had the change ran nothing, and says so.
+func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) string {
+	ongoing, finished := "Rolling out:", "Rolled out to"
+	if rollback {
+		ongoing, finished = "Rolling back:", "Rolled back on"
+	}
+	var line string
+	switch {
+	case !settled || p.Unsettled > 0:
+		line = fmt.Sprintf("%s %d of %d targets done", ongoing, p.Done, p.Total)
+	case p.AlreadyHad == p.Total:
+		return fmt.Sprintf("All %d targets already had this schema", p.Total)
+	case p.Done == p.Total:
+		line = fmt.Sprintf("%s all %d targets", finished, p.Total)
+	case p.Done == 0:
+		line = finished + " no targets"
+	default:
+		line = fmt.Sprintf("%s %d of %d targets", finished, p.Done, p.Total)
+	}
+	if len(p.Others) > 0 {
+		line += ", " + countsPhrase(p.Others)
+	}
+	if p.AlreadyHad > 0 {
+		line += fmt.Sprintf(" (%d already had it)", p.AlreadyHad)
+	}
+	return line
 }
 
 // writeAggregateMetadata writes the apply-level metadata line. The database is
@@ -420,7 +492,7 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		if len(g.Members) > 1 {
 			fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n<dl><dd>\n\n", openAttr,
 				glyphTag(g.Lead.Emoji, html.EscapeString(flattenIdentifier(g.Deployment))), groupCountsLabel(g))
-			writeTargetRollup(sb, data, g, budget)
+			writeTargetRollup(sb, data, g, budget, false)
 			sb.WriteString("\n</dd></dl>\n</details>\n")
 			continue
 		}

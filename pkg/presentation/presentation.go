@@ -149,6 +149,10 @@ const (
 	// when the apply was created, so nothing ran there. It is neither a
 	// completed rollout member nor one still to report.
 	StateAlreadyApplied
+
+	// presentationStateCount is one past the last state, so a test can visit
+	// every state and fail when a new one has no histogram category.
+	presentationStateCount
 )
 
 // Deployment is the derived presentation for one deployment of the apply.
@@ -811,4 +815,58 @@ func (d *Deployment) set(ps PresentationState, label, emoji string, open bool) {
 	d.Label = label
 	d.Emoji = emoji
 	d.Open = open
+}
+
+// TargetProgress is a multi-target group's progress as one status line reads
+// it: how many of its targets finished running the change, how many already
+// had it, and the histogram of the rest.
+type TargetProgress struct {
+	// Total is every target the group addresses.
+	Total int
+	// Done is the targets that ran the change to completion.
+	Done int
+	// AlreadyHad is the targets that already held the change, so ran nothing.
+	AlreadyHad int
+	// Others is the histogram of the remaining targets, in display order.
+	Others []StateCount
+	// Unsettled is the targets that can still change in this apply: every
+	// target whose status is not final, an unknown one included. An apply can
+	// settle while one of them is still going, so it is counted on its own.
+	Unsettled int
+}
+
+// TargetProgress counts g's targets for its status line. Done and AlreadyHad
+// are counted apart from the rest, so Done + AlreadyHad plus the Others counts
+// is always Total.
+func (a Apply) TargetProgress(g Group) TargetProgress {
+	p := TargetProgress{Total: len(g.Members)}
+	var rest []Deployment
+	for _, i := range g.Members {
+		d := a.Deployments[i]
+		switch d.Presentation {
+		case StateCompleted:
+			p.Done++
+		case StateAlreadyApplied:
+			p.AlreadyHad++
+		default:
+			rest = append(rest, d)
+		}
+		if !d.Presentation.final() {
+			p.Unsettled++
+		}
+	}
+	p.Others = summaryCounts(rest)
+	return p
+}
+
+// final reports whether a member's status is the outcome it keeps for this
+// apply: it ran the change, already had it, or ended without it and will not
+// run again. Every other status, an unknown one included, can still change.
+func (s PresentationState) final() bool {
+	switch s {
+	case StateCompleted, StateAlreadyApplied, StateFailed, StateHalted, StateCancelled, StateReverted:
+		return true
+	default:
+		return false
+	}
 }
