@@ -210,7 +210,7 @@ func (h *Handler) executeApply(
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", refusalErr)
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+				otherTargetPlansUnverifiedMessage(actionName, environment))
 			return
 		}
 		if refusal != "" {
@@ -298,7 +298,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			planDriftCause(planResp, storedPlan), rolloutPreview); err != nil {
+			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork); err != nil {
 			h.logger.Error("failed to post the DDL-drift downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -327,7 +327,7 @@ func (h *Handler) executeApply(
 				"environment", environment, "action", actionName,
 				"plan_id", planResp.PlanID, "disclosed_plan_id", disclosedPlan.PlanIdentifier, "newly_direct", len(newlyDirect))
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				newlyDirectCause(newlyDirect), rolloutPreview); err != nil {
+				newlyDirectCause(newlyDirect), rolloutPreview, runsMemberWork); err != nil {
 				h.logger.Error("failed to post the comment disclosing the newly-direct changes, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -367,7 +367,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			nil, rolloutPreview); err != nil {
+			nil, rolloutPreview, runsMemberWork); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -386,20 +386,32 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// --defer-cutover only affects engine-driven statements; an all-direct
-	// plan has no cutover to defer, so reject the flag instead of silently
-	// ignoring it. Only apply-confirm reaches this gate (the apply command
-	// rejects the flag before locking on an all-direct plan, and an apply whose
-	// re-plan routes changes to direct execution that the disclosed plan did
-	// not stops above), so keep the lock: it still
-	// pins the plan the operator confirmed against, and re-running
-	// apply-confirm without the flag executes it.
-	if result.DeferCutover && planResp.AllChangesDirect() {
-		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan; the pending confirmation is preserved",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-			fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
-		return
+	// --defer-cutover only affects engine-driven statements; an apply whose
+	// every target runs only direct statements has no cutover to defer, so
+	// reject the flag instead of silently ignoring it. Only apply-confirm
+	// reaches this gate (the apply command rejects the flag before locking on
+	// such an apply, and an apply whose re-plan routes changes to direct
+	// execution that the disclosed plan did not stops above), so keep the
+	// lock: it still pins the plan the operator confirmed against, and
+	// re-running apply-confirm without the flag executes it.
+	if result.DeferCutover {
+		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+		if deferErr != nil {
+			h.logger.Error("apply rejected: could not read every target's plan to tell whether --defer-cutover has a cutover to defer; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"action", actionName, "plan_id", planResp.PlanID, "error", deferErr)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				otherTargetPlansUnverifiedMessage(actionName, environment))
+			return
+		}
+		if nothingToDefer {
+			h.logger.Info("apply rejected: --defer-cutover on an apply whose every target runs only direct changes; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName,
+				"plan_id", planResp.PlanID, "runs_other_targets", runsMemberWork)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
+			return
+		}
 	}
 
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe
@@ -620,7 +632,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
-	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData,
+	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData, runsMemberWork bool,
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
@@ -629,6 +641,9 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeferCutover = result.DeferCutover
+	if result.DeferCutover {
+		commentData.NoCutoverToDefer = h.confirmCommandHasNoCutoverToDefer(ctx, repo, pr, planResp, environment, runsMemberWork)
+	}
 	commentData.SkipRevert = result.SkipRevert
 	commentData.PendingManualConfirmation = true
 	commentData.PausedApplyCause = cause

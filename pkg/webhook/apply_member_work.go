@@ -119,16 +119,9 @@ func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment str
 	if rollout.work.copyAtStake != "" {
 		return rollout.work.copyAtStake, nil
 	}
-	plan, err := h.service.Storage().Plans().Get(ctx, planID)
+	plan, members, err := h.reviewRoundPlans(ctx, planID, environment)
 	if err != nil {
-		return "", fmt.Errorf("load primary target's plan %s: %w", planID, err)
-	}
-	if plan == nil {
-		return "", fmt.Errorf("primary target's plan %s was not stored", planID)
-	}
-	members, err := h.service.MemberPlansForReviewRound(ctx, plan, environment)
-	if err != nil {
-		return "", fmt.Errorf("load member plans of round %s: %w", planID, err)
+		return "", err
 	}
 	for _, member := range slices.Sorted(maps.Keys(members)) {
 		memberPlan := members[member]
@@ -140,6 +133,83 @@ func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment str
 		}
 	}
 	return "", nil
+}
+
+// reviewRoundPlans loads the primary target's plan stored as planID and the
+// plans its rollout round stored for the other targets, keyed by target.
+func (h *Handler) reviewRoundPlans(ctx context.Context, planID, environment string) (*storage.Plan, map[string]*storage.Plan, error) {
+	plan, err := h.service.Storage().Plans().Get(ctx, planID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load primary target's plan %s: %w", planID, err)
+	}
+	if plan == nil {
+		return nil, nil, fmt.Errorf("primary target's plan %s was not stored", planID)
+	}
+	members, err := h.service.MemberPlansForReviewRound(ctx, plan, environment)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load member plans of round %s: %w", planID, err)
+	}
+	return plan, members, nil
+}
+
+// deferCutoverHasNothingToDefer reports whether --defer-cutover has nothing to
+// act on in an apply: every target it runs carries only direct-execution
+// changes, which have no cutover, and at least one carries a change. When the
+// apply runs other targets' own plans, their plans are read too, since the
+// primary plan speaks only for the primary target. When it does not, the
+// primary plan alone decides: runsMemberWork is the same answer that decides
+// whether the apply runs the other targets' plans, so a plan this check skips
+// is one the apply does not run.
+func (h *Handler) deferCutoverHasNothingToDefer(ctx context.Context, planResp *apitypes.PlanResponse, environment string, runsMemberWork bool) (bool, error) {
+	if !runsMemberWork {
+		return planResp.AllChangesDirect(), nil
+	}
+	_, members, err := h.reviewRoundPlans(ctx, planResp.PlanID, environment)
+	if err != nil {
+		return false, err
+	}
+	return rolloutAllChangesDirect(planResp, members), nil
+}
+
+// confirmCommandHasNoCutoverToDefer reports whether the apply-confirm a paused
+// apply's comment suggests leaves out --defer-cutover, because no target the
+// apply runs has a cutover to defer. The primary plan alone cannot say so when
+// other targets run engine-driven changes of their own. A target plan that
+// cannot be read keeps the flag: apply-confirm refuses a flag with nothing to
+// defer and keeps the pending confirmation, while a dropped flag would let a
+// cutover run without the pause the operator asked for.
+func (h *Handler) confirmCommandHasNoCutoverToDefer(ctx context.Context, repo string, pr int, planResp *apitypes.PlanResponse, environment string, runsMemberWork bool) bool {
+	nothingToDefer, err := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+	if err != nil {
+		h.logger.Warn("could not read every target's plan for the comment's apply-confirm command; it keeps --defer-cutover, which apply-confirm refuses if no target has a cutover to defer",
+			"repo", repo, "pr", pr, "environment", environment, "plan_id", planResp.PlanID, "error", err)
+		return false
+	}
+	return nothingToDefer
+}
+
+// rolloutAllChangesDirect reports whether every target with work, the
+// primary's included, runs only direct-execution changes, and at least one
+// target has work. A target already at the desired schema runs nothing, so it
+// neither carries a cutover nor counts as direct.
+func rolloutAllChangesDirect(primary *apitypes.PlanResponse, members map[string]*storage.Plan) bool {
+	direct := false
+	if primary.HasChanges() {
+		if !primary.AllChangesDirect() {
+			return false
+		}
+		direct = true
+	}
+	for _, member := range members {
+		if !member.HasWork() {
+			continue
+		}
+		if !member.AllChangesDirect() {
+			return false
+		}
+		direct = true
+	}
+	return direct
 }
 
 // memberWorkPrimaryPlanCannotRun asks of one member's plan what apply creation

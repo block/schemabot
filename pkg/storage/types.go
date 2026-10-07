@@ -816,6 +816,42 @@ func (p *Plan) HasWork() bool {
 	return false
 }
 
+// AllChangesDirect reports whether every change in the plan runs as direct
+// execution, and at least one exists. A namespace to finalize is work for the
+// schema change engine, so a plan with one is not all-direct. A namespace whose
+// shards carry changes of their own runs as those shard changes, so its
+// namespace-level rows, a collapsed view of them, are not consulted.
+func (p *Plan) AllChangesDirect() bool {
+	if p == nil || len(p.FinalizerNamespaces()) > 0 {
+		return false
+	}
+	carriedByShards := map[string]bool{}
+	for _, shard := range p.Shards {
+		if len(shard.Changes) > 0 {
+			carriedByShards[shard.Namespace] = true
+		}
+	}
+	total := 0
+	for _, change := range p.FlatDDLChanges() {
+		if carriedByShards[change.Namespace] {
+			continue
+		}
+		if !change.DirectExecution() {
+			return false
+		}
+		total++
+	}
+	for _, shard := range p.Shards {
+		for _, change := range shard.Changes {
+			if !change.DirectExecution() {
+				return false
+			}
+			total++
+		}
+	}
+	return total > 0
+}
+
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
 func (p *Plan) FlatDDLChanges() []TableChange {
 	if len(p.Namespaces) == 0 {
