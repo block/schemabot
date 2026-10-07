@@ -318,7 +318,7 @@ func TestE2EApplyNoChanges(t *testing.T) {
 // The state is reachable: the active-apply gate only inspects applies while
 // this PR holds the lock, so a concurrent apply can claim the row between the
 // gate and the no-changes write. The test also pins the call-site choice —
-// swapping storeApplyPlanCheckRecord for the manual plan path would run
+// swapping storePlanCheckRecord for the manual plan path would run
 // RecoverApplyOwnedCheckWithNoOpPlan, which releases same-head apply-owned
 // rows on exactly this write (completed/success/no-changes), and the ApplyID
 // assertion below would fail.
@@ -2496,7 +2496,7 @@ func TestE2EApplyConfirmRejectsWhenPlanSHAStale(t *testing.T) {
 	dbName := "webhook_confirm_stale_plan"
 	svc := setupE2EService(t, dbName)
 
-	// Seed a check record matching what storeApplyPlanCheckRecord would have
+	// Seed a check record matching what storeApplyCheckRecord would have
 	// created when the original `apply` posted the confirmation comment.
 	seedCheck(t, svc, dbName, "staging", "action_required")
 

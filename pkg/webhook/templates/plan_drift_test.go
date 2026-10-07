@@ -612,25 +612,50 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 		"the other targets converge through the apply, which runs each target's own plan")
 }
 
-// The apply on a rollout whose primary target is already converged pauses for
-// confirmation: the reader confirms against the other targets' plans on this
-// comment, and the cause says the primary target runs nothing.
+// An automatic apply on a rollout whose primary target is already converged
+// stops for confirmation when another target's plan changed while it was
+// starting: the reader confirms against the other targets' plans as they are
+// now, shown on this comment.
 func TestRenderPlanComment_ConvergedPrimaryApplyAsksForConfirmation(t *testing.T) {
 	data := convergedPrimaryPlanData()
 	data.IsLocked = true
 	data.LockOwner = "pr:octocat/testapp#7"
 	data.PendingManualConfirmation = true
 	data.PausedApplyCause = &PausedApplyCauseData{
-		Heading: "The primary target already has this schema",
-		Remedy:  "Nothing has run. Confirming runs each target's own plan shown above; a target already at the desired schema runs nothing.",
+		Heading: "A target's plan changed while this apply was starting",
+		Remedy:  "Nothing has run. The plans above are each target's plan as it is now; review them, then confirm to apply them.",
 	}
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-	assert.Contains(t, out, "⚠️ **The primary target already has this schema**\n\nNothing has run.")
+	assert.Contains(t, out, "⚠️ **A target's plan changed while this apply was starting**\n\nNothing has run.")
 	assert.Contains(t, out, "**Confirmation required** — review the plan above, then confirm manually:\n```\nschemabot apply-confirm -e production\n```\n")
 	assert.NotContains(t, out, "**Applying automatically**")
 	assert.NotContains(t, out, "No changes to apply")
+}
+
+// When another target's plan turns unsafe after the operator opted in with
+// --allow-unsafe, the apply's comment lists that target's unsafe change whether
+// it stops for confirmation or runs: a paused comment's apply-confirm carries
+// the opt-in forward, and a running comment is the only record of what the
+// apply destroys on that target.
+func TestRenderPlanComment_RolloutApplyListsAnotherTargetsNewUnsafeChange(t *testing.T) {
+	data := convergedPrimaryPlanData()
+	data.IsLocked = true
+	data.LockOwner = "pr:octocat/testapp#7"
+	data.AllowUnsafe = true
+	data.PendingManualConfirmation = true
+	data.DeploymentDrift.Plans[1].Changes = []KeyspaceChangeData{{Keyspace: "testapp", Statements: []string{"ALTER TABLE `users` DROP COLUMN `legacy_ref`"}}}
+	data.DeploymentDrift.Plans[1].UnsafeChanges = []UnsafeChangeData{{Table: "users", Reason: "DROP COLUMN discards the column's data", ChangeType: "drop"}}
+
+	out := RenderPlanComment(data)
+	assert.Contains(t, out, "⚠️ **Issues**: 1 unsafe change detected\n1. `users`: DROP COLUMN discards the column's data\n")
+	assert.Contains(t, out, "schemabot apply-confirm -e production --allow-unsafe")
+
+	data.PendingManualConfirmation = false
+	out = RenderPlanComment(data)
+	assert.Contains(t, out, "⚠️ **Issues**: 1 unsafe change detected\n1. `users`: DROP COLUMN discards the column's data\n")
+	assert.Contains(t, out, "**Applying automatically**")
 }
 
 // A multi-environment plan offers the apply for an environment whose reviewed

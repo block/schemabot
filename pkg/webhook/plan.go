@@ -913,17 +913,11 @@ const msgDeferCutoverAllDirect = "`--defer-cutover` has no effect on this plan: 
 // The format verb takes the environment for the coached command.
 const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `schemabot apply-confirm -e %s` without the flag."
 
-// otherTargetPlansUnverifiedMessage answers a command that could not read the
-// other targets' plans. Nothing was applied either way, but the recovery
-// differs: apply-confirm keeps the pending confirmation, so the operator
-// re-runs apply-confirm rather than starting over from apply, while apply
-// holds nothing yet and is simply retried.
-func otherTargetPlansUnverifiedMessage(command, environment string) string {
-	if command == action.ApplyConfirm {
-		return fmt.Sprintf("SchemaBot could not verify the other targets' plans, so nothing was applied. The pending confirmation is preserved; re-run `schemabot %s -e %s` with the same flags, and see server logs if it persists.", command, environment)
-	}
-	return "SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists."
-}
+// msgOtherTargetPlansUnverified answers an apply command that could not read
+// the other targets' plans before taking the lock. Nothing was applied and the
+// command holds nothing yet, so it is simply retried; once the lock is taken,
+// unverifiedMemberWorkMessage names the recovery instead.
+const msgOtherTargetPlansUnverified = "SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists."
 
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together

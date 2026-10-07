@@ -97,16 +97,16 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 // from a PR apply, or "" when it can. planID names the round's primary plan,
 // and primaryTargetConverged says whether that plan is empty.
 //
-// The apply runs each member's stored plan, and the comment the operator
-// confirms renders those plans' statements with each target's direct and
-// unsafe changes under it. So work the apply cannot run as planned, and
+// The apply runs each member's stored plan, and the comment behind the apply
+// renders those plans' statements with each target's direct and unsafe changes
+// under it. So work the apply cannot run as planned, and
 // anything whose consent rests on a disclosure that comment does not carry,
 // refuses here: an unfinished copy the apply would discard. A direct-execution
 // or unsafe change is not refused: the comment discloses it under the target
 // that runs it, and an unsafe one needs --allow-unsafe as the primary plan's
-// own does. It is asked before the apply pauses, so a refusal never
-// pins a confirmation that could not succeed, and again at confirm against the
-// rollout as it is then.
+// own does. It is asked before the apply takes its lock, so a refusal never
+// pins a confirmation that could not succeed, and again against the re-plan the
+// apply runs from.
 //
 // A copy at stake refuses whether or not the primary target has work, since
 // the comment discloses only the primary plan's discarded copies. The rest is
@@ -225,8 +225,8 @@ func memberWorkPrimaryPlanCannotRun(primary, member *storage.Plan, primaryTarget
 // run the other targets' plans it renders, whether or not the primary target
 // has work of its own. Such an apply is refused whatever its flags, so the
 // comment must not offer it. A refusal that cannot be computed leaves the apply
-// offered: the apply asks again before it pauses and refuses on the same
-// grounds, so the comment only ever misses a shortcut, never a gate.
+// offered: the apply asks again before it takes its lock and refuses on the
+// same grounds, so the comment only ever misses a shortcut, never a gate.
 func (h *Handler) annotateMemberApplyRefusal(ctx context.Context, data *templates.PlanCommentData, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, repo string, pr int) {
 	if !rolloutRunsMemberWork(rollout, data.DeploymentDrift) {
 		h.logger.Debug("plan comment renders no other targets' plans a PR apply would run; no member-work refusal to disclose",
@@ -235,7 +235,7 @@ func (h *Handler) annotateMemberApplyRefusal(ctx context.Context, data *template
 	}
 	refusal, err := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, !planResp.HasChanges())
 	if err != nil {
-		h.logger.Warn("could not tell whether a PR apply can run the other targets' plans; the plan comment offers the apply, which re-checks before it pauses",
+		h.logger.Warn("could not tell whether a PR apply can run the other targets' plans; the plan comment offers the apply, which re-checks before it takes its lock",
 			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID, "error", err)
 		return
 	}
@@ -278,40 +278,6 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 // not run. The refusal names only targets, tables, and namespaces.
 func memberWorkRefusalMessage(refusal string) string {
 	return fmt.Sprintf("This PR cannot apply every target's plan: %s, so nothing was applied. An apply runs every target or none. The schema check keeps blocking merge until every target has the change.", refusal)
-}
-
-// pauseForMemberWorkConfirmation holds the lock this apply acquired for an
-// apply-confirm, when targets other than the primary have work, whether or
-// not the primary target has work of its own.
-//
-// The caller recorded the pending work on the check straight after the rollout
-// round, before taking the lock, so the merge gate is already blocked whatever
-// the operator decides and on every exit between that round and this pause
-// (MG-12).
-func (h *Handler) pauseForMemberWorkConfirmation(
-	ctx context.Context,
-	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
-	planResp *apitypes.PlanResponse, environment string,
-	rollout reviewDriftOutcome, commentData templates.PlanCommentData, primaryTargetConverged bool,
-) (bool, error) {
-	database, dbType := schemaResult.Database, schemaResult.Type
-	h.logger.Info("apply paused for confirmation: targets other than the primary have work",
-		"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-		"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names)
-	commentData.PendingManualConfirmation = true
-	commentData.PausedApplyCause = &templates.PausedApplyCauseData{
-		Heading: "Each target runs its own plan",
-		Remedy: "Nothing has run. Confirming runs each target's own plan shown above; " +
-			"a target already at the desired schema runs nothing.",
-	}
-	if primaryTargetConverged {
-		commentData.PausedApplyCause.Heading = "The primary target already has this schema"
-	}
-	if postErr := h.postPendingConfirmation(ctx, repo, pr, installationID, database, dbType, environment, planResp.PlanID,
-		templates.RenderPlanComment(commentData), "member-work confirmation disclosure post failure"); postErr != nil {
-		return true, fmt.Errorf("apply command member-work confirmation disclosure %s#%d: %w", repo, pr, postErr)
-	}
-	return false, nil
 }
 
 // failClosedOnUnstoredRollout publishes a failing aggregate for an environment
@@ -364,19 +330,20 @@ func unconfirmedWorkMessage(work memberWork, reason string) string {
 	return message
 }
 
-// confirmationCoversMemberWork reports whether the pending confirmation an
-// apply-confirm acts on was given against the member work it is about to run,
-// with a reason for the log when it was not.
+// confirmationCoversMemberWork reports whether the comment behind an apply was
+// posted with the member work it is about to run, with a reason for the log
+// when it was not. pinnedPlanID is the plan the lock pins: on apply-confirm, the
+// one the confirmation was given against, and on an automatic apply, the one the
+// apply command just posted.
 //
-// A pending confirmation covers another target's work only through the
-// rollout round stored with the pinned plan. The apply command runs that round
-// before pinning, and whenever another target has work it pauses on a comment
-// that renders every target's plan, so a round whose members have work is one
-// whose plans the operator was shown. A pin without such a round covers no other
-// target's work.
+// A pinned plan covers another target's work only through the rollout round
+// stored with it. The apply command runs that round before pinning, and
+// whenever another target has work the comment it posts renders every target's
+// plan, so a round whose members have work is one whose plans the operator was
+// shown. A pin without such a round covers no other target's work.
 //
-// The targets are planned again at confirm, and a target's schema can change in
-// between. So the primary target, when it still has work, and each member with
+// The targets are planned again before the apply runs, and a target's schema
+// can change in between. So the primary target, when it still has work, and each member with
 // work now must have been planned with the same work in the confirmed round,
 // and work the confirmed comment did not show never runs on the strength of
 // that confirmation.
