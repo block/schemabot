@@ -616,8 +616,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		commentData.PendingManualConfirmation = true
 		commentData.PausedApplyCause = &templates.PausedApplyCauseData{
 			Heading: "The plan this apply would be checked against could not be read",
-			Remedy: "Nothing has run. The statements above were planned fresh from this pull request; " +
-				"review them, then confirm to apply them.",
+			Remedy:  "Nothing has run.",
 		}
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		headSHA, checkRunErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)

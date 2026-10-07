@@ -547,6 +547,12 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	targetPlans := RendersTargetPlans(data.DeploymentDrift)
 	summary := data
 	if targetPlans {
+		// With each target's plan under its own heading, a cause written after
+		// them would read as part of the last target's section. It leads instead,
+		// so the reader knows why the apply is waiting before reading the plans.
+		if data.PausedApplyCause != nil {
+			writePausedApplyCause(&sb, data.PausedApplyCause)
+		}
 		writeTargetPlans(&sb, data, budget, false)
 		summary.Changes = combinedTargetPlanChanges(data)
 		summary.summaryRollout = data.DeploymentDrift
@@ -631,7 +637,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// rather than in the footer so every warning on the comment is in one
 	// region: the reader meets them in one pass, and the footer stays the same
 	// sentence whatever paused the apply.
-	if data.PausedApplyCause != nil {
+	if data.PausedApplyCause != nil && !targetPlans {
 		writePausedApplyCause(&sb, data.PausedApplyCause)
 	}
 

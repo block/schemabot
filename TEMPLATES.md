@@ -3660,11 +3660,11 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `products`: ~1.1 GB
 
 ⚠️ **Schema changes differ from the plan this apply was started from**
-- `orders` (alter) runs a different statement than in the plan this apply was started from
-- `products` (alter) is in this plan but not in the one this apply was started from
-- `shipments` (create) was in the plan this apply was started from but is not in this one
+- `orders` (alter) now runs a different statement
+- `products` (alter) is new since this apply was started
+- `shipments` (create) is no longer planned
 
-The statements above are what will run. Review them, then confirm to apply them.
+Nothing has run.
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 

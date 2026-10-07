@@ -618,20 +618,27 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 // An automatic apply on a rollout whose primary target is already converged
 // stops for confirmation when another target's plan changed while it was
 // starting: the reader confirms against the other targets' plans as they are
-// now, shown on this comment.
+// now, shown on this comment. The cause leads the plans, so it reads as the
+// reason the apply waits rather than as part of the last target's section.
 func TestRenderPlanComment_ConvergedPrimaryApplyAsksForConfirmation(t *testing.T) {
 	data := convergedPrimaryPlanData()
 	data.IsLocked = true
 	data.LockOwner = "pr:octocat/testapp#7"
 	data.PendingManualConfirmation = true
 	data.PausedApplyCause = &PausedApplyCauseData{
-		Heading: "A target's plan changed while this apply was starting",
-		Remedy:  "Nothing has run. The plans above are each target's plan as it is now; review them, then confirm to apply them.",
+		Heading: "The plan for target `primary/testapp_2` changed while this apply was starting",
+		Entries: []string{"`users` (alter) now runs a different statement"},
+		Remedy:  "Nothing has run.",
 	}
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-	assert.Contains(t, out, "⚠️ **A target's plan changed while this apply was starting**\n\nNothing has run.")
+	cause := "⚠️ **The plan for target `primary/testapp_2` changed while this apply was starting**\n" +
+		"- `users` (alter) now runs a different statement\n\nNothing has run.\n"
+	plan := "```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	require.Contains(t, out, cause)
+	require.Contains(t, out, plan)
+	assert.Less(t, strings.Index(out, cause), strings.Index(out, plan), "the cause leads the targets' plans")
+	assert.Equal(t, 1, strings.Count(out, "⚠️ **The plan for target"), "the cause renders once")
 	assert.Contains(t, out, "**Confirmation required** — review the plan above, then confirm manually:\n```\nschemabot apply-confirm -e production\n```\n")
 	assert.NotContains(t, out, "**Applying automatically**")
 	assert.NotContains(t, out, "No changes to apply")

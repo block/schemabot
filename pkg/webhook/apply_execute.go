@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -224,18 +225,18 @@ func (h *Handler) executeApply(
 			// The apply command posted every target's plan moments ago, and a
 			// target's schema changed before this re-plan. As with a primary
 			// plan whose DDL drifted, stop and ask against a comment that
-			// shows each target's plan as it is now. When the primary's own
-			// DDL is what drifted, the cause compares it statement by
-			// statement, as on a single target.
-			primaryDDLDrifted := !ddlMatchesStoredPlan(planResp, storedPlan)
-			cause := rolloutPlansChangedCause
-			if primaryDDLDrifted {
-				cause = planDriftCause(planResp, storedPlan)
+			// shows each target's plan as it is now, naming each target whose
+			// plan changed and how.
+			cause, causeErr := h.rolloutPlansChangedCause(ctx, expectedPendingPlanID, planResp.PlanID, environment)
+			if causeErr != nil {
+				h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, true, expectedPendingPlanID, planResp.PlanID,
+					"could not read the targets' plans to say how they changed", causeErr,
+					"the plans this apply covers")
+				return
 			}
-			h.logger.Info("automatic apply downgraded: the other targets' plans changed after the apply posted them",
+			h.logger.Info("automatic apply downgraded: a target's plan changed after the apply posted it",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason,
-				"primary_ddl_drifted", primaryDDLDrifted)
+				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
 				cause, rolloutPreview, runsMemberWork); err != nil {
 				h.logger.Error("failed to post the comment showing the targets' changed plans, so the pending confirmation was not moved",
@@ -582,11 +583,119 @@ func (h *Handler) executeApply(
 
 // rolloutPlansChangedCause heads the comment an automatic apply posts when a
 // target's plan changed between the comment the apply command posted and the
-// re-plan the apply runs from.
-var rolloutPlansChangedCause = &templates.PausedApplyCauseData{
-	Heading: "A target's plan changed while this apply was starting",
-	Remedy: "Nothing has run. The plans above are each target's plan as it is now; " +
-		"review them, then confirm to apply them.",
+// re-plan the apply runs from. It names each target whose plan changed and,
+// per table, how, so the reader sees what moved without diffing two comments.
+// A target whose statements are unchanged but whose plan still differs, in how
+// a statement runs, which statements are unsafe, the namespaces it finalizes,
+// or the VSchema it writes, gets one entry naming that part.
+func (h *Handler) rolloutPlansChangedCause(ctx context.Context, postedPlanID, planID, environment string) (*templates.PausedApplyCauseData, error) {
+	postedPrimary, posted, err := h.reviewRoundPlans(ctx, postedPlanID, environment)
+	if err != nil {
+		return nil, fmt.Errorf("load the round the apply posted: %w", err)
+	}
+	currentPrimary, current, err := h.reviewRoundPlans(ctx, planID, environment)
+	if err != nil {
+		return nil, fmt.Errorf("load the round the apply re-planned: %w", err)
+	}
+	started := roundWithPrimary(postedPrimary, posted)
+	now := roundWithPrimary(currentPrimary, current)
+	members := make(map[string]struct{}, len(started)+len(now))
+	for member := range started {
+		members[member] = struct{}{}
+	}
+	for member := range now {
+		members[member] = struct{}{}
+	}
+
+	type changedTarget struct {
+		name    string
+		was, is *storage.Plan
+	}
+	var changed []changedTarget
+	for _, member := range slices.Sorted(maps.Keys(members)) {
+		was, is := started[member], now[member]
+		named, round := is, now
+		if named == nil {
+			named, round = was, started
+		}
+		target := changedTarget{name: roundMemberName(named, round), was: was, is: is}
+		if len(targetPlanDriftEntries(target.was, target.is, "")) > 0 {
+			changed = append(changed, target)
+		}
+	}
+	// One changed target is named in the heading, so its entries need not
+	// repeat it; with several, each entry says which target it is on.
+	var entries []string
+	for _, target := range changed {
+		name := ""
+		if len(changed) > 1 {
+			name = target.name
+		}
+		entries = append(entries, targetPlanDriftEntries(target.was, target.is, name)...)
+	}
+	if len(entries) > planDriftEntryCap {
+		remaining := len(entries) - planDriftEntryCap
+		entries = append(entries[:planDriftEntryCap:planDriftEntryCap],
+			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("change", "changes", remaining)))
+	}
+
+	heading := "The targets' plans changed while this apply was starting"
+	switch {
+	case len(changed) == 1:
+		heading = fmt.Sprintf("The plan for target `%s` changed while this apply was starting", changed[0].name)
+	case len(changed) > 1:
+		heading = fmt.Sprintf("The plans for %d targets changed while this apply was starting", len(changed))
+	}
+	return &templates.PausedApplyCauseData{
+		Heading: heading,
+		Entries: entries,
+		Remedy:  "Nothing has run.",
+	}, nil
+}
+
+// roundWithPrimary is a round's plans keyed by member, the primary target's
+// own plan included.
+func roundWithPrimary(primary *storage.Plan, members map[string]*storage.Plan) map[string]*storage.Plan {
+	round := maps.Clone(members)
+	if round == nil {
+		round = make(map[string]*storage.Plan, 1)
+	}
+	round[qualifiedTargetName(routing.ExecutionTarget{Deployment: primary.Deployment, Target: primary.Target})] = primary
+	return round
+}
+
+// targetPlanDriftEntries says how one target's plan now differs from the plan
+// the apply was started from, either of which may be absent. A non-empty name
+// starts each entry, for an apply whose entries span several targets.
+func targetPlanDriftEntries(was, is *storage.Plan, name string) []string {
+	var wasIDs, isIDs map[planChangeIdentity]int
+	if was != nil {
+		wasIDs = storedPlanIdentities(was)
+	}
+	if is != nil {
+		isIDs = storedPlanIdentities(is)
+	}
+	tablePrefix, subject := "", "It"
+	if name != "" {
+		tablePrefix, subject = fmt.Sprintf("Target `%s`: ", name), fmt.Sprintf("Target `%s`", name)
+	}
+	if entries := planDriftEntries(planDriftStatements(isIDs), planDriftStatements(wasIDs), tablePrefix); len(entries) > 0 {
+		return entries
+	}
+	switch {
+	case was == nil && is != nil && is.HasWork():
+		return []string{subject + " now has changes to apply"}
+	case was != nil && is == nil && was.HasWork():
+		return []string{subject + " no longer has changes to apply"}
+	case was != nil && is != nil:
+		if difference := memberWorkDifference(was, is); difference != workUnchanged {
+			if name == "" {
+				return []string{fmt.Sprintf("%s changed", ui.CapitalizeFirst(string(difference)))}
+			}
+			return []string{fmt.Sprintf("%s: %s changed", subject, difference)}
+		}
+	}
+	return nil
 }
 
 // rejectUnverifiedMemberWork answers an apply that could not read what it needs
@@ -879,40 +988,7 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 	now := planDriftStatements(responsePlanIdentities(planResp))
 	started := planDriftStatements(storedPlanIdentities(storedPlan))
 
-	// The namespace distinguishes the same table under two keyspaces, so it is
-	// named only when the drift spans more than one — on the single-namespace
-	// database it is noise the rest of the comment does not carry either.
-	namespaces := make(map[string]struct{})
-	for change := range now {
-		namespaces[change.namespace] = struct{}{}
-	}
-	for change := range started {
-		namespaces[change.namespace] = struct{}{}
-	}
-	qualify := len(namespaces) > 1
-
-	changes := slices.SortedFunc(
-		maps.Keys(planDriftUnion(now, started)),
-		func(a, b planDriftChange) int {
-			return cmp.Or(
-				cmp.Compare(a.namespace, b.namespace),
-				cmp.Compare(a.table, b.table),
-				cmp.Compare(a.operation, b.operation),
-			)
-		})
-
-	var entries []string
-	for _, change := range changes {
-		phrase, drifted := planDriftPhrase(now[change], started[change])
-		if !drifted {
-			continue
-		}
-		subject := fmt.Sprintf("`%s`", change.table)
-		if qualify {
-			subject = fmt.Sprintf("`%s` in `%s`", change.table, change.namespace)
-		}
-		entries = append(entries, fmt.Sprintf("%s (%s) %s", subject, change.operation, phrase))
-	}
+	entries := planDriftEntries(now, started, "")
 
 	if len(entries) > planDriftEntryCap {
 		remaining := len(entries) - planDriftEntryCap
@@ -923,7 +999,7 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 	return &templates.PausedApplyCauseData{
 		Heading: "Schema changes differ from the plan this apply was started from",
 		Entries: entries,
-		Remedy:  "The statements above are what will run. Review them, then confirm to apply them.",
+		Remedy:  "Nothing has run.",
 	}
 }
 
@@ -1012,8 +1088,8 @@ func newlyDirectChanges(planResp *apitypes.PlanResponse, disclosedPlan *storage.
 
 // newlyDirectCause names each table the re-plan newly routes to direct
 // execution, once per table with the shards it moved on. How the statements
-// run is disclosed in the direct execution section above this cause, so the
-// entries only say which tables moved.
+// run is disclosed in the direct execution section, so the entries only say
+// which tables moved.
 func newlyDirectCause(newly []directChangeIdentity) *templates.PausedApplyCauseData {
 	type tableKey struct{ namespace, table string }
 	var order []tableKey
@@ -1048,8 +1124,49 @@ func newlyDirectCause(newly []directChangeIdentity) *templates.PausedApplyCauseD
 	return &templates.PausedApplyCauseData{
 		Heading: "Changes run differently from the plan this apply was started from",
 		Entries: entries,
-		Remedy:  "The direct execution section above shows how they will run. Review it, then confirm to apply.",
+		Remedy:  "Nothing has run.",
 	}
+}
+
+// planDriftEntries lists, per table, how the changes now differ from the ones
+// the apply was started from. prefix, when set, starts each entry, for example
+// with the target the table is on.
+func planDriftEntries(now, started map[planDriftChange]map[string]int, prefix string) []string {
+	// The namespace distinguishes the same table under two keyspaces, so it is
+	// named only when the drift spans more than one — on the single-namespace
+	// database it is noise the rest of the comment does not carry either.
+	namespaces := make(map[string]struct{})
+	for change := range now {
+		namespaces[change.namespace] = struct{}{}
+	}
+	for change := range started {
+		namespaces[change.namespace] = struct{}{}
+	}
+	qualify := len(namespaces) > 1
+
+	changes := slices.SortedFunc(
+		maps.Keys(planDriftUnion(now, started)),
+		func(a, b planDriftChange) int {
+			return cmp.Or(
+				cmp.Compare(a.namespace, b.namespace),
+				cmp.Compare(a.table, b.table),
+				cmp.Compare(a.operation, b.operation),
+			)
+		})
+
+	var entries []string
+	for _, change := range changes {
+		phrase, drifted := planDriftPhrase(now[change], started[change])
+		if !drifted {
+			continue
+		}
+		subject := fmt.Sprintf("`%s`", change.table)
+		if qualify {
+			subject = fmt.Sprintf("`%s` in `%s`", change.table, change.namespace)
+		}
+		entries = append(entries, fmt.Sprintf("%s%s (%s) %s", prefix, subject, change.operation, phrase))
+	}
+	return entries
 }
 
 // planDriftUnion is every table change either plan carries, so one pass over it
@@ -1071,13 +1188,13 @@ func planDriftUnion(now, started map[planDriftChange]map[string]int) map[planDri
 func planDriftPhrase(now, started map[string]int) (string, bool) {
 	switch {
 	case len(started) == 0:
-		return "is in this plan but not in the one this apply was started from", true
+		return "is new since this apply was started", true
 	case len(now) == 0:
-		return "was in the plan this apply was started from but is not in this one", true
+		return "is no longer planned", true
 	case maps.Equal(now, started):
 		return "", false
 	default:
-		return "runs a different statement than in the plan this apply was started from", true
+		return "now runs a different statement", true
 	}
 }
 

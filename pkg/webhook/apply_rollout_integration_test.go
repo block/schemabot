@@ -1444,7 +1444,8 @@ func TestE2EApplyStopsForConfirmationWhenAnotherTargetsPlanChangesWhileStarting(
 	}
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "A target's plan changed while this apply was starting")
+	body := awaitCommentContaining(t, apply, "The plan for target `us` changed while this apply was starting")
+	assert.Contains(t, body, "- `users` (alter) now runs a different statement\n", "the cause names how us's plan changed")
 	assert.Contains(t, body, "Confirmation required")
 	assert.Contains(t, body, "MODIFY COLUMN `email`", "the comment shows us's plan as it is now")
 	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
@@ -1472,7 +1473,7 @@ func TestE2EApplyStopsForConfirmationWhenAnotherTargetsPlanChangesWhileStarting(
 // re-plan the apply runs from, eu gains a narrower `email` column out of band,
 // so the primary's own plan is now a `MODIFY COLUMN`. The apply stops for
 // apply-confirm, and the comment names how the primary's statements differ from
-// the plan the apply started from, as it does on a single target.
+// the plan the apply started from, as it does for any other target.
 func TestE2EApplyNamesThePrimarysDriftWhenItStopsARolloutWhileStarting(t *testing.T) {
 	dbName := "webhook_rollout_primary_changed_auto"
 	var hooked *afterLockStorage
@@ -1493,11 +1494,10 @@ func TestE2EApplyNamesThePrimarysDriftWhenItStopsARolloutWhileStarting(t *testin
 	}
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Schema changes differ from the plan this apply was started from")
-	assert.Contains(t, body, "`users` (alter)", "the cause names the primary's drifted statement")
+	body := awaitCommentContaining(t, apply, "The plan for target `eu` changed while this apply was starting")
+	assert.Contains(t, body, "- `users` (alter) now runs a different statement\n", "the cause names the primary's drifted statement")
 	assert.Contains(t, body, "MODIFY COLUMN `email`", "the comment shows eu's plan as it is now")
 	assert.Contains(t, body, "Confirmation required")
-	assert.NotContains(t, body, rolloutPlansChangedCause.Heading, "the primary's own drift gets the detailed cause")
 	requireNoApplies(t, svc, dbName)
 }
 
