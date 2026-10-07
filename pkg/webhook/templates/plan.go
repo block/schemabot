@@ -2676,7 +2676,11 @@ func writeUnsafeWarning(sb *strings.Builder, changes []UnsafeChangeData, attribu
 	fmt.Fprintf(sb, glyph.Attention+" **Issues**: %d unsafe %s detected\n", n, pluralize("change", n))
 	item := 0
 	for _, c := range changes {
-		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, attributionNotes[c.Table])
+		note := attributionNotes[c.Table]
+		if createsItsTable(c) {
+			note = ""
+		}
+		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, note)
 	}
 	if len(attributionNotes) > 0 {
 		sb.WriteString("\nA plan diffs this PR's schema files against the live database, so a change another PR applied before merging shows up here as one to undo.\n")
@@ -2703,14 +2707,20 @@ func unsafeChangeLabel(c UnsafeChangeData) string {
 // unsafeAttributionNotes returns, keyed by table, the note each attributed
 // table's unsafe findings carry, and whether the attribution is folded into
 // the unsafe warning. It folds only when that warning is shown and lists every
-// attributed table; otherwise the attribution keeps its own section, so no
-// disclosure is lost.
+// attributed table with a finding that destroys something; otherwise the
+// attribution keeps its own section, so no disclosure is lost. A finding on a
+// change that creates its table never carries the note: such a change
+// destroys nothing, so another target's change to the same table, which the
+// attribution is about, would otherwise read as the creation's.
 func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (map[string]string, bool) {
 	if !unsafeShown || len(data.AttributedChanges) == 0 {
 		return nil, false
 	}
 	unsafeTables := make(map[string]bool, len(data.UnsafeChanges))
 	for _, c := range data.UnsafeChanges {
+		if createsItsTable(c) {
+			continue
+		}
 		unsafeTables[c.Table] = true
 	}
 	notes := make(map[string]string, len(data.AttributedChanges))
@@ -2725,6 +2735,12 @@ func unsafeAttributionNotes(data PlanCommentData, unsafeShown bool) (map[string]
 		notes[a.Table] = "changed by open PR " + pullRequestRef(data.Repository, a.Repository, a.PullRequest)
 	}
 	return notes, true
+}
+
+// createsItsTable reports whether an unsafe change creates its table, so the
+// table is not on the target yet.
+func createsItsTable(c UnsafeChangeData) bool {
+	return ddl.OpToStatementType(c.ChangeType) == ddl.StatementCreateTable
 }
 
 // pullRequestRef links a pull request, by number alone when it is in the
