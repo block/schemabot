@@ -656,3 +656,98 @@ func TestPlanCommentSweepSkipsRowsPostedAfterAnchor(t *testing.T) {
 	assert.Empty(t, fake.minimizedNodes())
 	assert.ElementsMatch(t, []string{"sha2", "sha3"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"))
 }
+
+// replacementDecision asks the handler whether an auto-plan that would
+// otherwise post nothing must post a plan comment for slot to replace the
+// slot's visible answer.
+func replacementDecision(t *testing.T, h *Handler, repo string, slot planCommentSlot, keepMatchingOutcome bool) bool {
+	t.Helper()
+	client, err := h.clientForRepo(repo, 12345)
+	require.NoError(t, err)
+	return h.priorHeadPlanCommentNeedsReplacing(t.Context(), client, repo, 42, slot, keepMatchingOutcome)
+}
+
+// Two pushes land close together. The newer head's plan shows DDL and posts
+// first; the older head's slow auto-plan then finishes and resolves to no
+// changes. Its comment would be stale on arrival and would sit below the
+// current answer contradicting it, so it does not post — on a schema-neutral
+// push or a schema-changing one.
+func TestPlanCommentReplacementSkipsAHeadThePRMovedPast(t *testing.T) {
+	const repo = "org/plan-replace-stale-head"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaB", 9001, "IC_current_ddl", false)
+	fake.setCurrentHead("shaB")
+
+	stale := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging"}, HeadSHA: "shaA", UpToDate: true}
+	assert.False(t, replacementDecision(t, h, repo, stale, false), "a plan for a head the PR moved past must not post")
+	assert.False(t, replacementDecision(t, h, repo, stale, true), "a plan for a head the PR moved past must not post")
+
+	current := stale
+	current.HeadSHA = "shaB"
+	assert.True(t, replacementDecision(t, h, repo, current, true),
+		"the same outcome on the current head does replace the comment showing DDL")
+}
+
+// Every environment's schema request failed, so the plan resolved no head.
+// Its error-only comment cannot be told apart from the visible answer by
+// head, and posting it untracked would repeat on every push for as long as
+// the failure lasts; the failing check run reports the failure instead.
+func TestPlanCommentReplacementSkipsAPlanWithNoResolvedHead(t *testing.T) {
+	const repo = "org/plan-replace-no-head"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaA", 9001, "IC_no_changes", true)
+	fake.setCurrentHead("shaB")
+
+	assert.False(t, replacementDecision(t, h, repo, planCommentSlot{DatabaseType: "mysql"}, true))
+}
+
+// Under the minimize-based policy, an apply ran the DDL from shaA's plan
+// comment, so that comment stays expanded as the record of what ran. shaB's
+// auto-plan resolves to no changes and posts its no-changes comment, which is
+// now the PR's answer. Later schema-neutral pushes keep resolving to no
+// changes; the answer still matches, so none of them posts again, even though
+// shaA's apply-owned comment showing DDL stays visible.
+func TestPlanCommentReplacementIgnoresApplyOwnedHistoryUnderMinimizePolicy(t *testing.T) {
+	const repo = "org/plan-replace-minimize-history"
+	h, st, fake := setupPlanCommentHandler(t, repo, false)
+
+	slot := planCommentSlot{Database: "ledger", DatabaseType: "mysql", Environments: []string{"staging"}, HeadSHA: "shaA"}
+	fake.setCurrentHead("shaA")
+	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaA with DDL")
+	createRunningApplyForHead(t, st, repo, 42, "ledger", "staging", "shaA")
+
+	slot.HeadSHA, slot.UpToDate = "shaB", true
+	fake.setCurrentHead("shaB")
+	require.True(t, replacementDecision(t, h, repo, slot, false), "the no-changes plan replaces shaA's answer")
+	h.postTrackedPlanComment(repo, 42, 12345, slot, "no changes at shaB")
+	require.ElementsMatch(t, []string{"shaA", "shaB"}, unretiredHeads(t, st, repo, 42, "ledger", "mysql"),
+		"the apply-owned shaA comment stays expanded under the minimize policy")
+
+	for _, head := range []string{"shaC", "shaD"} {
+		slot.HeadSHA = head
+		fake.setCurrentHead(head)
+		assert.False(t, replacementDecision(t, h, repo, slot, true),
+			"schema-neutral push to %s keeps shaB's matching answer", head)
+	}
+	assert.Equal(t, 2, fake.createCount(), "no comment beyond shaA's and shaB's")
+}
+
+// After an apply settles, the plan re-runs for the head it last answered
+// (shaB): its visible comment still shows DDL, but the DDL has now run and
+// the plan resolves to no changes. The comment no longer matches its own
+// head's plan, so the no-changes comment replaces it; a same-head comment
+// whose outcome still matches stays.
+func TestPlanCommentReplacementComparesTheOutcomeOnTheSameHead(t *testing.T) {
+	const repo = "org/plan-replace-same-head"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaB", 9001, "IC_shows_ddl", false)
+	fake.setCurrentHead("shaB")
+
+	slot := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging"}, HeadSHA: "shaB", UpToDate: true}
+	assert.True(t, replacementDecision(t, h, repo, slot, true))
+	assert.True(t, replacementDecision(t, h, repo, slot, false))
+
+	slot.UpToDate = false
+	assert.False(t, replacementDecision(t, h, repo, slot, true))
+	assert.False(t, replacementDecision(t, h, repo, slot, false))
+}

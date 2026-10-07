@@ -642,12 +642,13 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		UpToDate:     planCommentUpToDate(multiEnvData, rolloutHasWork),
 	}
 
-	// The visible plan comment was proven to cover this head's schema inputs.
-	// It stays the PR's answer unless its outcome no longer matches this plan,
-	// rather than being re-posted on every schema-neutral push.
+	// The caller asked not to re-post: either the push left the schema inputs
+	// unchanged, or this is the re-plan after a terminal apply, where the
+	// operator asked for an apply rather than a plan. The visible plan comment
+	// stays the PR's answer unless its outcome no longer matches this plan.
 	if !postPlanComment {
-		if !h.priorHeadPlanCommentNeedsReplacing(ctx, repo, pr, slot, true) {
-			h.logger.Info("auto-plan refreshed checks without posting plan comment because the visible plan comment covers the current schema inputs and outcome",
+		if !h.priorHeadPlanCommentNeedsReplacing(ctx, client, repo, pr, slot, true) {
+			h.logger.Info("auto-plan refreshed checks without posting plan comment because the visible plan comment still answers for this plan",
 				"repo", repo, "pr", pr, "database", slot.Database,
 				"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA, "up_to_date", slot.UpToDate)
 			return
@@ -663,7 +664,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		// answer it keeps showing a current one: a prior head's comment is
 		// superseded by posting this head's no-changes comment, never by
 		// removing it and leaving nothing.
-		if !h.priorHeadPlanCommentNeedsReplacing(ctx, repo, pr, slot, false) {
+		if !h.priorHeadPlanCommentNeedsReplacing(ctx, client, repo, pr, slot, false) {
 			h.logger.Info("auto-plan: no changes, errors, or drift detected and no plan comment from a prior head is visible; skipping comment",
 				"repo", repo, "pr", pr, "database", slot.Database,
 				"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA)
@@ -679,16 +680,16 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 }
 
 // planCommentUpToDate reports whether the plan shows nothing to act on: no
-// changes on any rollout member, no errors, and no deployment drift. A member
-// with work keeps the check pending, and a drifted or unverifiable deployment
-// fails it closed, even when every primary plan is a clean no-op, so neither
-// is up to date.
+// changes on any rollout member, no errors in any environment or plan, and no
+// deployment drift. A member with work keeps the check pending, and a drifted
+// or unverifiable deployment fails it closed, even when every primary plan is
+// a clean no-op, so neither is up to date.
 func planCommentUpToDate(data templates.MultiEnvPlanCommentData, rolloutHasWork bool) bool {
 	if rolloutHasWork || len(data.Errors) > 0 || templates.AnyEnvHasDriftToShow(data) {
 		return false
 	}
 	for _, plan := range data.Plans {
-		if plan != nil && len(plan.Changes) > 0 {
+		if plan != nil && (len(plan.Changes) > 0 || len(plan.Errors) > 0) {
 			return false
 		}
 	}
