@@ -235,7 +235,7 @@ func TestE2EReviewDriftBlocksWhenDeploymentDiverges(t *testing.T) {
 	dbName := "webhook_drift_diverge"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},      // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},      // matches the primary target's plan
+		{name: "au", liveSchema: usersBaseSchema},      // matches this plan
 		{name: "us", liveSchema: usersWithEmailSchema}, // drifted: already has email
 	})
 
@@ -257,7 +257,7 @@ func TestE2EReviewDriftBlocksWhenDeploymentUnreachable(t *testing.T) {
 	dbName := "webhook_drift_unreachable"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},                     // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},                     // matches the primary target's plan
+		{name: "au", liveSchema: usersBaseSchema},                     // matches this plan
 		{name: "us", liveSchema: usersBaseSchema, dropDatabase: true}, // undiffable
 	})
 
@@ -305,7 +305,7 @@ func TestE2EReviewDriftClearsBlockAfterDeploymentReconciled(t *testing.T) {
 	dbName := "webhook_drift_unblock"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},      // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},      // matches the primary target's plan
+		{name: "au", liveSchema: usersBaseSchema},      // matches this plan
 		{name: "us", liveSchema: usersWithEmailSchema}, // drifted: already has email
 	})
 

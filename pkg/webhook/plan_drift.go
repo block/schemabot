@@ -604,7 +604,7 @@ func describeDriftDiff(diff tern.ChangeSetDiff) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return strings.Join(parts, ", ") + " change(s) vs the primary target's plan"
+	return strings.Join(parts, ", ") + " change(s) vs this plan"
 }
 
 // rollupMemberNames renders each rollup entry the way an operator addresses it,
@@ -667,7 +667,7 @@ func summarizeReviewDrift(rollup api.PlanRollup) string {
 		if independent {
 			return "blocks apply: not every target could be planned"
 		}
-		return "drift blocks apply: deployments differ from the primary target's plan"
+		return "drift blocks apply: deployments differ from the reviewed plan"
 	}
 	// Targets that hold their own schemas are never expected to agree, so their
 	// failure is an unplanned target, not drift between them.

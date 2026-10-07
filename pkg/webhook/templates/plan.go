@@ -165,11 +165,6 @@ type PlanCommentData struct {
 	// unchanged comment.
 	AgentHint string
 
-	// PlanSummaryScope names the targets a summary of several targets' plans
-	// covers, e.g. "39 of 40 targets", so a count combined across targets never
-	// reads as any one target's work. Empty when the summary is one plan's.
-	PlanSummaryScope string
-
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
 	Errors         []string
@@ -261,6 +256,12 @@ type PlanCommentData struct {
 	// place. Empty when the apply can run them, or when the comment renders the
 	// primary plan alone.
 	MemberApplyRefusal string
+
+	// summaryRollout is the rollout a summary of several targets' plans
+	// covers. The summary then says how many targets the diff rolls out to and
+	// how many already have it, so a count combined across targets never reads
+	// as any one target's work. Nil when the summary is one plan's.
+	summaryRollout *DeploymentDriftData
 
 	// namespaceLabelsInline renders each keyspace's label as a bold line
 	// rather than a heading, for changes under a target group heading that
@@ -548,7 +549,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	if targetPlans {
 		writeTargetPlans(&sb, data, budget, false)
 		summary.Changes = combinedTargetPlanChanges(data)
-		summary.PlanSummaryScope = targetPlansScope(data.DeploymentDrift)
+		summary.summaryRollout = data.DeploymentDrift
 	}
 
 	// Count changes
@@ -802,7 +803,7 @@ func (c unsafeConsent) instruction() string {
 		noun = "unsafe changes"
 	}
 	if c.primaryOnly {
-		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on the primary target (%s) and any on the other targets", c.findings, noun, c.tables)
+		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s) and any the other targets carry", c.findings, noun, c.tables)
 	}
 	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s)", c.findings, noun, c.tables)
 }
@@ -1032,10 +1033,13 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 	}
 
 	text := planSummaryText(data.Changes, data.DatabaseType, data.IsMySQL, totalStatements)
-	if data.PlanSummaryScope != "" {
-		text += " across " + data.PlanSummaryScope
+	if data.summaryRollout != nil {
+		text += " · " + rolloutScope(data.summaryRollout)
 	}
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
+	if data.summaryRollout != nil {
+		writeRolloutTargetNames(sb, data.summaryRollout)
+	}
 
 	// Disclosed directly under the plan summary so the exclusion reads as
 	// part of the plan result: what was counted, then what was withheld.
@@ -1256,8 +1260,8 @@ func writeMultiEnvIgnoredNamespaces(sb *strings.Builder, data MultiEnvPlanCommen
 // target still has work.
 const noChangesDetected = "✅ **No schema changes detected**"
 
-// groupNoChanges is written under a shard or target group with nothing to
-// apply. Such a group only renders beside a group that still has work, so it
+// groupNoChanges is written under a shard group with nothing to apply. Such a
+// group only renders beside a group that still has work, so it
 // carries no ✅ and no emphasis: the rollout is not done, and the groups that
 // have work are what the reader needs to find.
 const groupNoChanges = "No schema changes detected"
@@ -1281,17 +1285,69 @@ func changingTargetCount(drift *DeploymentDriftData) int {
 	return changing
 }
 
-// targetPlansScope states how many of the rollout's targets run the work a
-// combined target-plan summary counts: "39 of 40 targets" when some targets
-// are already at the desired schema, "40 targets" when none are, matching the
-// target group headings. The summary is the union of every group's changes, so
-// each target runs some of that work, not necessarily all of it.
-func targetPlansScope(drift *DeploymentDriftData) string {
+// rolloutScope states how many of the rollout's targets the plan rolls out
+// to: "rolling out to 3 of 4 targets (1 already has it)" when some targets are
+// already at the desired schema, "rolling out to all 4 targets" (or "both
+// targets") when none are.
+// The summary is the union of every target's changes, so each target runs some
+// of that work, not necessarily all of it.
+func rolloutScope(drift *DeploymentDriftData) string {
 	changing, total := changingTargetCount(drift), len(drift.Deployments)
-	if changing == total {
-		return fmt.Sprintf("%d %s", total, targetNoun.Plural)
+	if changing == total && total == 2 {
+		return "rolling out to both " + targetNoun.Plural
 	}
-	return presentation.CoveragePhrase(targetNoun, changing, total)
+	if changing == total {
+		return fmt.Sprintf("rolling out to all %d %s", total, targetNoun.Plural)
+	}
+	return fmt.Sprintf("rolling out to %s (%d already %s it)",
+		presentation.CoveragePhrase(targetNoun, changing, total), total-changing, hasOrHave(total-changing))
+}
+
+func hasOrHave(n int) string {
+	if n == 1 {
+		return "has"
+	}
+	return "have"
+}
+
+// writeRolloutTargetNames lists, collapsed under the plan summary, which
+// targets need the change and which already have it. The summary states them
+// as counts; the names stay one click away for the operator who addresses a
+// target.
+func writeRolloutTargetNames(sb *strings.Builder, drift *DeploymentDriftData) {
+	var needs, has []string
+	for _, g := range drift.Plans {
+		if g.Empty() {
+			has = append(has, g.Members...)
+		} else {
+			needs = append(needs, g.Members...)
+		}
+	}
+	// Each list reads in rollout order, as every other list of targets does.
+	order := make(map[string]int)
+	for i, name := range driftMemberNames(drift.Deployments) {
+		order[name] = i
+	}
+	byRollout := func(a, b string) int { return order[a] - order[b] }
+	slices.SortStableFunc(needs, byRollout)
+	slices.SortStableFunc(has, byRollout)
+	line := "Needs it: " + strings.Join(inlineCodeList(needs), ", ")
+	if len(has) > 0 {
+		line += " · Already has it: " + strings.Join(inlineCodeList(has), ", ")
+	}
+	fmt.Fprintf(sb, "<details>\n<summary>Targets</summary>\n\n%s\n\n</details>\n\n", line)
+}
+
+// workingTargetGroups is the rollout's groups of targets that have work, each
+// running a plan of its own.
+func workingTargetGroups(drift *DeploymentDriftData) []DeploymentPlanGroup {
+	var working []DeploymentPlanGroup
+	for _, g := range drift.Plans {
+		if !g.Empty() {
+			working = append(working, g)
+		}
+	}
+	return working
 }
 
 // writeNoChangesDetected closes a comment with nothing to apply. It is never
@@ -1631,7 +1687,7 @@ func primaryTargetSizeScope(drift *DeploymentDriftData, code func(string) string
 		return ""
 	}
 	if !drift.Computed || len(drift.Deployments) == 0 {
-		return "primary target only; targets could not be listed"
+		return "one target only; targets could not be listed"
 	}
 	if len(drift.Deployments) == 1 {
 		return ""
@@ -1639,10 +1695,10 @@ func primaryTargetSizeScope(drift *DeploymentDriftData, code func(string) string
 	names := driftMemberNames(drift.Deployments)
 	for i, d := range drift.Deployments {
 		if d.Primary {
-			return fmt.Sprintf("primary target %s only; other targets not shown", code(names[i]))
+			return fmt.Sprintf("%s only; other targets not shown", code(names[i]))
 		}
 	}
-	return "primary target only; other targets not shown"
+	return "one target only; other targets not shown"
 }
 
 // tableSizeEntries flattens every keyspace's sized tables into section lines,
@@ -2036,7 +2092,7 @@ func writeDeploymentDrift(sb *strings.Builder, drift *DeploymentDriftData, revie
 		// reconcile targets that are supposed to differ.
 		sb.WriteString(glyph.Attention + " **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:\n\n")
 	default:
-		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match the primary target's plan, so the plan check is failing closed:\n\n")
+		sb.WriteString(glyph.Attention + " **Deployment drift detected** — some deployments no longer match this plan, so the plan check is failing closed:\n\n")
 	}
 	// A clean rollup has nothing more to say unless some member will refuse a
 	// change at apply, which the per-member list below is the only place to
@@ -2076,12 +2132,9 @@ func writeNamedRolloutLine(sb *strings.Builder, statement, tail string, names []
 
 // driftMemberLine renders one member's line in the per-member drift breakdown.
 func driftMemberLine(drift *DeploymentDriftData, d DeploymentDriftEntry, name string) string {
-	if d.Primary {
-		name += " (primary)"
-	}
 	switch d.Class {
 	case "match":
-		return fmt.Sprintf("- %s ✅ matches the primary target's plan%s\n", name, blockedSuffix(d.Blocked))
+		return fmt.Sprintf("- %s ✅ matches this plan%s\n", name, blockedSuffix(d.Blocked))
 	case "planned":
 		return fmt.Sprintf("- %s ✅ planned against its own schema%s\n", name, blockedSuffix(d.Blocked))
 	case "diverged":
@@ -2117,7 +2170,7 @@ func quietMembersSummary(drift *DeploymentDriftData, count int) string {
 	if drift.Independent {
 		return fmt.Sprintf("%s ✅ planned against their own schemas", presentation.CoveragePhrase(targetNoun, count, len(drift.Deployments)))
 	}
-	return fmt.Sprintf("%s ✅ match the primary target's plan", presentation.CoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
+	return fmt.Sprintf("%s ✅ match this plan", presentation.CoveragePhrase(deploymentNoun, count, len(drift.Deployments)))
 }
 
 func anyDeploymentBlocked(deployments []DeploymentDriftEntry) bool {
@@ -2191,14 +2244,18 @@ func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
 	return g.PlanID
 }
 
-// writeTargetPlans renders the rollout's plans the way a sharded keyspace
-// renders its shards: one heading per group naming the targets that run it,
-// with the group's DDL under it, and a group already at the desired schema
-// saying so in place of DDL. A single group still names its targets, so every
-// target is shown with the plan it runs. collapse folds a plan with more than one change into a
-// details block, as a multi-environment section does for its own plan.
+// writeTargetPlans renders the rollout's plans. The operator is rolling one
+// diff out everywhere, so targets are a count on the plan summary, not the
+// structure of the comment: when every target with work runs the same plan,
+// that plan renders once with no target heading. Only when targets run
+// different plans does each plan get a heading naming the targets that run
+// it, the way a sharded keyspace renders its shards. A target already at the
+// desired schema gets no heading of its own; the plan summary counts it.
+// collapse folds a plan with more than one change into a details block, as a
+// multi-environment section does for its own plan.
 func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget, collapse bool) {
 	drift := data.DeploymentDrift
+	headed := len(workingTargetGroups(drift)) > 1
 	// Targets with work lead, as changing shards do: they are what the apply
 	// will run, and the targets already at the schema follow them. Among
 	// groups with work the largest leads, since it is what most targets will
@@ -2219,14 +2276,20 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 	if collapse {
 		level, namespaceLabelsInline = "####", true
 	}
+	// A plan with no target heading over it labels its namespaces as a
+	// target's own plan does.
+	if !headed {
+		namespaceLabelsInline = data.namespaceLabelsInline
+	}
 	for _, g := range plans {
-		writeTargetGroupHeading(sb, level, g.Members, len(drift.Deployments))
 		if g.Empty() {
-			sb.WriteString(groupNoChanges + "\n\n")
 			if g.Primary {
 				writePrimaryTargetDisclosures(sb, data, g)
 			}
 			continue
+		}
+		if headed {
+			writeTargetGroupHeading(sb, level, g.Members, len(drift.Deployments))
 		}
 		group := data
 		group.namespaceLabelsInline = namespaceLabelsInline
@@ -2272,8 +2335,8 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 // findings carry the same attribution notes the plan-wide warning would, since
 // the attribution section folds into them on the same condition.
 func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g DeploymentPlanGroup) {
-	if hasExistingCopies(data) && len(g.Members) > 1 {
-		fmt.Fprintf(sb, "On the primary target %s:\n\n", inlineCode(g.Members[0]))
+	if hasExistingCopies(data) && !headedByItself(data.DeploymentDrift, g) {
+		fmt.Fprintf(sb, "On target %s:\n\n", inlineCode(g.Members[0]))
 	}
 	writeExistingCopies(sb, data)
 	var unsafe []UnsafeChangeData
@@ -2285,6 +2348,12 @@ func writePrimaryTargetDisclosures(sb *strings.Builder, data PlanCommentData, g 
 		notes, _ := unsafeAttributionNotes(data, data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 && attributionStillActionable(data))
 		writeUnsafeWarning(sb, unsafe, notes, data.DatabaseType, data.IsMySQL, !data.applyingWithoutConfirmation())
 	}
+}
+
+// headedByItself reports whether a target group renders under a heading that
+// names its one target, so a line about that target need not name it again.
+func headedByItself(drift *DeploymentDriftData, g DeploymentPlanGroup) bool {
+	return len(g.Members) == 1 && !g.Empty() && len(workingTargetGroups(drift)) > 1
 }
 
 func hasExistingCopies(data PlanCommentData) bool {
@@ -3292,7 +3361,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	if targetPlans {
 		writeTargetPlans(sb, *plan, budget, true)
 		summary.Changes = combinedTargetPlanChanges(*plan)
-		summary.PlanSummaryScope = targetPlansScope(plan.DeploymentDrift)
+		summary.summaryRollout = plan.DeploymentDrift
 	}
 
 	totalStatements, keyspaceUpdates := countChanges(plan.Changes)

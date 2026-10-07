@@ -148,7 +148,7 @@ var managedDirMissingConfigBlock = checkBlockReason{
 // (e.g. an apply-time plan) that did not re-evaluate drift.
 var reviewTimeDeploymentDriftBlock = checkBlockReason{
 	blockingReason: checkstate.BlockReviewTimeDeploymentDrift,
-	message:        "One or more deployments differ from the primary target's plan, or could not be confirmed to match it; reconcile the deployment drift or replan once the deployments match before this check can pass.",
+	message:        "One or more deployments differ from the reviewed plan, or could not be confirmed to match it; reconcile the deployment drift or replan once the deployments match before this check can pass.",
 }
 
 // namespacePlacementRefusedBlock is used when an environment's plan was refused

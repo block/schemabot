@@ -282,10 +282,11 @@ func TestRenderPlanComment_UnsafeConsentBoundsTheTableList(t *testing.T) {
 }
 
 // When the rollup is blocked or could not be computed, the comment has no plan
-// per target to count from, so the consent counts the primary target's unsafe
-// changes and says the flag covers any the other targets carry. The apply plans
-// the rollout again, so the instruction stays: a rollup clean by then runs.
-func TestRenderPlanComment_UnsafeConsentScopedToPrimaryWithoutTargetPlans(t *testing.T) {
+// per target to count from, so the consent counts the unsafe changes of the one
+// plan it has and says the flag covers any the other targets carry. The apply
+// plans the rollout again, so the instruction stays: a rollup clean by then
+// runs.
+func TestRenderPlanComment_UnsafeConsentCoversOtherTargetsWithoutTargetPlans(t *testing.T) {
 	for name, drift := range map[string]*DeploymentDriftData{
 		"blocked":      {Computed: true, Clean: false, Deployments: previewRolloutMembers()},
 		"not computed": {Computed: false},
@@ -294,7 +295,7 @@ func TestRenderPlanComment_UnsafeConsentScopedToPrimaryWithoutTargetPlans(t *tes
 			data := unsafeConsentPlan("staging")
 			data.DeploymentDrift = drift
 			out := RenderPlanComment(*data)
-			assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on the primary target (`transfer_events`, `refund_backfill`) and any on the other targets:\n```\nschemabot apply -e staging\n```")
+			assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`) and any the other targets carry:\n```\nschemabot apply -e staging\n```")
 		})
 	}
 
