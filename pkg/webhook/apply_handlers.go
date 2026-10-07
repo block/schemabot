@@ -196,16 +196,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			// Lock held by a different entity
 			h.logger.Info("apply blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 			h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
-				Database:     database,
-				DatabaseType: dbType,
-				Environment:  environment,
-				RequestedBy:  requestedBy,
-				LockOwner:    existingLock.Owner,
-				LockRepo:     existingLock.Repository,
-				LockPR:       existingLock.PullRequest,
-				LockCreated:  existingLock.CreatedAt,
-				CLIName:      h.cliName(),
-				Tenant:       h.deploymentTenant(),
+				Database:         database,
+				DatabaseType:     dbType,
+				Environment:      environment,
+				RequestedBy:      requestedBy,
+				LockOwner:        existingLock.Owner,
+				LockRepo:         existingLock.Repository,
+				LockPR:           existingLock.PullRequest,
+				LockCreated:      existingLock.CreatedAt,
+				CLIName:          h.cliName(),
+				Tenant:           h.deploymentTenant(),
+				LockApplyRunning: h.lockedDatabaseApplyRunningForComment(ctx, repo, pr, environment, existingLock),
 			}))
 			return false, nil
 		}
@@ -909,16 +910,17 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 	if existingLock.Owner != lockOwner {
 		h.logger.Info("apply-confirm blocked by lock conflict", "repo", repo, "pr", pr, "database", database, "lock_owner", existingLock.Owner)
 		h.postComment(repo, pr, installationID, templates.RenderApplyBlockedByOtherPR(templates.ApplyLockConflictData{
-			Database:     database,
-			DatabaseType: dbType,
-			Environment:  environment,
-			RequestedBy:  requestedBy,
-			LockOwner:    existingLock.Owner,
-			LockRepo:     existingLock.Repository,
-			LockPR:       existingLock.PullRequest,
-			LockCreated:  existingLock.CreatedAt,
-			CLIName:      h.cliName(),
-			Tenant:       h.deploymentTenant(),
+			Database:         database,
+			DatabaseType:     dbType,
+			Environment:      environment,
+			RequestedBy:      requestedBy,
+			LockOwner:        existingLock.Owner,
+			LockRepo:         existingLock.Repository,
+			LockPR:           existingLock.PullRequest,
+			LockCreated:      existingLock.CreatedAt,
+			CLIName:          h.cliName(),
+			Tenant:           h.deploymentTenant(),
+			LockApplyRunning: h.lockedDatabaseApplyRunningForComment(ctx, repo, pr, environment, existingLock),
 		}))
 		return false, nil
 	}
@@ -1436,6 +1438,37 @@ func isLockAcquiredSinceVetting(err error) bool {
 func isVettedLockGone(err error) bool {
 	return errors.Is(err, storage.ErrLockNotFound) ||
 		errors.Is(err, storage.ErrLockNotOwned)
+}
+
+// lockedDatabaseApplyRunning reports whether a non-terminal apply is recorded
+// for the locked database. While one is, neither closing the holding PR nor an
+// unlock releases the lock (the unlock refuses on the same check).
+func (h *Handler) lockedDatabaseApplyRunning(ctx context.Context, lock *storage.Lock) (bool, error) {
+	applies, err := h.service.Storage().Applies().GetByDatabase(ctx, lock.DatabaseName, lock.DatabaseType, "")
+	if err != nil {
+		return false, fmt.Errorf("list applies for locked database %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err)
+	}
+	for _, a := range applies {
+		if a.Database == lock.DatabaseName && !state.IsTerminalApplyState(a.State) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// lockedDatabaseApplyRunningForComment is lockedDatabaseApplyRunning for a
+// lock-conflict comment. The comment only words its release hint from the
+// answer, so a lookup failure is logged and the hint omits the running case;
+// an unlock issued anyway re-checks and refuses while an apply runs.
+func (h *Handler) lockedDatabaseApplyRunningForComment(ctx context.Context, repo string, pr int, environment string, lock *storage.Lock) bool {
+	running, err := h.lockedDatabaseApplyRunning(ctx, lock)
+	if err != nil {
+		h.logger.Warn("lock conflict comment will not say whether the lock holder's apply is running: apply state lookup failed",
+			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+			"environment", environment, "lock_owner", lock.Owner, "error", err)
+		return false
+	}
+	return running
 }
 
 func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, result CommandResult) ([]*storage.Lock, error) {

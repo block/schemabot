@@ -34,6 +34,10 @@ type ApplyLockConflictData struct {
 	// Tenant is the deployment's own tenant; when set, the PR-comment unlock
 	// hints carry it so pasting them addresses this deployment.
 	Tenant string
+
+	// LockApplyRunning reports that an apply is still running on the locked
+	// database, so the lock cannot be released until it finishes.
+	LockApplyRunning bool
 }
 
 // ActorAuthorizationCommentData contains data for PR command actor
@@ -361,7 +365,7 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, cliUnlockArgs(data.Database, data.DatabaseType)))
 		fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock -d "+data.Database+" --force", data.Tenant))
 	} else {
-		sb.WriteString(otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", data.Tenant)) + "\n")
+		sb.WriteString(otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", data.Tenant), data.LockApplyRunning) + "\n")
 	}
 
 	return offerSupportChannel(sb.String())
@@ -369,15 +373,14 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 
 // otherPRLockReleaseHint tells the requester when another PR's lock goes away.
 // A PR's lock outlives its apply: it is released when that PR is merged or
-// closed, or when someone comments the unlock command on it, so "wait for it
-// to finish" would send the requester to watch the wrong event. Neither
-// releases a lock whose apply is still running, and a PR closed mid-apply
-// keeps its lock after the apply finishes, so the hint names that case too.
-func otherPRLockReleaseHint(unlockCommand string) string {
-	return "The lock is held until that PR is merged or closed, even after its apply finishes. " +
-		"To release it sooner, ask the lock holder to comment `" + unlockCommand + "` on that PR. " +
-		"Neither releases the lock while that PR's apply is still running; " +
-		"if the PR was merged or closed during its apply, comment the unlock on it once the apply finishes."
+// closed, or when the unlock command is commented on it. Neither releases it
+// while an apply is still running, so that case says to wait for it first.
+func otherPRLockReleaseHint(unlockCommand string, applyRunning bool) string {
+	release := "when that PR is merged or closed, or when `" + unlockCommand + "` is commented on it."
+	if applyRunning {
+		return "That PR's apply is still running. Once it finishes, the lock is released " + release
+	}
+	return "The lock is released " + release
 }
 
 // cliUnlockArgs renders the CLI unlock arguments for the lock on database.

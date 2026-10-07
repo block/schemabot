@@ -82,9 +82,9 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 		"the lock owner's machine is internal detail and stays out of PR markdown")
 }
 
-// A PR's lock outlives its apply, so the blocked requester is told the event
-// that actually releases it: the holding PR merging or closing, or an unlock
-// commented on that PR.
+// A PR's lock outlives its apply, so the blocked requester is told the events
+// that actually release it. While an apply is still running neither works, so
+// the comment says so instead of sending the requester to try.
 func TestRenderApplyBlockedByOtherPRNamesWhenTheLockIsReleased(t *testing.T) {
 	data := ApplyLockConflictData{
 		Database:    "example-db",
@@ -96,17 +96,22 @@ func TestRenderApplyBlockedByOtherPRNamesWhenTheLockIsReleased(t *testing.T) {
 	}
 	rendered := RenderApplyBlockedByOtherPR(data)
 	assert.Contains(t, rendered, "**Locked by**: [acme/storefront#42](https://github.com/acme/storefront/pull/42)")
-	assert.Contains(t, rendered, "The lock is held until that PR is merged or closed, even after its apply finishes. "+
-		"To release it sooner, ask the lock holder to comment `schemabot unlock` on that PR. "+
-		"Neither releases the lock while that PR's apply is still running; "+
-		"if the PR was merged or closed during its apply, comment the unlock on it once the apply finishes.\n")
-	assert.NotContains(t, rendered, "to complete")
+	assert.Contains(t, rendered, "\nThe lock is released when that PR is merged or closed, or when `schemabot unlock` is commented on it.\n")
+	assert.NotContains(t, rendered, "still running")
+
+	t.Run("apply running", func(t *testing.T) {
+		data := data
+		data.LockApplyRunning = true
+		rendered := RenderApplyBlockedByOtherPR(data)
+		assert.Contains(t, rendered, "\nThat PR's apply is still running. Once it finishes, the lock is released "+
+			"when that PR is merged or closed, or when `schemabot unlock` is commented on it.\n")
+	})
 
 	t.Run("tenant deployment", func(t *testing.T) {
 		data := data
 		data.Tenant = "acme"
 		rendered := RenderApplyBlockedByOtherPR(data)
-		assert.Contains(t, rendered, "ask the lock holder to comment `schemabot unlock --tenant acme` on that PR.")
+		assert.Contains(t, rendered, "or when `schemabot unlock --tenant acme` is commented on it.")
 	})
 }
 
