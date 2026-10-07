@@ -205,6 +205,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				LockPR:       existingLock.PullRequest,
 				LockCreated:  existingLock.CreatedAt,
 				CLIName:      h.cliName(),
+				Tenant:       h.deploymentTenant(),
 			}))
 			return false, nil
 		}
@@ -917,6 +918,7 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			LockPR:       existingLock.PullRequest,
 			LockCreated:  existingLock.CreatedAt,
 			CLIName:      h.cliName(),
+			Tenant:       h.deploymentTenant(),
 		}))
 		return false, nil
 	}

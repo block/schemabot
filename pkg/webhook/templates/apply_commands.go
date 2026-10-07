@@ -30,6 +30,10 @@ type ApplyLockConflictData struct {
 	// CLIName is the tool name the comment's CLI command hints start with,
 	// the server's cli_name. Empty renders the CLI's own default.
 	CLIName string
+
+	// Tenant is the deployment's own tenant; when set, the PR-comment unlock
+	// hints carry it so pasting them addresses this deployment.
+	Tenant string
 }
 
 // ActorAuthorizationCommentData contains data for PR command actor
@@ -355,12 +359,21 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 
 	if isCLI {
 		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, cliUnlockArgs(data.Database, data.DatabaseType)))
-		fmt.Fprintf(&sb, "```\nschemabot unlock -d %s --force\n```\n", data.Database)
+		fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock -d "+data.Database+" --force", data.Tenant))
 	} else {
-		sb.WriteString("Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.\n")
+		sb.WriteString(otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", data.Tenant)) + "\n")
 	}
 
 	return offerSupportChannel(sb.String())
+}
+
+// otherPRLockReleaseHint tells the requester when another PR's lock goes away.
+// A PR's lock outlives its apply: it is released when that PR is merged or
+// closed, or when someone comments the unlock command on it, so "wait for it
+// to finish" would send the requester to watch the wrong event.
+func otherPRLockReleaseHint(unlockCommand string) string {
+	return "The lock is held until that PR is merged or closed, even after its apply finishes. " +
+		"To release it sooner, ask the lock holder to comment `" + unlockCommand + "` on that PR."
 }
 
 // cliUnlockArgs renders the CLI unlock arguments for the lock on database.

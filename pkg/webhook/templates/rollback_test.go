@@ -248,7 +248,9 @@ func TestRenderRollbackBlockedByLock(t *testing.T) {
 		assert.Contains(t, rendered, "`testapp`")
 		assert.Contains(t, rendered, "`staging`")
 		assert.Contains(t, rendered, "[block/myapp#42](https://github.com/block/myapp/pull/42)")
-		assert.Contains(t, rendered, "`schemabot unlock`")
+		assert.Contains(t, rendered, "The lock is held until that PR is merged or closed, even after its apply finishes. "+
+			"To release it sooner, ask the lock holder to comment `schemabot unlock` on that PR.")
+		assert.NotContains(t, rendered, "to complete")
 		assert.NotContains(t, rendered, "--tenant")
 		assert.NotContains(t, rendered, "`block/myapp#42`",
 			"PR-link variant should not render the owner as a bare backticked string")
@@ -256,7 +258,7 @@ func TestRenderRollbackBlockedByLock(t *testing.T) {
 
 	t.Run("PR-owned lock on tenant deployment hints tenant-scoped unlock", func(t *testing.T) {
 		rendered := RenderRollbackBlockedByLock("testapp", "production", "block/myapp#42", "block/myapp", 42, "acme")
-		assert.Contains(t, rendered, "`schemabot unlock --tenant acme`")
+		assert.Contains(t, rendered, "ask the lock holder to comment `schemabot unlock --tenant acme` on that PR.")
 	})
 
 	t.Run("non-PR lock renders the owner without its hostname", func(t *testing.T) {
