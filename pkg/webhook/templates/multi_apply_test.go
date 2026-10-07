@@ -1621,6 +1621,41 @@ func TestRenderMultiDeploymentApplyComment_SoleMultiTargetStatusFollowsTheApply(
 	assert.NotContains(t, out, "Rolled out to")
 }
 
+// An apply settles as cancelled or reverted while one of its targets is still
+// running. The status line follows the target that is still going, in the
+// present tense, rather than calling the rollout finished beside a running
+// count.
+func TestRenderMultiDeploymentApplyComment_SoleMultiTargetStatusWaitsForARunningTarget(t *testing.T) {
+	for _, tc := range []struct {
+		ended    string
+		rollback bool
+		want     string
+	}{
+		{so.Cancelled, false, "Rolling out: 0 of 2 targets done, 1 running, 1 cancelled"},
+		{so.Reverted, true, "Rolling back: 0 of 2 targets done, 1 running, 1 reverted"},
+	} {
+		data := MultiDeploymentApplyData{
+			Model: presentation.Derive([]presentation.Operation{
+				parallelTarget("primary", "testapp-001", tc.ended),
+				parallelTarget("primary", "testapp-002", so.Running),
+			}),
+			ApplyID: "apply-123", Environment: "production", Rollback: tc.rollback,
+			Details: []*ApplyStatusCommentData{nil, targetDetail("testapp_002", state.Task.Running, addNote, 500)},
+		}
+		require.True(t, state.IsState(data.Model.State, state.SettledApplyStates...), "the apply settled as %s with a target still running", data.Model.State)
+		for name, out := range map[string]string{
+			"status":  RenderMultiDeploymentApplyComment(data),
+			"summary": RenderMultiDeploymentApplySummaryComment(data),
+		} {
+			t.Run(tc.ended+" "+name, func(t *testing.T) {
+				assert.Contains(t, out, tc.want)
+				assert.NotContains(t, out, "Rolled out to")
+				assert.NotContains(t, out, "Rolled back on")
+			})
+		}
+	}
+}
+
 func TestTargetRolloutStatus(t *testing.T) {
 	counts := func(pairs ...any) []presentation.StateCount {
 		var out []presentation.StateCount
@@ -1636,11 +1671,11 @@ func TestTargetRolloutStatus(t *testing.T) {
 		want     string
 	}{
 		"running": {
-			presentation.TargetProgress{Total: 4, Done: 1, AlreadyHad: 1, Others: counts("running", 1, "queued", 1)}, false, false,
+			presentation.TargetProgress{Total: 4, Done: 1, AlreadyHad: 1, Others: counts("running", 1, "queued", 1), Unsettled: 2}, false, false,
 			"Rolling out: 1 of 4 targets done, 1 running, 1 queued (1 already had it)",
 		},
 		"running, none done yet": {
-			presentation.TargetProgress{Total: 3, Others: counts("running", 3)}, false, false,
+			presentation.TargetProgress{Total: 3, Others: counts("running", 3), Unsettled: 3}, false, false,
 			"Rolling out: 0 of 3 targets done, 3 running",
 		},
 		"every target ran": {
@@ -1660,8 +1695,12 @@ func TestTargetRolloutStatus(t *testing.T) {
 			"Rolled out to no targets, 2 failed",
 		},
 		"rollback running": {
-			presentation.TargetProgress{Total: 3, Done: 1, Others: counts("running", 2)}, false, true,
+			presentation.TargetProgress{Total: 3, Done: 1, Others: counts("running", 2), Unsettled: 2}, false, true,
 			"Rolling back: 1 of 3 targets done, 2 running",
+		},
+		"settled with a target still running": {
+			presentation.TargetProgress{Total: 2, Others: counts("running", 1, "cancelled", 1), Unsettled: 1}, true, false,
+			"Rolling out: 0 of 2 targets done, 1 running, 1 cancelled",
 		},
 		"rollback finished": {
 			presentation.TargetProgress{Total: 3, Done: 3}, true, true,

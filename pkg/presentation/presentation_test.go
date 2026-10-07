@@ -656,7 +656,8 @@ func TestTargetProgress_CountsRanAndAlreadyHadApart(t *testing.T) {
 		Done:       1,
 		AlreadyHad: 1,
 		Others:     []StateCount{{"running", 1}, {"queued", 1}, {"failed", 1}},
-	}, apply.TargetProgress(groups[0]))
+		Unsettled:  2,
+	}, apply.TargetProgress(groups[0]), "the running and queued targets can still run; the failed one cannot")
 }
 
 // Members that are not distinct targets, such as keyed operations with no

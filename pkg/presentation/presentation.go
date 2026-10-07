@@ -825,6 +825,10 @@ type TargetProgress struct {
 	AlreadyHad int
 	// Others is the histogram of the remaining targets, in display order.
 	Others []StateCount
+	// Unsettled is the targets that can still run in this apply: running,
+	// queued, waiting, paused, stopped, or in a revert window. An apply can
+	// settle while one of them is still going, so it is counted on its own.
+	Unsettled int
 }
 
 // TargetProgress counts g's targets for its status line. Done and AlreadyHad
@@ -843,7 +847,22 @@ func (a Apply) TargetProgress(g Group) TargetProgress {
 		default:
 			rest = append(rest, d)
 		}
+		if !d.Presentation.final() {
+			p.Unsettled++
+		}
 	}
 	p.Others = summaryCounts(rest)
 	return p
+}
+
+// final reports whether a member's status is the outcome it keeps for this
+// apply: it ran the change, already had it, or ended without it and will not
+// run again. Every other status, an unknown one included, can still change.
+func (s PresentationState) final() bool {
+	switch s {
+	case StateCompleted, StateAlreadyApplied, StateFailed, StateHalted, StateCancelled, StateReverted:
+		return true
+	default:
+		return false
+	}
 }

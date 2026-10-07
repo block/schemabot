@@ -194,9 +194,11 @@ func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, 
 
 // targetRolloutStatus states a multi-target rollout's progress in one line:
 // "Rolled out to 3 of 4 targets (1 already had it)" once the apply has
-// settled, and "Rolling out: 1 of 4 targets done, 1 running, 1 queued" until
-// then. A stopped apply has not settled: its targets run again once it
-// resumes. A rollback says "Rolled back on" and "Rolling back" instead. Every
+// settled and no target can still run, and "Rolling out: 1 of 4 targets done,
+// 1 running, 1 queued" until then. A stopped apply has not settled: its
+// targets run again once it resumes. An apply can settle as cancelled while a
+// target is still running, and that target keeps the line in the present
+// tense. A rollback says "Rolled back on" and "Rolling back" instead. Every
 // count is out of all the targets, so the parts add up.
 func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) string {
 	ongoing, finished := "Rolling out:", "Rolled out to"
@@ -205,7 +207,7 @@ func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) 
 	}
 	var line string
 	switch {
-	case !settled:
+	case !settled || p.Unsettled > 0:
 		line = fmt.Sprintf("%s %d of %d targets done", ongoing, p.Done, p.Total)
 	case p.Done == p.Total:
 		line = fmt.Sprintf("%s all %d targets", finished, p.Total)
