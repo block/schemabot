@@ -1060,7 +1060,10 @@ The defaults, and why they were chosen:
   instance class silently starves or overloads another, and autoscaling is why
   there is no operator knob for copy aggressiveness. Autoscaling needs Aurora's
   load signal: on other MySQL targets Spirit leaves it disengaged and runs at
-  fixed default thread counts.
+  fixed default thread counts. An Aurora instance with fewer than 4 vCPUs is
+  too small to scale, so Spirit runs it in small-instance mode instead: every
+  pool runs one worker with small chunks and does not scale, which makes a
+  large copy on such an instance markedly slower.
 - **The copy is verified with Spirit's lockless checksum** (not configurable).
   It verifies with optimistic reads, retries, and hot-range splitting instead
   of a checksum setup lock held over long-lived `REPEATABLE READ` snapshots, so
@@ -1078,6 +1081,14 @@ The defaults, and why they were chosen:
 
 A database can override the server-level value by setting the same key
 (`checkpoint_max_age`) in its own metadata; the database's entry wins.
+
+The keys `enable_experimental_autoscaling`,
+`enable_experimental_lockless_checksum`, and `checksum_yield_timeout` were
+removed: Spirit now chooses thread autoscaling and the checksum itself. A
+config that still sets one is rejected rather than ignored, because the
+operator set it to change how runs behave. In the `spirit:` block it fails
+startup; in a database's metadata it fails building that database's engine
+client. Both errors name the key. Deleting the key is the whole remedy.
 
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment

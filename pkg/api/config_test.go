@@ -5197,9 +5197,10 @@ spirit:
 	})
 
 	// Autoscaling and the checksum algorithm are Spirit's own defaults and no
-	// longer configurable. The server config decodes strictly, so a config that
-	// still sets one of the removed keys fails to load instead of silently
-	// running with a setting the operator believes they changed.
+	// longer configurable. A config that still sets one of the removed keys
+	// fails to load instead of silently running with a setting the operator
+	// believes they changed, and the error says the key was removed so the
+	// operator knows deleting it is the whole remedy.
 	t.Run("removed keys are rejected", func(t *testing.T) {
 		for key, value := range map[string]string{
 			"enable_experimental_autoscaling":       "false",
@@ -5207,8 +5208,15 @@ spirit:
 			"checksum_yield_timeout":                "6h",
 		} {
 			_, err := ParseServerConfig([]byte("spirit:\n  " + key + ": " + value + "\n"))
-			require.ErrorContains(t, err, key)
+			require.ErrorContains(t, err, "spirit."+key+" was removed")
 		}
+	})
+
+	// The server config decodes strictly, so an unknown spirit key that was
+	// never a setting still fails to load.
+	t.Run("unknown keys are rejected", func(t *testing.T) {
+		_, err := ParseServerConfig([]byte("spirit:\n  copy_threads: 8\n"))
+		require.ErrorContains(t, err, "copy_threads")
 	})
 
 	t.Run("invalid duration errors", func(t *testing.T) {

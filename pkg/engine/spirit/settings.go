@@ -7,6 +7,7 @@ package spirit
 
 import (
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -34,12 +35,35 @@ const (
 	MetadataCheckpointMaxAge = "checkpoint_max_age"
 )
 
+// removedSettingKeys are run settings this engine no longer exposes because
+// Spirit now chooses them itself: thread autoscaling and the checksum
+// algorithm.
+var removedSettingKeys = []string{
+	"enable_experimental_autoscaling",
+	"enable_experimental_lockless_checksum",
+	"checksum_yield_timeout",
+}
+
+// RemovedSettingKeys returns the run setting keys this engine no longer
+// accepts. A config that still sets one is rejected rather than ignored: the
+// operator set it to change how runs behave, and Spirit's default would
+// silently replace that intent.
+func RemovedSettingKeys() []string {
+	return slices.Clone(removedSettingKeys)
+}
+
 // SettingsFromMetadata builds Settings from engine metadata key-value pairs.
 // Absent keys leave the corresponding field at its zero value so New resolves
 // the default; present keys must parse, because silently ignoring a
 // misconfigured override would run the apply with settings the operator
-// believes they changed.
+// believes they changed. A removed setting key is an error for the same
+// reason.
 func SettingsFromMetadata(metadata map[string]string) (Settings, error) {
+	for _, key := range removedSettingKeys {
+		if _, ok := metadata[key]; ok {
+			return Settings{}, fmt.Errorf("metadata key %s is no longer supported: Spirit now chooses this itself; remove the key from the database's metadata", key)
+		}
+	}
 	var settings Settings
 	var err error
 	if settings.CheckpointMaxAge, err = parsePositiveDuration(metadata, MetadataCheckpointMaxAge); err != nil {

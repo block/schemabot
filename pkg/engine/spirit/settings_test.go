@@ -36,17 +36,6 @@ func TestSettingsFromMetadata(t *testing.T) {
 			want: Settings{CheckpointMaxAge: 24 * time.Hour},
 		},
 		{
-			// Keys for settings SchemaBot no longer exposes (Spirit's own
-			// defaults apply) are ignored like any other unrelated key.
-			name: "removed setting keys are ignored",
-			metadata: map[string]string{
-				"enable_experimental_autoscaling":       "false",
-				"enable_experimental_lockless_checksum": "false",
-				"checksum_yield_timeout":                "6h",
-			},
-			want: Settings{},
-		},
-		{
 			name: "invalid checkpoint duration errors",
 			metadata: map[string]string{
 				MetadataCheckpointMaxAge: "3 days",
@@ -71,6 +60,21 @@ func TestSettingsFromMetadata(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
+	}
+}
+
+// A database whose metadata still sets a run setting this engine no longer
+// exposes must not silently run with Spirit's default instead: the operator
+// set that key to change how the run behaves, so the settings fail to build
+// and the error names the key to delete.
+func TestSettingsFromMetadataRejectsRemovedKeys(t *testing.T) {
+	for _, key := range []string{
+		"enable_experimental_autoscaling",
+		"enable_experimental_lockless_checksum",
+		"checksum_yield_timeout",
+	} {
+		_, err := SettingsFromMetadata(map[string]string{key: "false"})
+		require.ErrorContains(t, err, "metadata key "+key+" is no longer supported")
 	}
 }
 

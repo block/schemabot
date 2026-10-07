@@ -2099,6 +2099,9 @@ func ParseServerConfig(data []byte) (*ServerConfig, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&config); err != nil {
+		if key, ok := removedSpiritKey(data); ok {
+			return nil, fmt.Errorf("invalid config: spirit.%s was removed: Spirit now chooses this itself; delete the key from the spirit block: %w", key, err)
+		}
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
@@ -2115,6 +2118,27 @@ func ParseServerConfig(data []byte) (*ServerConfig, error) {
 	}
 
 	return &config, nil
+}
+
+// removedSpiritKey reports the first run setting a config's spirit block still
+// sets that Spirit now chooses itself. The strict decode rejects such a key
+// only as an unknown field; naming it as removed tells the operator that
+// deleting it is the whole remedy. It runs only once the strict decode has
+// failed, so YAML that does not parse here is already reported by that
+// decode's error.
+func removedSpiritKey(data []byte) (string, bool) {
+	var doc struct {
+		Spirit map[string]any `yaml:"spirit"`
+	}
+	if yaml.Unmarshal(data, &doc) != nil {
+		return "", false
+	}
+	for _, key := range spirit.RemovedSettingKeys() {
+		if _, ok := doc.Spirit[key]; ok {
+			return key, true
+		}
+	}
+	return "", false
 }
 
 func (c *ServerConfig) canonicalizeRepositories() error {
