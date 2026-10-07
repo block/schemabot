@@ -135,9 +135,10 @@ func TestRenderPlanComment_AttributionKeepsItsSectionWhenNotAnUnsafeFinding(t *t
 // comment lists the unsafe changes it consents to: the plan can have changed
 // since the operator first opted in, and confirming must not run an unsafe
 // change no comment showed. An attribution rides on its finding there as on
-// the plan comment. The comment of an apply already running lists none, as it
-// reached the apply only under the opt-in.
-func TestRenderPlanComment_PausedCommentListsTheUnsafeChangesItConsentsTo(t *testing.T) {
+// the plan comment. The comment of an apply already running lists them too,
+// as the record of what the apply destroys, without the drop guidance or the
+// attribution that only a reader still deciding the apply can act on.
+func TestRenderPlanComment_EveryLockedCommentListsTheUnsafeChangesItRuns(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.AttributedChanges = []AttributedChangeData{{Table: "transfer_events", Repository: "acme/payments", PullRequest: 4790}}
 	data.IsLocked = true
@@ -146,12 +147,16 @@ func TestRenderPlanComment_PausedCommentListsTheUnsafeChangesItConsentsTo(t *tes
 	out := RenderPlanComment(*data)
 	assert.Contains(t, out, "⚠️ **Issues**: 2 unsafe changes detected\n1. `transfer_events`: DROP COLUMN discards the column's data (changed by open PR [acme/payments#4790](https://github.com/acme/payments/pull/4790))\n2. `refund_backfill`: DROP TABLE removes all data\n")
 	assert.NotContains(t, out, "Check before applying", "the attribution folds into its finding")
+	assert.Contains(t, out, "Destructive drop guidance")
 	assert.Contains(t, fencedCommands(t, out), "schemabot apply-confirm -e staging --allow-unsafe")
 
 	data.PendingManualConfirmation = false
 	out = RenderPlanComment(*data)
-	assert.NotContains(t, out, "unsafe change")
-	assert.NotContains(t, out, "transfer_events`: DROP COLUMN")
+	assert.Contains(t, out, "⚠️ **Issues**: 2 unsafe changes detected\n1. `transfer_events`: DROP COLUMN discards the column's data\n2. `refund_backfill`: DROP TABLE removes all data\n")
+	assert.NotContains(t, out, "Destructive drop guidance", "the guidance is out of reach once the apply runs")
+	assert.NotContains(t, out, "changed by open PR", "the attribution coaches a decision the running apply no longer offers")
+	assert.NotContains(t, out, "Check before applying")
+	assert.Contains(t, out, "**Applying automatically**")
 }
 
 // A plan without unsafe changes keeps the plain instruction.
