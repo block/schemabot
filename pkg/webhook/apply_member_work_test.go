@@ -556,3 +556,16 @@ func TestRolloutAllChangesDirect(t *testing.T) {
 		})
 	}
 }
+
+// An apply that could not verify the other targets' plans tells the operator
+// how to recover from the state the rejection left: an automatic apply
+// released its lock, so the apply command starts over, while apply-confirm
+// kept the pending confirmation, so confirming again is the retry.
+func TestUnverifiedMemberWorkMessage(t *testing.T) {
+	assert.Equal(t,
+		"SchemaBot could not verify the other targets' plans, so nothing was applied. The lock is released: run apply again, and see server logs if it persists.",
+		unverifiedMemberWorkMessage("the other targets' plans", true))
+	assert.Equal(t,
+		"SchemaBot could not verify the other targets' plans, so nothing was applied. The confirmation is still pending: run apply-confirm again, and see server logs if it persists.",
+		unverifiedMemberWorkMessage("the other targets' plans", false))
+}

@@ -186,7 +186,7 @@ func (h *Handler) executeApply(
 		if coverErr != nil {
 			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
 				"could not verify that the reviewed plans cover the other targets' work", coverErr,
-				"SchemaBot could not verify the plans this apply covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+				"the plans this apply covers")
 			return
 		}
 		// Work the apply cannot run is refused before anything else, releasing
@@ -194,11 +194,15 @@ func (h *Handler) executeApply(
 		// a target after the comment was posted, a fresh confirmation could
 		// never run it, and apply creation would refuse it with the lock still
 		// pinned.
+		// When the confirmation is also stale, the refusal is the reason the
+		// operator is told: it is the one that blocks any confirmation, where
+		// a stale one would only send them to confirm again into the same
+		// refusal.
 		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
 		if refusalErr != nil {
 			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
 				"could not verify that the other targets' plans can run from this apply", refusalErr,
-				"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+				"the other targets' plans")
 			return
 		}
 		if refusal != "" {
@@ -576,7 +580,7 @@ var rolloutPlansChangedCause = &templates.PausedApplyCauseData{
 func (h *Handler) rejectUnverifiedMemberWork(
 	ctx context.Context, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	environment, requestedBy, actionName string, automatic bool, expectedPendingPlanID, planID string,
-	what string, err error, message string,
+	what string, err error, unverified string,
 ) {
 	database, dbType := schemaResult.Database, schemaResult.Type
 	if automatic {
@@ -589,7 +593,20 @@ func (h *Handler) rejectUnverifiedMemberWork(
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"pending_plan_id", expectedPendingPlanID, "plan_id", planID, "error", err)
 	}
-	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, message)
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedMemberWorkMessage(unverified, automatic))
+}
+
+// unverifiedMemberWorkMessage tells the operator that nothing ran because
+// SchemaBot could not verify the named plans, and how to recover from the
+// state the rejection left: an automatic apply released its lock, so the apply
+// command starts over, while apply-confirm kept the pending confirmation, so
+// confirming again retries against the same comment.
+func unverifiedMemberWorkMessage(unverified string, automatic bool) string {
+	recovery := "The confirmation is still pending: run apply-confirm again, and see server logs if it persists."
+	if automatic {
+		recovery = "The lock is released: run apply again, and see server logs if it persists."
+	}
+	return fmt.Sprintf("SchemaBot could not verify %s, so nothing was applied. %s", unverified, recovery)
 }
 
 func applyExecutionErrorMessage(command, environment string, err error) string {

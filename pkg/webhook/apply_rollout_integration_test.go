@@ -1486,7 +1486,7 @@ func TestE2EApplyReleasesTheLockWhenItCannotVerifyAnotherTargetsWork(t *testing.
 	hooked.onAcquire = func(lock *storage.Lock) { hooked.failRoundOf = lock.PendingPlanID }
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "SchemaBot could not verify the plans this apply covers, so nothing was applied.")
+	awaitCommentContaining(t, apply, "SchemaBot could not verify the plans this apply covers, so nothing was applied. The lock is released: run apply again")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
