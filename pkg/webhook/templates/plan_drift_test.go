@@ -648,9 +648,7 @@ func TestRenderPlanComment_PausedRolloutListsAnotherTargetsNewUnsafeChange(t *te
 	data.DeploymentDrift.Plans[1].UnsafeChanges = []UnsafeChangeData{{Table: "users", Reason: "DROP COLUMN discards the column's data", ChangeType: "drop"}}
 
 	out := RenderPlanComment(data)
-	group := sectionOf(t, out, "### 2 of 3 targets")
-	assert.Contains(t, group, "1 unsafe change detected")
-	assert.Contains(t, group, "`users`: DROP COLUMN discards the column's data")
+	assert.Contains(t, out, "⚠️ **Issues**: 1 unsafe change detected\n1. `users`: DROP COLUMN discards the column's data\n")
 	assert.Contains(t, out, "schemabot apply-confirm -e production --allow-unsafe")
 
 	data.PendingManualConfirmation = false
