@@ -168,6 +168,23 @@ func (h *Handler) deferCutoverHasNothingToDefer(ctx context.Context, planResp *a
 	return rolloutAllChangesDirect(planResp, members), nil
 }
 
+// confirmCommandAllChangesDirect reports whether the apply-confirm a paused
+// apply's comment suggests leaves out --defer-cutover, because no target the
+// apply runs has a cutover to defer. The primary plan alone cannot say so when
+// other targets run engine-driven changes of their own. A target plan that
+// cannot be read keeps the flag: apply-confirm refuses a flag with nothing to
+// defer and keeps the pending confirmation, while a dropped flag would let a
+// cutover run without the pause the operator asked for.
+func (h *Handler) confirmCommandAllChangesDirect(ctx context.Context, repo string, pr int, planResp *apitypes.PlanResponse, environment string, runsMemberWork bool) bool {
+	allDirect, err := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+	if err != nil {
+		h.logger.Warn("could not read every target's plan for the comment's apply-confirm command; it keeps --defer-cutover, which apply-confirm refuses if no target has a cutover to defer",
+			"repo", repo, "pr", pr, "environment", environment, "plan_id", planResp.PlanID, "error", err)
+		return false
+	}
+	return allDirect
+}
+
 // rolloutAllChangesDirect reports whether every target with work, the
 // primary's included, runs only direct-execution changes, and at least one
 // target has work. A target already at the desired schema runs nothing, so it

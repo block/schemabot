@@ -298,7 +298,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			planDriftCause(planResp, storedPlan), rolloutPreview); err != nil {
+			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork); err != nil {
 			h.logger.Error("failed to post the DDL-drift downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -327,7 +327,7 @@ func (h *Handler) executeApply(
 				"environment", environment, "action", actionName,
 				"plan_id", planResp.PlanID, "disclosed_plan_id", disclosedPlan.PlanIdentifier, "newly_direct", len(newlyDirect))
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				newlyDirectCause(newlyDirect), rolloutPreview); err != nil {
+				newlyDirectCause(newlyDirect), rolloutPreview, runsMemberWork); err != nil {
 				h.logger.Error("failed to post the comment disclosing the newly-direct changes, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -367,7 +367,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			nil, rolloutPreview); err != nil {
+			nil, rolloutPreview, runsMemberWork); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -632,7 +632,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
-	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData,
+	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData, runsMemberWork bool,
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
@@ -641,6 +641,9 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeferCutover = result.DeferCutover
+	if result.DeferCutover {
+		commentData.AllChangesDirect = h.confirmCommandAllChangesDirect(ctx, repo, pr, planResp, environment, runsMemberWork)
+	}
 	commentData.SkipRevert = result.SkipRevert
 	commentData.PendingManualConfirmation = true
 	commentData.PausedApplyCause = cause

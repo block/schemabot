@@ -450,6 +450,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// every target runs only direct statements has no cutover to defer, so
 	// reject the flag instead of silently ignoring it. No lock is held yet, so
 	// a plan that cannot be read leaves the command retryable.
+	rolloutAllDirect := planResp.AllChangesDirect()
 	if result.DeferCutover {
 		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
 		if deferErr != nil {
@@ -470,6 +471,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				msgDeferCutoverAllDirect)
 			return false, nil
 		}
+		rolloutAllDirect = nothingToDefer
 	}
 
 	// Block unsafe changes unless --allow-unsafe was specified, on every target
@@ -538,6 +540,11 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	commentData.LockOwner = lockOwner
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
 	commentData.DeferCutover = result.DeferCutover
+	// The apply-confirm the comment suggests drops --defer-cutover only when no
+	// target has a cutover to defer, which the primary plan alone cannot tell
+	// on a rollout; the check above read every target's plan when the flag
+	// was given, and the footer reads this only then.
+	commentData.AllChangesDirect = rolloutAllDirect
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeploymentDrift = rolloutPreview

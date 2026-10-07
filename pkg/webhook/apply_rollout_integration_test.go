@@ -381,6 +381,56 @@ func TestE2EDeferCutoverRefusedWhenOnlyAnotherTargetRunsDirectChanges(t *testing
 	assert.NotEmpty(t, lock.PendingPlanID)
 }
 
+// usersWithTenantIndexSchema reshapes the primary key of `users`, as
+// pkSwapSchema does, and also indexes tenant_id.
+const usersWithTenantIndexSchema = "CREATE TABLE `users` (\n" +
+	"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+	"  `tenant_id` bigint unsigned NOT NULL,\n" +
+	"  PRIMARY KEY (`id`,`tenant_id`),\n" +
+	"  KEY `idx_tenant` (`tenant_id`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+
+// The primary target (eu), on the direct execution policy, needs only the
+// primary key reshape, which runs as native DDL with no cutover. us already has
+// the reshaped key and needs only the index, which the schema change engine
+// copies and cuts over. --defer-cutover has us's cutover to defer, so the
+// comment the apply pauses on suggests an apply-confirm that keeps the flag,
+// though the primary plan alone has nothing to defer.
+func TestE2EPausedApplyKeepsDeferCutoverForAnotherTargetsCutover(t *testing.T) {
+	dbName := "webhook_rollout_mixed_defer"
+	usersWithTenantIndexLive := strings.Replace(strings.TrimSuffix(usersWithTenantIndexSchema, ";"),
+		"  PRIMARY KEY (`id`,`tenant_id`),\n", "  PRIMARY KEY (`id`),\n", 1)
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithTenantIndexLive, engineMetadata: directPolicyMetadata},
+		{name: "us", liveSchema: strings.TrimSuffix(pkSwapSchema, ";")},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	files := map[string]string{"users.sql": usersWithTenantIndexSchema}
+
+	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	body := awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
+		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied") ||
+			strings.Contains(body, "Failed to execute apply") || strings.Contains(body, "has no effect on this plan")
+	})
+	require.Contains(t, body, "Confirmation required", "another target's work pauses for apply-confirm")
+	assert.Contains(t, body, "**Direct execution**", "the comment discloses eu's direct change")
+	confirmLine := ""
+	for line := range strings.SplitSeq(body, "\n") {
+		if strings.Contains(line, "schemabot apply-confirm") {
+			confirmLine = line
+			break
+		}
+	}
+	require.NotEmpty(t, confirmLine, "the comment suggests an apply-confirm:\n%s", body)
+	assert.Contains(t, confirmLine, "--defer-cutover", "us's cutover is still to defer")
+
+	confirm := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	created := awaitConfirmedApply(t, svc, dbName, confirm)
+	assert.True(t, storage.ParseApplyOptions(created.Options).DeferCutover, "the confirmed apply defers the cutover")
+}
+
 // Two targets planned against schemas of their own, both needing the column.
 // eu also drops nickname, and us, which has drifted, drops legacy_id besides,
 // a change the primary plan does not carry. The plan comment discloses us's
