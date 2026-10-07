@@ -1463,13 +1463,16 @@ func PreviewCommentReviewGateError() string {
 
 // PreviewCommentReviewGateErrorApprovalNotComparable renders the review gate
 // error comment when an approval on an earlier commit cannot be compared with
-// the head (fail-closed).
+// the head, so it does not count and the apply is blocked (fail-closed).
 func PreviewCommentReviewGateErrorApprovalNotComparable() string {
-	return RenderGenericError(SchemaErrorData{
-		RequestedBy: previewRequestedBy,
-		Environment: "staging",
-		CommandName: action.Apply,
-		ErrorDetail: "Review gate check failed; see server logs for details. An approval of the latest commit satisfies the gate without this check.",
+	return RenderReviewGateError(ReviewGateData{
+		Database:            "testapp",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		OperatorReviewers:   []string{"acme/testapp-operators"},
+		OtherReviewers:      []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:            previewRequestedBy,
+		UncomparedApprovers: []string{"jdoe"},
 	})
 }
 

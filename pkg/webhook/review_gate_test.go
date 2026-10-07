@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -38,17 +37,6 @@ func TestReviewGateErrorDetailTeamMembership(t *testing.T) {
 	assert.Contains(t, detail, "GitHub App can read organization members")
 	assert.NotContains(t, detail, "expand team @octocat/schema-admins",
 		"raw error text must never render in PR markdown")
-}
-
-// A gate that could not compare an approval on an earlier commit with the
-// head tells the author the remedy that needs no comparison.
-func TestReviewGateErrorDetailApprovalNotComparable(t *testing.T) {
-	err := fmt.Errorf("compare schema change for octocat/hello-world#1 database %q at approved commit aaa111 and head abc123: %w",
-		"orders", errors.Join(errApprovalNotComparable, ghclient.ErrGitTreeTruncated))
-
-	detail := reviewGateErrorDetail(err)
-
-	assert.Equal(t, "Review gate check failed; see server logs for details. An approval of the latest commit satisfies the gate without this check.", detail)
 }
 
 func TestReviewGateErrorDetailGeneric(t *testing.T) {
@@ -223,11 +211,12 @@ const (
 	reviewGateApproved = "aaa111"
 )
 
-// The approval-coverage tables expect one of two verdicts per approval, or an
-// evaluation error.
+// The approval-coverage tables expect one of three verdicts per approval, or
+// an evaluation error.
 const (
-	wantCovers  = "covers"
-	wantChanged = "changed"
+	wantCovers     = "covers"
+	wantChanged    = "changed"
+	wantUncompared = "uncompared"
 )
 
 // An operator approves the PR at an earlier commit and the author then
@@ -466,20 +455,20 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			}(),
 			prChange:   addVotes,
 			headChange: addVotesAnd(func(files map[string]string) { files["app/orders.go"] = "package app // votes" }),
-			wantErr:    errApprovalNotComparable,
+			want:       wantUncompared,
 		},
 		{
 			name:       "a schema path reached through a symlink cannot be compared",
 			base:       map[string]string{"linked": reviewGateSymlink + "schema", "schema/testdb/orders/orders.sql": ordersTable},
 			schemaPath: "linked/testdb",
 			configPath: "linked/testdb/schemabot.yaml",
-			wantErr:    errApprovalNotComparable,
+			want:       wantUncompared,
 		},
 		{
 			name:            "an approved commit GitHub cannot find cannot be compared",
 			prChange:        addVotes,
 			approvedUnknown: true,
-			wantErr:         errApprovalNotComparable,
+			want:            wantUncompared,
 		},
 		{
 			name:             "a tree lookup GitHub cannot answer is a retryable evaluation failure",
@@ -566,17 +555,23 @@ func assertApprovalVerdict(t *testing.T, result *ReviewGateResult, want, reviewe
 	case wantCovers:
 		assert.True(t, result.Approved)
 		assert.Empty(t, result.ChangedApprovers)
+		assert.Empty(t, result.UncomparedApprovers)
 	case wantChanged:
 		assert.False(t, result.Approved)
 		assert.Equal(t, []string{reviewer}, result.ChangedApprovers)
+		assert.Empty(t, result.UncomparedApprovers)
+	case wantUncompared:
+		assert.False(t, result.Approved)
+		assert.Empty(t, result.ChangedApprovers)
+		assert.Equal(t, []string{reviewer}, result.UncomparedApprovers)
 	default:
 		require.Failf(t, "unknown verdict", "%q", want)
 	}
 }
 
 // An approval GitHub recorded without a commit cannot be compared with the
-// head, so the gate cannot decide and returns an evaluation error, reading
-// nothing to find that out.
+// head, so it does not count and the gate blocks, reading nothing to find
+// that out.
 func TestCheckReviewGate_ApprovalWithoutCommit(t *testing.T) {
 	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 		db := cfg.Databases["orders"]
@@ -592,8 +587,9 @@ func TestCheckReviewGate_ApprovalWithoutCommit(t *testing.T) {
 	require.NoError(t, err)
 
 	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
-	require.ErrorIs(t, err, errApprovalNotComparable)
-	assert.Nil(t, result)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assertApprovalVerdict(t, result, wantUncompared, "bob")
 	assert.Zero(t, reads.refs.Load(), "an approval without a commit needs no comparison")
 }
 
@@ -748,8 +744,8 @@ func registerReviewGateGitObjects(t *testing.T, mux *http.ServeMux, commits map[
 }
 
 // A schema directory holds more distinct symlinks than a comparison reads.
-// The comparison cannot be completed, so the gate returns an evaluation error,
-// and it gives up before reading any symlink: a directory full of links costs
+// The comparison cannot be completed, so the approval does not count, and the
+// gate gives up before reading any symlink: a directory full of links costs
 // one listing, not a GitHub read per link.
 func TestCheckReviewGate_SymlinkBudgetCheckedBeforeReads(t *testing.T) {
 	files := map[string]string{
@@ -760,8 +756,9 @@ func TestCheckReviewGate_SymlinkBudgetCheckedBeforeReads(t *testing.T) {
 		files[fmt.Sprintf("schema/testdb/alias_%03d", i)] = reviewGateSymlink + fmt.Sprintf("orders/../orders_%03d", i)
 	}
 	result, blobReads, err := checkReviewGateOnUnchangedFiles(t, files)
-	require.ErrorIs(t, err, errApprovalNotComparable)
-	assert.Nil(t, result)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assertApprovalVerdict(t, result, wantUncompared, "bob")
 	assert.Zero(t, blobReads, "the symlink budget is checked before any symlink is read")
 }
 
@@ -811,8 +808,8 @@ func checkReviewGateOnUnchangedFiles(t *testing.T, files map[string]string) (*Re
 // Two operators approved different earlier commits. One cannot be compared
 // with the head; the other proves the PR's schema change is the same, so the
 // gate is decided by that one and the apply proceeds. When the comparable
-// approval is of a different change instead, nothing decides the gate and it
-// returns an evaluation error rather than a block.
+// approval is of a different change instead, neither approval counts and the
+// gate blocks, naming each reviewer under the reason their approval missed.
 func TestCheckReviewGate_ApprovalNotComparableDefersToOtherApprovals(t *testing.T) {
 	const otherApproved = "bbb222"
 	ordersTable := "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
@@ -850,13 +847,14 @@ func TestCheckReviewGate_ApprovalNotComparableDefersToOtherApprovals(t *testing.
 			require.NoError(t, err)
 
 			result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, reviewGateSchema("schema/testdb", reviewGateTestHeadSHA))
-			if !tt.wantApproved {
-				require.ErrorIs(t, err, errApprovalNotComparable)
-				assert.Nil(t, result)
-				return
-			}
 			require.NoError(t, err)
 			require.NotNil(t, result)
+			if !tt.wantApproved {
+				assert.False(t, result.Approved)
+				assert.Equal(t, []string{"bob"}, result.UncomparedApprovers)
+				assert.Equal(t, []string{"carol"}, result.ChangedApprovers)
+				return
+			}
 			assert.True(t, result.Approved)
 		})
 	}
@@ -1492,7 +1490,7 @@ func TestEnforceReviewGate(t *testing.T) {
 		}
 	})
 
-	t.Run("an approval that cannot be compared is an evaluation failure naming the remedy", func(t *testing.T) {
+	t.Run("an approval that cannot be compared blocks with a gate error naming the remedy", func(t *testing.T) {
 		h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
 			db := cfg.Databases["orders"]
 			db.OperatorUsers = []string{"bob"}
@@ -1509,17 +1507,22 @@ func TestEnforceReviewGate(t *testing.T) {
 		client, err := h.clientForRepo("octocat/hello-world", 12345)
 		require.NoError(t, err)
 
-		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", false)
-		require.ErrorIs(t, err, errApprovalNotComparable)
-		assert.False(t, blocked, "an approval that cannot be compared is not a merit block")
+		// A durable attempt still comments: asking GitHub again returns the
+		// same answer, so the block is the command's answer and is not retried.
+		blocked, err := h.enforceReviewGate(t.Context(), client, "octocat/hello-world", 1, 12345, schemaResult, "staging", "alice", "apply", true)
+		require.NoError(t, err)
+		assert.True(t, blocked)
 
 		select {
 		case body := <-comments:
-			assert.Contains(t, body, "Review gate check failed; see server logs for details. An approval of the latest commit satisfies the gate without this check.")
+			assert.Contains(t, body, "Review Gate Error")
+			assert.Contains(t, body, "**This apply needs an approval of the latest commit.** @bob approved an earlier commit.")
+			assert.Contains(t, body, "1. Ask anyone listed above to approve the latest commit\n2. Once approved, run `schemabot apply -e staging` again\n")
+			assert.Contains(t, body, "- @bob\n")
 			assert.NotContains(t, body, "Review Required")
 			assert.NotContains(t, body, reviewGateApproved, "raw comparison errors must never render in PR markdown")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for evaluation-failure comment")
+			t.Fatal("timed out waiting for gate-error comment")
 		}
 	})
 

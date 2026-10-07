@@ -28,17 +28,28 @@ type ReviewGateResult struct {
 	// head, so the review-required comment can say why an approval visible on
 	// the PR does not count.
 	ChangedApprovers []string
+	// UncomparedApprovers are authorized reviewers whose approval was given
+	// on an earlier commit the gate could not compare with the head. Nothing
+	// proves such an approval still describes the head, so it does not count,
+	// and the gate-error comment names the remedy that needs no comparison.
+	UncomparedApprovers []string
 }
 
-// errApprovalNotComparable marks a gate evaluation that could not compare an
-// approval on an earlier commit with the head. Nothing proves the approval
-// still describes the head, so the gate cannot decide; an approval of the
-// head needs no comparison and decides it.
+// errApprovalNotComparable marks an approval on an earlier commit that could
+// not be compared with the head: GitHub answered, but what it returned cannot
+// prove the approval still describes the head (no recorded commit, an unknown
+// commit, a tree GitHub cannot list completely, a symlink that cannot be
+// followed). Asking again returns the same answer, so it is a block rather
+// than a retryable evaluation failure; an approval of the head needs no
+// comparison and lifts it.
 var errApprovalNotComparable = errors.New("an approval on an earlier commit cannot be compared with the head")
 
 // enforceReviewGate runs the review gate check and posts the appropriate comment if blocked.
-// Returns blocked=true when the gate blocks on the merits — the PR lacks an
-// approval from a configured review-policy principal (caller should return).
+// Returns blocked=true when the gate blocks — the PR lacks an approval from a
+// configured review-policy principal that covers the head (caller should
+// return). A block in which an approval could not be compared with the head
+// posts a gate-error comment; any other block posts Review Required. Both
+// name the reviewers who can approve the latest commit.
 // A gate evaluation failure (a GitHub read inside checkReviewGate, or a review
 // policy the gate cannot resolve) stops the command (fail closed) and is
 // returned as an error, not a block: the approval state could not be
@@ -48,7 +59,7 @@ var errApprovalNotComparable = errors.New("an approval on an earlier commit cann
 // are bounded by the driver's retry budget, so the gate does not maintain a
 // separate taxonomy for them. suppressRetryComments silences the
 // evaluation-failure comment on durable attempts, where the driver retries
-// and posts the single terminal answer instead; merit blocks always comment.
+// and posts the single terminal answer instead; blocks always comment.
 func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
 	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult)
 	if err != nil {
@@ -61,15 +72,21 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 		return false, fmt.Errorf("review gate check %s#%d: %w", repo, pr, err)
 	}
 	if gateResult != nil && !gateResult.Approved {
-		h.postComment(repo, pr, installationID, templates.RenderReviewRequired(templates.ReviewGateData{
-			Database:          schemaResult.Database,
-			Environment:       environment,
-			RequestedBy:       requestedBy,
-			OperatorReviewers: gateResult.OperatorReviewers,
-			OtherReviewers:    gateResult.OtherReviewers,
-			PRAuthor:          gateResult.PRAuthor,
-			ChangedApprovers:  gateResult.ChangedApprovers,
-		}))
+		data := templates.ReviewGateData{
+			Database:            schemaResult.Database,
+			Environment:         environment,
+			RequestedBy:         requestedBy,
+			OperatorReviewers:   gateResult.OperatorReviewers,
+			OtherReviewers:      gateResult.OtherReviewers,
+			PRAuthor:            gateResult.PRAuthor,
+			ChangedApprovers:    gateResult.ChangedApprovers,
+			UncomparedApprovers: gateResult.UncomparedApprovers,
+		}
+		if len(gateResult.UncomparedApprovers) > 0 {
+			h.postComment(repo, pr, installationID, templates.RenderReviewGateError(data))
+		} else {
+			h.postComment(repo, pr, installationID, templates.RenderReviewRequired(data))
+		}
 		return true, nil
 	}
 	return false, nil
@@ -81,9 +98,6 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 // that must not land in PR markdown; operators triage from the server logs.
 func reviewGateErrorDetail(err error) string {
 	detail := "Review gate check failed; see server logs for details"
-	if errors.Is(err, errApprovalNotComparable) {
-		detail += ". An approval of the latest commit satisfies the gate without this check."
-	}
 	if errors.Is(err, ghclient.ErrTeamMembershipUnreadable) {
 		detail += ". If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership."
 	}
@@ -102,10 +116,11 @@ func reviewGateErrorDetail(err error) string {
 // An approval counts only for the schema change it reviewed: it must have been
 // given on HeadSHA, or on an earlier commit at which the PR's change to the
 // database's schema inputs is the same as at HeadSHA (see approvalCoversHead).
-// When GitHub is unavailable while proving that, or an earlier commit cannot
-// be compared with HeadSHA at all, the approval state is undetermined and the
-// gate returns an evaluation error rather than a block, unless another
-// approval covers the head.
+// When GitHub is unavailable while proving that, the approval state is
+// undetermined and the gate returns an evaluation error rather than a block.
+// An approval on an earlier commit that cannot be compared with HeadSHA at all
+// does not count; it is recorded in UncomparedApprovers so the comment can say
+// why it was not counted.
 func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
 	if !h.isReviewGateEnabled(repo) {
 		return nil, nil
@@ -165,8 +180,7 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		inputPaths: reviewGateInputPaths(schema),
 		verdicts:   make(map[string]approvalVerdict),
 	}
-	var changedApprovers []string
-	var notComparable error
+	var changedApprovers, uncomparedApprovers []string
 	for _, approval := range validApprovals {
 		reviewer := approval.User
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
@@ -179,12 +193,10 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 			continue
 		}
 		covers, err := h.approvalCoversHead(ctx, client, &coverage, approval)
-		// An approval that cannot be compared leaves the gate undecided only
-		// if no other approval covers the head, so the rest are still checked.
+		// An approval that cannot be compared does not count, but another
+		// approval may still cover the head, so the rest are still checked.
 		if errors.Is(err, errApprovalNotComparable) {
-			if notComparable == nil {
-				notComparable = err
-			}
+			uncomparedApprovers = append(uncomparedApprovers, reviewer)
 			continue
 		}
 		if err != nil {
@@ -210,21 +222,20 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		}, nil
 	}
 
-	if notComparable != nil {
-		return nil, notComparable
-	}
 	h.logger.Info("review gate: blocked",
 		"repo", repo, "pr", pr, "database", database,
 		"valid_approvers", validApprovers,
-		"changed_approvers", changedApprovers, "head_sha", headSHA,
+		"changed_approvers", changedApprovers,
+		"uncompared_approvers", uncomparedApprovers, "head_sha", headSHA,
 		"operator_reviewers", policy.OperatorReviewers,
 		"other_reviewers", policy.OtherReviewers)
 	return &ReviewGateResult{
-		Approved:          false,
-		OperatorReviewers: policy.OperatorReviewers,
-		OtherReviewers:    policy.OtherReviewers,
-		PRAuthor:          prInfo.User,
-		ChangedApprovers:  changedApprovers,
+		Approved:            false,
+		OperatorReviewers:   policy.OperatorReviewers,
+		OtherReviewers:      policy.OtherReviewers,
+		PRAuthor:            prInfo.User,
+		ChangedApprovers:    changedApprovers,
+		UncomparedApprovers: uncomparedApprovers,
 	}, nil
 }
 
