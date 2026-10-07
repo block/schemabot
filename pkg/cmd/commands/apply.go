@@ -653,7 +653,7 @@ const (
 	logHeartbeatDefault = 10 * time.Second
 )
 
-// tableLogState tracks the last-emitted state for a single table to detect changes.
+// tableLogState tracks the last-emitted state for a single task to detect changes.
 type tableLogState struct {
 	status         string    // last emitted status (normalized)
 	lastEmit       time.Time // last time a line was emitted for this table
@@ -900,10 +900,11 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 
 		// Emit per-table events
 		for _, tbl := range tables {
-			ts, ok := tableStates[tbl.TableName]
+			key := tableLogKey(tbl)
+			ts, ok := tableStates[key]
 			if !ok {
 				ts = &tableLogState{startedAt: time.Now()}
-				tableStates[tbl.TableName] = ts
+				tableStates[key] = ts
 			}
 
 			tblStatus := state.NormalizeState(tbl.Status)
@@ -1021,7 +1022,17 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 	}
 }
 
-// tableKVs returns the common key-value pairs for a table log line (table name + task_id if known).
+// tableLogKey uses the durable task identity, which distinguishes repeated
+// statements on the same member and table. Legacy responses without task IDs
+// are scoped by namespace and rollout member; quoting keeps the tuple unambiguous.
+func tableLogKey(tbl *apitypes.TableProgressResponse) string {
+	if tbl.TaskID != "" {
+		return "task:" + tbl.TaskID
+	}
+	return fmt.Sprintf("legacy:%q/%q/%q/%q", tbl.Keyspace, tbl.Deployment, tbl.Target, tbl.TableName)
+}
+
+// tableKVs returns the common identity and provenance fields for a table log line.
 func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState) []string {
 	kvs := []string{"msg", msg, "table", tbl.TableName}
 	taskID := ts.taskID
@@ -1033,6 +1044,12 @@ func tableKVs(msg string, tbl *apitypes.TableProgressResponse, ts *tableLogState
 	}
 	if tbl.Keyspace != "" {
 		kvs = append(kvs, "keyspace", tbl.Keyspace)
+	}
+	if tbl.Deployment != "" {
+		kvs = append(kvs, "deployment", tbl.Deployment)
+	}
+	if tbl.Target != "" {
+		kvs = append(kvs, "target", tbl.Target)
 	}
 	return kvs
 }
