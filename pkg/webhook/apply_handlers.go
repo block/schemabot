@@ -362,10 +362,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// The rollout round runs whether or not the primary target has work: it
 	// stores the plan each other target runs, bound to this plan, and an apply
 	// created from this plan has nothing to run on a target without one. When
-	// other targets have work, the apply runs their own plans, and it always
-	// stops for apply-confirm: the one-step gates below read only the reviewed
-	// plan, so the operator confirms against the comment that renders every
-	// target's plan instead.
+	// other targets have work, the apply runs their own plans in the same step,
+	// as it runs the primary plan: every gate below reads each target's plan,
+	// and the comment the apply posts renders every target's plan.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 	primaryTargetConverged := !planResp.HasChanges()
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
@@ -401,7 +400,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}
-		h.logger.Info("apply: other targets have plans of their own; they will run once confirmed",
+		h.logger.Info("apply: other targets have plans of their own; the apply runs each of them",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged,
 			"targets_pending", rollout.work.pending, "targets", rollout.work.members,
@@ -565,14 +564,6 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// Other targets have work, so the apply runs their own plans, and it never
-	// does so in one step: the gates that let an apply proceed automatically
-	// read only the primary plan. The operator confirms against this comment,
-	// which renders every target's plan.
-	if runsMemberWork {
-		return h.pauseForMemberWorkConfirmation(ctx, repo, pr, installationID, schemaResult, planResp, environment, rollout, commentData, primaryTargetConverged)
-	}
-
 	// Discarding an unfinished copy destroys work already done on the target —
 	// often hours of it — so it never happens in one step. Downgrade to the
 	// two-step confirm against the locked comment that discloses what is being
@@ -588,7 +579,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		// (keyed on this plan's intent) and stays retryable — the re-drive
 		// re-plans from the top, reacquires the lock, and reaches this gate
 		// again — so the pause is never acknowledged over unknown check state.
-		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+		headSHA, checkRunErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)
 		if checkRunErr != nil {
 			h.logger.Error("failed to store check state for copy-discard downgrade; the merge gate does not reflect the pending changes, so the command stays retryable",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
@@ -627,7 +618,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"review them, then confirm to apply them.",
 		}
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+		headSHA, checkRunErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)
 		if checkRunErr != nil {
 			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
 		}
@@ -642,7 +633,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// releases the lock (keyed on this plan's intent) and stays retryable — the
 	// re-drive re-plans from the top, reacquires the lock, and stores again —
 	// so the apply never dispatches over unknown check state.
-	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+	headSHA, checkErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)
 	if checkErr != nil {
 		h.logger.Error("failed to store check state for automatic apply; the merge gate does not reflect the pending changes, so nothing was dispatched and the command stays retryable",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,

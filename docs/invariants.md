@@ -657,7 +657,9 @@ every path that records a check from a plan plans the other members first. A mem
 be planned is unknown work, never none. *Breaks if violated:* a PR merges green while a target still
 lacks its schema change. *Enforced:* member work counted into the stored check state
 (`upsertPlanCheckRecord` in `pkg/webhook/check_records.go`, read from `PlanRollup.MembersWithWork`
-in `pkg/api`); the rollout round the apply command and apply-confirm run before answering any
+in `pkg/api`, and stored from the rollout round when an apply runs other members' plans by
+`storeApplyCheckRecord` in `pkg/webhook/apply_check_records.go`); the rollout round the apply
+command and apply-confirm run before answering any
 primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); apply creation
 refusing member work the apply's operation shape cannot carry, rather than settling that member as
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
@@ -1546,8 +1548,8 @@ unfinished row copy, require the operator to confirm the specific consequences d
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
 after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
 `pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
-primary target's included, is what the confirmation was given against and carries no consequence
-it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
+primary target's included, is what the confirmation, or the comment an automatic apply posted,
+was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
 `pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
 member's unsafe change requiring the same opt-in as the primary plan's, both at the PR gate
 (`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
@@ -1591,10 +1593,10 @@ resolution (`storage.Plan.DirectExecution`, `pkg/api/plan_handlers.go`); in a ro
 member's own direct changes disclosed under that member's plan (`deploymentPlanGroups` in
 `pkg/webhook/plan_drift.go`; for a plan requested through the API, members grouped on their
 verdicts as well as their work by `planGroupKey` in `pkg/api/plan_rollout.go` and disclosed by
-`directChangeNotices` in `pkg/cmd/commands/plan.go`), with apply-confirm refusing a member whose
-execution modes differ from the confirmed round's (`roundCoversWork` in
+`directChangeNotices` in `pkg/cmd/commands/plan.go`), with a pull request apply refusing or
+pausing a member whose execution modes differ from the reviewed round's (`roundCoversWork` in
 `pkg/webhook/apply_member_work.go`), and apply creation refusing a member's own direct change for
-any caller other than that confirmed apply-confirm (`rejectUnconfirmedMemberDirectExecution` in
+any caller other than that pull request apply (`rejectUnconfirmedMemberDirectExecution` in
 `pkg/api/plan_handlers.go`).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored

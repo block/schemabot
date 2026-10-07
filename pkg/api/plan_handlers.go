@@ -585,9 +585,10 @@ type ApplyRequest struct {
 	ExpectedLockOwner     string `json:"-"`
 	ExpectedPendingPlanID string `json:"-"`
 	// ConfirmedMemberWork is an internal webhook guard, set only by a pull
-	// request apply-confirm that checked the confirmation against every other
-	// target's statements, execution modes and unsafe verdicts, on a comment disclosing each
-	// target's direct and unsafe changes under that target. Without it, apply
+	// request apply that checked every other target's statements, execution
+	// modes and unsafe verdicts against the round whose comment disclosed each
+	// target's direct and unsafe changes under that target: the comment an
+	// apply-confirm was given against, or the one the apply command posted. Without it, apply
 	// creation refuses another target's direct-execution change, and an unsafe
 	// change the primary plan does not carry: no other caller confirms them.
 	// Direct API callers cannot assert it through JSON.
@@ -1945,10 +1946,10 @@ func (s *Service) createStoredApply(
 	//
 	// A member's direct-execution verdict is the verdict of the target that
 	// runs the statement (RV-4), so its task carries it, whether or not the
-	// primary plan has work. Only a pull request apply-confirm confirms it:
-	// that comment names each target's direct changes under that target, and
-	// the confirm re-checks each target's statements, execution modes and
-	// unsafe verdicts against the confirmed round before it creates the apply. No other caller
+	// primary plan has work. Only a pull request apply confirms it: the
+	// comment behind it names each target's direct changes under that target,
+	// and the apply re-checks each target's statements, execution modes and
+	// unsafe verdicts against that comment's round before it creates the apply. No other caller
 	// confirms another target's direct change, the CLI included, though it
 	// shows each target's notice, so a member's direct change is refused for
 	// it, and runs from an apply narrowed to that member.
@@ -1956,7 +1957,7 @@ func (s *Service) createStoredApply(
 	// Every member's unsafe change needs the opt-in, as the primary plan's
 	// does: one --allow-unsafe consents for every target, the way it does for a
 	// single target (RV-3). That comment also lists each target's unsafe
-	// changes under that target, so a confirmed apply runs them. Any other
+	// changes under that target, so a pull request apply runs them. Any other
 	// caller was shown only the primary plan's disclosure, so for it a
 	// member's unsafe change runs only when the primary plan carries the same
 	// change.

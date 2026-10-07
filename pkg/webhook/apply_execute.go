@@ -164,10 +164,11 @@ func (h *Handler) executeApply(
 	// created from this re-plan, and each other target runs the plan this round
 	// stores for it, bound to this re-plan.
 	//
-	// Other targets' work runs only from apply-confirm, and only when the
-	// confirmation was given against exactly that work. An automatic apply
-	// reaching here with other targets' work saw it appear after its comment was
-	// posted without it, so it refuses.
+	// Other targets' work runs only when the comment behind this apply showed
+	// exactly that work: on apply-confirm, the comment the confirmation was
+	// given against, and on an automatic apply, the comment the apply command
+	// posted with every target's plan just before this re-plan. Work that comment
+	// did not show stops for a fresh confirmation or is refused.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 	primaryTargetConverged := !planResp.HasChanges()
 	refuseRollout := func(reason string) {
@@ -175,21 +176,42 @@ func (h *Handler) executeApply(
 		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged)
 	}
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
-	// confirmedMemberWork records that this confirmation was checked against
-	// every other target's work, so apply creation may run the direct changes
-	// the comment disclosed under those targets.
+	// confirmedMemberWork records that this apply was checked against every
+	// other target's work on the comment behind it, so apply creation may run
+	// the direct changes that comment disclosed under those targets.
 	confirmedMemberWork := false
 	switch {
-	case runsMemberWork && storedPlan == nil:
+	case runsMemberWork:
 		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment)
 		if coverErr != nil {
-			// The confirmation is kept: nothing is known to be wrong with it,
-			// and a retry can still confirm the plans the operator reviewed.
-			h.logger.Error("apply-confirm rejected: could not verify that the confirmation covers the other targets' work; the pending confirmation is preserved",
+			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
+				"could not verify that the reviewed plans cover the other targets' work", coverErr,
+				"SchemaBot could not verify the plans this apply covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+			return
+		}
+		if !covered && storedPlan != nil {
+			// The apply command posted every target's plan moments ago, and a
+			// target's schema changed before this re-plan. As with a primary
+			// plan whose DDL drifted, stop and ask against a comment that
+			// shows each target's plan as it is now.
+			h.logger.Info("automatic apply downgraded: the other targets' plans changed after the apply posted them",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", coverErr)
-			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				"SchemaBot could not verify the plans this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				rolloutPlansChangedCause, rolloutPreview, runsMemberWork); err != nil {
+				h.logger.Error("failed to post the comment showing the targets' changed plans, so the pending confirmation was not moved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				return
+			}
+			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+				h.logger.Error("failed to re-pin the pending confirmation onto the plan whose comment shows the targets' changed plans",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"The targets' plans changed while this apply was starting. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to review them.")
+			}
 			return
 		}
 		if !covered {
@@ -200,16 +222,14 @@ func (h *Handler) executeApply(
 			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
 			return
 		}
-		// The statements match the confirmed round's, but a copy can appear on
+		// The statements match the reviewed round's, but a copy can appear on
 		// a target after the comment was posted, and work the apply cannot run
-		// is refused here, releasing the confirmation, rather than at apply
-		// creation, which would leave it pinned.
+		// is refused here, releasing the lock, rather than at apply creation,
+		// which would leave it pinned.
 		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
 		if refusalErr != nil {
-			h.logger.Error("apply-confirm rejected: could not verify that the other targets' plans can run from this apply; the pending confirmation is preserved",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", refusalErr)
-			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
+				"could not verify that the other targets' plans can run from this apply", refusalErr,
 				otherTargetPlansUnverifiedMessage(actionName, environment))
 			return
 		}
@@ -219,12 +239,9 @@ func (h *Handler) executeApply(
 			return
 		}
 		confirmedMemberWork = true
-		h.logger.Info("apply-confirm: running the confirmed plans of the other targets that still need the change",
+		h.logger.Info("apply: running the reviewed plans of the other targets that still need the change",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names)
-	case runsMemberWork:
-		refuseRollout("other targets' work was not on the comment this automatic apply acts on")
-		return
+			"action", actionName, "plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names)
 	case rollout.blocks():
 		refuseRollout("the rollout round could not confirm every target's plan")
 		return
@@ -535,6 +552,40 @@ func (h *Handler) executeApply(
 		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy, "Apply was accepted, but SchemaBot could not update the required status check: "+err.Error())
 		return
 	}
+}
+
+// rolloutPlansChangedCause heads the comment an automatic apply posts when a
+// target's plan changed between the comment the apply command posted and the
+// re-plan the apply runs from.
+var rolloutPlansChangedCause = &templates.PausedApplyCauseData{
+	Heading: "A target's plan changed while this apply was starting",
+	Remedy: "Nothing has run. The plans above are each target's plan as it is now; " +
+		"review them, then confirm to apply them.",
+}
+
+// rejectUnverifiedMemberWork answers an apply that could not read what it needs
+// to tell whether the other targets' work is what the comment behind it showed.
+// Nothing is known to be wrong with that comment, so an apply-confirm keeps its
+// pending confirmation for a retry. An automatic apply releases the lock it
+// took, as its other failures past the hand-off do: the operator's recovery is
+// re-issuing the command.
+func (h *Handler) rejectUnverifiedMemberWork(
+	ctx context.Context, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
+	environment, requestedBy, actionName string, automatic bool, expectedPendingPlanID, planID string,
+	what string, err error, message string,
+) {
+	database, dbType := schemaResult.Database, schemaResult.Type
+	if automatic {
+		h.logger.Error("automatic apply rejected: "+what+"; the lock is released",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"posted_plan_id", expectedPendingPlanID, "plan_id", planID, "error", err)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, what)
+	} else {
+		h.logger.Error("apply-confirm rejected: "+what+"; the pending confirmation is preserved",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"pending_plan_id", expectedPendingPlanID, "plan_id", planID, "error", err)
+	}
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, message)
 }
 
 func applyExecutionErrorMessage(command, environment string, err error) string {

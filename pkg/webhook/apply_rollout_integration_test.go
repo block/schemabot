@@ -84,10 +84,10 @@ func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, r
 	return result
 }
 
-// awaitConfirmedApply waits for the apply an apply-confirm creates on the
-// rollout fixture's database, failing if the confirmation reports that it could
-// not create one.
-func awaitConfirmedApply(t *testing.T, svc *api.Service, dbName string, confirm *planFlowResult) *storage.Apply {
+// awaitRolloutApply waits for the command to create an apply on the rollout
+// fixture's database, failing if it posts a refusal, an execution failure or a
+// pause for apply-confirm instead.
+func awaitRolloutApply(t *testing.T, svc *api.Service, dbName string, command *planFlowResult) *storage.Apply {
 	t.Helper()
 	var created *storage.Apply
 	require.Eventually(t, func() bool {
@@ -102,13 +102,47 @@ func awaitConfirmedApply(t *testing.T, svc *api.Service, dbName string, confirm 
 			}
 		}
 		select {
-		case posted := <-confirm.comments:
-			require.NotContains(t, posted, "Failed to execute apply", "the confirmation must create the apply")
+		case posted := <-command.comments:
+			require.NotContains(t, posted, "Failed to execute apply", "the command must create the apply")
+			require.NotContains(t, posted, "nothing was applied", "the command must create the apply")
+			require.NotContains(t, posted, "Confirmation required", "the command must create the apply")
 		default:
 		}
 		return false
-	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "the confirmation creates an apply")
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "the command creates an apply")
 	return created
+}
+
+// pinRolloutConfirmation leaves the rollout fixture where an apply that stopped
+// for apply-confirm leaves it: the plan command stores every target's plan,
+// bound to the primary target's plan, and the lock pins that plan for
+// confirmation. nil files plans the PR's default schema.
+func pinRolloutConfirmation(t *testing.T, svc *api.Service, dbName string, files map[string]string) {
+	t.Helper()
+	if files == nil {
+		files = map[string]string{"users.sql": usersWithEmailSchema}
+	}
+	runRolloutCommandWithFiles(t, svc, dbName, "schemabot plan -e "+driftEnv, files)
+	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
+	require.NoError(t, err)
+	var reviewed *storage.Plan
+	for _, plan := range plans {
+		if plan.Database == dbName && plan.PrimaryPlanIdentifier == "" && (reviewed == nil || plan.ID > reviewed.ID) {
+			reviewed = plan
+		}
+	}
+	require.NotNil(t, reviewed, "the plan command stores the primary target's plan")
+	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: reviewed.PlanIdentifier,
+	}))
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
 }
 
 // awaitCapture returns the first value the command publishes on ch that
@@ -159,10 +193,10 @@ func requireNoApplies(t *testing.T, svc *api.Service, dbName string) {
 // Two targets planned against schemas of their own, where the primary target
 // (eu) already has the column the PR adds and us does not. The plan check must
 // not pass on the primary's empty plan: it records the pending work on us. The
-// apply command neither reports "no changes" nor runs anything yet: it pauses
-// for confirmation on a comment that shows us's own plan, with the check still
-// pending. Confirming runs us's own plan and settles eu, which has nothing to do.
-func TestE2EConvergedPrimaryWithPendingTargetAppliesAfterConfirmation(t *testing.T) {
+// apply command does not report "no changes": it posts a comment that shows
+// us's own plan and, in the same step, creates one apply that runs us's plan
+// and settles eu, which has nothing to do.
+func TestE2EConvergedPrimaryWithPendingTargetAppliesEveryTarget(t *testing.T) {
 	dbName := "webhook_rollout_pending"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersWithEmailSchema},
@@ -181,34 +215,16 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesAfterConfirmation(t *testing
 	assert.Empty(t, check.BlockingReason, "independent targets differing is not drift")
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Confirmation required")
-	assert.Contains(t, body, "The primary target already has this schema")
-	assert.Contains(t, body, "ADD COLUMN `email`", "the comment shows the plan us would run")
-	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "ADD COLUMN `email`")
 	assert.Contains(t, body, "### Target `eu`\n\nNo schema changes detected\n\n", "eu is shown already at the desired schema")
 	assert.NotContains(t, body, "✅ **No schema changes detected**", "a target still has work, so the comment never closes as a no-op")
+	assert.NotContains(t, body, "Confirmation required", "the apply runs every target's plan in one step")
+	assert.NotContains(t, body, "schemabot apply-confirm")
 
-	requireNoApplies(t, svc, dbName)
+	created := awaitRolloutApply(t, svc, dbName, apply)
 	check = rolloutCheck(t, svc, dbName)
-	assert.Equal(t, "action_required", check.Conclusion, "the paused apply leaves the check pending")
+	assert.NotEqual(t, "success", check.Conclusion, "us still needs the change while the apply runs, so the check never passes on eu's empty plan")
 	assert.True(t, check.HasChanges)
-
-	runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
-
-	var created *storage.Apply
-	require.Eventually(t, func() bool {
-		applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
-		if err != nil {
-			return false
-		}
-		for _, a := range applies {
-			if a.Database == dbName {
-				created = a
-				return true
-			}
-		}
-		return false
-	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "the confirmation creates an apply")
 
 	operations, err := svc.Storage().ApplyOperations().ListByApply(t.Context(), created.ID)
 	require.NoError(t, err)
@@ -231,9 +247,8 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesAfterConfirmation(t *testing
 
 // Two targets planned against schemas of their own, where both the reviewed
 // primary (eu) and us still need the column. The apply runs each target's own
-// plan: the apply command pauses for apply-confirm on a comment that renders
-// every target's plan, since the one-step gates read only the primary plan,
-// and confirming creates one apply that drives the column onto both targets.
+// plan: the apply command posts a comment that renders every target's plan and,
+// in the same step, creates one apply that drives the column onto both targets.
 func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *testing.T) {
 	dbName := "webhook_rollout_both"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
@@ -248,19 +263,11 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
-		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "Failed to execute apply")
-	})
-	require.NotContains(t, body, "Failed to execute apply")
-	assert.Contains(t, body, "Each target runs its own plan")
+	body := awaitCommentContaining(t, apply, "ADD COLUMN `email`")
 	assert.Contains(t, body, "`eu`, `us`", "the comment names every target the plan runs on")
-	assert.Contains(t, body, "ADD COLUMN `email`")
-	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
-	requireNoApplies(t, svc, dbName)
+	assert.NotContains(t, body, "Confirmation required", "the apply runs every target's plan in one step")
 
-	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
-
-	created := awaitConfirmedApply(t, svc, dbName, confirm)
+	created := awaitRolloutApply(t, svc, dbName, apply)
 
 	operations, err := svc.Storage().ApplyOperations().ListByApply(t.Context(), created.ID)
 	require.NoError(t, err)
@@ -287,10 +294,10 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 // Two targets planned against schemas of their own, both on the direct
 // execution policy, both reshaping the users primary key: the schema change
 // engine refuses the reshape and the policy routes it to native DDL on each
-// target. The comment the operator confirms discloses that direct change under
-// the targets that run it, so apply-confirm creates one apply in which us's
-// task carries us's own direct verdict.
-func TestE2EApplyConfirmRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
+// target. The comment the apply command posts discloses that direct change
+// under the targets that run it, and the apply it creates in the same step
+// gives us's task us's own direct verdict.
+func TestE2EApplyRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 	dbName := "webhook_rollout_direct"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersPreReshapeSchema, engineMetadata: directPolicyMetadata},
@@ -304,17 +311,10 @@ func TestE2EApplyConfirmRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 	runRolloutCommandWithFiles(t, svc, dbName, "schemabot plan -e "+driftEnv, files)
 
 	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
-	body := awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
-		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied") || strings.Contains(body, "Failed to execute apply")
-	})
-	require.Contains(t, body, "Confirmation required", "another target's work pauses for apply-confirm")
-	assert.Contains(t, body, "`eu`, `us`")
-	assert.Contains(t, body, "**Direct execution**", "the comment discloses the direct change under the targets that run it")
-	requireNoApplies(t, svc, dbName)
+	body := awaitCommentContaining(t, apply, "**Direct execution**")
+	assert.Contains(t, body, "`eu`, `us`", "the comment discloses the direct change under the targets that run it")
 
-	confirm := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe", files)
-
-	created := awaitConfirmedApply(t, svc, dbName, confirm)
+	created := awaitRolloutApply(t, svc, dbName, apply)
 
 	operations, err := svc.Storage().ApplyOperations().ListByApply(t.Context(), created.ID)
 	require.NoError(t, err)
@@ -345,8 +345,9 @@ const usersPreReshapeSchema = "CREATE TABLE `users` (\n" +
 // direct execution policy, still needs it, so the only change the apply would
 // run is us's native DDL, which has no cutover. --defer-cutover has nothing to
 // act on there, though the primary plan alone shows no direct change: the apply
-// command refuses the flag before taking a lock, and apply-confirm refuses it
-// while keeping the pending confirmation, as they do for one target.
+// command refuses the flag before taking a lock, and an apply-confirm of a
+// pending confirmation refuses it while keeping that confirmation, as they do
+// for one target.
 func TestE2EDeferCutoverRefusedWhenOnlyAnotherTargetRunsDirectChanges(t *testing.T) {
 	dbName := "webhook_rollout_direct_defer"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
@@ -364,12 +365,7 @@ func TestE2EDeferCutoverRefusedWhenOnlyAnotherTargetRunsDirectChanges(t *testing
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
 
-	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
-	body = awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
-		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied") || strings.Contains(body, "Failed to execute apply")
-	})
-	require.Contains(t, body, "Confirmation required", "another target's work pauses for apply-confirm")
-	assert.Contains(t, body, "**Direct execution**", "the comment discloses us's direct change")
+	pinRolloutConfirmation(t, svc, dbName, files)
 
 	confirm := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
 	body = awaitCommentContaining(t, confirm, "has no effect on this plan")
@@ -393,10 +389,10 @@ const usersWithTenantIndexSchema = "CREATE TABLE `users` (\n" +
 // The primary target (eu), on the direct execution policy, needs only the
 // primary key reshape, which runs as native DDL with no cutover. us already has
 // the reshaped key and needs only the index, which the schema change engine
-// copies and cuts over. --defer-cutover has us's cutover to defer, so the
-// comment the apply pauses on suggests an apply-confirm that keeps the flag,
-// though the primary plan alone has nothing to defer.
-func TestE2EPausedApplyKeepsDeferCutoverForAnotherTargetsCutover(t *testing.T) {
+// copies and cuts over. --defer-cutover has us's cutover to defer, so the apply
+// runs every target in one step and keeps the flag, though the primary plan
+// alone has nothing to defer.
+func TestE2EApplyKeepsDeferCutoverForAnotherTargetsCutover(t *testing.T) {
 	dbName := "webhook_rollout_mixed_defer"
 	usersWithTenantIndexLive := strings.Replace(strings.TrimSuffix(usersWithTenantIndexSchema, ";"),
 		"  PRIMARY KEY (`id`,`tenant_id`),\n", "  PRIMARY KEY (`id`),\n", 1)
@@ -409,26 +405,13 @@ func TestE2EPausedApplyKeepsDeferCutoverForAnotherTargetsCutover(t *testing.T) {
 	})
 	files := map[string]string{"users.sql": usersWithTenantIndexSchema}
 
-	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
-	body := awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
-		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied") ||
-			strings.Contains(body, "Failed to execute apply") || strings.Contains(body, "has no effect on this plan")
-	})
-	require.Contains(t, body, "Confirmation required", "another target's work pauses for apply-confirm")
-	assert.Contains(t, body, "**Direct execution**", "the comment discloses eu's direct change")
-	confirmLine := ""
-	for line := range strings.SplitSeq(body, "\n") {
-		if strings.Contains(line, "schemabot apply-confirm") {
-			confirmLine = line
-			break
-		}
-	}
-	require.NotEmpty(t, confirmLine, "the comment suggests an apply-confirm:\n%s", body)
-	assert.Contains(t, confirmLine, "--defer-cutover", "us's cutover is still to defer")
+	plan := runRolloutCommandWithFiles(t, svc, dbName, "schemabot plan -e "+driftEnv, files)
+	planBody := awaitCommentContaining(t, plan, "**Direct execution**")
+	assert.Contains(t, planBody, "idx_tenant", "the comment shows us's index")
 
-	confirm := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
-	created := awaitConfirmedApply(t, svc, dbName, confirm)
-	assert.True(t, storage.ParseApplyOptions(created.Options).DeferCutover, "the confirmed apply defers the cutover")
+	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe --defer-cutover", files)
+	created := awaitRolloutApply(t, svc, dbName, apply)
+	assert.True(t, storage.ParseApplyOptions(created.Options).DeferCutover, "the apply defers us's cutover")
 }
 
 // Two targets planned against schemas of their own, both needing the column.
@@ -436,8 +419,7 @@ func TestE2EPausedApplyKeepsDeferCutoverForAnotherTargetsCutover(t *testing.T) {
 // a change the primary plan does not carry. The plan comment discloses us's
 // unsafe change under us, so the apply runs every target the way a single
 // target runs: without --allow-unsafe it is refused, naming us's change, and
-// with it, it pauses on the comment that discloses each target's changes and
-// apply-confirm runs us's own plan.
+// with it, the apply runs us's own plan in the same step.
 func TestE2EIndependentRolloutRunsAnotherTargetsDisclosedUnsafeChange(t *testing.T) {
 	dbName := "webhook_rollout_unsafe"
 	withNickname := strings.Replace(usersBaseSchema, "  PRIMARY KEY", "  `nickname` varchar(64) DEFAULT NULL,\n  PRIMARY KEY", 1)
@@ -465,14 +447,7 @@ func TestE2EIndependentRolloutRunsAnotherTargetsDisclosedUnsafeChange(t *testing
 	requireNoApplyLock(t, svc, dbName)
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe")
-	body = awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
-		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied")
-	})
-	require.Contains(t, body, "Confirmation required", "another target's work pauses for apply-confirm")
-	requireNoApplies(t, svc, dbName)
-
-	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe")
-	created := awaitConfirmedApply(t, svc, dbName, confirm)
+	created := awaitRolloutApply(t, svc, dbName, apply)
 	requireTaskDDLByDeployment(t, svc, created, map[string][]string{
 		"eu": {"DROP COLUMN `nickname`"},
 		"us": {"DROP COLUMN `nickname`", "DROP COLUMN `legacy_id`"},
@@ -575,8 +550,8 @@ func TestE2EDriftedMirrorBlocksApplyWhenTheReviewedTargetHasWork(t *testing.T) {
 	assert.Equal(t, storage.ReviewTimeDeploymentDriftBlockingReason, check.BlockingReason)
 }
 
-// Both targets need the column, so the apply pauses on a comment that renders
-// each target's own plan. Before the operator confirms, us can no longer be
+// Both targets need the column, and a pending confirmation pins a round that
+// planned each target's own plan. Before the operator confirms, us can no longer be
 // planned. apply-confirm plans every target again, and a target it cannot plan
 // is unknown work, so it refuses, runs nothing on either target, and releases
 // the pending confirmation.
@@ -590,8 +565,7 @@ func TestE2EApplyConfirmRefusesWhenATargetCanNoLongerBePlanned(t *testing.T) {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "Confirmation required")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	admin := openDriftDB(t, driftDSN(t, ""))
 	_, err := admin.ExecContext(t.Context(), "DROP DATABASE `"+dbName+"_us`")
@@ -639,31 +613,10 @@ func TestE2EApplyConfirmOnConvergedPrimaryWithPendingTargetRefuses(t *testing.T)
 		{name: "us", liveSchema: usersBaseSchema},
 	}, api.PlanIndependent)
 
-	runRolloutCommand(t, svc, dbName, "schemabot plan -e "+driftEnv)
-	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
-	require.NoError(t, err)
-	var reviewed *storage.Plan
-	for _, plan := range plans {
-		if plan.Database == dbName && plan.PrimaryPlanIdentifier == "" {
-			reviewed = plan
-		}
-	}
-	require.NotNil(t, reviewed, "the plan command stores the primary target's plan")
-
-	require.NoError(t, svc.Storage().Locks().Acquire(t.Context(), &storage.Lock{
-		DatabaseName:  dbName,
-		DatabaseType:  "mysql",
-		Repository:    "octocat/hello-world",
-		PullRequest:   1,
-		Owner:         "octocat/hello-world#1",
-		PendingPlanID: reviewed.PlanIdentifier,
-	}))
-	t.Cleanup(func() {
-		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
-	})
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
-	_, err = eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(255) DEFAULT NULL")
+	_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(255) DEFAULT NULL")
 	require.NoError(t, err)
 	us := openDriftDB(t, driftDSN(t, dbName+"_us"))
 	_, err = us.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `nickname` varchar(64) DEFAULT NULL")
@@ -682,9 +635,9 @@ func TestE2EApplyConfirmOnConvergedPrimaryWithPendingTargetRefuses(t *testing.T)
 	assert.True(t, check.HasChanges)
 }
 
-// The primary target (eu) already has the column and us does not, so the
-// apply pauses on a comment that shows us's plan alone. Before the operator
-// confirms, eu loses the column and needs the change again. The confirmed
+// The primary target (eu) already has the column and us does not, and a
+// pending confirmation pins a round that showed us's plan alone. Before the
+// operator confirms, eu loses the column and needs the change again. The confirmed
 // comment never showed eu's plan, so apply-confirm refuses, runs nothing on
 // either target, and releases the pending confirmation.
 func TestE2EApplyConfirmRefusesWhenConvergedPrimaryGainsChanges(t *testing.T) {
@@ -697,16 +650,14 @@ func TestE2EApplyConfirmRefusesWhenConvergedPrimaryGainsChanges(t *testing.T) {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Confirmation required")
-	assert.Contains(t, body, "The primary target already has this schema")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
 	_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` DROP COLUMN `email`")
 	require.NoError(t, err)
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
-	body = awaitCommentContaining(t, confirm, "now has changes of its own")
+	body := awaitCommentContaining(t, confirm, "now has changes of its own")
 	assert.Contains(t, body, "showed the primary target already at the desired schema")
 	assert.Contains(t, body, "nothing was applied")
 
@@ -738,8 +689,8 @@ func requireNoApplyLock(t *testing.T, svc *api.Service, dbName string) {
 // bringing us to the PR's schema also drops a column only us carries. That drop
 // is unsafe, so the apply asks for the same opt-in a single target would:
 // without --allow-unsafe it is refused before taking a lock, naming us's table,
-// and with it, apply-confirm runs us's plan though the primary target has
-// nothing to do.
+// and with it, the apply runs us's plan though the primary target has nothing
+// to do.
 func TestE2EConvergedPrimaryRunsUnsafeWorkOnAnotherTargetUnderTheOptIn(t *testing.T) {
 	dbName := "webhook_rollout_member_unsafe"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
@@ -762,14 +713,9 @@ func TestE2EConvergedPrimaryRunsUnsafeWorkOnAnotherTargetUnderTheOptIn(t *testin
 	assert.True(t, check.HasChanges)
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe")
-	body = awaitCapture(t, apply.comments, "the apply command's answer", func(body string) bool {
-		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied")
-	})
-	require.Contains(t, body, "Confirmation required")
-	assert.Contains(t, body, "DROP COLUMN `legacy`", "the comment the operator confirms shows us's plan")
-
-	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe")
-	created := awaitConfirmedApply(t, svc, dbName, confirm)
+	body = awaitCommentContaining(t, apply, "DROP COLUMN `legacy`")
+	assert.NotContains(t, body, "Confirmation required", "the comment the apply posts shows us's plan, and the apply runs it in one step")
+	created := awaitRolloutApply(t, svc, dbName, apply)
 	requireTaskDDLByDeployment(t, svc, created, map[string][]string{
 		"us": {"ADD COLUMN `email`", "DROP COLUMN `legacy`"},
 	})
@@ -778,9 +724,9 @@ func TestE2EConvergedPrimaryRunsUnsafeWorkOnAnotherTargetUnderTheOptIn(t *testin
 // The primary (eu) is already at the PR's schema, and only us's plan
 // drops a column on `users`, a table another open pull request last changed.
 // Whether a destructive change is this pull request's to make is part of what
-// --allow-unsafe consents to, so the unsafe refusal and the comment the
-// operator confirms both name the other pull request, though the primary
-// plan changes nothing.
+// --allow-unsafe consents to, so the unsafe refusal names the other pull
+// request, though the primary plan changes nothing. With the opt-in, the apply
+// runs us's plan in one step, as a single target's apply does.
 func TestE2EAnotherTargetsDestructiveChangeDisclosesAttributedTable(t *testing.T) {
 	dbName := "webhook_rollout_member_attributed"
 	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
@@ -820,17 +766,12 @@ func TestE2EAnotherTargetsDestructiveChangeDisclosesAttributedTable(t *testing.T
 	assert.Contains(t, body, "⚠️ **Check before applying**")
 	assert.Contains(t, body, owner, "the refusal names the open pull request that last changed the table us would drop a column on")
 
-	body = awaitCapture(t, command("schemabot apply -e "+driftEnv+" --allow-unsafe").comments, "the apply command's answer", func(body string) bool {
-		return strings.Contains(body, "Confirmation required") || strings.Contains(body, "nothing was applied")
-	})
-	require.Contains(t, body, "Confirmation required")
-	assert.Contains(t, body, owner, "the comment the operator confirms names the other pull request too")
-	requireNoApplies(t, svc, dbName)
+	awaitRolloutApply(t, svc, dbName, command("schemabot apply -e "+driftEnv+" --allow-unsafe"))
 }
 
-// The primary target (eu) already has the column and us does not, so the
-// apply pauses on a comment that shows us's `ADD COLUMN`. Before the operator
-// confirms, us gains a narrower `email` column out of band, so its plan is now a
+// The primary target (eu) already has the column and us does not, and a
+// pending confirmation pins a round that showed us's `ADD COLUMN`. Before the
+// operator confirms, us gains a narrower `email` column out of band, so its plan is now a
 // `MODIFY COLUMN` the comment never showed. The confirmation was given against
 // the statements on that comment, so apply-confirm refuses, runs nothing on
 // either target, and releases the pending confirmation.
@@ -844,24 +785,22 @@ func TestE2EApplyConfirmRefusesWhenAnotherTargetsStatementsChange(t *testing.T) 
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Confirmation required")
-	assert.Contains(t, body, "ADD COLUMN `email`", "the comment shows the plan us would run")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	us := openDriftDB(t, driftDSN(t, dbName+"_us"))
 	_, err := us.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
 	require.NoError(t, err)
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
-	body = awaitCommentContaining(t, confirm, "nothing was applied")
+	body := awaitCommentContaining(t, confirm, "nothing was applied")
 	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the plan of target us/"+dbName+"-us-target differs from what the confirmed round planned, in its statements")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
 }
 
-// Both targets need the column, so the apply pauses on a comment that renders
-// each target's own `ADD COLUMN`. Before the operator confirms, the reviewed
+// Both targets need the column, and a pending confirmation pins a round that
+// showed each target's own `ADD COLUMN`. Before the operator confirms, the reviewed
 // target (eu) gains a narrower `email` column out of band, so its own re-plan is
 // now a `MODIFY COLUMN` the comment never showed, while us is unchanged.
 // apply-confirm refuses, runs nothing, releases the pending confirmation, and
@@ -876,16 +815,14 @@ func TestE2EApplyConfirmRefusesWhenTheReviewedTargetsStatementsChange(t *testing
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Confirmation required")
-	assert.Contains(t, body, "Each target runs its own plan")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
 	_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
 	require.NoError(t, err)
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
-	body = awaitCommentContaining(t, confirm, "nothing was applied")
+	body := awaitCommentContaining(t, confirm, "nothing was applied")
 	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in its statements")
 	assert.NotContains(t, body, "other than the primary", "the primary target's plan changed, not the other targets'")
 
@@ -909,8 +846,7 @@ func TestE2EApplyConfirmRefusesWhenOnlyTheReviewedTargetsStatementsChange(t *tes
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "Confirmation required")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	us := openDriftDB(t, driftDSN(t, dbName+"_us"))
 	_, err := us.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL DEFAULT NULL")
@@ -1111,32 +1047,6 @@ func rolloutServiceOver(t *testing.T, svc *api.Service, dbName string, names ...
 	return shrunk
 }
 
-// awaitRolloutApply waits for the confirmation to create an apply for dbName,
-// failing the test if the confirm posts a refusal instead.
-func awaitRolloutApply(t *testing.T, svc *api.Service, dbName string, confirm *planFlowResult) *storage.Apply {
-	t.Helper()
-	var created *storage.Apply
-	require.Eventually(t, func() bool {
-		applies, err := svc.Storage().Applies().GetByPR(t.Context(), "octocat/hello-world", 1)
-		if err != nil {
-			return false
-		}
-		for _, a := range applies {
-			if a.Database == dbName {
-				created = a
-				return true
-			}
-		}
-		select {
-		case posted := <-confirm.comments:
-			require.NotContains(t, posted, "nothing was applied", "the confirmation must create the apply")
-		default:
-		}
-		return false
-	}, webhookIntegrationPollDeadline, 100*time.Millisecond, "the confirmation creates an apply")
-	return created
-}
-
 // The operator confirmed a round where eu (the primary target) and us both
 // needed the email column. Before the confirm, us is removed from the rollout,
 // so eu is the environment's only target, and eu gains a narrower email column
@@ -1154,9 +1064,7 @@ func TestE2EApplyConfirmRechecksTheReviewedTargetAfterTheRolloutShrinks(t *testi
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Confirmation required")
-	assert.Contains(t, body, "Each target runs its own plan")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
 	_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
@@ -1164,7 +1072,7 @@ func TestE2EApplyConfirmRechecksTheReviewedTargetAfterTheRolloutShrinks(t *testi
 	shrunk := rolloutServiceOver(t, svc, dbName, "eu")
 
 	confirm := runRolloutCommand(t, shrunk, dbName, "schemabot apply-confirm -e "+driftEnv)
-	body = awaitCommentContaining(t, confirm, "nothing was applied")
+	body := awaitCommentContaining(t, confirm, "nothing was applied")
 	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in its statements")
 
 	requireNoApplies(t, shrunk, dbName)
@@ -1184,8 +1092,7 @@ func TestE2EApplyConfirmRunsTheConfirmedPlanAfterTheRolloutShrinks(t *testing.T)
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "Confirmation required")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 	shrunk := rolloutServiceOver(t, svc, dbName, "eu")
 
 	confirm := runRolloutCommand(t, shrunk, dbName, "schemabot apply-confirm -e "+driftEnv)
@@ -1214,12 +1121,11 @@ func TestE2EApplyConfirmComparesTheReviewedTargetsWholePlan(t *testing.T) {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "Confirmation required")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
-	require.NotNil(t, lock, "the paused apply pins its plan")
+	require.NotNil(t, lock, "the pending confirmation pins its plan")
 	confirmed, err := svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
 	require.NoError(t, err)
 	require.NotNil(t, confirmed)
@@ -1248,7 +1154,7 @@ func TestE2EApplyConfirmComparesTheReviewedTargetsWholePlan(t *testing.T) {
 }
 
 // Two targets reshape the users primary key under the direct execution policy,
-// so the apply pauses on a rollout comment that shows each target's plan. Before
+// and a pending confirmation pins a round that showed each target's plan. Before
 // the confirm, us gets the reshape out of band, leaving only eu (the reviewed
 // target) with work, and the way eu's unchanged statement runs moves:
 //
@@ -1300,13 +1206,11 @@ func TestE2EApplyConfirmRefusesWhenHowTheReviewedTargetsStatementRunsMoves(t *te
 			})
 			files := map[string]string{"users.sql": pkSwapSchema}
 
-			apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
-			body := awaitCommentContaining(t, apply, "Confirmation required")
-			require.Contains(t, body, "**Direct execution**", "the policy routes the reshape to direct execution on both targets")
+			pinRolloutConfirmation(t, svc, dbName, files)
 
 			lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 			require.NoError(t, err)
-			require.NotNil(t, lock, "the paused apply pins its plan")
+			require.NotNil(t, lock, "the pending confirmation pins its plan")
 			confirmed, err := svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
 			require.NoError(t, err)
 			require.NotNil(t, confirmed)
@@ -1333,7 +1237,7 @@ func TestE2EApplyConfirmRefusesWhenHowTheReviewedTargetsStatementRunsMoves(t *te
 
 			confirmer := tc.confirmVia(t, svc, dbName)
 			confirm := runRolloutCommandWithFiles(t, confirmer, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe", files)
-			body = awaitCommentContaining(t, confirm, "nothing was applied")
+			body := awaitCommentContaining(t, confirm, "nothing was applied")
 			assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in how its statements run")
 			assert.NotContains(t, body, "Changes run differently", "a rollout confirmation is refused, not re-disclosed for another confirmation")
 
@@ -1369,8 +1273,7 @@ func (s *planResultFailingCheckStore) UpsertPlanResult(context.Context, *storage
 // command that finds us still needs the change must not leave that stale pass
 // as the PR's check: it publishes a failing check from the rollout round. A plan
 // scoped to one environment, a plan across every environment, and an apply
-// paused for confirmation each store the record on a path of their own, so all
-// three are covered.
+// each store the record on a path of their own, so all three are covered.
 func TestE2EUnstoredPendingRolloutFailsCheckClosed(t *testing.T) {
 	rollout := []deploymentSpec{
 		{name: "eu", liveSchema: usersWithEmailSchema},
@@ -1432,8 +1335,8 @@ func (s *lockRaceLockStore) AcquireIfPendingPlanID(context.Context, *storage.Loc
 
 // The primary target (eu) already has the column and us does not, and the PR
 // carries a passing check from an earlier plan. The apply loses the lock race
-// after the rollout round found us's work, so it exits before pausing for
-// confirmation. The stored check state must already record us's pending work
+// after the rollout round found us's work, so it exits before running
+// anything. The stored check state must already record us's pending work
 // by then: an apply that ends early never leaves the earlier pass standing.
 func TestE2EConvergedPrimaryApplyLosingTheLockRecordsPendingWork(t *testing.T) {
 	dbName := "webhook_rollout_lock_race"
@@ -1455,6 +1358,134 @@ func TestE2EConvergedPrimaryApplyLosingTheLockRecordsPendingWork(t *testing.T) {
 	requireNoApplies(t, svc, dbName)
 	check := rolloutCheck(t, svc, dbName)
 	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the earlier pass is replaced")
+	assert.True(t, check.HasChanges)
+}
+
+// afterLockStorage runs onAcquire once, straight after the apply command takes
+// its lock, so a test can change a target or the storage between the comment
+// the apply posts and the re-plan it runs from. Once failRoundOf is set, reading
+// the rollout round stored with that plan fails.
+type afterLockStorage struct {
+	storage.Storage
+	onAcquire   func(lock *storage.Lock)
+	failRoundOf string
+}
+
+func (s *afterLockStorage) Locks() storage.LockStore {
+	return &afterLockLockStore{LockStore: s.Storage.Locks(), owner: s}
+}
+
+func (s *afterLockStorage) Plans() storage.PlanStore {
+	return &roundFailingPlanStore{PlanStore: s.Storage.Plans(), owner: s}
+}
+
+type afterLockLockStore struct {
+	storage.LockStore
+	owner *afterLockStorage
+}
+
+func (s *afterLockLockStore) AcquireIfPendingPlanID(ctx context.Context, lock *storage.Lock, pendingPlanID string) error {
+	if err := s.LockStore.AcquireIfPendingPlanID(ctx, lock, pendingPlanID); err != nil {
+		return err
+	}
+	if hook := s.owner.onAcquire; hook != nil {
+		s.owner.onAcquire = nil
+		hook(lock)
+	}
+	return nil
+}
+
+type roundFailingPlanStore struct {
+	storage.PlanStore
+	owner *afterLockStorage
+}
+
+func (s *roundFailingPlanStore) List(ctx context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	if failing := s.owner.failRoundOf; failing != "" && opts.PrimaryPlanIdentifier == failing {
+		return nil, errors.New("list rollout round: injected failure")
+	}
+	return s.PlanStore.List(ctx, opts)
+}
+
+// The primary target (eu) already has the column and us does not, so the
+// apply command posts us's `ADD COLUMN` and runs it in the same step. Between
+// that comment and the re-plan the apply runs from, us gains a narrower `email`
+// column out of band, so its plan is now a `MODIFY COLUMN` the comment never
+// showed. As with a single target whose DDL drifted, the apply stops for
+// apply-confirm on a fresh comment showing us's plan as it is now, runs
+// nothing, and pins the confirmation to that plan, so confirming runs the
+// `MODIFY COLUMN`.
+func TestE2EApplyStopsForConfirmationWhenAnotherTargetsPlanChangesWhileStarting(t *testing.T) {
+	dbName := "webhook_rollout_member_changed_auto"
+	var hooked *afterLockStorage
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		hooked = &afterLockStorage{Storage: st}
+		return hooked
+	})
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	us := openDriftDB(t, driftDSN(t, dbName+"_us"))
+	hooked.onAcquire = func(*storage.Lock) {
+		_, err := us.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
+		require.NoError(t, err)
+	}
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "A target's plan changed while this apply was starting")
+	assert.Contains(t, body, "Confirmation required")
+	assert.Contains(t, body, "MODIFY COLUMN `email`", "the comment shows us's plan as it is now")
+	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
+
+	requireNoApplies(t, svc, dbName)
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the stopped apply keeps its lock for the confirmation")
+	repinned, err := svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
+	require.NoError(t, err)
+	require.NotNil(t, repinned)
+	check := rolloutCheck(t, svc, dbName)
+	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the check keeps blocking merge")
+	assert.True(t, check.HasChanges)
+
+	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
+	created := awaitRolloutApply(t, svc, dbName, confirm)
+	requireTaskDDLByDeployment(t, svc, created, map[string][]string{
+		"us": {"MODIFY COLUMN `email`"},
+	})
+}
+
+// The primary target (eu) already has the column and us does not, so the
+// apply command posts us's plan and runs it in the same step. Before the apply
+// is created it re-reads the rollout round stored with the plan it posted, to
+// confirm us's work is what that comment showed. When that read fails, nothing
+// is known about us's work, so the apply runs nothing, releases its lock so a
+// retry of the command starts over, and the check keeps blocking merge.
+func TestE2EApplyReleasesTheLockWhenItCannotVerifyAnotherTargetsWork(t *testing.T) {
+	dbName := "webhook_rollout_member_unverified_auto"
+	var hooked *afterLockStorage
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		hooked = &afterLockStorage{Storage: st}
+		return hooked
+	})
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	hooked.onAcquire = func(lock *storage.Lock) { hooked.failRoundOf = lock.PendingPlanID }
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	awaitCommentContaining(t, apply, "SchemaBot could not verify the plans this apply covers, so nothing was applied.")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+	check := rolloutCheck(t, svc, dbName)
+	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the check keeps blocking merge")
 	assert.True(t, check.HasChanges)
 }
 
@@ -1507,8 +1538,8 @@ func TestE2EConvergedPrimaryRefusesToDiscardAnotherTargetsCopy(t *testing.T) {
 	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the check keeps blocking merge")
 }
 
-// The primary target (eu) already has the column and us does not, so the
-// apply pauses on a comment that shows us's plan. Before the operator confirms,
+// The primary target (eu) already has the column and us does not, and a
+// pending confirmation pins a round that showed us's plan. Before the operator confirms,
 // an unfinished copy of `users` made for a different statement appears on us.
 // The confirmed comment disclosed no copy, so apply-confirm refuses, runs
 // nothing, leaves the copy in place, and releases the pending confirmation.
@@ -1522,8 +1553,7 @@ func TestE2EApplyConfirmRefusesToDiscardACopyThatAppearedOnAnotherTarget(t *test
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "Confirmation required")
+	pinRolloutConfirmation(t, svc, dbName, nil)
 
 	seedUsersCopy(t, dbName+"_us")
 

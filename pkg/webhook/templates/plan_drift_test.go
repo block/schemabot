@@ -612,22 +612,23 @@ func TestRenderPlanComment_ConvergedPrimaryDoesNotReadAsNoOp(t *testing.T) {
 		"the other targets converge through the apply, which runs each target's own plan")
 }
 
-// The apply on a rollout whose primary target is already converged pauses for
-// confirmation: the reader confirms against the other targets' plans on this
-// comment, and the cause says the primary target runs nothing.
+// An automatic apply on a rollout whose primary target is already converged
+// stops for confirmation when another target's plan changed while it was
+// starting: the reader confirms against the other targets' plans as they are
+// now, shown on this comment.
 func TestRenderPlanComment_ConvergedPrimaryApplyAsksForConfirmation(t *testing.T) {
 	data := convergedPrimaryPlanData()
 	data.IsLocked = true
 	data.LockOwner = "pr:octocat/testapp#7"
 	data.PendingManualConfirmation = true
 	data.PausedApplyCause = &PausedApplyCauseData{
-		Heading: "The primary target already has this schema",
-		Remedy:  "Nothing has run. Confirming runs each target's own plan shown above; a target already at the desired schema runs nothing.",
+		Heading: "A target's plan changed while this apply was starting",
+		Remedy:  "Nothing has run. The plans above are each target's plan as it is now; review them, then confirm to apply them.",
 	}
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "`primary/testapp_2`, `primary/testapp_3`\n\n```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-	assert.Contains(t, out, "⚠️ **The primary target already has this schema**\n\nNothing has run.")
+	assert.Contains(t, out, "⚠️ **A target's plan changed while this apply was starting**\n\nNothing has run.")
 	assert.Contains(t, out, "**Confirmation required** — review the plan above, then confirm manually:\n```\nschemabot apply-confirm -e production\n```\n")
 	assert.NotContains(t, out, "**Applying automatically**")
 	assert.NotContains(t, out, "No changes to apply")
