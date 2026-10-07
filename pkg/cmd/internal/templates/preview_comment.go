@@ -178,6 +178,7 @@ func previewCommentPlanAllOutput() {
 		{"MYSQL PLAN (COLUMN-ONLY ALTER, NO TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanColumnOnlyAlter()) }},
 		{"MYSQL PLAN (MANY TABLES, FOLDED TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyTables()) }},
 		{"MYSQL PLAN (COLLATION CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCollationChanges()) }},
+		{"MYSQL PLAN (PARTITIONED TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanPartitionedTables()) }},
 		{"MYSQL PLAN (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
 		{"MYSQL PLAN (UNMANAGED SCHEMA ALONGSIDE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnmanagedSchema()) }},
 		{"POSTGRES PLAN (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
@@ -440,6 +441,7 @@ func previewCLIPlanAllOutput() {
 		fn   func()
 	}{
 		{"PLAN (MYSQL)", previewPlanOutput},
+		{"PLAN (MYSQL, PARTITIONED TABLES)", previewPartitionedPlanOutput},
 		{"PLAN (POSTGRES)", previewPostgresPlanOutput},
 		{"PLAN (NO CHANGES)", previewPlanNoChangesOutput},
 		{"PLAN (VITESS)", previewVitessPlanOutput},

@@ -171,6 +171,44 @@ func PreviewCommentPlanColumnOnlyAlter() string {
 	})
 }
 
+// PreviewCommentPlanPartitionedTables renders a plan for partitioned tables:
+// a new table partitioned by month, a REORGANIZE PARTITION that splits the
+// catch-all partition, and an ALTER that adds a column and repartitions. Each
+// partition definition shows on its own line.
+func PreviewCommentPlanPartitionedTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"CREATE TABLE `ledger_entries` (`id` bigint NOT NULL AUTO_INCREMENT, `settlement_date` date NOT NULL, `amount_cents` bigint NOT NULL, " +
+					"PRIMARY KEY (`id`,`settlement_date`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci " +
+					"PARTITION BY RANGE COLUMNS(`settlement_date`) (" +
+					"PARTITION `p202601` VALUES LESS THAN ('2026-02-01') ENGINE = InnoDB," +
+					"PARTITION `p202602` VALUES LESS THAN ('2026-03-01') ENGINE = InnoDB," +
+					"PARTITION `p202603` VALUES LESS THAN ('2026-04-01') ENGINE = InnoDB," +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB);",
+				"ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (" +
+					"PARTITION `p202611` VALUES LESS THAN ('2026-12-01'), " +
+					"PARTITION `p202612` VALUES LESS THAN ('2027-01-01'), " +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE));",
+				"ALTER TABLE `payouts` ADD COLUMN `note` varchar(64) NULL DEFAULT NULL " +
+					"PARTITION BY RANGE COLUMNS (`settlement_date`) (" +
+					"PARTITION `p2025` VALUES LESS THAN ('2026-01-01')," +
+					"PARTITION `p2026` VALUES LESS THAN ('2027-01-01')," +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE));",
+			},
+		}},
+	})
+}
+
 // PreviewCommentPlanCollationChanges renders a plan that moves a table onto a
 // new default collation, which re-collates the columns the ALTER redeclares,
 // and makes one unique column case-sensitive. The collation section under the

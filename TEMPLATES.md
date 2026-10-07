@@ -338,6 +338,63 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-partitioned-tables"></a><strong>MySQL Plan (Partitioned Tables)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `ledger_entries` (
+    `id` bigint NOT NULL AUTO_INCREMENT,
+    `settlement_date` date NOT NULL,
+    `amount_cents` bigint NOT NULL,
+    PRIMARY KEY(`id`, `settlement_date`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci
+  PARTITION BY RANGE COLUMNS (`settlement_date`) (
+      PARTITION `p202601` VALUES LESS THAN ('2026-02-01') ENGINE = InnoDB,
+      PARTITION `p202602` VALUES LESS THAN ('2026-03-01') ENGINE = InnoDB,
+      PARTITION `p202603` VALUES LESS THAN ('2026-04-01') ENGINE = InnoDB,
+      PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB
+  );
+```
+
+```sql
+ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (
+    PARTITION `p202611` VALUES LESS THAN ('2026-12-01'),
+    PARTITION `p202612` VALUES LESS THAN ('2027-01-01'),
+    PARTITION `future` VALUES LESS THAN (MAXVALUE)
+);
+```
+
+```sql
+ALTER TABLE `payouts`
+    ADD COLUMN `note` varchar(64) NULL DEFAULT NULL
+    PARTITION BY RANGE COLUMNS (`settlement_date`) (
+        PARTITION `p2025` VALUES LESS THAN ('2026-01-01'),
+        PARTITION `p2026` VALUES LESS THAN ('2027-01-01'),
+        PARTITION `future` VALUES LESS THAN (MAXVALUE)
+    );
+```
+
+📋 **Plan**: **1** table to create, **2** tables to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-ignored-namespaces"></a><strong>MySQL Plan (Ignored Namespaces)</strong></summary>
 
 
@@ -2913,6 +2970,57 @@ That command wasn't recognized. Available commands:
 📋 Plan: 2 tables to create, 1 table to alter
 
 Options: ⏸️ Defer Cutover
+
+```
+</details>
+
+<details>
+<summary><a name="plan-mysql-partitioned-tables"></a><strong>Plan (MySQL, Partitioned Tables)</strong></summary>
+
+```
+
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Plan                   │
+│                                             │
+│  Database: testapp                          │
+│  Environment: staging                       │
+│  Schema name: testapp                       │
+╰─────────────────────────────────────────────╯
+
+     + ledger_entries
+       CREATE TABLE `ledger_entries` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `settlement_date` date NOT NULL,
+           `amount_cents` bigint NOT NULL,
+           PRIMARY KEY(`id`, `settlement_date`)
+       ) ENGINE InnoDB,
+         CHARSET utf8mb4,
+         COLLATE utf8mb4_0900_ai_ci
+         PARTITION BY RANGE COLUMNS (`settlement_date`) (
+             PARTITION `p202601` VALUES LESS THAN ('2026-02-01') ENGINE = InnoDB,
+             PARTITION `p202602` VALUES LESS THAN ('2026-03-01') ENGINE = InnoDB,
+             PARTITION `p202603` VALUES LESS THAN ('2026-04-01') ENGINE = InnoDB,
+             PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB
+         );
+
+     ~ events
+       ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (
+           PARTITION `p202611` VALUES LESS THAN ('2026-12-01'),
+           PARTITION `p202612` VALUES LESS THAN ('2027-01-01'),
+           PARTITION `future` VALUES LESS THAN (MAXVALUE)
+       );
+
+     ~ payouts
+       ALTER TABLE `payouts`
+           ADD COLUMN `note` varchar(64) NULL DEFAULT NULL
+           PARTITION BY RANGE COLUMNS (`settlement_date`) (
+               PARTITION `p2025` VALUES LESS THAN ('2026-01-01'),
+               PARTITION `p2026` VALUES LESS THAN ('2027-01-01'),
+               PARTITION `future` VALUES LESS THAN (MAXVALUE)
+           );
+
+📋 Plan: 1 table to create, 2 tables to alter
+
 
 ```
 </details>
