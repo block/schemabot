@@ -1114,10 +1114,11 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 	return false, baseTipSHA, nil
 }
 
-// maxFollowedSchemaSymlinks bounds how many symlinks a schema change
-// comparison follows, so a directory full of links or a chain of them cannot
-// turn one comparison into an unbounded number of GitHub reads.
-const maxFollowedSchemaSymlinks = 64
+// maxSchemaSymlinkReads bounds how many distinct symlinks a schema change
+// comparison reads, so a directory full of links or a chain of them cannot
+// turn one comparison into an unbounded number of GitHub reads. Links with
+// the same target text share one read.
+const maxSchemaSymlinkReads = 64
 
 // SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
 type SchemaChangeComparison struct {
@@ -1156,8 +1157,8 @@ type SchemaChangeComparison struct {
 // An error means the comparison could not be completed and proves nothing:
 // GitHub was unavailable, a commit or tree could not be read, a directory was
 // too large to list completely, a path runs through a symlink, a symlink
-// points outside the repository, or there were more symlinks to follow than
-// maxFollowedSchemaSymlinks.
+// points outside the repository, or there were more distinct symlinks to read
+// than maxSchemaSymlinkReads.
 func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, approvedSHA, headSHA string, paths []string) (SchemaChangeComparison, error) {
 	var result SchemaChangeComparison
 	baseTipSHA, err := ic.branchTipSHA(ctx, repo, baseRef)
@@ -1173,10 +1174,11 @@ func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, 
 	}
 
 	comparer := &schemaChangeComparer{
-		ic:         ic,
-		repo:       repo,
-		commits:    [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
-		levelCache: make(map[string][]TreeEntry),
+		ic:          ic,
+		repo:        repo,
+		commits:     [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
+		levelCache:  make(map[string][]TreeEntry),
+		symlinkText: make(map[string]string),
 	}
 	differingPath, err := comparer.compare(ctx, paths)
 	if err != nil {
@@ -1214,8 +1216,9 @@ type schemaChangeComparer struct {
 	repo       string
 	commits    [4]string
 	levelCache map[string][]TreeEntry
-	// followed counts the symlinks followed so far.
-	followed int
+	// symlinkText caches each symlink object's target text by blob SHA, so
+	// links with the same target text cost one read.
+	symlinkText map[string]string
 }
 
 type schemaChangeItem struct {
@@ -1349,7 +1352,7 @@ func (c *schemaChangeComparer) children(ctx context.Context, dir string, sides [
 // symlinkTargets returns the repo-relative target of the symlink at p, or of
 // every symlink inside the directory at p, on each of sides.
 func (c *schemaChangeComparer) symlinkTargets(ctx context.Context, p string, sides []gitSide) ([]string, error) {
-	var targets []string
+	var links []TreeEntry
 	listed := make(map[string]bool)
 	for _, side := range sides {
 		if !side.found || listed[side.entry.SHA] {
@@ -1358,23 +1361,48 @@ func (c *schemaChangeComparer) symlinkTargets(ctx context.Context, p string, sid
 		listed[side.entry.SHA] = true
 		switch {
 		case side.entry.Type == "tree":
-			dirTargets, err := c.ic.symlinkTargetsInTree(ctx, c.repo, p, side.entry.SHA, maxFollowedSchemaSymlinks-c.followed)
+			dirLinks, err := c.ic.symlinksInTree(ctx, c.repo, p, side.entry.SHA)
 			if err != nil {
 				return nil, err
 			}
-			c.followed += len(dirTargets)
-			targets = append(targets, dirTargets...)
+			links = append(links, dirLinks...)
 		case side.entry.Mode == gitSymlinkMode:
-			if c.followed >= maxFollowedSchemaSymlinks {
-				return nil, fmt.Errorf("symlink %s in repo %s: more than %d symlinks to follow", p, c.repo, maxFollowedSchemaSymlinks)
-			}
-			target, err := c.ic.resolveSymlinkBlobTarget(ctx, c.repo, p, side.entry.SHA)
-			if err != nil {
-				return nil, err
-			}
-			c.followed++
-			targets = append(targets, target)
+			links = append(links, TreeEntry{Path: p, Mode: side.entry.Mode, Type: side.entry.Type, SHA: side.entry.SHA})
 		}
+	}
+	return c.resolveSymlinks(ctx, links)
+}
+
+// resolveSymlinks returns the repo-relative target of each link. Every link
+// whose target text has not been read yet costs a blob read, so the budget is
+// checked for all of them before any is read.
+func (c *schemaChangeComparer) resolveSymlinks(ctx context.Context, links []TreeEntry) ([]string, error) {
+	unread := make(map[string]bool)
+	for _, link := range links {
+		if _, ok := c.symlinkText[link.SHA]; !ok {
+			unread[link.SHA] = true
+		}
+	}
+	if len(c.symlinkText)+len(unread) > maxSchemaSymlinkReads {
+		return nil, fmt.Errorf("schema paths in repo %s hold %d distinct symlinks, more than the %d a comparison reads",
+			c.repo, len(c.symlinkText)+len(unread), maxSchemaSymlinkReads)
+	}
+	targets := make([]string, 0, len(links))
+	for _, link := range links {
+		text, ok := c.symlinkText[link.SHA]
+		if !ok {
+			var err error
+			text, err = c.ic.FetchBlobContent(ctx, c.repo, link.SHA)
+			if err != nil {
+				return nil, fmt.Errorf("read symlink %s in repo %s: %w", link.Path, c.repo, err)
+			}
+			c.symlinkText[link.SHA] = text
+		}
+		target, err := symlinkTargetPath(c.repo, link.Path, text)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
 	}
 	return targets, nil
 }
@@ -1419,11 +1447,9 @@ func (ic *InstallationClient) mergeBaseSHA(ctx context.Context, repo, baseSHA, h
 	return mergeBase, nil
 }
 
-// symlinkTargetsInTree lists the directory tree treeSHA at dir and returns the
-// repo-relative target of every symlink inside it. Each target costs a blob
-// read, so a directory holding more than budget symlinks is an error before
-// any of them is read.
-func (ic *InstallationClient) symlinkTargetsInTree(ctx context.Context, repo, dir, treeSHA string, budget int) ([]string, error) {
+// symlinksInTree lists the directory tree treeSHA at dir and returns every
+// symlink inside it, with repo-relative paths.
+func (ic *InstallationClient) symlinksInTree(ctx context.Context, repo, dir, treeSHA string) ([]TreeEntry, error) {
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, treeSHA)
 	if err != nil {
 		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, err)
@@ -1434,33 +1460,19 @@ func (ic *InstallationClient) symlinkTargetsInTree(ctx context.Context, repo, di
 	var symlinks []TreeEntry
 	for _, entry := range entries {
 		if entry.Mode == gitSymlinkMode {
+			entry.Path = path.Join(dir, entry.Path)
 			symlinks = append(symlinks, entry)
 		}
 	}
-	if len(symlinks) > budget {
-		return nil, fmt.Errorf("schema path %s in repo %s holds %d symlinks, more than the %d left to follow", dir, repo, len(symlinks), max(budget, 0))
-	}
-	targets := make([]string, 0, len(symlinks))
-	for _, entry := range symlinks {
-		target, err := ic.resolveSymlinkBlobTarget(ctx, repo, path.Join(dir, entry.Path), entry.SHA)
-		if err != nil {
-			return nil, err
-		}
-		targets = append(targets, target)
-	}
-	return targets, nil
+	return symlinks, nil
 }
 
-// resolveSymlinkBlobTarget reads the symlink at linkPath, whose blob is
-// blobSHA, and returns its target as a repo-relative path. A target is
-// relative to the directory holding the link; one that is absolute or
-// escapes the repository is an error.
-func (ic *InstallationClient) resolveSymlinkBlobTarget(ctx context.Context, repo, linkPath, blobSHA string) (string, error) {
-	content, err := ic.FetchBlobContent(ctx, repo, blobSHA)
-	if err != nil {
-		return "", fmt.Errorf("read symlink %s in repo %s: %w", linkPath, repo, err)
-	}
-	target := strings.TrimSpace(content)
+// symlinkTargetPath returns the target of the symlink at linkPath, whose
+// object holds text, as a repo-relative path. A target is relative to the
+// directory holding the link; one that is absolute or escapes the repository
+// is an error.
+func symlinkTargetPath(repo, linkPath, text string) (string, error) {
+	target := strings.TrimSpace(text)
 	if target == "" {
 		return "", fmt.Errorf("symlink %s in repo %s has an empty target", linkPath, repo)
 	}

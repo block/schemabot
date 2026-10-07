@@ -1451,21 +1451,6 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 	})
 }
 
-// PreviewCommentReviewRequiredUncomparableApproval renders the "review
-// required" comment when an authorized reviewer approved an earlier commit
-// that cannot be compared with the head, so that approval cannot carry over.
-func PreviewCommentReviewRequiredUncomparableApproval() string {
-	return RenderReviewRequired(ReviewGateData{
-		Database:              "testapp",
-		Environment:           "staging",
-		RequestedBy:           previewRequestedBy,
-		OperatorReviewers:     []string{"acme/testapp-operators"},
-		OtherReviewers:        []string{"acme/schema-reviewers", "jdoe"},
-		PRAuthor:              previewRequestedBy,
-		UncomparableApprovers: []string{"jdoe"},
-	})
-}
-
 // PreviewCommentReviewGateError renders a sample review gate error comment (fail-closed).
 func PreviewCommentReviewGateError() string {
 	return RenderGenericError(SchemaErrorData{
@@ -1473,6 +1458,18 @@ func PreviewCommentReviewGateError() string {
 		Environment: "staging",
 		CommandName: action.Apply,
 		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+	})
+}
+
+// PreviewCommentReviewGateErrorApprovalNotComparable renders the review gate
+// error comment when an approval on an earlier commit cannot be compared with
+// the head (fail-closed).
+func PreviewCommentReviewGateErrorApprovalNotComparable() string {
+	return RenderGenericError(SchemaErrorData{
+		RequestedBy: previewRequestedBy,
+		Environment: "staging",
+		CommandName: action.Apply,
+		ErrorDetail: "Review gate check failed; see server logs for details. An approval of the latest commit satisfies the gate without this check.",
 	})
 }
 

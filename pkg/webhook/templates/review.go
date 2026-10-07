@@ -20,10 +20,6 @@ type ReviewGateData struct {
 	// ChangedApprovers are authorized reviewers whose approval was given on
 	// an earlier commit at which the PR's schema change differed from the head.
 	ChangedApprovers []string
-	// UncomparableApprovers are authorized reviewers whose approval was given
-	// on an earlier commit that could not be compared with the head, so the
-	// approval cannot carry over to it.
-	UncomparableApprovers []string
 }
 
 // RenderReviewRequired renders a PR comment when the review gate blocks an apply.
@@ -38,15 +34,8 @@ func RenderReviewRequired(data ReviewGateData) string {
 
 	sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
 	if len(data.ChangedApprovers) > 0 {
-		fmt.Fprintf(&sb, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: %s.\n",
+		fmt.Fprintf(&sb, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: %s. Ask for an approval of the latest commit.\n",
 			mentionList(data.ChangedApprovers))
-	}
-	if len(data.UncomparableApprovers) > 0 {
-		fmt.Fprintf(&sb, "\nApprovals on an earlier commit can't carry over because SchemaBot can't compare that commit with the latest one: %s.\n",
-			mentionList(data.UncomparableApprovers))
-	}
-	if len(data.ChangedApprovers) > 0 || len(data.UncomparableApprovers) > 0 {
-		sb.WriteString("Ask for an approval of the latest commit.\n")
 	}
 
 	hasOperators := len(data.OperatorReviewers) > 0

@@ -36,64 +36,21 @@ func TestRenderReviewRequired(t *testing.T) {
 
 // An authorized reviewer whose approval was given on an earlier commit sees
 // why that approval, still visible on the PR, does not satisfy the gate: the
-// PR's schema change differs now, or the earlier commit cannot be compared.
-func TestRenderReviewRequired_EarlierCommitApprovers(t *testing.T) {
-	tests := []struct {
-		name         string
-		changed      []string
-		uncomparable []string
-		want         []string
-		notWant      []string
-	}{
-		{
-			name:    "schema change differs",
-			changed: []string{"bob", "carol"},
-			want: []string{
-				"\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob, @carol.\nAsk for an approval of the latest commit.\n",
-			},
-			notWant: []string{"can't compare"},
-		},
-		{
-			name:         "earlier commit cannot be compared",
-			uncomparable: []string{"bob"},
-			want: []string{
-				"\nApprovals on an earlier commit can't carry over because SchemaBot can't compare that commit with the latest one: @bob.\nAsk for an approval of the latest commit.\n",
-			},
-			notWant: []string{"is different now"},
-		},
-		{
-			name:         "both reasons",
-			changed:      []string{"bob"},
-			uncomparable: []string{"carol"},
-			want: []string{
-				"is different now: @bob.\n",
-				"can't compare that commit with the latest one: @carol.\nAsk for an approval of the latest commit.\n",
-			},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := RenderReviewRequired(ReviewGateData{
-				Database:              "payments",
-				Environment:           "staging",
-				RequestedBy:           "alice",
-				OperatorReviewers:     []string{"org/payments-operators"},
-				OtherReviewers:        []string{"bob", "carol"},
-				PRAuthor:              "alice",
-				ChangedApprovers:      tt.changed,
-				UncomparableApprovers: tt.uncomparable,
-			})
-			for _, w := range tt.want {
-				assert.Contains(t, result, w)
-			}
-			for _, w := range tt.notWant {
-				assert.NotContains(t, result, w)
-			}
-			assert.Equal(t, 1, strings.Count(result, "Ask for an approval of the latest commit."))
-			assert.Less(t, strings.Index(result, "Approvals on an earlier commit"), strings.Index(result, "**Operators of `payments`**"),
-				"the explanation precedes the reviewer lists")
-		})
-	}
+// PR's schema change is different at the latest commit.
+func TestRenderReviewRequired_ChangedApprovers(t *testing.T) {
+	result := RenderReviewRequired(ReviewGateData{
+		Database:          "payments",
+		Environment:       "staging",
+		RequestedBy:       "alice",
+		OperatorReviewers: []string{"org/payments-operators"},
+		OtherReviewers:    []string{"bob", "carol"},
+		PRAuthor:          "alice",
+		ChangedApprovers:  []string{"bob", "carol"},
+	})
+
+	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob, @carol. Ask for an approval of the latest commit.\n")
+	assert.Less(t, strings.Index(result, "Approvals on an earlier commit"), strings.Index(result, "**Operators of `payments`**"),
+		"the explanation precedes the reviewer lists")
 }
 
 // A database with no operator principals falls back to a single flat list —
