@@ -123,7 +123,7 @@ func (h *Handler) executeApply(
 	// the target that leads the rollout since. Any other confirmation was given
 	// against the primary target's own plan, and the gates below re-check that.
 	if storedPlan == nil && planResp.HasChanges() {
-		refusal, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, planResp.PlanID, environment)
+		refusal, primary, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, planResp.PlanID, environment)
 		if roundErr != nil {
 			h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its review round, or the re-plan to compare with the primary target's changes; the pending confirmation is preserved",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
@@ -134,7 +134,7 @@ func (h *Handler) executeApply(
 		}
 		switch refusal {
 		case convergedRoundPrimaryMoved:
-			reason := primaryTargetDifferenceReason(workTarget)
+			reason := primaryTargetDifferenceReason(primary, workTarget)
 			h.logger.Info("apply-confirm refused: the primary target is not the one the confirmed comment showed as converged",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
@@ -148,7 +148,7 @@ func (h *Handler) executeApply(
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the primary target has changes the confirmation did not cover")
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				"The comment this confirmation acts on showed the primary target already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.")
+				fmt.Sprintf("The comment this confirmation acts on showed target %s already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.", primary))
 			return
 		case convergedRoundAccepts:
 		}
@@ -182,7 +182,7 @@ func (h *Handler) executeApply(
 	confirmedMemberWork := false
 	switch {
 	case runsMemberWork:
-		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment)
+		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, primaryTargetName(rollout.work, planResp))
 		if coverErr != nil {
 			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
 				"could not verify that the reviewed plans cover the other targets' work", coverErr,
@@ -301,7 +301,7 @@ func (h *Handler) executeApply(
 				return
 			}
 			if difference != workUnchanged {
-				reason := primaryTargetDifferenceReason(difference)
+				reason := primaryTargetDifferenceReason(primaryTargetName(rollout.work, planResp), difference)
 				h.logger.Info("apply-confirm refused: the primary target would run work the confirmed plan did not show",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)

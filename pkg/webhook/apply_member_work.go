@@ -43,12 +43,23 @@ func rolloutRunsMemberWork(outcome reviewDriftOutcome, preview *templates.Deploy
 // pending: drift blocks, the rest of the rollout is not known to be at the
 // desired schema, or the other targets' work is not what the operator was shown.
 // primaryTargetConverged says whether the primary target itself was already at
-// the desired schema, which decides what the operator is told.
+// the desired schema, which decides what the operator is told, and the message
+// names that target the way the comment does.
 //
 // The apply does not run, and the check records what is pending so the PR
 // cannot merge as if every target were up to date (MG-12).
 func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, actionName string, outcome reviewDriftOutcome, primaryTargetConverged bool) {
-	h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, outcome, primaryTargetConverged, pendingRolloutMessage(outcome, primaryTargetConverged))
+	h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, outcome, primaryTargetConverged, pendingRolloutMessage(outcome, primaryTargetConverged, primaryTargetName(outcome.work, planResp)))
+}
+
+// primaryTargetName names the target the apply's own plan was planned against
+// the way the plan comment does: as the rollout's first member, or, when no
+// rollup ran, as the one target, which no other member shares a deployment with.
+func primaryTargetName(work memberWork, planResp *apitypes.PlanResponse) string {
+	if work.primary != "" {
+		return work.primary
+	}
+	return routing.DisplayNames([]routing.ExecutionTarget{plannedPrimaryMember(planResp)})[0]
 }
 
 // refuseRollout refuses an apply that cannot run what the rollout has pending,
@@ -299,20 +310,21 @@ func (h *Handler) failClosedOnUnstoredRollout(ctx context.Context, client *ghcli
 	h.postFailingAggregates(ctx, client, repo, pr, headSHA, map[string]string{environment: outcome.work.unstoredSummary()})
 }
 
-// pendingRolloutMessage explains a refused apply to the operator. The drift
-// summary names only configured members and is already clamped for markdown,
-// so it is safe to render; the raw causes stay in the server logs.
-func pendingRolloutMessage(outcome reviewDriftOutcome, primaryTargetConverged bool) string {
+// pendingRolloutMessage explains a refused apply to the operator, naming the
+// primary target as the comment does. The drift summary names only configured
+// members and is already clamped for markdown, so it is safe to render; the raw
+// causes stay in the server logs.
+func pendingRolloutMessage(outcome reviewDriftOutcome, primaryTargetConverged bool, primary string) string {
 	const rerun = "Run apply again for this environment to review and confirm each target's own plan."
 	switch {
 	case outcome.blocks() && primaryTargetConverged:
-		return fmt.Sprintf("The primary target already has this schema, but SchemaBot could not confirm that the other targets do (%s), so nothing was applied. The schema check stays failing until every target is confirmed.", outcome.summary)
+		return fmt.Sprintf("Target %s already has this schema, but SchemaBot could not confirm that the other targets do (%s), so nothing was applied. The schema check stays failing until every target is confirmed.", primary, outcome.summary)
 	case outcome.blocks():
 		return fmt.Sprintf("SchemaBot could not confirm the plan of every target (%s), so nothing was applied. The schema check stays failing until every target is confirmed.", outcome.summary)
 	case primaryTargetConverged:
-		return fmt.Sprintf("The primary target already has this schema, but %s: %s. The plans those targets would run were not on the comment this apply acts on, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
+		return fmt.Sprintf("Target %s already has this schema, but %s: %s. The plans those targets would run were not on the comment this apply acts on, so nothing was applied. %s", primary, outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
 	default:
-		return fmt.Sprintf("%s: %s. The plans of the targets other than the primary were not on the comment this apply acts on, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
+		return fmt.Sprintf("%s: %s. The comment this apply acts on showed only the plan of target %s, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), primary, rerun)
 	}
 }
 
@@ -347,7 +359,7 @@ func unconfirmedWorkMessage(work memberWork, reason string) string {
 // work now must have been planned with the same work in the confirmed round,
 // and work the confirmed comment did not show never runs on the strength of
 // that confirmation.
-func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID, currentPlanID, environment string) (bool, string, error) {
+func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID, currentPlanID, environment, primary string) (bool, string, error) {
 	plans := h.service.Storage().Plans()
 	pinned, err := plans.Get(ctx, pinnedPlanID)
 	if err != nil {
@@ -368,7 +380,7 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	// afterwards would keep a confirmation already known not to cover the work.
 	if primaryTargetChanged(pinned, current) {
 		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
-		return false, primaryTargetDifferenceReason(workTarget), nil
+		return false, primaryTargetDifferenceReason(primary, workTarget), nil
 	}
 	confirmed, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
 	if err != nil {
@@ -378,28 +390,29 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	if err != nil {
 		return false, "", fmt.Errorf("load member plans of the confirm-time round: %w", err)
 	}
-	covered, reason := roundCoversWork(pinned, current, confirmed, now)
+	covered, reason := roundCoversWork(primary, pinned, current, confirmed, now)
 	return covered, reason, nil
 }
 
 // roundCoversWork reports whether the confirm-time round runs only work the
 // confirmed round planned, with a reason naming the target and the part of its
-// work that differs when it does not. The primary member must still be the
-// reviewed member, even when it converged while other targets still have work.
-// With that identity fixed, only targets with work are compared.
+// work that differs when it does not. primary names the target current was
+// planned against. The primary member must still be the reviewed member, even
+// when it converged while other targets still have work. With that identity
+// fixed, only targets with work are compared.
 //
 // The identity check is part of what this comparison means, so it is made here
 // as well as by confirmationCoversMemberWork, which refuses a changed primary
 // before reading the member plans this function compares. That earlier refusal
 // is the enforcement point; this one keeps the comparison complete on its own
 // for any caller that has the plans already.
-func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*storage.Plan) (bool, string) {
+func roundCoversWork(primary string, pinned, current *storage.Plan, confirmed, now map[string]*storage.Plan) (bool, string) {
 	if primaryTargetChanged(pinned, current) {
-		return false, primaryTargetDifferenceReason(workTarget)
+		return false, primaryTargetDifferenceReason(primary, workTarget)
 	}
 	if current.HasWork() {
 		if difference := memberWorkDifference(pinned, current); difference != workUnchanged {
-			return false, primaryTargetDifferenceReason(difference)
+			return false, primaryTargetDifferenceReason(primary, difference)
 		}
 	}
 	for _, member := range slices.Sorted(maps.Keys(now)) {
@@ -418,14 +431,15 @@ func roundCoversWork(pinned, current *storage.Plan, confirmed, now map[string]*s
 	return true, ""
 }
 
-// primaryTargetDifferenceReason is the refusal reason for a primary target
-// whose confirm-time re-plan differs from the plan the confirmation was given
-// against, naming the part of its work that differs.
-func primaryTargetDifferenceReason(difference workDifference) string {
+// primaryTargetDifferenceReason is the refusal reason for a primary target,
+// named as the comment names it, whose confirm-time re-plan differs from the
+// plan the confirmation was given against, naming the part of its work that
+// differs, or saying that the confirmed plan reviewed another target.
+func primaryTargetDifferenceReason(primary string, difference workDifference) string {
 	if difference == workTarget {
-		return "the primary target is not the one the confirmed plan reviewed"
+		return fmt.Sprintf("target %s is not the target the confirmed plan reviewed", primary)
 	}
-	return fmt.Sprintf("the re-plan of the primary target differs from the confirmed plan in %s", difference)
+	return fmt.Sprintf("the re-plan of target %s differs from the confirmed plan in %s", primary, difference)
 }
 
 func primaryTargetChanged(pinned, current *storage.Plan) bool {
@@ -473,41 +487,45 @@ const (
 // one that leads the rollout now. A pinned or confirm-time plan that no longer
 // loads is an error: what the comment showed, or what the apply would run,
 // cannot be told.
-func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanID, currentPlanID, environment string) (convergedRoundRefusal, error) {
+//
+// A refusal comes with the name of the primary target it is about, as the
+// comment named the targets of its round: the converged target when it gained
+// changes, and the target that leads the rollout now when that moved.
+func (h *Handler) confirmedConvergedTargetRound(ctx context.Context, pinnedPlanID, currentPlanID, environment string) (convergedRoundRefusal, string, error) {
 	plans := h.service.Storage().Plans()
 	pinned, err := plans.Get(ctx, pinnedPlanID)
 	if err != nil {
-		return convergedRoundAccepts, fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
+		return convergedRoundAccepts, "", fmt.Errorf("load confirmed plan %s: %w", pinnedPlanID, err)
 	}
 	if pinned == nil {
-		return convergedRoundAccepts, fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
+		return convergedRoundAccepts, "", fmt.Errorf("confirmed plan %s no longer exists", pinnedPlanID)
 	}
 	if pinned.HasWork() {
 		h.logger.Debug("apply-confirm: the confirmed plan has work on the primary target, so its comment was not a converged-target confirmation",
 			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID)
-		return convergedRoundAccepts, nil
+		return convergedRoundAccepts, "", nil
 	}
 	members, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
 	if err != nil {
-		return convergedRoundAccepts, fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
+		return convergedRoundAccepts, "", fmt.Errorf("load member plans of the confirmed round %s: %w", pinnedPlanID, err)
 	}
 	if !anyMemberHasWork(members) {
 		h.logger.Debug("apply-confirm: the confirmed round planned no other target with work, so its comment was not a converged-target confirmation",
 			"database", pinned.Database, "environment", environment, "pending_plan_id", pinnedPlanID, "member_plans", len(members))
-		return convergedRoundAccepts, nil
+		return convergedRoundAccepts, "", nil
 	}
 	current, err := plans.Get(ctx, currentPlanID)
 	if err != nil {
-		return convergedRoundAccepts, fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
+		return convergedRoundAccepts, "", fmt.Errorf("load confirm-time plan %s: %w", currentPlanID, err)
 	}
 	if current == nil {
-		return convergedRoundAccepts, fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
+		return convergedRoundAccepts, "", fmt.Errorf("confirm-time plan %s was not stored", currentPlanID)
 	}
 	if primaryTargetChanged(pinned, current) {
 		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
-		return convergedRoundPrimaryMoved, nil
+		return convergedRoundPrimaryMoved, roundMemberName(current, members), nil
 	}
-	return convergedRoundPrimaryGainedWork, nil
+	return convergedRoundPrimaryGainedWork, roundMemberName(pinned, members), nil
 }
 
 // anyMemberHasWork reports whether any plan of a review round's other targets
@@ -519,6 +537,22 @@ func anyMemberHasWork(members map[string]*storage.Plan) bool {
 		}
 	}
 	return false
+}
+
+// roundMemberName names target the way the comment of its review round named
+// it: by its deployment, qualified with the target when another member of the
+// round routes through the same deployment.
+func roundMemberName(target *storage.Plan, round map[string]*storage.Plan) string {
+	named := routing.ExecutionTarget{Deployment: target.Deployment, Target: target.Target}
+	members := []routing.ExecutionTarget{named}
+	for _, member := range round {
+		other := routing.ExecutionTarget{Deployment: member.Deployment, Target: member.Target}
+		if other.MemberID() == named.MemberID() {
+			continue
+		}
+		members = append(members, other)
+	}
+	return routing.DisplayNames(members)[0]
 }
 
 // confirmationCoversPrimaryTarget reports how the primary target's

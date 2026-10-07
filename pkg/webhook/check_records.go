@@ -69,6 +69,10 @@ type memberWork struct {
 	// names are the members with work, the way an operator addresses them, in
 	// rollout order.
 	names []string
+	// primary is the name of the target the apply's own plan was planned
+	// against, the first in rollout order, whether or not it has work. Empty
+	// when no rollup was run.
+	primary string
 	// copyAtStake names a member other than the primary whose apply would
 	// discard an unfinished copy, or could not say whether it would, and why.
 	// Empty when no member with work puts a copy at stake.
@@ -92,6 +96,9 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	// where the rest of the comment qualifies it.
 	names := rollupMemberNames(*rollup)
 	work := memberWork{members: len(rollup.Entries)}
+	if len(names) > 0 {
+		work.primary = names[0]
+	}
 	for i, entry := range rollup.Entries {
 		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
 			work.names = append(work.names, names[i])
