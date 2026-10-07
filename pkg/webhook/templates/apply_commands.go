@@ -35,9 +35,23 @@ type ApplyLockConflictData struct {
 	// hints carry it so pasting them addresses this deployment.
 	Tenant string
 
-	// LockApplyRunning reports that an apply is still running on the locked
-	// database, so the lock cannot be released until it finishes.
-	LockApplyRunning bool
+	// LockedApply is what SchemaBot found running on the locked database.
+	LockedApply LockedDatabaseApply
+}
+
+// LockedDatabaseApply is what a lookup found running on a locked database. A
+// running apply keeps the lock: closing the holding PR retains it and unlock
+// refuses. The zero value is an unchecked lookup, so a caller that never
+// looked renders only what holds without it.
+type LockedDatabaseApply struct {
+	// Checked reports that the lookup succeeded.
+	Checked bool
+	// RunningApplyID identifies the apply still running on the database;
+	// empty when none is.
+	RunningApplyID string
+	// RunningIsLockHolders reports that the running apply belongs to the PR
+	// holding the lock.
+	RunningIsLockHolders bool
 }
 
 // ActorAuthorizationCommentData contains data for PR command actor
@@ -365,7 +379,7 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 		fmt.Fprintf(&sb, "Ask the lock holder to run `%s` from their CLI, or force-unlock with:\n", cliCommand(data.CLIName, cliUnlockArgs(data.Database, data.DatabaseType)))
 		fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock -d "+data.Database+" --force", data.Tenant))
 	} else {
-		sb.WriteString(otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", data.Tenant), data.LockApplyRunning) + "\n")
+		sb.WriteString(otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", data.Tenant), data.LockedApply) + "\n")
 	}
 
 	return offerSupportChannel(sb.String())
@@ -373,14 +387,22 @@ func RenderApplyBlockedByOtherPR(data ApplyLockConflictData) string {
 
 // otherPRLockReleaseHint tells the requester when another PR's lock goes away.
 // A PR's lock outlives its apply: it is released when that PR is merged or
-// closed, or when the unlock command is commented on it. Neither releases it
-// while an apply is still running, so that case says to wait for it first.
-func otherPRLockReleaseHint(unlockCommand string, applyRunning bool) string {
-	release := "when that PR is merged or closed, or when `" + unlockCommand + "` is commented on it."
-	if applyRunning {
-		return "That PR's apply is still running. Once it finishes, the lock is released " + release
+// closed, or when the unlock command is commented on it. Neither works while
+// an apply is still running, so that case names the apply to wait for. When
+// the lookup failed, only the part that holds without it is said.
+func otherPRLockReleaseHint(unlockCommand string, locked LockedDatabaseApply) string {
+	if !locked.Checked {
+		return "The lock is held until that PR is merged or closed."
 	}
-	return "The lock is released " + release
+	release := "when that PR is merged or closed, or when `" + unlockCommand + "` is commented on it."
+	switch {
+	case locked.RunningApplyID == "":
+		return "The lock is released " + release
+	case locked.RunningIsLockHolders:
+		return "That PR's apply `" + locked.RunningApplyID + "` is still running. Once it finishes, the lock is released " + release
+	default:
+		return "Apply `" + locked.RunningApplyID + "` is still running on this database. Once it finishes, the lock is released " + release
+	}
 }
 
 // cliUnlockArgs renders the CLI unlock arguments for the lock on database.

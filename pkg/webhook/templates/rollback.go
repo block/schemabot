@@ -152,16 +152,16 @@ func sanitizedRollbackRejectionReason(reason string) string {
 // lockPR are populated, the holder is rendered as a PR link; otherwise the bare
 // owner string is shown. Tenant is the deployment's own tenant; when set, the
 // suggested unlock command carries it so pasting the hint addresses this
-// deployment. applyRunning reports that an apply is still running on the
-// locked database, so the lock cannot be released until it finishes.
-func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo string, lockPR int, tenant string, applyRunning bool) string {
+// deployment. lockedApply is what SchemaBot found running on the locked
+// database.
+func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo string, lockPR int, tenant string, lockedApply LockedDatabaseApply) string {
 	if lockPR > 0 && lockRepo != "" {
 		return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
 			"**Database**: `%s` | **Environment**: `%s`\n\n"+
 			"A lock is currently held by %s.\n\n%s",
 			database, environment,
 			caller.PullRequestMarkdownLink(lockRepo, lockPR),
-			otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", tenant), applyRunning)))
+			otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", tenant), lockedApply)))
 	}
 	return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+

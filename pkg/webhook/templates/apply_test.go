@@ -84,7 +84,8 @@ func TestRenderApplyBlockedByCLILockUsesValidUnlockCommand(t *testing.T) {
 
 // A PR's lock outlives its apply, so the blocked requester is told the events
 // that actually release it. While an apply is still running neither works, so
-// the comment says so instead of sending the requester to try.
+// the comment names that apply instead of sending the requester to try; when
+// the lookup failed, it says only what holds without it.
 func TestRenderApplyBlockedByOtherPRNamesWhenTheLockIsReleased(t *testing.T) {
 	data := ApplyLockConflictData{
 		Database:    "example-db",
@@ -93,18 +94,39 @@ func TestRenderApplyBlockedByOtherPRNamesWhenTheLockIsReleased(t *testing.T) {
 		LockRepo:    "acme/storefront",
 		LockPR:      42,
 		LockCreated: time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC),
+		LockedApply: LockedDatabaseApply{Checked: true},
 	}
 	rendered := RenderApplyBlockedByOtherPR(data)
 	assert.Contains(t, rendered, "**Locked by**: [acme/storefront#42](https://github.com/acme/storefront/pull/42)")
 	assert.Contains(t, rendered, "\nThe lock is released when that PR is merged or closed, or when `schemabot unlock` is commented on it.\n")
 	assert.NotContains(t, rendered, "still running")
 
-	t.Run("apply running", func(t *testing.T) {
+	t.Run("lock holder's apply running", func(t *testing.T) {
 		data := data
-		data.LockApplyRunning = true
+		data.LockedApply = LockedDatabaseApply{Checked: true, RunningApplyID: "apply-a1b2", RunningIsLockHolders: true}
 		rendered := RenderApplyBlockedByOtherPR(data)
-		assert.Contains(t, rendered, "\nThat PR's apply is still running. Once it finishes, the lock is released "+
+		assert.Contains(t, rendered, "\nThat PR's apply `apply-a1b2` is still running. Once it finishes, the lock is released "+
 			"when that PR is merged or closed, or when `schemabot unlock` is commented on it.\n")
+	})
+
+	// An apply from another PR still running on the database is named without
+	// being attributed to the lock holder.
+	t.Run("other apply running", func(t *testing.T) {
+		data := data
+		data.LockedApply = LockedDatabaseApply{Checked: true, RunningApplyID: "apply-c3d4"}
+		rendered := RenderApplyBlockedByOtherPR(data)
+		assert.Contains(t, rendered, "\nApply `apply-c3d4` is still running on this database. Once it finishes, the lock is released "+
+			"when that PR is merged or closed, or when `schemabot unlock` is commented on it.\n")
+		assert.NotContains(t, rendered, "That PR's apply")
+	})
+
+	t.Run("lookup failed", func(t *testing.T) {
+		data := data
+		data.LockedApply = LockedDatabaseApply{}
+		rendered := RenderApplyBlockedByOtherPR(data)
+		assert.Contains(t, rendered, "\nThe lock is held until that PR is merged or closed.\n")
+		assert.NotContains(t, rendered, "`schemabot unlock`",
+			"without the lookup an unlock may be refused, so it is not suggested")
 	})
 
 	t.Run("tenant deployment", func(t *testing.T) {

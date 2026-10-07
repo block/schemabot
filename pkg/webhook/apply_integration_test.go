@@ -424,6 +424,7 @@ func TestE2EApplyLockConflictDifferentPR(t *testing.T) {
 		name         string
 		dbName       string
 		holderApply  string
+		applyPR      int
 		wantRelease  string
 		notInComment string
 	}{
@@ -438,8 +439,19 @@ func TestE2EApplyLockConflictDifferentPR(t *testing.T) {
 			name:        "holder apply running",
 			dbName:      "webhook_apply_conflict_running",
 			holderApply: state.Apply.Running,
-			wantRelease: "\nThat PR's apply is still running. Once it finishes, the lock is released " +
+			wantRelease: "\nThat PR's apply `apply-webhook_apply_conflict_running` is still running. Once it finishes, the lock is released " +
 				"when that PR is merged or closed, or when `schemabot unlock` is commented on it.\n",
+		},
+		{
+			// A running apply left by a different PR is named without being
+			// attributed to the lock holder, whose own apply finished.
+			name:        "another PR's apply running",
+			dbName:      "webhook_apply_conflict_orphan",
+			holderApply: state.Apply.Running,
+			applyPR:     7,
+			wantRelease: "\nApply `apply-webhook_apply_conflict_orphan` is still running on this database. Once it finishes, the lock is released " +
+				"when that PR is merged or closed, or when `schemabot unlock` is commented on it.\n",
+			notInComment: "That PR's apply",
 		},
 	}
 	for _, tc := range cases {
@@ -460,12 +472,16 @@ func TestE2EApplyLockConflictDifferentPR(t *testing.T) {
 			t.Cleanup(func() {
 				_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 			})
+			applyPR := 42
+			if tc.applyPR != 0 {
+				applyPR = tc.applyPR
+			}
 			_, err = svc.Storage().Applies().Create(t.Context(), &storage.Apply{
 				ApplyIdentifier: "apply-" + dbName,
 				Database:        dbName,
 				DatabaseType:    "mysql",
 				Repository:      "other-org/other-repo",
-				PullRequest:     42,
+				PullRequest:     applyPR,
 				Environment:     "staging",
 				Engine:          storage.EngineSpirit,
 				State:           tc.holderApply,
