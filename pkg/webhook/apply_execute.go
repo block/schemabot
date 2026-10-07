@@ -593,16 +593,16 @@ func (h *Handler) rejectUnverifiedMemberWork(
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"pending_plan_id", expectedPendingPlanID, "plan_id", planID, "error", err)
 	}
-	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedMemberWorkMessage(unverified, automatic))
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedMemberWorkMessage(unverified, environment, automatic))
 }
 
 // unverifiedMemberWorkMessage tells the operator that nothing ran because
 // SchemaBot could not verify the named plans, and how to recover from the
 // state the rejection left: an automatic apply released its lock, so the apply
 // command starts over, while apply-confirm kept the pending confirmation, so
-// confirming again retries against the same comment.
-func unverifiedMemberWorkMessage(unverified string, automatic bool) string {
-	recovery := "The confirmation is still pending: run apply-confirm again, and see server logs if it persists."
+// confirming again with the same flags retries against the same comment.
+func unverifiedMemberWorkMessage(unverified, environment string, automatic bool) string {
+	recovery := fmt.Sprintf("The pending confirmation is preserved; re-run `schemabot %s -e %s` with the same flags, and see server logs if it persists.", action.ApplyConfirm, environment)
 	if automatic {
 		recovery = "The lock is released: run apply again, and see server logs if it persists."
 	}

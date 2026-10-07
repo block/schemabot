@@ -564,8 +564,8 @@ func TestRolloutAllChangesDirect(t *testing.T) {
 func TestUnverifiedMemberWorkMessage(t *testing.T) {
 	assert.Equal(t,
 		"SchemaBot could not verify the other targets' plans, so nothing was applied. The lock is released: run apply again, and see server logs if it persists.",
-		unverifiedMemberWorkMessage("the other targets' plans", true))
+		unverifiedMemberWorkMessage("the other targets' plans", "staging", true))
 	assert.Equal(t,
-		"SchemaBot could not verify the other targets' plans, so nothing was applied. The confirmation is still pending: run apply-confirm again, and see server logs if it persists.",
-		unverifiedMemberWorkMessage("the other targets' plans", false))
+		"SchemaBot could not verify the other targets' plans, so nothing was applied. The pending confirmation is preserved; re-run `schemabot apply-confirm -e staging` with the same flags, and see server logs if it persists.",
+		unverifiedMemberWorkMessage("the other targets' plans", "staging", false))
 }

@@ -920,7 +920,7 @@ const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this
 // holds nothing yet and is simply retried.
 func otherTargetPlansUnverifiedMessage(command, environment string) string {
 	if command == action.ApplyConfirm {
-		return fmt.Sprintf("SchemaBot could not verify the other targets' plans, so nothing was applied. The pending confirmation is preserved; re-run `schemabot %s -e %s` with the same flags, and see server logs if it persists.", command, environment)
+		return unverifiedMemberWorkMessage("the other targets' plans", environment, false)
 	}
 	return "SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists."
 }
