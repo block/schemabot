@@ -2200,13 +2200,6 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 📋 **Plan**: **1** table to alter · rolling out to all 3 targets
 
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_1`, `us/testapp_2`, `us/testapp_3`
-
-</details>
-
 
 ---
 

@@ -1313,7 +1313,10 @@ func hasOrHave(n int) string {
 // writeRolloutTargetNames lists, collapsed under the plan summary, which
 // targets need the change and which already have it. The summary states them
 // as counts; the names stay one click away for the operator who addresses a
-// target.
+// target. When targets run different plans, each plan's heading already names
+// the targets that run it, so the block lists only the targets already at the
+// schema, and is left out when there are none: a fleet's names are not spent
+// twice from the room the comment leaves for DDL.
 func writeRolloutTargetNames(sb *strings.Builder, drift *DeploymentDriftData) {
 	var needs, has []string
 	for _, g := range drift.Plans {
@@ -1331,11 +1334,25 @@ func writeRolloutTargetNames(sb *strings.Builder, drift *DeploymentDriftData) {
 	byRollout := func(a, b string) int { return order[a] - order[b] }
 	slices.SortStableFunc(needs, byRollout)
 	slices.SortStableFunc(has, byRollout)
-	line := "Needs it: " + strings.Join(inlineCodeList(needs), ", ")
-	if len(has) > 0 {
-		line += " · Already has it: " + strings.Join(inlineCodeList(has), ", ")
+	var parts []string
+	if !targetPlansHeaded(drift) {
+		parts = append(parts, "Needs it: "+strings.Join(inlineCodeList(needs), ", "))
 	}
+	if len(has) > 0 {
+		parts = append(parts, "Already has it: "+strings.Join(inlineCodeList(has), ", "))
+	}
+	if len(parts) == 0 {
+		return
+	}
+	line := strings.Join(parts, " · ")
 	fmt.Fprintf(sb, "<details>\n<summary>Targets</summary>\n\n%s\n\n</details>\n\n", line)
+}
+
+// targetPlansHeaded reports whether the rollout's plans render under headings
+// naming their targets, which they do when targets with work run more than one
+// plan.
+func targetPlansHeaded(drift *DeploymentDriftData) bool {
+	return len(workingTargetGroups(drift)) > 1
 }
 
 // workingTargetGroups is the rollout's groups of targets that have work, each
@@ -2255,7 +2272,7 @@ func targetPlanID(g DeploymentPlanGroup, data PlanCommentData) string {
 // multi-environment section does for its own plan.
 func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBlockBudget, collapse bool) {
 	drift := data.DeploymentDrift
-	headed := len(workingTargetGroups(drift)) > 1
+	headed := targetPlansHeaded(drift)
 	// Targets with work lead, as changing shards do: they are what the apply
 	// will run, and the targets already at the schema follow them. Among
 	// groups with work the largest leads, since it is what most targets will
@@ -2296,7 +2313,15 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 		group.Changes = targetPlanChanges(g, data)
 		group.PlanID = targetPlanID(g, data)
 		statements, vschema := countChanges(group.Changes)
-		restore := budget.forTargetGroup(g.Members)
+		// A cut block's marker names whose plan it points at. Under a heading
+		// the heading names the group; a sole plan has none, so the marker
+		// names the target itself.
+		var restore func()
+		if headed {
+			restore = budget.forTargetGroup(g.Members)
+		} else {
+			restore = budget.forSoleTargetGroup(g.Members, 0)
+		}
 		if collapse && statements+vschema > 1 {
 			writeCollapsibleKeyspaceChanges(sb, group, statements, budget)
 		} else {

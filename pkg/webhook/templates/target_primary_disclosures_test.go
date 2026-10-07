@@ -87,6 +87,28 @@ func TestRenderPlanComment_RolloutDisclosuresNameOnlyTheTargetCopiesWereReadFrom
 	assert.Contains(t, body, "Needs it: `shop/orders_a` · Already has it: `shop/orders_b`")
 }
 
+// When targets run different plans, each plan's heading names the targets
+// that run it, so the Targets block under the plan summary does not list them
+// again: it lists only the targets already at the schema, and is left out
+// when every target has work.
+func TestRenderPlanComment_HeadedRolloutListsOnlyTargetsThatAlreadyHaveIt(t *testing.T) {
+	body := RenderPlanComment(withDistinctPlan(primaryDropsLegacyPlan("production")))
+
+	assert.Contains(t, body, "### Target `shop/orders_c`")
+	assert.Contains(t, body, "<details>\n<summary>Targets</summary>\n\nAlready has it: `shop/orders_b`\n\n</details>\n")
+	assert.NotContains(t, body, "Needs it:")
+
+	data := withDistinctPlan(primaryDropsLegacyPlan("production"))
+	drift := *data.DeploymentDrift
+	drift.Plans = slices.DeleteFunc(slices.Clone(drift.Plans), DeploymentPlanGroup.Empty)
+	drift.Deployments = slices.DeleteFunc(slices.Clone(drift.Deployments), func(d DeploymentDriftEntry) bool { return d.Target == "orders_b" })
+	data.DeploymentDrift = &drift
+	body = RenderPlanComment(data)
+
+	assert.Contains(t, body, "### Target `shop/orders_c`")
+	assert.NotContains(t, body, "<summary>Targets</summary>", "every target with work is named by its plan's heading")
+}
+
 // A target that shares its plan with other targets is still named on its
 // copies, since they were read from it and not from the other targets.
 func TestRenderPlanComment_RolloutCopiesNameTheirTargetInASharedPlan(t *testing.T) {
