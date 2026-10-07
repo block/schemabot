@@ -538,6 +538,10 @@ targets are now each planned against their own schema.
 Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
 Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
+`apply` refuses a blocked plan before it checks or takes a lock or asks for
+confirmation, for a single target, the whole rollout, or `--target` alike.
+Change the schema files so the engine accepts them; `--yield` has no lock to
+release on this refusal.
 
 An apply of the whole rollout runs each target's own plan, but holds every
 target to what the first target's plan discloses, since that is the plan you

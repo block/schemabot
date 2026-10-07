@@ -173,6 +173,13 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return blockRolloutApplyRefused(planResult, rollout, cfg.Database, cmd.Environment, cfg.SchemaDir)
 	}
 
+	// The primary is not listed among rollout member refusals. Its engine's
+	// blocked verdict also refuses single-target and narrowed applies, and no
+	// unsafe opt-in makes it executable.
+	if planResult.HasBlockedChanges() {
+		return fmt.Errorf("apply blocked: the plan contains changes its target's engine refuses; change the schema files so the engine accepts them")
+	}
+
 	// Check for unsafe changes
 	if len(planResult.RolloutUnsafeChanges()) > 0 && !cmd.AllowUnsafe {
 		return blockUnsafeApply(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, cmd.Target, cmd.Output)

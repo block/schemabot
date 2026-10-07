@@ -1022,6 +1022,21 @@ schemabot list-plans -e production plan-example-42
 Error: plan plan-example-42 was made for environment "staging", not "production"; rerun with -e staging
 ```
 
+A blocked execution verdict is a refusal, not a request for unsafe consent.
+For example, when the fresh plan contains a blocked key alteration on `users`,
+`apply` stops before prompting or locking, even with `--allow-unsafe --yield`:
+
+```sh
+schemabot apply -s ./schema -e staging --allow-unsafe --yield
+```
+
+```text
+Error: apply blocked: the plan contains changes its target's engine refuses; change the schema files so the engine accepts them
+```
+
+This also applies to a whole rollout and an apply narrowed with `--target`.
+No apply is submitted and no lock is acquired or released.
+
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,
 `repository`, and `pull_request` (with `repository`), plus a `last` window.

@@ -42,8 +42,8 @@ func TestPlanCmd_TargetRequiresEnvironment(t *testing.T) {
 }
 
 // narrowedPlanServer serves plan from /api/plan, the given active applies from
-// /api/status, and accepts every apply, and records the requests the CLI sent
-// and the paths it called. Its status answer follows the server's: an apply's
+// /api/status, grants locks and accepts every apply, and records the requests
+// the CLI sent and the paths it called. Its status answer follows the server's: an apply's
 // deployment is reported only when the request names one, and then only that
 // deployment's applies are listed.
 type narrowedPlanServer struct {
@@ -96,6 +96,8 @@ func newNarrowedPlanServer(t *testing.T, plan *apitypes.PlanResponse, active ...
 		case "/api/status":
 			recorded.statusDeployments = append(recorded.statusDeployments, r.URL.Query().Get("deployment"))
 			assert.NoError(t, json.NewEncoder(w).Encode(apitypes.StatusResponse{Applies: statusAppliesFor(r.URL.Query().Get("deployment"), active)}))
+		case "/api/locks/acquire":
+			writeTestJSON(t, w, []byte(`{"lock":{"database":"testdb","database_type":"mysql"}}`))
 		case "/api/apply":
 			assert.NoError(t, json.NewDecoder(r.Body).Decode(&recorded.applyReq))
 			_, writeErr := w.Write([]byte(`{"accepted":true,"apply_id":"apply-narrowed"}`))
