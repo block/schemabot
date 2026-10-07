@@ -184,7 +184,8 @@ func soleTargetRollout(groups []presentation.Group) (presentation.Group, bool) {
 // writeTargetRolloutBody writes a sole multi-target deployment's comment body:
 // its status line, the first failure, and the rolled-up table lines.
 func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
-	status := targetRolloutStatus(data.Model.TargetProgress(g), state.IsTerminalApplyState(data.Model.State))
+	settled := state.IsState(data.Model.State, state.SettledApplyStates...)
+	status := targetRolloutStatus(data.Model.TargetProgress(g), settled, data.Rollback)
 	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
 	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
 	sb.WriteString("\n")
@@ -193,19 +194,25 @@ func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, 
 
 // targetRolloutStatus states a multi-target rollout's progress in one line:
 // "Rolled out to 3 of 4 targets (1 already had it)" once the apply has
-// finished, and "Rolling out: 1 of 4 targets done, 1 running, 1 queued" while
-// it runs. Every count is out of all the targets, so the parts add up.
-func targetRolloutStatus(p presentation.TargetProgress, terminal bool) string {
+// settled, and "Rolling out: 1 of 4 targets done, 1 running, 1 queued" until
+// then. A stopped apply has not settled: its targets run again once it
+// resumes. A rollback says "Rolled back on" and "Rolling back" instead. Every
+// count is out of all the targets, so the parts add up.
+func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) string {
+	ongoing, finished := "Rolling out:", "Rolled out to"
+	if rollback {
+		ongoing, finished = "Rolling back:", "Rolled back on"
+	}
 	var line string
 	switch {
-	case !terminal:
-		line = fmt.Sprintf("Rolling out: %d of %d targets done", p.Done, p.Total)
+	case !settled:
+		line = fmt.Sprintf("%s %d of %d targets done", ongoing, p.Done, p.Total)
 	case p.Done == p.Total:
-		line = fmt.Sprintf("Rolled out to all %d targets", p.Total)
+		line = fmt.Sprintf("%s all %d targets", finished, p.Total)
 	case p.Done == 0:
-		line = "Rolled out to no targets"
+		line = finished + " no targets"
 	default:
-		line = fmt.Sprintf("Rolled out to %d of %d targets", p.Done, p.Total)
+		line = fmt.Sprintf("%s %d of %d targets", finished, p.Done, p.Total)
 	}
 	if len(p.Others) > 0 {
 		line += ", " + countsPhrase(p.Others)

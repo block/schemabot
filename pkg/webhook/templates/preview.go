@@ -2887,6 +2887,7 @@ func PreviewCommentMultiTargetApplyInProgressOneDeployment() string {
 	}
 	converged := target(3, state.ApplyOperation.Completed)
 	converged.NeverStarted = true
+	converged.AlreadyConverged = true
 
 	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
 		Model: presentation.Derive([]presentation.Operation{

@@ -640,6 +640,7 @@ func TestTargetProgress_CountsRanAndAlreadyHadApart(t *testing.T) {
 	}
 	converged := target("t_004", so.Completed)
 	converged.NeverStarted = true
+	converged.AlreadyConverged = true
 	apply := Derive([]Operation{
 		target("t_000", so.Completed),
 		target("t_001", so.Running),
