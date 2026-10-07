@@ -1136,6 +1136,144 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 	return false, baseTipSHA, nil
 }
 
+// maxComparedSchemaPaths bounds how many paths SchemaPathsIdenticalBetween
+// follows, symlink targets included, so a symlink chain cannot turn one
+// comparison into an unbounded number of GitHub reads.
+const maxComparedSchemaPaths = 64
+
+// SchemaPathsIdenticalBetween reports whether every path in paths holds
+// identical content at commits baseSHA and headSHA. It needs no common
+// history between them, so it answers for a head that was rebased or
+// force-pushed away from baseSHA, and its cost does not depend on how many
+// files changed elsewhere in the repository.
+//
+// Git objects are content-addressed: a path names the same object at both
+// commits exactly when its content is identical, so each path is compared by
+// object SHA, type, and mode. A path present at one commit and absent at the
+// other differs; a path absent at both is identical. A symlink's object holds
+// only its target, so a symlink at a path, or inside a directory at a path,
+// is followed and its target compared too, unless the target lies inside a
+// directory already proven identical.
+//
+// differingPath names the first path found to differ. An error means the
+// comparison could not be completed and proves nothing: GitHub was
+// unavailable, a commit or tree could not be read, a directory was too large
+// to list completely, or a symlink points outside the repository.
+func (ic *InstallationClient) SchemaPathsIdenticalBetween(ctx context.Context, repo, baseSHA, headSHA string, paths []string) (identical bool, differingPath string, err error) {
+	// Tree SHAs are content-addressed, so one level cache serves both commits
+	// and an unchanged path prefix is read once.
+	levelCache := make(map[string][]TreeEntry)
+	pending := make([]string, 0, len(paths))
+	for _, p := range paths {
+		pending = append(pending, path.Clean(p))
+	}
+	visited := make(map[string]bool)
+	var identicalDirs []string
+	for len(pending) > 0 {
+		current := pending[0]
+		pending = pending[1:]
+		if visited[current] || pathInsideAny(current, identicalDirs) {
+			continue
+		}
+		visited[current] = true
+		if len(visited) > maxComparedSchemaPaths {
+			return false, "", fmt.Errorf("compare schema paths in %s between %s and %s: more than %d paths to compare after following symlinks", repo, baseSHA, headSHA, maxComparedSchemaPaths)
+		}
+
+		baseEntry, baseFound, err := ic.resolveGitTreeEntry(ctx, repo, baseSHA, current, levelCache)
+		if err != nil {
+			return false, "", fmt.Errorf("resolve schema path %s at %s: %w", current, baseSHA, err)
+		}
+		headEntry, headFound, err := ic.resolveGitTreeEntry(ctx, repo, headSHA, current, levelCache)
+		if err != nil {
+			return false, "", fmt.Errorf("resolve schema path %s at %s: %w", current, headSHA, err)
+		}
+		if baseFound != headFound {
+			return false, current, nil
+		}
+		if !baseFound {
+			continue
+		}
+		if baseEntry.SHA != headEntry.SHA || baseEntry.Type != headEntry.Type || baseEntry.Mode != headEntry.Mode {
+			return false, current, nil
+		}
+
+		switch {
+		case headEntry.Type == "tree":
+			targets, err := ic.symlinkTargetsInTree(ctx, repo, current, headEntry.SHA)
+			if err != nil {
+				return false, "", err
+			}
+			identicalDirs = append(identicalDirs, current)
+			pending = append(pending, targets...)
+		case headEntry.Mode == gitSymlinkMode:
+			target, err := ic.resolveSymlinkBlobTarget(ctx, repo, current, headEntry.SHA)
+			if err != nil {
+				return false, "", err
+			}
+			pending = append(pending, target)
+		}
+	}
+	return true, "", nil
+}
+
+// symlinkTargetsInTree lists the directory tree treeSHA at dir and returns the
+// repo-relative target of every symlink inside it.
+func (ic *InstallationClient) symlinkTargetsInTree(ctx context.Context, repo, dir, treeSHA string) ([]string, error) {
+	entries, truncated, err := ic.FetchGitTree(ctx, repo, treeSHA)
+	if err != nil {
+		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, ErrGitTreeTruncated)
+	}
+	var targets []string
+	for _, entry := range entries {
+		if entry.Mode != gitSymlinkMode {
+			continue
+		}
+		target, err := ic.resolveSymlinkBlobTarget(ctx, repo, path.Join(dir, entry.Path), entry.SHA)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
+// resolveSymlinkBlobTarget reads the symlink at linkPath, whose blob is
+// blobSHA, and returns its target as a repo-relative path. A target is
+// relative to the directory holding the link; one that is absolute or
+// escapes the repository is an error.
+func (ic *InstallationClient) resolveSymlinkBlobTarget(ctx context.Context, repo, linkPath, blobSHA string) (string, error) {
+	content, err := ic.FetchBlobContent(ctx, repo, blobSHA)
+	if err != nil {
+		return "", fmt.Errorf("read symlink %s in repo %s: %w", linkPath, repo, err)
+	}
+	target := strings.TrimSpace(content)
+	if target == "" {
+		return "", fmt.Errorf("symlink %s in repo %s has an empty target", linkPath, repo)
+	}
+	if strings.HasPrefix(target, "/") {
+		return "", fmt.Errorf("symlink %s in repo %s points to absolute path %s", linkPath, repo, target)
+	}
+	resolved := path.Clean(path.Join(path.Dir(linkPath), target))
+	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+		return "", fmt.Errorf("symlink %s in repo %s points outside the repository: %s", linkPath, repo, target)
+	}
+	return resolved, nil
+}
+
+// pathInsideAny reports whether p is one of dirs or lies beneath one.
+func pathInsideAny(p string, dirs []string) bool {
+	for _, dir := range dirs {
+		if dir == "." || p == dir || strings.HasPrefix(p, dir+"/") {
+			return true
+		}
+	}
+	return false
+}
+
 // PRFilesProposedAgainstDefaultBranch narrows a pull request's changed files to
 // the ones it actually proposes, and returns the pinned default branch tip the
 // narrowing was measured against for operator logs.
@@ -1713,6 +1851,9 @@ type TreeEntry struct {
 // as "blob" tree entries with this mode; their content is the target path.
 const gitSymlinkMode = "120000"
 
+// gitTreeMode is the git tree file mode for a directory.
+const gitTreeMode = "040000"
+
 // FetchGitTree fetches the entire directory tree in one API call using recursive mode.
 func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA string) ([]TreeEntry, bool, error) {
 	owner, repoName := splitRepo(repo)
@@ -1820,19 +1961,41 @@ func (ic *InstallationClient) resolveGitTreeSHA(ctx context.Context, repo, ref, 
 }
 
 func (ic *InstallationClient) resolveGitObjectSHA(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (objectSHA, objectType string, found bool, err error) {
+	entry, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, objectPath, levelCache)
+	if errors.Is(err, errGitPathThroughNonTree) {
+		return "", "", false, nil
+	}
+	if err != nil || !found {
+		return "", "", found, err
+	}
+	return entry.SHA, entry.Type, true, nil
+}
+
+// errGitPathThroughNonTree reports that a path cannot be resolved in the git
+// tree because a segment before its last is a file or symlink, not a
+// directory. The path may still reach content through that symlink, so it is
+// not the same answer as "absent".
+var errGitPathThroughNonTree = errors.New("path passes through a non-directory entry")
+
+// resolveGitTreeEntry resolves objectPath at ref to the tree entry naming it,
+// mode included, walking one shallow tree level per path segment. The repo
+// root resolves to a synthetic tree entry for the ref's root tree. found is
+// false when any path segment is absent. A non-final segment that is not a
+// tree is errGitPathThroughNonTree.
+func (ic *InstallationClient) resolveGitTreeEntry(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (entry TreeEntry, found bool, err error) {
 	cleanPath := path.Clean(objectPath)
 	if cleanPath == "." {
 		_, rootTreeSHA, err := ic.fetchGitTreeShallow(ctx, repo, ref)
 		if err != nil {
-			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: %w", repo, ref, err)
+			return TreeEntry{}, false, fmt.Errorf("resolve repo root in repo %s ref %s: %w", repo, ref, err)
 		}
 		if rootTreeSHA == "" {
-			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: GitHub returned no tree SHA", repo, ref)
+			return TreeEntry{}, false, fmt.Errorf("resolve repo root in repo %s ref %s: GitHub returned no tree SHA", repo, ref)
 		}
-		return rootTreeSHA, "tree", true, nil
+		return TreeEntry{Path: ".", Mode: gitTreeMode, Type: "tree", SHA: rootTreeSHA}, true, nil
 	}
 	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
-		return "", "", false, fmt.Errorf("schema path %q is not repo-relative", objectPath)
+		return TreeEntry{}, false, fmt.Errorf("schema path %q is not repo-relative", objectPath)
 	}
 
 	treeSHA := ref
@@ -1842,32 +2005,32 @@ func (ic *InstallationClient) resolveGitObjectSHA(ctx context.Context, repo, ref
 		if !cached {
 			levelEntries, _, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
 			if err != nil {
-				return "", "", false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
+				return TreeEntry{}, false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
 			}
 			if levelCache != nil {
 				levelCache[treeSHA] = levelEntries
 			}
 		}
 		var matched *TreeEntry
-		for _, entry := range levelEntries {
-			if entry.Path == segment {
-				entryCopy := entry
+		for _, levelEntry := range levelEntries {
+			if levelEntry.Path == segment {
+				entryCopy := levelEntry
 				matched = &entryCopy
 				break
 			}
 		}
 		if matched == nil {
-			return "", "", false, nil
+			return TreeEntry{}, false, nil
 		}
 		if i == len(segments)-1 {
-			return matched.SHA, matched.Type, true, nil
+			return *matched, true, nil
 		}
 		if matched.Type != "tree" {
-			return "", "", false, nil
+			return TreeEntry{}, false, fmt.Errorf("resolve %s in repo %s ref %s: %s is a %s: %w", objectPath, repo, ref, path.Join(segments[:i+1]...), matched.Type, errGitPathThroughNonTree)
 		}
 		treeSHA = matched.SHA
 	}
-	return "", "", false, nil
+	return TreeEntry{}, false, nil
 }
 
 // FetchBlobContent fetches file content using the Git Blob API.

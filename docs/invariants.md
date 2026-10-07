@@ -1737,7 +1737,8 @@ admins, or CODEOWNERS, per config), evaluated per database. The change's author 
 their own review requirement. An approval counts only for the schema it reviewed: it was given on
 the commit being applied, or on an earlier commit from which that commit provably changed no schema
 input; when that cannot be proved, the approval does not count. *Enforced:* the review gate and actor authorization
-(`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`).
+(`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the schema input content
+comparison in `SchemaPathsIdenticalBetween` (`pkg/github/client.go`).
 
 ### AZ-5: Commands never guess
 

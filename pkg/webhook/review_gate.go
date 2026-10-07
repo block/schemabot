@@ -43,7 +43,7 @@ type ReviewGateResult struct {
 // evaluation-failure comment on durable attempts, where the driver retries
 // and posts the single terminal answer instead; merit blocks always comment.
 func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, environment, requestedBy, commandName string, suppressRetryComments bool) (blocked bool, err error) {
-	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult.Database, schemaResult.SchemaPath, schemaResult.SchemaLinkPath, schemaResult.HeadSHA)
+	gateResult, err := h.checkReviewGate(ctx, client, repo, pr, schemaResult)
 	if err != nil {
 		h.logger.Error("review gate check failed", "repo", repo, "pr", pr,
 			"database", schemaResult.Database, "environment", environment,
@@ -84,21 +84,21 @@ func reviewGateErrorDetail(err error) string {
 // Returns nil if review gating is disabled (apply proceeds).
 // Returns a result with Approved=true if gate passes.
 // Returns a result with Approved=false if gate blocks.
-// schemaPath is the repo-relative path to the database's schema directory (e.g. "schema/payments");
-// schemaLinkPath is the logical environment path when schemaPath was resolved
-// through a symlink, or empty.
-//
-// headSHA is the commit the schema files being applied were read from.
+// schema identifies the database and where its schema inputs live: the schema
+// directory, the environment symlink it was resolved through (if any), and the
+// config file. schema.HeadSHA is the commit the schema files being applied
+// were read from.
 //
 // An approval counts only for the schema it reviewed: it must have been given
-// on headSHA, or on an earlier commit from which no schema input changed on
-// the way to headSHA (see approvalCoversHead). When GitHub is unavailable
-// while proving that, the approval state is undetermined and the gate returns
-// an evaluation error rather than a block.
-func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, schemaPath, schemaLinkPath, headSHA string) (*ReviewGateResult, error) {
+// on HeadSHA, or on an earlier commit at which every one of the database's
+// schema inputs is identical to HeadSHA (see approvalCoversHead). When GitHub
+// is unavailable while proving that, the approval state is undetermined and
+// the gate returns an evaluation error rather than a block.
+func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
 	if !h.isReviewGateEnabled(repo) {
 		return nil, nil
 	}
+	database, schemaPath, headSHA := schema.Database, schema.SchemaPath, schema.HeadSHA
 	if headSHA == "" {
 		return nil, fmt.Errorf("review gate for %s#%d database %q: the commit the schema was read from is unknown", repo, pr, database)
 	}
@@ -145,12 +145,12 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 	validApprovals := slices.Concat(headApprovals, earlierApprovals)
 
 	coverage := approvalCoverage{
-		repo:        repo,
-		pr:          pr,
-		database:    database,
-		headSHA:     headSHA,
-		schemaPaths: reviewGateSchemaPaths(schemaPath, schemaLinkPath),
-		verdicts:    make(map[string]bool),
+		repo:       repo,
+		pr:         pr,
+		database:   database,
+		headSHA:    headSHA,
+		inputPaths: reviewGateInputPaths(schema),
+		verdicts:   make(map[string]bool),
 	}
 	var staleApprovers []string
 	for _, approval := range validApprovals {
@@ -207,24 +207,25 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 // verdict per approved commit, so reviewers who approved the same commit share
 // one comparison.
 type approvalCoverage struct {
-	repo        string
-	pr          int
-	database    string
-	headSHA     string
-	schemaPaths []string
-	verdicts    map[string]bool
+	repo     string
+	pr       int
+	database string
+	headSHA  string
+	// inputPaths are the database's schema inputs: every path whose content
+	// at the approved commit must match the head for the approval to count.
+	inputPaths []string
+	verdicts   map[string]bool
 }
 
 // approvalCoversHead reports whether an approval still stands for the PR head.
 // An approval on the head commit covers it. An approval on an earlier commit
-// covers it only when GitHub proves the head descends from that commit and no
-// schema input — a schema or config file anywhere, or any file under the
-// database's schema paths — changed in between. Anything that prevents that
-// proof (an unknown commit, a compare error, history rewritten by a
-// force-push, a truncated file list) leaves the approval not counting. A
-// comparison GitHub could not answer — it was unavailable, or the evaluation
-// was cancelled — proves nothing either way, so it is returned as an error
-// and never cached as a verdict.
+// covers it only when GitHub proves none of the database's schema inputs
+// changed between that commit and the head (see schemaUnchangedSince).
+// Anything that prevents that proof (an unknown commit, a tree GitHub cannot
+// list completely) leaves the approval not counting. A comparison GitHub could
+// not answer — it was unavailable, or the evaluation was cancelled — proves
+// nothing either way, so it is returned as an error and never cached as a
+// verdict.
 func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
 	approvedSHA := approval.CommitID
 	if approvedSHA == "" {
@@ -247,6 +248,18 @@ func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.Insta
 	return covers, nil
 }
 
+// schemaUnchangedSince decides whether the database's schema inputs are the
+// same at the approved commit and the head. It reads the history compare
+// first, which settles the common cases in one call: when the head descends
+// from the approved commit, a changed file under an input path is a change,
+// and no schema or config file changed anywhere means nothing changed.
+//
+// Every other case is decided by comparing the inputs' content at the two
+// commits (schemaContentUnchangedSince): a compare GitHub cannot use as proof
+// (history rewritten by a rebase or force-push, a truncated file list, an
+// unknown commit), and a compare whose only schema changes lie outside this
+// database's inputs, such as another database's schema arriving from the
+// default branch.
 func (h *Handler) schemaUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
 	files, err := client.FetchChangedFilesBetween(ctx, c.repo, approval.CommitID, c.headSHA)
 	if err != nil {
@@ -258,28 +271,68 @@ func (h *Handler) schemaUnchangedSince(ctx context.Context, client *ghclient.Ins
 			return false, fmt.Errorf("compare schema inputs for %s#%d database %q from approved commit %s to head %s: evaluation cancelled: %w",
 				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(ctxErr, err))
 		}
-		h.logger.Warn("review gate: approval on an earlier commit does not count because GitHub cannot prove the schema inputs are unchanged since it",
+		h.logger.Info("review gate: history compare cannot prove the schema inputs unchanged since the approved commit; comparing their content at both commits",
 			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "error", err)
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths, "compare_error", err)
+		return h.schemaContentUnchangedSince(ctx, client, c, approval)
+	}
+	if anyFileUnderPaths(files, c.inputPaths) {
+		h.logger.Info("review gate: approval on an earlier commit does not count because a file under the database's schema inputs changed since it",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths)
 		return false, nil
 	}
-	if ghclient.HasSchemaInputFiles(files) || anyFileUnderPaths(files, c.schemaPaths) {
-		h.logger.Info("review gate: approval on an earlier commit does not count because schema inputs changed since it",
+	if !ghclient.HasSchemaInputFiles(files) {
+		h.logger.Info("review gate: approval on an earlier commit counts because no schema input changed since it",
 			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
 			"approved_sha", approval.CommitID, "head_sha", c.headSHA)
+		return true, nil
+	}
+	h.logger.Info("review gate: schema files changed since the approved commit, but none under the database's schema inputs; comparing their content at both commits",
+		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+		"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths)
+	return h.schemaContentUnchangedSince(ctx, client, c, approval)
+}
+
+// schemaContentUnchangedSince compares the content of every schema input of
+// the database at the approved commit and the head, following symlinks. It
+// needs no common history between the two commits. Identical content counts
+// the approval; a difference, or a comparison that cannot be completed, does
+// not, and a GitHub outage is returned as a retryable error.
+func (h *Handler) schemaContentUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
+	identical, differingPath, err := client.SchemaPathsIdenticalBetween(ctx, c.repo, approval.CommitID, c.headSHA, c.inputPaths)
+	if err != nil {
+		if ghclient.IsUnavailableError(err) {
+			return false, fmt.Errorf("compare schema input content for %s#%d database %q at approved commit %s and head %s: %w",
+				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, fmt.Errorf("compare schema input content for %s#%d database %q at approved commit %s and head %s: evaluation cancelled: %w",
+				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(ctxErr, err))
+		}
+		h.logger.Warn("review gate: approval on an earlier commit does not count because GitHub cannot prove the schema inputs are unchanged since it",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths, "error", err)
 		return false, nil
 	}
-	h.logger.Info("review gate: approval on an earlier commit counts because no schema input changed since it",
+	if !identical {
+		h.logger.Info("review gate: approval on an earlier commit does not count because a schema input differs between it and the head",
+			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "differing_path", differingPath)
+		return false, nil
+	}
+	h.logger.Info("review gate: approval on an earlier commit counts because every schema input is identical at it and the head",
 		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-		"approved_sha", approval.CommitID, "head_sha", c.headSHA)
+		"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths)
 	return true, nil
 }
 
-// reviewGateSchemaPaths lists the schema paths the gate protects, the same
-// paths the base schema freshness guard compares.
-func reviewGateSchemaPaths(schemaPath, schemaLinkPath string) []string {
+// reviewGateInputPaths lists the database's schema inputs the gate protects:
+// the schema paths the base schema freshness guard compares, and the config
+// file, which can sit outside them.
+func reviewGateInputPaths(schema *ghclient.SchemaRequestResult) []string {
 	var paths []string
-	for _, p := range []string{schemaPath, schemaLinkPath} {
+	for _, p := range []string{schema.SchemaPath, schema.SchemaLinkPath, schema.ConfigPath} {
 		if p != "" {
 			paths = append(paths, p)
 		}
