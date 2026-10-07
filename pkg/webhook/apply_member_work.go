@@ -49,17 +49,37 @@ func rolloutRunsMemberWork(outcome reviewDriftOutcome, preview *templates.Deploy
 // The apply does not run, and the check records what is pending so the PR
 // cannot merge as if every target were up to date (MG-12).
 func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, requestedBy string, actionName string, outcome reviewDriftOutcome, primaryTargetConverged bool) {
-	h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, outcome, primaryTargetConverged, pendingRolloutMessage(outcome, primaryTargetConverged, primaryTargetName(outcome.work, planResp)))
+	h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, outcome, primaryTargetConverged, pendingRolloutMessage(outcome, primaryTargetConverged, h.primaryTargetName(outcome.work, planResp, schemaResult.Database, environment)))
 }
 
 // primaryTargetName names the target the apply's own plan was planned against
-// the way the plan comment does: as the rollout's first member, or, when no
-// rollup ran, as the one target, which no other member shares a deployment with.
-func primaryTargetName(work memberWork, planResp *apitypes.PlanResponse) string {
+// the way the plan comment does: as the rollout's first member. When the
+// rollout round named no members, because it did not run or failed, the name
+// is read against the environment's configured targets instead, so a
+// deployment that addresses several targets still qualifies it. Targets that
+// cannot be resolved leave the name qualified, which never reads as another
+// target.
+func (h *Handler) primaryTargetName(work memberWork, planResp *apitypes.PlanResponse, database, environment string) string {
 	if work.primary != "" {
 		return work.primary
 	}
-	return routing.DisplayNames([]routing.ExecutionTarget{plannedPrimaryMember(planResp)})[0]
+	primary := plannedPrimaryMember(planResp)
+	targets, err := h.service.Config().ResolveDatabaseTargets(database, environment)
+	if err != nil {
+		h.logger.Warn("could not resolve the environment's targets to name the primary target; naming it with its target",
+			"database", database, "environment", environment, "deployment", primary.Deployment, "target", primary.Target, "error", err)
+		return qualifiedTargetName(primary)
+	}
+	return routing.DisplayNames(append([]routing.ExecutionTarget{primary}, targets...))[0]
+}
+
+// qualifiedTargetName names a member by its deployment and target, or by its
+// deployment alone when it carries no target.
+func qualifiedTargetName(member routing.ExecutionTarget) string {
+	if member.Target == "" {
+		return member.Deployment
+	}
+	return member.MemberID()
 }
 
 // refuseRollout refuses an apply that cannot run what the rollout has pending,

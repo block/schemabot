@@ -182,7 +182,7 @@ func (h *Handler) executeApply(
 	confirmedMemberWork := false
 	switch {
 	case runsMemberWork:
-		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, primaryTargetName(rollout.work, planResp))
+		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment))
 		if coverErr != nil {
 			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
 				"could not verify that the reviewed plans cover the other targets' work", coverErr,
@@ -301,7 +301,7 @@ func (h *Handler) executeApply(
 				return
 			}
 			if difference != workUnchanged {
-				reason := primaryTargetDifferenceReason(primaryTargetName(rollout.work, planResp), difference)
+				reason := primaryTargetDifferenceReason(h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment), difference)
 				h.logger.Info("apply-confirm refused: the primary target would run work the confirmed plan did not show",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)

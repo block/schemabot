@@ -481,12 +481,35 @@ func TestPendingRolloutMessageNamesThePrimaryTarget(t *testing.T) {
 
 // The primary target is named the way the plan comment names it: by its
 // deployment, qualified with the target only when another member of the
-// rollout routes through the same deployment. With no rollup there are no
-// other members to share a deployment with.
+// rollout routes through the same deployment. When the rollout round named no
+// members, the environment's configured targets decide, so a deployment with a
+// second target still qualifies it, and targets that cannot be resolved leave
+// it qualified.
 func TestPrimaryTargetName(t *testing.T) {
+	handlerOver := func(deployments map[string]api.DeploymentTarget) *Handler {
+		cfg := &api.ServerConfig{Databases: map[string]api.DatabaseConfig{
+			"payments": {Type: "mysql", Environments: map[string]api.EnvironmentConfig{"production": {Deployments: deployments}}},
+		}}
+		return &Handler{
+			service: api.New(&rollbackConfirmTestStorage{plans: &rollbackConfirmTestPlanStore{}}, cfg, nil, testLogger()),
+			logger:  testLogger(),
+		}
+	}
 	planResp := &apitypes.PlanResponse{Deployment: "eu", Target: "payments-001"}
-	assert.Equal(t, "eu/payments-001", primaryTargetName(memberWork{primary: "eu/payments-001"}, planResp), "the rollout's name wins")
-	assert.Equal(t, "eu", primaryTargetName(memberWork{}, planResp), "a lone target is named by its deployment")
+	lone := handlerOver(map[string]api.DeploymentTarget{
+		"eu": {Targets: []api.TargetEntry{{Target: "payments-001"}}},
+		"us": {Targets: []api.TargetEntry{{Target: "payments-002"}}},
+	})
+	assert.Equal(t, "eu/payments-001", lone.primaryTargetName(memberWork{primary: "eu/payments-001"}, planResp, "payments", "production"), "the rollout's name wins")
+	assert.Equal(t, "eu", lone.primaryTargetName(memberWork{}, planResp, "payments", "production"), "a target alone on its deployment is named by the deployment")
+
+	shared := handlerOver(map[string]api.DeploymentTarget{
+		"eu": {Targets: []api.TargetEntry{{Target: "payments-001"}, {Target: "payments-002"}}},
+	})
+	assert.Equal(t, "eu/payments-001", shared.primaryTargetName(memberWork{}, planResp, "payments", "production"),
+		"a deployment with a second target qualifies its members though the rollout round named none")
+	assert.Equal(t, "eu/payments-001", shared.primaryTargetName(memberWork{}, planResp, "payments", "staging"),
+		"targets that cannot be resolved leave the name qualified")
 
 	pinned := &storage.Plan{Deployment: "eu", Target: "payments-001"}
 	assert.Equal(t, "eu", roundMemberName(pinned, map[string]*storage.Plan{"us/payments-002": {Deployment: "us", Target: "payments-002"}}))
