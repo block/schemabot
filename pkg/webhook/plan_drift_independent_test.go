@@ -142,11 +142,12 @@ func TestReviewDriftComment_BlockedChangeNamesOnlyTheTargetsThatRefuseIt(t *test
 
 	rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
 	require.True(t, rollup.Clean)
-	assert.Contains(t, out, "`commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`\n\n```sql\n", "one DDL, one group")
+	assert.Contains(t, out, "Needs it: `commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`", "one DDL, one group, every target counted")
+	assert.NotContains(t, out, "### ", "one plan renders with no target heading")
 	assert.Contains(t, out, "- `orders` on target `commerce/orders-002`\n", "only the refusing target is named")
 
-	// When every target in the group refuses the change, the heading already
-	// names them.
+	// When every target with the change refuses it, the plan summary already
+	// counts them, so the refusal names none.
 	for i := range diffs {
 		diffs[i].Changes[0].TableChanges[0].ExecutionMode = engine.ExecutionModeBlocked
 	}

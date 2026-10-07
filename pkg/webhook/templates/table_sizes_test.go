@@ -466,25 +466,25 @@ func TestRenderPlanComment_MultiTargetSizesSingleTargetTable(t *testing.T) {
 }
 
 // A blocked rollup carries no per-target sizes, so the section falls back to
-// the primary plan's own, and the heading names the primary target so the
-// sizes are not read as the whole rollout's.
-func TestRenderPlanComment_MultiTargetWithoutTargetSizesNamesPrimaryTarget(t *testing.T) {
+// the one target's plan the comment has, and the heading names that target so
+// the sizes are not read as the whole rollout's.
+func TestRenderPlanComment_MultiTargetWithoutTargetSizesNamesTheSizedTarget(t *testing.T) {
 	data := multiTargetSizePlanData(nil)
 	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: previewRolloutMembers()}
 	out := RenderPlanComment(data)
 
-	assert.Contains(t, out, "📊 **Table sizes** (primary target `primary/testapp_1` only; other targets not shown):\n- `orders`: ~100 KB\n\n")
+	assert.Contains(t, out, "📊 **Table sizes** (`us/testapp_1` only; other targets not shown):\n- `orders`: ~100 KB\n\n")
 }
 
 // A rollup that could not be computed names no members, so the heading scopes
-// the sizes to the primary target without naming it, and without claiming
-// other targets exist: the database may have only the primary.
-func TestRenderPlanComment_UncomputedRollupScopesSizesToPrimaryTarget(t *testing.T) {
+// the sizes to one target without naming it, and without claiming other
+// targets exist: the database may have only that one.
+func TestRenderPlanComment_UncomputedRollupScopesSizesToOneTarget(t *testing.T) {
 	data := multiTargetSizePlanData(nil)
 	data.DeploymentDrift = &DeploymentDriftData{Computed: false}
 	out := RenderPlanComment(data)
 
-	assert.Contains(t, out, "📊 **Table sizes** (primary target only; targets could not be listed):\n")
+	assert.Contains(t, out, "📊 **Table sizes** (one target only; targets could not be listed):\n")
 	assert.NotContains(t, out, "other targets")
 }
 
@@ -506,7 +506,7 @@ func TestRenderPlanComment_TableSizeNamesStayInCodeSpans(t *testing.T) {
 	members[0].Deployment = "prim`ary"
 	data := multiTargetSizePlanData(nil)
 	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: members}
-	assert.Contains(t, RenderPlanComment(data), "(primary target `` prim`ary `` only; other targets not shown)")
+	assert.Contains(t, RenderPlanComment(data), "(`` prim`ary `` only; other targets not shown)")
 
 	out := RenderPlanComment(multiTargetSizePlanData([]TargetTableSize{
 		targetSize("primary/a`b", "ord`ers", 23_400_000_000),
@@ -520,14 +520,14 @@ func TestRenderPlanComment_TableSizeNamesStayInCodeSpans(t *testing.T) {
 
 // A collapsed section on the reviewed-target fallback keeps the target scope
 // in its summary, where GitHub reads HTML rather than markdown, so the
-// primary target's name is escaped and set in a <code> tag.
-func TestRenderPlanComment_CollapsedPrimaryTargetSizesKeepScope(t *testing.T) {
+// target's name is escaped and set in a <code> tag.
+func TestRenderPlanComment_CollapsedOneTargetSizesKeepScope(t *testing.T) {
 	order, bytes := rankedTables(presentation.TableSizesInlineLimit + 1)
 	data := tableSizePlanData(sizedTables(bytes, order))
 	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: previewRolloutMembers()}
 	out := RenderPlanComment(data)
 
-	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b> (primary target <code>primary/testapp_1</code> only; other targets not shown)</summary>\n\n"+
+	assert.Equal(t, "<details>\n<summary>📊 <b>Table sizes</b> (<code>us/testapp_1</code> only; other targets not shown)</summary>\n\n"+
 		sizeLines(bytes, largestFirst(order))+
 		"\n</details>\n\n", tableSizesSection(t, out))
 
@@ -535,5 +535,5 @@ func TestRenderPlanComment_CollapsedPrimaryTargetSizesKeepScope(t *testing.T) {
 	members[0].Deployment = "<b>prim`ary</b>"
 	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: false, Deployments: members}
 	assert.Contains(t, RenderPlanComment(data),
-		"<summary>📊 <b>Table sizes</b> (primary target <code>&lt;b&gt;prim`ary&lt;/b&gt;</code> only; other targets not shown)</summary>")
+		"<summary>📊 <b>Table sizes</b> (<code>&lt;b&gt;prim`ary&lt;/b&gt;</code> only; other targets not shown)</summary>")
 }

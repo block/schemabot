@@ -187,14 +187,15 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 	// Count and show changes, every target's when the apply runs them.
 	summary := data
 	if RendersTargetPlans(data.DeploymentDrift) {
-		// The refusal lists the primary's unsafe changes below with every
-		// other target's, and like a single target's refusal it does not
-		// disclose existing copies, so the primary's group carries neither.
+		// The refusal lists every target's unsafe changes below, and like a
+		// single target's refusal it does not disclose existing copies, so no
+		// plan above it carries either.
 		groups := data
 		groups.HasUnsafeChanges, groups.UnsafeChanges = false, nil
 		groups.DiscardedCopies, groups.AdoptedCopies, groups.RunningCopies = nil, nil, nil
 		writeTargetPlans(&sb, groups, budget, false)
 		summary.Changes = combinedTargetPlanChanges(data)
+		summary.summaryRollout = data.DeploymentDrift
 	} else if statements, keyspaceUpdates := countChanges(data.Changes); statements+keyspaceUpdates > 0 {
 		writeKeyspaceChanges(&sb, data, budget)
 	}

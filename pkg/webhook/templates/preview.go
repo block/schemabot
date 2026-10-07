@@ -851,7 +851,7 @@ func PreviewCommentPlanDriftDetected() string {
 			Clean:    false,
 			Deployments: []DeploymentDriftEntry{
 				{Deployment: "eu", Primary: true, Class: "match"},
-				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the primary target's plan"},
+				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs this plan"},
 				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
 			},
 		},
@@ -862,9 +862,9 @@ func PreviewCommentPlanDriftDetected() string {
 // below are rendered for, in rollout order with the primary target first.
 func previewRolloutMembers() []DeploymentDriftEntry {
 	return []DeploymentDriftEntry{
-		{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
-		{Deployment: "primary", Target: "testapp_2", Class: "planned"},
-		{Deployment: "primary", Target: "testapp_3", Class: "planned"},
+		{Deployment: "us", Target: "testapp_1", Primary: true, Class: "planned"},
+		{Deployment: "us", Target: "testapp_2", Class: "planned"},
+		{Deployment: "us", Target: "testapp_3", Class: "planned"},
 	}
 }
 
@@ -887,8 +887,8 @@ func PreviewCommentPlanRolloutConverging() string {
 			Computed: true, Clean: true, Independent: true,
 			Deployments: previewRolloutMembers(),
 			Plans: []DeploymentPlanGroup{
-				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: samplePlanChanges()},
-				{Members: []string{"primary/testapp_3"}},
+				{Members: []string{"us/testapp_1", "us/testapp_2"}, Primary: true, Changes: samplePlanChanges()},
+				{Members: []string{"us/testapp_3"}},
 			},
 		},
 	})
@@ -914,8 +914,8 @@ func PreviewCommentPlanRolloutConvergedPrimary() string {
 			Computed: true, Clean: true, Independent: true,
 			Deployments: previewRolloutMembers(),
 			Plans: []DeploymentPlanGroup{
-				{Members: []string{"primary/testapp_1"}, Primary: true},
-				{Members: []string{"primary/testapp_2", "primary/testapp_3"}, Changes: samplePlanChanges()},
+				{Members: []string{"us/testapp_1"}, Primary: true},
+				{Members: []string{"us/testapp_2", "us/testapp_3"}, Changes: samplePlanChanges()},
 			},
 		},
 	})
@@ -942,8 +942,8 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 			Computed: true, Clean: true, Independent: true,
 			Deployments: previewRolloutMembers(),
 			Plans: []DeploymentPlanGroup{
-				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: reviewed},
-				{Members: []string{"primary/testapp_3"}, Changes: []KeyspaceChangeData{{
+				{Members: []string{"us/testapp_1", "us/testapp_2"}, Primary: true, Changes: reviewed},
+				{Members: []string{"us/testapp_3"}, Changes: []KeyspaceChangeData{{
 					Keyspace:   "testapp",
 					Statements: []string{email, "ALTER TABLE `users` ADD INDEX `idx_email` (`email`);"},
 				}}},
@@ -959,10 +959,10 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 	members := previewRolloutMembers()[:2]
 	return previewRolloutTableSizes(members, []TargetTableSize{
-		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
-		previewTargetSize("primary/testapp_1", "users", 95_000_000),
-		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
-		previewTargetSize("primary/testapp_2", "users", 98_000_000),
+		previewTargetSize("us/testapp_1", "orders", 610_000_000),
+		previewTargetSize("us/testapp_1", "users", 95_000_000),
+		previewTargetSize("us/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("us/testapp_2", "users", 98_000_000),
 	})
 }
 
@@ -973,12 +973,12 @@ func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 // understates the table.
 func PreviewCommentPlanRolloutTableSizes() string {
 	return previewRolloutTableSizes(previewRolloutMembers(), []TargetTableSize{
-		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
-		previewTargetSize("primary/testapp_1", "users", 95_000_000),
-		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
-		previewTargetSize("primary/testapp_2", "users", 98_000_000),
-		{Target: "primary/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
-		previewTargetSize("primary/testapp_3", "users", 104_000_000),
+		previewTargetSize("us/testapp_1", "orders", 610_000_000),
+		previewTargetSize("us/testapp_1", "users", 95_000_000),
+		previewTargetSize("us/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("us/testapp_2", "users", 98_000_000),
+		{Target: "us/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
+		previewTargetSize("us/testapp_3", "users", 104_000_000),
 	})
 }
 

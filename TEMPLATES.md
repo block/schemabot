@@ -1890,9 +1890,9 @@ schemabot apply -e production
 
 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
-- `eu` (primary) ✅ matches the primary target's plan
-- `au` ✅ matches the primary target's plan · blocked: 1
-- `us` ✅ matches the primary target's plan
+- `eu` ✅ matches this plan
+- `au` ✅ matches this plan · blocked: 1
+- `us` ✅ matches this plan
 
 ```sql
 CREATE TABLE `users` (
@@ -1948,10 +1948,10 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-⚠️ **Deployment drift detected** — some deployments no longer match the primary target's plan, so the plan check is failing closed:
+⚠️ **Deployment drift detected** — some deployments no longer match this plan, so the plan check is failing closed:
 
-- `eu` (primary) ✅ matches the primary target's plan
-- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs the primary target's plan
+- `eu` ✅ matches this plan
+- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs this plan
 - `us` ❌ could not verify — diff failed; see server logs
 
 ```sql
@@ -1983,7 +1983,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (primary target `eu` only; other targets not shown):
+📊 **Table sizes** (`eu` only; other targets not shown):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
@@ -2039,7 +2039,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (primary target only; targets could not be listed):
+📊 **Table sizes** (one target only; targets could not be listed):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
@@ -2064,10 +2064,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-### 2 of 3 targets
-
-`primary/testapp_1`, `primary/testapp_2`
-
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -2097,11 +2093,14 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-### Target `primary/testapp_3`
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to 2 of 3 targets (1 already has it)
 
-No schema changes detected
+<details>
+<summary>Targets</summary>
 
-📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
+Needs it: `us/testapp_1`, `us/testapp_2` · Already has it: `us/testapp_3`
+
+</details>
 
 
 ---
@@ -2123,10 +2122,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-### 2 of 3 targets
-
-`primary/testapp_2`, `primary/testapp_3`
-
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -2156,11 +2151,14 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-### Target `primary/testapp_1`
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to 2 of 3 targets (1 already has it)
 
-No schema changes detected
+<details>
+<summary>Targets</summary>
 
-📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
+Needs it: `us/testapp_2`, `us/testapp_3` · Already has it: `us/testapp_1`
+
+</details>
 
 
 ---
@@ -2184,13 +2182,13 @@ schemabot apply -e production
 
 ### 2 of 3 targets
 
-`primary/testapp_1`, `primary/testapp_2`
+`us/testapp_1`, `us/testapp_2`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ```
 
-### Target `primary/testapp_3`
+### Target `us/testapp_3`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
@@ -2200,7 +2198,7 @@ ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-📋 **Plan**: **1** table to alter across 3 targets
+📋 **Plan**: **1** table to alter · rolling out to all 3 targets
 
 
 ---
@@ -2222,10 +2220,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-### 2 targets
-
-`primary/testapp_1`, `primary/testapp_2`
-
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 ```
@@ -2235,10 +2229,17 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📊 **Table sizes**:
-- `orders`: ~24.0 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
-- `users`: ~193 MB across 2 targets · largest ~98.0 MB on `primary/testapp_2` · smallest ~95.0 MB
+- `orders`: ~24.0 GB across 2 targets · largest ~23.4 GB on `us/testapp_2` · smallest ~610 MB
+- `users`: ~193 MB across 2 targets · largest ~98.0 MB on `us/testapp_2` · smallest ~95.0 MB
 
-📋 **Plan**: **2** tables to alter across 2 targets
+📋 **Plan**: **2** tables to alter · rolling out to both targets
+
+<details>
+<summary>Targets</summary>
+
+Needs it: `us/testapp_1`, `us/testapp_2`
+
+</details>
 
 
 ---
@@ -2260,10 +2261,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-### 3 targets
-
-`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`
-
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 ```
@@ -2273,10 +2270,17 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📊 **Table sizes**:
-- `orders`: ~24.0 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
-- `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95.0 MB
+- `orders`: ~24.0 GB across 2 of 3 targets · largest ~23.4 GB on `us/testapp_2` · smallest ~610 MB · size estimate unavailable on `us/testapp_3`
+- `users`: ~297 MB across 3 targets · largest ~104 MB on `us/testapp_3` · smallest ~95.0 MB
 
-📋 **Plan**: **2** tables to alter across 3 targets
+📋 **Plan**: **2** tables to alter · rolling out to all 3 targets
+
+<details>
+<summary>Targets</summary>
+
+Needs it: `us/testapp_1`, `us/testapp_2`, `us/testapp_3`
+
+</details>
 
 
 ---
@@ -2300,9 +2304,9 @@ schemabot apply -e production
 
 ⚠️ **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:
 
-- `primary/testapp_1` (primary) ✅ planned against its own schema
-- `primary/testapp_2` ✅ planned against its own schema
-- `primary/testapp_3` ❌ could not plan — diff failed; see server logs
+- `us/testapp_1` ✅ planned against its own schema
+- `us/testapp_2` ✅ planned against its own schema
+- `us/testapp_3` ❌ could not plan — diff failed; see server logs
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -2312,7 +2316,7 @@ ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-📊 **Table sizes** (primary target `primary/testapp_1` only; other targets not shown):
+📊 **Table sizes** (`us/testapp_1` only; other targets not shown):
 - `orders`: ~610 MB
 - `users`: ~95.0 MB
 

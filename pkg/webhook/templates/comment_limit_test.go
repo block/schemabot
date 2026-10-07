@@ -746,3 +746,54 @@ func TestPlanCommentCutTargetGroupNamesWhosePlanItPointsAt(t *testing.T) {
 	assert.NotContains(t, body, "for these targets")
 	assert.NotContains(t, body, ddlTruncatedMarker)
 }
+
+// When every target with work runs one plan, it renders with no heading
+// naming them, so a cut block's marker names the target whose stored plan it
+// points at itself. That holds when the plan is the primary's and other
+// targets share it, and when the only target with work is another target's.
+func TestPlanCommentCutSoleTargetPlanNamesWhosePlanItPointsAt(t *testing.T) {
+	t.Run("targets share the primary's plan", func(t *testing.T) {
+		primary := greenfieldPlan("production", "orders", 150)
+		primary.PlanID = "plan_reviewed"
+		primary.DeploymentDrift = &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/orders_1", "primary/orders_2"}, Primary: true, Changes: primary.Changes},
+			},
+		}
+		body := RenderPlanComment(primary)
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+
+		assert.NotContains(t, body, "### Target", "one plan renders with no target heading")
+		assert.Contains(t, body, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_1` is available from the CLI with `schemabot list-plans -e production plan_reviewed` (every target runs the same DDL)._\n")
+		assert.NotContains(t, body, "for this target")
+	})
+
+	t.Run("only another target has work", func(t *testing.T) {
+		primary := greenfieldPlan("production", "orders", 0)
+		primary.PlanID = "plan_reviewed"
+		primary.Changes = nil
+		other := greenfieldPlan("production", "orders_eu", 150).Changes
+		primary.DeploymentDrift = &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "orders_1", Primary: true, Class: "converged"},
+				{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/orders_1"}, Primary: true},
+				{Members: []string{"primary/orders_2"}, Changes: other, PlanID: "plan_member_2"},
+			},
+		}
+		body := RenderPlanComment(primary)
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+
+		assert.NotContains(t, body, "### Target", "one plan renders with no target heading")
+		assert.Contains(t, body, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_2` is available from the CLI with `schemabot list-plans -e production plan_member_2`._\n")
+		assert.NotContains(t, body, "for this target")
+	})
+}
