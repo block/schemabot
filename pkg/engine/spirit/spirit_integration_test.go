@@ -1628,10 +1628,8 @@ func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 		started:  time.Now(),
 	})
 
-	// The lockless checksum reaches its verdict only after its full pass
-	// budget (checksum.DefaultLocklessMaxPasses), each pass paced by
-	// checksum.DefaultLocklessRetryDelay, so the bound must cover all of them.
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	shortenLocklessRetryDelay(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	err = eng.executeSpiritMigration(ctx, host, username, password, database,
 		"ALTER TABLE `checksum_duplicates` ADD UNIQUE KEY `uq_duplicate_value` (`duplicate_value`)", false)
@@ -1644,6 +1642,19 @@ func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 	require.NoError(t, err, "Progress()")
 	assert.Equal(t, engine.StateFailed, result.State)
 	assert.False(t, result.Retryable)
+}
+
+// shortenLocklessRetryDelay paces the lockless checksum's passes 100ms apart
+// for the rest of the test. A lossy ALTER fails only once the checksum has run
+// its full pass budget (checksum.DefaultLocklessMaxPasses), and at the
+// production pacing (5s) that alone exceeds a test's 30-second bound. The
+// override is a package global, so a test that uses it must not run in
+// parallel.
+func shortenLocklessRetryDelay(t *testing.T) {
+	t.Helper()
+	prev := checksum.DefaultLocklessRetryDelay
+	checksum.DefaultLocklessRetryDelay = 100 * time.Millisecond
+	t.Cleanup(func() { checksum.DefaultLocklessRetryDelay = prev })
 }
 
 // TestEngine_Progress_FailingApplyNeverReportsCompleted verifies that a

@@ -5201,15 +5201,13 @@ spirit:
 	// still sets one of the removed keys fails to load instead of silently
 	// running with a setting the operator believes they changed.
 	t.Run("removed keys are rejected", func(t *testing.T) {
-		for _, key := range []string{
-			"enable_experimental_autoscaling: false",
-			"enable_experimental_lockless_checksum: true",
-			"checksum_yield_timeout: 6h",
+		for key, value := range map[string]string{
+			"enable_experimental_autoscaling":       "false",
+			"enable_experimental_lockless_checksum": "true",
+			"checksum_yield_timeout":                "6h",
 		} {
-			var cfg ServerConfig
-			dec := yaml.NewDecoder(strings.NewReader("spirit:\n  " + key + "\n"))
-			dec.KnownFields(true)
-			require.Error(t, dec.Decode(&cfg), key)
+			_, err := ParseServerConfig([]byte("spirit:\n  " + key + ": " + value + "\n"))
+			require.ErrorContains(t, err, key)
 		}
 	})
 
