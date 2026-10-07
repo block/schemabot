@@ -1437,8 +1437,8 @@ func PreviewCommentReviewRequiredNoOperators() string {
 }
 
 // PreviewCommentReviewRequiredStaleApproval renders the "review required"
-// comment when an authorized reviewer approved an earlier commit and schema
-// files changed after it, so that approval no longer counts.
+// comment when an authorized reviewer approved an earlier commit and the PR's
+// schema change differs at the head, so that approval no longer counts.
 func PreviewCommentReviewRequiredStaleApproval() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:          "testapp",
@@ -1447,7 +1447,22 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		OperatorReviewers: []string{"acme/testapp-operators"},
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
-		StaleApprovers:    []string{"jdoe"},
+		ChangedApprovers:  []string{"jdoe"},
+	})
+}
+
+// PreviewCommentReviewRequiredUncomparableApproval renders the "review
+// required" comment when an authorized reviewer approved an earlier commit
+// that cannot be compared with the head, so that approval cannot carry over.
+func PreviewCommentReviewRequiredUncomparableApproval() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:              "testapp",
+		Environment:           "staging",
+		RequestedBy:           previewRequestedBy,
+		OperatorReviewers:     []string{"acme/testapp-operators"},
+		OtherReviewers:        []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:              previewRequestedBy,
+		UncomparableApprovers: []string{"jdoe"},
 	})
 }
 

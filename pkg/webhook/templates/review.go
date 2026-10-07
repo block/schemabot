@@ -17,9 +17,13 @@ type ReviewGateData struct {
 	// the gate: admins, repo admins, and codeowners.
 	OtherReviewers []string
 	PRAuthor       string
-	// StaleApprovers are authorized reviewers whose approval was given on an
-	// earlier commit and no longer counts.
-	StaleApprovers []string
+	// ChangedApprovers are authorized reviewers whose approval was given on
+	// an earlier commit at which the PR's schema change differed from the head.
+	ChangedApprovers []string
+	// UncomparableApprovers are authorized reviewers whose approval was given
+	// on an earlier commit that could not be compared with the head, so the
+	// approval cannot carry over to it.
+	UncomparableApprovers []string
 }
 
 // RenderReviewRequired renders a PR comment when the review gate blocks an apply.
@@ -33,13 +37,16 @@ func RenderReviewRequired(data ReviewGateData) string {
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
 	sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
-	if len(data.StaleApprovers) > 0 {
-		mentions := make([]string, 0, len(data.StaleApprovers))
-		for _, approver := range data.StaleApprovers {
-			mentions = append(mentions, "@"+approver)
-		}
-		fmt.Fprintf(&sb, "\nApprovals on an earlier commit no longer count, because schema files changed since then or SchemaBot could not confirm they did not: %s. Ask for an approval of the latest commit.\n",
-			strings.Join(mentions, ", "))
+	if len(data.ChangedApprovers) > 0 {
+		fmt.Fprintf(&sb, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: %s.\n",
+			mentionList(data.ChangedApprovers))
+	}
+	if len(data.UncomparableApprovers) > 0 {
+		fmt.Fprintf(&sb, "\nApprovals on an earlier commit can't carry over because SchemaBot can't compare that commit with the latest one: %s.\n",
+			mentionList(data.UncomparableApprovers))
+	}
+	if len(data.ChangedApprovers) > 0 || len(data.UncomparableApprovers) > 0 {
+		sb.WriteString("Ask for an approval of the latest commit.\n")
 	}
 
 	hasOperators := len(data.OperatorReviewers) > 0
@@ -72,4 +79,13 @@ func writeReviewerList(sb *strings.Builder, reviewers []string) {
 	for _, reviewer := range reviewers {
 		fmt.Fprintf(sb, "- @%s\n", reviewer)
 	}
+}
+
+// mentionList renders logins as comma-separated @-mentions.
+func mentionList(logins []string) string {
+	mentions := make([]string, 0, len(logins))
+	for _, login := range logins {
+		mentions = append(mentions, "@"+login)
+	}
+	return strings.Join(mentions, ", ")
 }

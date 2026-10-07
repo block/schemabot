@@ -23,10 +23,13 @@ type ReviewGateResult struct {
 	// the gate — global admins, then repo admins, then codeowners.
 	OtherReviewers []string
 	PRAuthor       string
-	// StaleApprovers are authorized reviewers whose approval was given on an
-	// earlier commit and does not cover the head, so the review-required
-	// comment can say why an approval visible on the PR does not count.
-	StaleApprovers []string
+	// ChangedApprovers and UncomparableApprovers are authorized reviewers
+	// whose approval was given on an earlier commit and does not cover the
+	// head, so the review-required comment can say why an approval visible on
+	// the PR does not count: the PR's schema change differs at the head, or
+	// the earlier commit could not be compared with it.
+	ChangedApprovers      []string
+	UncomparableApprovers []string
 }
 
 // enforceReviewGate runs the review gate check and posts the appropriate comment if blocked.
@@ -55,13 +58,14 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 	}
 	if gateResult != nil && !gateResult.Approved {
 		h.postComment(repo, pr, installationID, templates.RenderReviewRequired(templates.ReviewGateData{
-			Database:          schemaResult.Database,
-			Environment:       environment,
-			RequestedBy:       requestedBy,
-			OperatorReviewers: gateResult.OperatorReviewers,
-			OtherReviewers:    gateResult.OtherReviewers,
-			PRAuthor:          gateResult.PRAuthor,
-			StaleApprovers:    gateResult.StaleApprovers,
+			Database:              schemaResult.Database,
+			Environment:           environment,
+			RequestedBy:           requestedBy,
+			OperatorReviewers:     gateResult.OperatorReviewers,
+			OtherReviewers:        gateResult.OtherReviewers,
+			PRAuthor:              gateResult.PRAuthor,
+			ChangedApprovers:      gateResult.ChangedApprovers,
+			UncomparableApprovers: gateResult.UncomparableApprovers,
 		}))
 		return true, nil
 	}
@@ -89,11 +93,11 @@ func reviewGateErrorDetail(err error) string {
 // config file. schema.HeadSHA is the commit the schema files being applied
 // were read from.
 //
-// An approval counts only for the schema it reviewed: it must have been given
-// on HeadSHA, or on an earlier commit at which every one of the database's
-// schema inputs is identical to HeadSHA (see approvalCoversHead). When GitHub
-// is unavailable while proving that, the approval state is undetermined and
-// the gate returns an evaluation error rather than a block.
+// An approval counts only for the schema change it reviewed: it must have been
+// given on HeadSHA, or on an earlier commit at which the PR's change to the
+// database's schema inputs is the same as at HeadSHA (see approvalCoversHead).
+// When GitHub is unavailable while proving that, the approval state is
+// undetermined and the gate returns an evaluation error rather than a block.
 func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult) (*ReviewGateResult, error) {
 	if !h.isReviewGateEnabled(repo) {
 		return nil, nil
@@ -148,11 +152,12 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		repo:       repo,
 		pr:         pr,
 		database:   database,
+		baseRef:    prInfo.BaseRef,
 		headSHA:    headSHA,
 		inputPaths: reviewGateInputPaths(schema),
-		verdicts:   make(map[string]bool),
+		verdicts:   make(map[string]approvalVerdict),
 	}
-	var staleApprovers []string
+	var changedApprovers, uncomparableApprovers []string
 	for _, approval := range validApprovals {
 		reviewer := approval.User
 		matched, principal, err := policy.Matches(ctx, client, reviewer)
@@ -164,15 +169,22 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 				"repo", repo, "pr", pr, "database", database, "reviewer", reviewer)
 			continue
 		}
-		covers, err := h.approvalCoversHead(ctx, client, &coverage, approval)
+		verdict, err := h.approvalCoversHead(ctx, client, &coverage, approval)
 		if err != nil {
 			return nil, err
 		}
 		// A matching reviewer whose approval does not cover the head is treated
 		// like a reviewer who has not approved.
-		if !covers {
-			staleApprovers = append(staleApprovers, reviewer)
+		switch verdict {
+		case approvalCovers:
+		case approvalChanged:
+			changedApprovers = append(changedApprovers, reviewer)
 			continue
+		case approvalUncomparable:
+			uncomparableApprovers = append(uncomparableApprovers, reviewer)
+			continue
+		default:
+			return nil, fmt.Errorf("review gate for %s#%d database %q: unknown verdict %d for the approval by %s", repo, pr, database, verdict, reviewer)
 		}
 		h.logger.Info("review gate: approved",
 			"repo", repo, "pr", pr, "database", database,
@@ -191,17 +203,32 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 	h.logger.Info("review gate: blocked",
 		"repo", repo, "pr", pr, "database", database,
 		"valid_approvers", validApprovers,
-		"stale_approvers", staleApprovers, "head_sha", headSHA,
+		"changed_approvers", changedApprovers,
+		"uncomparable_approvers", uncomparableApprovers, "head_sha", headSHA,
 		"operator_reviewers", policy.OperatorReviewers,
 		"other_reviewers", policy.OtherReviewers)
 	return &ReviewGateResult{
-		Approved:          false,
-		OperatorReviewers: policy.OperatorReviewers,
-		OtherReviewers:    policy.OtherReviewers,
-		PRAuthor:          prInfo.User,
-		StaleApprovers:    staleApprovers,
+		Approved:              false,
+		OperatorReviewers:     policy.OperatorReviewers,
+		OtherReviewers:        policy.OtherReviewers,
+		PRAuthor:              prInfo.User,
+		ChangedApprovers:      changedApprovers,
+		UncomparableApprovers: uncomparableApprovers,
 	}, nil
 }
+
+// approvalVerdict is whether an approval covers the PR head.
+type approvalVerdict int
+
+const (
+	// approvalCovers: the approval counts for the head.
+	approvalCovers approvalVerdict = iota + 1
+	// approvalChanged: the PR's schema change differs at the head.
+	approvalChanged
+	// approvalUncomparable: the approved commit cannot be compared with the
+	// head, so nothing proves the approval still describes it.
+	approvalUncomparable
+)
 
 // approvalCoverage holds the PR head an approval must cover and caches the
 // verdict per approved commit, so reviewers who approved the same commit share
@@ -210,114 +237,94 @@ type approvalCoverage struct {
 	repo     string
 	pr       int
 	database string
-	headSHA  string
-	// inputPaths are the database's schema inputs: every path whose content
-	// at the approved commit must match the head for the approval to count.
+	// baseRef is the PR's base branch, which each commit's change is measured
+	// against.
+	baseRef string
+	headSHA string
+	// inputPaths are the database's schema inputs: every path whose change at
+	// the approved commit must match the head for the approval to count.
 	inputPaths []string
-	verdicts   map[string]bool
+	verdicts   map[string]approvalVerdict
 }
 
-// approvalCoversHead reports whether an approval still stands for the PR head.
+// approvalCoversHead decides whether an approval still stands for the PR head.
 // An approval on the head commit covers it. An approval on an earlier commit
-// covers it only when GitHub proves every one of the database's schema inputs
-// is identical at that commit and the head (see schemaUnchangedSince).
-// Anything that prevents that proof (an unknown commit, a tree GitHub cannot
-// list completely) leaves the approval not counting. A comparison GitHub could
-// not answer — it was unavailable, or the evaluation was cancelled — proves
-// nothing either way, so it is returned as an error and never cached as a
-// verdict.
-func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
+// covers it only when GitHub proves the PR's change to every one of the
+// database's schema inputs is the same at that commit and the head (see
+// schemaChangeUnchangedSince). Anything that prevents that proof (an unknown
+// commit, a tree GitHub cannot list completely) leaves the approval not
+// counting. A comparison GitHub could not answer — it was unavailable, or the
+// evaluation was cancelled — proves nothing either way, so it is returned as
+// an error and never cached as a verdict.
+func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
 	approvedSHA := approval.CommitID
 	if approvedSHA == "" {
 		h.logger.Warn("review gate: approval does not count because GitHub reports no commit for it",
 			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
 			"head_sha", c.headSHA)
-		return false, nil
+		return approvalUncomparable, nil
 	}
 	if approvedSHA == c.headSHA {
-		return true, nil
+		return approvalCovers, nil
 	}
-	if covers, ok := c.verdicts[approvedSHA]; ok {
-		return covers, nil
+	if verdict, ok := c.verdicts[approvedSHA]; ok {
+		return verdict, nil
 	}
-	covers, err := h.schemaUnchangedSince(ctx, client, c, approval)
+	verdict, err := h.schemaChangeUnchangedSince(ctx, client, c, approval)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
-	c.verdicts[approvedSHA] = covers
-	return covers, nil
+	c.verdicts[approvedSHA] = verdict
+	return verdict, nil
 }
 
-// schemaUnchangedSince decides whether the database's schema inputs are the
-// same at the approved commit and the head. Only the content comparison
-// (schemaContentUnchangedSince) can count the approval: a changed-file list
-// cannot show that an input reached through a symlink, such as a config or
-// namespace whose target lies outside the input paths, is unchanged.
-//
-// The history compare is read first because it can settle the other answer
-// in one call: when the head descends from the approved commit, a changed
-// file under an input path is a change. A compare GitHub cannot use as proof
-// (history rewritten by a rebase or force-push, a truncated file list, an
-// unknown commit) settles nothing and goes to the content comparison too.
-func (h *Handler) schemaUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
-	files, err := client.FetchChangedFilesBetween(ctx, c.repo, approval.CommitID, c.headSHA)
+// schemaChangeUnchangedSince compares the PR's change to the database's schema
+// inputs at the approved commit and the head, each measured against the base
+// branch content it was built on. Differences that came from the base branch,
+// such as a rebase onto it or a merge of it, do not count as a change: they
+// are not this PR's change, and they reached the base branch through their
+// own PR and its own review. A change the PR itself
+// makes differently at the head does, and a comparison that cannot be
+// completed counts the approval as uncomparable. A GitHub outage is returned
+// as a retryable error.
+func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
+	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, approval.CommitID, c.headSHA, c.inputPaths)
 	if err != nil {
 		if ghclient.IsUnavailableError(err) {
-			return false, fmt.Errorf("compare schema inputs for %s#%d database %q from approved commit %s to head %s: %w",
+			return 0, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
 				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, err)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return false, fmt.Errorf("compare schema inputs for %s#%d database %q from approved commit %s to head %s: evaluation cancelled: %w",
+			return 0, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: evaluation cancelled: %w",
 				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(ctxErr, err))
 		}
-		h.logger.Info("review gate: history compare cannot prove the schema inputs unchanged since the approved commit; comparing their content at both commits",
+		h.logger.Warn("review gate: approval on an earlier commit does not count because GitHub cannot compare the PR's schema change at it and the head",
 			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths, "compare_error", err)
-		return h.schemaContentUnchangedSince(ctx, client, c, approval)
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "base_ref", c.baseRef,
+			"base_tip_sha", comparison.BaseTipSHA,
+			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
+			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
+			"input_paths", c.inputPaths, "error", err)
+		return approvalUncomparable, nil
 	}
-	if anyFileUnderPaths(files, c.inputPaths) {
-		h.logger.Info("review gate: approval on an earlier commit does not count because a file under the database's schema inputs changed since it",
+	if !comparison.Unchanged {
+		h.logger.Info("review gate: approval on an earlier commit does not count because the PR's schema change differs between it and the head",
 			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths)
-		return false, nil
+			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "base_ref", c.baseRef,
+			"base_tip_sha", comparison.BaseTipSHA,
+			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
+			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
+			"differing_path", comparison.DifferingPath)
+		return approvalChanged, nil
 	}
-	h.logger.Info("review gate: no file under the database's schema inputs changed since the approved commit; comparing their content at both commits",
+	h.logger.Info("review gate: approval on an earlier commit counts because the PR's schema change is the same at it and the head",
 		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-		"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths)
-	return h.schemaContentUnchangedSince(ctx, client, c, approval)
-}
-
-// schemaContentUnchangedSince compares the content of every schema input of
-// the database at the approved commit and the head, following symlinks. It
-// needs no common history between the two commits. Identical content counts
-// the approval; a difference, or a comparison that cannot be completed, does
-// not, and a GitHub outage is returned as a retryable error.
-func (h *Handler) schemaContentUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
-	identical, differingPath, err := client.SchemaPathsIdenticalBetween(ctx, c.repo, approval.CommitID, c.headSHA, c.inputPaths)
-	if err != nil {
-		if ghclient.IsUnavailableError(err) {
-			return false, fmt.Errorf("compare schema input content for %s#%d database %q at approved commit %s and head %s: %w",
-				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, err)
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return false, fmt.Errorf("compare schema input content for %s#%d database %q at approved commit %s and head %s: evaluation cancelled: %w",
-				c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(ctxErr, err))
-		}
-		h.logger.Warn("review gate: approval on an earlier commit does not count because GitHub cannot prove the schema inputs are unchanged since it",
-			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths, "error", err)
-		return false, nil
-	}
-	if !identical {
-		h.logger.Info("review gate: approval on an earlier commit does not count because a schema input differs between it and the head",
-			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "differing_path", differingPath)
-		return false, nil
-	}
-	h.logger.Info("review gate: approval on an earlier commit counts because every schema input is identical at it and the head",
-		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-		"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths)
-	return true, nil
+		"approved_sha", approval.CommitID, "head_sha", c.headSHA, "base_ref", c.baseRef,
+		"base_tip_sha", comparison.BaseTipSHA,
+		"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
+		"head_merge_base_sha", comparison.HeadMergeBaseSHA,
+		"input_paths", c.inputPaths)
+	return approvalCovers, nil
 }
 
 // reviewGateInputPaths lists the database's schema inputs the gate protects:
@@ -331,30 +338,6 @@ func reviewGateInputPaths(schema *ghclient.SchemaRequestResult) []string {
 		}
 	}
 	return paths
-}
-
-// anyFileUnderPaths reports whether a changed file, or the path it was renamed
-// from, is one of paths or lies beneath one. A root path covers every file.
-func anyFileUnderPaths(files []ghclient.PRFile, paths []string) bool {
-	for _, f := range files {
-		for _, p := range paths {
-			if pathWithin(f.Filename, p) || pathWithin(f.PreviousFilename, p) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func pathWithin(file, dir string) bool {
-	if file == "" {
-		return false
-	}
-	dir = strings.TrimSuffix(dir, "/")
-	if dir == "" || dir == "." {
-		return true
-	}
-	return file == dir || strings.HasPrefix(file, dir+"/")
 }
 
 type reviewGatePolicy struct {
