@@ -241,19 +241,36 @@ func testLeaseTakeoverDoesNotOrphanTheEngineRun(t *testing.T, deferCutover bool)
 	// The original instance stops claiming, so the peer is the one that reclaims.
 	original.service.StopClaiming()
 
+	operations, err := shared.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, operations, 1, "apply %s has one operation", applyIdentifier)
+	originalOperationLease := operations[0].LeaseToken
+
 	// Heartbeats stop landing and the lease ages past the staleness window. The
 	// window is a fixed minute, so it is aged in storage rather than waited out.
+	// A write the original drive already had in flight, such as the progress
+	// projection a poll writes right after the task progress this test waited
+	// on, renews updated_at after it was aged. The rows the original still
+	// holds are aged again until the peer takes the claim; the token guards
+	// keep the peer's own claim from ever being aged.
 	heartbeatsBlocked.Store(true)
-	_, err = storageDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?", apply.ID)
-	require.NoError(t, err)
-	_, err = storageDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_id = ?", apply.ID)
-	require.NoError(t, err)
+	ageOriginalLease := func() {
+		_, err := storageDB.ExecContext(ctx, "UPDATE applies SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ? AND lease_token = ?", apply.ID, originalLease)
+		require.NoError(t, err)
+		_, err = storageDB.ExecContext(ctx, "UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE apply_id = ? AND lease_token = ?", apply.ID, originalOperationLease)
+		require.NoError(t, err)
+	}
+	ageOriginalLease()
 
 	peer.service.StartOperator(ctx)
 	testutil.Poll(t, leaseTakeoverPollDeadline, 50*time.Millisecond, func() bool {
 		current, err := shared.Applies().Get(ctx, apply.ID)
 		require.NoError(t, err)
-		return current != nil && current.LeaseToken != originalLease
+		if current != nil && current.LeaseToken != originalLease {
+			return true
+		}
+		ageOriginalLease()
+		return false
 	}, func() string { return "the peer never reclaimed the stale apply" })
 
 	// The original instance's storage is reachable again, so its next heartbeat
