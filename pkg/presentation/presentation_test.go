@@ -660,6 +660,34 @@ func TestTargetProgress_CountsRanAndAlreadyHadApart(t *testing.T) {
 	}, apply.TargetProgress(groups[0]), "the running and queued targets can still run; the failed one cannot")
 }
 
+// Every status is in exactly one histogram category, so a group's status line
+// accounts for each of its targets: with one target in every status, the counts
+// still add up to every target the group addresses.
+func TestTargetProgress_EveryStatusIsCounted(t *testing.T) {
+	var apply Apply
+	var group Group
+	for ps := range presentationStateCount {
+		categories := 0
+		for _, cat := range summaryCategoryOrder {
+			if slices.Contains(cat.states, ps) {
+				categories++
+			}
+		}
+		assert.Equal(t, 1, categories, "status %d must be in exactly one histogram category", ps)
+
+		group.Members = append(group.Members, len(apply.Deployments))
+		apply.Deployments = append(apply.Deployments, Deployment{Presentation: ps})
+	}
+
+	p := apply.TargetProgress(group)
+	counted := p.Done + p.AlreadyHad
+	for _, c := range p.Others {
+		counted += c.Count
+	}
+	assert.Equal(t, p.Total, counted, "every target is counted once: %+v", p)
+	assert.Equal(t, int(presentationStateCount), p.Total)
+}
+
 // Members that are not distinct targets, such as keyed operations with no
 // target or several operations dividing one target's work, are not rolled up:
 // each stays a group of its own, so no surface counts them as targets.

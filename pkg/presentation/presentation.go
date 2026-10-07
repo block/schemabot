@@ -149,6 +149,10 @@ const (
 	// when the apply was created, so nothing ran there. It is neither a
 	// completed rollout member nor one still to report.
 	StateAlreadyApplied
+
+	// presentationStateCount is one past the last state, so a test can visit
+	// every state and fail when a new one has no histogram category.
+	presentationStateCount
 )
 
 // Deployment is the derived presentation for one deployment of the apply.
@@ -825,8 +829,8 @@ type TargetProgress struct {
 	AlreadyHad int
 	// Others is the histogram of the remaining targets, in display order.
 	Others []StateCount
-	// Unsettled is the targets that can still run in this apply: running,
-	// queued, waiting, paused, stopped, or in a revert window. An apply can
+	// Unsettled is the targets that can still change in this apply: every
+	// target whose status is not final, an unknown one included. An apply can
 	// settle while one of them is still going, so it is counted on its own.
 	Unsettled int
 }
