@@ -44,6 +44,12 @@ func TestFormatSchemaFileForDialect(t *testing.T) {
 			expected: "CREATE TABLE \"Order\" (\n  \"id\" bigint PRIMARY KEY\n);\nCREATE INDEX \"idx_id\" ON \"Order\" (\"id\");\n",
 		},
 		{
+			name:     "PostgreSQL list partition keeps one bound value per line",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN ('PENDING','HELD')",
+			expected: "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (\n    'PENDING',\n    'HELD'\n);\n",
+		},
+		{
 			name:    "PostgreSQL table and indexes",
 			dialect: schema.DialectPostgres,
 			input:   "CREATE TABLE users (id bigint PRIMARY KEY); CREATE INDEX users_id_idx ON users (id)",
@@ -987,10 +993,11 @@ func TestDisplayFormattingPreservesSQL(t *testing.T) {
 	}
 }
 
-// A displayed ENUM or SET list too long for a line of its own wraps onto
-// indented lines no wider than valueListWrapWidth, so the DDL reads without
-// scrolling and GitHub still highlights it. Short lists stay inline, and the
-// wrapped statement parses to the same SQL.
+// A displayed ENUM or SET list, or PostgreSQL list partition bound, too long
+// for a line of its own wraps onto indented lines no wider than
+// valueListWrapWidth, so the DDL reads without scrolling and GitHub still
+// highlights it. Short lists stay inline, and the wrapped statement parses to
+// the same SQL.
 func TestFormatDDLForDialectWrapsLongValueLists(t *testing.T) {
 	values := func(n int) string {
 		v := make([]string, n)
@@ -1062,6 +1069,39 @@ func TestFormatDDLForDialectWrapsLongValueLists(t *testing.T) {
 				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
 				"    'STATUS_05_VALUE'\n" +
 				");",
+		},
+		{
+			name:    "postgres list partition bound",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (" + values(6) + ")",
+			expected: "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (\n" +
+				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
+				"    'STATUS_05_VALUE'\n" +
+				");",
+		},
+		{
+			name:    "postgres list partition bound before the partition's own PARTITION BY",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (" + values(6) + ") PARTITION BY HASH (id)",
+			expected: "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (\n" +
+				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
+				"    'STATUS_05_VALUE'\n" +
+				") PARTITION BY HASH (id);",
+		},
+		{
+			name:    "postgres ATTACH PARTITION bound",
+			dialect: schema.DialectPostgres,
+			input:   "ALTER TABLE orders ATTACH PARTITION orders_pending FOR VALUES IN (" + values(6) + ")",
+			expected: "ALTER TABLE orders ATTACH PARTITION orders_pending FOR VALUES IN (\n" +
+				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
+				"    'STATUS_05_VALUE'\n" +
+				");",
+		},
+		{
+			name:     "postgres short partition bound stays on the statement line",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN ('PENDING','HELD')",
+			expected: "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN ('PENDING', 'HELD');",
 		},
 	}
 	for _, tc := range tests {

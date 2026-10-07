@@ -16,8 +16,9 @@ import (
 // It first canonicalizes using Spirit's parser, then formats:
 //   - ALTER statements: each clause on its own line
 //   - CREATE TABLE statements: each column/index on its own line
-//   - ENUM and SET value lists, and LIST partition value lists, too long for
-//     a line of their own: wrapped onto indented lines
+//   - ENUM and SET value lists, and LIST partition value lists (FOR VALUES
+//     IN on PostgreSQL), too long for a line of their own: wrapped onto
+//     indented lines
 //   - partition definition lists: each definition on its own indented line
 //   - Data types, functions, and charset/collate values are lowercased
 //     while SQL keywords remain uppercase (PlanetScale style).
@@ -419,17 +420,18 @@ const valueListWrapWidth = 100
 // values are tuples, which pack whole.
 var mysqlValueListPattern = regexp.MustCompile(`(?i)^(enum|set|values\s+in)\s*\(`)
 
-// enumValueListPattern matches the opening of an ENUM value list. Outside the
-// MySQL family SET is not a type, and SET ( opens a parameter list such as a
-// table's storage parameters, so only ENUM lists wrap.
-var enumValueListPattern = regexp.MustCompile(`(?i)^enum\s*\(`)
+// postgresValueListPattern matches the opening of an ENUM value list, or of a
+// list partition's FOR VALUES IN bound. Outside the MySQL family SET is not a
+// type, and SET ( opens a parameter list such as a table's storage
+// parameters, so it never wraps.
+var postgresValueListPattern = regexp.MustCompile(`(?i)^(enum|values\s+in)\s*\(`)
 
-// valueListPatternFor returns the matcher for the dialect's value-list types.
+// valueListPatternFor returns the matcher for the dialect's value lists.
 func valueListPatternFor(dialect schema.Dialect) *regexp.Regexp {
 	if dialect == schema.DialectMySQL {
 		return mysqlValueListPattern
 	}
-	return enumValueListPattern
+	return postgresValueListPattern
 }
 
 // wrapLongValueLists breaks each value list matched by listPattern that
@@ -648,6 +650,14 @@ func formatCreateTableWithOptions(ddl string, multiline bool) string {
 		return ddl
 	}
 
+	// A PostgreSQL partition with no column list opens its first parenthesis
+	// in its partition bound, which is not a column list. Display leaves the
+	// bound to value-list wrapping; source files keep their established
+	// one-value-per-line form.
+	if !multiline && opensPartitionBound(ddl[:openParen]) {
+		return ddl
+	}
+
 	header := ddl[:openParen+1]           // "CREATE TABLE `name` ("
 	body := ddl[openParen+1 : closeParen] // column definitions
 	footer := ddl[closeParen:]            // ") ENGINE = ..."
@@ -693,6 +703,14 @@ func formatCreateTableWithOptions(ddl string, multiline bool) string {
 	}
 
 	return sb.String()
+}
+
+// opensPartitionBound reports whether the CREATE TABLE text before its first
+// parenthesis ends in a PostgreSQL partition bound, as in PARTITION OF
+// orders FOR VALUES IN (, so that parenthesis is the bound's and not the
+// start of a column list.
+func opensPartitionBound(beforeParen string) bool {
+	return strings.Contains(strings.ToUpper(beforeParen), " FOR VALUES ")
 }
 
 // splitPartitionClause separates the trailing PARTITION BY clause, if any,
