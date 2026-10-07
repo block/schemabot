@@ -9,8 +9,6 @@ import (
 )
 
 func TestSettingsFromMetadata(t *testing.T) {
-	boolPtr := func(v bool) *bool { return &v }
-
 	tests := []struct {
 		name     string
 		metadata map[string]string
@@ -31,47 +29,22 @@ func TestSettingsFromMetadata(t *testing.T) {
 			want: Settings{},
 		},
 		{
-			name: "all overrides parse",
+			name: "checkpoint max age parses",
 			metadata: map[string]string{
-				MetadataEnableExperimentalAutoscaling:      "false",
-				MetadataEnableExperimentalLocklessChecksum: "true",
-				MetadataCheckpointMaxAge:                   "24h",
-				MetadataChecksumYieldTimeout:               "6h",
+				MetadataCheckpointMaxAge: "24h",
 			},
-			want: Settings{
-				EnableExperimentalAutoscaling:      boolPtr(false),
-				EnableExperimentalLocklessChecksum: true,
-				CheckpointMaxAge:                   24 * time.Hour,
-				ChecksumYieldTimeout:               6 * time.Hour,
-			},
+			want: Settings{CheckpointMaxAge: 24 * time.Hour},
 		},
 		{
-			name: "lockless checksum false parses to the default",
+			// Keys for settings SchemaBot no longer exposes (Spirit's own
+			// defaults apply) are ignored like any other unrelated key.
+			name: "removed setting keys are ignored",
 			metadata: map[string]string{
-				MetadataEnableExperimentalLocklessChecksum: "false",
+				"enable_experimental_autoscaling":       "false",
+				"enable_experimental_lockless_checksum": "false",
+				"checksum_yield_timeout":                "6h",
 			},
 			want: Settings{},
-		},
-		{
-			name: "invalid lockless checksum value errors",
-			metadata: map[string]string{
-				MetadataEnableExperimentalLocklessChecksum: "sure",
-			},
-			wantErr: MetadataEnableExperimentalLocklessChecksum,
-		},
-		{
-			name: "autoscaling true is preserved as an explicit value",
-			metadata: map[string]string{
-				MetadataEnableExperimentalAutoscaling: "true",
-			},
-			want: Settings{EnableExperimentalAutoscaling: boolPtr(true)},
-		},
-		{
-			name: "invalid autoscaling value errors",
-			metadata: map[string]string{
-				MetadataEnableExperimentalAutoscaling: "yep",
-			},
-			wantErr: MetadataEnableExperimentalAutoscaling,
 		},
 		{
 			name: "invalid checkpoint duration errors",
@@ -81,9 +54,9 @@ func TestSettingsFromMetadata(t *testing.T) {
 			wantErr: MetadataCheckpointMaxAge,
 		},
 		{
-			name: "non-positive checksum yield errors",
+			name: "non-positive checkpoint duration errors",
 			metadata: map[string]string{
-				MetadataChecksumYieldTimeout: "0s",
+				MetadataCheckpointMaxAge: "0s",
 			},
 			wantErr: "must be positive",
 		},
@@ -109,22 +82,10 @@ func TestNewResolvesSettings(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		eng := New(Config{})
 		assert.Equal(t, DefaultCheckpointMaxAge, eng.checkpointMaxAge)
-		assert.Equal(t, DefaultChecksumYieldTimeout, eng.checksumYieldTimeout)
-		assert.True(t, eng.autoscaling)
-		assert.False(t, eng.locklessChecksum)
 	})
 
 	t.Run("overrides", func(t *testing.T) {
-		disabled := false
-		eng := New(Config{Settings: Settings{
-			EnableExperimentalAutoscaling:      &disabled,
-			EnableExperimentalLocklessChecksum: true,
-			CheckpointMaxAge:                   24 * time.Hour,
-			ChecksumYieldTimeout:               6 * time.Hour,
-		}})
+		eng := New(Config{Settings: Settings{CheckpointMaxAge: 24 * time.Hour}})
 		assert.Equal(t, 24*time.Hour, eng.checkpointMaxAge)
-		assert.Equal(t, 6*time.Hour, eng.checksumYieldTimeout)
-		assert.False(t, eng.autoscaling)
-		assert.True(t, eng.locklessChecksum)
 	})
 }

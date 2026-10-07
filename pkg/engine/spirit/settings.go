@@ -7,7 +7,6 @@ package spirit
 
 import (
 	"fmt"
-	"strconv"
 	"time"
 )
 
@@ -17,44 +16,14 @@ import (
 // slower and riskier than starting over.
 const DefaultCheckpointMaxAge = 3 * 24 * time.Hour
 
-// DefaultChecksumYieldTimeout bounds how long each checksum read transaction
-// may run before yielding. The checksum reads under a REPEATABLE READ
-// snapshot; without a yield bound a long checksum pins InnoDB purge and
-// history-list growth degrades the whole target instance.
-const DefaultChecksumYieldTimeout = 12 * time.Hour
-
 // Settings tunes the Spirit runs this engine starts. A zero value resolves to
 // the corresponding default in New; fields are set only to deviate from the
-// fleet defaults.
+// fleet defaults. Everything else about a run (thread autoscaling on Aurora,
+// the lockless checksum) is Spirit's own default and not configurable here.
 type Settings struct {
-	// EnableExperimentalAutoscaling scales Spirit's thread pools dynamically
-	// from throttler feedback so apply throughput tracks the target instance's
-	// capacity instead of a fixed constant. It engages on Aurora targets only;
-	// other MySQL targets run at fixed thread counts. nil defaults to enabled;
-	// false is the operator kill switch when autoscaling misbehaves on a
-	// target fleet.
-	EnableExperimentalAutoscaling *bool
-
-	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
-	// reads, retries, and hot-range splitting instead of a checksum setup lock
-	// held over long-lived REPEATABLE READ snapshots. Cutover locking is
-	// unchanged either way. False — the zero value — is the default, because
-	// the lockless checker changes what an unverifiable copy costs: a
-	// continuously updated row is not yet supported and keeps the verify phase
-	// running, and the phase reports no progress until its first clean pass.
-	// docs/configuration.md states the terms an operator accepts by enabling
-	// it. Unlike the autoscaling kill
-	// switch this needs no tri-state, because absent and false both mean the
-	// same thing.
-	EnableExperimentalLocklessChecksum bool
-
 	// CheckpointMaxAge bounds how old a checkpoint may be and still be
 	// resumed. Zero defaults to DefaultCheckpointMaxAge.
 	CheckpointMaxAge time.Duration
-
-	// ChecksumYieldTimeout bounds each checksum read transaction before it
-	// yields its snapshot. Zero defaults to DefaultChecksumYieldTimeout.
-	ChecksumYieldTimeout time.Duration
 }
 
 // Engine metadata keys read by SettingsFromMetadata. These are the
@@ -62,10 +31,7 @@ type Settings struct {
 // translated into these keys, and a database's own metadata entry wins over
 // the server-level value.
 const (
-	MetadataEnableExperimentalAutoscaling      = "enable_experimental_autoscaling"
-	MetadataEnableExperimentalLocklessChecksum = "enable_experimental_lockless_checksum"
-	MetadataCheckpointMaxAge                   = "checkpoint_max_age"
-	MetadataChecksumYieldTimeout               = "checksum_yield_timeout"
+	MetadataCheckpointMaxAge = "checkpoint_max_age"
 )
 
 // SettingsFromMetadata builds Settings from engine metadata key-value pairs.
@@ -75,25 +41,8 @@ const (
 // believes they changed.
 func SettingsFromMetadata(metadata map[string]string) (Settings, error) {
 	var settings Settings
-	if raw, ok := metadata[MetadataEnableExperimentalAutoscaling]; ok {
-		enabled, err := strconv.ParseBool(raw)
-		if err != nil {
-			return Settings{}, fmt.Errorf("parse %s %q: %w", MetadataEnableExperimentalAutoscaling, raw, err)
-		}
-		settings.EnableExperimentalAutoscaling = &enabled
-	}
-	if raw, ok := metadata[MetadataEnableExperimentalLocklessChecksum]; ok {
-		enabled, err := strconv.ParseBool(raw)
-		if err != nil {
-			return Settings{}, fmt.Errorf("parse %s %q: %w", MetadataEnableExperimentalLocklessChecksum, raw, err)
-		}
-		settings.EnableExperimentalLocklessChecksum = enabled
-	}
 	var err error
 	if settings.CheckpointMaxAge, err = parsePositiveDuration(metadata, MetadataCheckpointMaxAge); err != nil {
-		return Settings{}, err
-	}
-	if settings.ChecksumYieldTimeout, err = parsePositiveDuration(metadata, MetadataChecksumYieldTimeout); err != nil {
 		return Settings{}, err
 	}
 	return settings, nil
