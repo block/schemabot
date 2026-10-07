@@ -123,6 +123,9 @@ func TestMemberWorkDifference(t *testing.T) {
 		"a finding the confirmed round showed is gone")
 	assert.Equal(t, workUnsafe, memberWorkDifference(unsafeFor(createdAt), unsafeFor(createdAt+"; "+updatedAt)),
 		"a finding the confirmed round did not show")
+	const sameOnTwoColumns = "Column uses `TIMESTAMP`"
+	assert.Equal(t, workUnsafe, memberWorkDifference(unsafeFor(sameOnTwoColumns), unsafeFor(sameOnTwoColumns+"; "+sameOnTwoColumns)),
+		"the same message raised on a second column is a second finding")
 
 	sharded := plan(nil)
 	sharded.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "payments", Changes: sharded.FlatDDLChanges()}}
