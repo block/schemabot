@@ -226,9 +226,10 @@ const (
 // config, environment link) is the same at the head, however much the default
 // branch moved underneath it. When the PR's change differs at the head, the PR
 // is blocked until someone approves the head and the comment says why. When
-// the approved commit cannot be compared with the head, or GitHub is
-// unavailable during the comparison, the gate cannot decide and returns an
-// evaluation error, never a verdict.
+// the approved commit cannot be compared with the head, the approval does not
+// count and the PR is blocked the same way. When GitHub is unavailable during
+// the comparison, the gate cannot decide and returns a retryable evaluation
+// error, never a verdict.
 func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 	ordersTable := "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
 	baseFiles := map[string]string{
@@ -1486,7 +1487,7 @@ func TestEnforceReviewGate(t *testing.T) {
 			assert.Contains(t, body, "Review gate check failed; see server logs")
 			assert.NotContains(t, body, "Resource not accessible", "raw GitHub error text must never render in PR markdown")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for evaluation-failure comment")
+			require.Fail(t, "timed out waiting for evaluation-failure comment")
 		}
 	})
 
@@ -1522,7 +1523,7 @@ func TestEnforceReviewGate(t *testing.T) {
 			assert.NotContains(t, body, "Review Required")
 			assert.NotContains(t, body, reviewGateApproved, "raw comparison errors must never render in PR markdown")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for gate-error comment")
+			require.Fail(t, "timed out waiting for gate-error comment")
 		}
 	})
 
@@ -1571,7 +1572,7 @@ func TestEnforceReviewGate(t *testing.T) {
 			assert.Contains(t, body, "Review Required")
 			assert.Contains(t, body, "@bob")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for review-required comment")
+			require.Fail(t, "timed out waiting for review-required comment")
 		}
 	})
 
@@ -1605,7 +1606,7 @@ func TestEnforceReviewGate(t *testing.T) {
 			assert.Contains(t, body, "Review Required")
 			assert.Contains(t, body, "Approvals on an earlier commit no longer count because this PR's schema change is different now: @bob.")
 		case <-time.After(2 * time.Second):
-			t.Fatal("timed out waiting for review-required comment")
+			require.Fail(t, "timed out waiting for review-required comment")
 		}
 	})
 
