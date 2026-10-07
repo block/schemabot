@@ -130,14 +130,14 @@ func (h *Handler) classifyDestructiveChange(ctx context.Context, client *ghclien
 
 // plannedDestructiveTables returns the distinct tables the plan would destroy
 // something on — a dropped table, column, or index — in a stable order. Each
-// table is judged by the same predicate --allow-unsafe is gated on, less the
-// changes that create a table (createsTable), but over a
-// wider view: both the namespace-level changes and the per-shard ones are read,
-// where the unsafe gate reads only the namespace-level ones. A sharded plan can
-// carry a destructive change on individual shards that the collapsed view
-// omits, and one confined to a single shard is still destructive — so the
-// annotation is a superset of what the opt-in gates, which is the safe
-// direction for a disclosure.
+// table is judged by the same predicate --allow-unsafe is gated on, over the
+// same view: both the namespace-level changes and the per-shard ones are read,
+// since a sharded plan can carry a destructive change on individual shards that
+// the collapsed view omits, and one confined to a single shard is still
+// destructive. The changes that create a table (createsTable) are left out: a
+// table the plan creates holds no other pull request's work to attribute. Its
+// unsafe findings still require the opt-in, so the annotated tables are a
+// subset of the gated ones.
 func plannedDestructiveTables(planResp *apitypes.PlanResponse) []string {
 	if planResp == nil {
 		return nil
