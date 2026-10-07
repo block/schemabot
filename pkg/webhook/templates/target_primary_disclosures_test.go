@@ -186,3 +186,32 @@ func TestRenderPlanComment_RolloutUnsafeFindingCarriesAttribution(t *testing.T) 
 	assert.Equal(t, 1, strings.Count(body, "`legacy`: drops the table and all of its rows (changed by open PR [#4790](https://github.com/acme/orders/pull/4790))"))
 	assert.NotContains(t, body, "Check before applying")
 }
+
+// When the primary target creates a table that another target already has and
+// changes unsafely, the attribution is about the other target's change, not
+// the creation. A creation destroys nothing, so its finding carries no note,
+// and the attribution keeps a section of its own rather than folding onto it.
+func TestRenderPlanComment_PrimaryTargetCreationNeverCarriesAnotherTargetsAttribution(t *testing.T) {
+	data := primaryDropsLegacyPlan("production")
+	data.Repository = "acme/orders"
+	create := []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"CREATE TABLE `stations` (`id` bigint NOT NULL, `seen_at` timestamp NULL, PRIMARY KEY (`id`))"}}}
+	data.Changes = create
+	data.DiscardedCopies = nil
+	data.UnsafeChanges = []UnsafeChangeData{{Table: "stations", Reason: "has_timestamp: column seen_at uses TIMESTAMP", ChangeType: "create"}}
+	data.DeploymentDrift.Deployments[0].Class = "planned"
+	data.DeploymentDrift.Plans = []DeploymentPlanGroup{
+		{Members: []string{"primary/orders_a"}, Primary: true, Changes: create},
+		{
+			Members:       []string{"primary/orders_b"},
+			Changes:       []KeyspaceChangeData{{Keyspace: "orders", Statements: []string{"ALTER TABLE `stations` DROP COLUMN `legacy_ref`"}}},
+			UnsafeChanges: []UnsafeChangeData{{Table: "stations", Reason: "DROP COLUMN discards the column's data", ChangeType: "alter"}},
+		},
+	}
+	data.AttributedChanges = []AttributedChangeData{{Table: "stations", Repository: "acme/orders", PullRequest: 4790}}
+	body := RenderPlanComment(data)
+
+	primary := sectionOf(t, body, "### Target `primary/orders_a`")
+	assert.Contains(t, primary, "`stations`: has_timestamp: column seen_at uses TIMESTAMP\n")
+	assert.NotContains(t, body, "(changed by open PR", "no finding carries the attribution")
+	assert.Contains(t, body, "**Check before applying**: 1 destructive change SchemaBot cannot attribute to this PR")
+}
