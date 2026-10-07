@@ -204,7 +204,7 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 		h.postComment(repo, pr, installationID, templates.RenderRollbackBlockedByLock(
 			database, environment,
 			existingLock.Owner, existingLock.Repository, existingLock.PullRequest,
-			h.deploymentTenant()))
+			h.deploymentTenant(), h.lockedDatabaseApplyForComment(ctx, repo, pr, environment, existingLock)))
 		return false, nil
 	}
 

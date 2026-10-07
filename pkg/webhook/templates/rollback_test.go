@@ -242,25 +242,32 @@ func TestRenderRollbackRejectedSanitizesReason(t *testing.T) {
 
 func TestRenderRollbackBlockedByLock(t *testing.T) {
 	t.Run("PR-owned lock renders as link", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42, "")
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42, "", LockedDatabaseApply{Checked: true})
 
 		assert.Contains(t, rendered, "## Rollback Blocked")
 		assert.Contains(t, rendered, "`testapp`")
 		assert.Contains(t, rendered, "`staging`")
 		assert.Contains(t, rendered, "[block/myapp#42](https://github.com/block/myapp/pull/42)")
-		assert.Contains(t, rendered, "`schemabot unlock`")
+		assert.Contains(t, rendered, "The lock is released when that PR is merged or closed, or when `schemabot unlock` is commented on it.")
+		assert.NotContains(t, rendered, "to complete")
 		assert.NotContains(t, rendered, "--tenant")
 		assert.NotContains(t, rendered, "`block/myapp#42`",
 			"PR-link variant should not render the owner as a bare backticked string")
 	})
 
 	t.Run("PR-owned lock on tenant deployment hints tenant-scoped unlock", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "production", "block/myapp#42", "block/myapp", 42, "acme")
-		assert.Contains(t, rendered, "`schemabot unlock --tenant acme`")
+		rendered := RenderRollbackBlockedByLock("testapp", "production", "block/myapp#42", "block/myapp", 42, "acme", LockedDatabaseApply{Checked: true})
+		assert.Contains(t, rendered, "or when `schemabot unlock --tenant acme` is commented on it.")
+	})
+
+	t.Run("PR-owned lock with a running apply says to wait for it", func(t *testing.T) {
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "block/myapp#42", "block/myapp", 42, "", LockedDatabaseApply{Checked: true, RunningApplyID: "apply-a1b2", RunningIsLockHolders: true})
+		assert.Contains(t, rendered, "That PR's apply `apply-a1b2` is still running. Once it finishes, the lock is released "+
+			"when that PR is merged or closed, or when `schemabot unlock` is commented on it.")
 	})
 
 	t.Run("non-PR lock renders the owner without its hostname", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "cli:alice@laptop", "", 0, "")
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "cli:alice@laptop", "", 0, "", LockedDatabaseApply{})
 
 		assert.Contains(t, rendered, "## Rollback Blocked")
 		assert.Contains(t, rendered, "`cli:alice`")
@@ -274,7 +281,7 @@ func TestRenderRollbackBlockedByLock(t *testing.T) {
 	})
 
 	t.Run("missing repo falls back to bare owner even with PR > 0", func(t *testing.T) {
-		rendered := RenderRollbackBlockedByLock("testapp", "staging", "stale-owner", "", 99, "")
+		rendered := RenderRollbackBlockedByLock("testapp", "staging", "stale-owner", "", 99, "", LockedDatabaseApply{})
 		assert.Contains(t, rendered, "`stale-owner`")
 		assert.NotContains(t, rendered, "github.com")
 	})
@@ -339,8 +346,8 @@ func TestRollbackTemplates_NoStrayWhitespace(t *testing.T) {
 		"MissingApplyID":            RenderRollbackMissingApplyID("", "", ""),
 		"ApplyNotFound":             RenderRollbackApplyNotFound("a"),
 		"Rejected":                  RenderRollbackRejected(RollbackRejectedData{ApplyID: "a", Database: "d", Environment: "e", Reason: "r"}),
-		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1, ""),
-		"BlockedByLockOwner":        RenderRollbackBlockedByLock("d", "e", "o", "", 0, ""),
+		"BlockedByLockPR":           RenderRollbackBlockedByLock("d", "e", "o", "r", 1, "", LockedDatabaseApply{}),
+		"BlockedByLockOwner":        RenderRollbackBlockedByLock("d", "e", "o", "", 0, "", LockedDatabaseApply{}),
 		"NothingToDo":               RenderRollbackNothingToDo("d", "e", "a"),
 		"LockNotOwned":              RenderRollbackLockNotOwned("d", "e", "o"),
 		"AlreadyRolledBack":         RenderRollbackAlreadyRolledBack("d", "e"),

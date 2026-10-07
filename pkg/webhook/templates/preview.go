@@ -1367,6 +1367,7 @@ func PreviewCommentApplyBlockedByOtherPR() string {
 		LockRepo:     "block/myapp",
 		LockPR:       42,
 		LockCreated:  sampleTime().Add(-2 * time.Hour),
+		LockedApply:  LockedDatabaseApply{Checked: true},
 	})
 }
 

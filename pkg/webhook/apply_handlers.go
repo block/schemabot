@@ -205,6 +205,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				LockPR:       existingLock.PullRequest,
 				LockCreated:  existingLock.CreatedAt,
 				CLIName:      h.cliName(),
+				Tenant:       h.deploymentTenant(),
+				LockedApply:  h.lockedDatabaseApplyForComment(ctx, repo, pr, environment, existingLock),
 			}))
 			return false, nil
 		}
@@ -923,6 +925,8 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			LockPR:       existingLock.PullRequest,
 			LockCreated:  existingLock.CreatedAt,
 			CLIName:      h.cliName(),
+			Tenant:       h.deploymentTenant(),
+			LockedApply:  h.lockedDatabaseApplyForComment(ctx, repo, pr, environment, existingLock),
 		}))
 		return false, nil
 	}
@@ -1320,22 +1324,20 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// fails closed: storage uncertainty must never release a lock that could be
 	// protecting an in-flight apply.
 	for _, lock := range locks {
-		applies, err := h.service.Storage().Applies().GetByDatabase(ctx, lock.DatabaseName, lock.DatabaseType, "")
+		running, err := h.runningApplyOnLockedDatabase(ctx, lock)
 		if err != nil {
 			h.logger.Error("unlock refused: cannot verify active applies, no locks will be released",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
-					"Failed to verify active applies for database `"+lock.DatabaseName+"`: "+err.Error()+". No locks were released.")
+					"Failed to verify active applies for database `"+lock.DatabaseName+"`. No locks were released; retry the command.")
 			}
 			return true, fmt.Errorf("unlock command verify active applies %s#%d database %s: %w", repo, pr, lock.DatabaseName, err)
 		}
-		for _, a := range applies {
-			if a.Database == lock.DatabaseName && !state.IsTerminalApplyState(a.State) {
-				h.postComment(repo, pr, installationID, templates.RenderCannotUnlock(
-					lock.DatabaseName, a.Environment, a.ApplyIdentifier, a.State))
-				return false, nil
-			}
+		if running != nil {
+			h.postComment(repo, pr, installationID, templates.RenderCannotUnlock(
+				lock.DatabaseName, running.Environment, running.ApplyIdentifier, running.State))
+			return false, nil
 		}
 	}
 
@@ -1440,6 +1442,44 @@ func isLockAcquiredSinceVetting(err error) bool {
 func isVettedLockGone(err error) bool {
 	return errors.Is(err, storage.ErrLockNotFound) ||
 		errors.Is(err, storage.ErrLockNotOwned)
+}
+
+// runningApplyOnLockedDatabase returns the non-terminal apply recorded for the
+// locked database, or nil when none is. While one runs, neither closing the
+// holding PR nor an unlock releases the lock; unlock refuses on this check.
+func (h *Handler) runningApplyOnLockedDatabase(ctx context.Context, lock *storage.Lock) (*storage.Apply, error) {
+	applies, err := h.service.Storage().Applies().GetByDatabase(ctx, lock.DatabaseName, lock.DatabaseType, "")
+	if err != nil {
+		return nil, fmt.Errorf("list applies for locked database %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err)
+	}
+	for _, a := range applies {
+		if a.Database == lock.DatabaseName && !state.IsTerminalApplyState(a.State) {
+			return a, nil
+		}
+	}
+	return nil, nil
+}
+
+// lockedDatabaseApplyForComment looks up the running apply for a lock-conflict
+// comment. The comment only words its release hint from the answer, so a
+// lookup failure is logged and returned unchecked: the hint then says only
+// what holds without it.
+func (h *Handler) lockedDatabaseApplyForComment(ctx context.Context, repo string, pr int, environment string, lock *storage.Lock) templates.LockedDatabaseApply {
+	running, err := h.runningApplyOnLockedDatabase(ctx, lock)
+	if err != nil {
+		h.logger.Warn("lock conflict comment will not suggest an unlock: running apply lookup failed",
+			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+			"environment", environment, "lock_owner", lock.Owner, "error", err)
+		return templates.LockedDatabaseApply{}
+	}
+	if running == nil {
+		return templates.LockedDatabaseApply{Checked: true}
+	}
+	return templates.LockedDatabaseApply{
+		Checked:              true,
+		RunningApplyID:       running.ApplyIdentifier,
+		RunningIsLockHolders: strings.EqualFold(running.Repository, lock.Repository) && running.PullRequest == lock.PullRequest,
+	}
 }
 
 func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, result CommandResult) ([]*storage.Lock, error) {

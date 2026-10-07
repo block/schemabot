@@ -50,6 +50,18 @@ func (s *rollbackTestApplyStore) GetByApplyIdentifier(_ context.Context, _ strin
 	return s.apply, s.err
 }
 
+// GetByDatabase serves the lock-conflict comment's running-apply lookup with
+// the one apply this store holds.
+func (s *rollbackTestApplyStore) GetByDatabase(_ context.Context, _, _, _ string) ([]*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.apply == nil {
+		return nil, nil
+	}
+	return []*storage.Apply{s.apply}, nil
+}
+
 type rollbackTestPlanStore struct {
 	storage.PlanStore
 	plan *storage.Plan
