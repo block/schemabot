@@ -12,6 +12,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -610,5 +611,22 @@ func sameTableChange(a, b storage.TableChange) bool {
 // the same way and carry the same unsafe verdict and reason, so an opt-in given
 // for one consents to exactly the consequences of the other.
 func sameUnsafeVerdict(a, b storage.TableChange) bool {
-	return sameTableChange(a, b) && a.IsUnsafe == b.IsUnsafe && a.UnsafeReason == b.UnsafeReason
+	return sameTableChange(a, b) && a.IsUnsafe == b.IsUnsafe && sameUnsafeReason(a.UnsafeReason, b.UnsafeReason)
+}
+
+// sameUnsafeReason reports whether two unsafe reasons name the same set of
+// findings. A reason joins a table's findings in the order the engine reported
+// them, and an engine may report the same findings in a different order on
+// another target, so two reasons are compared as the sets of findings the
+// comment renders from them, each on its own line.
+func sameUnsafeReason(a, b string) bool {
+	return slices.Equal(unsafeReasonFindings(a), unsafeReasonFindings(b))
+}
+
+// unsafeReasonFindings returns the distinct findings an unsafe reason names,
+// sorted.
+func unsafeReasonFindings(reason string) []string {
+	findings := ui.LintReasons(reason)
+	slices.Sort(findings)
+	return slices.Compact(findings)
 }

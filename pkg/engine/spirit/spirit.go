@@ -803,14 +803,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 
 		// Error-severity violations mark the change as unsafe
-		if errViolations := pc.Errors(); len(errViolations) > 0 {
-			change.IsUnsafe = true
-			msgs := make([]string, len(errViolations))
-			for i, v := range errViolations {
-				msgs[i] = v.Message
-			}
-			change.UnsafeReason = strings.Join(msgs, "; ")
-		}
+		change.UnsafeReason, change.IsUnsafe = lint.PlannedChangeUnsafeReason(pc)
 
 		// Execution-mode verdict: surface statements Spirit deterministically
 		// refuses so the operator learns at plan time how the apply will
@@ -839,14 +832,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		changes = append(changes, change)
 
 		// Collect lint violations from all severity levels
-		for _, v := range pc.Violations {
-			lintViolations = append(lintViolations, engine.LintViolation{
-				Table:    pc.TableName,
-				Linter:   v.Linter.Name(),
-				Message:  v.Message,
-				Severity: strings.ToLower(v.Severity.String()),
-			})
-		}
+		lintViolations = append(lintViolations, lint.PlannedChangeViolations(pc)...)
 	}
 
 	// Build per-namespace SchemaChanges.

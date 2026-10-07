@@ -451,7 +451,7 @@ func memberUnsafeTableChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
 					continue
 				}
 				at := slices.IndexFunc(out, func(c templates.UnsafeChangeData) bool {
-					return c.Table == uc.Table && c.Reason == uc.Reason
+					return c.Table == uc.Table && sameUnsafeReason(c.Reason, uc.Reason)
 				})
 				if at < 0 {
 					out = append(out, templates.UnsafeChangeData{Table: uc.Table, Reason: uc.Reason, DDL: uc.DDL, ChangeType: uc.ChangeType})
@@ -481,7 +481,7 @@ func memberUnsafeTableChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
 func addUnsafeTarget(list *[]templates.UnsafeChangeData, change templates.UnsafeChangeData, target string) {
 	for i := range *list {
 		existing := &(*list)[i]
-		if existing.Table == change.Table && existing.Reason == change.Reason && slices.Equal(existing.Shards, change.Shards) {
+		if existing.Table == change.Table && sameUnsafeReason(existing.Reason, change.Reason) && slices.Equal(existing.Shards, change.Shards) {
 			if !slices.Contains(existing.Targets, target) {
 				existing.Targets = append(existing.Targets, target)
 			}

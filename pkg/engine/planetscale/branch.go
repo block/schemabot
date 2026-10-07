@@ -276,14 +276,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 			Operation: stmtType,
 			DDL:       pc.Statement,
 		}
-		if errViolations := pc.Errors(); len(errViolations) > 0 {
-			change.IsUnsafe = true
-			msgs := make([]string, len(errViolations))
-			for i, v := range errViolations {
-				msgs[i] = v.Message
-			}
-			change.UnsafeReason = strings.Join(msgs, "; ")
-		}
+		change.UnsafeReason, change.IsUnsafe = lint.PlannedChangeUnsafeReason(pc)
 		// Only a CREATE TABLE or an ALTER TABLE can declare a foreign key.
 		// Gating on the type keeps the verdict — an informational field — off
 		// the statement types the refusal check's own parser rejects outright.
