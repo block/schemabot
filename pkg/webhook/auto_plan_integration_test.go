@@ -1063,23 +1063,26 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	}
 }
 
-// TestE2EAutoPlanNoChangesSkipsComment exercises the up-to-date-PR UX through
-// the full webhook path: a synchronize delivery whose auto-plan resolves to no
-// changes posts no plan comment (the check run alone reports the green state),
-// and the outcome supersedes the slot's plan comments from prior heads — their
-// pending DDL and apply prompt no longer match the branch, so they are retired
-// even though no new comment replaces them. No apply acted on the prior head,
-// so its comment is deleted rather than minimized.
-func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
-	dbName := "webhook_autoplan_nochange"
+// noChangesAutoPlanFixture is a PR whose schema files already match the live
+// database, so every auto-plan on it resolves to no changes. deleted receives
+// the ID of each plan comment the handler deletes from the timeline.
+type noChangesAutoPlanFixture struct {
+	svc     *api.Service
+	mux     *http.ServeMux
+	result  *planFlowResult
+	h       *Handler
+	deleted chan string
+}
+
+func setupNoChangesAutoPlan(t *testing.T, dbName string) *noChangesAutoPlanFixture {
+	t.Helper()
 	svc := setupE2EService(t, dbName)
 
 	// Pre-create the table so there are no changes
-	ctx := t.Context()
 	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
 	db, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
-	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
 	_ = db.Close()
 
@@ -1094,12 +1097,7 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 	schemaFiles := map[string]string{
 		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 	}
-
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
-
-	// A plan comment from a prior head is still visible on the PR; the
-	// no-changes outcome must retire it.
-	insertPlanCommentRow(t, svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "priorsha", 9001, "IC_stale_prior")
 
 	deleted := make(chan string, 4)
 	mux.HandleFunc("DELETE /repos/octocat/hello-world/issues/comments/{id}", func(w http.ResponseWriter, r *http.Request) {
@@ -1113,50 +1111,120 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
 
-	h := NewHandler(svc, factory, nil, logger)
+	return &noChangesAutoPlanFixture{svc: svc, mux: mux, result: result, h: h, deleted: deleted}
+}
 
+// synchronize delivers a synchronize webhook moving the PR from beforeSHA to
+// headSHA and waits for the auto-plan's passing check run.
+func (f *noChangesAutoPlanFixture) synchronize(t *testing.T, beforeSHA, headSHA string) {
+	t.Helper()
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
-		action:  "synchronize",
-		headSHA: "abc123",
-		headRef: "feature-branch",
+		action:    "synchronize",
+		beforeSHA: beforeSHA,
+		headSHA:   headSHA,
+		headRef:   "feature-branch",
 	}, nil)
-
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-
+	f.h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	// Check run should still be created (for PR status)
 	select {
-	case cr := <-result.checkRuns:
+	case cr := <-f.result.checkRuns:
 		assert.Equal(t, "completed", cr.Status)
 		assert.Equal(t, "success", cr.Conclusion)
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for check run")
 	}
+}
 
-	// The prior head's plan comment is retired even though no new comment is
-	// posted: the no-changes outcome supersedes it.
+// requireNoCommentActivity fails if the handler posts or deletes a comment
+// within a short settling window.
+func (f *noChangesAutoPlanFixture) requireNoCommentActivity(t *testing.T) {
+	t.Helper()
 	select {
-	case id := <-deleted:
+	case body := <-f.result.comments:
+		t.Fatalf("expected no comment for auto-plan with no changes, but got: %s", body)
+	case id := <-f.deleted:
+		t.Fatalf("expected no plan comment to be deleted, but comment %s was", id)
+	case <-time.After(3 * time.Second):
+	}
+}
+
+// A user ran `schemabot plan` and got an answer, then a push that touches the
+// schema files lands and its auto-plan resolves to no changes. The PR already
+// showed a plan, so it must keep showing a current one: the auto-plan posts its
+// no-changes plan comment, which supersedes the prior head's comment through
+// the normal tracked-post path. No apply acted on the prior head, so its
+// comment is deleted rather than minimized — but only after its replacement is
+// on the PR.
+func TestE2EAutoPlanNoChangesSupersedesPriorHeadPlan(t *testing.T) {
+	dbName := "webhook_autoplan_nochange"
+	f := setupNoChangesAutoPlan(t, dbName)
+	registerCompareFiles(t, f.mux, "priorsha", "abc123", []*gh.CommitFile{{
+		Filename: new("schema/" + dbName + "/users.sql"),
+		Status:   new("modified"),
+	}})
+	insertPlanCommentRow(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "priorsha", 9001, "IC_stale_prior")
+
+	f.synchronize(t, "priorsha", "abc123")
+
+	select {
+	case body := <-f.result.comments:
+		firstLine, _, _ := strings.Cut(body, "\n")
+		assert.Equal(t, "## Schema Change Plan — Staging", firstLine)
+		assert.Contains(t, body, "No schema changes detected")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the no-changes plan comment")
+	}
+	select {
+	case id := <-f.deleted:
 		assert.Equal(t, "9001", id)
-	case <-time.After(30 * time.Second):
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for the prior head's plan comment to be deleted")
 	}
 	require.Eventually(t, func() bool {
-		return len(unretiredHeads(t, svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")) == 0
-	}, 10*time.Second, 100*time.Millisecond, "the deleted plan comment must be recorded in storage")
+		heads := unretiredHeads(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")
+		return len(heads) == 1 && heads[0] == "abc123"
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond,
+		"the no-changes comment is the slot's only visible plan comment")
+}
 
-	// No comment should be posted — give it a moment to confirm nothing arrives
-	select {
-	case body := <-result.comments:
-		t.Fatalf("expected no comment for auto-plan with no changes, but got: %s", body)
-	case <-time.After(3 * time.Second):
-		// expected: no comment posted
-	}
+// A PR whose auto-plan resolves to no changes and that has never shown a plan
+// comment stays quiet: the passing check run alone reports the green state.
+func TestE2EAutoPlanNoChangesWithoutPriorPlanSkipsComment(t *testing.T) {
+	dbName := "webhook_autoplan_nochange_quiet"
+	f := setupNoChangesAutoPlan(t, dbName)
+
+	f.synchronize(t, "", "abc123")
+
+	f.requireNoCommentActivity(t)
+	assert.Empty(t, unretiredHeads(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "mysql"))
+}
+
+// A user ran `schemabot plan`, then pushed a schema-neutral commit (a merge of
+// the default branch that touches no schema input) whose auto-plan resolves to
+// no changes. The visible plan comment is proven to cover the current schema
+// inputs, so it stays on the PR as the answer instead of being deleted, and no
+// new comment is posted for the push.
+func TestE2EAutoPlanNoChangesSchemaNeutralSyncKeepsVisiblePlan(t *testing.T) {
+	dbName := "webhook_autoplan_nochange_neutral"
+	f := setupNoChangesAutoPlan(t, dbName)
+	f.result.HeadSHAs = []string{"newsha"}
+	registerCompareFiles(t, f.mux, "oldsha", "newsha", []*gh.CommitFile{{
+		Filename: new("app/service.go"),
+		Status:   new("modified"),
+	}})
+	insertPlanCommentRow(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "oldsha", 9001, "IC_command_reply")
+
+	f.synchronize(t, "oldsha", "newsha")
+
+	f.requireNoCommentActivity(t)
+	assert.Equal(t, []string{"oldsha"}, unretiredHeads(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "mysql"),
+		"the visible plan comment stays on the PR")
 }
 
 func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {

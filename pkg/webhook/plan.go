@@ -281,6 +281,8 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 // When isAutoPlan is true and there is genuinely nothing to show, the comment is skipped to reduce
 // PR noise — which is narrower than "no environment has changes": a rollout still converging plans
 // no changes for the target that was reviewed and is not a no-op for the fleet.
+// The skip only holds while no plan comment from a prior head is visible: once
+// the PR shows a plan answer, the no-changes comment posts and supersedes it.
 // commentID is the command comment to acknowledge once discovery commits this
 // deployment to acting; auto-plans pass zero (no comment to acknowledge).
 // commandScopeDatabases is how many databases a bare command offered by this
@@ -647,15 +649,28 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		// environment-scoped deployment the comment is the PR's only mention
 		// of it.
 		if !anyChanges && !rolloutHasWork && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) && len(unmanagedSchema) == 0 {
-			// The no-changes outcome supersedes older plan comments just as a
-			// new plan comment would: a prior head's comment still advertises
-			// pending DDL and an apply prompt that no longer match the branch.
-			h.logger.Info("auto-plan: no changes, errors, or drift detected; skipping comment and retiring plan comments from prior heads",
+			// The visible plan was proven to cover this head's schema inputs,
+			// so it stays as the PR's answer rather than being replaced on
+			// every schema-neutral push.
+			if !postPlanComment {
+				h.logger.Info("auto-plan: no changes, errors, or drift detected; refreshed checks and left the visible plan comment in place because it covers the current schema inputs",
+					"repo", repo, "pr", pr, "database", multiEnvData.Database,
+					"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
+				return
+			}
+			// Once the PR shows a plan answer it keeps showing a current one:
+			// a prior head's comment is superseded by posting this head's
+			// no-changes comment, never by removing it and leaving nothing.
+			// A PR that never showed a plan stays quiet.
+			if !h.slotShowsPlanFromPriorHead(ctx, repo, pr, multiEnvData.Database, multiEnvData.DatabaseType, multiEnvData.HeadSHA) {
+				h.logger.Info("auto-plan: no changes, errors, or drift detected and no plan comment from a prior head is visible; skipping comment",
+					"repo", repo, "pr", pr, "database", multiEnvData.Database,
+					"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
+				return
+			}
+			h.logger.Info("auto-plan: no changes, errors, or drift detected; posting the no-changes plan comment to supersede the plan comment from a prior head",
 				"repo", repo, "pr", pr, "database", multiEnvData.Database,
 				"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
-			h.retireStalePlanComments(ctx, client, repo, pr,
-				multiEnvData.Database, multiEnvData.DatabaseType, multiEnvData.HeadSHA)
-			return
 		}
 	}
 

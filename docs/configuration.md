@@ -1973,10 +1973,13 @@ for the same set of environments. A same-commit comment covering different
 environments is kept expanded — it may be the only visible plan for those
 environments.
 
-A plan outcome can also supersede without posting: when an auto-plan resolves
-to no changes, no new comment appears (the check run alone reports the green
-state), but plan comments from prior commits are still retired — the pending
-DDL and apply prompt they show no longer match the branch.
+Once a PR shows a plan comment, it keeps showing a current one. When an
+auto-plan resolves to no changes and a plan comment from a prior commit is
+still visible, the auto-plan posts its no-changes plan comment, which
+supersedes the prior one like any other plan comment. A PR that has never shown
+a plan comment gets no comment for a no-changes auto-plan; the check run alone
+reports the green state. A push that changes no schema input files leaves the
+visible plan comment in place, since it still covers the PR's schema files.
 
 By default, a superseded plan comment no apply ever acted on is deleted from
 the PR timeline outright — its DDL never ran and is reproducible from the

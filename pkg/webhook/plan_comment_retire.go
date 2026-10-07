@@ -114,33 +114,43 @@ func (h *Handler) retireSupersededPlanComments(ctx context.Context, client *ghcl
 		"database", posted.DatabaseName, "database_type", posted.DatabaseType) {
 		return
 	}
-	h.retirePlanCommentsForSlot(ctx, client,
-		posted.Repository, posted.PullRequest, posted.DatabaseName, posted.DatabaseType, posted.HeadSHA, posted)
+	priors, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx,
+		posted.Repository, posted.PullRequest, posted.DatabaseName, posted.DatabaseType)
+	if err != nil {
+		h.logger.Error("failed to list prior plan comments; superseded plan comments stay visible until the next supersede sweep",
+			append(planCommentAttrs(posted), "error", err)...)
+		return
+	}
+	h.retireSupersededPlanCommentRows(ctx, client, priors, posted.HeadSHA, posted)
 }
 
-// retireStalePlanComments retires the slot's still-visible plan comments
-// rendered at a head other than the current one, for plan outcomes that
-// supersede prior comments without posting a new comment — an auto-plan
-// resolving to no changes still moves the head past every older comment,
-// whose pending DDL and apply prompt no longer match the branch. Same-head
-// comments stay expanded: one may be the only visible plan for its
-// environment scope.
-func (h *Handler) retireStalePlanComments(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, databaseType, headSHA string) {
-	if database == "" || headSHA == "" {
-		// Without a database and head there is no slot identity to sweep;
-		// treating the empty identity as a slot could retire untracked
-		// error-only comments across databases.
-		h.logger.Info("skipping stale plan comment retirement because no database or head resolved to key the slot",
-			"repo", repo, "pr", pr, "database", database, "database_type", databaseType, "head_sha", headSHA)
-		return
+// slotShowsPlanFromPriorHead reports whether the slot still shows a plan
+// comment rendered at a head other than headSHA. An auto-plan that resolves
+// to no changes posts its comment only when this holds, so the comment it
+// supersedes is replaced rather than removed with nothing in its place. A
+// failed read reports true: an extra visible comment is the safe failure,
+// while a wrong false would leave a stale plan as the PR's only answer.
+func (h *Handler) slotShowsPlanFromPriorHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) bool {
+	slotAttrs := []any{
+		"repo", repo, "pr", pr,
+		"database", database, "database_type", databaseType,
+		"head_sha", headSHA,
 	}
-
-	if !h.planSweepHeadIsCurrent(ctx, client, repo, pr, headSHA,
-		"database", database, "database_type", databaseType) {
-		return
+	comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx, repo, pr, database, databaseType)
+	if err != nil {
+		h.logger.Error("failed to list the slot's plan comments; posting the no-changes plan comment so the PR still shows a current answer",
+			append(slotAttrs, "error", err)...)
+		return true
 	}
-
-	h.retirePlanCommentsForSlot(ctx, client, repo, pr, database, databaseType, headSHA, nil)
+	for _, c := range comments {
+		if c.HeadSHA != headSHA {
+			h.logger.Info("slot shows a plan comment from a prior head", planCommentAttrs(c)...)
+			return true
+		}
+	}
+	h.logger.Debug("slot shows no plan comment from a prior head",
+		append(slotAttrs, "visible_comments", len(comments))...)
+	return false
 }
 
 // retireStalePlanCommentsForPR retires every plan comment still visible on
@@ -193,31 +203,6 @@ func (h *Handler) planSweepHeadIsCurrent(ctx context.Context, client *ghclient.I
 		return false
 	}
 	return true
-}
-
-// retirePlanCommentsForSlot sweeps the slot's still-visible plan comments and
-// retires the superseded ones. posted is the newly posted comment when the
-// sweep follows a post: its own row is skipped and supersession follows
-// planCommentSupersedes. When posted is nil the sweep follows an outcome with
-// no new comment, and only comments from heads other than headSHA are
-// superseded. Every failure keeps the comment on the PR and its row
-// unretired, so the next sweep retries it.
-func (h *Handler) retirePlanCommentsForSlot(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database, databaseType, headSHA string, posted *storage.PlanComment) {
-	slotAttrs := []any{
-		"repo", repo, "pr", pr,
-		"database", database, "database_type", databaseType,
-		"head_sha", headSHA,
-	}
-
-	priors, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx,
-		repo, pr, database, databaseType)
-	if err != nil {
-		h.logger.Error("failed to list prior plan comments; superseded plan comments stay visible until the next supersede sweep",
-			append(slotAttrs, "error", err)...)
-		return
-	}
-
-	h.retireSupersededPlanCommentRows(ctx, client, priors, headSHA, posted)
 }
 
 // retireSupersededPlanCommentRows retires the superseded comments among
