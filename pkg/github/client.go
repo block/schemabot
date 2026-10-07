@@ -1132,6 +1132,9 @@ type SchemaChangeComparison struct {
 	BaseTipSHA           string
 	ApprovedMergeBaseSHA string
 	HeadMergeBaseSHA     string
+	// BaseMovedForward is true when the head's merge base is the approved
+	// commit's merge base or a descendant of it.
+	BaseMovedForward bool
 }
 
 // PRSchemaChangeUnchangedSince reports whether the change a pull request
@@ -1143,8 +1146,13 @@ type SchemaChangeComparison struct {
 // when the pull request turns the same base content into the same result at
 // both commits, or when it leaves the path as its base branch has it at both
 // commits, so any difference came from the base branch rather than from the
-// pull request. Identical content on different bases is not unchanged: the
-// head would undo or overwrite the base branch's change. Rebasing onto, or
+// pull request. That second rule holds only when the head's base content is
+// newer than the approved commit's: the head's merge base must descend from
+// the approved commit's. A head rebuilt on older base content would otherwise
+// carry an older version of a path the pull request never touched, which
+// nobody approved for this change. Identical content on different bases is
+// not unchanged either: the head would undo or overwrite the base branch's
+// change. Rebasing onto, or
 // merging in, a newer base branch therefore leaves the change unchanged; a
 // path the pull request edits, adds, deletes, or resolves differently at the
 // head does not. Directories that satisfy neither are compared entry by entry.
@@ -1172,13 +1180,17 @@ func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, 
 	if result.HeadMergeBaseSHA, err = ic.mergeBaseSHA(ctx, repo, baseTipSHA, headSHA); err != nil {
 		return result, err
 	}
+	if result.BaseMovedForward, err = ic.isAncestorOrSame(ctx, repo, result.ApprovedMergeBaseSHA, result.HeadMergeBaseSHA); err != nil {
+		return result, err
+	}
 
 	comparer := &schemaChangeComparer{
-		ic:          ic,
-		repo:        repo,
-		commits:     [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
-		levelCache:  make(map[string][]TreeEntry),
-		symlinkText: make(map[string]string),
+		ic:               ic,
+		repo:             repo,
+		commits:          [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
+		baseMovedForward: result.BaseMovedForward,
+		levelCache:       make(map[string][]TreeEntry),
+		symlinkText:      make(map[string]string),
 	}
 	differingPath, err := comparer.compare(ctx, paths)
 	if err != nil {
@@ -1212,10 +1224,14 @@ func sameGitObject(x, y gitSide) bool {
 }
 
 type schemaChangeComparer struct {
-	ic         *InstallationClient
-	repo       string
-	commits    [4]string
-	levelCache map[string][]TreeEntry
+	ic      *InstallationClient
+	repo    string
+	commits [4]string
+	// baseMovedForward is true when the head's merge base descends from the
+	// approved commit's, so a path the pull request leaves as its base has it
+	// at both commits differs only by newer base content.
+	baseMovedForward bool
+	levelCache       map[string][]TreeEntry
 	// symlinkText caches each symlink object's target text by blob SHA, so
 	// links with the same target text cost one read.
 	symlinkText map[string]string
@@ -1259,7 +1275,7 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 		s := item.sides
 		identical := sameGitObject(s[sideApproved], s[sideHead])
 		switch {
-		case sameChange(s) || untouchedByPR(s):
+		case sameChange(s) || (c.baseMovedForward && untouchedByPR(s)):
 			sides := []gitSide{s[sideHead]}
 			if !identical {
 				sides = append(sides, s[sideApproved])
@@ -1425,6 +1441,19 @@ func (ic *InstallationClient) branchTipSHA(ctx context.Context, repo, branch str
 		return "", fmt.Errorf("ref heads/%s for %s resolved to no commit", branch, repo)
 	}
 	return tipSHA, nil
+}
+
+// isAncestorOrSame reports whether ancestorSHA is descendantSHA or one of its
+// ancestors: their merge base is ancestorSHA itself.
+func (ic *InstallationClient) isAncestorOrSame(ctx context.Context, repo, ancestorSHA, descendantSHA string) (bool, error) {
+	if ancestorSHA == descendantSHA {
+		return true, nil
+	}
+	mergeBase, err := ic.mergeBaseSHA(ctx, repo, ancestorSHA, descendantSHA)
+	if err != nil {
+		return false, err
+	}
+	return mergeBase == ancestorSHA, nil
 }
 
 // mergeBaseSHA returns the merge base of baseSHA and headSHA.

@@ -269,12 +269,15 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		// prChange turns the old default branch into the approved commit.
 		// headChange builds the head from the tip, or from the old default
 		// branch when headOnOldBase is set; nil replays prChange.
-		prChange       func(map[string]string)
-		headChange     func(map[string]string)
-		headOnOldBase  bool
-		schemaPath     string
-		schemaLinkPath string
-		configPath     string
+		// approvedOnNewBase builds the approved commit from the tip instead,
+		// so with headOnOldBase the head is on older base content.
+		prChange          func(map[string]string)
+		headChange        func(map[string]string)
+		headOnOldBase     bool
+		approvedOnNewBase bool
+		schemaPath        string
+		schemaLinkPath    string
+		configPath        string
 		// approvedUnknown leaves the approved commit unknown to GitHub.
 		approvedUnknown  bool
 		treesUnavailable bool
@@ -333,6 +336,30 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				files["schema/shared/orders.yaml"] = "database: orders\nignore_tables:\n  - legacy_old\n"
 			},
 			want: wantCovers,
+		},
+		{
+			name: "a head rebuilt on an older default branch that restores a config outside the schema directory does not count",
+			base: func() map[string]string {
+				files := maps.Clone(baseFiles)
+				files["schemabot.yaml"] = "database: orders\n"
+				return files
+			}(),
+			baseChange: func(files map[string]string) {
+				files["schemabot.yaml"] = "database: orders\nignore_tables:\n  - legacy_old\n"
+			},
+			prChange:          addVotes,
+			approvedOnNewBase: true,
+			headOnOldBase:     true,
+			configPath:        "schemabot.yaml",
+			want:              wantChanged,
+		},
+		{
+			name:              "a head rebuilt on an older default branch that left the schema inputs alone counts",
+			baseChange:        func(files map[string]string) { files["README.md"] = "readme, updated on the default branch" },
+			prChange:          addVotes,
+			approvedOnNewBase: true,
+			headOnOldBase:     true,
+			want:              wantCovers,
 		},
 		{
 			name:          "a push on the same base that changed only files outside the schema inputs counts",
@@ -517,8 +544,12 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			}
 			mergeBases := map[string]string{reviewGateTestHeadSHA: headMergeBase}
 			if !tt.approvedUnknown {
-				commits[reviewGateApproved] = derive(oldBase, tt.prChange)
-				mergeBases[reviewGateApproved] = reviewGateOldBase
+				approvedBase, approvedMergeBase := oldBase, reviewGateOldBase
+				if tt.approvedOnNewBase {
+					approvedBase, approvedMergeBase = tip, reviewGateBaseTip
+				}
+				commits[reviewGateApproved] = derive(approvedBase, tt.prChange)
+				mergeBases[reviewGateApproved] = approvedMergeBase
 			}
 			registerReviewGateBaseBranch(t, mux, mergeBases)
 			if tt.treesUnavailable {
@@ -632,6 +663,17 @@ func registerReviewGateBaseBranch(t *testing.T, mux *http.ServeMux, mergeBases m
 		reads.compared = append(reads.compared, commit)
 		reads.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		// The default branch's history is the old base followed by its tip,
+		// so of two default-branch commits the old base is their merge base.
+		onDefaultBranch := func(sha string) bool { return sha == reviewGateOldBase || sha == reviewGateBaseTip }
+		if onDefaultBranch(base) && onDefaultBranch(commit) {
+			mergeBase := reviewGateOldBase
+			if base == commit {
+				mergeBase = base
+			}
+			_ = json.NewEncoder(w).Encode(&gh.CommitsComparison{Status: new("diverged"), MergeBaseCommit: &gh.RepositoryCommit{SHA: &mergeBase}})
+			return
+		}
 		mergeBase, ok := mergeBases[commit]
 		if base != reviewGateBaseTip || !ok {
 			w.WriteHeader(http.StatusNotFound)
