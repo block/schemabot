@@ -116,13 +116,14 @@ func awaitRolloutApply(t *testing.T, svc *api.Service, dbName string, command *p
 // pinRolloutConfirmation leaves the rollout fixture where an apply that stopped
 // for apply-confirm leaves it: the plan command stores every target's plan,
 // bound to the primary target's plan, and the lock pins that plan for
-// confirmation. nil files plans the PR's default schema.
-func pinRolloutConfirmation(t *testing.T, svc *api.Service, dbName string, files map[string]string) {
+// confirmation. nil files plans the PR's default schema. It returns the plan
+// command's result, whose comment is the one the confirmation is given against.
+func pinRolloutConfirmation(t *testing.T, svc *api.Service, dbName string, files map[string]string) *planFlowResult {
 	t.Helper()
 	if files == nil {
 		files = map[string]string{"users.sql": usersWithEmailSchema}
 	}
-	runRolloutCommandWithFiles(t, svc, dbName, "schemabot plan -e "+driftEnv, files)
+	plan := runRolloutCommandWithFiles(t, svc, dbName, "schemabot plan -e "+driftEnv, files)
 	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
 	require.NoError(t, err)
 	var reviewed *storage.Plan
@@ -143,6 +144,7 @@ func pinRolloutConfirmation(t *testing.T, svc *api.Service, dbName string, files
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
+	return plan
 }
 
 // awaitCapture returns the first value the command publishes on ch that
@@ -888,10 +890,9 @@ func TestE2EApplyConfirmRefusesAChangedPrimaryWithIdenticalDDL(t *testing.T) {
 				_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), tc.dbName, "mysql")
 			})
 
-			apply := runRolloutCommand(t, svc, tc.dbName, "schemabot apply -e "+driftEnv)
-			body := awaitCommentContaining(t, apply, "Confirmation required")
+			plan := pinRolloutConfirmation(t, svc, tc.dbName, nil)
+			body := awaitCommentContaining(t, plan, "MODIFY COLUMN `email`")
 			assert.Contains(t, body, "ADD COLUMN `email`")
-			assert.Contains(t, body, "MODIFY COLUMN `email`")
 			lock, err := svc.Storage().Locks().Get(t.Context(), tc.dbName, "mysql")
 			require.NoError(t, err)
 			require.NotNil(t, lock)
@@ -964,9 +965,8 @@ func TestE2EApplyConfirmRefusesAChangedPrimaryWhileAnotherTargetHasWork(t *testi
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Confirmation required")
-	require.Contains(t, body, "MODIFY COLUMN `email`")
+	plan := pinRolloutConfirmation(t, svc, dbName, nil)
+	awaitCommentContaining(t, plan, "MODIFY COLUMN `email`")
 
 	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
 	_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(255) DEFAULT NULL")
@@ -977,7 +977,7 @@ func TestE2EApplyConfirmRefusesAChangedPrimaryWhileAnotherTargetHasWork(t *testi
 	changed := rolloutServiceOver(t, svc, dbName, "us", "eu", "ap")
 
 	confirm := runRolloutCommand(t, changed, dbName, "schemabot apply-confirm -e "+driftEnv)
-	body = awaitCommentContaining(t, confirm, "nothing was applied")
+	body := awaitCommentContaining(t, confirm, "nothing was applied")
 	assert.Contains(t, body, "the primary target is not the one the confirmed plan reviewed")
 	requireNoApplies(t, changed, dbName)
 	requireNoApplyLock(t, changed, dbName)
@@ -997,14 +997,20 @@ func TestE2EApplyConfirmConvergedPrimaryMovedNamesTheMovedPrimary(t *testing.T) 
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
 	})
 
-	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Confirmation required")
-	require.Contains(t, body, "The primary target already has this schema")
-	require.Contains(t, body, "ADD COLUMN `email`")
+	plan := pinRolloutConfirmation(t, svc, dbName, nil)
+	awaitCommentContaining(t, plan, "ADD COLUMN `email`")
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	pinned, err := svc.Storage().Plans().Get(t.Context(), lock.PendingPlanID)
+	require.NoError(t, err)
+	require.NotNil(t, pinned)
+	require.Equal(t, "eu", pinned.Deployment)
+	require.False(t, pinned.HasWork(), "the confirmation pins the converged primary target's empty plan")
 	changed := rolloutServiceOver(t, svc, dbName, "us", "eu")
 
 	confirm := runRolloutCommand(t, changed, dbName, "schemabot apply-confirm -e "+driftEnv)
-	body = awaitCommentContaining(t, confirm, "nothing was applied")
+	body := awaitCommentContaining(t, confirm, "nothing was applied")
 	assert.Contains(t, body, "the primary target is not the one the confirmed plan reviewed")
 	assert.NotContains(t, body, "now has changes of its own")
 	requireNoApplies(t, changed, dbName)
