@@ -450,8 +450,10 @@ func memberUnsafeTableChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
 				if !ok {
 					continue
 				}
+				// Shards whose reasons name the same findings in any order share
+				// an entry, which keeps the first shard's reason text.
 				at := slices.IndexFunc(out, func(c templates.UnsafeChangeData) bool {
-					return c.Table == uc.Table && c.Reason == uc.Reason
+					return c.Table == uc.Table && sameUnsafeReason(c.Reason, uc.Reason)
 				})
 				if at < 0 {
 					out = append(out, templates.UnsafeChangeData{Table: uc.Table, Reason: uc.Reason, DDL: uc.DDL, ChangeType: uc.ChangeType})
@@ -477,11 +479,15 @@ func memberUnsafeTableChanges(cs tern.ChangeSet) []templates.UnsafeChangeData {
 
 // addUnsafeTarget records that a target carries one of its group's unsafe
 // changes, folding it into the group's entry for the same change when another
-// target already carries it, the way addModeTarget folds a verdict.
+// target already carries it, the way addModeTarget folds a verdict. Reasons
+// match when they name the same findings in any order, and the folded entry
+// keeps the reason text of the first target that carried it: the findings are
+// the same, so only their order on the comment can differ from a later
+// target's.
 func addUnsafeTarget(list *[]templates.UnsafeChangeData, change templates.UnsafeChangeData, target string) {
 	for i := range *list {
 		existing := &(*list)[i]
-		if existing.Table == change.Table && existing.Reason == change.Reason && slices.Equal(existing.Shards, change.Shards) {
+		if existing.Table == change.Table && sameUnsafeReason(existing.Reason, change.Reason) && slices.Equal(existing.Shards, change.Shards) {
 			if !slices.Contains(existing.Targets, target) {
 				existing.Targets = append(existing.Targets, target)
 			}

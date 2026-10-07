@@ -12,6 +12,7 @@ import (
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/ui"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -610,5 +611,24 @@ func sameTableChange(a, b storage.TableChange) bool {
 // the same way and carry the same unsafe verdict and reason, so an opt-in given
 // for one consents to exactly the consequences of the other.
 func sameUnsafeVerdict(a, b storage.TableChange) bool {
-	return sameTableChange(a, b) && a.IsUnsafe == b.IsUnsafe && a.UnsafeReason == b.UnsafeReason
+	return sameTableChange(a, b) && a.IsUnsafe == b.IsUnsafe && sameUnsafeReason(a.UnsafeReason, b.UnsafeReason)
+}
+
+// sameUnsafeReason reports whether two unsafe reasons name the same findings,
+// compared as the lists the comment renders from them, each on its own line,
+// with order ignored. Engines that normalize their reasons already sort the
+// findings, but a reason can also come from a plan stored before that, or from
+// an engine that does not normalize, so the order of a reason's findings is
+// never taken to mean anything. How many times a finding appears does mean
+// something: the same message raised on two columns is two findings, and a
+// plan that gains the second is not the plan the opt-in was given for.
+func sameUnsafeReason(a, b string) bool {
+	return slices.Equal(unsafeReasonFindings(a), unsafeReasonFindings(b))
+}
+
+// unsafeReasonFindings returns the findings an unsafe reason names, sorted.
+func unsafeReasonFindings(reason string) []string {
+	findings := ui.LintReasons(reason)
+	slices.Sort(findings)
+	return findings
 }

@@ -109,6 +109,23 @@ func TestMemberWorkDifference(t *testing.T) {
 		c.IsUnsafe = true
 		c.UnsafeReason = "drop_index: index idx_email is visible"
 	})), "the same statement, unsafe for another reason")
+	unsafeFor := func(reason string) *storage.Plan {
+		return plan(func(c *storage.TableChange) {
+			c.IsUnsafe = true
+			c.UnsafeReason = reason
+		})
+	}
+	const createdAt = "Column `created_at` uses `TIMESTAMP`"
+	const updatedAt = "Column `updated_at` uses `TIMESTAMP`"
+	assert.Equal(t, workUnchanged, memberWorkDifference(unsafeFor(createdAt+"; "+updatedAt), unsafeFor(updatedAt+"; "+createdAt)),
+		"the same findings reported in another order")
+	assert.Equal(t, workUnsafe, memberWorkDifference(unsafeFor(createdAt+"; "+updatedAt), unsafeFor(createdAt)),
+		"a finding the confirmed round showed is gone")
+	assert.Equal(t, workUnsafe, memberWorkDifference(unsafeFor(createdAt), unsafeFor(createdAt+"; "+updatedAt)),
+		"a finding the confirmed round did not show")
+	const sameOnTwoColumns = "Column uses `TIMESTAMP`"
+	assert.Equal(t, workUnsafe, memberWorkDifference(unsafeFor(sameOnTwoColumns), unsafeFor(sameOnTwoColumns+"; "+sameOnTwoColumns)),
+		"the same message raised on a second column is a second finding")
 
 	sharded := plan(nil)
 	sharded.Shards = []storage.ShardPlan{{Shard: "-80", Namespace: "payments", Changes: sharded.FlatDDLChanges()}}
