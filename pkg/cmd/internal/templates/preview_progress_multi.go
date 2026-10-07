@@ -23,7 +23,7 @@ func previewCLIMultiDeploymentApplyInProgress() {
 
 func previewCLIMultiDeploymentApplyFailed() {
 	WriteProgress(multiDeploymentProgressData([]ProgressOperation{
-		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Completed, StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339), CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate key name 'idx_orders_source'"},
 		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 	}, []TableProgress{
@@ -47,9 +47,9 @@ func previewCLIMultiDeploymentApplyHaltedWithLiveSibling() {
 
 func previewCLIMultiDeploymentApplyCompleted() {
 	data := multiDeploymentProgressData([]ProgressOperation{
-		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
-		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
-		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{Deployment: "us-east", Target: "orders-us-east", State: state.ApplyOperation.Completed, StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339), CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Completed, StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339), CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Completed, StartedAt: previewTime.Add(-8 * time.Minute).Format(time.RFC3339), CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 	}, []TableProgress{
 		{Deployment: "us-east", Target: "orders-us-east", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
 		{Deployment: "eu-west", Target: "orders-eu-west", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL", Status: state.Task.Completed, RowsCopied: 120000, RowsTotal: 120000, PercentComplete: 100},
@@ -93,6 +93,7 @@ func previewCLIMultiTargetRolloutInProgress() {
 		switch {
 		case i < 40:
 			op.State, table.Status, table.RowsCopied, table.PercentComplete = state.ApplyOperation.Completed, state.Task.Completed, 80000, 100
+			op.StartedAt = previewTime.Add(-8 * time.Minute).Format(time.RFC3339)
 		case i == 40:
 			op.State, op.ErrorMessage, op.ExternalID = state.ApplyOperation.Failed, "duplicate key name 'idx_orders_source'", "spirit-apply-041"
 			table.Status, table.RowsCopied, table.PercentComplete = state.Task.Failed, 12000, 15

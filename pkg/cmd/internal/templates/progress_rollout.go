@@ -101,7 +101,7 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 		tables := byMember[rolloutMemberKey{d.Deployment, d.Target}]
 		if len(tables) == 0 {
 			switch {
-			case targetAlreadyConverged(d):
+			case d.AlreadyApplied():
 				converged++
 			case !state.IsApplyOperationTerminal(d.State):
 				silent++
@@ -203,14 +203,6 @@ func tablesByMember(tables []TableProgress) map[rolloutMemberKey][]TableProgress
 		byMember[key] = append(byMember[key], table)
 	}
 	return byMember
-}
-
-// targetAlreadyConverged reports whether a target already held the change
-// when the apply was created: its operation was recorded completed without a
-// driver ever starting it, which is how an apply settles a target with
-// nothing left to run.
-func targetAlreadyConverged(d presentation.Deployment) bool {
-	return state.IsState(d.State, state.ApplyOperation.Completed) && d.NeverStarted
 }
 
 // tableChangeSignature keys the change a target runs by its tables and their

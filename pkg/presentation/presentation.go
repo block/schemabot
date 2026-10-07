@@ -141,6 +141,10 @@ const (
 	StateRevertWindow
 	StateCancelled
 	StateReverted
+	// StateAlreadyApplied is a member whose target already held the change
+	// when the apply was created, so nothing ran there. It is neither a
+	// completed rollout member nor one still to report.
+	StateAlreadyApplied
 )
 
 // Deployment is the derived presentation for one deployment of the apply.
@@ -343,7 +347,7 @@ var attentionOrder = []PresentationState{
 	StateFailed, StateRetrying, StatePaused, StateHalted, StateStopped,
 	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
 	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
-	StateCancelled, StateReverted, StateCompleted,
+	StateCancelled, StateReverted, StateCompleted, StateAlreadyApplied,
 }
 
 // attentionRank is ps's position in attentionOrder; unnamed states rank last.
@@ -443,6 +447,10 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 
 	switch op.State {
 	case state.ApplyOperation.Completed:
+		if d.AlreadyApplied() {
+			d.set(StateAlreadyApplied, "already had it", "✅", false)
+			break
+		}
 		d.set(StateCompleted, "completed", "✅", false)
 	case state.ApplyOperation.Running:
 		d.set(StateRunningCopy, "running table copy", "🔄", true)
@@ -725,6 +733,7 @@ var summaryCategoryOrder = []struct {
 	states []PresentationState
 }{
 	{"completed", []PresentationState{StateCompleted}},
+	{"already had it", []PresentationState{StateAlreadyApplied}},
 	{"cutting over", []PresentationState{StateCuttingOver}},
 	{"ready for cutover", []PresentationState{StateReadyForCutoverNext, StateReadyForCutoverWaiting}},
 	{"running", []PresentationState{StateRunningCopy}},
@@ -777,6 +786,14 @@ func firstWithPresentation(deps []Deployment, ps PresentationState) (Deployment,
 		}
 	}
 	return Deployment{}, false
+}
+
+// AlreadyApplied reports whether the member's target already held the change
+// when the apply was created: its operation was recorded completed without a
+// driver ever starting it, which is how an apply settles a target with nothing
+// left to run.
+func (d Deployment) AlreadyApplied() bool {
+	return state.IsState(d.State, state.ApplyOperation.Completed) && d.NeverStarted
 }
 
 func (d *Deployment) set(ps PresentationState, label, emoji string, open bool) {

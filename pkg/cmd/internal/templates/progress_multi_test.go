@@ -21,7 +21,7 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 			State:       state.Apply.Running,
 			StartedAt:   "2026-06-16T10:00:00Z",
 			Operations: []ProgressOperation{
-				{Deployment: "region-a", ExternalID: "remote-apply-region-a", ExternalOperationID: "remote-region-a", Target: "orders-a", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "region-a", ExternalID: "remote-apply-region-a", ExternalOperationID: "remote-region-a", Target: "orders-a", State: state.ApplyOperation.Completed, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 				{Deployment: "region-b", Target: "orders-b", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate column name 'region'"},
 				{Deployment: "region-c", Target: "orders-c", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 			},
@@ -66,7 +66,7 @@ func TestWriteProgressKeyedApplySectionsCarryOwnOperationIdentity(t *testing.T) 
 			Environment: "staging",
 			State:       state.Apply.Running,
 			Operations: []ProgressOperation{
-				{Deployment: "cake", OperationKey: "commerce/-80/users", ExternalID: "remote-apply-shared", ExternalOperationID: "remote-op-1", Target: "commerce-db", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
+				{Deployment: "cake", OperationKey: "commerce/-80/users", ExternalID: "remote-apply-shared", ExternalOperationID: "remote-op-1", Target: "commerce-db", State: state.ApplyOperation.Completed, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
 				{Deployment: "cake", OperationKey: "commerce/80-/users", ExternalOperationID: "remote-op-2", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureHalt},
 			},
 		})
@@ -181,7 +181,7 @@ func TestWriteProgressMultiTargetDeploymentRollsUpBesideASingleTargetSibling(t *
 			Environment: "staging",
 			State:       state.Apply.Running,
 			Operations: []ProgressOperation{
-				{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Completed, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 				{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 				{Deployment: "eu-west", Target: "orders-eu", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 			},
@@ -265,7 +265,7 @@ func TestWriteProgressMultiTargetRollupIsMemberScoped(t *testing.T) {
 			Environment: "staging",
 			State:       state.Apply.Running,
 			Operations: []ProgressOperation{
-				{Deployment: "primary", Target: "testapp-001", ExternalID: "remote-apply-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "primary", Target: "testapp-001", ExternalID: "remote-apply-001", State: state.ApplyOperation.Completed, StartedAt: "2026-06-16T10:00:00Z", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 				{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 			},
 			Tables: []TableProgress{

@@ -167,7 +167,7 @@ func TestCommentObserverRendersVSchemaFromEngineResumeState(t *testing.T) {
 // the operation rows and routes through the multi-deployment layout.
 func TestFormatStatusCommentRoutesMultiDeployment(t *testing.T) {
 	o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running},
 	}})
 
@@ -207,8 +207,8 @@ func TestFormatStatusCommentFallsBackOnLoadError(t *testing.T) {
 // layout.
 func TestFormatTerminalSummaryCommentRoutesMultiDeployment(t *testing.T) {
 	o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
-		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
 	}})
 
 	body := o.formatTerminalSummaryComment(completedApply())
@@ -223,7 +223,7 @@ func TestFormatTerminalSummaryCommentRoutesMultiDeployment(t *testing.T) {
 // unchanged — no aggregate header.
 func TestFormatTerminalSummaryCommentRoutesSingleDeployment(t *testing.T) {
 	o := newDispatchTestObserver(&stubApplyOperationStore{ops: []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
 	}})
 
 	body := o.formatTerminalSummaryComment(completedApply())
@@ -556,8 +556,8 @@ func TestProgressCommentAuthorityDecidesOncePerCallback(t *testing.T) {
 func TestShouldPublishSeparateSummaryDefersForMultiOperationApply(t *testing.T) {
 	o := newDispatchTestObserver(nil)
 	ops := []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
-		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
 	}
 
 	assert.False(t, o.shouldPublishSeparateSummary(completedApply(), ops, nil))
@@ -568,7 +568,7 @@ func TestShouldPublishSeparateSummaryDefersForMultiOperationApply(t *testing.T) 
 func TestShouldPublishSeparateSummaryPublishesForSingleOperationApply(t *testing.T) {
 	o := newDispatchTestObserver(nil)
 	ops := []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
 	}
 
 	assert.True(t, o.shouldPublishSeparateSummary(completedApply(), ops, nil))

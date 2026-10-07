@@ -92,7 +92,7 @@ func renderRollout(t *testing.T, data ProgressData) string {
 }
 
 func completedTarget() rolloutTarget {
-	return rolloutTarget{opState: state.ApplyOperation.Completed, status: state.Task.Completed, rowsCopied: 1000, rowsTotal: 1000}
+	return rolloutTarget{opState: state.ApplyOperation.Completed, status: state.Task.Completed, rowsCopied: 1000, rowsTotal: 1000, startedAt: "2026-09-30T12:00:00Z"}
 }
 
 func copyingTarget(copied int64) rolloutTarget {
@@ -154,13 +154,12 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 // waiting.
 func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
 	ran := completedTarget()
-	ran.startedAt = "2026-09-30T12:00:00Z"
 	converged := rolloutTarget{opState: state.ApplyOperation.Completed}
 
 	finished := targetRolloutData([]rolloutTarget{ran, ran, converged})
 	finished.State = state.Apply.Completed
 	out := renderRollout(t, finished)
-	assert.Contains(t, out, "✅ prod — 3 completed (3 targets)")
+	assert.Contains(t, out, "✅ prod — 2 completed · 1 already had it (3 targets)")
 	assert.Contains(t, out, "1 of 3 targets already had this schema; nothing ran there.")
 	assert.NotContains(t, out, "have not reported progress yet", "a finished target is not waiting to report:\n%s", out)
 

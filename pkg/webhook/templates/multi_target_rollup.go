@@ -61,7 +61,12 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		restorePlan()
 		restoreGroup()
 	}
-	if len(work) > 0 && silent > 0 {
+	if converged := alreadyAppliedTargets(data, g); converged > 0 {
+		fmt.Fprintf(sb, "_%d of %d targets already had this schema; nothing ran there._\n", converged, len(g.Members))
+	}
+	// A terminal apply has a final outcome for every target, so none of them
+	// is still to report.
+	if len(work) > 0 && silent > 0 && !state.IsTerminalApplyState(data.Model.State) {
 		fmt.Fprintf(sb, "_%d of %d targets have not reported progress yet._\n", silent, len(g.Members))
 	}
 	writeFailedTargets(sb, data.Model, g)
@@ -78,12 +83,29 @@ func planScopeForWork(budget *ddlBlockBudget, members []string, groups, unreport
 	return budget.forSoleTargetGroup(members, unreported)
 }
 
-// unreportedTargets counts the targets with no table progress to show yet, so
-// the table lines do not read as covering the whole deployment.
+// unreportedTargets counts the targets with work that have no table progress
+// to show yet, so the table lines do not read as covering the whole
+// deployment. A target that already had the change ran nothing, so it has
+// nothing to report and is not counted.
 func unreportedTargets(data MultiDeploymentApplyData, g presentation.Group) int {
 	n := 0
 	for _, i := range g.Members {
+		if data.Model.Deployments[i].AlreadyApplied() {
+			continue
+		}
 		if detail := memberDetail(data.Details, i); detail == nil || len(detail.Tables) == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// alreadyAppliedTargets counts the targets that already had the change when
+// the apply was created.
+func alreadyAppliedTargets(data MultiDeploymentApplyData, g presentation.Group) int {
+	n := 0
+	for _, i := range g.Members {
+		if data.Model.Deployments[i].AlreadyApplied() {
 			n++
 		}
 	}

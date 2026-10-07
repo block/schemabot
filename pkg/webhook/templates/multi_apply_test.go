@@ -1447,3 +1447,66 @@ func TestRenderMultiDeploymentApplySummaryComment_MemberSectionNamesItsPlan(t *t
 	assert.Contains(t, out, "**Database**: `orders` | **Plan**: `plan_reviewed`\n")
 	assertRolloutHeaderNotRepeated(t, out)
 }
+
+// A target that already held the change is settled completed without a driver
+// ever starting it, so it ran nothing and reports no table progress. The
+// deployment counts it as already having the change, says so once, and never
+// counts it among the targets still to report. A finished apply has a final
+// outcome for every target, so it says nothing is still to report.
+func TestRenderMultiDeploymentApplyComment_TargetThatAlreadyHadTheChangeIsNotWaiting(t *testing.T) {
+	converged := parallelTarget("primary", "testapp-004", so.Completed)
+	converged.NeverStarted = true
+
+	t.Run("finished", func(t *testing.T) {
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Completed),
+			parallelTarget("primary", "testapp-003", so.Completed),
+			converged,
+		}),
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_003", state.Task.Completed, addNote, 1000),
+			nil,
+		)
+
+		assert.Contains(t, out, "<summary>✅ primary — 3 completed, 1 already had it (4 targets)</summary>")
+		assert.Contains(t, out, "\n_1 of 4 targets already had this schema; nothing ran there._\n")
+		assert.NotContains(t, out, "have not reported progress yet", "a finished apply has nothing still to report:\n%s", out)
+		assert.NotContains(t, out, "across", "the rows cover every target that ran")
+	})
+
+	t.Run("finished with a target that failed before reporting", func(t *testing.T) {
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Completed),
+			parallelTarget("primary", "testapp-003", so.Failed),
+			converged,
+		}),
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Completed, addNote, 1000),
+			nil,
+			nil,
+		)
+
+		assert.Contains(t, out, "| `testapp-003` | ❌ failed |")
+		assert.NotContains(t, out, "have not reported progress yet", "a failed target is final, not still to report:\n%s", out)
+	})
+
+	t.Run("running", func(t *testing.T) {
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Running),
+			parallelTarget("primary", "testapp-003", so.Pending),
+			converged,
+		}),
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Running, addNote, 500),
+			nil,
+			nil,
+		)
+
+		assert.Contains(t, out, "\n_1 of 4 targets already had this schema; nothing ran there._\n")
+		assert.Contains(t, out, "\n_1 of 4 targets have not reported progress yet._\n", "only the queued target is still to report:\n%s", out)
+	})
+}
