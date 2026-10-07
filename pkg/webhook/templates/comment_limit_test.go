@@ -94,6 +94,42 @@ func TestPlanCommentDDLFillsTheCommentBeforeItIsCut(t *testing.T) {
 	assert.Contains(t, body, "schemabot apply -e production", "the sections after the DDL still render")
 }
 
+// partitionedCreate returns a CREATE TABLE partitioned by day, with one
+// partition definition per day.
+func partitionedCreate(table string, days int) string {
+	definitions := make([]string, 0, days)
+	for day := range days {
+		definitions = append(definitions, fmt.Sprintf("PARTITION `p%04d` VALUES LESS THAN (%d) ENGINE = InnoDB", day, day+1))
+	}
+	return "CREATE TABLE `" + table + "` (`id` bigint NOT NULL, `settlement_day` int NOT NULL, " +
+		"PRIMARY KEY (`id`,`settlement_day`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci " +
+		"PARTITION BY RANGE (`settlement_day`) (" + strings.Join(definitions, ",") + ")"
+}
+
+// Displayed partition definitions take a line each, which makes a heavily
+// partitioned table's DDL longer than its one-line form. The comment still
+// cuts that DDL to the room the rest of the comment leaves, mid-list, with the
+// truncation marker after it.
+func TestPlanCommentCutsWrappedPartitionDefinitionsToFit(t *testing.T) {
+	statements := make([]string, 0, 4)
+	for i := range 4 {
+		statements = append(statements, partitionedCreate(fmt.Sprintf("ledger_entries_%d", i), 365))
+	}
+	body := RenderPlanComment(PlanCommentData{
+		Database:     "ledger",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Changes:      []KeyspaceChangeData{{Keyspace: "ledger_production", Statements: statements}},
+	})
+
+	assert.Equal(t, 1, strings.Count(body, ddlTruncatedMarker))
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Greater(t, len(body), commentBodyLimit-256, "the DDL takes the room the comment leaves")
+	assert.Contains(t, body, "  PARTITION BY RANGE (`settlement_day`) (\n      PARTITION `p0000` VALUES LESS THAN (1) ENGINE = InnoDB,\n")
+	assert.Contains(t, body, "schemabot apply -e production", "the sections after the DDL still render")
+}
+
 // A multi-environment plan shares one DDL budget across its environments, so
 // two large, differing plans render under the limit together instead of each
 // taking a full comment's worth of DDL.

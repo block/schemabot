@@ -18,6 +18,7 @@ import (
 //   - CREATE TABLE statements: each column/index on its own line
 //   - ENUM and SET value lists too long for a line of their own: wrapped
 //     onto indented lines
+//   - partition definition lists: each definition on its own indented line
 //   - Data types, functions, and charset/collate values are lowercased
 //     while SQL keywords remain uppercase (PlanetScale style).
 func FormatDDL(ddl string) string {
@@ -189,28 +190,97 @@ func layoutDDLWithOptions(ddl string, multilineCreate bool) string {
 	case strings.HasPrefix(upperDDL, "CREATE TABLE"):
 		return formatCreateTableWithOptions(ddl, multilineCreate)
 	case strings.HasPrefix(upperDDL, "ALTER TABLE"):
-		clauses := splitAlterClauses(ddl)
-		if len(clauses) <= 1 {
-			return ddl
-		}
-		// Extract table header (ALTER TABLE `name`) from first clause
-		tableEnd := findTableNameEnd(clauses[0])
-		tableHeader := strings.TrimSpace(clauses[0][:tableEnd-1]) // -1 to remove trailing space
-		firstClause := strings.TrimSpace(clauses[0][tableEnd:])
-
-		// Format with header on first line, each clause on its own indented line
-		var sb strings.Builder
-		sb.WriteString(tableHeader)
-		sb.WriteString("\n    ")
-		sb.WriteString(firstClause)
-		for i := 1; i < len(clauses); i++ {
-			sb.WriteString(",\n    ")
-			sb.WriteString(clauses[i])
-		}
-		return sb.String()
+		return formatAlterTable(ddl)
 	default:
 		return ddl
 	}
+}
+
+// formatAlterTable puts the table header of a multi-clause ALTER TABLE on its
+// first line and each clause on an indented line of its own. A trailing
+// partitioning clause, which follows the other clauses with no comma between
+// them, gets a line of its own after them. A statement with one clause, or
+// with only a partitioning clause, stays on one line.
+func formatAlterTable(ddl string) string {
+	body, partitioning := splitAlterPartitioning(ddl)
+	clauses := splitAlterClauses(body)
+	if partitioning == "" && len(clauses) <= 1 {
+		return ddl
+	}
+	// Extract table header (ALTER TABLE `name`) from first clause
+	tableEnd := findTableNameEnd(clauses[0])
+	if tableEnd >= len(clauses[0]) {
+		return ddl
+	}
+	tableHeader := strings.TrimSpace(clauses[0][:tableEnd-1]) // -1 to remove trailing space
+	firstClause := strings.TrimSpace(clauses[0][tableEnd:])
+
+	// Format with header on first line, each clause on its own indented line
+	var sb strings.Builder
+	sb.WriteString(tableHeader)
+	sb.WriteString("\n    ")
+	sb.WriteString(firstClause)
+	for i := 1; i < len(clauses); i++ {
+		sb.WriteString(",\n    ")
+		sb.WriteString(clauses[i])
+	}
+	if partitioning != "" {
+		sb.WriteString("\n    ")
+		sb.WriteString(partitioning)
+	}
+	return sb.String()
+}
+
+// splitAlterPartitioning separates an ALTER TABLE's trailing partitioning
+// clause, PARTITION BY or REMOVE PARTITIONING, from the clauses before it.
+// MySQL's grammar puts that clause after every other one, separated by a
+// space rather than a comma. Parentheses and quoted regions are opaque, so a
+// window function's PARTITION BY or a COMMENT mentioning one is never taken
+// for the clause; an unterminated quote leaves the statement whole.
+func splitAlterPartitioning(ddl string) (body, partitioning string) {
+	depth := 0
+	for i := findTableNameEnd(ddl); i < len(ddl); i++ {
+		c := ddl[i]
+		if isQuote(c) {
+			end, ok := quotedEnd(ddl, i)
+			if !ok {
+				return ddl, ""
+			}
+			i = end - 1
+			continue
+		}
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth != 0 || ddl[i-1] != ' ' || !startsPartitioningClause(ddl[i:]) {
+			continue
+		}
+		body = strings.TrimRight(ddl[:i], " ")
+		if strings.HasSuffix(body, ",") {
+			return ddl, ""
+		}
+		return body, ddl[i:]
+	}
+	return ddl, ""
+}
+
+// startsPartitioningClause reports whether s opens a PARTITION BY or REMOVE
+// PARTITIONING clause.
+func startsPartitioningClause(s string) bool {
+	return startsWithKeyword(s, "PARTITION BY") || startsWithKeyword(s, "REMOVE PARTITIONING")
+}
+
+// startsWithKeyword reports whether s opens with keyword, case-insensitively,
+// followed by the end of the statement or a character that cannot continue
+// the keyword.
+func startsWithKeyword(s, keyword string) bool {
+	if len(s) < len(keyword) || !strings.EqualFold(s[:len(keyword)], keyword) {
+		return false
+	}
+	return len(s) == len(keyword) || !isIdentifierByte(s[len(keyword)])
 }
 
 // FormatDDLForDialect formats a DDL statement for display under the dialect's
@@ -223,9 +293,10 @@ func layoutDDLWithOptions(ddl string, multilineCreate bool) string {
 // registered parser (logged, since it means a database type reached the
 // display layer without a parser) — renders unformatted, with only
 // surrounding whitespace trimmed and a trailing semicolon enforced. Value
-// lists too long for a line of their own wrap onto indented lines; the
-// wrapping is kept only when the dialect's parser reads the wrapped statement
-// as the same SQL. Display transformations preserve quoted names and values,
+// lists too long for a line of their own wrap onto indented lines, and a
+// MySQL partition definition list puts each definition on a line of its own;
+// each wrapping is kept only when the dialect's parser reads the wrapped
+// statement as the same SQL. Display transformations preserve quoted names and values,
 // and unknown dialects emit
 // only a debug diagnostic so interactive prompts remain readable.
 func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
@@ -240,15 +311,99 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 		slog.Debug("DDL display normalization changed the statement; preserving original SQL", "dialect", dialect)
 		return raw
 	}
-	wrapped := wrapLongValueLists(formatted, valueListPatternFor(dialect))
+	if dialect == schema.DialectMySQL {
+		formatted = keepEquivalentWrap(dialect, parser, formatted, wrapPartitionDefinitions(formatted), "partition-definition")
+	}
+	return keepEquivalentWrap(dialect, parser, formatted, wrapLongValueLists(formatted, valueListPatternFor(dialect)), "value-list")
+}
+
+// keepEquivalentWrap returns wrapped when the dialect's parser reads it as the
+// same statement as formatted, and formatted otherwise. kind names the
+// wrapping in the diagnostic logged when it is discarded.
+func keepEquivalentWrap(dialect schema.Dialect, parser StatementParser, formatted, wrapped, kind string) string {
 	if wrapped == formatted {
 		return formatted
 	}
 	if parser.Canonicalize(wrapped) != parser.Canonicalize(formatted) {
-		slog.Debug("DDL display value-list wrapping changed the statement; preserving unwrapped SQL", "dialect", dialect)
+		slog.Debug("DDL display wrapping changed the statement; preserving unwrapped SQL", "dialect", dialect, "wrapping", kind)
 		return formatted
 	}
 	return wrapped
+}
+
+// wrapPartitionDefinitions puts each definition of a MySQL partition
+// definition list on an indented line of its own, with the closing
+// parenthesis back at the line's own indentation:
+//
+//	PARTITION BY RANGE COLUMNS (`created_on`) (
+//	    PARTITION `p2024` VALUES LESS THAN ('2025-01-01'),
+//	    PARTITION `future` VALUES LESS THAN (MAXVALUE)
+//	)
+//
+// That covers the list after PARTITION BY and the new partitions of ADD
+// PARTITION and REORGANIZE PARTITION ... INTO. A list of one definition stays
+// inline unless its line is too long to read. A partition's own subpartition
+// list stays on its definition's line.
+//
+// The scan works on the canonical text rather than the parser's partition
+// definitions because canonical ALTER TABLE text comes from Spirit's
+// normalized clause string, which does not expose them. It only inserts
+// whitespace at commas between definitions, and FormatDDLForDialect keeps
+// the result only when the parser reads it as the same statement.
+func wrapPartitionDefinitions(ddl string) string {
+	lines := strings.Split(ddl, "\n")
+	for i, line := range lines {
+		lines[i] = wrapLinePartitionDefinitions(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// wrapLinePartitionDefinitions wraps the partition definition lists on one
+// line of a statement. MySQL reserves PARTITION, so outside a quoted region
+// a parenthesis followed by it can only open a definition list.
+func wrapLinePartitionDefinitions(line string) string {
+	indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+	innerIndent := indent + "    "
+
+	var sb strings.Builder
+	start := 0
+	for i := 0; i < len(line); i++ {
+		if isQuote(line[i]) {
+			end, ok := quotedEnd(line, i)
+			if !ok {
+				return line
+			}
+			i = end - 1
+			continue
+		}
+		if line[i] != '(' || !startsWithKeyword(line[i+1:], "PARTITION") {
+			continue
+		}
+		closeParen := findMatchingParen(line, i)
+		if closeParen == -1 {
+			return line
+		}
+		definitions := splitByComma(line[i+1 : closeParen])
+		if len(definitions) == 1 && len(line) <= valueListWrapWidth {
+			i = closeParen
+			continue
+		}
+		sb.WriteString(line[start : i+1])
+		sb.WriteString("\n")
+		for j, definition := range definitions {
+			sb.WriteString(innerIndent)
+			sb.WriteString(strings.TrimSpace(definition))
+			if j < len(definitions)-1 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(indent)
+		start = closeParen
+		i = closeParen
+	}
+	sb.WriteString(line[start:])
+	return sb.String()
 }
 
 // valueListWrapWidth is the line width a displayed statement's value lists
