@@ -2612,8 +2612,7 @@ func buildApplyOperationGroups(
 				// could never run. It is recorded as the settled work it is, as
 				// the other shapes record it; the primary plan has finalizer
 				// work, so the apply keeps a drivable operation.
-				operation.State = state.ApplyOperation.Completed
-				operation.CompletedAt = &now
+				settleAlreadyConverged(operation, now)
 			}
 			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
 		}
@@ -2680,13 +2679,21 @@ func settleConvergedMemberOperations(groups []*storage.ApplyOperationWithTasks, 
 		if len(group.Tasks) > 0 {
 			continue
 		}
-		// Completed, but never started: no driver claimed it and nothing ran on
-		// its target. Leaving StartedAt unset is what distinguishes it from an
-		// apply that ran and finished instantly, and keeps it out of the
-		// earliest-start calculation the apply's progress summary makes.
-		group.Operation.State = state.ApplyOperation.Completed
-		group.Operation.CompletedAt = &now
+		settleAlreadyConverged(group.Operation, now)
 	}
+}
+
+// settleAlreadyConverged records an operation as the completed work of a target
+// that already held the change, so nothing runs there. It is completed but never
+// started: no driver claims it and nothing runs on its target. Leaving StartedAt
+// unset keeps it out of the earliest-start calculation the apply's progress
+// summary makes. The AlreadyConverged mark is what tells it apart from an
+// operation a reaper settled to its parent's outcome, which is completed and
+// never started too but says nothing about its target's schema.
+func settleAlreadyConverged(op *storage.ApplyOperation, now time.Time) {
+	op.State = state.ApplyOperation.Completed
+	op.CompletedAt = &now
+	op.AlreadyConverged = true
 }
 
 // memberAlreadyConverged reports whether a member runs a plan of its own that
@@ -2900,8 +2907,7 @@ func buildShardedApplyOperationGroups(
 				return nil, err
 			}
 			operation := newPendingApplyOperation(member, applyPlan, operationKey, cutoverPolicy, onFailure, now)
-			operation.State = state.ApplyOperation.Completed
-			operation.CompletedAt = &now
+			settleAlreadyConverged(operation, now)
 			groups = append(groups, &storage.ApplyOperationWithTasks{Operation: operation})
 			continue
 		}

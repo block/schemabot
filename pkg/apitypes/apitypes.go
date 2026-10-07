@@ -1750,8 +1750,12 @@ type ProgressOperationResponse struct {
 	OnFailure    string `json:"on_failure,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	CompletedAt  string `json:"completed_at,omitempty"`
+	// AlreadyConverged is true for an operation recorded completed when the
+	// apply was created, because its target already held the change and
+	// nothing ran there.
+	AlreadyConverged bool   `json:"already_converged,omitempty"`
+	StartedAt        string `json:"started_at,omitempty"`
+	CompletedAt      string `json:"completed_at,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.

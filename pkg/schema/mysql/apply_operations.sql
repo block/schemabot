@@ -16,6 +16,7 @@ CREATE TABLE `apply_operations` (
   `cutover_policy` varchar(16) NOT NULL DEFAULT 'rolling',
   `on_failure` varchar(16) NOT NULL DEFAULT 'halt',
   `attempt` int NOT NULL DEFAULT '0',
+  `already_converged` tinyint(1) NOT NULL DEFAULT '0',
   `lease_owner` varchar(255) NOT NULL DEFAULT '',
   `lease_token` varchar(64) NOT NULL DEFAULT '',
   `lease_acquired_at` datetime DEFAULT NULL,

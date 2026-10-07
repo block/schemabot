@@ -476,7 +476,7 @@ func multiDeploymentTUITestProgress() apitypes.ProgressResponse {
 		Database:    "orders",
 		Environment: "production",
 		Operations: []*apitypes.ProgressOperationResponse{
-			{Deployment: "us-east", ExternalID: "remote-apply-us-east-test", ExternalOperationID: "remote-op-us-east-test", Target: "orders-us-east", State: state.ApplyOperation.Completed, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+			{Deployment: "us-east", ExternalID: "remote-apply-us-east-test", ExternalOperationID: "remote-op-us-east-test", Target: "orders-us-east", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 			{Deployment: "eu-west", Target: "orders-eu-west", State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt, ErrorMessage: "duplicate key name 'idx_orders_source'"},
 			{Deployment: "ap-south", Target: "orders-ap-south", State: state.ApplyOperation.Pending, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 		},
@@ -828,7 +828,7 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	m.state = state.Apply.Running
 	m.initialized = true
 	m.operations = []templates.ProgressOperation{
-		{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Completed, StartedAt: "2026-09-30T12:00:00Z", CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+		{Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 		{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 	}
 	m.tables = []templates.TableProgress{

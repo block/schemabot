@@ -2848,6 +2848,7 @@ func PreviewCommentMultiTargetApplySummaryAlreadyHadIt() string {
 		op := presentation.Operation{Deployment: "us", Target: target, State: state.ApplyOperation.Completed, Parallel: true, ContinueOnFailure: true}
 		if i == 3 {
 			op.NeverStarted = true
+			op.AlreadyConverged = true
 			ops = append(ops, op)
 			details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, nil))
 			continue

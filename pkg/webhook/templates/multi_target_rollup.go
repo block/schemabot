@@ -64,10 +64,8 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	if converged := alreadyAppliedTargets(data, g); converged > 0 {
 		fmt.Fprintf(sb, "_%d of %d targets already had this schema; nothing ran there._\n", converged, len(g.Members))
 	}
-	// A terminal apply has a final outcome for every target, so none of them
-	// is still to report.
-	if len(work) > 0 && silent > 0 && !state.IsTerminalApplyState(data.Model.State) {
-		fmt.Fprintf(sb, "_%d of %d targets have not reported progress yet._\n", silent, len(g.Members))
+	if waiting := targetsStillToReport(data, g); len(work) > 0 && waiting > 0 {
+		fmt.Fprintf(sb, "_%d of %d targets have not reported progress yet._\n", waiting, len(g.Members))
 	}
 	writeFailedTargets(sb, data.Model, g)
 }
@@ -91,6 +89,23 @@ func unreportedTargets(data MultiDeploymentApplyData, g presentation.Group) int 
 	n := 0
 	for _, i := range g.Members {
 		if data.Model.Deployments[i].AlreadyApplied() {
+			continue
+		}
+		if detail := memberDetail(data.Details, i); detail == nil || len(detail.Tables) == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// targetsStillToReport counts the unreported targets whose own outcome can
+// still change. A settled target has its final outcome whether or not it
+// reported tables, so it is not waiting. A stopped one is: it reports once the
+// apply resumes.
+func targetsStillToReport(data MultiDeploymentApplyData, g presentation.Group) int {
+	n := 0
+	for _, i := range g.Members {
+		if state.IsState(data.Model.Deployments[i].State, state.SettledApplyStates...) {
 			continue
 		}
 		if detail := memberDetail(data.Details, i); detail == nil || len(detail.Tables) == 0 {

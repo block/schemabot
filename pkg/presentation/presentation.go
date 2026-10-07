@@ -56,6 +56,10 @@ type Operation struct {
 	Finalizer    bool
 	NeverStarted bool
 
+	// AlreadyConverged carries the stored row's mark that its target already
+	// held the change when the apply was created, so nothing ran there.
+	AlreadyConverged bool
+
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
 	// by the caller from storage.CutoverPolicyBarrier). Under barrier an earlier
 	// sibling stops blocking a later copy once it reaches the cutover barrier or
@@ -196,6 +200,10 @@ type Deployment struct {
 
 	// NeverStarted is whether no driver ever claimed the member's operation.
 	NeverStarted bool
+
+	// AlreadyConverged is whether the member's operation was recorded as a
+	// target that already held the change when the apply was created.
+	AlreadyConverged bool
 }
 
 // NextActionKind is the semantic operator action the aggregate suggests. The
@@ -443,6 +451,7 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	d := Deployment{
 		Deployment: op.Deployment, Target: op.Target, Name: names[i], State: op.State, Error: op.Error,
 		ExternalID: op.ExternalID, ExternalOperationID: op.ExternalOperationID, NeverStarted: op.NeverStarted,
+		AlreadyConverged: op.AlreadyConverged,
 	}
 
 	switch op.State {
@@ -789,11 +798,12 @@ func firstWithPresentation(deps []Deployment, ps PresentationState) (Deployment,
 }
 
 // AlreadyApplied reports whether the member's target already held the change
-// when the apply was created: its operation was recorded completed without a
-// driver ever starting it, which is how an apply settles a target with nothing
-// left to run.
+// when the apply was created, so nothing ran there. It reads the stored mark the
+// apply records, never a missing start: an operation a reaper settled to its
+// parent's outcome is completed without a start too, and its target may never
+// have received the change.
 func (d Deployment) AlreadyApplied() bool {
-	return state.IsState(d.State, state.ApplyOperation.Completed) && d.NeverStarted
+	return state.IsState(d.State, state.ApplyOperation.Completed) && d.AlreadyConverged
 }
 
 func (d *Deployment) set(ps PresentationState, label, emoji string, open bool) {

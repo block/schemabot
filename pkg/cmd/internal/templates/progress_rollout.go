@@ -103,7 +103,9 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 			switch {
 			case d.AlreadyApplied():
 				converged++
-			case !state.IsApplyOperationTerminal(d.State):
+			// A settled target has its final outcome whether or not it
+			// reported tables. A stopped one reports once the apply resumes.
+			case !state.IsState(d.State, state.SettledApplyStates...):
 				silent++
 			}
 			continue

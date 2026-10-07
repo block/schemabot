@@ -1451,11 +1451,15 @@ func TestRenderMultiDeploymentApplySummaryComment_MemberSectionNamesItsPlan(t *t
 // A target that already held the change is settled completed without a driver
 // ever starting it, so it ran nothing and reports no table progress. The
 // deployment counts it as already having the change, says so once, and never
-// counts it among the targets still to report. A finished apply has a final
-// outcome for every target, so it says nothing is still to report.
+// counts it among the targets still to report. A settled target has its final
+// outcome, so it is never still to report; a stopped one is, because it
+// reports once the apply resumes. A target settled without starting but not
+// marked as already holding the change, as a reaper settles one to its apply's
+// outcome, counts as completed.
 func TestRenderMultiDeploymentApplyComment_TargetThatAlreadyHadTheChangeIsNotWaiting(t *testing.T) {
 	converged := parallelTarget("primary", "testapp-004", so.Completed)
 	converged.NeverStarted = true
+	converged.AlreadyConverged = true
 
 	t.Run("finished", func(t *testing.T) {
 		out := renderTargets(presentation.Derive([]presentation.Operation{
@@ -1508,5 +1512,44 @@ func TestRenderMultiDeploymentApplyComment_TargetThatAlreadyHadTheChangeIsNotWai
 
 		assert.Contains(t, out, "\n_1 of 4 targets already had this schema; nothing ran there._\n")
 		assert.Contains(t, out, "\n_1 of 4 targets have not reported progress yet._\n", "only the queued target is still to report:\n%s", out)
+	})
+
+	t.Run("stopped", func(t *testing.T) {
+		caught := parallelTarget("primary", "testapp-003", so.Stopped)
+		caught.NeverStarted = true
+		model := presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Stopped),
+			caught,
+			converged,
+		})
+		require.Equal(t, state.Apply.Stopped, model.State)
+		out := renderTargets(model,
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Stopped, addNote, 500),
+			nil,
+			nil,
+		)
+
+		assert.Contains(t, out, "\n_1 of 4 targets have not reported progress yet._\n", "a stopped target reports once the apply resumes:\n%s", out)
+	})
+
+	t.Run("settled without starting", func(t *testing.T) {
+		reaped := parallelTarget("primary", "testapp-004", so.Completed)
+		reaped.NeverStarted = true
+		out := renderTargets(presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Completed),
+			parallelTarget("primary", "testapp-003", so.Completed),
+			reaped,
+		}),
+			targetDetail("testapp_001", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_002", state.Task.Completed, addNote, 1000),
+			targetDetail("testapp_003", state.Task.Completed, addNote, 1000),
+			nil,
+		)
+
+		assert.Contains(t, out, "<summary>✅ primary — 4 completed (4 targets)</summary>")
+		assert.NotContains(t, out, "already had", "a target settled without the mark is not one that already had the change:\n%s", out)
 	})
 }

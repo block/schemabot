@@ -696,7 +696,8 @@ Response excerpt (illustrative values):
   "state": "running",
   "operations": [
     {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling"},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "rolling"}
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "rolling"},
+    {"deployment": "commerce-a", "target": "shop-003", "state": "completed", "cutover_policy": "rolling", "already_converged": true}
   ],
   "tables": [
     {
@@ -726,6 +727,12 @@ Response excerpt (illustrative values):
 Both rows report the same table under the same deployment; `target` names
 which member owns each copy. Each row's `estimated_bytes` is that target's own
 copy of the table.
+
+`already_converged` marks an operation the apply recorded completed when it was
+created, because its target already had the change: nothing ran there, so it
+has no table rows and no `started_at`. A missing `started_at` alone does not
+mean that: an operation can also be settled to its apply's outcome without ever
+starting, and its target may not have the change.
 
 </details>
 

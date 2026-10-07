@@ -20,13 +20,6 @@ func runningApply() *storage.Apply {
 	}
 }
 
-// operationStartedAt is when a driver started a fixture operation. A completed
-// operation without a start already held the change when the apply was created.
-func operationStartedAt() *time.Time {
-	started := time.Date(2026, 10, 7, 7, 0, 0, 0, time.UTC)
-	return &started
-}
-
 // An apply with no operation rows (legacy, predating apply_operations) renders
 // the single-deployment comment unchanged — no aggregate header.
 func TestFormatApplyStatusComment_NoOperationsRendersSingle(t *testing.T) {
@@ -50,7 +43,7 @@ func TestFormatApplyStatusComment_OneOperationRendersSingle(t *testing.T) {
 // the per-status count line, and a per-deployment summary in resolved order.
 func TestFormatApplyStatusComment_MultipleOperationsRendersMulti(t *testing.T) {
 	ops := []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt(), CutoverPolicy: storage.CutoverPolicyBarrier},
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyBarrier},
 		{ID: 2, Deployment: "us", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyBarrier},
 	}
 	out := formatApplyStatusComment(runningApply(), ops, false, nil, nil, nil, nil, "", "")
@@ -117,7 +110,7 @@ func TestFormatApplySummaryComment_NoOperationsRendersSingle(t *testing.T) {
 // summary — the multi-deployment hierarchy only appears with more than one.
 func TestFormatApplySummaryComment_OneOperationRendersSingle(t *testing.T) {
 	ops := []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
 	}
 	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil, nil, "", "")
 	assert.NotContains(t, out, "**Deployments**:")
@@ -129,8 +122,8 @@ func TestFormatApplySummaryComment_OneOperationRendersSingle(t *testing.T) {
 // order.
 func TestFormatApplySummaryComment_MultipleOperationsRendersMulti(t *testing.T) {
 	ops := []*storage.ApplyOperation{
-		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
-		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed, StartedAt: operationStartedAt()},
+		{ID: 1, Deployment: "eu", State: state.ApplyOperation.Completed},
+		{ID: 2, Deployment: "us", State: state.ApplyOperation.Completed},
 	}
 	out := formatApplySummaryComment(completedApply(), ops, false, nil, nil, nil, nil, "", "")
 	assert.Contains(t, out, "## ✅ Schema Change Applied")

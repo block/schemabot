@@ -30,6 +30,12 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 				StartedAt:           "2026-06-16T10:00:00Z",
 				CompletedAt:         "2026-06-16T10:05:00Z",
 			},
+			{
+				Deployment:       "deploy-a",
+				Target:           "target-b",
+				State:            "STATE_COMPLETED",
+				AlreadyConverged: true,
+			},
 		},
 		Tables: []*apitypes.TableProgressResponse{
 			{
@@ -45,7 +51,9 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 
 	data := ParseProgressResponse(result)
 
-	require.Len(t, data.Operations, 1)
+	require.Len(t, data.Operations, 2)
+	assert.False(t, data.Operations[0].AlreadyConverged)
+	assert.True(t, data.Operations[1].AlreadyConverged, "the target that already had the change keeps its mark")
 	assert.Equal(t, "deploy-a", data.Operations[0].Deployment)
 	assert.Equal(t, "commerce/-80/users", data.Operations[0].OperationKey)
 	assert.Equal(t, "remote-apply-a", data.Operations[0].ExternalID)
