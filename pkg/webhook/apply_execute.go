@@ -189,6 +189,26 @@ func (h *Handler) executeApply(
 				"SchemaBot could not verify the plans this apply covers, so nothing was applied. Retry the command, and see server logs if it persists.")
 			return
 		}
+		// Work the apply cannot run is refused before anything else, releasing
+		// the lock, whether or not the comment showed it: a copy can appear on
+		// a target after the comment was posted, a fresh confirmation could
+		// never run it, and apply creation would refuse it with the lock still
+		// pinned.
+		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
+		if refusalErr != nil {
+			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
+				"could not verify that the other targets' plans can run from this apply", refusalErr,
+				"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+			return
+		}
+		if refusal != "" {
+			h.logger.Info("apply refused: the other targets' work cannot run from this apply",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", refusal)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
+			return
+		}
 		if !covered && storedPlan != nil {
 			// The apply command posted every target's plan moments ago, and a
 			// target's schema changed before this re-plan. As with a primary
@@ -220,22 +240,6 @@ func (h *Handler) executeApply(
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
 			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
-			return
-		}
-		// The statements match the reviewed round's, but a copy can appear on
-		// a target after the comment was posted, and work the apply cannot run
-		// is refused here, releasing the lock, rather than at apply creation,
-		// which would leave it pinned.
-		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
-		if refusalErr != nil {
-			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
-				"could not verify that the other targets' plans can run from this apply", refusalErr,
-				otherTargetPlansUnverifiedMessage(actionName, environment))
-			return
-		}
-		if refusal != "" {
-			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
-			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return
 		}
 		confirmedMemberWork = true

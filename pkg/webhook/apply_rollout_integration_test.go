@@ -1538,6 +1538,47 @@ func TestE2EConvergedPrimaryRefusesToDiscardAnotherTargetsCopy(t *testing.T) {
 	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the check keeps blocking merge")
 }
 
+// The primary target (eu) already has the column and us does not, so the
+// apply command posts us's plan and runs it in the same step. Between that
+// comment and the re-plan the apply runs from, us gains a narrower `email`
+// column and an unfinished copy of `users` made for a different statement.
+// us's plan changed, but a fresh confirmation could never run it, since it
+// would discard the copy, so the apply refuses rather than asking: it runs
+// nothing, releases its lock, leaves the copy in place, and offers no
+// apply-confirm.
+func TestE2EApplyRefusesRatherThanAskingWhenAnotherTargetsChangedPlanCannotRun(t *testing.T) {
+	dbName := "webhook_rollout_member_changed_copy"
+	var hooked *afterLockStorage
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		hooked = &afterLockStorage{Storage: st}
+		return hooked
+	})
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	us := openDriftDB(t, driftDSN(t, dbName+"_us"))
+	hooked.onAcquire = func(*storage.Lock) {
+		_, err := us.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
+		require.NoError(t, err)
+		seedUsersCopy(t, dbName+"_us")
+	}
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "nothing was applied")
+	assert.Contains(t, body, "target us: applying its plan discards the unfinished copy of users")
+	assert.NotContains(t, body, "Confirmation required")
+	assert.NotContains(t, body, "schemabot apply-confirm", "a refused apply offers no confirmation")
+
+	requireNoApplies(t, svc, dbName)
+	requireNoApplyLock(t, svc, dbName)
+	requireUsersCopyIntact(t, dbName+"_us")
+	check := rolloutCheck(t, svc, dbName)
+	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the check keeps blocking merge")
+}
+
 // The primary target (eu) already has the column and us does not, and a
 // pending confirmation pins a round that showed us's plan. Before the operator confirms,
 // an unfinished copy of `users` made for a different statement appears on us.

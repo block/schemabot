@@ -966,18 +966,21 @@ shows each target's plan as it is now.
 The apply is refused instead, with nothing run and the record left
 `action_required` (or `failure` for drift), when a target could not be
 confirmed, when the comment cannot render every target's plan, or when a
-target's plan carries work that comment cannot disclose for confirmation. That
-is a change its engine refuses, an unfinished copy it would discard, work the
-apply's operation shape has no place for, or an unsafe change the primary target's plan
-does not carry. An unsafe change the primary target's plan carries too, in the same
-statement up to its schema qualifier, runs under `--allow-unsafe` like the
-primary target's own. When the primary target is already at the desired schema, any
-unsafe, per-shard or finalizer change on another target is refused, since the
-primary target's plan discloses none. A target's direct-execution change is not
-refused: the comment discloses it under that target, and the apply runs it
-there as native DDL that blocks writes to the table until it finishes. It runs
-only from a pull request apply; an apply created any other way, such as a
-`POST /api/apply` of the primary target's plan, refuses it. A target whose data plane
+target's plan carries work the apply cannot run as planned. That is a change
+its engine refuses, an unfinished copy it would discard, or work the apply's
+operation shape has no place for. When the primary target is already at the
+desired schema, that includes any per-shard or finalizer change on another
+target. These refusals come before the pause for a fresh confirmation, so an
+apply never asks for a confirmation that could not run. An unsafe change on
+another target is not refused: the comment discloses it under that target, and
+it runs under `--allow-unsafe` like the primary target's own, whether or not the
+primary target has work. A target's direct-execution change is not refused
+either: the comment discloses it under that target, and the apply runs it
+there as native DDL that blocks writes to the table until it finishes. An
+apply created any other way, such as a
+`POST /api/apply` of the primary target's plan, refuses another target's
+direct-execution change, and its unsafe changes unless the primary target's
+plan carries the same statement up to its schema qualifier. A target whose data plane
 could not say whether it holds an unfinished copy, because it does not look or
 its lookup failed, is refused the same way. The plan comment offers no apply
 for a rollout it knows would be refused, and says why in its place.
