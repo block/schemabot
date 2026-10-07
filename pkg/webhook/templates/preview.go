@@ -1437,8 +1437,8 @@ func PreviewCommentReviewRequiredNoOperators() string {
 }
 
 // PreviewCommentReviewRequiredStaleApproval renders the "review required"
-// comment when an authorized reviewer approved an earlier commit and schema
-// files changed after it, so that approval no longer counts.
+// comment when an authorized reviewer approved an earlier commit and the PR's
+// schema change differs at the head, so that approval no longer counts.
 func PreviewCommentReviewRequiredStaleApproval() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:          "testapp",
@@ -1447,7 +1447,7 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		OperatorReviewers: []string{"acme/testapp-operators"},
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
-		StaleApprovers:    []string{"jdoe"},
+		ChangedApprovers:  []string{"jdoe"},
 	})
 }
 
@@ -1458,6 +1458,21 @@ func PreviewCommentReviewGateError() string {
 		Environment: "staging",
 		CommandName: action.Apply,
 		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+	})
+}
+
+// PreviewCommentReviewGateErrorApprovalNotComparable renders the review gate
+// error comment when an approval on an earlier commit cannot be compared with
+// the head, so it does not count and the apply is blocked (fail-closed).
+func PreviewCommentReviewGateErrorApprovalNotComparable() string {
+	return RenderReviewGateError(ReviewGateData{
+		Database:            "testapp",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		OperatorReviewers:   []string{"acme/testapp-operators"},
+		OtherReviewers:      []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:            previewRequestedBy,
+		UncomparedApprovers: []string{"jdoe"},
 	})
 }
 

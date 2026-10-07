@@ -4085,7 +4085,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 Schema changes require approval from an authorized reviewer before applying.
 
-Approvals on an earlier commit no longer count, because schema files changed since then or SchemaBot could not confirm they did not: @jdoe. Ask for an approval of the latest commit.
+Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Ask for an approval of the latest commit.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4114,6 +4114,31 @@ Approvals on an earlier commit no longer count, because schema files changed sin
 
 > Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 <!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-gate-error-approval-not-comparable"></a><strong>Apply Blocked: Review Gate Error (Approval Not Comparable)</strong></summary>
+
+
+## ❌ Review Gate Error
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Ask anyone listed above to approve the latest commit
+2. Once approved, run `schemabot apply -e staging` again
 
 </details>
 

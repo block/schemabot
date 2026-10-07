@@ -308,6 +308,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: REVIEW REQUIRED (NO OPERATORS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredNoOperators()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApproval()) }},
 		{"APPLY BLOCKED: REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
+		{"APPLY BLOCKED: REVIEW GATE ERROR (APPROVAL NOT COMPARABLE)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateErrorApprovalNotComparable()) }},
 		{"APPLY BLOCKED: CHECKS NOT PASSING", func() {
 			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
 				{Name: "CI / unit-tests", State: "failure"},
