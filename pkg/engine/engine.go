@@ -73,17 +73,19 @@ type Engine interface {
 // schema change's goroutine has fully exited (releasing DB connections) before
 // checking whether the next table still needs changes.
 type Drainer interface {
-	// Drain waits for any in-flight background work to complete and clears it.
-	Drain()
+	// DrainContext waits for any in-flight background work to complete and
+	// clears it. When ctx ends first it returns an error and leaves the work
+	// tracked.
+	DrainContext(ctx context.Context) error
 }
 
 // ShutdownHalter is an optional capability for engines whose schema change work
 // runs inside this process. Such an engine holds resources on the target — for
 // Spirit, an advisory lock on the table it is copying — for exactly as long as
 // its in-process work lives, and that work outlives the drive that started it.
-// Without a way to bring it down, a shutting-down process stops renewing the
-// apply's lease while still holding the target, and peer drivers reclaim work
-// they cannot execute.
+// Without a way to bring it down, a process that stops renewing the apply's
+// lease, because it is shutting down or because its drive was displaced, keeps
+// holding the target, and peer drivers reclaim work they cannot execute.
 //
 // An engine whose work runs elsewhere (a remote online-DDL service) must not
 // implement this: its schema change is unaffected by this process going away,
@@ -94,8 +96,25 @@ type ShutdownHalter interface {
 	// no longer holds the target's resources. It is not an operator stop: it
 	// records no operator intent and leaves the apply active for reclaim.
 	// It returns an error if the work has not come down by the time ctx expires,
-	// so a caller can report that the target may still be held.
+	// so a caller can report that the target may still be held. Work that has
+	// already ended leaves nothing to halt.
 	HaltForShutdown(ctx context.Context) error
+}
+
+// OwnedWorkHalter is an optional capability, alongside ShutdownHalter, for an
+// engine that can halt one drive's in-process work without touching another's.
+// A drive that hands its apply back halts through it, so its run does not keep
+// holding the target under nobody's claim.
+//
+// It is separate from ShutdownHalter so an engine that only halts for shutdown
+// keeps that halt. Such an engine's drives hand the apply back without halting
+// anything, as they did before this capability existed.
+type OwnedWorkHalter interface {
+	// HaltWorkOwnedBy halts like HaltForShutdown, but only the work started
+	// under owner (see WithWorkOwner). One engine serves every drive of a
+	// target in this process, so the drive that hands an apply back must not
+	// bring down the run a later drive has already started in its place.
+	HaltWorkOwnedBy(ctx context.Context, owner string) error
 }
 
 // HaltEngineForShutdown brings eng's in-process schema change work down when it
@@ -108,6 +127,33 @@ func HaltEngineForShutdown(ctx context.Context, eng Engine) (supported bool, err
 		return false, nil
 	}
 	return true, halter.HaltForShutdown(ctx)
+}
+
+// HaltEngineWorkOwnedBy halts the work eng started under owner when eng
+// implements OwnedWorkHalter, and reports whether it does.
+func HaltEngineWorkOwnedBy(ctx context.Context, eng Engine, owner string) (supported bool, err error) {
+	halter, ok := eng.(OwnedWorkHalter)
+	if !ok {
+		return false, nil
+	}
+	return true, halter.HaltWorkOwnedBy(ctx, owner)
+}
+
+type workOwnerContextKey struct{}
+
+// WithWorkOwner names the owner of the engine work started under ctx. An
+// engine that runs its work in this process records the owner on the work
+// when it accepts an Apply or a Start, and HaltWorkOwnedBy halts by it. Work
+// started with no owner belongs to the empty owner.
+func WithWorkOwner(ctx context.Context, owner string) context.Context {
+	return context.WithValue(ctx, workOwnerContextKey{}, owner)
+}
+
+// WorkOwnerFromContext returns the owner WithWorkOwner attached to ctx, or
+// the empty owner.
+func WorkOwnerFromContext(ctx context.Context) string {
+	owner, _ := ctx.Value(workOwnerContextKey{}).(string)
+	return owner
 }
 
 // DeferredCutoverSignalChecker is an optional capability for engines that can
@@ -874,6 +920,12 @@ type ApplyRequest struct {
 	ResumeState  *ResumeState       // Fresh context or full resume state after restart
 	Credentials  *Credentials       // Resolved credentials (from discovery)
 
+	// IgnoreTables lists the live tables the plan was reviewed under the
+	// ignore_tables config withholding (see PlanRequest.IgnoreTables). An engine
+	// that compares a target's live schema against SchemaFiles during apply
+	// leaves these tables out of the comparison, as the plan did.
+	IgnoreTables []string
+
 	// Logger is an optional logger scoped to this schema change, already bound with
 	// the caller's triage identity (apply id, repo, PR, environment). Engines
 	// use it for every log line about this schema change so engine lines stay
@@ -886,7 +938,9 @@ type ApplyRequest struct {
 	// This enables crash recovery: if the driver dies mid-Apply, the tern layer can
 	// resume from the last persisted state instead of starting over.
 	// Nil means no persistence (state is only returned at the end of Apply).
-	OnStateChange func(state *ResumeState)
+	// The returned error reports whether the state was durably saved, so an
+	// engine never relies on a record that did not land.
+	OnStateChange func(state *ResumeState) error
 
 	// OnEvent is called by the engine to emit structured lifecycle events during Apply.
 	// These events are recorded in apply_logs so operators can see intermediate progress
@@ -955,6 +1009,12 @@ type ProgressResult struct {
 	// scratch, so preserved progress can be told apart from a fresh restart.
 	// False for engines without checkpoint resume.
 	ResumedFromCheckpoint bool
+
+	// TargetHeld reports that a failed result is the engine being refused the
+	// target because another run holds it (ErrTargetHeld), not the schema
+	// change failing. The drive waits for the holder instead of recording a
+	// failure.
+	TargetHeld bool
 
 	// Metadata carries engine-specific display fields for the progress response
 	// (e.g. PlanetScale branch_name, deploy_request_url, is_instant). It lets the

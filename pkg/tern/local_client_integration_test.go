@@ -479,8 +479,9 @@ func (e *stagedGroupedResumeEngine) Progress(_ context.Context, req *engine.Prog
 	return &engine.ProgressResult{State: engine.StateCompleted}, nil
 }
 
-func (e *stagedGroupedResumeEngine) Drain() {
+func (e *stagedGroupedResumeEngine) DrainContext(context.Context) error {
 	e.drainCount++
+	return nil
 }
 
 func (e *stagedGroupedResumeEngine) DeferredCutoverSignalExists(ctx context.Context, req *engine.DeferredCutoverSignalRequest) (bool, error) {

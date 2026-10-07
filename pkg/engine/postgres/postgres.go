@@ -107,6 +107,8 @@ type trackedApply struct {
 	// operator's.
 	cancelsInFlight int
 	done            chan struct{}
+	// owner is the drive the apply was started for (engine.WithWorkOwner).
+	owner string
 }
 
 type buildTracker interface {
@@ -333,7 +335,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			result.ExemptTables = append(result.ExemptTables, &engine.ExemptTables{
 				Namespace: namespace,
 				Tables:    exempt,
-				Reason:    "archive naming",
+				Reason:    exemptReasonArchiveNaming,
 			})
 		}
 		if exemption := ignored.Exemption(namespace, withheld); exemption != nil {
@@ -343,7 +345,7 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 			// Only a namespace with changes needs a rollback baseline, so
 			// the render is paid once per changed namespace rather than for
 			// every namespace the schema files declare.
-			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace)
+			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
 			if err != nil {
 				return nil, err
 			}
@@ -379,7 +381,9 @@ func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
 
 // captureOriginalFiles renders the live namespace as the plan's rollback
 // baseline, keyed by schema file name. The baseline is every managed table
-// in the namespace except the archive tables the plan exempts, so it is
+// in the namespace except ignored tables and undeclared archives. Declared
+// archives keep their originals. Exclusions are applied before introspection,
+// so only tables the forward plan manages decide capture completeness. It is
 // complete or it is nothing, and the two ways it can fall short end
 // differently. A table the engine read but pg-sprite's renderer refuses —
 // each shape it refuses is named by one of its ErrUnrenderable errors,
@@ -398,8 +402,8 @@ func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
 // not, so its cost grows with the namespace rather than with the change; the
 // introspections run concurrently within the pool's ceiling, so the wall
 // time grows more slowly than the table count does.
-func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string) (files map[string]string, captured bool, err error) {
-	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, namespace, rollbackBaseline)
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, captured bool, err error) {
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, ignored))
 	if err != nil {
 		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
 	}
@@ -899,6 +903,11 @@ func concurrentIndexStatement(sql string) (bool, error) {
 	return statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent(), nil
 }
 
+// exemptReasonArchiveNaming is the exemption reason a plan carries for an
+// undeclared live table whose name marks it as an archive: the table is left
+// in place rather than dropped, and left out of the rollback baseline.
+const exemptReasonArchiveNaming = "archive naming"
+
 // undeclaredTableDrops surfaces every live table in the namespace that no
 // schema file declares, whether its file was deleted or it was never declared
 // at all. Desired state is declarative: an undeclared table converges only by
@@ -1387,16 +1396,82 @@ func (e *Engine) RegistersWorkSynchronously() bool {
 }
 
 // Drain blocks until every background apply goroutine has finished, then stops
-// tracking every schema change so the next Progress reports the idle sentinel.
+// tracking the schema changes it waited out so the next Progress reports the
+// idle sentinel.
 // Resume and recovery paths call this before re-planning so a statement still
 // in flight from a lost lease cannot race the next drive's view of the schema,
 // and so the next poll reads a clean engine instead of the previous change's
 // terminal snapshot.
+//
+// Drain waits without a bound, for a caller that owns the engine outright. A
+// drive waits through DrainContext instead, so it never outlives its claim.
 func (e *Engine) Drain() {
+	drained := e.trackedAtDrainStart()
 	e.wg.Wait()
+	e.clearDrainedProgress(drained)
+}
+
+// DrainContext is Drain bounded by ctx. When ctx ends before every apply
+// goroutine has finished, it returns an error and leaves the schema changes
+// tracked, so the engine still reports them as holding the target.
+//
+// The snapshot scopes only what a finished drain clears. The wait itself is on
+// every apply goroutine, including one accepted after the drain began, so a
+// drive draining behind a newly started apply waits for that apply too, up to
+// ctx. Giving up does not release the wait: its goroutine stays parked until
+// the applies it was waiting on exit, then closes a channel no one reads.
+func (e *Engine) DrainContext(ctx context.Context) error {
+	drained := e.trackedAtDrainStart()
+	done := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		e.clearDrainedProgress(drained)
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("drain PostgreSQL schema changes: still running after %w", ctx.Err())
+	}
+}
+
+// trackedAtDrainStart snapshots the schema changes a drain is waiting out.
+// Only these are the drain's to clear: an apply accepted while the drain waits
+// belongs to the drive that started it, and its poller must still find it.
+func (e *Engine) trackedAtDrainStart() map[string]*trackedApply {
 	e.mu.Lock()
-	e.progress = nil
-	e.mu.Unlock()
+	defer e.mu.Unlock()
+	drained := make(map[string]*trackedApply, len(e.progress))
+	maps.Copy(drained, e.progress)
+	return drained
+}
+
+// clearDrainedProgress stops tracking the schema changes the drain started
+// with whose apply goroutine has exited. An entry replaced since the snapshot
+// is a newer apply and stays, as does one whose goroutine is still running.
+func (e *Engine) clearDrainedProgress(drained map[string]*trackedApply) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for key, tracked := range drained {
+		if e.progress[key] == tracked && applyGoroutineExited(tracked) {
+			delete(e.progress, key)
+		}
+	}
+}
+
+// applyGoroutineExited reports whether the goroutine executing a tracked apply
+// has returned. An entry with no goroutine has nothing left to run.
+func applyGoroutineExited(tracked *trackedApply) bool {
+	if tracked.done == nil {
+		return true
+	}
+	select {
+	case <-tracked.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // HaltForShutdown brings this instance's in-flight concurrent index builds
@@ -1416,13 +1491,7 @@ func (e *Engine) Drain() {
 // shutdown open.
 func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	e.mu.Lock()
-	halted := 0
-	for _, tracked := range e.progress {
-		if tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
-			tracked.cancelApply()
-			halted++
-		}
-	}
+	halted := e.cancelConcurrentBuildsLocked(func(*trackedApply) bool { return true })
 	e.mu.Unlock()
 	if halted > 0 {
 		slog.Info("PostgreSQL engine halting concurrent index builds for shutdown", "builds", halted)
@@ -1442,6 +1511,47 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return fmt.Errorf("halt PostgreSQL engine for shutdown: schema change work is still running on the target: %w", ctx.Err())
 	}
+}
+
+// HaltWorkOwnedBy halts like HaltForShutdown, but only the applies started
+// for owner, and waits only for those. Another drive's applies on the same
+// engine are left running and are not waited on.
+func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
+	e.mu.Lock()
+	owned := func(tracked *trackedApply) bool { return tracked.owner == owner }
+	halted := e.cancelConcurrentBuildsLocked(owned)
+	var pending []chan struct{}
+	for _, tracked := range e.progress {
+		if owned(tracked) {
+			pending = append(pending, tracked.done)
+		}
+	}
+	e.mu.Unlock()
+	if halted > 0 {
+		slog.Info("PostgreSQL engine halting the concurrent index builds a drive started as it returns", "builds", halted)
+	}
+
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return fmt.Errorf("halt PostgreSQL engine work a drive started: schema change work is still running on the target: %w", ctx.Err())
+		}
+	}
+	return nil
+}
+
+// cancelConcurrentBuildsLocked ends the running concurrent index builds that
+// selected picks and returns how many it ended. The caller holds e.mu.
+func (e *Engine) cancelConcurrentBuildsLocked(selected func(*trackedApply) bool) int {
+	halted := 0
+	for _, tracked := range e.progress {
+		if selected(tracked) && tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+			tracked.cancelApply()
+			halted++
+		}
+	}
+	return halted
 }
 
 // Stop declines: a concurrent index build has no resumable midpoint, so stop
@@ -1482,5 +1592,7 @@ var _ engine.Engine = (*Engine)(nil)
 // Compile-time check that Engine implements engine.Drainer.
 var _ engine.Drainer = (*Engine)(nil)
 
-// Compile-time check that Engine implements engine.ShutdownHalter.
+// Compile-time check that Engine implements engine.ShutdownHalter and
+// engine.OwnedWorkHalter.
 var _ engine.ShutdownHalter = (*Engine)(nil)
+var _ engine.OwnedWorkHalter = (*Engine)(nil)

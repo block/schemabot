@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -429,6 +430,146 @@ func TestTableKVs(t *testing.T) {
 		tbl := &apitypes.TableProgressResponse{TableName: "users"}
 		kvs := tableKVs("Test", tbl, ts)
 		assert.Equal(t, []string{"msg", "Test", "table", "users"}, kvs)
+	})
+
+	t.Run("rollout provenance stays paired with each task ID", func(t *testing.T) {
+		for _, target := range []string{"shop-001", "shop-002"} {
+			tbl := &apitypes.TableProgressResponse{
+				TableName: "orders", Keyspace: "public", Deployment: "commerce-a", Target: target, TaskID: "task-" + target,
+			}
+			ts := &tableLogState{taskID: tbl.TaskID}
+			assert.Equal(t, []string{
+				"msg", "Test", "table", "orders", "task_id", tbl.TaskID,
+				"keyspace", "public", "deployment", "commerce-a", "target", target,
+			}, tableKVs("Test", tbl, ts))
+		}
+	})
+}
+
+// runLogProgress polls a fixed sequence without HTTP or wall-clock waits.
+func runLogProgress(t *testing.T, frames ...*apitypes.ProgressResponse) string {
+	t.Helper()
+	polls := 0
+	var watchErr error
+	poller := &progressPoller{
+		applyID: "apply-log-test",
+		fetch: func() (*apitypes.ProgressResponse, error) {
+			require.Less(t, polls, len(frames), "watcher must exit on the final frame")
+			frame := frames[polls]
+			polls++
+			return frame, nil
+		},
+		sleep: func(time.Duration) {},
+	}
+	output := captureOutput(t, func() {
+		watchErr = watchApplyProgressLog(poller, logHeartbeatDefault)
+	})
+	require.NoError(t, watchErr)
+	require.Equal(t, len(frames), polls)
+	return stripANSI(output)
+}
+
+func TestWatchApplyProgressLog_SeparateTasks(t *testing.T) {
+	tests := []struct {
+		name   string
+		first  apitypes.TableProgressResponse
+		second apitypes.TableProgressResponse
+	}{
+		{
+			name:   "same table on two targets with task IDs",
+			first:  apitypes.TableProgressResponse{TaskID: "task-001", Deployment: "commerce-a", Target: "shop-001"},
+			second: apitypes.TableProgressResponse{TaskID: "task-002", Deployment: "commerce-a", Target: "shop-002"},
+		},
+		{
+			name:   "repeated statement on the same member and table",
+			first:  apitypes.TableProgressResponse{TaskID: "task-001", Deployment: "commerce-a", Target: "shop-001"},
+			second: apitypes.TableProgressResponse{TaskID: "task-002", Deployment: "commerce-a", Target: "shop-001"},
+		},
+		{
+			name:   "legacy namespace fallback",
+			first:  apitypes.TableProgressResponse{Keyspace: "public"},
+			second: apitypes.TableProgressResponse{Keyspace: "audit"},
+		},
+		{
+			name:   "legacy deployment fallback",
+			first:  apitypes.TableProgressResponse{Deployment: "commerce-a", Target: "shop-001"},
+			second: apitypes.TableProgressResponse{Deployment: "commerce-b", Target: "shop-001"},
+		},
+		{
+			name:   "legacy target fallback",
+			first:  apitypes.TableProgressResponse{Deployment: "commerce-a", Target: "shop-001"},
+			second: apitypes.TableProgressResponse{Deployment: "commerce-a", Target: "shop-002"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.first.TableName, tt.second.TableName = "orders", "orders"
+			tt.first.DDL, tt.second.DDL = "ALTER TABLE orders ADD COLUMN status INT", "ALTER TABLE orders ADD COLUMN status INT"
+			tt.first.Status, tt.second.Status = state.Apply.Completed, state.Apply.Completed
+			output := runLogProgress(t, &apitypes.ProgressResponse{
+				ApplyID: "apply-test", State: state.Apply.Completed,
+				Tables: []*apitypes.TableProgressResponse{&tt.first, &tt.second},
+			})
+
+			assert.Equal(t, 2, strings.Count(output, "Table started table=orders"), output)
+			assert.Equal(t, 2, strings.Count(output, "Table complete table=orders"), output)
+			assert.Contains(t, output, `tables="2/2 succeeded"`)
+			assert.NotContains(t, output, "Table status changed")
+			for _, tbl := range []*apitypes.TableProgressResponse{&tt.first, &tt.second} {
+				if tbl.Deployment != "" {
+					assert.Contains(t, output, "deployment="+tbl.Deployment)
+				}
+				if tbl.Target != "" {
+					assert.Contains(t, output, "target="+tbl.Target)
+				}
+				if tbl.Keyspace != "" {
+					assert.Contains(t, output, "keyspace="+tbl.Keyspace)
+				}
+			}
+		})
+	}
+}
+
+// Mixed task states stay attached to their member across repeated polls; a
+// completed sibling is not reported again while the other member is running.
+func TestWatchApplyProgressLog_MixedTaskStates(t *testing.T) {
+	running := &apitypes.TableProgressResponse{
+		TableName: "orders", TaskID: "task-002", Deployment: "commerce-a", Target: "shop-002", Status: state.Apply.Running,
+	}
+	completed := &apitypes.TableProgressResponse{
+		TableName: "orders", TaskID: "task-001", Deployment: "commerce-a", Target: "shop-001", Status: state.Apply.Completed,
+	}
+	finished := *running
+	finished.Status = state.Apply.Completed
+	output := runLogProgress(t,
+		&apitypes.ProgressResponse{State: state.Apply.Running, Tables: []*apitypes.TableProgressResponse{running, completed}},
+		&apitypes.ProgressResponse{State: state.Apply.Running, Tables: []*apitypes.TableProgressResponse{completed, running}},
+		&apitypes.ProgressResponse{State: state.Apply.Completed, Tables: []*apitypes.TableProgressResponse{completed, &finished}},
+	)
+
+	assert.Equal(t, 2, strings.Count(output, "Table started table=orders"), output)
+	assert.Equal(t, 1, strings.Count(output, "Table complete table=orders deployment=commerce-a target=shop-001"), output)
+	assert.Equal(t, 1, strings.Count(output, "Table complete table=orders deployment=commerce-a target=shop-002"), output)
+	assert.NotContains(t, output, "Table status changed")
+	assert.Contains(t, output, `tables="2/2 succeeded"`)
+}
+
+func TestTableLogKey(t *testing.T) {
+	t.Run("durable task ID wins over table and member names", func(t *testing.T) {
+		first := &apitypes.TableProgressResponse{TaskID: "task-001", TableName: "orders", Target: "shop-001"}
+		second := &apitypes.TableProgressResponse{TaskID: "task-001", TableName: "renamed", Target: "shop-002"}
+		assert.Equal(t, "task:task-001", tableLogKey(first))
+		assert.Equal(t, tableLogKey(first), tableLogKey(second))
+	})
+	t.Run("fallback tuple cannot collide at field boundaries", func(t *testing.T) {
+		first := &apitypes.TableProgressResponse{Keyspace: "a/b", Deployment: "c", TableName: "orders"}
+		second := &apitypes.TableProgressResponse{Keyspace: "a", Deployment: "b/c", TableName: "orders"}
+		assert.NotEqual(t, tableLogKey(first), tableLogKey(second))
+	})
+	t.Run("legacy row cannot collide with a durable task ID", func(t *testing.T) {
+		legacy := &apitypes.TableProgressResponse{TableName: "orders"}
+		task := &apitypes.TableProgressResponse{TaskID: tableLogKey(legacy)}
+		assert.NotEqual(t, tableLogKey(legacy), tableLogKey(task))
 	})
 }
 

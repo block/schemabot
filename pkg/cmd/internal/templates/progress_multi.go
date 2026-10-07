@@ -65,6 +65,7 @@ func ProgressOperationsForPresentation(ops []ProgressOperation, released bool) [
 			Work:                op.OperationKind == storage.ApplyOperationKindWork,
 			Finalizer:           op.OperationKind == storage.ApplyOperationKindGroupFinalizer,
 			NeverStarted:        op.StartedAt == "",
+			AlreadyConverged:    op.AlreadyConverged,
 			Barrier:             op.CutoverPolicy == storage.CutoverPolicyBarrier,
 			Parallel:            op.CutoverPolicy == storage.CutoverPolicyParallel,
 			ContinueOnFailure:   op.OnFailure == storage.OnFailureContinue,

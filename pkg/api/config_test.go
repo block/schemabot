@@ -5187,34 +5187,36 @@ func TestServerConfig_SpiritMetadata(t *testing.T) {
 		var cfg ServerConfig
 		require.NoError(t, yaml.Unmarshal([]byte(`
 spirit:
-  enable_experimental_autoscaling: false
-  enable_experimental_lockless_checksum: true
   checkpoint_max_age: 24h
-  checksum_yield_timeout: 6h
 `), &cfg))
 		metadata, err := cfg.SpiritMetadata()
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{
-			spirit.MetadataEnableExperimentalAutoscaling:      "false",
-			spirit.MetadataEnableExperimentalLocklessChecksum: "true",
-			spirit.MetadataCheckpointMaxAge:                   "24h",
-			spirit.MetadataChecksumYieldTimeout:               "6h",
+			spirit.MetadataCheckpointMaxAge: "24h",
 		}, metadata)
 	})
 
-	// The lockless checksum is off by default, so a block that spells that out
-	// carries no override: the key would restate the default, and a database
-	// that enabled the checker in its own metadata outranks the server value
-	// regardless.
-	t.Run("lockless checksum false carries no override", func(t *testing.T) {
-		var cfg ServerConfig
-		require.NoError(t, yaml.Unmarshal([]byte(`
-spirit:
-  enable_experimental_lockless_checksum: false
-`), &cfg))
-		metadata, err := cfg.SpiritMetadata()
-		require.NoError(t, err)
-		assert.Empty(t, metadata)
+	// Autoscaling and the checksum algorithm are Spirit's own defaults and no
+	// longer configurable. A config that still sets one of the removed keys
+	// fails to load instead of silently running with a setting the operator
+	// believes they changed, and the error says the key was removed so the
+	// operator knows deleting it is the whole remedy.
+	t.Run("removed keys are rejected", func(t *testing.T) {
+		for key, value := range map[string]string{
+			"enable_experimental_autoscaling":       "false",
+			"enable_experimental_lockless_checksum": "true",
+			"checksum_yield_timeout":                "6h",
+		} {
+			_, err := ParseServerConfig([]byte("spirit:\n  " + key + ": " + value + "\n"))
+			require.ErrorContains(t, err, "spirit."+key+" was removed")
+		}
+	})
+
+	// The server config decodes strictly, so an unknown spirit key that was
+	// never a setting still fails to load.
+	t.Run("unknown keys are rejected", func(t *testing.T) {
+		_, err := ParseServerConfig([]byte("spirit:\n  copy_threads: 8\n"))
+		require.ErrorContains(t, err, "copy_threads")
 	})
 
 	t.Run("invalid duration errors", func(t *testing.T) {
@@ -5224,7 +5226,7 @@ spirit:
 	})
 
 	t.Run("non-positive duration errors", func(t *testing.T) {
-		cfg := ServerConfig{Spirit: SpiritConfig{ChecksumYieldTimeout: "-1h"}}
+		cfg := ServerConfig{Spirit: SpiritConfig{CheckpointMaxAge: "-1h"}}
 		_, err := cfg.SpiritMetadata()
 		require.ErrorContains(t, err, "must be positive")
 	})

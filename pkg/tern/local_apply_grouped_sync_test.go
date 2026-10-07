@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	spiritstatus "github.com/block/spirit/pkg/status"
 
@@ -56,7 +57,7 @@ func TestSyncAtomicTaskProgress_RefinesPhaseAndDisplayPerTask(t *testing.T) {
 	}
 	client := groupedSyncClient(taskStore)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{catchingUp, copying}, result, state.Task.Running, time.Now(), settledTaskSet{})
+	require.NoError(t, client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{catchingUp, copying}, result, state.Task.Running, time.Now(), settledTaskSet{}))
 
 	assert.Equal(t, state.Task.CatchingUp, catchingUp.State, "a table applying its changeset renders as catching up")
 	assert.EqualValues(t, 100, catchingUp.ProgressPercent)
@@ -94,7 +95,7 @@ func TestSyncAtomicTaskProgress_RefusedStateClaimStillRefreshesDisplay(t *testin
 	}
 	client := groupedSyncClient(taskStore)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{checksumming}, result, state.Task.Running, time.Now(), settledTaskSet{})
+	require.NoError(t, client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{checksumming}, result, state.Task.Running, time.Now(), settledTaskSet{}))
 
 	assert.Equal(t, state.Task.Checksumming, checksumming.State, "a poll claiming an earlier phase never rewinds the stored state")
 	assert.EqualValues(t, 120, checksumming.RowsCopied, "the display takes the poll's counters even when its state claim is refused")
@@ -122,7 +123,7 @@ func TestSyncAtomicTaskProgress_CompletedPollFinishesTheBar(t *testing.T) {
 	}
 	client := groupedSyncClient(taskStore)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{copied}, result, state.Task.Completed, time.Now(), settledTaskSet{})
+	require.NoError(t, client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{copied}, result, state.Task.Completed, time.Now(), settledTaskSet{}))
 
 	assert.EqualValues(t, 100, copied.ProgressPercent, "a completed poll finishes the bar even when the last table sample fell short")
 	assert.EqualValues(t, 8_912, copied.RowsCopied, "the row counters keep what the engine reported")
@@ -149,7 +150,7 @@ func TestSyncAtomicTaskProgress_UnreportedTableKeepsApplyStateAndLastProgress(t 
 	}
 	client := groupedSyncClient(taskStore)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{unreported}, result, state.Task.Running, time.Now(), settledTaskSet{})
+	require.NoError(t, client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{unreported}, result, state.Task.Running, time.Now(), settledTaskSet{}))
 
 	assert.Equal(t, state.Task.Running, unreported.State, "a sibling table's phase never refines a task the engine did not report on")
 	assert.EqualValues(t, 500, unreported.RowsCopied, "an unreported table keeps its last known progress")
@@ -180,7 +181,7 @@ func TestSyncAtomicTaskProgress_SettledTaskTakesNothingFromThePoll(t *testing.T)
 	settled := settledTaskSet{}
 	settled.add(settledTask)
 
-	client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{settledTask}, result, state.Task.Running, time.Now(), settled)
+	require.NoError(t, client.syncAtomicTaskProgress(t.Context(), slog.Default(), []*storage.Task{settledTask}, result, state.Task.Running, time.Now(), settled))
 
 	assert.Equal(t, state.Task.Completed, settledTask.State, "the target's verdict stands; the poll claims nothing")
 	assert.EqualValues(t, 900, settledTask.RowsCopied, "a settled task keeps the progress its settlement left")

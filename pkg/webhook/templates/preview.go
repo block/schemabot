@@ -74,6 +74,31 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	return RenderPlanComment(data)
 }
 
+// PreviewCommentPlanUnmanagedSchema renders the plan comment a staging-scoped
+// deployment posts for a PR that also changes a schema directory it does not
+// manage. It posts no separate notice, since a deployment serving another
+// environment may manage that directory, so the plan closes with a note
+// naming it.
+func PreviewCommentPlanUnmanagedSchema() string {
+	plan := previewPlanData()
+	plan.LintViolations = nil
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     plan.Database,
+		SchemaName:   plan.SchemaName,
+		HeadSHA:      plan.HeadSHA,
+		Repository:   plan.Repository,
+		DatabaseType: plan.DatabaseType,
+		IsMySQL:      plan.IsMySQL,
+		RequestedBy:  plan.RequestedBy,
+		Environments: []string{"staging"},
+		Plans:        map[string]*PlanCommentData{"staging": &plan},
+		UnmanagedSchema: []UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		},
+		UnmanagedEnvironments: []string{"staging"},
+	})
+}
+
 // PreviewCommentPlanExemptTables renders a plan with archive-named live tables.
 func PreviewCommentPlanExemptTables() string {
 	return RenderPlanComment(PlanCommentData{
@@ -1412,8 +1437,8 @@ func PreviewCommentReviewRequiredNoOperators() string {
 }
 
 // PreviewCommentReviewRequiredStaleApproval renders the "review required"
-// comment when an authorized reviewer approved an earlier commit and schema
-// files changed after it, so that approval no longer counts.
+// comment when an authorized reviewer approved an earlier commit and the PR's
+// schema change differs at the head, so that approval no longer counts.
 func PreviewCommentReviewRequiredStaleApproval() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:          "testapp",
@@ -1422,7 +1447,7 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		OperatorReviewers: []string{"acme/testapp-operators"},
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
-		StaleApprovers:    []string{"jdoe"},
+		ChangedApprovers:  []string{"jdoe"},
 	})
 }
 
@@ -1433,6 +1458,21 @@ func PreviewCommentReviewGateError() string {
 		Environment: "staging",
 		CommandName: action.Apply,
 		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+	})
+}
+
+// PreviewCommentReviewGateErrorApprovalNotComparable renders the review gate
+// error comment when an approval on an earlier commit cannot be compared with
+// the head, so it does not count and the apply is blocked (fail-closed).
+func PreviewCommentReviewGateErrorApprovalNotComparable() string {
+	return RenderReviewGateError(ReviewGateData{
+		Database:            "testapp",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		OperatorReviewers:   []string{"acme/testapp-operators"},
+		OtherReviewers:      []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:            previewRequestedBy,
+		UncomparedApprovers: []string{"jdoe"},
 	})
 }
 
@@ -2827,6 +2867,81 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
 		Details:     details,
+	})
+}
+
+// PreviewCommentMultiTargetApplySummaryAlreadyHadIt renders the summary of a
+// finished rollout across four targets, one of which already had the change
+// when the apply was created: it ran nothing, so it reports no table progress
+// and is counted apart from the targets that ran.
+func PreviewCommentMultiTargetApplySummaryAlreadyHadIt() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const rows = 1_466_232
+	var ops []presentation.Operation
+	var details []*ApplyStatusCommentData
+	for i := range 4 {
+		target := fmt.Sprintf("orders_%03d", i)
+		op := presentation.Operation{Deployment: "us", Target: target, State: state.ApplyOperation.Completed, Parallel: true, ContinueOnFailure: true}
+		if i == 3 {
+			op.NeverStarted = true
+			op.AlreadyConverged = true
+			ops = append(ops, op)
+			details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, nil))
+			continue
+		}
+		ops = append(ops, op)
+		details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, []TableProgressData{
+			{TableName: "orders", DDL: addIndex, Status: state.Task.Completed, RowsCopied: rows, RowsTotal: rows},
+		}))
+	}
+
+	return RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       presentation.Derive(ops),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().UTC().Format(time.RFC3339),
+		Details:     details,
+	})
+}
+
+// PreviewCommentMultiTargetApplyInProgressOneDeployment renders a rollout
+// whose one deployment addresses four targets: one done, one copying, one
+// queued, and one that already had the change. With no other deployment to
+// tell it apart from, the status is one line and the table lines sit under it.
+func PreviewCommentMultiTargetApplyInProgressOneDeployment() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const rows = 1_466_232
+	target := func(i int, opState string) presentation.Operation {
+		return presentation.Operation{Deployment: "us", Target: fmt.Sprintf("orders_%03d", i), State: opState, Parallel: true, ContinueOnFailure: true}
+	}
+	detail := func(i int, opState, taskState string, copied, eta int64) *ApplyStatusCommentData {
+		return sampleDeploymentDetail(fmt.Sprintf("orders_%03d", i), opState, []TableProgressData{
+			{TableName: "orders", DDL: addIndex, Status: taskState, RowsCopied: copied, RowsTotal: rows, ETASeconds: eta},
+		})
+	}
+	converged := target(3, state.ApplyOperation.Completed)
+	converged.NeverStarted = true
+	converged.AlreadyConverged = true
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			target(0, state.ApplyOperation.Completed),
+			target(1, state.ApplyOperation.Running),
+			target(2, state.ApplyOperation.Pending),
+			converged,
+		}),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		Details: []*ApplyStatusCommentData{
+			detail(0, state.ApplyOperation.Completed, state.Task.Completed, rows, 0),
+			detail(1, state.ApplyOperation.Running, state.Task.Running, 914_707, 195),
+			nil,
+			sampleDeploymentDetail("orders_003", state.ApplyOperation.Completed, nil),
+		},
 	})
 }
 

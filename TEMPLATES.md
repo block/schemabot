@@ -394,6 +394,64 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-unmanaged-schema-alongside"></a><strong>MySQL Plan (Unmanaged Schema Alongside)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+ℹ️ This PR also changes schema under paths SchemaBot does not manage in `staging`, so this plan does not cover them:
+
+- `services/inventory/schema` declares database `inventory`
+
+</details>
+
+<details>
 <summary><a name="postgres-plan-exempt-tables"></a><strong>Postgres Plan (Exempt Tables)</strong></summary>
 
 
@@ -2717,11 +2775,13 @@ type: mysql
 
 ## ⚠️ Schema Changes Not Managed by SchemaBot
 
-This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
+**Environments**: `staging`, `production`
+
+This PR changes schema under the following path(s), which SchemaBot is not configured to manage in any environment:
 
 - `services/inventory/schema` — declares database `inventory`
 
-These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
+These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's `allowed_dirs` in the server config; otherwise remove these schema changes from this PR.
 <!-- schemabot:offer-support-channel -->
@@ -3867,6 +3927,23 @@ _Requested by @jackjackbits_
 </details>
 
 <details>
+<summary><a name="applyconfirm-refused-primary-target-changed"></a><strong>Apply-confirm Refused: Primary Target Changed</strong></summary>
+
+
+## ❌ Apply-confirm Failed
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+### Error
+
+> This confirmation no longer covers what the apply would run: the primary target is not the one the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target&#39;s own plan.
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="apply-blocked-by-prior-env-pending"></a><strong>Apply Blocked By Prior Env (Pending)</strong></summary>
 
 
@@ -4062,7 +4139,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 Schema changes require approval from an authorized reviewer before applying.
 
-Approvals on an earlier commit no longer count, because schema files changed since then or SchemaBot could not confirm they did not: @jdoe. Ask for an approval of the latest commit.
+Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Ask for an approval of the latest commit.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4091,6 +4168,31 @@ Approvals on an earlier commit no longer count, because schema files changed sin
 
 > Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 <!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-gate-error-approval-not-comparable"></a><strong>Apply Blocked: Review Gate Error (Approval Not Comparable)</strong></summary>
+
+
+## ❌ Review Gate Error
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Ask anyone listed above to approve the latest commit
+2. Once approved, run `schemabot apply -e staging` again
 
 </details>
 
@@ -8390,6 +8492,59 @@ schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-in-progress-one-deployment"></a><strong>Multi-target Rollout In Progress (One Deployment)</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+🔄 Rolling out: 1 of 4 targets done, 1 running, 1 queued (1 already had it)
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 81% · 1 complete, 1 running
+- Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
+- Running: `orders_001`
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="summary-multitarget-rollout-with-a-target-that-already-had-it"></a><strong>Summary: Multi-target Rollout With A Target That Already Had It</strong></summary>
+
+
+## ✅ Schema Change Applied — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+✅ Rolled out to 3 of 4 targets (1 already had it)
+
+**`orders`**: ✅ Complete (3 targets)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
 
 </details>
 

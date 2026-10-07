@@ -1,6 +1,10 @@
 package webhook
 
-import "github.com/block/schemabot/pkg/storage"
+import (
+	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
+)
 
 // PreviewAggregateSummary renders a representative aggregate-check Details
 // summary for TEMPLATES.md: the leader's own per-database checks with their
@@ -72,4 +76,14 @@ func PreviewAggregateCheckStopped() string {
 // the author to split the PR so SchemaBot can see the full changed-file list.
 func PreviewAggregateCheckFileCapBlocked() string {
 	return "Plan failed\n\n" + prFileCapExceededBlock.message
+}
+
+// PreviewConfirmationPrimaryTargetChanged renders the refusal when the primary
+// member changes after review, using the same reason as both comparison paths.
+func PreviewConfirmationPrimaryTargetChanged() string {
+	return templates.RenderGenericError(templates.SchemaErrorData{
+		RequestedBy: "jackjackbits", Timestamp: templates.NowFunc().UTC().Format("2006-01-02 15:04:05"),
+		Environment: "production", CommandName: action.ApplyConfirm,
+		ErrorDetail: unconfirmedWorkMessage(memberWork{}, primaryTargetDifferenceReason(workTarget)),
+	})
 }

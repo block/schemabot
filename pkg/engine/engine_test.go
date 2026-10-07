@@ -303,12 +303,18 @@ type remoteWorkEngine struct{ Engine }
 // haltableEngine models an engine that runs its schema change in this process.
 type haltableEngine struct {
 	Engine
-	haltErr error
-	halts   int
+	haltErr    error
+	halts      int
+	ownedHalts []string
 }
 
 func (e *haltableEngine) HaltForShutdown(context.Context) error {
 	e.halts++
+	return e.haltErr
+}
+
+func (e *haltableEngine) HaltWorkOwnedBy(_ context.Context, owner string) error {
+	e.ownedHalts = append(e.ownedHalts, owner)
 	return e.haltErr
 }
 
@@ -346,6 +352,60 @@ func TestHaltEngineForShutdownReportsTheHaltResult(t *testing.T) {
 		assert.True(t, supported)
 		assert.Contains(t, err.Error(), "runner still copying")
 	})
+}
+
+// A drive halts only the work it started. The owner the drive names reaches
+// the engine unchanged, and an engine whose work runs elsewhere still has
+// nothing to halt.
+func TestHaltEngineWorkOwnedByScopesTheHaltToTheOwner(t *testing.T) {
+	eng := &haltableEngine{}
+
+	supported, err := HaltEngineWorkOwnedBy(t.Context(), eng, "drive-a")
+
+	require.NoError(t, err)
+	assert.True(t, supported)
+	assert.Equal(t, []string{"drive-a"}, eng.ownedHalts)
+	assert.Zero(t, eng.halts, "an owner-scoped halt is not a halt of everything")
+
+	supported, err = HaltEngineWorkOwnedBy(t.Context(), &remoteWorkEngine{}, "drive-a")
+	require.NoError(t, err)
+	assert.False(t, supported)
+}
+
+// shutdownOnlyEngine runs its work in this process and halts it for shutdown,
+// but cannot halt one drive's work apart from another's.
+type shutdownOnlyEngine struct {
+	Engine
+	halts int
+}
+
+func (e *shutdownOnlyEngine) HaltForShutdown(context.Context) error {
+	e.halts++
+	return nil
+}
+
+// The owner-scoped halt is its own capability, so an engine that implements
+// only the shutdown halt keeps it. Its drives hand the apply back without
+// halting anything rather than losing the shutdown halt as well.
+func TestShutdownOnlyEngineKeepsItsShutdownHalt(t *testing.T) {
+	eng := &shutdownOnlyEngine{}
+
+	supported, err := HaltEngineForShutdown(t.Context(), eng)
+	require.NoError(t, err)
+	assert.True(t, supported, "the shutdown halt does not depend on the owner-scoped one")
+	assert.Equal(t, 1, eng.halts)
+
+	supported, err = HaltEngineWorkOwnedBy(t.Context(), eng, "drive-a")
+	require.NoError(t, err)
+	assert.False(t, supported, "an engine without the owner-scoped halt has nothing a drive can halt alone")
+	assert.Equal(t, 1, eng.halts, "a drive's exit never falls back to halting everything")
+}
+
+// The owner a drive attaches is the one the engine reads back, and a context
+// with none reads as the empty owner.
+func TestWorkOwnerRoundTripsThroughTheContext(t *testing.T) {
+	assert.Equal(t, "drive-a", WorkOwnerFromContext(WithWorkOwner(t.Context(), "drive-a")))
+	assert.Empty(t, WorkOwnerFromContext(t.Context()))
 }
 
 func TestSchemaChange_Sharded(t *testing.T) {

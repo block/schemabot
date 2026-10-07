@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/schemabot/pkg/webhook"
 	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -50,6 +51,7 @@ func previewCommentAllOutput() {
 		{"PLAN COMMENT (MANY TABLES, FOLDED TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyTables()) }},
 		{"PLAN COMMENT (COLLATION CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCollationChanges()) }},
 		{"PLAN COMMENT (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
+		{"PLAN COMMENT (UNMANAGED SCHEMA ALONGSIDE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnmanagedSchema()) }},
 		{"PLAN COMMENT (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"PLAN COMMENT (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
 		{"PLAN COMMENT (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
@@ -177,6 +179,7 @@ func previewCommentPlanAllOutput() {
 		{"MYSQL PLAN (MANY TABLES, FOLDED TABLE SIZES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyTables()) }},
 		{"MYSQL PLAN (COLLATION CHANGES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanCollationChanges()) }},
 		{"MYSQL PLAN (IGNORED NAMESPACES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoredNamespaces()) }},
+		{"MYSQL PLAN (UNMANAGED SCHEMA ALONGSIDE)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanUnmanagedSchema()) }},
 		{"POSTGRES PLAN (EXEMPT TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanExemptTables()) }},
 		{"MYSQL PLAN (IGNORE TABLES)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanIgnoreTables()) }},
 		{"MYSQL PLAN (MANY LINT WARNINGS)", func() { fmt.Print(webhooktemplates.PreviewCommentPlanManyLintWarnings()) }},
@@ -291,6 +294,9 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY-CONFIRM REFUSED: PLAN CANNOT BE LOADED", func() {
 			fmt.Print(webhooktemplates.PreviewCommentConfirmationPlanUnavailable())
 		}},
+		{"APPLY-CONFIRM REFUSED: PRIMARY TARGET CHANGED", func() {
+			fmt.Print(webhook.PreviewConfirmationPrimaryTargetChanged())
+		}},
 		{"APPLY BLOCKED BY PRIOR ENV (PENDING)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnv()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvFailed()) }},
 		{"APPLY BLOCKED BY PRIOR ENV (IN PROGRESS)", func() { fmt.Print(webhooktemplates.PreviewCommentApplyBlockedByPriorEnvInProgress()) }},
@@ -303,6 +309,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"APPLY BLOCKED: REVIEW REQUIRED (NO OPERATORS)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredNoOperators()) }},
 		{"APPLY BLOCKED: REVIEW REQUIRED (APPROVAL ON AN EARLIER COMMIT)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewRequiredStaleApproval()) }},
 		{"APPLY BLOCKED: REVIEW GATE ERROR (FAIL-CLOSED)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateError()) }},
+		{"APPLY BLOCKED: REVIEW GATE ERROR (APPROVAL NOT COMPARABLE)", func() { fmt.Print(webhooktemplates.PreviewCommentReviewGateErrorApprovalNotComparable()) }},
 		{"APPLY BLOCKED: CHECKS NOT PASSING", func() {
 			fmt.Print(webhooktemplates.RenderApplyBlockedByNonPassingChecks("staging", []webhooktemplates.BlockingCheck{
 				{Name: "CI / unit-tests", State: "failure"},
@@ -395,6 +402,8 @@ func previewCommentMultiDeployAllOutput() {
 		{"BARRIER ROLLOUT IN PROGRESS", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyInProgress()) }},
 		{"ROLLOUT WHERE PLANS DIFFER", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyDivergentPlans()) }},
 		{"MULTI-TARGET ROLLOUT (TWO DEPLOYMENTS, 64 TARGETS EACH)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiTargetApplyInProgress()) }},
+		{"MULTI-TARGET ROLLOUT IN PROGRESS (ONE DEPLOYMENT)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiTargetApplyInProgressOneDeployment()) }},
+		{"SUMMARY: MULTI-TARGET ROLLOUT WITH A TARGET THAT ALREADY HAD IT", func() { fmt.Print(webhooktemplates.PreviewCommentMultiTargetApplySummaryAlreadyHadIt()) }},
 		{"BARRIER ROLLOUT WITH DEFERRED CUTOVER", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyDeferredCutover()) }},
 		{"HALT ON FAILURE (ONE DEPLOYMENT FAILED)", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyFailed()) }},
 		{"ALL DEPLOYMENTS COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentMultiDeploymentApplyCompleted()) }},

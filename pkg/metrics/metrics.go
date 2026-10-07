@@ -2364,8 +2364,9 @@ var knownDirectExecutionOutcomes = map[string]bool{
 // means row estimates are unavailable (check target connectivity and
 // information_schema access). blocked_force_kill_unavailable means the target
 // user lacks a grant the kill needs (grant SELECT on performance_schema.*,
-// PROCESS, and CONNECTION_ADMIN or SUPER); blocked_force_kill_unknown means
-// checking those grants failed (check target connectivity).
+// PROCESS, and CONNECTION_ADMIN or SUPER, or on RDS EXECUTE on mysql.rds_kill);
+// blocked_force_kill_unknown means checking those grants failed (check target
+// connectivity).
 func RecordDirectExecution(ctx context.Context, database, outcome string) {
 	if !knownDirectExecutionOutcomes[outcome] {
 		outcome = "unknown"

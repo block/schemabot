@@ -631,6 +631,63 @@ func TestGroups_RollsUpEachDeploymentsTargets(t *testing.T) {
 	assert.False(t, eu.Open)
 }
 
+// A group's progress counts the targets that ran the change apart from the
+// ones that already had it, and the rest by status, so the parts always add up
+// to every target the group addresses.
+func TestTargetProgress_CountsRanAndAlreadyHadApart(t *testing.T) {
+	target := func(tgt, st string) Operation {
+		return Operation{Deployment: "primary", Target: tgt, State: st, Parallel: true, ContinueOnFailure: true}
+	}
+	converged := target("t_004", so.Completed)
+	converged.NeverStarted = true
+	converged.AlreadyConverged = true
+	apply := Derive([]Operation{
+		target("t_000", so.Completed),
+		target("t_001", so.Running),
+		target("t_002", so.Pending),
+		target("t_003", so.Failed),
+		converged,
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 1)
+	assert.Equal(t, TargetProgress{
+		Total:      5,
+		Done:       1,
+		AlreadyHad: 1,
+		Others:     []StateCount{{"running", 1}, {"queued", 1}, {"failed", 1}},
+		Unsettled:  2,
+	}, apply.TargetProgress(groups[0]), "the running and queued targets can still run; the failed one cannot")
+}
+
+// Every status is in exactly one histogram category, so a group's status line
+// accounts for each of its targets: with one target in every status, the counts
+// still add up to every target the group addresses.
+func TestTargetProgress_EveryStatusIsCounted(t *testing.T) {
+	var apply Apply
+	var group Group
+	for ps := range presentationStateCount {
+		categories := 0
+		for _, cat := range summaryCategoryOrder {
+			if slices.Contains(cat.states, ps) {
+				categories++
+			}
+		}
+		assert.Equal(t, 1, categories, "status %d must be in exactly one histogram category", ps)
+
+		group.Members = append(group.Members, len(apply.Deployments))
+		apply.Deployments = append(apply.Deployments, Deployment{Presentation: ps})
+	}
+
+	p := apply.TargetProgress(group)
+	counted := p.Done + p.AlreadyHad
+	for _, c := range p.Others {
+		counted += c.Count
+	}
+	assert.Equal(t, p.Total, counted, "every target is counted once: %+v", p)
+	assert.Equal(t, int(presentationStateCount), p.Total)
+}
+
 // Members that are not distinct targets, such as keyed operations with no
 // target or several operations dividing one target's work, are not rolled up:
 // each stays a group of its own, so no surface counts them as targets.

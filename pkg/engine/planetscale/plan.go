@@ -194,14 +194,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 			var violations []engine.LintViolation
 			if plan != nil {
 				for _, pc := range plan.Changes {
-					for _, v := range pc.Violations {
-						violations = append(violations, engine.LintViolation{
-							Table:    pc.TableName,
-							Linter:   v.Linter.Name(),
-							Message:  v.Message,
-							Severity: strings.ToLower(v.Severity.String()),
-						})
-					}
+					violations = append(violations, lint.PlannedChangeViolations(pc)...)
 				}
 			}
 

@@ -89,6 +89,8 @@ const (
 	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
 	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
+	ErrCodeUnsafeOptInRequired  = "unsafe_opt_in_required" // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
+	ErrCodePlanBlocked          = "plan_blocked"           // Plan carries a change the engine refuses; no retry or option can apply it
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -1748,8 +1750,12 @@ type ProgressOperationResponse struct {
 	OnFailure    string `json:"on_failure,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	CompletedAt  string `json:"completed_at,omitempty"`
+	// AlreadyConverged is true for an operation recorded completed when the
+	// apply was created, because its target already held the change and
+	// nothing ran there.
+	AlreadyConverged bool   `json:"already_converged,omitempty"`
+	StartedAt        string `json:"started_at,omitempty"`
+	CompletedAt      string `json:"completed_at,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.

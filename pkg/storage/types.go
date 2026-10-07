@@ -1341,6 +1341,14 @@ type ApplyOperation struct {
 	// retry.
 	Attempt int
 
+	// AlreadyConverged is true for an operation recorded completed when its
+	// apply was created, because its target already held the change and had
+	// nothing left to run. It is set only at creation, on a completed row no
+	// driver started. A row a reaper later settled to its parent's outcome is
+	// also completed and never started, so this flag, not the missing start, is
+	// what says the target already had the change.
+	AlreadyConverged bool
+
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
 

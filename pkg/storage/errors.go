@@ -65,6 +65,11 @@ var (
 	// learns the outcome already landed instead of overwriting it.
 	ErrApplyOutcomeSettled = errors.New("apply outcome already settled")
 
+	// ErrValueRejected is returned when storage refuses a write because a value
+	// does not fit its column. The same write is refused on every attempt, so
+	// it is not a transient failure to retry.
+	ErrValueRejected = errors.New("storage rejected a value its column cannot hold")
+
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")

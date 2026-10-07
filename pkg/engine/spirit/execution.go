@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn"
 	spiritflags "github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
@@ -29,17 +30,25 @@ const maxCommitLatency = 100 * time.Millisecond
 
 // classifyRunnerError marks runner failures that are verdicts about the data
 // as permanent, so operator retries are not spent repeating a lossy schema
-// change: the snapshot checksum found row differences on every completed
-// attempt. Everything else remains retryable:
+// change: the checksum had to repair row differences on every pass it ran
+// (checksum.ErrDifferencesExhausted). Everything else remains retryable:
 //   - attempts that errored before establishing row differences;
-//   - the lockless checksum's pass budget running out, which proves no
-//     divergence, only that ranges were still changing too fast to verify;
+//   - the checksum's pass budget running out without that verdict
+//     (checksum.ErrVerificationUnresolved alone), which proves no divergence,
+//     only that ranges were still changing too fast to verify;
 //   - a divergence found by the continuous checksum during the deferred
 //     cutover wait. That checksum never repairs, because a cutover may be
 //     imminent; the resumed run's initial checksum repairs the range.
+//
+// A run refused the table's advisory lock is marked ErrTargetHeld: another run
+// is still working on the table, so the refusal says nothing about this schema
+// change and it can start once that run lets go.
 func classifyRunnerError(err error) error {
 	if errors.Is(err, checksum.ErrDifferencesExhausted) {
 		return &engine.PermanentError{Err: err}
+	}
+	if errors.Is(err, dbconn.ErrLockHeld) {
+		return fmt.Errorf("%w: %w", engine.ErrTargetHeld, err)
 	}
 	return err
 }
@@ -48,31 +57,25 @@ func classifyRunnerError(err error) error {
 // target with the engine's copy, durability, and throttling settings.
 // Callers layer statement-specific fields (DeferCutOver) onto the result.
 //
-// On Aurora with autoscaling enabled, Spirit sizes the thread pools from the
-// instance and scales them on throttler feedback, so apply throughput tracks
-// the target instance rather than a fixed constant. Other MySQL targets, and
-// Aurora with autoscaling disabled, run at the configured copier threads and
-// Spirit's default write threads.
-//
-// The copy is verified under the snapshot checksum unless the lockless one is
-// enabled; cutover locking is the same either way.
+// On Aurora, Spirit sizes the thread pools from the instance and scales them
+// on throttler feedback, so apply throughput tracks the target instance rather
+// than a fixed constant. Other MySQL targets run at the configured copier
+// threads and Spirit's default write threads. The copy is verified with
+// Spirit's default (lockless) checksum.
 func (e *Engine) newSpiritMigration(host, username, password, database, stmt string) *spiritmigration.Migration {
 	threads, lockTimeout := e.threads, e.lockWaitTimeout
 	return &spiritmigration.Migration{
-		Host:                               host,
-		Username:                           username,
-		Password:                           &password,
-		Database:                           database,
-		Statement:                          stmt,
-		ChecksumYieldTimeout:               e.checksumYieldTimeout,
-		EnableExperimentalLocklessChecksum: e.locklessChecksum,
+		Host:      host,
+		Username:  username,
+		Password:  &password,
+		Database:  database,
+		Statement: stmt,
 		Common: spiritflags.Common{
-			Threads:                       threads,
-			WriteThreads:                  spiritflags.DefaultWriteThreads, // autoscaling sizes it on Aurora
-			InterpolateParams:             true,
-			CheckpointMaxAge:              e.checkpointMaxAge,
-			MaxCommitLatency:              maxCommitLatency,
-			EnableExperimentalAutoscaling: e.autoscaling,
+			Threads:           threads,
+			WriteThreads:      spiritflags.DefaultWriteThreads, // autoscaling sizes it on Aurora
+			InterpolateParams: true,
+			CheckpointMaxAge:  e.checkpointMaxAge,
+			MaxCommitLatency:  maxCommitLatency,
 		},
 		Cutover: spiritflags.Cutover{
 			LockWaitTimeout: lockTimeout,
@@ -488,6 +491,7 @@ func (e *Engine) setSchemaChangeFailed(err error) {
 		if err != nil {
 			e.runningSchemaChange.errorMessage = failureReason(err)
 			e.runningSchemaChange.permanentFailure = !engine.IsRetryable(err)
+			e.runningSchemaChange.targetHeld = errors.Is(err, engine.ErrTargetHeld)
 		}
 	}
 }

@@ -3038,17 +3038,59 @@ type MultiEnvPlanCommentData struct {
 
 	// Errors per environment (if plan execution failed)
 	Errors map[string]string
+
+	// UnmanagedSchema lists the schema configs the PR also changes that this
+	// deployment does not manage, and UnmanagedEnvironments the environments
+	// it serves. Set only by an environment-scoped deployment, which posts no
+	// separate notice for them; the comment closes with a note naming them.
+	UnmanagedSchema       []UnmanagedSchemaConfigNoticeData
+	UnmanagedEnvironments []string
 }
 
 // RenderMultiEnvPlanComment renders a combined plan comment showing all environments.
 // If all environments have identical plans, deduplicates into a single section.
 func RenderMultiEnvPlanComment(data MultiEnvPlanCommentData) string {
-	if plan, ok := singleEnvironmentPlan(data); ok {
-		return RenderPlanComment(plan)
+	note := RenderUnmanagedSchemaPlanNote(data.UnmanagedEnvironments, data.UnmanagedSchema)
+	if note == "" {
+		return renderMultiEnvPlanCommentWithin(data, 0)
 	}
-	return renderWithinCommentLimit(countMultiEnvPlanDDLBlocks(data), 0, func(budget *ddlBlockBudget) string {
+	// The note goes after the plan and before the agent hint, so the hint
+	// stays the comment's last line. The size limit keeps room for both.
+	hint := data.AgentHint
+	if plan, ok := singleEnvironmentPlan(data); ok {
+		hint = plan.AgentHint
+	}
+	data.AgentHint = ""
+	data.Plans = withoutAgentHints(data.Plans)
+	body := renderMultiEnvPlanCommentWithin(data, len(note)+len(appendAgentHint("", hint))+len("\n\n"))
+	return appendAgentHint(strings.TrimRight(body, "\n")+"\n\n"+note, hint)
+}
+
+func renderMultiEnvPlanCommentWithin(data MultiEnvPlanCommentData, reserve int) string {
+	if plan, ok := singleEnvironmentPlan(data); ok {
+		return renderWithinCommentLimit(countCommentDDLBlocks(plan), reserve, func(budget *ddlBlockBudget) string {
+			return renderPlanComment(plan, budget)
+		})
+	}
+	return renderWithinCommentLimit(countMultiEnvPlanDDLBlocks(data), reserve, func(budget *ddlBlockBudget) string {
 		return renderMultiEnvPlanComment(data, budget)
 	})
+}
+
+// withoutAgentHints copies plans with each one's agent hint cleared, so a
+// caller appending a section after the plan can append the hint itself.
+func withoutAgentHints(plans map[string]*PlanCommentData) map[string]*PlanCommentData {
+	cleared := make(map[string]*PlanCommentData, len(plans))
+	for env, plan := range plans {
+		if plan == nil {
+			cleared[env] = nil
+			continue
+		}
+		copied := *plan
+		copied.AgentHint = ""
+		cleared[env] = &copied
+	}
+	return cleared
 }
 
 // countEnvsWithChanges counts the environments whose plan carries a change.

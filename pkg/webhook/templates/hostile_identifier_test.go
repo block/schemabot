@@ -52,7 +52,8 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 		"sharded apply shard table":                    shardTable.String(),
 		"config not authorized comment":                RenderConfigNotAuthorized(configNotAuthorized),
 		"config not authorized error line":             RenderConfigNotAuthorizedLine(hostileIdentifier, hostileIdentifier),
-		"unmanaged schema config notice":               RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{{Database: hostileIdentifier, SchemaPath: hostileIdentifier}}),
+		"unmanaged schema config notice":               RenderUnmanagedSchemaConfigsNotice([]string{hostileIdentifier}, []UnmanagedSchemaConfigNoticeData{{Database: hostileIdentifier, SchemaPath: hostileIdentifier}}),
+		"unmanaged schema passing check summary":       unmanagedSchemaPassingCheckSummary(hostileIdentifier),
 		"invalid environment available list":           RenderInvalidEnv("apply", []string{hostileIdentifier}),
 		"database not found for a hostile -d":          RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier}),
 		"scoped database not found for a hostile -d":   RenderDatabaseNotFound(SchemaErrorData{DatabaseName: hostileIdentifier, SearchedDirs: []string{"schema"}}),
@@ -78,4 +79,9 @@ func TestHostileIdentifierNeverEscapesItsCodeSpan(t *testing.T) {
 			}
 		})
 	}
+}
+
+func unmanagedSchemaPassingCheckSummary(identifier string) string {
+	_, summary := RenderUnmanagedSchemaPassingCheck(identifier, []UnmanagedSchemaConfigNoticeData{{Database: identifier, SchemaPath: identifier}})
+	return summary
 }

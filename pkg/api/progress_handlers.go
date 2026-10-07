@@ -222,6 +222,7 @@ func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.
 		OnFailure:           op.OnFailure,
 		ErrorCode:           deriveErrorCode(op.State, op.ErrorMessage),
 		ErrorMessage:        op.ErrorMessage,
+		AlreadyConverged:    op.AlreadyConverged,
 	}
 	if op.StartedAt != nil {
 		resp.StartedAt = op.StartedAt.Format(time.RFC3339)
@@ -414,8 +415,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// Reuse the operation rows already listed above for multi-op detection.
 	// Operation rows are observability enrichment, not an apply safety gate, so
 	// a storage error (already logged) just omits the per-deployment breakdown.
+	var memberByOperationID map[int64]routing.ExecutionTarget
 	if opsErr == nil {
-		httpResp.Operations, _ = progressOperationsFromRows(ops)
+		httpResp.Operations, memberByOperationID = progressOperationsFromRows(ops)
 		httpResp.Released = s.resolveReleaseLatch(r.Context(), apply, ops)
 	}
 	httpResp.ApplyID = apply.ApplyIdentifier
@@ -450,7 +452,12 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	setRevertSkippedMetadata(httpResp, apply)
 
-	// Overlay per-table timestamps from task records. The proto response
+	// Overlay each table row with its stored task. The data plane mints its
+	// own task identifiers and knows nothing of the control plane's operation
+	// rows, so a proxied row carries the control-plane task identity and
+	// rollout member only once its stored task is matched; polls answered from
+	// storage already carry both, and a watcher keying on task_id must see the
+	// same identity whichever source answered. The proto response also
 	// doesn't carry task timestamps, but storage has them from engine
 	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
@@ -468,13 +475,20 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 		}
 		for _, tpr := range httpResp.Tables {
 			task, ok := taskIndex.Lookup(tpr.Keyspace, tpr.TableName, tpr.DDL)
-			if ok {
-				if task.StartedAt != nil && tpr.StartedAt == "" {
-					tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
-				}
-				if task.CompletedAt != nil && tpr.CompletedAt == "" {
-					tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
-				}
+			if !ok {
+				s.logger.Debug("progress row keeps the data plane's task identifier: no stored task matches its statement",
+					append(apply.LogAttrs(),
+						"namespace", tpr.Keyspace,
+						"table", tpr.TableName,
+						"ddl", tpr.DDL)...)
+				continue
+			}
+			attributeStoredTask(tpr, task, memberByOperationID)
+			if task.StartedAt != nil && tpr.StartedAt == "" {
+				tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
+			}
+			if task.CompletedAt != nil && tpr.CompletedAt == "" {
+				tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
 			}
 		}
 	}
@@ -1186,14 +1200,8 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			Throttled:           task.Throttled,
 			ThrottleReason:      task.ThrottleReason,
 			IsInstant:           task.IsInstant,
-			TaskID:              task.TaskIdentifier,
 		}
-		if task.ApplyOperationID != nil {
-			if member, ok := memberByOperationID[*task.ApplyOperationID]; ok {
-				tpr.Deployment = member.Deployment
-				tpr.Target = member.Target
-			}
-		}
+		attributeStoredTask(tpr, task, memberByOperationID)
 		if task.StartedAt != nil {
 			tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
 		}
@@ -1204,6 +1212,22 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 
 	return httpResp, nil
+}
+
+// attributeStoredTask stamps a table row with the control-plane identity of
+// its stored task: the task identifier, and the rollout member that runs it
+// when the task belongs to an operation row the caller has loaded. Every
+// progress source hands its rows through here so one task reads under one
+// task_id, deployment, and target on every poll.
+func attributeStoredTask(tpr *apitypes.TableProgressResponse, task *storage.Task, memberByOperationID map[int64]routing.ExecutionTarget) {
+	tpr.TaskID = task.TaskIdentifier
+	if task.ApplyOperationID == nil {
+		return
+	}
+	if member, ok := memberByOperationID[*task.ApplyOperationID]; ok {
+		tpr.Deployment = member.Deployment
+		tpr.Target = member.Target
+	}
 }
 
 // overlayApplyOptions populates the options map on the response from the apply record.
