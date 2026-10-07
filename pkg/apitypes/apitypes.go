@@ -1341,10 +1341,19 @@ func (r *PlanResponse) DirectChanges() []*TableChangeResponse {
 // AllChangesDirect reports whether every planned change is a direct-execution
 // change (and at least one exists). Options that only affect engine-driven
 // statements — like a deferred cutover — have nothing to act on in such a
-// plan, so their commands are rejected rather than silently ignored.
+// plan, so their commands are rejected rather than silently ignored. A
+// namespace whose shards carry changes of their own runs as those shard
+// changes, so its namespace-level table changes, a collapsed view of them, are
+// not consulted.
 func (r *PlanResponse) AllChangesDirect() bool {
 	if r == nil {
 		return false
+	}
+	carriedByShards := map[string]bool{}
+	for _, sp := range r.Shards {
+		if sp != nil && len(sp.Changes) > 0 {
+			carriedByShards[sp.Namespace] = true
+		}
 	}
 	total := 0
 	for _, sc := range r.Changes {
@@ -1353,6 +1362,9 @@ func (r *PlanResponse) AllChangesDirect() bool {
 		}
 		if sc.HasVSchemaChange() || sc.NeedsFinalizer() {
 			return false
+		}
+		if carriedByShards[sc.Namespace] {
+			continue
 		}
 		total += len(sc.TableChanges)
 		for _, t := range sc.TableChanges {

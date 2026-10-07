@@ -110,6 +110,20 @@ func TestPlanAllChangesDirect(t *testing.T) {
 			Namespaces: map[string]*NamespacePlanData{"testdb": {Tables: []TableChange{direct}}},
 			Shards:     []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{engine}}},
 		}, want: false},
+		{name: "direct shard changes under an engine-driven collapsed row", plan: &Plan{
+			Namespaces: map[string]*NamespacePlanData{"testdb": {Tables: []TableChange{engine}}},
+			Shards: []ShardPlan{
+				{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}},
+				{Namespace: "testdb", Shard: "80-", Changes: []TableChange{direct}},
+			},
+		}, want: true},
+		{name: "an engine-driven namespace no shard carries", plan: &Plan{
+			Namespaces: map[string]*NamespacePlanData{
+				"testdb":  {Tables: []TableChange{direct}},
+				"lookups": {Tables: []TableChange{engine}},
+			},
+			Shards: []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}}},
+		}, want: false},
 		{name: "direct shard changes only", plan: &Plan{
 			Shards: []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}}},
 		}, want: true},
