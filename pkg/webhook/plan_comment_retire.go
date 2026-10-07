@@ -20,6 +20,9 @@ type planCommentSlot struct {
 	DatabaseType string
 	Environments []string
 	HeadSHA      string
+	// UpToDate records that the comment shows nothing to act on, so a later
+	// plan can tell whether the comment still matches its outcome.
+	UpToDate bool
 }
 
 // environmentScope canonicalizes the slot's environments (sorted,
@@ -86,6 +89,7 @@ func (h *Handler) postTrackedPlanComment(repo string, pr int, installationID int
 		HeadSHA:          slot.HeadSHA,
 		GitHubCommentID:  commentID,
 		GitHubNodeID:     nodeID,
+		UpToDate:         slot.UpToDate,
 	}
 	if err := h.service.Storage().PlanComments().Insert(ctx, posted); err != nil {
 		// The comment is live on GitHub either way, but without a row it can
@@ -124,32 +128,50 @@ func (h *Handler) retireSupersededPlanComments(ctx context.Context, client *ghcl
 	h.retireSupersededPlanCommentRows(ctx, client, priors, posted.HeadSHA, posted)
 }
 
-// slotShowsPlanFromPriorHead reports whether the slot still shows a plan
-// comment rendered at a head other than headSHA. An auto-plan that resolves
-// to no changes posts its comment only when this holds, so the comment it
-// supersedes is replaced rather than removed with nothing in its place. A
-// failed read reports true: an extra visible comment is the safe failure,
+// priorHeadPlanCommentNeedsReplacing reports whether the slot still shows a
+// plan comment from a head other than slot.HeadSHA that this head's plan
+// comment must replace, for an auto-plan that would otherwise post nothing.
+//
+// When the push left the schema inputs unchanged (inputsUnchanged), a visible
+// comment still covers those inputs, but the live target can move without
+// them — a change applied outside this PR turns a plan with DDL into no
+// changes. Such a comment is kept only while its recorded outcome matches
+// slot.UpToDate. Otherwise any prior-head comment is replaced, so an
+// auto-plan that resolves to no changes supersedes the visible answer rather
+// than removing it and leaving nothing.
+//
+// A failed read reports true: an extra visible comment is the safe failure,
 // while a wrong false would leave a stale plan as the PR's only answer.
-func (h *Handler) slotShowsPlanFromPriorHead(ctx context.Context, repo string, pr int, database, databaseType, headSHA string) bool {
+func (h *Handler) priorHeadPlanCommentNeedsReplacing(ctx context.Context, repo string, pr int, slot planCommentSlot, inputsUnchanged bool) bool {
 	slotAttrs := []any{
 		"repo", repo, "pr", pr,
-		"database", database, "database_type", databaseType,
-		"head_sha", headSHA,
+		"database", slot.Database, "database_type", slot.DatabaseType,
+		"head_sha", slot.HeadSHA, "up_to_date", slot.UpToDate,
 	}
-	comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx, repo, pr, database, databaseType)
+	comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx, repo, pr, slot.Database, slot.DatabaseType)
 	if err != nil {
-		h.logger.Error("failed to list the slot's plan comments; posting the no-changes plan comment so the PR still shows a current answer",
+		h.logger.Error("failed to list the slot's plan comments; posting the plan comment so the PR still shows a current answer",
 			append(slotAttrs, "error", err)...)
 		return true
 	}
 	for _, c := range comments {
-		if c.HeadSHA != headSHA {
-			h.logger.Info("slot shows a plan comment from a prior head", planCommentAttrs(c)...)
+		if c.HeadSHA == slot.HeadSHA {
+			continue
+		}
+		if !inputsUnchanged {
+			h.logger.Info("plan comment from a prior head is visible; this head's plan comment replaces it",
+				append(planCommentAttrs(c), "current_head_sha", slot.HeadSHA)...)
+			return true
+		}
+		if c.UpToDate != slot.UpToDate {
+			h.logger.Info("plan comment from a prior head shows a different outcome than this head's plan; this head's plan comment replaces it",
+				append(planCommentAttrs(c), "current_head_sha", slot.HeadSHA,
+					"comment_up_to_date", c.UpToDate, "plan_up_to_date", slot.UpToDate)...)
 			return true
 		}
 	}
-	h.logger.Debug("slot shows no plan comment from a prior head",
-		append(slotAttrs, "visible_comments", len(comments))...)
+	h.logger.Debug("no plan comment from a prior head needs replacing",
+		append(slotAttrs, "inputs_unchanged", inputsUnchanged, "visible_comments", len(comments))...)
 	return false
 }
 

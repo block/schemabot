@@ -437,6 +437,14 @@ func TestPlanCommentDeleteFailureRetriesOnNextSupersede(t *testing.T) {
 // that posting through the handler would run.
 func insertPlanCommentRow(t *testing.T, st storage.Storage, repo string, pr int, database, scope, headSHA string, commentID int64, nodeID string) {
 	t.Helper()
+	insertPlanCommentRowWithOutcome(t, st, repo, pr, database, scope, headSHA, commentID, nodeID, false)
+}
+
+// insertPlanCommentRowWithOutcome is insertPlanCommentRow for a comment whose
+// recorded outcome matters to the test: upToDate marks a comment that showed
+// nothing to act on.
+func insertPlanCommentRowWithOutcome(t *testing.T, st storage.Storage, repo string, pr int, database, scope, headSHA string, commentID int64, nodeID string, upToDate bool) {
+	t.Helper()
 	require.NoError(t, st.PlanComments().Insert(t.Context(), &storage.PlanComment{
 		Repository:       repo,
 		PullRequest:      pr,
@@ -446,6 +454,7 @@ func insertPlanCommentRow(t *testing.T, st storage.Storage, repo string, pr int,
 		HeadSHA:          headSHA,
 		GitHubCommentID:  commentID,
 		GitHubNodeID:     nodeID,
+		UpToDate:         upToDate,
 	}))
 }
 

@@ -2073,6 +2073,13 @@ type PlanComment struct {
 	// mutation.
 	GitHubNodeID string
 
+	// UpToDate records that the comment showed nothing to act on: no changes,
+	// rollout work, errors, or drift. A later plan whose outcome differs
+	// replaces the comment even when the schema inputs did not change, so a
+	// retained comment never contradicts the current plan. False is the safe
+	// default: a comment not known to be up to date is replaced.
+	UpToDate bool
+
 	// MinimizedAt is set only after the GitHub minimize call succeeded. Nil
 	// means the comment was not minimized — including after a failed
 	// minimize, so the next supersede retries it.

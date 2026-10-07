@@ -178,6 +178,10 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		DatabaseType: schemaResult.Type,
 		Environments: []string{environment},
 		HeadSHA:      schemaResult.HeadSHA,
+		UpToDate: planCommentUpToDate(templates.MultiEnvPlanCommentData{
+			Environments: []string{environment},
+			Plans:        map[string]*templates.PlanCommentData{environment: &commentData},
+		}, drift.work.pending > 0),
 	}, templates.RenderPlanComment(commentData))
 
 	// When drift blocked the check, or any rollout member has work (the primary
@@ -630,62 +634,65 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 			"environments", len(pendingWorkUnstored))
 	}
 
-	// Auto-plan: skip the comment only when there is genuinely nothing to show —
-	// no changes on any rollout member, no errors, and no deployment drift. A
-	// member with work keeps the check pending, and a drifted or unverifiable
-	// deployment fails it closed, even when every primary plan is a clean no-op,
-	// so the comment must still post to explain the check; skipping it would
-	// leave a check that is not passing with no visible reason on the PR.
-	if isAutoPlan {
-		hasErrors := len(multiEnvData.Errors) > 0
-		anyChanges := false
-		for _, plan := range multiEnvData.Plans {
-			if plan != nil && len(plan.Changes) > 0 {
-				anyChanges = true
-				break
-			}
-		}
-		// Schema this deployment does not manage keeps the comment too: on an
-		// environment-scoped deployment the comment is the PR's only mention
-		// of it.
-		if !anyChanges && !rolloutHasWork && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) && len(unmanagedSchema) == 0 {
-			// The visible plan was proven to cover this head's schema inputs,
-			// so it stays as the PR's answer rather than being replaced on
-			// every schema-neutral push.
-			if !postPlanComment {
-				h.logger.Info("auto-plan: no changes, errors, or drift detected; refreshed checks and left the visible plan comment in place because it covers the current schema inputs",
-					"repo", repo, "pr", pr, "database", multiEnvData.Database,
-					"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
-				return
-			}
-			// Once the PR shows a plan answer it keeps showing a current one:
-			// a prior head's comment is superseded by posting this head's
-			// no-changes comment, never by removing it and leaving nothing.
-			// A PR that never showed a plan stays quiet.
-			if !h.slotShowsPlanFromPriorHead(ctx, repo, pr, multiEnvData.Database, multiEnvData.DatabaseType, multiEnvData.HeadSHA) {
-				h.logger.Info("auto-plan: no changes, errors, or drift detected and no plan comment from a prior head is visible; skipping comment",
-					"repo", repo, "pr", pr, "database", multiEnvData.Database,
-					"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
-				return
-			}
-			h.logger.Info("auto-plan: no changes, errors, or drift detected; posting the no-changes plan comment to supersede the plan comment from a prior head",
-				"repo", repo, "pr", pr, "database", multiEnvData.Database,
-				"database_type", multiEnvData.DatabaseType, "head_sha", multiEnvData.HeadSHA)
-		}
-	}
-
-	if !postPlanComment {
-		h.logger.Info("auto-plan refreshed checks without posting plan comment", "repo", repo, "pr", pr, "database", multiEnvData.Database)
-		return
-	}
-
-	// Post a single combined comment
-	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
+	slot := planCommentSlot{
 		Database:     multiEnvData.Database,
 		DatabaseType: multiEnvData.DatabaseType,
 		Environments: multiEnvData.Environments,
 		HeadSHA:      multiEnvData.HeadSHA,
-	}, templates.RenderMultiEnvPlanComment(multiEnvData))
+		UpToDate:     planCommentUpToDate(multiEnvData, rolloutHasWork),
+	}
+
+	// The visible plan comment was proven to cover this head's schema inputs.
+	// It stays the PR's answer unless its outcome no longer matches this plan,
+	// rather than being re-posted on every schema-neutral push.
+	if !postPlanComment {
+		if !h.priorHeadPlanCommentNeedsReplacing(ctx, repo, pr, slot, true) {
+			h.logger.Info("auto-plan refreshed checks without posting plan comment because the visible plan comment covers the current schema inputs and outcome",
+				"repo", repo, "pr", pr, "database", slot.Database,
+				"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA, "up_to_date", slot.UpToDate)
+			return
+		}
+		h.logger.Info("auto-plan posting plan comment because the visible plan comment no longer matches the plan outcome",
+			"repo", repo, "pr", pr, "database", slot.Database,
+			"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA, "up_to_date", slot.UpToDate)
+	} else if isAutoPlan && slot.UpToDate && len(unmanagedSchema) == 0 {
+		// Auto-plan skips the comment only when there is genuinely nothing to
+		// show and the PR has never shown a plan. Schema this deployment does
+		// not manage keeps the comment: on an environment-scoped deployment the
+		// comment is the PR's only mention of it. Once the PR shows a plan
+		// answer it keeps showing a current one: a prior head's comment is
+		// superseded by posting this head's no-changes comment, never by
+		// removing it and leaving nothing.
+		if !h.priorHeadPlanCommentNeedsReplacing(ctx, repo, pr, slot, false) {
+			h.logger.Info("auto-plan: no changes, errors, or drift detected and no plan comment from a prior head is visible; skipping comment",
+				"repo", repo, "pr", pr, "database", slot.Database,
+				"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA)
+			return
+		}
+		h.logger.Info("auto-plan: no changes, errors, or drift detected; posting the no-changes plan comment to supersede the plan comment from a prior head",
+			"repo", repo, "pr", pr, "database", slot.Database,
+			"database_type", slot.DatabaseType, "head_sha", slot.HeadSHA)
+	}
+
+	// Post a single combined comment
+	h.postTrackedPlanComment(repo, pr, installationID, slot, templates.RenderMultiEnvPlanComment(multiEnvData))
+}
+
+// planCommentUpToDate reports whether the plan shows nothing to act on: no
+// changes on any rollout member, no errors, and no deployment drift. A member
+// with work keeps the check pending, and a drifted or unverifiable deployment
+// fails it closed, even when every primary plan is a clean no-op, so neither
+// is up to date.
+func planCommentUpToDate(data templates.MultiEnvPlanCommentData, rolloutHasWork bool) bool {
+	if rolloutHasWork || len(data.Errors) > 0 || templates.AnyEnvHasDriftToShow(data) {
+		return false
+	}
+	for _, plan := range data.Plans {
+		if plan != nil && len(plan.Changes) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) postFailingAggregateForMultiEnvSetupError(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, database string, err error) {

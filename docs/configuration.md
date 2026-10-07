@@ -1979,7 +1979,11 @@ still visible, the auto-plan posts its no-changes plan comment, which
 supersedes the prior one like any other plan comment. A PR that has never shown
 a plan comment gets no comment for a no-changes auto-plan; the check run alone
 reports the green state. A push that changes no schema input files leaves the
-visible plan comment in place, since it still covers the PR's schema files.
+visible plan comment in place while it still matches the plan: a comment that
+shows changes stays while there are still changes, and one that shows none
+stays while there are still none. When the live database moved without the
+schema files changing, for example after a change applied outside the PR, the
+auto-plan posts a new plan comment that supersedes the outdated one.
 
 By default, a superseded plan comment no apply ever acted on is deleted from
 the PR timeline outright — its DDL never ran and is reproducible from the

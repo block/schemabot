@@ -547,10 +547,11 @@ func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Chec
 	h.logger.Info("re-planning after a terminal apply: the PR head moved while the apply held its check, so no plan result covers the current commit",
 		logFields...)
 	h.goSafe(a.Repository, a.PullRequest, a.InstallationID, "", func() {
-		// System-triggered: no actor to authorize, and no comment — the operator
-		// asked for an apply, not for a plan. The stored check state it writes
-		// is the whole point. It re-plans the one database the settled apply
-		// held the check for.
+		// System-triggered: no actor to authorize, and no new comment while the
+		// visible plan comment still matches the outcome — the operator asked
+		// for an apply, not for a plan. The stored check state it writes is the
+		// whole point. It re-plans the one database the settled apply held the
+		// check for.
 		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil)
 	})
 }
