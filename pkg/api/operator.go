@@ -1105,6 +1105,9 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 
 	resumed, resumeErr := s.resumeClaimedApply(runCtx, driverID, apply, op.ID, op.Deployment)
 	stopHeartbeat()
+	if s.handBackParentOfDisplacedDrive(ctx, driverID, op, opLease, applyLease) {
+		return
+	}
 	if !resumed {
 		if errors.Is(resumeErr, tern.ErrNoTasksForApplyOperation) {
 			// The drive failed closed: the operation has no tasks, so it can
@@ -1996,6 +1999,66 @@ func (s *Service) releaseParentApplyClaim(ctx context.Context, driverID int, app
 			"driver", driverID,
 			"apply_operation_id", op.ID,
 			"operation_deployment", op.Deployment)...)
+}
+
+// handBackParentOfDisplacedDrive releases the parent apply lease a
+// single-operation drive still holds when the drive ended because it lost its
+// operation lease, and reports whether it did lose it. A displaced drive has
+// nothing left to persist: the operation and its tasks belong to whoever
+// holds the operation lease now, or to the next poll if nobody does.
+//
+// The operation claim re-leases a row on that row's own heartbeat, but the
+// drive renews the parent with its state writes as well as its heartbeat, so
+// the operation can go stale while the parent stays fresh. A peer then takes
+// the operation, is refused the parent, and releases the operation again, and
+// this drive's next operation-scoped write is refused and ends it. From then
+// on nobody drives the apply, yet the parent lease left here refuses every
+// claim until it goes stale a full staleness window later. Handing it back
+// makes the apply claimable on the next poll.
+//
+// The drive has returned, so the engine work it started is halted. If the
+// halt failed, the target's own lock refuses the next driver's start without
+// spending the apply's recovery budget, exactly as it would once the lease
+// went stale. Shutdown owns the handback while its drain is open, because it
+// halts the engines only after every drive has returned.
+func (s *Service) handBackParentOfDisplacedDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease, applyLease storage.ApplyLease) bool {
+	if s.claimDrainInProgress() {
+		return false
+	}
+	current, err := s.storage.ApplyOperations().Get(ctx, op.ID)
+	if err != nil {
+		s.logger.Warn("operator: could not read the operation after its drive returned to check whether the drive was displaced; any parent lease it left behind is retried once it goes stale",
+			append(op.LogAttrs(), "driver", driverID, "error", err)...)
+		return false
+	}
+	if current != nil && current.LeaseToken == opLease.Token {
+		return false
+	}
+	parent, err := s.storage.Applies().Get(ctx, applyLease.ApplyID)
+	if err != nil {
+		s.logger.Warn("operator: could not read the parent apply of a displaced drive; its lease is retried once it goes stale",
+			append(op.LogAttrs(), "driver", driverID, "error", err)...)
+		return true
+	}
+	if parent == nil || state.IsTerminalApplyState(parent.State) {
+		// Settled or gone: there is nothing to hand over, and backdating a
+		// settled apply's heartbeat would misreport when it finished.
+		return true
+	}
+	released, err := s.storage.Applies().ReleaseClaim(ctx, applyLease)
+	if err != nil {
+		s.logger.Warn("operator: could not hand back the parent apply lease of a displaced drive; the apply is retried once the lease goes stale",
+			append(parent.LogAttrs(), "driver", driverID, "apply_operation_id", op.ID, "error", err)...)
+		return true
+	}
+	if !released {
+		s.logger.Debug("operator: a displaced drive's parent apply lease had already moved on; nothing to hand back",
+			append(parent.LogAttrs(), "driver", driverID, "apply_operation_id", op.ID)...)
+		return true
+	}
+	s.logger.Info("operator: handed back the parent apply lease of a drive that lost its operation lease; the apply is claimable on the next poll",
+		append(parent.LogAttrs(), "driver", driverID, "apply_operation_id", op.ID)...)
+	return true
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply

@@ -160,6 +160,14 @@ func spiritLockHolder(t *testing.T, ctx context.Context, target *sql.DB, appDBNa
 // left holding the table afterwards. The same holds for an apply that defers
 // its cutover, which drives every table together and is cut over by an
 // operator once the copy is done.
+//
+// That drive also writes the parent apply's state on every progress poll, and
+// that write renews the parent's lease while the operation's heartbeat stays
+// blocked. When the renewal lands after the lease is aged, the peer takes the
+// stale operation, is refused the fresh parent, and hands the operation back,
+// and the original learns from its next write that it was displaced. The peer
+// still reclaims the apply on its next poll rather than a staleness window
+// later, because the displaced driver hands back the parent lease it left.
 func TestOperator_LeaseTakeoverDoesNotOrphanTheEngineRun(t *testing.T) {
 	t.Run("sequential", func(t *testing.T) { testLeaseTakeoverDoesNotOrphanTheEngineRun(t, false) })
 	t.Run("deferred cutover", func(t *testing.T) { testLeaseTakeoverDoesNotOrphanTheEngineRun(t, true) })
