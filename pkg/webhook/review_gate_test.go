@@ -15,6 +15,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -201,10 +202,11 @@ func TestCheckReviewGate_OperatorUserApproval(t *testing.T) {
 }
 
 // An operator approves an earlier commit, then the author pushes more commits
-// on top of it. When the head descends from the approved commit, the history
-// compare decides on its own: a change under the database's schema inputs
-// leaves the PR blocked until someone approves the head, and a push that
-// touches no schema or config file keeps the approval.
+// on top of it. When the head descends from the approved commit, a change the
+// history compare lists under the database's schema inputs leaves the PR
+// blocked until someone approves the head, without reading the inputs; a push
+// that touches nothing under them keeps the approval once their content is
+// confirmed identical.
 func TestCheckReviewGate_ApprovalCommit(t *testing.T) {
 	const approvedSHA = "aaa111"
 	compareRange := approvedSHA + "..." + reviewGateTestHeadSHA
@@ -224,7 +226,7 @@ func TestCheckReviewGate_ApprovalCommit(t *testing.T) {
 			wantApproved: true,
 		},
 		{
-			name:          "approval on an earlier commit counts when only non-schema files changed",
+			name:          "approval on an earlier commit counts when only files outside the schema inputs changed",
 			reviewCommit:  approvedSHA,
 			compareStatus: "ahead",
 			compareFiles:  []string{"README.md", "app/orders.go"},
@@ -280,6 +282,11 @@ func TestCheckReviewGate_ApprovalCommit(t *testing.T) {
 				w.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(w).Encode(reviewGateComparison(tt.compareStatus, tt.compareFiles, 0))
 			})
+			schemaFiles := map[string]string{
+				"schema/testdb/schemabot.yaml": "database: orders\n",
+				"schema/testdb/orders.sql":     "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))",
+			}
+			registerReviewGateGitObjects(t, mux, map[string]map[string]string{approvedSHA: schemaFiles, reviewGateTestHeadSHA: schemaFiles})
 
 			client, err := h.clientForRepo("octocat/hello-world", 12345)
 			require.NoError(t, err)
@@ -454,6 +461,20 @@ func TestCheckReviewGate_ApprovalContentComparison(t *testing.T) {
 			wantApproved:  true,
 		},
 		{
+			name: "linear history where only a symlinked config's target changed does not count",
+			approved: func() map[string]string {
+				files := maps.Clone(approvedFiles)
+				files["schema/testdb/schemabot.yaml"] = reviewGateSymlink + "../shared/orders.yaml"
+				files["schema/shared/orders.yaml"] = "database: orders\n"
+				return files
+			}(),
+			changeHead: func(files map[string]string) {
+				files["schema/shared/orders.yaml"] = "database: orders\nignore_tables:\n  - orders\n"
+			},
+			compareStatus: "ahead",
+			compareFiles:  []string{"schema/shared/orders.yaml"},
+		},
+		{
 			name:            "an approved commit GitHub cannot find does not count",
 			changeHead:      func(map[string]string) {},
 			compareNotFound: true,
@@ -556,8 +577,10 @@ const reviewGateSymlink = "symlink:"
 // SHAs are content-addressed like Git's, so a directory has the same tree SHA
 // at two commits exactly when its content is identical. Unknown commits and
 // objects are 404s.
-func registerReviewGateGitObjects(t *testing.T, mux *http.ServeMux, commits map[string]map[string]string) {
+// It returns the number of blob reads served.
+func registerReviewGateGitObjects(t *testing.T, mux *http.ServeMux, commits map[string]map[string]string) *atomic.Int64 {
 	t.Helper()
+	blobReads := new(atomic.Int64)
 	type object struct {
 		name, mode, kind, sha string
 	}
@@ -633,6 +656,7 @@ func registerReviewGateGitObjects(t *testing.T, mux *http.ServeMux, commits map[
 		_ = json.NewEncoder(w).Encode(&gh.Tree{SHA: new(treeSHA), Entries: listed, Truncated: new(false)})
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/blobs/{sha}", func(w http.ResponseWriter, r *http.Request) {
+		blobReads.Add(1)
 		content, ok := blobs[r.PathValue("sha")]
 		if !ok {
 			notFound(w)
@@ -642,6 +666,47 @@ func registerReviewGateGitObjects(t *testing.T, mux *http.ServeMux, commits map[
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(&gh.Blob{Content: &encoded, Encoding: new("base64")})
 	})
+	return blobReads
+}
+
+// A schema directory holds more symlinks than the content comparison may
+// follow. The comparison cannot be completed, so the approval does not count,
+// and it gives up before reading any symlink: a directory full of links costs
+// one listing, not a GitHub read per link.
+func TestCheckReviewGate_SymlinkBudgetCheckedBeforeReads(t *testing.T) {
+	const approvedSHA = "aaa111"
+	files := map[string]string{
+		"schema/testdb/schemabot.yaml":    "database: orders\n",
+		"schema/testdb/orders/orders.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`))",
+	}
+	for i := range 200 {
+		files[fmt.Sprintf("schema/testdb/alias_%03d", i)] = reviewGateSymlink + "orders"
+	}
+	h, mux := setupReviewGateHandler(t, reviewGateTestConfig(func(cfg *api.ServerConfig) {
+		db := cfg.Databases["orders"]
+		db.OperatorUsers = []string{"bob"}
+		cfg.Databases["orders"] = db
+	}))
+	registerPREndpoint(mux, "alice")
+	registerReviewsEndpoint(mux, []*gh.PullRequestReview{
+		{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(approvedSHA)},
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(reviewGateComparison("diverged", nil, 0))
+	})
+	blobReads := registerReviewGateGitObjects(t, mux, map[string]map[string]string{approvedSHA: files, reviewGateTestHeadSHA: files})
+	client, err := h.clientForRepo("octocat/hello-world", 12345)
+	require.NoError(t, err)
+
+	schema := reviewGateSchema("schema/testdb", reviewGateTestHeadSHA)
+	schema.ConfigPath = "schema/testdb/schemabot.yaml"
+	result, err := h.checkReviewGate(t.Context(), client, "octocat/hello-world", 1, schema)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.False(t, result.Approved)
+	assert.Equal(t, []string{"bob"}, result.StaleApprovers)
+	assert.Zero(t, blobReads.Load(), "the symlink budget is checked before any symlink is read")
 }
 
 // Two operators approved the same earlier commit and a third approved the

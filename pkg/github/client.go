@@ -1200,9 +1200,12 @@ func (ic *InstallationClient) SchemaPathsIdenticalBetween(ctx context.Context, r
 
 		switch {
 		case headEntry.Type == "tree":
-			targets, err := ic.symlinkTargetsInTree(ctx, repo, current, headEntry.SHA)
+			// Every target still pending will be compared, so the budget
+			// left for this directory's symlinks is what remains after them.
+			budget := maxComparedSchemaPaths - len(visited) - len(pending)
+			targets, err := ic.symlinkTargetsInTree(ctx, repo, current, headEntry.SHA, budget)
 			if err != nil {
-				return false, "", err
+				return false, "", fmt.Errorf("compare schema paths in %s between %s and %s: %w", repo, baseSHA, headSHA, err)
 			}
 			identicalDirs = append(identicalDirs, current)
 			pending = append(pending, targets...)
@@ -1218,8 +1221,10 @@ func (ic *InstallationClient) SchemaPathsIdenticalBetween(ctx context.Context, r
 }
 
 // symlinkTargetsInTree lists the directory tree treeSHA at dir and returns the
-// repo-relative target of every symlink inside it.
-func (ic *InstallationClient) symlinkTargetsInTree(ctx context.Context, repo, dir, treeSHA string) ([]string, error) {
+// repo-relative target of every symlink inside it. Each target costs a blob
+// read, so a directory holding more than budget symlinks is an error before
+// any of them is read.
+func (ic *InstallationClient) symlinkTargetsInTree(ctx context.Context, repo, dir, treeSHA string, budget int) ([]string, error) {
 	entries, truncated, err := ic.FetchGitTree(ctx, repo, treeSHA)
 	if err != nil {
 		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, err)
@@ -1227,11 +1232,17 @@ func (ic *InstallationClient) symlinkTargetsInTree(ctx context.Context, repo, di
 	if truncated {
 		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, ErrGitTreeTruncated)
 	}
-	var targets []string
+	var symlinks []TreeEntry
 	for _, entry := range entries {
-		if entry.Mode != gitSymlinkMode {
-			continue
+		if entry.Mode == gitSymlinkMode {
+			symlinks = append(symlinks, entry)
 		}
+	}
+	if len(symlinks) > budget {
+		return nil, fmt.Errorf("schema path %s in repo %s holds %d symlinks, more than the %d paths left to compare", dir, repo, len(symlinks), max(budget, 0))
+	}
+	targets := make([]string, 0, len(symlinks))
+	for _, entry := range symlinks {
 		target, err := ic.resolveSymlinkBlobTarget(ctx, repo, path.Join(dir, entry.Path), entry.SHA)
 		if err != nil {
 			return nil, err

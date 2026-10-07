@@ -219,8 +219,8 @@ type approvalCoverage struct {
 
 // approvalCoversHead reports whether an approval still stands for the PR head.
 // An approval on the head commit covers it. An approval on an earlier commit
-// covers it only when GitHub proves none of the database's schema inputs
-// changed between that commit and the head (see schemaUnchangedSince).
+// covers it only when GitHub proves every one of the database's schema inputs
+// is identical at that commit and the head (see schemaUnchangedSince).
 // Anything that prevents that proof (an unknown commit, a tree GitHub cannot
 // list completely) leaves the approval not counting. A comparison GitHub could
 // not answer — it was unavailable, or the evaluation was cancelled — proves
@@ -249,17 +249,16 @@ func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.Insta
 }
 
 // schemaUnchangedSince decides whether the database's schema inputs are the
-// same at the approved commit and the head. It reads the history compare
-// first, which settles the common cases in one call: when the head descends
-// from the approved commit, a changed file under an input path is a change,
-// and no schema or config file changed anywhere means nothing changed.
+// same at the approved commit and the head. Only the content comparison
+// (schemaContentUnchangedSince) can count the approval: a changed-file list
+// cannot show that an input reached through a symlink, such as a config or
+// namespace whose target lies outside the input paths, is unchanged.
 //
-// Every other case is decided by comparing the inputs' content at the two
-// commits (schemaContentUnchangedSince): a compare GitHub cannot use as proof
+// The history compare is read first because it can settle the other answer
+// in one call: when the head descends from the approved commit, a changed
+// file under an input path is a change. A compare GitHub cannot use as proof
 // (history rewritten by a rebase or force-push, a truncated file list, an
-// unknown commit), and a compare whose only schema changes lie outside this
-// database's inputs, such as another database's schema arriving from the
-// default branch.
+// unknown commit) settles nothing and goes to the content comparison too.
 func (h *Handler) schemaUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (bool, error) {
 	files, err := client.FetchChangedFilesBetween(ctx, c.repo, approval.CommitID, c.headSHA)
 	if err != nil {
@@ -282,13 +281,7 @@ func (h *Handler) schemaUnchangedSince(ctx context.Context, client *ghclient.Ins
 			"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths)
 		return false, nil
 	}
-	if !ghclient.HasSchemaInputFiles(files) {
-		h.logger.Info("review gate: approval on an earlier commit counts because no schema input changed since it",
-			"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
-			"approved_sha", approval.CommitID, "head_sha", c.headSHA)
-		return true, nil
-	}
-	h.logger.Info("review gate: schema files changed since the approved commit, but none under the database's schema inputs; comparing their content at both commits",
+	h.logger.Info("review gate: no file under the database's schema inputs changed since the approved commit; comparing their content at both commits",
 		"repo", c.repo, "pr", c.pr, "database", c.database, "reviewer", approval.User,
 		"approved_sha", approval.CommitID, "head_sha", c.headSHA, "input_paths", c.inputPaths)
 	return h.schemaContentUnchangedSince(ctx, client, c, approval)
