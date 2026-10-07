@@ -221,6 +221,7 @@ When applying, users can pass options that control execution:
 | `--defer-deploy` | Hold the change before any work starts until manually started (Vitess only). |
 | `--skip-revert` | Skip the revert window that normally opens after cutover (Vitess only), finalizing the change immediately. |
 | `--allow-unsafe` | Permit destructive changes (see [Unsafe Changes](#unsafe-changes) below). |
+| `--target <target>` | Plan and apply one target of the environment's rollout only (see [Apply to one target of a rollout](cli.md#apply-to-one-target-of-a-rollout)). `plan` takes it too. |
 
 ### Unsafe Changes
 

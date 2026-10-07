@@ -20,8 +20,9 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-// handlePlanCommand handles the "schemabot plan -e <env>" command.
-func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, tenant string, installationID int64, deliveryID, requestedBy string, commentID int64) {
+// handlePlanCommand handles the "schemabot plan -e <env>" command. A non-empty
+// target narrows the plan to that one rollout member of the environment.
+func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, environment, databaseName, target, tenant string, installationID int64, deliveryID, requestedBy string, commentID int64) {
 	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("plan: failed to bootstrap command", "error", err)
@@ -131,6 +132,7 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		IgnoredNamespaces: schemaResult.IgnoredNamespaces,
 		IgnoreTables:      schemaResult.IgnoreTables,
 		SourceTrusted:     true,
+		Target:            target,
 	}
 
 	// Execute plan via the service
@@ -154,9 +156,14 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		return
 	}
 
+	if planResp.NarrowedTo != "" {
+		h.postNarrowedPlan(ctx, client, w, repo, pr, installationID, schemaResult, planResp, environment, databaseName, target, tenant, requestedBy)
+		return
+	}
+
 	// Roll up every deployment's diff against the primary plan so drift on a
 	// non-primary deployment fails the check closed at review time.
-	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+	drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
 
 	// Build plan comment data
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
@@ -194,6 +201,33 @@ func (h *Handler) handlePlanCommand(w http.ResponseWriter, repo string, pr int, 
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
 
+	h.writeJSON(w, http.StatusOK, map[string]string{
+		"message": "plan generated successfully",
+		"plan_id": planResp.PlanID,
+	})
+}
+
+// postNarrowedPlan posts the comment for a plan narrowed to one rollout member
+// with --target. The plan covers that member alone, so it says nothing about
+// whether the environment as a whole matches the PR: it records no stored
+// check state and does not recompute the aggregate, leaving the check exactly
+// where the last rollout-wide plan or apply put it (MG-12). Review-time drift
+// is not rolled up either, because the rollup compares every deployment to the
+// rollout's primary member and this plan is not of the primary.
+func (h *Handler) postNarrowedPlan(ctx context.Context, client *ghclient.InstallationClient, w http.ResponseWriter, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment, databaseName, target, tenant, requestedBy string) {
+	h.logger.Info("plan narrowed to one target; stored check state and the aggregate check are left unchanged",
+		"repo", repo, "pr", pr, "database", schemaResult.Database, "environment", environment,
+		"target", target, "narrowed_to", planResp.NarrowedTo, "plan_id", planResp.PlanID, "head_sha", schemaResult.HeadSHA)
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData.ScopedDatabase = databaseName
+	commentData.Target = target
+	h.annotateAttributedChanges(ctx, client, &commentData, planResp, nil, repo, pr, environment)
+	h.postTrackedPlanComment(repo, pr, installationID, planCommentSlot{
+		Database:     schemaResult.Database,
+		DatabaseType: schemaResult.Type,
+		Environments: []string{environment},
+		HeadSHA:      schemaResult.HeadSHA,
+	}, templates.RenderPlanComment(commentData))
 	h.writeJSON(w, http.StatusOK, map[string]string{
 		"message": "plan generated successfully",
 		"plan_id": planResp.PlanID,
@@ -535,7 +569,7 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 
 		// Roll up every deployment's diff against the primary plan so drift on a
 		// non-primary deployment fails the check closed at review time.
-		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+		drift, driftPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
 
 		// Store per-database check record per environment
 		var recoveredApplyOwnedCheckState bool

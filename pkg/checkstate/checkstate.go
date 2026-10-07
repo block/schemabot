@@ -78,6 +78,7 @@ const (
 	BlockManagedDirMissingConfig          = "managed_dir_missing_config"
 	BlockNoAllowedConfiguredEnvironments  = "no_allowed_configured_environments"
 	BlockParticipantUnresolved            = "participant_unresolved"
+	BlockNarrowedApply                    = "narrowed_apply"
 	BlockReviewTimeDeploymentDrift        = storage.ReviewTimeDeploymentDriftBlockingReason
 	BlockNamespacePlacementRefused        = storage.NamespacePlacementRefusedBlockingReason
 )
@@ -106,6 +107,10 @@ const (
 // that re-evaluates the rollup lifts the block once they match. Reading it as
 // a reconciliation would deny the action that actually clears it.
 //
+// A narrowed apply is a guard for the same reason: it changed one target of
+// the rollout, and a plan of the whole environment lifts the block once every
+// target has the change.
+//
 // An unlisted reason is read as blockGuard: the column is a plain string, so a
 // value this table does not know about is one whose remedy cannot be asserted,
 // and the honest reading of an unknown block is that someone has to look at it.
@@ -124,6 +129,7 @@ var blockClasses = map[string]blockClass{
 	BlockPRFileCapExceeded:                blockGuard,
 	BlockManagedDirMissingConfig:          blockGuard,
 	BlockNoAllowedConfiguredEnvironments:  blockGuard,
+	BlockNarrowedApply:                    blockGuard,
 	BlockParticipantUnresolved:            blockAwaitingReport,
 }
 

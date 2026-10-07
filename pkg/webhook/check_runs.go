@@ -165,6 +165,16 @@ var namespacePlacementRefusedBlock = checkBlockReason{
 	message:        "SchemaBot could not plan this environment because its targets entries and the schema files disagree on where a namespace lives, or its plan proposed dropping tables in a namespace the target's entry does not select; make the fix the plan comment names, then re-run plan, or re-run this check if the refusal could not be recorded, before this check can pass.",
 }
 
+// narrowedApplyBlock is used for an apply narrowed to one rollout member with
+// --target: from the moment it is dispatched, and once it completes. It ran on
+// one target, so it cannot show that the environment as a whole has the
+// change, and the check stays blocked until a plan of every target does
+// (MG-12).
+var narrowedApplyBlock = checkBlockReason{
+	blockingReason: checkstate.BlockNarrowedApply,
+	message:        "An apply ran on one target only; plan the whole environment to check every target before this check can pass.",
+}
+
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but
 // the server-configured environments for the database do not overlap this
 // service's allowed_environments. SchemaBot cannot safely plan the schema
@@ -194,5 +204,6 @@ var allCheckBlockReasons = []checkBlockReason{
 	reviewTimeDeploymentDriftBlock,
 	namespacePlacementRefusedBlock,
 	noAllowedConfiguredEnvironmentsBlock,
+	narrowedApplyBlock,
 	{blockingReason: participantUnresolvedBlockingReason},
 }

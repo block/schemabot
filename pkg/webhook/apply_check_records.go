@@ -25,10 +25,38 @@ import (
 // terminal outcome must land on it, so only the manual plan command may
 // override that claim.
 func (h *Handler) storeApplyCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, rollout reviewDriftOutcome, runsMemberWork bool) (string, error) {
+	if planResp.NarrowedTo != "" {
+		return h.storeNarrowedApplyCheck(ctx, client, repo, pr, schema, planResp, environment)
+	}
 	if runsMemberWork {
 		return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, rollout)
 	}
 	return h.storePlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, reviewDriftOutcome{state: driftNotEvaluated})
+}
+
+// narrowedApplyCheckSummary is the stored Change column for an environment
+// whose last apply was narrowed to one target. The apply comment names the
+// target.
+const narrowedApplyCheckSummary = "an apply ran on one target only; plan the whole environment to check every target"
+
+// storeNarrowedApplyCheck blocks the environment's check before an apply
+// narrowed to one rollout member dispatches. The narrowed plan says nothing
+// about the other targets, so it cannot be recorded as the environment's plan
+// result, and the check must not keep reading as a pass from an earlier plan
+// while one target changes (MG-12). The block holds after the apply completes
+// (updateCheckRecordForApplyResult) and lifts when a plan of the whole
+// environment records its own result.
+func (h *Handler) storeNarrowedApplyCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
+	h.logger.Info("apply narrowed to one target; blocking the environment's check until a plan of every target records its result",
+		"repo", repo, "pr", pr, "head_sha", schema.HeadSHA, "environment", environment,
+		"database_type", schema.Type, "database", schema.Database,
+		"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+	blocked := reviewDriftOutcome{state: driftBlocked, summary: narrowedApplyCheckSummary, block: narrowedApplyBlock}
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
+	if err != nil {
+		return headSHA, fmt.Errorf("block check for apply narrowed to %s: %w", planResp.NarrowedTo, err)
+	}
+	return headSHA, nil
 }
 
 // updateCheckRecordForApplyStart updates the stored check state to "in_progress"

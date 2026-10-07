@@ -57,6 +57,7 @@ const (
 	issueCommentGateAutoConfirm         issueCommentGateBlockReason = "auto-confirm flag unsupported for command"
 	issueCommentGateDeferCutover        issueCommentGateBlockReason = "defer-cutover flag unsupported for command"
 	issueCommentGateDatabase            issueCommentGateBlockReason = "database flag unsupported for command"
+	issueCommentGateTarget              issueCommentGateBlockReason = "target flag unsupported for command"
 )
 
 // issueCommentGateBlock evaluates the routing and usage gates shared by the
@@ -100,6 +101,9 @@ func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parse
 	}
 	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(commentBody) {
 		return issueCommentGateDatabase
+	}
+	if !commandSupportsTargetFlag(result.Action) && parser.HasTargetFlag(commentBody) {
+		return issueCommentGateTarget
 	}
 	return issueCommentGatePass
 }
@@ -286,7 +290,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// exactly one deployment: participants defer to the leader on an aggregate
 	// repo, and the respond_to_unscoped policy picks one responder otherwise.
 	if gateReason == issueCommentGateMissingEnvironment {
-		if result.Action == action.Plan {
+		if result.Action == action.Plan && result.Target == "" {
 			// Plan without -e: run for all configured environments. The same
 			// acknowledgment split as scoped commands applies: repos without an
 			// aggregate role and -t-scoped plans acknowledge at dispatch, while
@@ -327,6 +331,13 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		}
 		if result.Action == action.RollbackConfirm {
 			h.postComment(repo, pr, installationID, templates.RenderRollbackMissingEnv())
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
+			return
+		}
+		if result.Target != "" {
+			// A target is a member of one environment's rollout, so a
+			// narrowed command never fans out across environments.
+			h.postComment(repo, pr, installationID, templates.RenderTargetMissingEnv(result.Action, result.Target))
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
 			return
 		}
@@ -441,6 +452,19 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		return
 	}
 
+	if gateReason == issueCommentGateTarget {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping unsupported target flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
+		h.postComment(repo, pr, installationID, templates.RenderUnsupportedTargetFlag(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
 	// The branches above match the shared ladder's reasons one-for-one. A
 	// reason none of them recognized means a gate was added to the ladder
 	// without a request-path branch — the ladder said to block, so block:
@@ -472,7 +496,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	switch result.Action {
 	case action.Plan:
-		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, deliveryID, requestedBy, result.CommentID)
+		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Target, result.Tenant, installationID, deliveryID, requestedBy, result.CommentID)
 	case action.Help:
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})

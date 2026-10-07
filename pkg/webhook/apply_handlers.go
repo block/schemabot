@@ -333,6 +333,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		// that consent, so both have to predict the same apply. The command
 		// carrying the decision is already parsed here.
 		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
+		// A --target apply plans, and then applies, only the rollout member it
+		// names; the other targets are neither planned nor ordered against it.
+		Target: result.Target,
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
@@ -367,7 +370,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// other targets have work, the apply runs their own plans in the same step,
 	// as it runs the primary plan: every gate below reads each target's plan,
 	// and the comment the apply posts renders every target's plan.
-	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
 	primaryTargetConverged := !planResp.HasChanges()
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
 	switch {
@@ -420,6 +423,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	case !primaryTargetConverged:
 		h.logger.Debug("apply: only the primary target's own plan runs",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
+	case planResp.NarrowedTo != "":
+		// The named target already has the change. Its empty plan says nothing
+		// about the other targets, so it records no stored check state.
+		h.logger.Info("apply: the target the apply was narrowed to has no changes; posting its plan without updating stored check state",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData.ScopedDatabase = result.Database
+		commentData.Target = result.Target
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		return false, nil
 	default:
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
@@ -441,6 +455,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if planResp.HasBlockedChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
+		commentData.Target = narrowedTarget(planResp, result.Target)
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
@@ -534,6 +549,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// disclosure coaches is no longer open.
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
+	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner

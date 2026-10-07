@@ -49,6 +49,16 @@ func (h *Handler) executeApply(
 	database := schemaResult.Database
 	dbType := schemaResult.Type
 
+	// apply-confirm names no target: it confirms the plan its apply posted, so
+	// a plan narrowed to one rollout member narrows the re-plan and the apply
+	// to that same member.
+	if result.Target == "" && disclosedPlan != nil && disclosedPlan.NarrowedTo != "" {
+		result.Target = disclosedPlan.NarrowedTo
+		h.logger.Info("apply narrowed to the rollout member its confirmed plan was made for",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", disclosedPlan.PlanIdentifier, "narrowed_to", disclosedPlan.NarrowedTo)
+	}
+
 	// Re-plan for drift detection
 	prNumber := int32(pr)
 	planReq := api.PlanRequest{
@@ -67,6 +77,7 @@ func (h *Handler) executeApply(
 		// predict the apply that is about to run, not the default shape. The
 		// command carrying that decision is already resolved here.
 		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
+		Target:           result.Target,
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
@@ -170,7 +181,7 @@ func (h *Handler) executeApply(
 	// given against, and on an automatic apply, the comment the apply command
 	// posted with every target's plan just before this re-plan. Work that comment
 	// did not show stops for a fresh confirmation or is refused.
-	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
 	primaryTargetConverged := !planResp.HasChanges()
 	refuseRollout := func(reason string) {
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
@@ -279,8 +290,13 @@ func (h *Handler) executeApply(
 		// The target already matches the PR schema — apply found nothing to do.
 		// Record the passing (no-change) check result and refresh the aggregate so
 		// the schema check reflects that the target is up to date, the same as the
-		// no-change plan path.
-		if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
+		// no-change plan path. A narrowed re-plan speaks for one target only, so
+		// it records nothing.
+		if planResp.NarrowedTo != "" {
+			h.logger.Info("narrowed target already has the change; stored check state is left unchanged",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+		} else if headSHA, checkErr := h.storePlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout); checkErr != nil {
 			h.logger.Error("failed to record no-changes check after apply",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", checkErr)
 		} else if headSHA != "" {
@@ -515,6 +531,7 @@ func (h *Handler) executeApply(
 		ExpectedLockOwner:     fmt.Sprintf("%s#%d", repo, pr),
 		ExpectedPendingPlanID: expectedPendingPlanID,
 		ConfirmedMemberWork:   confirmedMemberWork,
+		Target:                result.Target,
 	}
 
 	applyResp, applyID, err := h.service.ExecuteApply(ctx, applyReq)
@@ -734,6 +751,7 @@ func (h *Handler) rejectBlockedChanges(
 	database, dbType := schemaResult.Database, schemaResult.Type
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
+	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
 		"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 		"action", actionName, "plan_id", planResp.PlanID)
@@ -853,6 +871,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
+	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)

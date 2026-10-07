@@ -665,7 +665,10 @@ refusing member work the apply's operation shape cannot carry, rather than settl
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
 (`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`);
-the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`); an environment whose
+the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`); an apply narrowed to
+one member blocking the check before it dispatches (`storeNarrowedApplyCheck` in
+`pkg/webhook/apply_check_records.go`) and when it completes (`completedNarrowedApply` in
+`updateCheckRecordForApplyResult`, `pkg/webhook/check_records.go`); an environment whose
 namespace placement refuses its plan stored as a failing check on every plan command
 (`storeNamespacePlacementCheck` in `pkg/webhook/check_records.go`, called by the single- and
 multi-environment plans in `pkg/webhook/plan.go` on each refusal `planRefusedByNamespacePlacement`
