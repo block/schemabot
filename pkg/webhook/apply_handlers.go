@@ -392,7 +392,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"plan_id", planResp.PlanID, "error", refusalErr)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-					otherTargetPlansUnverifiedMessage(action.Apply, environment))
+					msgOtherTargetPlansUnverified)
 			}
 			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
 		}
@@ -457,7 +457,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"plan_id", planResp.PlanID, "error", deferErr)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-					otherTargetPlansUnverifiedMessage(action.Apply, environment))
+					msgOtherTargetPlansUnverified)
 			}
 			return true, fmt.Errorf("apply command defer-cutover check %s#%d: %w", repo, pr, deferErr)
 		}
@@ -648,7 +648,22 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	// This comment is what discloses the other targets' plans an automatic
+	// apply runs without a confirmation, so that work dispatches only once it
+	// lands. A failed post releases the lock and stays retryable, as a pending
+	// confirmation whose comment never appeared does; the stored check keeps
+	// blocking merge on the pending changes meanwhile.
+	if runsMemberWork {
+		if postErr := h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData)); postErr != nil {
+			h.logger.Error("failed to post the comment disclosing the other targets' plans, so nothing was dispatched; releasing the lock",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "plan_id", planResp.PlanID, "error", postErr)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply disclosure post failure")
+			return true, fmt.Errorf("apply command disclosure of the other targets' plans %s#%d: %w", repo, pr, postErr)
+		}
+	} else {
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)

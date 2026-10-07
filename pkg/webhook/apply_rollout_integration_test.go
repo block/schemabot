@@ -56,8 +56,8 @@ func runRolloutCommandWithFiles(t *testing.T, svc *api.Service, dbName, command 
 }
 
 // register serves anything else the command reads from GitHub, such as the
-// state of another pull request.
-func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, req *http.Request, files map[string]string, register ...func(*http.ServeMux)) *planFlowResult {
+// state of another pull request, or sets how the fake GitHub answers.
+func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, req *http.Request, files map[string]string, register ...func(*http.ServeMux, *planFlowResult)) *planFlowResult {
 	t.Helper()
 
 	mux := http.NewServeMux()
@@ -72,7 +72,7 @@ func runRolloutWebhookWithFiles(t *testing.T, svc *api.Service, dbName string, r
 	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	result := setupFakeGitHubForPlan(t, mux, files, schemabotConfig, dbName)
 	for _, r := range register {
-		r(mux)
+		r(mux, result)
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
@@ -759,7 +759,7 @@ func TestE2EAnotherTargetsDestructiveChangeDisclosesAttributedTable(t *testing.T
 	require.NoError(t, err)
 	command := func(comment string) *planFlowResult {
 		return runRolloutWebhookWithFiles(t, svc, dbName, buildWebhookRequest(t, webhookPayloadOpts{comment: comment, isPR: true}, nil),
-			map[string]string{"users.sql": usersWithEmailSchema}, func(mux *http.ServeMux) { registerOpenPullRequest(mux, 2) })
+			map[string]string{"users.sql": usersWithEmailSchema}, func(mux *http.ServeMux, _ *planFlowResult) { registerOpenPullRequest(mux, 2) })
 	}
 	const owner = "[octocat/hello-world#2](https://github.com/octocat/hello-world/pull/2)"
 
@@ -1464,6 +1464,118 @@ func TestE2EApplyStopsForConfirmationWhenAnotherTargetsPlanChangesWhileStarting(
 	})
 }
 
+// Both targets (eu, the primary, and us) need the column, so the apply command
+// posts both plans and runs them in the same step. Between that comment and the
+// re-plan the apply runs from, eu gains a narrower `email` column out of band,
+// so the primary's own plan is now a `MODIFY COLUMN`. The apply stops for
+// apply-confirm, and the comment names how the primary's statements differ from
+// the plan the apply started from, as it does on a single target.
+func TestE2EApplyNamesThePrimarysDriftWhenItStopsARolloutWhileStarting(t *testing.T) {
+	dbName := "webhook_rollout_primary_changed_auto"
+	var hooked *afterLockStorage
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		hooked = &afterLockStorage{Storage: st}
+		return hooked
+	})
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
+	hooked.onAcquire = func(*storage.Lock) {
+		_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
+		require.NoError(t, err)
+	}
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "Schema changes differ from the plan this apply was started from")
+	assert.Contains(t, body, "`users` (alter)", "the cause names the primary's drifted statement")
+	assert.Contains(t, body, "MODIFY COLUMN `email`", "the comment shows eu's plan as it is now")
+	assert.Contains(t, body, "Confirmation required")
+	assert.NotContains(t, body, rolloutPlansChangedCause.Heading, "the primary's own drift gets the detailed cause")
+	requireNoApplies(t, svc, dbName)
+}
+
+// awaitApplyLockReleased waits for a command that posts before it releases its
+// lock to finish releasing it.
+func awaitApplyLockReleased(t *testing.T, svc *api.Service, dbName, msg string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+		return err == nil && lock == nil
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond, msg)
+}
+
+// The primary target (eu) already has the column and us does not, so the
+// apply command posts us's `ADD COLUMN` and runs it in the same step. Between
+// that comment and the re-plan the apply runs from, eu's primary key is
+// reshaped out of band, so bringing eu back to the PR's schema now means
+// dropping a primary key, which the engine refuses. No confirmation could run
+// that plan, so the apply rejects it outright and releases its lock instead of
+// asking for an apply-confirm that would only be rejected in turn.
+func TestE2EApplyRejectsAPrimaryPlanTheEngineBlocksWhileStarting(t *testing.T) {
+	dbName := "webhook_rollout_primary_blocked_auto"
+	var hooked *afterLockStorage
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		hooked = &afterLockStorage{Storage: st}
+		return hooked
+	})
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	eu := openDriftDB(t, driftDSN(t, dbName+"_eu"))
+	hooked.onAcquire = func(*storage.Lock) {
+		_, err := eu.ExecContext(t.Context(), "ALTER TABLE `users` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `name`)")
+		require.NoError(t, err)
+	}
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	body := awaitCommentContaining(t, apply, "⛔ Apply rejected")
+	assert.Contains(t, body, "the engine refuses to execute")
+	assert.Contains(t, body, "`users`")
+	assert.NotContains(t, body, "Confirmation required", "a plan the engine blocks is never offered for confirmation")
+	assert.NotContains(t, body, "schemabot apply-confirm")
+
+	awaitApplyLockReleased(t, svc, dbName, "a rejected apply releases its lock")
+	requireNoApplies(t, svc, dbName)
+	check := rolloutCheck(t, svc, dbName)
+	assert.NotEqual(t, "success", check.Conclusion, "nothing ran, so the check keeps blocking merge")
+	assert.True(t, check.HasChanges)
+}
+
+// The primary target (eu) already has the column and us does not, so the
+// comment the apply command posts is the only place us's plan is shown before
+// it runs. When GitHub rejects that comment, nothing runs: the apply releases
+// its lock so a retry of the command starts over, and the check keeps blocking
+// merge on us's pending change.
+func TestE2EApplyRunsNothingWhenTheCommentShowingAnotherTargetsPlanCannotBePosted(t *testing.T) {
+	dbName := "webhook_rollout_member_disclosure_fails"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	apply := runRolloutWebhookWithFiles(t, svc, dbName, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e " + driftEnv, isPR: true}, nil),
+		map[string]string{"users.sql": usersWithEmailSchema},
+		func(_ *http.ServeMux, result *planFlowResult) { result.FailCommentPost.Store(true) })
+	// The comment showing us's plan was attempted; GitHub rejected it.
+	awaitCommentContaining(t, apply, "ADD COLUMN `email`")
+
+	awaitApplyLockReleased(t, svc, dbName, "an apply whose comment never landed releases its lock")
+	requireNoApplies(t, svc, dbName)
+	check := rolloutCheck(t, svc, dbName)
+	assert.Equal(t, "action_required", check.Conclusion, "us still needs the change, so the check keeps blocking merge")
+	assert.True(t, check.HasChanges)
+}
+
 // The primary target (eu) already has the column and us does not, so the
 // apply command posts us's plan and runs it in the same step. Before the apply
 // is created it re-reads the rollout round stored with the plan it posted, to
@@ -1486,7 +1598,7 @@ func TestE2EApplyReleasesTheLockWhenItCannotVerifyAnotherTargetsWork(t *testing.
 	hooked.onAcquire = func(lock *storage.Lock) { hooked.failRoundOf = lock.PendingPlanID }
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	awaitCommentContaining(t, apply, "SchemaBot could not verify the plans this apply covers, so nothing was applied. The lock is released: run apply again")
+	awaitCommentContaining(t, apply, "SchemaBot could not verify the plans this apply covers, so nothing was applied. Run apply again")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)

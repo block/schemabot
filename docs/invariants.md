@@ -1550,7 +1550,7 @@ after the confirmation stops rather than running something the operator never sa
 (`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the re-check that the work of every rollout member, the
 primary target's included, is what the confirmation, or the comment an automatic apply posted,
 was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
-`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
+`pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
 member's unsafe change requiring the same opt-in as the primary plan's, both at the PR gate
 (`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
 `TargetPlanUnsafeChanges` in `pkg/webhook/templates/plan.go`) and at apply creation

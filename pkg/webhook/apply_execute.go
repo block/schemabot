@@ -213,16 +213,31 @@ func (h *Handler) executeApply(
 			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return
 		}
+		// A primary plan the engine now blocks cannot run from any
+		// confirmation, so an automatic apply rejects it here rather than
+		// pausing on a confirmation that would only be rejected in turn.
+		if storedPlan != nil && planResp.HasBlockedChanges() {
+			h.rejectBlockedChanges(ctx, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, result, expectedPendingPlanID)
+			return
+		}
 		if !covered && storedPlan != nil {
 			// The apply command posted every target's plan moments ago, and a
 			// target's schema changed before this re-plan. As with a primary
 			// plan whose DDL drifted, stop and ask against a comment that
-			// shows each target's plan as it is now.
+			// shows each target's plan as it is now. When the primary's own
+			// DDL is what drifted, the cause compares it statement by
+			// statement, as on a single target.
+			primaryDDLDrifted := !ddlMatchesStoredPlan(planResp, storedPlan)
+			cause := rolloutPlansChangedCause
+			if primaryDDLDrifted {
+				cause = planDriftCause(planResp, storedPlan)
+			}
 			h.logger.Info("automatic apply downgraded: the other targets' plans changed after the apply posted them",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason,
+				"primary_ddl_drifted", primaryDDLDrifted)
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				rolloutPlansChangedCause, rolloutPreview, runsMemberWork); err != nil {
+				cause, rolloutPreview, runsMemberWork); err != nil {
 				h.logger.Error("failed to post the comment showing the targets' changed plans, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -308,12 +323,7 @@ func (h *Handler) executeApply(
 	// statement newly resolved to blocked above instead, since how each
 	// statement runs is part of the confirmed plan it is held to.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
-		commentData.ScopedDatabase = result.Database
-		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
-		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "engine-blocked changes rejection")
+		h.rejectBlockedChanges(ctx, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, result, expectedPendingPlanID)
 		return
 	}
 
@@ -413,25 +423,33 @@ func (h *Handler) executeApply(
 
 	// --defer-cutover only affects engine-driven statements; an apply whose
 	// every target runs only direct statements has no cutover to defer, so
-	// reject the flag instead of silently ignoring it. Only apply-confirm
-	// reaches this gate (the apply command rejects the flag before locking on
-	// such an apply, and an apply whose re-plan routes changes to direct
-	// execution that the disclosed plan did not stops above), so keep the
+	// reject the flag instead of silently ignoring it. Apply-confirm keeps the
 	// lock: it still pins the plan the operator confirmed against, and
-	// re-running apply-confirm without the flag executes it.
+	// re-running apply-confirm without the flag executes it. An automatic
+	// apply releases it, as on its other rejections, so the apply command
+	// starts over. The apply command rejects the flag before locking on an
+	// apply with nothing to defer, so an automatic apply normally rejects
+	// here only when reading the targets' plans fails.
 	if result.DeferCutover {
+		automatic := storedPlan != nil
 		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
 		if deferErr != nil {
-			h.logger.Error("apply rejected: could not read every target's plan to tell whether --defer-cutover has a cutover to defer; the pending confirmation is preserved",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"action", actionName, "plan_id", planResp.PlanID, "error", deferErr)
-			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				otherTargetPlansUnverifiedMessage(actionName, environment))
+			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, automatic, expectedPendingPlanID, planResp.PlanID,
+				"could not read every target's plan to tell whether --defer-cutover has a cutover to defer", deferErr,
+				"the other targets' plans")
+			return
+		}
+		if nothingToDefer && automatic {
+			h.logger.Info("automatic apply rejected: --defer-cutover on an apply whose every target runs only direct changes; releasing the lock",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "action", actionName,
+				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "runs_other_targets", runsMemberWork)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "--defer-cutover has nothing to defer")
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, msgDeferCutoverAllDirect)
 			return
 		}
 		if nothingToDefer {
 			h.logger.Info("apply rejected: --defer-cutover on an apply whose every target runs only direct changes; the pending confirmation is preserved",
-				"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName,
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "action", actionName,
 				"plan_id", planResp.PlanID, "runs_other_targets", runsMemberWork)
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
 				fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
@@ -584,7 +602,7 @@ func (h *Handler) rejectUnverifiedMemberWork(
 ) {
 	database, dbType := schemaResult.Database, schemaResult.Type
 	if automatic {
-		h.logger.Error("automatic apply rejected: "+what+"; the lock is released",
+		h.logger.Error("automatic apply rejected: "+what+"; releasing the lock",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"posted_plan_id", expectedPendingPlanID, "plan_id", planID, "error", err)
 		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, what)
@@ -596,15 +614,32 @@ func (h *Handler) rejectUnverifiedMemberWork(
 	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedMemberWorkMessage(unverified, environment, automatic))
 }
 
+// rejectBlockedChanges rejects an apply whose re-plan the engine blocks and
+// releases its lock: no retry of the command can succeed, so holding the lock
+// would only force a manual unlock after the schema is rewritten.
+func (h *Handler) rejectBlockedChanges(
+	ctx context.Context, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
+	planResp *apitypes.PlanResponse, environment, requestedBy, actionName string, result CommandResult, expectedPendingPlanID string,
+) {
+	database, dbType := schemaResult.Database, schemaResult.Type
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData.ScopedDatabase = result.Database
+	h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
+		"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+		"action", actionName, "plan_id", planResp.PlanID)
+	h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+	h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "engine-blocked changes rejection")
+}
+
 // unverifiedMemberWorkMessage tells the operator that nothing ran because
 // SchemaBot could not verify the named plans, and how to recover from the
-// state the rejection left: an automatic apply released its lock, so the apply
-// command starts over, while apply-confirm kept the pending confirmation, so
+// state the rejection left: an automatic apply releases its lock unless the
+// intent changed, so the apply command starts over, while apply-confirm kept the pending confirmation, so
 // confirming again with the same flags retries against the same comment.
 func unverifiedMemberWorkMessage(unverified, environment string, automatic bool) string {
 	recovery := fmt.Sprintf("The pending confirmation is preserved; re-run `schemabot %s -e %s` with the same flags, and see server logs if it persists.", action.ApplyConfirm, environment)
 	if automatic {
-		recovery = "The lock is released: run apply again, and see server logs if it persists."
+		recovery = "Run apply again, and see server logs if it persists."
 	}
 	return fmt.Sprintf("SchemaBot could not verify %s, so nothing was applied. %s", unverified, recovery)
 }

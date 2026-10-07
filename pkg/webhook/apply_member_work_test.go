@@ -16,7 +16,6 @@ import (
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
-	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -502,19 +501,6 @@ func TestDeferCutoverHasNothingToDefer_PrimaryPlanDecidesWhenNoOtherTargetRuns(t
 	assert.False(t, nothingToDefer, "a primary plan with an engine-driven change has a cutover to defer")
 }
 
-// A command that could not read the other targets' plans tells the operator
-// how to recover from where it stopped: apply-confirm kept the pending
-// confirmation, so it is re-run as apply-confirm; apply held nothing, so it is
-// retried.
-func TestOtherTargetPlansUnverifiedMessage_NamesTheRecovery(t *testing.T) {
-	assert.Equal(t,
-		"SchemaBot could not verify the other targets' plans, so nothing was applied. The pending confirmation is preserved; re-run `schemabot apply-confirm -e production` with the same flags, and see server logs if it persists.",
-		otherTargetPlansUnverifiedMessage(action.ApplyConfirm, "production"))
-	assert.Equal(t,
-		"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.",
-		otherTargetPlansUnverifiedMessage(action.Apply, "production"))
-}
-
 // --defer-cutover has a cutover to defer when any target the apply runs
 // carries an engine-driven change, whichever target that is. A target already
 // at the desired schema runs nothing, so it decides nothing either way.
@@ -563,7 +549,7 @@ func TestRolloutAllChangesDirect(t *testing.T) {
 // kept the pending confirmation, so confirming again is the retry.
 func TestUnverifiedMemberWorkMessage(t *testing.T) {
 	assert.Equal(t,
-		"SchemaBot could not verify the other targets' plans, so nothing was applied. The lock is released: run apply again, and see server logs if it persists.",
+		"SchemaBot could not verify the other targets' plans, so nothing was applied. Run apply again, and see server logs if it persists.",
 		unverifiedMemberWorkMessage("the other targets' plans", "staging", true))
 	assert.Equal(t,
 		"SchemaBot could not verify the other targets' plans, so nothing was applied. The pending confirmation is preserved; re-run `schemabot apply-confirm -e staging` with the same flags, and see server logs if it persists.",
