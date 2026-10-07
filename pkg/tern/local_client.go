@@ -162,9 +162,7 @@ type LocalConfig struct {
 	// direct_execution_lock_acquisition_timeout_seconds (positive bound on
 	// each direct statement's lock acquisition; engine default when absent);
 	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
-	// (enable_experimental_autoscaling,
-	// enable_experimental_lockless_checksum, checkpoint_max_age,
-	// checksum_yield_timeout).
+	// (checkpoint_max_age).
 	Metadata map[string]string
 
 	// SchemaOverrides maps a requested canonical namespace to the

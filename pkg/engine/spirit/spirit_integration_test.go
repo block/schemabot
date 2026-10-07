@@ -1628,6 +1628,7 @@ func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 		started:  time.Now(),
 	})
 
+	shortenLocklessRetryDelay(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	err = eng.executeSpiritMigration(ctx, host, username, password, database,
@@ -1641,6 +1642,19 @@ func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 	require.NoError(t, err, "Progress()")
 	assert.Equal(t, engine.StateFailed, result.State)
 	assert.False(t, result.Retryable)
+}
+
+// shortenLocklessRetryDelay paces the lockless checksum's passes 100ms apart
+// for the rest of the test. A lossy ALTER fails only once the checksum has run
+// its full pass budget (checksum.DefaultLocklessMaxPasses), and at the
+// production pacing (5s) that alone exceeds a test's 30-second bound. The
+// override is a package global, so a test that uses it must not run in
+// parallel.
+func shortenLocklessRetryDelay(t *testing.T) {
+	t.Helper()
+	prev := checksum.DefaultLocklessRetryDelay
+	checksum.DefaultLocklessRetryDelay = 100 * time.Millisecond
+	t.Cleanup(func() { checksum.DefaultLocklessRetryDelay = prev })
 }
 
 // TestEngine_Progress_FailingApplyNeverReportsCompleted verifies that a
@@ -2382,10 +2396,8 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	eng := New(Config{})
 	m := eng.newSpiritMigration(host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.Equal(t, DefaultCheckpointMaxAge, m.CheckpointMaxAge)
-	assert.Equal(t, DefaultChecksumYieldTimeout, m.ChecksumYieldTimeout)
-	assert.True(t, m.EnableExperimentalAutoscaling, "autoscaling defaults to enabled")
-	assert.False(t, m.EnableExperimentalLocklessChecksum,
-		"the copy is verified under the snapshot checksum until an operator opts in")
+	assert.False(t, m.SkipAutoscaling, "autoscaling is Spirit's default and stays on")
+	assert.False(t, m.LegacyChecksum, "the copy is verified under Spirit's default lockless checksum")
 	assert.True(t, m.InterpolateParams)
 	assert.Equal(t, DefaultThreads, m.Threads, "copier threads carry the engine setting")
 	assert.Equal(t, DefaultLockWaitTimeout, m.LockWaitTimeout, "the cutover lock wait carries the engine setting")
@@ -2395,18 +2407,12 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 		"commit-latency throttle must be set explicitly; Spirit disables the throttler on zero")
 
 	settings, err := SettingsFromMetadata(map[string]string{
-		MetadataEnableExperimentalAutoscaling:      "false",
-		MetadataEnableExperimentalLocklessChecksum: "true",
-		MetadataCheckpointMaxAge:                   "24h",
-		MetadataChecksumYieldTimeout:               "6h",
+		MetadataCheckpointMaxAge: "24h",
 	})
 	require.NoError(t, err, "SettingsFromMetadata")
 	eng = New(Config{Settings: settings})
 	m = eng.newSpiritMigration(host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.Equal(t, 24*time.Hour, m.CheckpointMaxAge)
-	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
-	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
-	assert.True(t, m.EnableExperimentalLocklessChecksum, "the lockless checksum override enables it")
 }
 
 // A plan that touches existing tables reports each table's approximate row

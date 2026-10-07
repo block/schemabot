@@ -54,6 +54,24 @@ func TestClassifyRunnerError(t *testing.T) {
 		assert.True(t, engine.IsRetryable(classifiedErr))
 	})
 
+	// When every lockless pass had to repair a range and the next pass found
+	// differences again, the repairs cannot close the divergence (a lossy
+	// ALTER). Spirit wraps ErrDifferencesExhausted alongside
+	// ErrVerificationUnresolved, and that verdict wins: the failure is
+	// permanent.
+	t.Run("lockless every pass repaired is permanent", func(t *testing.T) {
+		runnerErr := fmt.Errorf("checksum failed: %w",
+			fmt.Errorf("%w: %w: 10 passes, each repaired at least one range",
+				checksum.ErrVerificationUnresolved, checksum.ErrDifferencesExhausted))
+
+		classifiedErr := classifyRunnerError(runnerErr)
+
+		assert.False(t, engine.IsRetryable(classifiedErr))
+		assert.ErrorIs(t, classifiedErr, checksum.ErrVerificationUnresolved)
+		var permanentErr *engine.PermanentError
+		assert.ErrorAs(t, classifiedErr, &permanentErr)
+	})
+
 	t.Run("checksum attempt errors remain retryable", func(t *testing.T) {
 		runnerErr := fmt.Errorf("checksum failed after several attempts: %w", checksum.ErrAttemptsExhausted)
 
