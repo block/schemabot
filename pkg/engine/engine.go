@@ -387,8 +387,10 @@ type PlanRequest struct {
 
 	// IgnoreTables lists the live tables the repository's ignore_tables config
 	// withholds from the planner, so a table no schema file declares is not
-	// proposed for DROP TABLE. Entries are matched exactly and case-sensitively
-	// against the target's own catalog, in every namespace the plan covers.
+	// proposed for DROP TABLE. Entries are matched against the target's own
+	// catalog, in every namespace the plan covers: a plain entry exactly and
+	// case-sensitively, an entry wrapped in slashes as a regular expression over
+	// the whole name. An entry that does not compile fails the plan.
 	// Every engine honors the list, discloses what it actually withheld through
 	// ExemptTables, and refuses a table the config withholds that a schema file
 	// also declares (see IgnoredTables).

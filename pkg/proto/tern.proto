@@ -482,10 +482,12 @@ message PlanRequest {
   optional bool grouped_execution = 12;
   // Live tables the repository's ignore_tables config withholds from the
   // planner, so a table no schema file declares is not proposed for
-  // DROP TABLE. Matched exactly and case-sensitively against the target's own
-  // catalog, in every namespace the plan covers. The engine discloses what it
-  // actually withheld through exempt_tables on the response, and refuses a
-  // table the config withholds that a schema file also declares.
+  // DROP TABLE. Matched against the target's own catalog, in every namespace
+  // the plan covers: a plain entry exactly and case-sensitively, and an entry
+  // wrapped in slashes as a regular expression over the whole name. The
+  // engine discloses what it actually withheld through exempt_tables on the
+  // response, and refuses a table the config withholds that a schema file
+  // also declares.
   repeated string ignore_tables = 13;
   // The caller's resolved direct execution policy for this database and
   // environment. A control plane forwards it so the target that runs the

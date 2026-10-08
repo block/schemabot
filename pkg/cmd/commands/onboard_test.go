@@ -825,6 +825,40 @@ func TestBuildOnboardWritePlanRecordsWhatItWithheld(t *testing.T) {
 	assert.Equal(t, apitypes.ExemptReasonIgnoreTables, plan.withheld[0].Reason)
 }
 
+// Re-onboarding a repository that withholds a runtime table family with a
+// pattern keeps the pattern in the rewritten config, round-tripped as written,
+// and writes no file for any member of the family the pull returned, so the
+// rewrite never declares a table the config withholds.
+func TestBuildOnboardWritePlanPreservesAndHonorsPatternEntries(t *testing.T) {
+	root := t.TempDir()
+	const pattern = `/^relay_\d+_feed$/`
+	plan, err := buildOnboardWritePlan(root, &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Type:        "mysql",
+		Environment: "production",
+		TableCount:  3,
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {Tables: map[string]string{
+				"users":         "CREATE TABLE `users` (`id` bigint NOT NULL);\n",
+				"relay_1_feed":  "CREATE TABLE `relay_1_feed` (`id` bigint NOT NULL);\n",
+				"relay_17_feed": "CREATE TABLE `relay_17_feed` (`id` bigint NOT NULL);\n",
+			}},
+		},
+	}, client.PlanExclusions{Tables: []string{pattern}})
+	require.NoError(t, err)
+	require.NoError(t, plan.write())
+
+	assert.FileExists(t, filepath.Join(root, "orders", "users.sql"))
+	assert.NoFileExists(t, filepath.Join(root, "orders", "relay_1_feed.sql"))
+	assert.NoFileExists(t, filepath.Join(root, "orders", "relay_17_feed.sql"))
+	require.Len(t, plan.withheld, 1)
+	assert.Equal(t, []string{"relay_17_feed", "relay_1_feed"}, plan.withheld[0].Tables)
+
+	cfg, err := LoadCLIConfig(root)
+	require.NoError(t, err, "the rewritten config is read back by the same parser plans use")
+	assert.Equal(t, []string{pattern}, cfg.IgnoreTables)
+}
+
 // For Vitess, vschema.json is a schema input: a leftover copy the pull did not
 // write proposes a VSchema the target doesn't have, so it must be flagged
 // alongside stray table files.

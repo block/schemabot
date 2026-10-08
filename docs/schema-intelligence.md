@@ -1304,11 +1304,12 @@ exempted omits the field.
 
 Two things populate it. Tables withheld by the repository's `ignore_tables`
 config (see [Ignoring Tables](namespaces.md#ignoring-tables)) are reported by
-every engine, with `reason` naming the config key; the table names are also
-persisted with the plan so a rollback or resume re-plan withholds the same
-tables the reviewed plan did. Archive-named tables are reported by PostgreSQL
-targets only — the MySQL-family engines exempt them from their live-schema view
-without reporting which ones.
+every engine, with `reason` naming the config key. The configured entries,
+patterns included, are persisted with the plan as written, so a rollback or
+resume re-plan withholds by the same rules the reviewed plan did.
+Archive-named tables are reported by PostgreSQL targets only — the
+MySQL-family engines exempt them from their live-schema view without reporting
+which ones.
 
 Response excerpt from the plan request (illustrative values):
 

@@ -579,7 +579,7 @@ func TestRenderPostgresTablesReturnsCancellationAfterFiltering(t *testing.T) {
 			require.NoError(t, err)
 			defer pool.Close()
 
-			files, captured, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, engine.NewIgnoredTables(tt.ignored))
+			files, captured, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
 			require.ErrorIs(t, err, context.Canceled)
 			assert.False(t, captured)
 			assert.Nil(t, files)
