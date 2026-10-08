@@ -249,13 +249,17 @@ type PlanCommentData struct {
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
-	// MemberApplyRefusal says why a PR apply cannot run the other targets'
-	// plans this comment renders, whether or not the primary target has work
-	// of its own, naming only targets, tables, and namespaces. Such an apply is
+	// MemberApplyRefusal says why a PR apply cannot run the plan of
+	// MemberApplyRefusalTarget, one of the targets' plans this comment
+	// renders, whether or not the primary target has work of its own, naming
+	// only tables and namespaces. Such an apply is
 	// refused whatever its flags, so the comment offers no apply command in its
 	// place. Empty when the apply can run them, or when the comment renders the
 	// primary plan alone.
 	MemberApplyRefusal string
+	// MemberApplyRefusalTarget names the target whose plan MemberApplyRefusal
+	// is about.
+	MemberApplyRefusalTarget string
 
 	// summaryRollout is the rollout a summary of several targets' plans
 	// covers. The summary then says which targets the diff rolls out to, so a
@@ -698,7 +702,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			sb.WriteString("**Applying automatically**\n")
 		}
 	case data.MemberApplyRefusal != "":
-		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal)
+		writeMemberApplyRefusal(&sb, data.MemberApplyRefusalTarget, data.MemberApplyRefusal)
 	case data.applyFailsOnRefusedChange():
 		writeRefusedChangeReplan(&sb, "this plan", scopedCommand("schemabot plan", data.Environment, data.ScopedDatabase, data.Tenant))
 	default:
@@ -715,9 +719,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 // writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
 // apply cannot run every target's plan the comment renders. Offering the
 // command there would coach an apply that is refused whatever its flags.
-func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
-	refusal = escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " "))
-	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: %s.\n\n", refusal)
+func writeMemberApplyRefusal(sb *strings.Builder, target, reason string) {
+	reason = escapeInlineMarkdown(strings.Join(strings.Fields(reason), " "))
+	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: target %s: %s.\n\n", inlineCode(target), reason)
 	sb.WriteString("An apply runs every target or none, so nothing runs until that plan can. The schema check keeps blocking merge until every target has the change.\n")
 }
 
@@ -3394,7 +3398,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 			writeTableSizesSection(sb, summary)
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
 			if plan.MemberApplyRefusal != "" {
-				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+				writeMemberApplyRefusal(sb, plan.MemberApplyRefusalTarget, plan.MemberApplyRefusal)
 				sb.WriteString("\n")
 			}
 			return
@@ -3466,7 +3470,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// An apply this section's other targets' plans would refuse is not offered
 	// in the footer, so the section says why.
 	if plan.MemberApplyRefusal != "" {
-		writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+		writeMemberApplyRefusal(sb, plan.MemberApplyRefusalTarget, plan.MemberApplyRefusal)
 		sb.WriteString("\n")
 	}
 }

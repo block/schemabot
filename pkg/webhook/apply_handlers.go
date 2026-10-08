@@ -398,7 +398,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
 		}
-		if refusal != "" {
+		if refusal.refuses() {
 			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}

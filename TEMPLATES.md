@@ -3966,7 +3966,7 @@ _Requested by @jackjackbits_
 
 ### Error
 
-> This confirmation no longer covers what the apply would run: target us is not the target the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target&#39;s own plan.
+> This confirmation no longer covers what the apply would run: target `us` is not the target the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target&#39;s own plan.
 <!-- schemabot:offer-support-channel -->
 
 </details>

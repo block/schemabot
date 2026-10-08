@@ -687,12 +687,13 @@ func TestRenderMultiEnvPlanComment_OffersApplyForPendingTargets(t *testing.T) {
 // command: offering it would coach an apply that is refused whatever its flags.
 func TestRenderPlanComment_ConvergedPrimaryWithRefusedMemberWorkOffersNoApply(t *testing.T) {
 	data := convergedPrimaryPlanData()
-	data.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
+	data.MemberApplyRefusalTarget = "primary/testapp_2"
+	data.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
 
 	out := RenderPlanComment(data)
 	assert.Contains(t, out, "```sql\nALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 		"the other targets' plans are still shown")
-	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**: target primary/testapp\\_2: its plan carries changes its target's engine refuses.")
+	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**: target `primary/testapp_2`: its plan carries changes its target's engine refuses.")
 	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
 	assert.NotContains(t, out, "schemabot apply", "an apply that is refused whatever its flags is never offered")
 }
@@ -703,7 +704,8 @@ func TestRenderPlanComment_ConvergedPrimaryWithRefusedMemberWorkOffersNoApply(t 
 func TestRenderMultiEnvPlanComment_RefusedMemberWorkOffersNoApply(t *testing.T) {
 	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
 	refused := convergedPrimaryPlanData()
-	refused.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
+	refused.MemberApplyRefusalTarget = "primary/testapp_2"
+	refused.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
 
 	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,
@@ -730,7 +732,8 @@ func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testi
 	refused := func(env string) *PlanCommentData {
 		data := convergedPrimaryPlanData()
 		data.Environment = env
-		data.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
+		data.MemberApplyRefusalTarget = "primary/testapp_2"
+		data.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
 		return &data
 	}
 	render := func(staging, production *PlanCommentData) string {
@@ -757,10 +760,11 @@ func TestRenderMultiEnvPlanComment_RefusedEnvironmentHoldsBackLaterOnes(t *testi
 // claiming the primary target is already done.
 func TestRenderPlanComment_PrimaryTargetWithWorkAndRefusedMemberWorkOffersNoApply(t *testing.T) {
 	data := primaryTargetWithWorkPlanData()
-	data.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
+	data.MemberApplyRefusalTarget = "primary/testapp_2"
+	data.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
 
 	out := RenderPlanComment(data)
-	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**: target primary/testapp\\_2: its plan carries changes its target's engine refuses.")
+	assert.Contains(t, out, "⚠️ **This PR cannot apply every target's plan**: target `primary/testapp_2`: its plan carries changes its target's engine refuses.")
 	assert.Contains(t, out, "The schema check keeps blocking merge until every target has the change.")
 	assert.NotContains(t, out, "the primary target already has this schema", "the primary target still has work")
 	assert.NotContains(t, out, "schemabot apply", "an apply that is refused whatever its flags is never offered")
@@ -771,7 +775,8 @@ func TestRenderPlanComment_PrimaryTargetWithWorkAndRefusedMemberWorkOffersNoAppl
 func TestRenderMultiEnvPlanComment_PrimaryTargetWithWorkAndRefusedMemberWorkOffersNoApply(t *testing.T) {
 	converged := &PlanCommentData{Environment: "staging", IsMySQL: true}
 	refused := primaryTargetWithWorkPlanData()
-	refused.MemberApplyRefusal = `target primary/testapp_2: its plan carries changes its target's engine refuses`
+	refused.MemberApplyRefusalTarget = "primary/testapp_2"
+	refused.MemberApplyRefusal = `its plan carries changes its target's engine refuses`
 
 	out := RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "testapp", DatabaseType: "mysql", IsMySQL: true,

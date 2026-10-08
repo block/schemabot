@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -150,13 +149,13 @@ func (h *Handler) recordPendingRollout(ctx context.Context, client *ghclient.Ins
 // (api.MemberWorkAConvergedPrimaryPlanCannotRun), and one with work holds each
 // member to its shape (api.MemberWorkThePrimaryPlanCannotRun). Neither refuses
 // a blocked change any less.
-func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment string, rollout reviewDriftOutcome, primaryTargetConverged bool) (string, error) {
-	if rollout.work.copyAtStake != "" {
+func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment string, rollout reviewDriftOutcome, primaryTargetConverged bool) (memberRefusal, error) {
+	if rollout.work.copyAtStake.refuses() {
 		return rollout.work.copyAtStake, nil
 	}
 	plan, members, err := h.reviewRoundPlans(ctx, planID, environment)
 	if err != nil {
-		return "", err
+		return memberRefusal{}, err
 	}
 	for _, member := range slices.Sorted(maps.Keys(members)) {
 		memberPlan := members[member]
@@ -164,10 +163,26 @@ func (h *Handler) memberWorkRefusal(ctx context.Context, planID, environment str
 			continue
 		}
 		if reason := memberWorkPrimaryPlanCannotRun(plan, memberPlan, primaryTargetConverged); reason != "" {
-			return fmt.Sprintf("target %s: its plan %s", member, reason), nil
+			return memberRefusal{target: member, reason: "its plan " + reason}, nil
 		}
 	}
-	return "", nil
+	return memberRefusal{}, nil
+}
+
+// memberRefusal says which target's plan a PR apply cannot run, and why. The
+// target is kept apart from the reason so a plan comment can render the name
+// as code while escaping the reason, which can carry engine-influenced text.
+type memberRefusal struct {
+	target string
+	reason string
+}
+
+// refuses reports whether a target's plan stops the apply.
+func (r memberRefusal) refuses() bool { return r.reason != "" }
+
+// String is the refusal as one clause, for command errors and logs.
+func (r memberRefusal) String() string {
+	return fmt.Sprintf("target `%s`: %s", r.target, r.reason)
 }
 
 // reviewRoundPlans loads the primary target's plan stored as planID and the
@@ -274,7 +289,8 @@ func (h *Handler) annotateMemberApplyRefusal(ctx context.Context, data *template
 			"repo", repo, "pr", pr, "database", planResp.Database, "environment", environment, "plan_id", planResp.PlanID, "error", err)
 		return
 	}
-	data.MemberApplyRefusal = refusal
+	data.MemberApplyRefusalTarget = refusal.target
+	data.MemberApplyRefusal = refusal.reason
 }
 
 // blockUnsafeWithoutOptIn posts the unsafe-changes refusal and reports true
@@ -311,7 +327,7 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 
 // memberWorkRefusalMessage tells the operator why the other targets' work was
 // not run. The refusal names only targets, tables, and namespaces.
-func memberWorkRefusalMessage(refusal string) string {
+func memberWorkRefusalMessage(refusal memberRefusal) string {
 	return fmt.Sprintf("This PR cannot apply every target's plan: %s, so nothing was applied. An apply runs every target or none. The schema check keeps blocking merge until every target has the change.", refusal)
 }
 
@@ -342,26 +358,25 @@ func pendingRolloutMessage(outcome reviewDriftOutcome, primaryTargetConverged bo
 	const rerun = "Run apply again for this environment to review and confirm each target's own plan."
 	switch {
 	case outcome.blocks() && primaryTargetConverged:
-		return fmt.Sprintf("Target %s already has this schema, but SchemaBot could not confirm that the other targets do (%s), so nothing was applied. The schema check stays failing until every target is confirmed.", primary, outcome.summary)
+		return fmt.Sprintf("Target `%s` already has this schema, but SchemaBot could not confirm that the other targets do (%s), so nothing was applied. The schema check stays failing until every target is confirmed.", primary, outcome.summary)
 	case outcome.blocks():
 		return fmt.Sprintf("SchemaBot could not confirm the plan of every target (%s), so nothing was applied. The schema check stays failing until every target is confirmed.", outcome.summary)
 	case primaryTargetConverged:
-		return fmt.Sprintf("Target %s already has this schema, but %s: %s. The plans those targets would run were not on the comment this apply acts on, so nothing was applied. %s", primary, outcome.work.summary(), strings.Join(outcome.work.names, ", "), rerun)
+		return fmt.Sprintf("Target `%s` already has this schema, but %s. The comment this apply acts on did not show those plans, so nothing was applied. %s", primary, outcome.work.pendingTargets(), rerun)
 	default:
-		return fmt.Sprintf("%s: %s. The comment this apply acts on showed only the plan of target %s, so nothing was applied. %s", outcome.work.summary(), strings.Join(outcome.work.names, ", "), primary, rerun)
+		return fmt.Sprintf("%s. The comment this apply acts on showed only the plan of target `%s`, so nothing was applied. %s", ui.CapitalizeFirst(outcome.work.pendingTargets()), primary, rerun)
 	}
 }
 
 // unconfirmedWorkMessage tells the operator why an apply-confirm did not run:
 // what the rollout would run now is not what the confirmation was given
 // against. reason names only targets, and says whether it is the reviewed
-// target or another one whose plan changed. The rollout's pending summary leads,
-// so the operator sees which targets still need the change, as on every other
-// refusal of a pending rollout.
+// target or another one whose plan changed. The targets that still need the
+// change lead, as on every other refusal of a pending rollout.
 func unconfirmedWorkMessage(work memberWork, reason string) string {
 	message := fmt.Sprintf("This confirmation no longer covers what the apply would run: %s, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.", reason)
 	if work.members > 1 && work.pending > 0 {
-		return fmt.Sprintf("%s: %s. %s", work.summary(), strings.Join(work.names, ", "), message)
+		return fmt.Sprintf("%s. %s", ui.CapitalizeFirst(work.pendingTargets()), message)
 	}
 	return message
 }
@@ -450,10 +465,10 @@ func roundCoversWork(primary func() string, pinned, current *storage.Plan, confi
 		}
 		was, ok := confirmed[member]
 		if !ok {
-			return false, fmt.Sprintf("target %s has work the confirmed round did not plan", member)
+			return false, fmt.Sprintf("target `%s` has work the confirmed round did not plan", member)
 		}
 		if difference := memberWorkDifference(was, plan); difference != workUnchanged {
-			return false, fmt.Sprintf("the plan of target %s differs from what the confirmed round planned, in %s", member, difference)
+			return false, fmt.Sprintf("the plan of target `%s` differs from what the confirmed round planned, in %s", member, difference)
 		}
 	}
 	return true, ""
@@ -465,9 +480,9 @@ func roundCoversWork(primary func() string, pinned, current *storage.Plan, confi
 // differs, or saying that the confirmed plan reviewed another target.
 func primaryTargetDifferenceReason(primary string, difference workDifference) string {
 	if difference == workTarget {
-		return fmt.Sprintf("target %s is not the target the confirmed plan reviewed", primary)
+		return fmt.Sprintf("target `%s` is not the target the confirmed plan reviewed", primary)
 	}
-	return fmt.Sprintf("the re-plan of target %s differs from the confirmed plan in %s", primary, difference)
+	return fmt.Sprintf("the re-plan of target `%s` differs from the confirmed plan in %s", primary, difference)
 }
 
 func primaryTargetChanged(pinned, current *storage.Plan) bool {

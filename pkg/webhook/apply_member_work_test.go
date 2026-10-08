@@ -184,7 +184,7 @@ func TestMemberWorkOfNamesTheCopyAtStake(t *testing.T) {
 	}}
 
 	got := memberWorkOf(&rollup)
-	assert.Equal(t, `target primary/payments-002: applying its plan discards the unfinished copy of orders in namespace "payments"`, got.copyAtStake)
+	assert.Equal(t, memberRefusal{target: "primary/payments-002", reason: `applying its plan discards the unfinished copy of orders in namespace "payments"`}, got.copyAtStake)
 	assert.Equal(t, []string{"primary/payments-002"}, got.names)
 
 	rollup.Entries[1].ExistingCopies = nil
@@ -223,11 +223,12 @@ func TestPlanCommentOffersNoApplyWhenAMembersCopiesWereNotRead(t *testing.T) {
 	}
 	h := &Handler{logger: testLogger()}
 	h.annotateMemberApplyRefusal(t.Context(), &data, &apitypes.PlanResponse{PlanID: "plan-reviewed", Database: "payments"}, "production", outcome, "octocat/payments", 7)
-	assert.Equal(t, "target primary/payments-002: its data plane did not report whether applying its plan discards an unfinished copy", data.MemberApplyRefusal)
+	assert.Equal(t, "primary/payments-002", data.MemberApplyRefusalTarget)
+	assert.Equal(t, "its data plane did not report whether applying its plan discards an unfinished copy", data.MemberApplyRefusal)
 
 	single := templates.RenderPlanComment(data)
 	assert.Contains(t, single, "ALTER TABLE orders ADD COLUMN region varchar(16)", "the other target's plan is still shown")
-	assert.Contains(t, single, "**This PR cannot apply every target's plan**: target primary/payments-002: its data plane did not report")
+	assert.Contains(t, single, "**This PR cannot apply every target's plan**: target `primary/payments-002`: its data plane did not report")
 	assert.NotContains(t, single, "schemabot apply", "an apply that is refused whatever its flags is never offered")
 
 	staging := &templates.PlanCommentData{Database: "payments", DatabaseType: "postgres", Environment: "staging"}
@@ -271,21 +272,21 @@ func TestRoundCoversWork(t *testing.T) {
 
 	covered, reason = roundCoversWork(staticName("eu/payments-001"), plan(region), plan(wider), members(region), members(region))
 	assert.False(t, covered)
-	assert.Equal(t, "the re-plan of target eu/payments-001 differs from the confirmed plan in its statements", reason)
+	assert.Equal(t, "the re-plan of target `eu/payments-001` differs from the confirmed plan in its statements", reason)
 
 	covered, reason = roundCoversWork(staticName("eu/payments-001"), &storage.Plan{}, plan(region), members(region), members(region))
 	assert.False(t, covered, "work on a primary target the confirmed plan showed as converged")
-	assert.Equal(t, "the re-plan of target eu/payments-001 differs from the confirmed plan in its statements", reason)
+	assert.Equal(t, "the re-plan of target `eu/payments-001` differs from the confirmed plan in its statements", reason)
 
 	reviewedDirect := plan(region)
 	reviewedDirect.Namespaces["payments"].Tables[0].ExecutionMode = "direct"
 	covered, reason = roundCoversWork(staticName("eu/payments-001"), plan(region), reviewedDirect, members(region), members(region))
 	assert.False(t, covered, "a reviewed-target statement that turned direct since the confirmed round is refused")
-	assert.Equal(t, "the re-plan of target eu/payments-001 differs from the confirmed plan in how its statements run", reason)
+	assert.Equal(t, "the re-plan of target `eu/payments-001` differs from the confirmed plan in how its statements run", reason)
 
 	covered, reason = roundCoversWork(staticName("eu/payments-001"), plan(region), plan(region), members(region), members(wider))
 	assert.False(t, covered)
-	assert.Equal(t, "the plan of target eu/payments-002 differs from what the confirmed round planned, in its statements", reason)
+	assert.Equal(t, "the plan of target `eu/payments-002` differs from what the confirmed round planned, in its statements", reason)
 
 	// A target whose statement is unchanged but now runs as direct-execution
 	// DDL would run write-blocking native DDL the confirmed comment disclosed as
@@ -294,11 +295,11 @@ func TestRoundCoversWork(t *testing.T) {
 	nowDirect["eu/payments-002"].Namespaces["payments"].Tables[0].ExecutionMode = "direct"
 	covered, reason = roundCoversWork(staticName("eu/payments-001"), plan(region), plan(region), members(region), nowDirect)
 	assert.False(t, covered, "a target that turned direct since the confirmed round is refused")
-	assert.Equal(t, "the plan of target eu/payments-002 differs from what the confirmed round planned, in how its statements run", reason)
+	assert.Equal(t, "the plan of target `eu/payments-002` differs from what the confirmed round planned, in how its statements run", reason)
 
 	covered, reason = roundCoversWork(staticName("eu/payments-001"), plan(region), plan(region), map[string]*storage.Plan{}, members(region))
 	assert.False(t, covered)
-	assert.Equal(t, "target eu/payments-002 has work the confirmed round did not plan", reason)
+	assert.Equal(t, "target `eu/payments-002` has work the confirmed round did not plan", reason)
 }
 
 // A primary member's identity is part of the confirmation even when its DDL
@@ -314,7 +315,7 @@ func TestRoundCoversWorkRequiresTheReviewedPrimaryMember(t *testing.T) {
 
 	covered, reason := roundCoversWork(staticName("us"), pinned, current, members, members)
 	assert.False(t, covered, "the same DDL on another primary member needs fresh review")
-	assert.Equal(t, "target us is not the target the confirmed plan reviewed", reason)
+	assert.Equal(t, "target `us` is not the target the confirmed plan reviewed", reason)
 
 	current.Namespaces = nil
 	covered, reason = roundCoversWork(staticName("us"), pinned, current, members, members)
@@ -386,7 +387,7 @@ func TestConfirmationRequiresTheReviewedPrimaryMember(t *testing.T) {
 			wantDifference := workUnchanged
 			if tc.changed {
 				wantDifference = workTarget
-				assert.Equal(t, "target "+tc.deployment+" is not the target the confirmed plan reviewed", reason)
+				assert.Equal(t, "target `"+tc.deployment+"` is not the target the confirmed plan reviewed", reason)
 			} else {
 				assert.Empty(t, reason)
 			}
@@ -431,7 +432,7 @@ func TestChangedPrimaryIsRefusedBeforeMemberPlansAreRead(t *testing.T) {
 	covered, reason, err := h.confirmationCoversMemberWork(t.Context(), pinned.PlanIdentifier, current.PlanIdentifier, "production", staticName("us"))
 	require.NoError(t, err)
 	assert.False(t, covered)
-	assert.Equal(t, "target us is not the target the confirmed plan reviewed", reason)
+	assert.Equal(t, "target `us` is not the target the confirmed plan reviewed", reason)
 	assert.Contains(t, logs.String(), "confirmed_deployment=eu confirmed_target=payments")
 	assert.Contains(t, logs.String(), "current_deployment=us current_target=payments")
 
@@ -447,7 +448,7 @@ func TestPendingRolloutMessageNamesTheTargetsThatNeedTheChange(t *testing.T) {
 	outcome := reviewDriftOutcome{state: driftClean, work: memberWork{pending: 2, members: 2, others: 1, names: []string{"eu", "us"}, primary: "eu"}}
 
 	assert.Equal(t,
-		"2 of 2 targets need this change: eu, us. The comment this apply acts on showed only the plan of target eu, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+		"Targets `eu`, `us` need this change. The comment this apply acts on showed only the plan of target `eu`, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
 		pendingRolloutMessage(outcome, false, "eu"))
 }
 
@@ -463,15 +464,15 @@ func TestPendingRolloutMessageNamesThePrimaryTarget(t *testing.T) {
 	}{
 		"converged, other target pending": {
 			outcome: reviewDriftOutcome{state: driftClean, work: pending}, converged: true,
-			want: "Target eu already has this schema, but 1 of 2 targets need this change: us.",
+			want: "Target `eu` already has this schema, but target `us` needs this change.",
 		},
 		"converged, rollout blocked": {
 			outcome: reviewDriftOutcome{state: driftBlocked, summary: "deployment us could not be diffed", work: pending}, converged: true,
-			want: "Target eu already has this schema, but SchemaBot could not confirm that the other targets do (deployment us could not be diffed)",
+			want: "Target `eu` already has this schema, but SchemaBot could not confirm that the other targets do (deployment us could not be diffed)",
 		},
 		"primary with work": {
 			outcome: reviewDriftOutcome{state: driftClean, work: pending},
-			want:    "The comment this apply acts on showed only the plan of target eu",
+			want:    "The comment this apply acts on showed only the plan of target `eu`",
 		},
 	}
 	for name, tc := range cases {
@@ -528,9 +529,9 @@ func TestPrimaryTargetName(t *testing.T) {
 func TestUnconfirmedWorkMessageForAChangedPrimary(t *testing.T) {
 	message := unconfirmedWorkMessage(memberWork{}, primaryTargetDifferenceReason("us", workTarget))
 	assert.Equal(t,
-		"This confirmation no longer covers what the apply would run: target us is not the target the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.", message)
+		"This confirmation no longer covers what the apply would run: target `us` is not the target the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.", message)
 	preview := PreviewConfirmationPrimaryTargetChanged()
-	assert.Contains(t, preview, "target us is not the target the confirmed plan reviewed")
+	assert.Contains(t, preview, "target `us` is not the target the confirmed plan reviewed")
 	assert.Contains(t, preview, "Run apply again for this environment")
 	assert.NotContains(t, preview, "in its statements")
 }
@@ -551,7 +552,7 @@ func TestUnconfirmedWorkMessageNamesTheTargetWhosePlanChanged(t *testing.T) {
 	require.False(t, covered)
 	message := unconfirmedWorkMessage(memberWork{pending: 2, members: 2, names: []string{"eu/payments-001", "us/payments-002"}}, reason)
 	assert.Equal(t,
-		"2 of 2 targets need this change: eu/payments-001, us/payments-002. This confirmation no longer covers what the apply would run: the re-plan of target eu/payments-001 differs from the confirmed plan in its statements, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
+		"Targets `eu/payments-001`, `us/payments-002` need this change. This confirmation no longer covers what the apply would run: the re-plan of target `eu/payments-001` differs from the confirmed plan in its statements, so nothing was applied. Run apply again for this environment to review and confirm each target's own plan.",
 		message)
 	assert.NotContains(t, message, "primary")
 }

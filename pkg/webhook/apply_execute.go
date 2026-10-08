@@ -149,7 +149,7 @@ func (h *Handler) executeApply(
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the primary target has changes the confirmation did not cover")
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				fmt.Sprintf("The comment this confirmation acts on showed target %s already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.", primary))
+				fmt.Sprintf("The comment this confirmation acts on showed target `%s` already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.", primary))
 			return
 		case convergedRoundAccepts:
 		}
@@ -208,10 +208,10 @@ func (h *Handler) executeApply(
 				"the other targets' plans")
 			return
 		}
-		if refusal != "" {
+		if refusal.refuses() {
 			h.logger.Info("apply refused: the other targets' work cannot run from this apply",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", refusal)
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", refusal.String())
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
 			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return
