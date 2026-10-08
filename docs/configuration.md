@@ -739,10 +739,11 @@ local-mode MySQL and `cleanup_enabled: true`.
 
 For MySQL databases executed by the Spirit engine, some ALTER statements are
 deterministically refused by the engine — for example dropping a primary key or
-adding a foreign key, which its online copy cannot preserve. By default those
-statements block the apply. The `direct_execution` policy lets a refused
-statement instead run verbatim as native MySQL DDL when the target table is
-small enough. See [Direct Execution](direct-execution.md) for how routing
+adding a foreign key, which its online copy cannot preserve. The
+`direct_execution` policy lets a refused statement instead run verbatim as
+native MySQL DDL when the target table is small enough. With no policy
+configured, the default applies: enabled, bounded at 100MiB of data and
+indexes. Set `enabled: false` to leave refused statements blocked. See [Direct Execution](direct-execution.md) for how routing
 works and what other engines need to adopt it.
 
 Set it at the top level of the server config to state one policy for every
@@ -750,9 +751,9 @@ MySQL database the server drives:
 
 ```yaml
 direct_execution:
-  enabled: true           # default: false
+  enabled: true           # default: true
   max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
-                          # or max_table_bytes (e.g. max_table_bytes: 100MiB)
+                          # or max_table_bytes (default: max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
 

@@ -1626,15 +1626,47 @@ func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *test
 	})
 }
 
-// With no policy configured anywhere, refused statements stay blocked: the
-// engine metadata carries no direct execution keys at all.
-func TestServerConfig_ResolveDirectExecutionDefaultsToBlocked(t *testing.T) {
-	cfg := ServerConfig{}
+// A server config that states no policy runs MySQL databases under the default
+// one: direct execution enabled, bounded at 100MiB of data and indexes. A
+// server-wide block that disables it opts every database out, and engines that
+// cannot honor it never receive the default.
+func TestServerConfig_ResolveDirectExecutionDefaultsToEnabledAt100MiB(t *testing.T) {
+	t.Run("no policy configured", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.Equal(t, &DirectExecutionConfig{Enabled: true, MaxTableBytes: "100MiB"},
+			cfg.ResolveDirectExecution(&EnvironmentConfig{}, storage.DatabaseTypeMySQL))
+		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20}, policy)
+	})
 
-	metadata, err := cfg.DirectExecutionMetadata(&EnvironmentConfig{}, storage.DatabaseTypeMySQL)
+	t.Run("server-wide opt out", func(t *testing.T) {
+		cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy,
+			"an explicit opt out travels as one rather than falling back to the default")
+	})
 
-	require.NoError(t, err)
-	assert.Empty(t, metadata)
+	t.Run("environment opt out", func(t *testing.T) {
+		cfg := ServerConfig{}
+		envConfig := &EnvironmentConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
+		assert.Equal(t, &DirectExecutionConfig{Enabled: false}, cfg.ResolveDirectExecution(envConfig, storage.DatabaseTypeMySQL))
+	})
+
+	t.Run("engine that cannot honor it", func(t *testing.T) {
+		cfg := ServerConfig{}
+		for _, dbType := range []string{storage.DatabaseTypeVitess, storage.DatabaseTypePostgres} {
+			assert.Nil(t, cfg.ResolveDirectExecution(&EnvironmentConfig{}, dbType), "the default must not reach %s", dbType)
+		}
+	})
+
+	t.Run("each resolution is its own value", func(t *testing.T) {
+		cfg := ServerConfig{}
+		first := cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL)
+		first.MaxTableBytes = "1GiB"
+		assert.Equal(t, "100MiB", cfg.ResolveDirectExecution(nil, storage.DatabaseTypeMySQL).MaxTableBytes)
+	})
 }
 
 // A well-formed revert_window_duration parses to the configured window.
@@ -5925,11 +5957,6 @@ func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
 		assert.Nil(t, policy)
 	})
 
-	t.Run("no server-wide policy leaves refused statements blocked", func(t *testing.T) {
-		policy, err := (&ServerConfig{}).DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
-		require.NoError(t, err)
-		assert.Nil(t, policy)
-	})
 }
 
 // targetNames builds a targets list of bare target names, the spelling that

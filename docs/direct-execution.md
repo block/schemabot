@@ -15,15 +15,17 @@
 Some ALTER statements are deterministically refused by the MySQL schema change
 engine — dropping a primary key or adding a foreign key can never survive its
 online copy, and explicit `ALGORITHM=` / `LOCK=` clauses conflict with the
-assertions it prepends. By default those statements block the apply, and the
-plan comment says so up front.
+assertions it prepends. By default such a statement runs directly when its
+table holds at most 100MiB of data and indexes; on a larger table, or with
+direct execution turned off, it blocks the apply, and the plan comment says so
+up front.
 
 Some refused changes are still genuinely necessary — the canonical case is a
 primary-key reshape on a small table. Without direct execution, the only path
 is running the DDL by hand against the target, outside SchemaBot, with no PR
 trail, no plan, and no audit record. Direct execution brings that category of
-change inside the system: under an explicit per-environment policy, a refused
-statement can run verbatim as native MySQL DDL.
+change inside the system: under a size-bounded policy, a refused statement
+can run verbatim as native MySQL DDL.
 
 A direct statement behaves nothing like a normal SchemaBot apply. It is
 synchronous, it blocks writes to the table for its full duration, and there is
@@ -133,8 +135,8 @@ operator-supplied: a caller able to name its own policy there would be
 granting itself the thing the configuration exists to bound.
 
 A request that states no policy leaves the executing server's own
-configuration in force, which with none configured leaves every statement the
-engine refuses blocked.
+configuration in force, which with none configured is the default policy:
+enabled, bounded at 100MiB.
 
 ### The plan carries the policy its verdicts were judged under
 
@@ -243,7 +245,7 @@ reshaping any shared surface:
 - **The PR workflow** keys purely off the execution mode recorded on table
   changes and aggregates across shards, so any engine that emits a `direct`
   verdict inherits the same disclosure with no webhook changes.
-- **Config validation is the opt-in gate.** A per-database `direct_execution`
+- **Config validation is the gate.** A per-database `direct_execution`
   block is only accepted on databases whose engine implements routing; on any
   other engine it fails at startup rather than being silently ignored. The
   server-wide policy names no database type, so it is accepted alongside every

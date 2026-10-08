@@ -51,7 +51,7 @@ stay put, where this page moves as engines gain features.
 |---|---|---|---|
 | **Cheap native path tried first** | yes, instant DDL | yes, instant DDL | yes, attempted under budgets that cancel a rewrite |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a rewrite is refused above a size limit and cancelled by its budget below it |
-| **Escape hatch for refused statements** | direct execution: opt-in and size-bounded | none, excluded by design | none, native execution is already the only path |
+| **Escape hatch for refused statements** | direct execution: on by default, size-bounded | none, excluded by design | none, native execution is already the only path |
 | **`stop`** | yes | no | planned |
 | **`start`** | yes | deferred deploys only | planned |
 | **Deferred cutover** | yes | yes | planned |
@@ -302,7 +302,7 @@ MySQL engine is GA without them.
 
 Everything else in the matrix is a difference rather than a gap. Adaptive pacing and a drop
 quarantine each make an engine better in their own way, and an engine without one is not below the
-bar. Direct execution says nothing about maturity in either direction: it is an opt-in escape
+bar. Direct execution says nothing about maturity in either direction: it is a size-bounded escape
 hatch for statements no copy can run, and the engine that lacks it lacks it on purpose.
 
 ## Load management
