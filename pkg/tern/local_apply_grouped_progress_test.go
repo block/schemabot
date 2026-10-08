@@ -499,6 +499,45 @@ func TestPollForCompletionAtomic_ProgressWriteThatCannotLandEndsTheDrive(t *test
 	}
 }
 
+// A peer takes the lease while a grouped apply is copying. The next tick's
+// progress writes are refused because the lease is gone, though storage would
+// still accept a terminal write. The drive exits at that tick without an
+// error. It must not count the refusal as a failed write and poll on, and it
+// must not complete, fail, or pause the apply or its tasks, since another
+// driver now owns them.
+func TestPollForCompletionAtomic_ProgressWriteRefusedByLeaseLossExits(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}, {State: engine.StateCompleted}}}
+	client, apply, tasks, recording := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	refusing := &progressRefusingTaskStore{
+		stateRecordingTaskStore: recording,
+		err:                     fmt.Errorf("task update: %w", storage.ErrApplyLeaseLost),
+		refusals:                -1,
+	}
+	st := client.storage.(*exactProgressStorage)
+	st.tasks = refusing
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false),
+		"a drive displaced by lease loss hands the apply back without an error")
+
+	assert.Equal(t, 1, eng.calls, "no further poll after the refused tick")
+	assert.GreaterOrEqual(t, refusing.refused, 1, "the refused tick did attempt its progress writes")
+	assert.LessOrEqual(t, refusing.refused, len(tasks), "no write is attempted beyond the one tick")
+	assert.Empty(t, recording.states, "no task write lands, terminal or otherwise")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Running, task.State, "the in-memory tasks are left in flight")
+		assert.Nil(t, task.CompletedAt)
+	}
+	assert.Equal(t, state.Apply.Running, apply.State, "the drive's own apply claims no verdict")
+	stored, err := st.applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, stored.State, "a displaced driver never completes, fails, or pauses the stored apply")
+	assert.Nil(t, stored.CompletedAt)
+	logs := st.logs.(*mockApplyLogStore)
+	for _, entry := range logs.logs {
+		assert.NotContains(t, entry.Message, "Task progress could not be recorded", "a lease loss is not reported as a write failure")
+	}
+}
+
 // An engine's throttle reason is display text whose length the engine does not
 // bound. Copied onto a task, it always fits its column, so a long reason can
 // never refuse the progress write that carries it.
