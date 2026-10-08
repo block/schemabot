@@ -470,6 +470,19 @@ func TestRequestOriginNormalizesDefaultPortAndCase(t *testing.T) {
 	}
 }
 
+// An empty redirect chain has sent nothing, so it has left no origin; a chain
+// that changes port has.
+func TestStayedOnFirstOrigin(t *testing.T) {
+	assert.True(t, StayedOnFirstOrigin(nil))
+	request := func(raw string) *http.Request {
+		r, err := http.NewRequestWithContext(t.Context(), http.MethodGet, raw, nil)
+		require.NoError(t, err)
+		return r
+	}
+	assert.True(t, StayedOnFirstOrigin([]*http.Request{request("https://a.example/x"), request("https://A.example:443/y")}))
+	assert.False(t, StayedOnFirstOrigin([]*http.Request{request("https://a.example/x"), request("https://a.example:8443/y")}))
+}
+
 func TestNoTokenAllowedOverInsecureRemote(t *testing.T) {
 	// Without a token there is nothing to leak, so the insecure-transport guard
 	// must not block ordinary unauthenticated requests: the request proceeds

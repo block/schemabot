@@ -111,11 +111,13 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(req)
 }
 
-// warnWriter receives the CLI's warning lines. It is the process's stderr, the
-// same stream the commands use for their own warnings, so an operator sees why
-// a later 401 happened next to the command output rather than in a log format
-// they filter out.
-var warnWriter io.Writer = os.Stderr
+// warnWriter receives the CLI's warning lines. Nil means the process's stderr
+// as it is when the warning is written, the same stream the commands use for
+// their own warnings, so an operator sees why a later 401 happened next to the
+// command output rather than in a log format they filter out. It is resolved at
+// write time rather than bound at package init, so a caller that redirects
+// os.Stderr sees the warning too.
+var warnWriter io.Writer
 
 // WarnUnauthenticatedRedirect tells the operator that a redirect is being
 // followed without the token and why, naming the origin the token belongs to
@@ -127,7 +129,11 @@ func WarnUnauthenticatedRedirect(reason, tokenOrigin, redirectOrigin string) {
 	}
 	// The warning is advisory. A stderr that refuses writes leaves nowhere to
 	// report that, and the request itself is unaffected.
-	_, _ = fmt.Fprintf(warnWriter, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
+	out := warnWriter
+	if out == nil {
+		out = os.Stderr
+	}
+	_, _ = fmt.Fprintf(out, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
 		subject, redirectOrigin, reason)
 }
 
@@ -168,7 +174,11 @@ func redirectChain(req *http.Request) (chain []*http.Request, complete bool) {
 // http.Client CheckRedirect policy passes its via requests with the pending
 // request appended. Any CLI client that sends a credential across redirects
 // holds it to this rule, so the token stays with the origin it was sent to.
+// An empty chain has sent nothing, so it has left no origin.
 func StayedOnFirstOrigin(chain []*http.Request) bool {
+	if len(chain) == 0 {
+		return true
+	}
 	origin := RequestOrigin(chain[0].URL)
 	for _, hop := range chain[1:] {
 		if RequestOrigin(hop.URL) != origin {

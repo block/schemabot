@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,10 +57,11 @@ func TestStorageSchemaSourceFlags_ValidateSource(t *testing.T) {
 	assert.Contains(t, err.Error(), "--release-repo only applies with --release")
 }
 
-// A token never travels in plaintext, including on a redirect. Go carries the
-// Authorization header across a redirect that stays on the same host and
-// compares hosts without comparing schemes, so an https host that redirects to
-// itself over http would otherwise forward the token in the clear.
+// A token never travels in plaintext, including on a redirect. In a real chain
+// a token-carrying plaintext hop cannot arise, because leaving the first
+// origin withholds the token first (see
+// TestRefuseInsecureRedirect_DowngradeWithTokenInARealChain); the policy is
+// called here with no chain so its backstop refusal is pinned on its own.
 func TestRefuseInsecureRedirect(t *testing.T) {
 	withToken := func(rawURL string) *http.Request {
 		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
@@ -121,6 +123,66 @@ func TestRefuseInsecureRedirect(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, converging(loopback, nil), "a loopback hop has no network path to protect")
 	require.NoError(t, converging(secure, nil))
+}
+
+// A token-carrying fetch redirected from https to http on the same host leaves
+// the origin, so the hop goes without the token and is then held to the
+// plaintext rule an anonymous hop gets: a plan follows it with both warnings,
+// and a convergence refuses it without claiming the request continues.
+func TestRefuseInsecureRedirect_DowngradeWithTokenInARealChain(t *testing.T) {
+	withToken := func(rawURL string) *http.Request {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
+		require.NoError(t, err)
+		request.Header.Set("Authorization", "Bearer "+releaseFetchToken)
+		return request
+	}
+	first := withToken("https://api.example/repos/example/schemabot/contents/pkg")
+
+	downgrade := withToken("http://api.example/repos/example/schemabot/contents/pkg")
+	var err error
+	stderr := captureStderr(t, func() {
+		err = refuseInsecureRedirect(false)(downgrade, []*http.Request{first})
+	})
+	require.NoError(t, err, "a plan follows the downgrade, without the token")
+	assert.Empty(t, downgrade.Header.Get("Authorization"))
+	assert.Contains(t, stderr, "read from http://api.example over plaintext")
+	assert.Contains(t, stderr, "Warning: not sending the auth token for https://api.example:443 to redirect target http://api.example:80 because the redirect chain has left that origin; the request continues unauthenticated\n")
+
+	downgrade = withToken("http://api.example/repos/example/schemabot/contents/pkg")
+	stderr = captureStderr(t, func() {
+		err = refuseInsecureRedirect(true)(downgrade, []*http.Request{first})
+	})
+	require.ErrorContains(t, err, "refusing to converge a release redirected to http://api.example")
+	assert.NotContains(t, stderr, "the request continues unauthenticated", "a refused hop sends nothing, so nothing continues")
+}
+
+// A fetch whose token is withheld from a redirect says so on stderr, naming
+// both origins, so a 401 from the second server is explainable; a fetch that
+// never carried a token has nothing to warn about.
+func TestReleaseFetch_WarnsWhenTokenWithheld(t *testing.T) {
+	destination := newAuthRecorder(t, httptest.NewServer, answerSchemaFile(t))
+	source := newAuthRecorder(t, httptest.NewServer, redirectTo(func() string { return destination.URL }))
+	sourceURL, err := url.Parse(source.URL)
+	require.NoError(t, err)
+	destinationURL, err := url.Parse(destination.URL)
+	require.NoError(t, err)
+
+	var fetchErr error
+	stderr := captureStderr(t, func() {
+		fetchErr = fetchReleasePathWithToken(t, releaseFetchClient(false), source.URL)
+	})
+	require.NoError(t, fetchErr)
+	assert.Equal(t, "Warning: not sending the auth token for "+cmdclient.RequestOrigin(sourceURL)+
+		" to redirect target "+cmdclient.RequestOrigin(destinationURL)+
+		" because the redirect chain has left that origin; the request continues unauthenticated\n", stderr)
+
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+	stderr = captureStderr(t, func() {
+		_, fetchErr = getReleaseContents(t.Context(), releaseFetchClient(false), "example/schemabot", "v1.4.0", "pkg/schema/mysql/applies.sql", "application/vnd.github.raw")
+	})
+	require.NoError(t, fetchErr)
+	assert.Empty(t, stderr, "an anonymous fetch has no token to withhold")
 }
 
 // releaseFetchToken is the token the redirect tests fetch with.

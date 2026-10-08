@@ -317,7 +317,7 @@ func refuseInsecureRedirect(converging bool) func(*http.Request, []*http.Request
 		if len(via) >= maxStorageSchemaRedirects {
 			return fmt.Errorf("stopped after %d redirects fetching release schema files", maxStorageSchemaRedirects)
 		}
-		withholdTokenOffOrigin(request, via)
+		withheld := withholdTokenOffOrigin(request, via)
 		if request.Header.Get("Authorization") == "" {
 			// Nothing to leak on this hop, but the files still arrive over
 			// whatever channel the redirect chose, and the check on the
@@ -331,8 +331,15 @@ func refuseInsecureRedirect(converging bool) func(*http.Request, []*http.Request
 				}
 				warnPlaintextSchemaSource(request.URL)
 			}
+			// The hop is accepted, so it now does go out without the token.
+			if withheld {
+				cmdclient.WarnUnauthenticatedRedirect("the redirect chain has left that origin", cmdclient.RequestOrigin(via[0].URL), cmdclient.RequestOrigin(request.URL))
+			}
 			return nil
 		}
+		// A hop that still carries the token is on the first request's origin,
+		// which passed this check before the token was set, so this refusal is
+		// a backstop for that invariant rather than a path a real chain takes.
 		if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
 			return fmt.Errorf("refusing a redirect to %s://%s: %w; the redirect stays on the same origin, so the token would follow it in plaintext", request.URL.Scheme, request.URL.Host, err)
 		}
@@ -341,22 +348,21 @@ func refuseInsecureRedirect(converging bool) func(*http.Request, []*http.Request
 }
 
 // withholdTokenOffOrigin removes the Authorization header from a redirect
-// request once the chain has left the origin of the first request, and says so
-// when that first request carried a token, so a later 401 is explainable. The
-// whole chain is checked rather than the last hop, so a redirect that bounces
-// back to the first origin stays unauthenticated: net/http copies the header
-// from the first request onto every hop, and the request arriving back was
-// shaped by a server the token was never sent to.
-func withholdTokenOffOrigin(request *http.Request, via []*http.Request) {
+// request once the chain has left the origin of the first request, and reports
+// whether it withheld a token the first request carried, so the caller can say
+// so once the hop is accepted and a later 401 is explainable. The whole chain
+// is checked rather than the last hop, so a redirect that bounces back to the
+// first origin stays unauthenticated: net/http copies the header from the first
+// request onto every hop, and the request arriving back was shaped by a server
+// the token was never sent to.
+func withholdTokenOffOrigin(request *http.Request, via []*http.Request) bool {
 	if cmdclient.StayedOnFirstOrigin(slices.Concat(via, []*http.Request{request})) {
 		// Every hop so far, this one included, is on the origin the token was
 		// sent to, so it travels as net/http copied it.
-		return
-	}
-	if via[0].Header.Get("Authorization") != "" {
-		cmdclient.WarnUnauthenticatedRedirect("it is on another origin", cmdclient.RequestOrigin(via[0].URL), cmdclient.RequestOrigin(request.URL))
+		return false
 	}
 	request.Header.Del("Authorization")
+	return via[0].Header.Get("Authorization") != ""
 }
 
 // maxStorageSchemaRedirects matches the ceiling net/http applies when a client
