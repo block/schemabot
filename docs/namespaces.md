@@ -351,7 +351,7 @@ ignore_tables:
 
 - A pattern matches the **whole** table name, whether or not you write `^` and `$`. `/relay_[0-9]+_feed/` withholds `relay_7_feed`, but not `old_relay_7_feed` or `relay_7_feed_backup`. To also match a prefix or suffix, say so with `.*`.
 - Matching is case-sensitive, the same as a plain entry. Start the expression with `(?i)` to ignore case.
-- The syntax is [RE2](https://github.com/google/re2/wiki/Syntax), the regular expression syntax of Go. It has no backtracking, so no pattern can slow a plan down. Lookarounds and backreferences are not supported.
+- The syntax is [RE2](https://github.com/google/re2/wiki/Syntax), the regular expression syntax of Go. It has no backtracking, and a pattern is at most 256 bytes, slashes included, so no pattern can stall a plan. Lookarounds and backreferences are not supported.
 - A pattern that does not compile is an error naming the entry. The plan or apply fails rather than skipping the entry, because a skipped entry withholds nothing.
 - An entry is a pattern only when it starts **and** ends with `/`. Any other entry is an exact table name, so existing entries keep their meaning. Wrap a pattern in quotes if your YAML tooling needs it; the quotes are not part of the entry.
 - A plan records the entries as written, and an apply, resume or rollback of that plan withholds by the same patterns. A table the application creates between the plan and the apply is withheld when it matches, never dropped.

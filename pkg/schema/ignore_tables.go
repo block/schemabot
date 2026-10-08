@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -16,6 +17,14 @@ import (
 // entry it wraps is unambiguously a pattern and every other entry keeps
 // meaning the one table it names.
 const ignoreTablePatternDelimiter = "/"
+
+// maxIgnoreTablePatternBytes caps a pattern entry's length, slashes included.
+// RE2 matches in linear time, but compiling an expression costs time in
+// proportion to its character classes, and one written to ignore case visits
+// every code point a class spans, so an uncapped entry could stall every plan
+// that reads it. A table name is at most 64 characters, so a pattern that
+// describes one never needs to come close to the cap.
+const maxIgnoreTablePatternBytes = 256
 
 // ValidateIgnoreTables rejects ignore_tables entries that cannot match a live
 // table: blank entries, entries padded with whitespace (a target spells a
@@ -62,7 +71,8 @@ func IsIgnoreTablePattern(entry string) bool {
 // anchored at both ends whether or not it is written with anchors, so a
 // pattern meant for one family of tables cannot reach a table that merely
 // contains a matching run of characters. The syntax is Go's RE2, which has no
-// backtracking, so no pattern can stall a plan.
+// backtracking, and an entry longer than maxIgnoreTablePatternBytes is refused,
+// so no pattern can stall a plan.
 //
 // The expression is compiled on its own before it is anchored, which is what
 // makes the anchoring hold: an expression that only parses once wrapped, such
@@ -81,6 +91,9 @@ func IsIgnoreTablePattern(entry string) bool {
 func CompileIgnoreTablePattern(entry string, foldCase bool) (*regexp.Regexp, error) {
 	if !IsIgnoreTablePattern(entry) {
 		return nil, fmt.Errorf("ignore_tables entry %s is not a pattern: a pattern is a regular expression wrapped in slashes", QuoteIgnoreTablesEntry(entry))
+	}
+	if len(entry) > maxIgnoreTablePatternBytes {
+		return nil, fmt.Errorf("ignore_tables entry %s is longer than %d bytes: split it into several pattern entries", QuoteIgnoreTablesEntry(entry), maxIgnoreTablePatternBytes)
 	}
 	expr := entry[len(ignoreTablePatternDelimiter) : len(entry)-len(ignoreTablePatternDelimiter)]
 	if expr == "" {
@@ -105,33 +118,60 @@ func CompileIgnoreTablePattern(entry string, foldCase bool) (*regexp.Regexp, err
 	return re, nil
 }
 
-// foldRegexpCase makes a parsed expression match a name when any spelling of
-// it that differs only in case matches the expression as written, whatever
-// flags the expression sets. That is the name a case-folding target would
-// treat as the table the pattern withholds. Each literal and character class
-// is closed under case folding; a negated class is folded after negation, so
-// `[^a-z]`, which as written matches A, also matches a.
+// foldRegexpCase makes a parsed expression match every name that a spelling
+// differing from it only in case would match as written, whatever flags the
+// expression sets: those are the names a case-folding target would treat as a
+// table the pattern withholds. Each literal and character class is closed under
+// case folding; a negated class is folded after negation, so `[^a-z]`, which as
+// written matches A, also matches a.
+//
+// A word boundary is treated as always holding. Whether one holds depends on
+// which spelling of the neighboring runes the name uses, since only ASCII runes
+// count as word characters, so `\bK\b` written would match the Kelvin sign's
+// ASCII spelling K but a folded `\b` would reject the Kelvin sign itself. Dropping
+// the assertion can only widen the match, and the folded expression only decides
+// what the declared-table refusal refuses, so it errs toward refusing.
 func foldRegexpCase(re *syntax.Regexp) {
 	switch re.Op {
 	case syntax.OpLiteral:
 		re.Flags |= syntax.FoldCase
 	case syntax.OpCharClass:
 		re.Rune = foldedRanges(re.Rune)
+	case syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+		re.Op = syntax.OpEmptyMatch
 	}
 	for _, sub := range re.Sub {
 		foldRegexpCase(sub)
 	}
 }
 
-// foldedRanges adds to a character class's rune ranges every rune that a rune
-// in them folds to. Only runes inside unicode.CaseRanges have another case, so
-// a range is walked only where it overlaps them.
-func foldedRanges(ranges []rune) []rune {
+// foldableRunes lists, in order, every rune that folds to another. Only runes
+// between the first and last entries of unicode.CaseRanges do, so the scan that
+// builds the list is bounded, and it runs once per process.
+var foldableRunes = sync.OnceValue(func() []rune {
 	minFold := rune(unicode.CaseRanges[0].Lo)
 	maxFold := rune(unicode.CaseRanges[len(unicode.CaseRanges)-1].Hi)
+	var runes []rune
+	for c := minFold; c <= maxFold; c++ {
+		if unicode.SimpleFold(c) != c {
+			runes = append(runes, c)
+		}
+	}
+	return runes
+})
+
+// foldedRanges adds to a character class's rune ranges every rune that a rune
+// in them folds to. It visits only the foldable runes inside each range, so a
+// class costs at most one visit per foldable rune however wide it is.
+func foldedRanges(ranges []rune) []rune {
+	foldable := foldableRunes()
 	out := slices.Clone(ranges)
 	for i := 0; i+1 < len(ranges); i += 2 {
-		for c := max(ranges[i], minFold); c <= min(ranges[i+1], maxFold); c++ {
+		start, _ := slices.BinarySearch(foldable, ranges[i])
+		for _, c := range foldable[start:] {
+			if c > ranges[i+1] {
+				break
+			}
 			for f := unicode.SimpleFold(c); f != c; f = unicode.SimpleFold(f) {
 				out = append(out, f, f)
 			}

@@ -1,6 +1,7 @@
 package schema
 
 import (
+	"strings"
 	"testing"
 	"unicode"
 
@@ -117,6 +118,9 @@ func TestCompileIgnoreTablePatternFoldsCaseDespiteEmbeddedFlags(t *testing.T) {
 		// that folds names, so the folded pattern matches both spellings.
 		{entry: `/[^a-z]+_feed/`, matches: []string{"12_FEED", "AB_feed", "ab_feed"}, misses: []string{"ab_fee"}},
 		{entry: `/(?-i)a|b/`, matches: []string{"A", "B"}, misses: []string{"AB", "aB"}},
+		// The Kelvin sign folds to K but is not an ASCII word character, so a
+		// word boundary cannot hold the way it does around K.
+		{entry: `/\bK\b/`, matches: []string{"K", "k", "\u212a"}, misses: []string{"KK"}},
 	} {
 		folded, err := CompileIgnoreTablePattern(tc.entry, true)
 		require.NoError(t, err, tc.entry)
@@ -134,8 +138,9 @@ func TestCompileIgnoreTablePatternFoldsCaseDespiteEmbeddedFlags(t *testing.T) {
 	assert.False(t, asWritten.MatchString("Relay_1_Feed"), "withholding keeps the expression's own case rules")
 }
 
-// foldedRanges only walks the runes inside unicode.CaseRanges, which holds only
-// while no rune outside them folds to another.
+// foldableRunes only scans the runes between the first and last entries of
+// unicode.CaseRanges, which holds only while no rune outside them folds to
+// another.
 func TestCaseRangesBoundEveryFold(t *testing.T) {
 	minFold := rune(unicode.CaseRanges[0].Lo)
 	maxFold := rune(unicode.CaseRanges[len(unicode.CaseRanges)-1].Hi)
@@ -145,6 +150,27 @@ func TestCaseRangesBoundEveryFold(t *testing.T) {
 		}
 		require.Equal(t, c, unicode.SimpleFold(c), "rune %U folds but lies outside unicode.CaseRanges", c)
 	}
+}
+
+// A pattern's length is capped, since compiling one costs time in proportion
+// to its character classes. A pattern at the cap made entirely of classes that
+// span the code space still compiles, folded and as written.
+func TestCompileIgnoreTablePatternLengthCap(t *testing.T) {
+	atCap := "/" + strings.Repeat(`[^_]`, (maxIgnoreTablePatternBytes-2)/4) + "/"
+	require.LessOrEqual(t, len(atCap), maxIgnoreTablePatternBytes)
+	for _, foldCase := range []bool{false, true} {
+		re, err := CompileIgnoreTablePattern(atCap, foldCase)
+		require.NoError(t, err)
+		assert.True(t, re.MatchString(strings.Repeat("A", (maxIgnoreTablePatternBytes-2)/4)))
+	}
+
+	tooLong := "/" + strings.Repeat("a", maxIgnoreTablePatternBytes-1) + "/"
+	_, err := CompileIgnoreTablePattern(tooLong, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is longer than 256 bytes: split it into several pattern entries")
+	err = ValidateIgnoreTables([]string{tooLong})
+	require.Error(t, err, "config validation refuses an over-long pattern")
+	assert.Contains(t, err.Error(), "is longer than 256 bytes")
 }
 
 func TestQuoteIgnoreTablesEntry(t *testing.T) {
