@@ -303,6 +303,11 @@ type recordingApplyStore struct {
 	updated       *storage.Apply
 	expectedState string
 	swapped       bool
+	successor     string
+}
+
+func (s *recordingApplyStore) NewerApplyOnTargets(context.Context, *storage.Apply) (string, error) {
+	return s.successor, nil
 }
 
 func (s *recordingApplyStore) UpdateDerivedState(_ context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
@@ -483,14 +488,17 @@ func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T)
 // read "all attached operations succeeded" (or "an attached operation
 // reverted") as the generation's outcome while declared siblings are still on
 // their way — it holds the apply running instead, for completed and reverted
-// alike. Failure verdicts pass through unheld, and an apply without a manifest
-// keeps the attached-rows-only semantics.
+// alike. Once a newer apply holds the same targets the missing siblings can no
+// longer arrive, so the hold ends and the verdict is the one over what attached.
+// Failure verdicts pass through unheld, and an apply without a manifest keeps
+// the attached-rows-only semantics.
 func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 	const shardA, shardB = "ns/-80/users", "ns/80-/users"
 	cases := []struct {
 		name      string
 		manifest  []string
 		ops       []*storage.ApplyOperation
+		successor string
 		wantState string
 		wantDone  bool
 	}{
@@ -502,6 +510,16 @@ func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 			},
 			wantState: state.Apply.Running,
 			wantDone:  false,
+		},
+		{
+			name:     "a newer apply on the targets settles the completed attached subset",
+			manifest: []string{shardA, shardB},
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Completed},
+			},
+			successor: "apply-newer",
+			wantState: state.Apply.Completed,
+			wantDone:  true,
 		},
 		{
 			name:     "full manifest attached and completed completes the apply",
@@ -553,7 +571,7 @@ func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			applyStore := &recordingApplyStore{swapped: true}
+			applyStore := &recordingApplyStore{swapped: true, successor: tc.successor}
 			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
 
 			apply := &storage.Apply{

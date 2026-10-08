@@ -2966,17 +2966,35 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// the work the dispatcher declared is still on its way, and terminalizing
 	// early would make later dispatches refuse to attach, silently diverging
 	// the declared shards from the recorded outcome.
+	//
+	// A newer apply on the same targets ends the wait. Admission lets a new
+	// generation in beside this one only once everything attached here has
+	// settled, and from then on refuses the missing operations, so they can no
+	// longer arrive and the verdict is the one over what did.
 	manifestHeld := false
 	if manifestGatedVerdict(derived) {
 		if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
-			derived = state.Apply.Running
-			manifestHeld = true
-			s.logger.Debug("operator: holding apply open; manifest operations have not attached yet",
-				append(apply.LogAttrs(),
-					"driver", driverID,
-					"missing_operation_keys", missing,
-					"operation_count", len(ops))...)
-			metrics.RecordApplyManifestHold(ctx, apply.Database, apply.Deployment, apply.Environment)
+			successor, err := s.storage.Applies().NewerApplyOnTargets(ctx, apply)
+			if err != nil {
+				return applyProjectionResult{}, fmt.Errorf("check for a newer apply on the targets of apply %s held open for its manifest: %w", apply.ApplyIdentifier, err)
+			}
+			if successor != "" {
+				s.logger.Warn("operator: settling apply held open for manifest operations that never attached; a newer apply holds its targets, so they can no longer arrive",
+					append(apply.LogAttrs(),
+						"driver", driverID,
+						"missing_operation_keys", missing,
+						"successor_apply_id", successor,
+						"derived_state", derived)...)
+			} else {
+				derived = state.Apply.Running
+				manifestHeld = true
+				s.logger.Debug("operator: holding apply open; manifest operations have not attached yet",
+					append(apply.LogAttrs(),
+						"driver", driverID,
+						"missing_operation_keys", missing,
+						"operation_count", len(ops))...)
+				metrics.RecordApplyManifestHold(ctx, apply.Database, apply.Deployment, apply.Environment)
+			}
 		}
 	}
 

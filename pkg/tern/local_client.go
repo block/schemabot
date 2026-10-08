@@ -2875,6 +2875,23 @@ func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *tern
 	}
 }
 
+// refuseAttachToTakenOverApply refuses an operation arriving for an apply whose
+// targets a newer apply now holds. The newer generation was admitted because
+// this one had settled everything that attached and was waiting only for
+// operations like this one, so running it now would run work the newer apply
+// owns on the same deployment.
+func (c *LocalClient) refuseAttachToTakenOverApply(req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, err error) *ternv1.ApplyResponse {
+	c.logger.Warn("Apply: refusing to attach operation to an apply whose targets a newer apply holds; dispatch is rejected",
+		append(apply.LogAttrs(),
+			"operation_key", operationKey,
+			"idempotency_key", req.IdempotencyKey,
+			"error", err)...)
+	return &ternv1.ApplyResponse{
+		Accepted:     false,
+		ErrorMessage: fmt.Sprintf("a newer apply holds the targets of apply %s; operation %s cannot attach", apply.ApplyIdentifier, operationKey),
+	}
+}
+
 // attachDispatchOperation adds a sibling dispatch's operation and its tasks to
 // the deployment's existing keyed apply. The attach runs the same conflict and
 // unsafe-DDL gates a fresh apply runs, so attaching never admits work a create
@@ -2964,6 +2981,8 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		return c.refuseAttachToTerminalApply(ctx, req, apply, operationKey), nil
 	case errors.Is(err, storage.ErrApplyOperationKeyingMismatch):
 		return c.refuseAttachKeyingMismatch(req, apply, plan, scope, operationKey, err), nil
+	case errors.Is(err, storage.ErrApplyTakenOver):
+		return c.refuseAttachToTakenOverApply(req, apply, operationKey, err), nil
 	case err != nil:
 		return nil, fmt.Errorf("attach operation %s to apply %s: %w", operationKey, apply.ApplyIdentifier, err)
 	}

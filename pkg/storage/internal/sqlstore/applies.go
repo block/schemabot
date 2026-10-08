@@ -493,11 +493,82 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 	if len(deployments) == 0 {
 		return fmt.Errorf("active apply target requires at least one deployment for %s/%s/%s", database, dbType, environment)
 	}
+	holders, err := activeApplyHoldersForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
+	if err != nil {
+		return err
+	}
+	if len(holders) > 0 {
+		return activeApplyExistsError(database, dbType, environment, deployments, holders[0].identifier)
+	}
+	return checkNoInProgressRolloutForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
+}
 
+// checkNoActiveApplyForNewGeneration is checkNoActiveApplyForTargets for the
+// creation of an apply that carries a generation manifest: the first dispatch
+// of a deployment-keyed generation. It admits the new generation past one kind
+// of holder only, an earlier generation held open waiting for operations that
+// never attached (settledManifestHold). The dispatcher starts a new generation
+// on a deployment only once it is done with every earlier one there, so those
+// operations can no longer arrive, and the earlier generation has no work left
+// to protect: everything that attached to it has settled. Its driver settles it
+// once it sees this newer apply on its targets, and a late attach to it is
+// refused while this one holds them (AttachOperationWithTasks). Every other
+// holder blocks exactly as it does for any apply.
+func checkNoActiveApplyForNewGeneration(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string) error {
+	deployments = dedupeDeployments(deployments)
+	if len(deployments) == 0 {
+		return fmt.Errorf("active apply target requires at least one deployment for %s/%s/%s", database, dbType, environment)
+	}
+	holders, err := activeApplyHoldersForTargets(ctx, tx, dialect, database, dbType, environment, deployments, 0)
+	if err != nil {
+		return err
+	}
+	for _, holder := range holders {
+		held, err := settledManifestHold(ctx, tx, holder)
+		if err != nil {
+			return err
+		}
+		if !held {
+			return activeApplyExistsError(database, dbType, environment, deployments, holder.identifier)
+		}
+		slog.WarnContext(ctx, "admitting a new generation past an earlier one held open for operations that never attached; its driver settles it on its next pass",
+			"database", database, "database_type", dbType, "environment", environment, "deployments", deployments,
+			"held_apply_id", holder.identifier)
+	}
+	return checkNoInProgressRolloutForTargets(ctx, tx, dialect, database, dbType, environment, deployments, 0)
+}
+
+// checkNoActiveApplyForCreate runs the admission check for a new apply's
+// targets. An apply that declares a generation manifest is the first dispatch
+// of a new generation, which only an earlier generation's manifest hold cannot
+// block; every other apply is held to the plain check.
+func checkNoActiveApplyForCreate(ctx context.Context, tx *rebindTx, dialect Dialect, apply *storage.Apply, deployments []string) error {
+	if len(apply.ExpectedOperationKeys) > 0 {
+		return checkNoActiveApplyForNewGeneration(ctx, tx, dialect, apply.Database, apply.DatabaseType, apply.Environment, deployments)
+	}
+	return checkNoActiveApplyForTargets(ctx, tx, dialect, apply.Database, apply.DatabaseType, apply.Environment, deployments, 0)
+}
+
+func activeApplyExistsError(database, dbType, environment string, deployments []string, holderIdentifier string) error {
+	return fmt.Errorf("active apply %s exists for %s/%s/%s deployments %v: %w", holderIdentifier, database, dbType, environment, deployments, storage.ErrActiveApplyExists)
+}
+
+// activeApplyHolder is a non-terminal apply reserving one of the deployments
+// an admission check asked about.
+type activeApplyHolder struct {
+	id         int64
+	identifier string
+	state      string
+}
+
+// activeApplyHoldersForTargets returns every non-terminal apply that reserves
+// one of the deployments, through its primary deployment or any of its
+// operations.
+func activeApplyHoldersForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) ([]activeApplyHolder, error) {
 	statePredicate, stateArgs := nonTerminalApplyStatePredicate("a.state")
 	deploymentPlaceholders := placeholders(len(deployments))
 	query := fmt.Sprintf(`
-		SELECT 1 FROM applies a%s
+		SELECT a.id, a.apply_identifier, a.state FROM applies a%s
 		WHERE a.database_name = ?
 		AND a.database_type = ?
 		AND a.environment = ?
@@ -519,17 +590,80 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 		query += " AND a.id != ?"
 		args = append(args, excludeApplyID)
 	}
-	query += " LIMIT 1"
+	query += " ORDER BY a.id"
 
-	var exists int
-	err := tx.QueryRowContext(ctx, query, args...).Scan(&exists)
-	if err == nil {
-		return fmt.Errorf("active apply exists for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, storage.ErrActiveApplyExists)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+	defer utils.CloseAndLog(rows)
+	var holders []activeApplyHolder
+	for rows.Next() {
+		var holder activeApplyHolder
+		if err := rows.Scan(&holder.id, &holder.identifier, &holder.state); err != nil {
+			return nil, fmt.Errorf("scan active apply for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+		}
+		holders = append(holders, holder)
 	}
-	return checkNoInProgressRolloutForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+	}
+	return holders, nil
+}
+
+// settledManifestHold reports whether an active apply is an earlier generation
+// held open only by its generation manifest: the operator's projection keeps it
+// running because declared operations never attached, while everything that
+// did attach has settled. It must be running, declare a manifest, have at
+// least one attached operation and at least one declared operation missing,
+// and carry no unsettled operation and no unfinished task, so it provably has
+// no engine work in flight. Anything else is a live apply.
+func settledManifestHold(ctx context.Context, tx *rebindTx, holder activeApplyHolder) (bool, error) {
+	if !state.IsState(holder.state, state.Apply.Running) {
+		return false, nil
+	}
+	var manifestJSON []byte
+	if err := tx.QueryRowContext(ctx, `SELECT expected_operation_keys FROM applies WHERE id = ?`, holder.id).Scan(&manifestJSON); err != nil {
+		return false, fmt.Errorf("load generation manifest of active apply %s: %w", holder.identifier, err)
+	}
+	if len(manifestJSON) == 0 {
+		return false, nil
+	}
+	held := &storage.Apply{ApplyIdentifier: holder.identifier}
+	if err := json.Unmarshal(manifestJSON, &held.ExpectedOperationKeys); err != nil {
+		return false, fmt.Errorf("unmarshal expected_operation_keys for apply %s: %w", holder.identifier, err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT operation_key, state FROM apply_operations WHERE apply_id = ?`, holder.id)
+	if err != nil {
+		return false, fmt.Errorf("list operations of active apply %s: %w", holder.identifier, err)
+	}
+	defer utils.CloseAndLog(rows)
+	var ops []*storage.ApplyOperation
+	for rows.Next() {
+		op := &storage.ApplyOperation{}
+		if err := rows.Scan(&op.OperationKey, &op.State); err != nil {
+			return false, fmt.Errorf("scan operation of active apply %s: %w", holder.identifier, err)
+		}
+		ops = append(ops, op)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate operations of active apply %s: %w", holder.identifier, err)
+	}
+	if len(ops) == 0 || len(held.MissingExpectedOperationKeys(ops)) == 0 {
+		return false, nil
+	}
+	for _, op := range ops {
+		if !slices.Contains(settledApplyStates(), state.NormalizeState(op.State)) {
+			return false, nil
+		}
+	}
+
+	var unfinished int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE apply_id = ? AND state NOT IN (`+terminalTaskStatesSQL+`)`, holder.id).Scan(&unfinished); err != nil {
+		return false, fmt.Errorf("count unfinished tasks of active apply %s: %w", holder.identifier, err)
+	}
+	return unfinished == 0, nil
 }
 
 // operationInProgressPredicate matches an operation row, under the given
@@ -875,6 +1009,9 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 	if err := requireAttachKeyingMatches(ctx, writeTx.tx, apply, operation); err != nil {
 		return err
 	}
+	if err := checkAttachTargetsNotTakenOver(ctx, writeTx.tx, s.db, s.locker, apply, operation); err != nil {
+		return err
+	}
 
 	operation.ApplyID = apply.ID
 	if _, err := insertApplyOperation(ctx, writeTx.tx, s.identity, s.classifier, operation); err != nil {
@@ -894,6 +1031,114 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 		return fmt.Errorf("commit %s: %w", opName, err)
 	}
 	return nil
+}
+
+// checkAttachTargetsNotTakenOver refuses an attach to an apply whose targets a
+// newer apply now holds. A new generation is admitted past an earlier one that
+// is held open only for operations that never attached
+// (checkNoActiveApplyForNewGeneration), so an operation of that earlier
+// generation arriving late must not join it, whatever state the newer apply
+// has reached since: it would run work the newer apply now owns. The check
+// takes the target lock after the apply's row lock, the order the
+// stopped-apply claim takes them in, so it serializes with the admission.
+func checkAttachTargetsNotTakenOver(ctx context.Context, tx *rebindTx, db *rebindDB, locker namedlock.Locker, apply *storage.Apply, operation *storage.ApplyOperation) error {
+	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
+	if err != nil {
+		return err
+	}
+	if !hasApplyTarget(database, dbType, environment) {
+		return fmt.Errorf("attach operation %s to apply %s: apply is missing target metadata for the exclusivity check", operation.OperationKey, apply.ApplyIdentifier)
+	}
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
+	if err != nil {
+		return err
+	}
+	defer releaseApplyTargetLockConn(ctx, locker, conn, lockName, "attach operation to apply")
+
+	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
+	if err != nil {
+		return err
+	}
+	deployments = dedupeDeployments(append(deployments, deployment, operation.Deployment))
+	newer, err := newerApplyOnDeployments(ctx, tx, database, dbType, environment, apply.ID, deployments)
+	if err != nil {
+		return fmt.Errorf("attach operation %s to apply %s: %w", operation.OperationKey, apply.ApplyIdentifier, err)
+	}
+	if newer != "" {
+		return fmt.Errorf("attach operation %s to apply %s: apply %s holds deployments %v: %w", operation.OperationKey, apply.ApplyIdentifier, newer, deployments, storage.ErrApplyTakenOver)
+	}
+	return nil
+}
+
+// NewerApplyOnTargets returns the identifier of the earliest apply created
+// after the given one that reserves one of its deployments, or "" when there
+// is none.
+func (s *applyStore) NewerApplyOnTargets(ctx context.Context, apply *storage.Apply) (string, error) {
+	if apply == nil {
+		return "", fmt.Errorf("find newer apply on targets: apply is nil")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT deployment FROM apply_operations WHERE apply_id = ?`, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("list operation deployments of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	defer utils.CloseAndLog(rows)
+	deployments := []string{apply.Deployment}
+	for rows.Next() {
+		var deployment string
+		if err := rows.Scan(&deployment); err != nil {
+			return "", fmt.Errorf("scan operation deployment of apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		deployments = append(deployments, deployment)
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("iterate operation deployments of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	deployments = dedupeDeployments(deployments)
+	if len(deployments) == 0 {
+		return "", fmt.Errorf("find newer apply on targets of apply %s: apply has no deployment", apply.ApplyIdentifier)
+	}
+	newer, err := newerApplyOnDeployments(ctx, s.db, apply.Database, apply.DatabaseType, apply.Environment, apply.ID, deployments)
+	if err != nil {
+		return "", fmt.Errorf("find newer apply on targets of apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return newer, nil
+}
+
+// newerApplyOnDeployments returns the identifier of the earliest apply after
+// applyID whose own deployment, or any of whose operations' deployments, is in
+// deployments, or "" when there is none. Any state counts: a newer apply on the
+// same deployment exists only because the older one was admitted past.
+func newerApplyOnDeployments(ctx context.Context, q queryRower, database, dbType, environment string, applyID int64, deployments []string) (string, error) {
+	deploymentPlaceholders := placeholders(len(deployments))
+	query := fmt.Sprintf(`
+		SELECT n.apply_identifier FROM applies n
+		WHERE n.database_name = ?
+		AND n.database_type = ?
+		AND n.environment = ?
+		AND n.id > ?
+		AND (
+			n.deployment IN (%s)
+			OR EXISTS (
+				SELECT 1 FROM apply_operations o
+				WHERE o.apply_id = n.id
+				AND o.deployment IN (%s)
+			)
+		)
+		ORDER BY n.id
+		LIMIT 1
+	`, deploymentPlaceholders, deploymentPlaceholders)
+	args := []any{database, dbType, environment, applyID}
+	args = append(args, stringArgs(deployments)...)
+	args = append(args, stringArgs(deployments)...)
+	var newer string
+	err := q.QueryRowContext(ctx, query, args...).Scan(&newer)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("query newer apply on deployments %v: %w", deployments, err)
+	}
+	return newer, nil
 }
 
 // requireAttachKeyingMatches refuses an attach whose operation is keyed by
@@ -967,7 +1212,7 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 	}
 
 	if lockTarget {
-		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, s.dialect, apply.Database, apply.DatabaseType, apply.Environment, newDeployments, 0); err != nil {
+		if err := checkNoActiveApplyForCreate(ctx, writeTx.tx, s.dialect, apply, newDeployments); err != nil {
 			return 0, err
 		}
 	}

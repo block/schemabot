@@ -1750,11 +1750,12 @@ type applyTaskScope struct {
 	// so nothing derives its terminal state but this drive.
 	tasklessOperation bool
 
-	// deploymentOperationKeys is the full operation-key set of the claimed
-	// operation's deployment, captured from the parent's operation rows at claim
-	// load. Deployment-keyed dispatches send it as the generation manifest so
-	// the data plane knows the whole generation from the first dispatch. Empty
-	// for whole-apply scopes.
+	// deploymentOperationKeys is the operation-key set the claimed operation's
+	// deployment will dispatch, captured from the parent's operation rows at
+	// claim load: every operation of the deployment except those settled because
+	// their target already held the change. Deployment-keyed dispatches send it
+	// as the generation manifest so the data plane knows the whole generation
+	// from the first dispatch. Empty for whole-apply scopes.
 	deploymentOperationKeys []string
 
 	// memberTarget is the claimed operation's target when its deployment
@@ -1973,7 +1974,7 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		if op.ID == applyOperationID {
 			found = true
 		}
-		if op.Deployment == operation.Deployment {
+		if declaredInGeneration(op, operation.Deployment) {
 			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
 		}
 	}
@@ -1996,6 +1997,16 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		deploymentOperationKeys: deploymentOperationKeys,
 		memberTarget:            memberTarget,
 	}, nil
+}
+
+// declaredInGeneration reports whether an operation belongs in the generation
+// manifest a dispatch for the given deployment declares: one of that
+// deployment's operations that will be dispatched. An operation settled at
+// creation because its target already held the change is never dispatched, so
+// declaring it would hold the remote apply open for an operation that never
+// attaches.
+func declaredInGeneration(op *storage.ApplyOperation, deployment string) bool {
+	return op.Deployment == deployment && !op.AlreadyConverged
 }
 
 // deploymentAddressesSeveralTargets reports whether the operations of one

@@ -957,6 +957,10 @@ rather than the operation is the unit of reconciliation. A parent that has recor
 verdict keeps the whole set reserved while any of its operations is still in progress, since a
 drive can still reopen it (ST-1). An operation is in progress from the moment a driver starts it
 until it reaches a terminal state, and one awaiting a retry only while a driver is retrying it.
+An apply held open only for operations its generation declared but never attached stops reserving
+its targets once every operation it did attach has settled and a newer generation of those targets
+is created: the newer generation is admitted, no operation can attach to the older apply after
+that, and the older apply's driver settles it over what attached.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
@@ -971,7 +975,11 @@ admitted after that result and before the correction lands is recorded active be
 rollout. *Enforced:* the exclusivity check in the storage apply create and activate paths, over
 active parents and over terminal parents with an operation in progress
 (`checkNoActiveApplyForTargets`, `checkNoInProgressRolloutForTargets`), under the apply target lock
-(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`).
+(`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`). The
+admission past a settled manifest hold is `checkNoActiveApplyForNewGeneration` and
+`settledManifestHold`, the attach refusal is `checkAttachTargetsNotTakenOver` in the same file, and
+the driver settles the held apply once `NewerApplyOnTargets` names a successor
+(`updateApplyStateFromOperations`, `pkg/api/operator.go`).
 
 ### OW-6: There is one way to claim work
 
