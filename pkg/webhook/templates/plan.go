@@ -249,18 +249,22 @@ type PlanCommentData struct {
 	// database (nothing to compare) or when drift was not evaluated.
 	DeploymentDrift *DeploymentDriftData
 
-	// MemberApplyRefusal says why a PR apply cannot run the other targets'
-	// plans this comment renders, whether or not the primary target has work
-	// of its own, naming only targets, tables, and namespaces. Such an apply is
+	// MemberApplyRefusal says why a PR apply cannot run the plan of
+	// MemberApplyRefusalTarget, one of the targets' plans this comment
+	// renders, whether or not the primary target has work of its own, naming
+	// only tables and namespaces. Such an apply is
 	// refused whatever its flags, so the comment offers no apply command in its
 	// place. Empty when the apply can run them, or when the comment renders the
 	// primary plan alone.
 	MemberApplyRefusal string
+	// MemberApplyRefusalTarget names the target whose plan MemberApplyRefusal
+	// is about.
+	MemberApplyRefusalTarget string
 
 	// summaryRollout is the rollout a summary of several targets' plans
-	// covers. The summary then says how many targets the diff rolls out to and
-	// how many already have it, so a count combined across targets never reads
-	// as any one target's work. Nil when the summary is one plan's.
+	// covers. The summary then says which targets the diff rolls out to, so a
+	// count combined across targets never reads as any one target's work. Nil
+	// when the summary is one plan's.
 	summaryRollout *DeploymentDriftData
 
 	// namespaceLabelsInline renders each keyspace's label as a bold line
@@ -442,12 +446,12 @@ func (d PlanCommentData) directNotesDeferCutover() bool {
 
 // PausedApplyCauseData is a cause the rest of the comment does not already
 // disclose, in the shape every other disclosure uses: a heading naming what is
-// wrong, the specifics behind it, and what the operator can do. Entries may be
-// empty where the cause has no per-table detail to give.
+// wrong and the specifics behind it. The footer says what the operator can do,
+// so the cause does not repeat it. Entries may be empty where the cause has no
+// per-table detail to give.
 type PausedApplyCauseData struct {
 	Heading string
 	Entries []string
-	Remedy  string
 }
 
 // KeyspaceChangeData contains changes for a single keyspace/schema.
@@ -547,6 +551,12 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	targetPlans := RendersTargetPlans(data.DeploymentDrift)
 	summary := data
 	if targetPlans {
+		// With each target's plan under its own heading, a cause written after
+		// them would read as part of the last target's section. It leads instead,
+		// so the reader knows why the apply is waiting before reading the plans.
+		if data.PausedApplyCause != nil {
+			writePausedApplyCause(&sb, data.PausedApplyCause)
+		}
 		writeTargetPlans(&sb, data, budget, false)
 		summary.Changes = combinedTargetPlanChanges(data)
 		summary.summaryRollout = data.DeploymentDrift
@@ -631,7 +641,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	// rather than in the footer so every warning on the comment is in one
 	// region: the reader meets them in one pass, and the footer stays the same
 	// sentence whatever paused the apply.
-	if data.PausedApplyCause != nil {
+	if data.PausedApplyCause != nil && !targetPlans {
 		writePausedApplyCause(&sb, data.PausedApplyCause)
 	}
 
@@ -692,7 +702,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 			sb.WriteString("**Applying automatically**\n")
 		}
 	case data.MemberApplyRefusal != "":
-		writeMemberApplyRefusal(&sb, data.MemberApplyRefusal)
+		writeMemberApplyRefusal(&sb, data.MemberApplyRefusalTarget, data.MemberApplyRefusal)
 	case data.applyFailsOnRefusedChange():
 		writeRefusedChangeReplan(&sb, "this plan", scopedCommand("schemabot plan", data.Environment, data.ScopedDatabase, data.Tenant))
 	default:
@@ -709,9 +719,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 // writeMemberApplyRefusal writes, in place of the apply instruction, why a PR
 // apply cannot run every target's plan the comment renders. Offering the
 // command there would coach an apply that is refused whatever its flags.
-func writeMemberApplyRefusal(sb *strings.Builder, refusal string) {
-	refusal = escapeInlineMarkdown(strings.Join(strings.Fields(refusal), " "))
-	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: %s.\n\n", refusal)
+func writeMemberApplyRefusal(sb *strings.Builder, target, reason string) {
+	reason = escapeInlineMarkdown(strings.Join(strings.Fields(reason), " "))
+	fmt.Fprintf(sb, glyph.Attention+" **This PR cannot apply every target's plan**: target %s: %s.\n\n", inlineCode(target), reason)
 	sb.WriteString("An apply runs every target or none, so nothing runs until that plan can. The schema check keeps blocking merge until every target has the change.\n")
 }
 
@@ -1037,9 +1047,6 @@ func writePlanSummary(sb *strings.Builder, data PlanCommentData, totalStatements
 		text += " · " + rolloutScope(data.summaryRollout)
 	}
 	fmt.Fprintf(sb, "📋 **Plan**: %s\n\n", text)
-	if data.summaryRollout != nil {
-		writeRolloutTargetNames(sb, data.summaryRollout)
-	}
 
 	// Disclosed directly under the plan summary so the exclusion reads as
 	// part of the plan result: what was counted, then what was withheld.
@@ -1285,10 +1292,12 @@ func changingTargetCount(drift *DeploymentDriftData) int {
 	return changing
 }
 
-// rolloutScope states how many of the rollout's targets the plan rolls out
-// to: "rolling out to 3 of 4 targets (1 already has it)" when some targets are
-// already at the desired schema, "rolling out to all 4 targets" (or "both
-// targets") when none are.
+// rolloutScope states which targets the plan rolls out to: "rolling out to
+// all 4 targets" (or "both targets") when every target has work, otherwise the
+// targets that have it, by name when there are few and when no plan heading
+// already names them: "rolling out to targets `a`, `c`", or "rolling out to
+// 12 targets". Targets already at the desired schema run nothing, so the
+// comment neither names nor counts them.
 // The summary is the union of every target's changes, so each target runs some
 // of that work, not necessarily all of it.
 func rolloutScope(drift *DeploymentDriftData) string {
@@ -1299,53 +1308,27 @@ func rolloutScope(drift *DeploymentDriftData) string {
 	if changing == total {
 		return fmt.Sprintf("rolling out to all %d %s", total, targetNoun.Plural)
 	}
-	return fmt.Sprintf("rolling out to %s (%d already %s it)",
-		presentation.CoveragePhrase(targetNoun, changing, total), total-changing, hasOrHave(total-changing))
-}
-
-func hasOrHave(n int) string {
-	if n == 1 {
-		return "has"
+	if targetPlansHeaded(drift) {
+		return "rolling out to " + presentation.CoveragePhrase(targetNoun, changing, 0)
 	}
-	return "have"
+	return "rolling out to " + planGroupList(targetNoun, rolloutTargetsWithWork(drift), 0)
 }
 
-// writeRolloutTargetNames lists, collapsed under the plan summary, which
-// targets need the change and which already have it. The summary states them
-// as counts; the names stay one click away for the operator who addresses a
-// target. When targets run different plans, each plan's heading already names
-// the targets that run it, so the block lists only the targets already at the
-// schema, and is left out when there are none: a fleet's names are not spent
-// twice from the room the comment leaves for DDL.
-func writeRolloutTargetNames(sb *strings.Builder, drift *DeploymentDriftData) {
-	var needs, has []string
+// rolloutTargetsWithWork is the rollout's targets that have work, in rollout
+// order, as every other list of targets reads.
+func rolloutTargetsWithWork(drift *DeploymentDriftData) []string {
+	var working []string
 	for _, g := range drift.Plans {
-		if g.Empty() {
-			has = append(has, g.Members...)
-		} else {
-			needs = append(needs, g.Members...)
+		if !g.Empty() {
+			working = append(working, g.Members...)
 		}
 	}
-	// Each list reads in rollout order, as every other list of targets does.
 	order := make(map[string]int)
 	for i, name := range driftMemberNames(drift.Deployments) {
 		order[name] = i
 	}
-	byRollout := func(a, b string) int { return order[a] - order[b] }
-	slices.SortStableFunc(needs, byRollout)
-	slices.SortStableFunc(has, byRollout)
-	var parts []string
-	if !targetPlansHeaded(drift) {
-		parts = append(parts, "Needs it: "+strings.Join(inlineCodeList(needs), ", "))
-	}
-	if len(has) > 0 {
-		parts = append(parts, "Already has it: "+strings.Join(inlineCodeList(has), ", "))
-	}
-	if len(parts) == 0 {
-		return
-	}
-	line := strings.Join(parts, " · ")
-	fmt.Fprintf(sb, "<details>\n<summary>Targets</summary>\n\n%s\n\n</details>\n\n", line)
+	slices.SortStableFunc(working, func(a, b string) int { return order[a] - order[b] })
+	return working
 }
 
 // targetPlansHeaded reports whether the rollout's plans render under headings
@@ -2611,9 +2594,6 @@ func writePausedApplyCause(sb *strings.Builder, cause *PausedApplyCauseData) {
 	for _, entry := range cause.Entries {
 		fmt.Fprintf(sb, "- %s\n", entry)
 	}
-	if cause.Remedy != "" {
-		fmt.Fprintf(sb, "\n%s\n", cause.Remedy)
-	}
 	sb.WriteString("\n")
 }
 
@@ -3418,7 +3398,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 			writeTableSizesSection(sb, summary)
 			writePlanSummary(sb, summary, summaryStatements, summaryKeyspaceUpdates)
 			if plan.MemberApplyRefusal != "" {
-				writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+				writeMemberApplyRefusal(sb, plan.MemberApplyRefusalTarget, plan.MemberApplyRefusal)
 				sb.WriteString("\n")
 			}
 			return
@@ -3490,7 +3470,7 @@ func writeEnvironmentPlanSection(sb *strings.Builder, plan *PlanCommentData, bud
 	// An apply this section's other targets' plans would refuse is not offered
 	// in the footer, so the section says why.
 	if plan.MemberApplyRefusal != "" {
-		writeMemberApplyRefusal(sb, plan.MemberApplyRefusal)
+		writeMemberApplyRefusal(sb, plan.MemberApplyRefusalTarget, plan.MemberApplyRefusal)
 		sb.WriteString("\n")
 	}
 }

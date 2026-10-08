@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -69,10 +70,14 @@ type memberWork struct {
 	// names are the members with work, the way an operator addresses them, in
 	// rollout order.
 	names []string
+	// primary is the name of the target the apply's own plan was planned
+	// against, the first in rollout order, whether or not it has work. Empty
+	// when no rollup was run.
+	primary string
 	// copyAtStake names a member other than the primary whose apply would
 	// discard an unfinished copy, or could not say whether it would, and why.
-	// Empty when no member with work puts a copy at stake.
-	copyAtStake string
+	// Zero when no member with work puts a copy at stake.
+	copyAtStake memberRefusal
 	// others counts the members with work other than the primary target,
 	// whose work runs from plans of their own rather than the primary plan.
 	others int
@@ -92,6 +97,9 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	// where the rest of the comment qualifies it.
 	names := rollupMemberNames(*rollup)
 	work := memberWork{members: len(rollup.Entries)}
+	if len(names) > 0 {
+		work.primary = names[0]
+	}
 	for i, entry := range rollup.Entries {
 		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
 			work.names = append(work.names, names[i])
@@ -102,7 +110,7 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 	}
 	work.pending = len(work.names)
 	if at, reason := rollup.MemberCopyAtStake(); at >= 0 {
-		work.copyAtStake = fmt.Sprintf("target %s: %s", names[at], reason)
+		work.copyAtStake = memberRefusal{target: names[at], reason: reason}
 	}
 	return work
 }
@@ -111,6 +119,17 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 // primary plan has nothing of its own to summarize.
 func (w memberWork) summary() string {
 	return fmt.Sprintf("%d of %d targets need this change", w.pending, w.members)
+}
+
+// pendingTargets names the targets that still need the change, for a refusal
+// that tells the operator which targets it held back. Targets already at the
+// schema are left out, as the plan comment leaves them out.
+func (w memberWork) pendingTargets() string {
+	names := "`" + strings.Join(w.names, "`, `") + "`"
+	if len(w.names) == 1 {
+		return "target " + names + " needs this change"
+	}
+	return "targets " + names + " need this change"
 }
 
 // unstoredSummary is the failing aggregate's summary when the check record for

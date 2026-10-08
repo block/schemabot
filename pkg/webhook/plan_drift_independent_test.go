@@ -142,7 +142,7 @@ func TestReviewDriftComment_BlockedChangeNamesOnlyTheTargetsThatRefuseIt(t *test
 
 	rollup, out := renderDriftComment(t, diffs, api.PlanIndependent)
 	require.True(t, rollup.Clean)
-	assert.Contains(t, out, "Needs it: `commerce/orders-001`, `commerce/orders-002`, `commerce/orders-003`", "one DDL, one group, every target counted")
+	assert.Contains(t, out, "rolling out to all 3 targets", "one DDL, one group, every target counted")
 	assert.NotContains(t, out, "### ", "one plan renders with no target heading")
 	assert.Contains(t, out, "- `orders` on target `commerce/orders-002`\n", "only the refusing target is named")
 

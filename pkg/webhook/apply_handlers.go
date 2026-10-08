@@ -398,7 +398,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
 		}
-		if refusal != "" {
+		if refusal.refuses() {
 			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}
@@ -616,8 +616,6 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		commentData.PendingManualConfirmation = true
 		commentData.PausedApplyCause = &templates.PausedApplyCauseData{
 			Heading: "The plan this apply would be checked against could not be read",
-			Remedy: "Nothing has run. The statements above were planned fresh from this pull request; " +
-				"review them, then confirm to apply them.",
 		}
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		headSHA, checkRunErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)

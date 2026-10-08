@@ -218,8 +218,8 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesEveryTarget(t *testing.T) {
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "ADD COLUMN `email`")
-	assert.Contains(t, body, "rolling out to 1 of 2 targets (1 already has it)", "eu is counted as already at the desired schema")
-	assert.Contains(t, body, "Needs it: `us` · Already has it: `eu`")
+	assert.Contains(t, body, " · rolling out to target `us`\n", "only the target that needs the change is named")
+	assert.NotContains(t, body, "`eu`", "eu is already at the desired schema, so it is not named")
 	assert.NotContains(t, body, "✅ **No schema changes detected**", "a target still has work, so the comment never closes as a no-op")
 	assert.NotContains(t, body, "Confirmation required", "the apply runs every target's plan in one step")
 	assert.NotContains(t, body, "schemabot apply-confirm")
@@ -267,7 +267,7 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "ADD COLUMN `email`")
-	assert.Contains(t, body, "`eu`, `us`", "the comment names every target the plan runs on")
+	assert.Contains(t, body, " · rolling out to both targets\n", "the plan runs on every target")
 	assert.NotContains(t, body, "Confirmation required", "the apply runs every target's plan in one step")
 
 	created := awaitRolloutApply(t, svc, dbName, apply)
@@ -298,7 +298,7 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 // execution policy, both reshaping the users primary key: the schema change
 // engine refuses the reshape and the policy routes it to native DDL on each
 // target. The comment the apply command posts discloses that direct change
-// under the targets that run it, and the apply it creates in the same step
+// on the plan both targets run, and the apply it creates in the same step
 // gives us's task us's own direct verdict.
 func TestE2EApplyRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 	dbName := "webhook_rollout_direct"
@@ -315,7 +315,7 @@ func TestE2EApplyRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 
 	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
 	body := awaitCommentContaining(t, apply, "**Direct execution**")
-	assert.Contains(t, body, "`eu`, `us`", "the comment discloses the direct change under the targets that run it")
+	assert.Contains(t, body, " · rolling out to both targets\n", "the direct change is disclosed on the plan every target runs")
 
 	created := awaitRolloutApply(t, svc, dbName, apply)
 
@@ -498,8 +498,8 @@ func TestE2EAutoPlanPostsCommentWhenOnlyAnotherTargetHasWork(t *testing.T) {
 	}, nil))
 
 	body := awaitCommentContaining(t, result, "ADD COLUMN `email`")
-	assert.Contains(t, body, "rolling out to 1 of 2 targets (1 already has it)")
-	assert.Contains(t, body, "Needs it: `us` · Already has it: `eu`")
+	assert.Contains(t, body, " · rolling out to target `us`\n")
+	assert.NotContains(t, body, "`eu`", "eu is already at the desired schema, so it is not named")
 	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 }
 
@@ -545,7 +545,7 @@ func TestE2EDriftedMirrorBlocksApplyWhenTheReviewedTargetHasWork(t *testing.T) {
 	body := awaitCommentContaining(t, apply, "nothing was applied")
 	assert.Contains(t, body, "SchemaBot could not confirm the plan of every target")
 	assert.Contains(t, body, "diverged: us")
-	assert.NotContains(t, body, "The primary target already has this schema", "the primary target has work of its own")
+	assert.NotContains(t, body, "Target `eu` already has this schema", "eu has work of its own")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
@@ -627,7 +627,7 @@ func TestE2EApplyConfirmOnConvergedPrimaryWithPendingTargetRefuses(t *testing.T)
 	require.NoError(t, err)
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
-	body := awaitCommentContaining(t, confirm, "1 of 2 targets need this change")
+	body := awaitCommentContaining(t, confirm, "Target `us` needs this change")
 	assert.Contains(t, body, "nothing was applied")
 
 	requireNoApplies(t, svc, dbName)
@@ -662,7 +662,7 @@ func TestE2EApplyConfirmRefusesWhenConvergedPrimaryGainsChanges(t *testing.T) {
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "now has changes of its own")
-	assert.Contains(t, body, "showed the primary target already at the desired schema")
+	assert.Contains(t, body, "showed target `eu` already at the desired schema")
 	assert.Contains(t, body, "nothing was applied")
 
 	requireNoApplies(t, svc, dbName)
@@ -797,7 +797,7 @@ func TestE2EApplyConfirmRefusesWhenAnotherTargetsStatementsChange(t *testing.T) 
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the plan of target us/"+dbName+"-us-target differs from what the confirmed round planned, in its statements")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the plan of target `us/"+dbName+"-us-target` differs from what the confirmed round planned, in its statements")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
@@ -827,8 +827,9 @@ func TestE2EApplyConfirmRefusesWhenTheReviewedTargetsStatementsChange(t *testing
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in its statements")
-	assert.NotContains(t, body, "other than the primary", "the primary target's plan changed, not the other targets'")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of target `eu` differs from the confirmed plan in its statements")
+	assert.NotContains(t, body, "showed only the plan of target", "eu's plan changed, not the other targets'")
+	assert.NotContains(t, body, "primary target", "a refusal names the target, as the plan comment does")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
@@ -861,7 +862,7 @@ func TestE2EApplyConfirmRefusesWhenOnlyTheReviewedTargetsStatementsChange(t *tes
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in its statements")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of target `eu` differs from the confirmed plan in its statements")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)
@@ -924,7 +925,7 @@ func TestE2EApplyConfirmRefusesAChangedPrimaryWithIdenticalDDL(t *testing.T) {
 				return
 			}
 			body = awaitCommentContaining(t, confirm, "nothing was applied")
-			assert.Contains(t, body, "the primary target is not the one the confirmed plan reviewed")
+			assert.Contains(t, body, "target `us` is not the target the confirmed plan reviewed")
 			assert.Contains(t, body, "Run apply again for this environment")
 			requireNoApplies(t, changed, tc.dbName)
 			requireNoApplyLock(t, changed, tc.dbName)
@@ -980,7 +981,7 @@ func TestE2EApplyConfirmRefusesAChangedPrimaryWhileAnotherTargetHasWork(t *testi
 
 	confirm := runRolloutCommand(t, changed, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "the primary target is not the one the confirmed plan reviewed")
+	assert.Contains(t, body, "target `us` is not the target the confirmed plan reviewed")
 	requireNoApplies(t, changed, dbName)
 	requireNoApplyLock(t, changed, dbName)
 }
@@ -1013,7 +1014,7 @@ func TestE2EApplyConfirmConvergedPrimaryMovedNamesTheMovedPrimary(t *testing.T) 
 
 	confirm := runRolloutCommand(t, changed, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "the primary target is not the one the confirmed plan reviewed")
+	assert.Contains(t, body, "target `us` is not the target the confirmed plan reviewed")
 	assert.NotContains(t, body, "now has changes of its own")
 	requireNoApplies(t, changed, dbName)
 	requireNoApplyLock(t, changed, dbName)
@@ -1081,7 +1082,7 @@ func TestE2EApplyConfirmRechecksTheReviewedTargetAfterTheRolloutShrinks(t *testi
 
 	confirm := runRolloutCommand(t, shrunk, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in its statements")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of target `eu` differs from the confirmed plan in its statements")
 
 	requireNoApplies(t, shrunk, dbName)
 	requireNoApplyLock(t, shrunk, dbName)
@@ -1154,7 +1155,7 @@ func TestE2EApplyConfirmComparesTheReviewedTargetsWholePlan(t *testing.T) {
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in which namespaces it finalizes")
+	assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of target `eu` differs from the confirmed plan in which namespaces it finalizes")
 	assert.NotContains(t, body, "in its statements", "the statements are the same on both sides, so the refusal does not point at them")
 
 	requireNoApplies(t, svc, dbName)
@@ -1246,7 +1247,7 @@ func TestE2EApplyConfirmRefusesWhenHowTheReviewedTargetsStatementRunsMoves(t *te
 			confirmer := tc.confirmVia(t, svc, dbName)
 			confirm := runRolloutCommandWithFiles(t, confirmer, dbName, "schemabot apply-confirm -e "+driftEnv+" --allow-unsafe", files)
 			body := awaitCommentContaining(t, confirm, "nothing was applied")
-			assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of the primary target differs from the confirmed plan in how its statements run")
+			assert.Contains(t, body, "This confirmation no longer covers what the apply would run: the re-plan of target `eu` differs from the confirmed plan in how its statements run")
 			assert.NotContains(t, body, "Changes run differently", "a rollout confirmation is refused, not re-disclosed for another confirmation")
 
 			requireNoApplies(t, svc, dbName)
@@ -1443,7 +1444,8 @@ func TestE2EApplyStopsForConfirmationWhenAnotherTargetsPlanChangesWhileStarting(
 	}
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "A target's plan changed while this apply was starting")
+	body := awaitCommentContaining(t, apply, "The plan for target `us` changed before this apply could start")
+	assert.Contains(t, body, "- `users` (alter) now runs a different statement\n", "the cause names how us's plan changed")
 	assert.Contains(t, body, "Confirmation required")
 	assert.Contains(t, body, "MODIFY COLUMN `email`", "the comment shows us's plan as it is now")
 	assert.Contains(t, body, "schemabot apply-confirm -e "+driftEnv)
@@ -1471,7 +1473,7 @@ func TestE2EApplyStopsForConfirmationWhenAnotherTargetsPlanChangesWhileStarting(
 // re-plan the apply runs from, eu gains a narrower `email` column out of band,
 // so the primary's own plan is now a `MODIFY COLUMN`. The apply stops for
 // apply-confirm, and the comment names how the primary's statements differ from
-// the plan the apply started from, as it does on a single target.
+// the plan the apply started from, as it does for any other target.
 func TestE2EApplyNamesThePrimarysDriftWhenItStopsARolloutWhileStarting(t *testing.T) {
 	dbName := "webhook_rollout_primary_changed_auto"
 	var hooked *afterLockStorage
@@ -1492,11 +1494,10 @@ func TestE2EApplyNamesThePrimarysDriftWhenItStopsARolloutWhileStarting(t *testin
 	}
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "Schema changes differ from the plan this apply was started from")
-	assert.Contains(t, body, "`users` (alter)", "the cause names the primary's drifted statement")
+	body := awaitCommentContaining(t, apply, "The plan for target `eu` changed before this apply could start")
+	assert.Contains(t, body, "- `users` (alter) now runs a different statement\n", "the cause names the primary's drifted statement")
 	assert.Contains(t, body, "MODIFY COLUMN `email`", "the comment shows eu's plan as it is now")
 	assert.Contains(t, body, "Confirmation required")
-	assert.NotContains(t, body, rolloutPlansChangedCause.Heading, "the primary's own drift gets the detailed cause")
 	requireNoApplies(t, svc, dbName)
 }
 
@@ -1647,7 +1648,7 @@ func TestE2EConvergedPrimaryRefusesToDiscardAnotherTargetsCopy(t *testing.T) {
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "nothing was applied")
-	assert.Contains(t, body, "target us: applying its plan discards the unfinished copy of users",
+	assert.Contains(t, body, "target `us`: applying its plan discards the unfinished copy of users",
 		"the refusal names the target and the table whose copy would be lost")
 	assert.NotContains(t, body, "schemabot apply-confirm", "a refused apply offers no confirmation")
 
@@ -1688,7 +1689,7 @@ func TestE2EApplyRefusesRatherThanAskingWhenAnotherTargetsChangedPlanCannotRun(t
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "nothing was applied")
-	assert.Contains(t, body, "target us: applying its plan discards the unfinished copy of users")
+	assert.Contains(t, body, "target `us`: applying its plan discards the unfinished copy of users")
 	assert.NotContains(t, body, "Confirmation required")
 	assert.NotContains(t, body, "schemabot apply-confirm", "a refused apply offers no confirmation")
 
@@ -1720,7 +1721,7 @@ func TestE2EApplyConfirmRefusesToDiscardACopyThatAppearedOnAnotherTarget(t *test
 
 	confirm := runRolloutCommand(t, svc, dbName, "schemabot apply-confirm -e "+driftEnv)
 	body := awaitCommentContaining(t, confirm, "nothing was applied")
-	assert.Contains(t, body, "target us: applying its plan discards the unfinished copy of users")
+	assert.Contains(t, body, "target `us`: applying its plan discards the unfinished copy of users")
 
 	requireNoApplies(t, svc, dbName)
 	requireNoApplyLock(t, svc, dbName)

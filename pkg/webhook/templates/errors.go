@@ -699,15 +699,18 @@ func MemberPlanUnsafeWithoutOptInDetail(target, table, namespace string) string 
 
 // MemberPlanUndisclosedUnsafeDetail is the error line for an apply whose
 // creation refused one rollout target's own plan for an unsafe change the
-// primary plan does not carry. The comment's unsafe disclosure names only the
-// primary plan's changes, so no `--allow-unsafe` covers it, and the line does
-// not suggest one. Like MemberPlanBlockedDetail, it is built from names
-// SchemaBot controls; table is empty for a VSchema change in namespace.
+// comment behind the apply did not show: it showed one plan, which does not
+// carry the change. No `--allow-unsafe` covers a change the comment never
+// disclosed, so the line points at a fresh apply, whose comment shows each
+// target's own plan, and says that is what lets `--allow-unsafe` consent to the
+// change. Like
+// MemberPlanBlockedDetail, it is built from names SchemaBot controls; table is
+// empty for a VSchema change in namespace.
 func MemberPlanUndisclosedUnsafeDetail(target, table, namespace string) string {
 	subject := "table " + inlineCode(table)
 	if table == "" {
 		subject = "the VSchema of namespace " + inlineCode(namespace)
 	}
-	return fmt.Sprintf("Target %s has an unsafe change on %s that the primary target's plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the primary target's plan carries the same change.",
+	return fmt.Sprintf("Target %s has an unsafe change on %s that the plan comment never showed, so nothing was applied. Run apply again for this environment: its comment shows each target's own plan, and `--allow-unsafe` can then consent to this change.",
 		inlineCode(target), subject)
 }
