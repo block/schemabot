@@ -8,7 +8,7 @@
 // version imported by pkg/api/telemetry.go; the test guards this precondition.
 module github.com/block/schemabot/e2e/consumermodule
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/block/schemabot v0.0.0
