@@ -495,3 +495,32 @@ func TestCompareChangeSets_VSchemaUnexpectedDirection(t *testing.T) {
 	require.Equal(t, []string{"testapp"}, diff.UnexpectedVSchema)
 	assert.Empty(t, diff.MissingVSchema)
 }
+
+// Table size context is display-only and legitimately differs between
+// deployments: one deployment's metrics call can fail while another's
+// succeeds, or statistics can move between the reviewed plan and an apply's
+// re-plan. None of it describes the work, and the drift key both the review
+// rollup and an apply's re-plan guard compare on carries no size, so a change
+// set carrying sizes and one carrying none compare identical and group
+// together: a missing size can never be refused as drift and block an apply.
+func TestCompareChangeSets_IgnoresTableSizeContext(t *testing.T) {
+	sized := protoAlterUsersEmail()
+	rows, largest, bytes := int64(13_100_000), int64(3_400_000), int64(6_200_000_000)
+	sized.EstimatedRows = &rows
+	sized.LargestShardRows = &largest
+	sized.EstimatedBytes = &bytes
+	sized.ShardCount = 4
+
+	baseline := protoNonShardedSet(sized)
+	candidate := protoNonShardedSet(protoAlterUsersEmail())
+
+	diff, err := CompareChangeSets(schema.DialectMySQL, baseline, candidate)
+	require.NoError(t, err)
+	assert.True(t, diff.Empty(), "size context must not register as drift: %+v", diff)
+
+	sizedFingerprint, err := ChangeSetFingerprint(schema.DialectMySQL, baseline)
+	require.NoError(t, err)
+	unsizedFingerprint, err := ChangeSetFingerprint(schema.DialectMySQL, candidate)
+	require.NoError(t, err)
+	assert.Equal(t, sizedFingerprint, unsizedFingerprint, "size context must not split a group")
+}

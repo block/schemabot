@@ -117,6 +117,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, err
 	}
 
+	// Display-only size context from the PlanetScale API. It cannot fail the
+	// plan: a failed or slow lookup yields no sizes within one probe budget.
+	sizes := e.fetchPlanTableSizes(ctx, client, org, req.Database, branch)
+
 	// Diff and lint per keyspace in parallel using Spirit's PlanChanges.
 	type keyspaceResult struct {
 		change     engine.SchemaChange
@@ -139,6 +143,8 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				return diffErr
 			}
 			vschemaChanged, currentVSchemaRaw := diff.vschemaChanged, diff.currentVSchemaRaw
+
+			attachTableSizes(sizes.shardCounts[ks], sizes.tableBytes, tableChanges)
 
 			sc := engine.SchemaChange{
 				Namespace:    ks,
