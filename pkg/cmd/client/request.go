@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -244,6 +246,13 @@ type APIError struct {
 	// only on responses that advertise one. Read it through RetryAfter rather
 	// than on its own, so a retry is never scheduled without it.
 	RetryAfterSeconds int
+
+	// RetryAfterHeader is the delay the response's Retry-After header asked
+	// for, zero when it sent none or one that could not be read. Unlike
+	// RetryAfter it does not say whether to retry: a proxy in front of the
+	// server can send it with no error code, so the caller decides from the
+	// status whether the request is worth repeating.
+	RetryAfterHeader time.Duration
 }
 
 func (e *APIError) Error() string {
@@ -304,7 +313,7 @@ func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, pat
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -337,7 +346,7 @@ func doSendBody(endpoint, method, path string, body any) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 	return nil
 }
@@ -386,7 +395,7 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 	// recorded and the apply owner completes it asynchronously; the body
 	// carries the same JSON shape as a 200 and is equally a success.
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -446,20 +455,53 @@ func stripHTMLTags(s string) string {
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
-// the error_code and any advertised retry delay from the JSON body. The delay
-// is read from the body rather than the Retry-After header because this client
-// keeps error bodies and discards responses.
-func parseAPIError(statusCode int, body []byte) *APIError {
+// the error_code and any advertised retry delay from the JSON body, and the
+// Retry-After header, which a proxy or rate limiter in front of SchemaBot may
+// send with a body that carries neither.
+func parseAPIError(resp *http.Response, body []byte) *APIError {
 	apiErr := &APIError{
-		Status:  statusCode,
-		Message: FormatAPIError(statusCode, body),
+		Status:           resp.StatusCode,
+		Message:          FormatAPIError(resp.StatusCode, body),
+		RetryAfterHeader: parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()),
 	}
-	var resp apitypes.ErrorResponse
-	if json.Unmarshal(body, &resp) == nil {
-		apiErr.ErrorCode = resp.ErrorCode
-		apiErr.RetryAfterSeconds = resp.RetryAfterSeconds
+	var errResp apitypes.ErrorResponse
+	if json.Unmarshal(body, &errResp) == nil {
+		apiErr.ErrorCode = errResp.ErrorCode
+		apiErr.RetryAfterSeconds = errResp.RetryAfterSeconds
 	}
 	return apiErr
+}
+
+// parseRetryAfterHeader reads a Retry-After header value in either form RFC
+// 9110 allows: a count of seconds, or an HTTP date measured from now. An
+// absent, malformed, or negative value, or a date already past, yields zero,
+// so a header nobody can act on never delays a retry.
+func parseRetryAfterHeader(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if isDigits(value) {
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds > int64(math.MaxInt64/time.Second) {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	at, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+	return max(at.Sub(now), 0)
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ConnectionError represents a client-side failure to reach the server

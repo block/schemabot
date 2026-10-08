@@ -129,6 +129,54 @@ func TestDoPostIntoCarriesTheServersRetryDelay(t *testing.T) {
 	assert.Equal(t, 4*time.Second, after)
 }
 
+// A proxy in front of the server can refuse a request with a Retry-After
+// header and a body that is not SchemaBot's JSON. The header's delay still
+// reaches the caller, alongside a status it can classify.
+func TestDoGetIntoCarriesTheRetryAfterHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`<html><body><h1>429 Too Many Requests</h1></body></html>`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var result struct{}
+	err := doGetInto(srv.URL, "/api/progress/apply/apply-abc", &result)
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusTooManyRequests, apiErr.Status)
+	assert.Empty(t, apiErr.ErrorCode)
+	assert.Equal(t, 30*time.Second, apiErr.RetryAfterHeader)
+}
+
+func TestParseRetryAfterHeader(t *testing.T) {
+	now := time.Date(2026, time.March, 4, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "absent", value: "", want: 0},
+		{name: "delta seconds", value: "45", want: 45 * time.Second},
+		{name: "delta seconds with surrounding space", value: " 45 ", want: 45 * time.Second},
+		{name: "zero seconds", value: "0", want: 0},
+		{name: "HTTP date in the future", value: now.Add(90 * time.Second).Format(http.TimeFormat), want: 90 * time.Second},
+		{name: "HTTP date in the past", value: now.Add(-time.Minute).Format(http.TimeFormat), want: 0},
+		{name: "negative seconds", value: "-5", want: 0},
+		{name: "signed seconds", value: "+5", want: 0},
+		{name: "fractional seconds", value: "1.5", want: 0},
+		{name: "seconds too large to represent", value: "99999999999999999999", want: 0},
+		{name: "malformed", value: "soon", want: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, parseRetryAfterHeader(tc.value, now))
+		})
+	}
+}
+
 // A permanent refusal reports no retry, so a client reading only RetryAfter
 // never schedules one against an error that will never succeed.
 func TestDoPostIntoReportsNoRetryForPermanentErrors(t *testing.T) {

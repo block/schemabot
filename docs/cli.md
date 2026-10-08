@@ -1053,7 +1053,10 @@ server retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
 rerun the original watch command, preserving its output format and connection
-flags, or to run `progress` with the apply ID to see its current state.
+flags, or to run `progress` with the apply ID to see its current state. When a
+refused poll carries a `Retry-After` header, as a proxy or rate limiter in
+front of SchemaBot may send, a log or JSON watcher waits at least that long
+before polling again.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

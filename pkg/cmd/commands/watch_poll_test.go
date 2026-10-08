@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
@@ -399,4 +400,107 @@ func TestProgressPoller_HonorsServerRetryAfter(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Running, result.State)
 	assert.Equal(t, []time.Duration{45 * time.Second}, *waits)
+}
+
+// proxyResponse is one scripted answer from whatever sits in front of the
+// server: a status, the Retry-After header it sends (empty for none), and its
+// body.
+type proxyResponse struct {
+	status     int
+	retryAfter string
+	body       string
+}
+
+// proxiedProgressPoller is a real progress poller whose fetches go through the
+// CLI's HTTP client to a server that answers with each scripted response in
+// turn. Waits are recorded instead of slept.
+func proxiedProgressPoller(t *testing.T, responses ...proxyResponse) (*progressPoller, *[]time.Duration) {
+	t.Helper()
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !assert.Less(t, calls, len(responses), "watch kept polling after its scripted responses ran out") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		resp := responses[calls]
+		calls++
+		if resp.retryAfter != "" {
+			w.Header().Set("Retry-After", resp.retryAfter)
+		}
+		w.WriteHeader(resp.status)
+		_, _ = w.Write([]byte(resp.body))
+	}))
+	t.Cleanup(srv.Close)
+
+	var waits []time.Duration
+	p := newProgressPoller(srv.URL, scriptedApplyID)
+	p.sleep = func(d time.Duration) { waits = append(waits, d) }
+	return p, &waits
+}
+
+const (
+	proxyRateLimitPage = `<html><body><h1>429 Too Many Requests</h1></body></html>`
+	proxyUnavailable   = `<html><body><h1>503 Service Unavailable</h1></body></html>`
+)
+
+func runningProgressBody() string {
+	return `{"apply_id": "` + scriptedApplyID + `", "state": "` + state.Apply.Running + `"}`
+}
+
+// A rate limiter in front of the server that refuses a poll with a
+// Retry-After header and an HTML page is waited out for as long as it asked,
+// not on the shorter fetch-error backoff.
+func TestProgressPoller_HonorsProxyRetryAfterHeader(t *testing.T) {
+	poller, waits := proxiedProgressPoller(t,
+		proxyResponse{status: http.StatusTooManyRequests, retryAfter: "45", body: proxyRateLimitPage},
+		proxyResponse{status: http.StatusOK, body: runningProgressBody()},
+	)
+
+	result, err := poller.next(func(progressRetry) {})
+
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, result.State)
+	assert.Equal(t, []time.Duration{45 * time.Second}, *waits)
+}
+
+// A code-less 503 that names no delay is retried on the plain fetch-error
+// backoff.
+func TestProgressPoller_ProxyUnavailableWithoutRetryAfterUsesBackoff(t *testing.T) {
+	poller, waits := proxiedProgressPoller(t,
+		proxyResponse{status: http.StatusServiceUnavailable, body: proxyUnavailable},
+		proxyResponse{status: http.StatusOK, body: runningProgressBody()},
+	)
+
+	result, err := poller.next(func(progressRetry) {})
+
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, result.State)
+	assert.Equal(t, []time.Duration{fetchErrorBackoff(1)}, *waits)
+}
+
+// When the body and the Retry-After header both name a delay, the watch waits
+// for the larger, so it never polls sooner than either asked.
+func TestProgressRetryWait_LargerOfBodyAndHeaderDelayWins(t *testing.T) {
+	tests := []struct {
+		name        string
+		bodySeconds int
+		header      time.Duration
+		want        time.Duration
+	}{
+		{name: "body longer", bodySeconds: 45, header: 10 * time.Second, want: 45 * time.Second},
+		{name: "header longer", bodySeconds: 10, header: 45 * time.Second, want: 45 * time.Second},
+		{name: "both shorter than backoff", bodySeconds: 1, header: time.Second, want: fetchErrorBackoff(1)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			limited := &client.APIError{
+				Status:            http.StatusTooManyRequests,
+				ErrorCode:         apitypes.ErrCodeRateLimited,
+				Message:           "rate limited",
+				RetryAfterSeconds: tc.bodySeconds,
+				RetryAfterHeader:  tc.header,
+			}
+			assert.Equal(t, tc.want, progressRetryWait(limited, 1))
+		})
+	}
 }
