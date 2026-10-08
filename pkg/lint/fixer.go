@@ -13,7 +13,8 @@ import (
 )
 
 // Fixer generates auto-fixes for lint violations using AST manipulation.
-// Parses SQL, walks the AST to apply fixes, and restores to canonical form.
+// Parses SQL, walks the AST to apply fixes, and restores a fixed file to
+// canonical form. A file with nothing to fix is returned as written.
 type Fixer struct {
 	config FixerConfig
 }
@@ -48,8 +49,8 @@ func NewFixerWithConfig(cfg FixerConfig) *Fixer {
 type FixResult struct {
 	Filename    string   // Original filename
 	OriginalSQL string   // Original SQL content
-	FixedSQL    string   // Fixed SQL content (empty if no changes)
-	Changed     bool     // Whether any changes were made
+	FixedSQL    string   // Fixed SQL content (empty if no fix was applied)
+	Changed     bool     // Whether a fix was applied; an unchanged file is left as written
 	Fixes       []string // Description of fixes applied
 }
 
@@ -71,9 +72,11 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 			OriginalSQL: content,
 		}
 
-		// Parse and fix using AST manipulation
+		// Parse and fix using AST manipulation. A file counts as changed only
+		// when a fix was applied to it, never because its restored spelling
+		// differs from what was written.
 		fixed, fixes := f.fixCreateTable(content)
-		if fixed != content {
+		if len(fixes) > 0 {
 			fileResult.FixedSQL = fixed
 			fileResult.Changed = true
 			fileResult.Fixes = fixes
@@ -109,7 +112,8 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 }
 
 // fixCreateTable parses a CREATE TABLE statement, applies all fixes via AST
-// manipulation, and returns the canonical fixed SQL.
+// manipulation, and returns the canonical fixed SQL with the fixes applied. It
+// returns the input unchanged and no fixes when there was nothing to fix.
 func (f *Fixer) fixCreateTable(sql string) (string, []string) {
 	ct, err := statement.ParseCreateTable(sql)
 	if err != nil {
@@ -141,6 +145,13 @@ func (f *Fixer) fixCreateTable(sql string) (string, []string) {
 		fixes = append(fixes, "Added DEFAULT for TIMESTAMP/DATETIME") // Only report once
 	}
 
+	// A file with nothing to fix is left exactly as written. Restoring it
+	// would only respell it (one backtick-quoted line, uppercase types) and
+	// turn every clean file into a diff.
+	if len(fixes) == 0 {
+		return sql, nil
+	}
+
 	// Restore to canonical form
 	var sb strings.Builder
 	rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
@@ -149,17 +160,7 @@ func (f *Fixer) fixCreateTable(sql string) (string, []string) {
 		return sql, nil
 	}
 
-	canonical := sb.String()
-
-	// If only canonicalization changed (no semantic fixes), report it
-	if len(fixes) == 0 && canonical != sql {
-		fixes = append(fixes, "Normalized to canonical format")
-	}
-
-	if canonical != sql {
-		return canonical, fixes
-	}
-	return sql, nil
+	return sb.String(), fixes
 }
 
 // fixColumnPrimaryKeyType changes INT to BIGINT for AUTO_INCREMENT columns.
