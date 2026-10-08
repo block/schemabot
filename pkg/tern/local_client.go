@@ -2908,6 +2908,20 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 			fmt.Errorf("apply %s records operation keys leading with their target = %t, but this dispatch names member target %q", apply.ApplyIdentifier, keysLeadWithTarget, scope.memberTarget)), nil
 	}
 
+	// A newer apply on this apply's targets means a later generation was
+	// admitted past it, so this operation is refused as late before the table
+	// conflict with that newer apply's tasks can refuse it without saying so.
+	// The attach re-checks under the target lock, which is what makes the
+	// refusal hold.
+	successor, err := c.storage.Applies().NewerApplyOnTargets(ctx, apply)
+	if err != nil {
+		return nil, fmt.Errorf("check for a newer apply on the targets of apply %s before attaching operation %s: %w", apply.ApplyIdentifier, operationKey, err)
+	}
+	if successor != "" {
+		return c.refuseAttachToTakenOverApply(req, apply, operationKey,
+			fmt.Errorf("apply %s holds the targets of apply %s: %w", successor, apply.ApplyIdentifier, storage.ErrApplyTakenOver)), nil
+	}
+
 	// An attach already belongs to a keyed apply, so a conflict here is another
 	// apply holding the database and there is nothing for this dispatch to
 	// resolve into. Adoption is a create-path outcome only.

@@ -617,6 +617,8 @@ func TestLocalClient_Apply_RerunAdmittedPastSettledManifestHold(t *testing.T) {
 	late, err := client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, heldKey, "payments-001"))
 	require.NoError(t, err)
 	assert.False(t, late.Accepted, "a late operation for the held apply must be refused while the re-run is in flight")
+	assert.Contains(t, late.ErrorMessage, "a newer apply holds the targets of apply "+held.ApplyId,
+		"the refusal names the takeover, not the re-run's table conflict")
 
 	settleDispatchedApply(t, stor, admitted.ApplyId, state.Apply.Completed)
 	late, err = client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, heldKey, "payments-001"))

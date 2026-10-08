@@ -987,8 +987,19 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 		}
 	}
 
+	// The target lock is taken before the transaction begins, as every write
+	// that checks the target reservation takes it, so the transaction's
+	// snapshot is taken under the lock and sees any apply a create admitted
+	// before it.
 	const opName = "attach operation to apply"
-	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
+	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, s.db, apply)
+	if err != nil {
+		return err
+	}
+	if !hasApplyTarget(database, dbType, environment) {
+		return attachTargetMissingError(ctx, s.db, apply, operation)
+	}
+	writeTx, err := beginApplyTargetWriteTx(ctx, s.db, s.locker, opName, database, dbType, environment)
 	if err != nil {
 		return err
 	}
@@ -1009,7 +1020,7 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 	if err := requireAttachKeyingMatches(ctx, writeTx.tx, apply, operation); err != nil {
 		return err
 	}
-	if err := checkAttachTargetsNotTakenOver(ctx, writeTx.tx, s.db, s.locker, apply, operation); err != nil {
+	if err := checkAttachTargetsNotTakenOver(ctx, writeTx.tx, database, dbType, environment, deployment, apply, operation); err != nil {
 		return err
 	}
 
@@ -1033,28 +1044,30 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 	return nil
 }
 
+// attachTargetMissingError explains why an attach found no target to lock:
+// the apply row is gone, or it exists without the target metadata the
+// exclusivity check needs.
+func attachTargetMissingError(ctx context.Context, db queryRower, apply *storage.Apply, operation *storage.ApplyOperation) error {
+	var exists int
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM applies WHERE id = ?`, apply.ID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("attach operation %s to apply %s: %w", operation.OperationKey, apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("check apply %s exists to attach operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
+	}
+	return fmt.Errorf("attach operation %s to apply %s: apply is missing target metadata for the exclusivity check", operation.OperationKey, apply.ApplyIdentifier)
+}
+
 // checkAttachTargetsNotTakenOver refuses an attach to an apply whose targets a
 // newer apply now holds. A new generation is admitted past an earlier one that
 // is held open only for operations that never attached
 // (checkNoActiveApplyForNewGeneration), so an operation of that earlier
 // generation arriving late must not join it, whatever state the newer apply
-// has reached since: it would run work the newer apply now owns. The check
-// takes the target lock after the apply's row lock, the order the
-// stopped-apply claim takes them in, so it serializes with the admission.
-func checkAttachTargetsNotTakenOver(ctx context.Context, tx *rebindTx, db *rebindDB, locker namedlock.Locker, apply *storage.Apply, operation *storage.ApplyOperation) error {
-	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, tx, apply)
-	if err != nil {
-		return err
-	}
-	if !hasApplyTarget(database, dbType, environment) {
-		return fmt.Errorf("attach operation %s to apply %s: apply is missing target metadata for the exclusivity check", operation.OperationKey, apply.ApplyIdentifier)
-	}
-	conn, lockName, err := acquireApplyTargetLockConn(ctx, db, locker, database, dbType, environment)
-	if err != nil {
-		return err
-	}
-	defer releaseApplyTargetLockConn(ctx, locker, conn, lockName, "attach operation to apply")
-
+// has reached since: it would run work the newer apply now owns. It runs in a
+// transaction begun under the apply target lock, which serializes it with the
+// admission.
+func checkAttachTargetsNotTakenOver(ctx context.Context, tx *rebindTx, database, dbType, environment, deployment string, apply *storage.Apply, operation *storage.ApplyOperation) error {
 	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
 	if err != nil {
 		return err
