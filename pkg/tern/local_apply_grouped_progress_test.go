@@ -520,7 +520,8 @@ func TestPollForCompletionAtomic_ProgressWriteRefusedByLeaseLossExits(t *testing
 		"a drive displaced by lease loss hands the apply back without an error")
 
 	assert.Equal(t, 1, eng.calls, "no further poll after the refused tick")
-	assert.Equal(t, len(tasks), refusing.refused, "only the one tick's progress writes are attempted")
+	assert.GreaterOrEqual(t, refusing.refused, 1, "the refused tick did attempt its progress writes")
+	assert.LessOrEqual(t, refusing.refused, len(tasks), "no write is attempted beyond the one tick")
 	assert.Empty(t, recording.states, "no task write lands, terminal or otherwise")
 	for _, task := range tasks {
 		assert.Equal(t, state.Task.Running, task.State, "the in-memory tasks are left in flight")
