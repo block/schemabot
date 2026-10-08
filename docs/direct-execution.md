@@ -18,7 +18,10 @@ online copy, and explicit `ALGORITHM=` / `LOCK=` clauses conflict with the
 assertions it prepends. By default such a statement runs directly when its
 table holds at most 100MiB of data and indexes; on a larger table, or with
 direct execution turned off, it blocks the apply, and the plan comment says so
-up front.
+up front. The byte figure is an InnoDB statistics estimate that can undercount
+a table that just grew, and nothing corroborates it; a policy bounded by
+`max_table_rows` is checked against an exact count instead (see
+[Configuration](configuration.md#direct-execution)).
 
 Some refused changes are still genuinely necessary — the canonical case is a
 primary-key reshape on a small table. Without direct execution, the only path

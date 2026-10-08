@@ -1640,6 +1640,14 @@ func TestServerConfig_ResolveDirectExecutionDefaultsToEnabledAt100MiB(t *testing
 		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20}, policy)
 	})
 
+	// The default is built in code rather than read from a config file, so
+	// it never passes startup validation on its own. Holding it to the same
+	// validation a stated block gets keeps a malformed default from failing
+	// every MySQL plan at resolve time instead of failing here.
+	t.Run("default passes the validation a stated block gets", func(t *testing.T) {
+		require.NoError(t, defaultDirectExecution().Validate("default direct_execution policy"))
+	})
+
 	t.Run("server-wide opt out", func(t *testing.T) {
 		cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: false}}
 		policy, err := cfg.DirectExecutionPolicyFor("anything", "production", storage.DatabaseTypeMySQL)
