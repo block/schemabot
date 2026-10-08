@@ -1,8 +1,11 @@
 package schema
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
+	"regexp/syntax"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -68,7 +71,10 @@ func IsIgnoreTablePattern(entry string) bool {
 //
 // foldCase compiles the pattern to ignore case. Withholding never does (see
 // engine.IgnoredTables); only the refusal of a pattern that reaches a declared
-// table does.
+// table does. The folding is applied to the parsed expression rather than by
+// prefixing a flag, because an expression can turn a flag back off: a folded
+// `(?-i)relay_[0-9]+_feed` must still match Relay_1_Feed, or the refusal would
+// miss a declared table the target folds to the same name.
 //
 // The error names the entry as written, so an operator can find it in
 // schemabot.yaml.
@@ -83,15 +89,74 @@ func CompileIgnoreTablePattern(entry string, foldCase bool) (*regexp.Regexp, err
 	if _, err := regexp.Compile(expr); err != nil {
 		return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)
 	}
-	anchored := `\A(?:` + expr + `)\z`
 	if foldCase {
-		anchored = `(?i)` + anchored
+		parsed, err := syntax.Parse(expr, syntax.Perl)
+		if err != nil {
+			return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)
+		}
+		foldRegexpCase(parsed)
+		expr = parsed.String()
 	}
+	anchored := `\A(?:` + expr + `)\z`
 	re, err := regexp.Compile(anchored)
 	if err != nil {
 		return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)
 	}
 	return re, nil
+}
+
+// foldRegexpCase makes a parsed expression match a name when any spelling of
+// it that differs only in case matches the expression as written, whatever
+// flags the expression sets. That is the name a case-folding target would
+// treat as the table the pattern withholds. Each literal and character class
+// is closed under case folding; a negated class is folded after negation, so
+// `[^a-z]`, which as written matches A, also matches a.
+func foldRegexpCase(re *syntax.Regexp) {
+	switch re.Op {
+	case syntax.OpLiteral:
+		re.Flags |= syntax.FoldCase
+	case syntax.OpCharClass:
+		re.Rune = foldedRanges(re.Rune)
+	}
+	for _, sub := range re.Sub {
+		foldRegexpCase(sub)
+	}
+}
+
+// foldedRanges adds to a character class's rune ranges every rune that a rune
+// in them folds to. Only runes inside unicode.CaseRanges have another case, so
+// a range is walked only where it overlaps them.
+func foldedRanges(ranges []rune) []rune {
+	minFold := rune(unicode.CaseRanges[0].Lo)
+	maxFold := rune(unicode.CaseRanges[len(unicode.CaseRanges)-1].Hi)
+	out := slices.Clone(ranges)
+	for i := 0; i+1 < len(ranges); i += 2 {
+		for c := max(ranges[i], minFold); c <= min(ranges[i+1], maxFold); c++ {
+			for f := unicode.SimpleFold(c); f != c; f = unicode.SimpleFold(f) {
+				out = append(out, f, f)
+			}
+		}
+	}
+	return mergeRuneRanges(out)
+}
+
+// mergeRuneRanges sorts lo, hi rune pairs and merges the ones that overlap or
+// touch, which is the form a parsed character class holds.
+func mergeRuneRanges(ranges []rune) []rune {
+	pairs := make([][2]rune, 0, len(ranges)/2)
+	for i := 0; i+1 < len(ranges); i += 2 {
+		pairs = append(pairs, [2]rune{ranges[i], ranges[i+1]})
+	}
+	slices.SortFunc(pairs, func(a, b [2]rune) int { return cmp.Compare(a[0], b[0]) })
+	merged := make([]rune, 0, len(ranges))
+	for _, p := range pairs {
+		if n := len(merged); n > 0 && p[0] <= merged[n-1]+1 {
+			merged[n-1] = max(merged[n-1], p[1])
+			continue
+		}
+		merged = append(merged, p[0], p[1])
+	}
+	return merged
 }
 
 // QuoteIgnoreTablesEntry renders an entry for an operator-facing message as it

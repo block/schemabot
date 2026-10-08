@@ -234,6 +234,15 @@ func TestIgnoredTablesRefuseDeclaredPattern(t *testing.T) {
 		err.Error(), "the refusal ignores case, as it does for plain entries")
 	assert.False(t, ignored.Withholds("Relay_1_Feed"), "ignoring case in the refusal does not widen what the pattern withholds")
 
+	// A flag inside the expression cannot switch the refusal's case folding off.
+	flagged := mustIgnoredTables(t, `/(?-i)relay_\d+_feed/`)
+	err = flagged.RefuseDeclared("app", []string{"Relay_1_Feed"})
+	require.Error(t, err)
+	assert.Equal(t,
+		`ignore_tables entry "/(?-i)relay_\d+_feed/" matches "Relay_1_Feed", which a schema file in namespace "app" declares. Narrow the pattern so it no longer matches it, or remove the schema file`,
+		err.Error())
+	assert.False(t, flagged.Withholds("Relay_1_Feed"))
+
 	// A pattern colliding alongside a plain entry is listed with it.
 	mixed := mustIgnoredTables(t, "legacy_audit_log", `/relay_\d+_feed/`)
 	err = mixed.RefuseDeclared("app", []string{"legacy_audit_log", "relay_1_feed"})

@@ -2,6 +2,7 @@ package schema
 
 import (
 	"testing"
+	"unicode"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -98,6 +99,52 @@ func TestCompileIgnoreTablePattern(t *testing.T) {
 	_, err = CompileIgnoreTablePattern("relay_feed", false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `ignore_tables entry "relay_feed" is not a pattern`)
+}
+
+// The refusal of a pattern that reaches a declared table ignores case on every
+// pattern, so an expression cannot opt its own literals or classes back out of
+// the folding with an embedded flag. Withholding keeps the flags as written.
+func TestCompileIgnoreTablePatternFoldsCaseDespiteEmbeddedFlags(t *testing.T) {
+	for _, tc := range []struct {
+		entry   string
+		matches []string
+		misses  []string
+	}{
+		{entry: `/(?-i)relay_[0-9]+_feed/`, matches: []string{"relay_1_feed", "Relay_1_Feed", "RELAY_1_FEED"}, misses: []string{"Relay_1_Feed_old"}},
+		{entry: `/(?i)relay_(?-i)feed/`, matches: []string{"RELAY_FEED", "relay_FEED"}},
+		{entry: `/(?-i:Relay)_[a-c]+/`, matches: []string{"relay_ABC", "RELAY_abc"}, misses: []string{"relay_abd"}},
+		// Written, the class withholds AB_feed, which is ab_feed on a target
+		// that folds names, so the folded pattern matches both spellings.
+		{entry: `/[^a-z]+_feed/`, matches: []string{"12_FEED", "AB_feed", "ab_feed"}, misses: []string{"ab_fee"}},
+		{entry: `/(?-i)a|b/`, matches: []string{"A", "B"}, misses: []string{"AB", "aB"}},
+	} {
+		folded, err := CompileIgnoreTablePattern(tc.entry, true)
+		require.NoError(t, err, tc.entry)
+		for _, name := range tc.matches {
+			assert.True(t, folded.MatchString(name), "%s folded must match %q", tc.entry, name)
+		}
+		for _, name := range tc.misses {
+			assert.False(t, folded.MatchString(name), "%s folded must not match %q", tc.entry, name)
+		}
+	}
+
+	asWritten, err := CompileIgnoreTablePattern(`/(?-i)relay_[0-9]+_feed/`, false)
+	require.NoError(t, err)
+	assert.True(t, asWritten.MatchString("relay_1_feed"))
+	assert.False(t, asWritten.MatchString("Relay_1_Feed"), "withholding keeps the expression's own case rules")
+}
+
+// foldedRanges only walks the runes inside unicode.CaseRanges, which holds only
+// while no rune outside them folds to another.
+func TestCaseRangesBoundEveryFold(t *testing.T) {
+	minFold := rune(unicode.CaseRanges[0].Lo)
+	maxFold := rune(unicode.CaseRanges[len(unicode.CaseRanges)-1].Hi)
+	for c := rune(0); c <= unicode.MaxRune; c++ {
+		if c >= minFold && c <= maxFold {
+			continue
+		}
+		require.Equal(t, c, unicode.SimpleFold(c), "rune %U folds but lies outside unicode.CaseRanges", c)
+	}
 }
 
 func TestQuoteIgnoreTablesEntry(t *testing.T) {
