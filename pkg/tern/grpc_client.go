@@ -1751,11 +1751,11 @@ type applyTaskScope struct {
 	tasklessOperation bool
 
 	// deploymentOperationKeys is the operation-key set the claimed operation's
-	// deployment will dispatch, captured from the parent's operation rows at
-	// claim load: every operation of the deployment except those settled because
-	// their target already held the change. Deployment-keyed dispatches send it
-	// as the generation manifest so the data plane knows the whole generation
-	// from the first dispatch. Empty for whole-apply scopes.
+	// deployment dispatches, excluding members already converged at creation.
+	// Captured from the parent's operation rows at claim load, it includes
+	// dispatched siblings that have since completed. Deployment-keyed dispatches
+	// send it as the generation manifest so the data plane knows the whole
+	// generation from the first dispatch. Empty for whole-apply scopes.
 	deploymentOperationKeys []string
 
 	// memberTarget is the claimed operation's target when its deployment
@@ -1974,7 +1974,15 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		if op.ID == applyOperationID {
 			found = true
 		}
-		if declaredInGeneration(op, operation.Deployment) {
+		if op.Deployment != operation.Deployment {
+			continue
+		}
+		// The manifest promises the data plane which keys will arrive. A
+		// converged placeholder never dispatches, so its key is left out;
+		// dispatched siblings keep StartedAt or a remote id and stay in. The
+		// claimed operation is the one key this dispatch is about to send, so
+		// it is always declared, whatever shape its row is in.
+		if op.ID == applyOperationID || !op.IsConvergedPlaceholder() {
 			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
 		}
 	}
@@ -1997,16 +2005,6 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		deploymentOperationKeys: deploymentOperationKeys,
 		memberTarget:            memberTarget,
 	}, nil
-}
-
-// declaredInGeneration reports whether an operation belongs in the generation
-// manifest a dispatch for the given deployment declares: one of that
-// deployment's operations that will be dispatched. An operation settled at
-// creation because its target already held the change is never dispatched, so
-// declaring it would hold the remote apply open for an operation that never
-// attaches.
-func declaredInGeneration(op *storage.ApplyOperation, deployment string) bool {
-	return op.Deployment == deployment && !op.AlreadyConverged
 }
 
 // deploymentAddressesSeveralTargets reports whether the operations of one

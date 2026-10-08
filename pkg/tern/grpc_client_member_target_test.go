@@ -130,6 +130,34 @@ func TestGRPCClient_SiblingTargetsOfOneDeploymentShareItsRemoteApply(t *testing.
 	assert.Empty(t, fx.apply.ExternalID, "a multi-operation dispatch must not write the parent apply external_id")
 }
 
+// An already-converged target remains part of the rollout but never dispatches.
+// The working target still names itself for key qualification and declares only
+// the operation the shared remote apply will actually receive.
+func TestGRPCClient_ConvergedMemberIsNotDispatchedInGenerationManifest(t *testing.T) {
+	server := &capturingTernServer{remoteApplyID: "remote-payments", remoteOperationID: "remote-op-002"}
+	client, cleanup := testCapturingGRPCClient(t, server)
+	defer cleanup()
+	fx := newMemberTargetFixture(t, client)
+	now := time.Now()
+	first := fx.operations.ops[fx.first]
+	first.State, first.CompletedAt = state.ApplyOperation.Completed, &now
+	stor := client.storage.(*mockStorage)
+	stor.tasks.tasks = stor.tasks.tasks[1:]
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, client.ResumeApplyOperation(ctx, fx.apply, fx.second))
+	req := server.getApplyRequest()
+	require.NotNil(t, req)
+	assert.Equal(t, []string{"payments-002"}, req.GenerationOperationKeys)
+	assert.Equal(t, "payments-002", req.Options[dispatchMemberTargetOption])
+	key, err := dispatchOperationKey(fx.plans.byID[fx.operations.ops[fx.second].PlanID], req)
+	require.NoError(t, err)
+	assert.Equal(t, "payments-002", key)
+	assert.Empty(t, first.RemoteApplyID(), "nothing was dispatched for the converged member")
+	assert.Nil(t, first.StartedAt)
+}
+
 // dispatchOperationKey derives a dispatch's operation key the way both planes
 // do: from the dispatch's plan and request shape.
 func dispatchOperationKey(plan *storage.Plan, req *ternv1.ApplyRequest) (string, error) {
@@ -311,10 +339,8 @@ func TestRemoteApplyIdempotencyKey_MemberTarget(t *testing.T) {
 
 // The claim-time scope decides the member target from the apply's operation
 // rows: a deployment addressing several targets names the claimed operation's
-// target, and its manifest declares every target's operation that will be
-// dispatched, since they all attach to the deployment's one remote apply. A
-// target that already held the change is settled at creation and never
-// dispatched, so the manifest leaves it out. A deployment addressing one
+// target, and its manifest declares every target's operation, since they all
+// attach to the deployment's one remote apply. A deployment addressing one
 // target names no member target. A row of a multi-target deployment that names
 // no target is refused rather than dispatched under a guessed key.
 func TestLoadOperationApplyTaskScope_MemberTarget(t *testing.T) {
@@ -336,15 +362,6 @@ func TestLoadOperationApplyTaskScope_MemberTarget(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, east.memberTarget, "a single-target deployment names no member target")
 	assert.Equal(t, []string{"payments/-80/orders", "payments/80-/orders"}, east.generationOperationKeys())
-
-	ops.ops[6] = &storage.ApplyOperation{ID: 6, ApplyID: 100, Deployment: "default", Target: "payments-003", OperationKey: "payments-003",
-		State: state.ApplyOperation.Completed, AlreadyConverged: true}
-	withConverged, err := client.loadOperationApplyTaskScope(t.Context(), apply, 2)
-	require.NoError(t, err)
-	assert.Equal(t, "payments-002", withConverged.memberTarget)
-	assert.Equal(t, []string{"payments-001", "payments-002"}, withConverged.generationOperationKeys(),
-		"a target that already held the change is never dispatched, so the manifest does not wait for it")
-	delete(ops.ops, 6)
 
 	ops.ops[5] = &storage.ApplyOperation{ID: 5, ApplyID: 100, Deployment: "default", OperationKey: "orphan"}
 	_, err = client.loadOperationApplyTaskScope(t.Context(), apply, 5)

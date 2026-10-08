@@ -2874,8 +2874,8 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 
 // PreviewCommentMultiTargetApplySummaryAlreadyHadIt renders the summary of a
 // finished rollout across four targets, one of which already had the change
-// when the apply was created: it ran nothing, so it reports no table progress
-// and is counted apart from the targets that ran.
+// when the apply was created: it ran nothing, so the comment neither names nor
+// counts it.
 func PreviewCommentMultiTargetApplySummaryAlreadyHadIt() string {
 	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
 	const rows = 1_466_232

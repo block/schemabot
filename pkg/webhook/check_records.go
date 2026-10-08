@@ -116,9 +116,13 @@ func memberWorkOf(rollup *api.PlanRollup) memberWork {
 }
 
 // summary says how many targets still need the change, for a check whose
-// primary plan has nothing of its own to summarize.
+// primary plan has nothing of its own to summarize. Targets already at the
+// schema are left out of the count, as every PR surface leaves them out.
 func (w memberWork) summary() string {
-	return fmt.Sprintf("%d of %d targets need this change", w.pending, w.members)
+	if w.pending == 1 {
+		return "1 target needs this change"
+	}
+	return fmt.Sprintf("%d targets need this change", w.pending)
 }
 
 // pendingTargets names the targets that still need the change, for a refusal

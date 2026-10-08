@@ -8533,7 +8533,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-🔄 Rolling out: 1 of 4 targets done, 1 running, 1 queued (1 already had it)
+🔄 Rolling out: 1 of 3 targets done, 1 running, 1 queued
 
 **`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 81% · 1 complete, 1 running
 - Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
@@ -8565,7 +8565,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-✅ Rolled out to 3 of 4 targets (1 already had it)
+✅ Rolled out to 3 targets
 
 **`orders`**: ✅ Complete (3 targets)
 
