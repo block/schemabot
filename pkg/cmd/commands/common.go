@@ -81,9 +81,10 @@ type CLIConfig struct {
 	// IgnoreNamespaces lists namespace subdirectories of the schema root that
 	// SchemaBot must not reconcile against the live database.
 	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
-	// IgnoreTables lists live tables SchemaBot must not reconcile. Without the
-	// exclusion a live table no schema file declares is planned as DROP TABLE,
-	// which blocks the merge.
+	// IgnoreTables lists live tables SchemaBot must not reconcile, by name or,
+	// wrapped in slashes, by a regular expression over the whole name. Without
+	// the exclusion a live table no schema file declares is planned as DROP
+	// TABLE, which blocks the merge.
 	IgnoreTables []string `yaml:"ignore_tables"`
 	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }

@@ -627,6 +627,14 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 	} else if warning != "" {
 		s.logger.Warn("plan request has empty schema files", "warning", warning, "database", req.Database)
 	}
+	// The same rule schemabot.yaml is held to, so a request that reaches the
+	// API without passing through a config parser cannot carry an entry the
+	// data plane would read differently from the caller, such as a pattern
+	// that does not compile.
+	if err := schema.ValidateIgnoreTables(req.IgnoreTables); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// Planning stages a change against a specific database and reads its live
 	// schema, so it takes the same per-database authorization as apply.
@@ -1148,31 +1156,39 @@ type storedPlanRoute struct {
 // A configured entry that withheld nothing is ordinarily a typo, a case
 // mismatch, or a stale entry for a table that no longer exists — the table it
 // names is fully reconciled, so it is surfaced as a warning rather than letting
-// the config imply an exclusion that is not happening. But an entry the plan
-// did not withhold and whose exact name it proposes dropping is not a typo: the
-// target holds that table, so the exclusion reached a data plane that did not
-// apply it — one that predates the field and discarded it. Every other
-// unmatched shape names a table that is not there to drop, so this one is
-// unambiguous, and letting it through would turn a reviewed exclusion into the
-// drop it was written to prevent.
+// the config imply an exclusion that is not happening.
+//
+// A plan that proposes dropping a table the config withholds is something
+// else: a planner that honored the config never sees that table, so the
+// exclusion reached a data plane that did not apply it. That is a build that
+// predates the field and discarded it, or one that predates pattern entries
+// and read a pattern as a literal table name. The check matches the drops
+// against the whole config, with the same matcher the engines withhold by, so
+// it holds for either, and letting such a plan through would turn a reviewed
+// exclusion into the drop it was written to prevent.
 func (s *Service) refuseDropsOfWithheldTables(req PlanRequest, resp *ternv1.PlanResponse, deployment string) error {
-	unmatched := schema.UnmatchedIgnoreTables(req.IgnoreTables, withheldTablesFromProto(resp.ExemptTables))
-	if len(unmatched) == 0 {
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return fmt.Errorf("check the plan from deployment %q against ignore_tables: %w", deployment, err)
+	}
+	if ignored.Empty() {
 		return nil
 	}
 	var prInt int
 	if req.PullRequest != nil {
 		prInt = int(*req.PullRequest)
 	}
-	s.logger.Warn("ignore_tables entries matched no live table and withheld nothing",
-		"database", req.Database,
-		"environment", req.Environment,
-		"deployment", deployment,
-		"repository", req.Repository,
-		"pull_request", prInt,
-		"unmatched_entries", unmatched,
-	)
-	dropped := plannedDropsAmong(resp.Changes, unmatched)
+	if unmatched := ignored.Unmatched(withheldTablesFromProto(resp.ExemptTables)); len(unmatched) > 0 {
+		s.logger.Warn("ignore_tables entries matched no live table and withheld nothing",
+			"database", req.Database,
+			"environment", req.Environment,
+			"deployment", deployment,
+			"repository", req.Repository,
+			"pull_request", prInt,
+			"unmatched_entries", unmatched,
+		)
+	}
+	dropped := plannedDropsWithheldBy(resp.Changes, ignored)
 	if len(dropped) == 0 {
 		return nil
 	}
@@ -1184,14 +1200,18 @@ func (s *Service) refuseDropsOfWithheldTables(req PlanRequest, resp *ternv1.Plan
 		"pull_request", prInt,
 		"tables", dropped,
 	)
+	upgrade := "Upgrade that deployment to a build that supports ignore_tables"
+	if ignored.HasPatterns() {
+		upgrade = "Upgrade that deployment to a build that supports ignore_tables patterns"
+	}
 	if len(dropped) == 1 {
 		return fmt.Errorf(
-			"the plan from deployment %q proposes dropping %q, which ignore_tables withholds. That deployment's planner never saw the exclusion, so the plan is refused rather than reviewed as a drop. Upgrade that deployment to a build that supports ignore_tables",
-			deployment, dropped[0])
+			"the plan from deployment %q proposes dropping %q, which ignore_tables withholds. That deployment's planner did not apply the exclusion, so the plan is refused rather than reviewed as a drop. %s",
+			deployment, dropped[0], upgrade)
 	}
 	return fmt.Errorf(
-		"the plan from deployment %q proposes dropping %s, which ignore_tables withholds. That deployment's planner never saw the exclusion, so the plan is refused rather than reviewed as drops. Upgrade that deployment to a build that supports ignore_tables",
-		deployment, quotedTableList(dropped))
+		"the plan from deployment %q proposes dropping %s, which ignore_tables withholds. That deployment's planner did not apply the exclusion, so the plan is refused rather than reviewed as drops. %s",
+		deployment, quotedTableList(dropped), upgrade)
 }
 
 // quotedTableList renders table names for an operator-facing message, quoted

@@ -111,7 +111,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// diff below, per keyspace, and disclosed on the result: the diff never
 	// sees a withheld table, so without the disclosure it would be
 	// indistinguishable from an unchanged one.
-	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", req.Database, err)
+	}
 	exemptTables, err := e.withholdIgnoredTables(ignored, req, keyspaces, currentSchema)
 	if err != nil {
 		return nil, err

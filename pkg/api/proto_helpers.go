@@ -300,17 +300,13 @@ func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
 	return slices.Compact(tables)
 }
 
-// plannedDropsAmong returns the tables from names that the plan proposes
-// dropping, sorted. Callers use it to tell an exclusion that matched nothing
-// because the table is not there from one that matched nothing because the
-// planner was never shown the exclusion at all.
-func plannedDropsAmong(changes []*ternv1.SchemaChange, names []string) []string {
-	if len(names) == 0 {
+// plannedDropsWithheldBy returns the tables the plan proposes dropping that
+// ignored withholds, sorted. A planner that honored the config never sees
+// those tables, so any such drop comes from one that was never shown the
+// exclusion, or could not read it.
+func plannedDropsWithheldBy(changes []*ternv1.SchemaChange, ignored engine.IgnoredTables) []string {
+	if ignored.Empty() {
 		return nil
-	}
-	wanted := make(map[string]bool, len(names))
-	for _, name := range names {
-		wanted[name] = true
 	}
 	var dropped []string
 	for _, change := range changes {
@@ -321,7 +317,7 @@ func plannedDropsAmong(changes []*ternv1.SchemaChange, names []string) []string 
 			if tc == nil || tc.ChangeType != ternv1.ChangeType_CHANGE_TYPE_DROP {
 				continue
 			}
-			if wanted[tc.TableName] {
+			if ignored.Withholds(tc.TableName) {
 				dropped = append(dropped, tc.TableName)
 			}
 		}

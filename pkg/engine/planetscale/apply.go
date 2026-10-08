@@ -86,6 +86,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 		return e.resumeApply(ctx, client, org, req)
 	}
 
+	// The tables the plan was reviewed with ignore_tables withholding are
+	// resolved before the branch is created, so an entry that cannot be read
+	// stops the apply before it has anything to clean up.
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("apply plan %s to database %s: %w", req.PlanID, req.Database, err)
+	}
+
 	emitEvent := e.eventEmitter(req)
 
 	// Track in-flight apply metadata for progress queries during setup.
@@ -305,7 +313,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// PlanetScale API which may return stale data after UpdateKeyspaceVSchema.
 	// Retry up to 30s to allow the API to converge.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, engine.NewIgnoredTables(req.IgnoreTables), password); err != nil {
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, ignored, password); err != nil {
 		return nil, fmt.Errorf("branch validation failed after DDL apply: %w", err)
 	}
 	emitEvent(engine.ApplyEvent{
@@ -955,7 +963,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// Tables the plan was reviewed with ignore_tables withholding are left out,
 	// as the plan left them out.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
+	}
 	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
 	if err != nil {
 		return nil, fmt.Errorf("fetch branch %s schema via MySQL on resume: %w", meta.BranchName, err)

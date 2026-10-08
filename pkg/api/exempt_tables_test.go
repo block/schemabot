@@ -1,10 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -83,18 +87,7 @@ func TestExecutePlanCarriesIgnoreTablesAndRecordsTheReviewedConfig(t *testing.T)
 			{Namespace: "payments", Tables: []string{"orders_archive_2024"}, Reason: "archive naming"},
 		},
 	}}
-	cfg := &ServerConfig{
-		Databases: map[string]DatabaseConfig{
-			"payments": {
-				Type:         storage.DatabaseTypeMySQL,
-				Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
-			},
-		},
-		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
-	}
-	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
-		DefaultDeployment + "/staging": mockClient,
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := withheldDropService(plans, mockClient)
 
 	resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
 		Database:    "payments",
@@ -141,18 +134,7 @@ func TestExecutePlanRefusesADropOfAWithheldTable(t *testing.T) {
 			}},
 		}},
 	}}
-	cfg := &ServerConfig{
-		Databases: map[string]DatabaseConfig{
-			"payments": {
-				Type:         storage.DatabaseTypeMySQL,
-				Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
-			},
-		},
-		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
-	}
-	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
-		DefaultDeployment + "/staging": mockClient,
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := withheldDropService(plans, mockClient)
 
 	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
 		Database:    "payments",
@@ -174,8 +156,8 @@ func TestExecutePlanRefusesADropOfAWithheldTable(t *testing.T) {
 
 // An entry that matched nothing because the table is not on the target is the
 // ordinary typo, and it is reported rather than refused: the plan proceeds and
-// the unmatched entry reaches the pull request comment. Only a drop of the
-// entry's own name proves the exclusion was not applied.
+// the unmatched entry reaches the pull request comment. Only a drop of a table
+// the config withholds proves the exclusion was not applied.
 func TestExecutePlanKeepsPlanningWhenAnUnmatchedEntryIsNotDropped(t *testing.T) {
 	plans := &capturingPlanStore{}
 	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{
@@ -188,18 +170,7 @@ func TestExecutePlanKeepsPlanningWhenAnUnmatchedEntryIsNotDropped(t *testing.T) 
 			}},
 		}},
 	}}
-	cfg := &ServerConfig{
-		Databases: map[string]DatabaseConfig{
-			"payments": {
-				Type:         storage.DatabaseTypeMySQL,
-				Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
-			},
-		},
-		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
-	}
-	svc := New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
-		DefaultDeployment + "/staging": mockClient,
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc := withheldDropService(plans, mockClient)
 
 	// The entry names one table; the plan drops a different one.
 	resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
@@ -215,6 +186,129 @@ func TestExecutePlanKeepsPlanningWhenAnUnmatchedEntryIsNotDropped(t *testing.T) 
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.NotNil(t, plans.created, "the plan is stored and the unmatched entry is reported, not refused")
+}
+
+// withheldDropService wires a service whose staging plan for payments is
+// answered by client, so a test can hand it the plan a data plane returned.
+func withheldDropService(plans storage.PlanStore, client tern.Client) *Service {
+	cfg := &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"payments": {
+				Type:         storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{"staging": {Target: "payments-staging-target", Deployment: DefaultDeployment}},
+			},
+		},
+		TernDeployments: TernConfig{DefaultDeployment: {"staging": "localhost:9090"}},
+	}
+	return New(&mockStorageWithPlanLookup{plans: plans}, cfg, map[string]tern.Client{
+		DefaultDeployment + "/staging": client,
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// A data plane built before pattern entries reads "/^relay_\d+_feed$/" as the
+// name of a table, withholds nothing, and plans every live member of the
+// family as a drop. The server matches those drops against the config with the
+// same matcher the engines withhold by, so the plan is refused rather than
+// stored and reviewed as the drops the pattern was written to prevent, and the
+// remedy names the capability that deployment lacks.
+func TestExecutePlanRefusesDropsOfAPatternWithheldFamily(t *testing.T) {
+	plans := &capturingPlanStore{}
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{
+		PlanId: "plan-literal-pattern",
+		Changes: []*ternv1.SchemaChange{{
+			Namespace: "payments",
+			TableChanges: []*ternv1.TableChange{
+				{TableName: "relay_2_feed", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP, Ddl: "DROP TABLE `relay_2_feed`"},
+				{TableName: "relay_1_feed", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP, Ddl: "DROP TABLE `relay_1_feed`"},
+				{TableName: "relay_settings", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP, Ddl: "DROP TABLE `relay_settings`"},
+			},
+		}},
+		// The plain entry was honored, so every entry but the pattern matched.
+		ExemptTables: []*ternv1.ExemptTables{{
+			Namespace: "payments", Tables: []string{"flyway_schema_history"}, Reason: engine.ExemptReasonIgnoreTables,
+		}},
+	}}
+	svc := withheldDropService(plans, mockClient)
+
+	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		IgnoreTables: []string{"flyway_schema_history", `/^relay_\d+_feed$/`},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `proposes dropping "relay_1_feed", "relay_2_feed", which ignore_tables withholds`)
+	assert.NotContains(t, err.Error(), "relay_settings", "a drop the config does not withhold is left to review")
+	assert.Contains(t, err.Error(), "Upgrade that deployment to a build that supports ignore_tables patterns")
+	assert.Nil(t, plans.created, "a plan that would drop a withheld table is not stored")
+}
+
+// A pattern the plan matched is not reported as unmatched, and the plan that
+// honored it is stored with the entries as written, so an apply, a resume and
+// a rollback re-plan withhold by the same pattern the plan was reviewed under.
+func TestExecutePlanRecordsPatternEntriesAsWritten(t *testing.T) {
+	plans := &capturingPlanStore{}
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{
+		PlanId: "plan-pattern",
+		Changes: []*ternv1.SchemaChange{{
+			Namespace: "payments",
+			TableChanges: []*ternv1.TableChange{{
+				TableName: "users", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				Ddl: "ALTER TABLE `users` ADD COLUMN `note` varchar(50)",
+			}},
+		}},
+		ExemptTables: []*ternv1.ExemptTables{{
+			Namespace: "payments", Tables: []string{"relay_1_feed", "relay_2_feed"}, Reason: engine.ExemptReasonIgnoreTables,
+		}},
+	}}
+	svc := withheldDropService(plans, mockClient)
+
+	resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		IgnoreTables: []string{`/^relay_\d+_feed$/`},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{`/^relay_\d+_feed$/`}, mockClient.planReq.GetIgnoreTables(), "the data plane is sent the pattern, not names resolved here")
+	assert.Equal(t, []string{"relay_1_feed", "relay_2_feed"}, resp.WithheldTables())
+	require.NotNil(t, plans.created)
+	assert.Equal(t, []string{`/^relay_\d+_feed$/`}, plans.created.IgnoreTables())
+}
+
+// POST /api/plan holds ignore_tables to the rule schemabot.yaml is, so a
+// pattern that does not compile is the request's error, answered before any
+// data plane is asked to plan.
+func TestPlanHandler_InvalidIgnoreTablesPatternIsBadRequest(t *testing.T) {
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{PlanId: "plan-unused"}}
+	svc := withheldDropService(&capturingPlanStore{}, mockClient)
+	body, err := json.Marshal(PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		IgnoreTables: []string{`/relay_(\d+_feed/`},
+	})
+	require.NoError(t, err)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/plan", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	svc.handlePlan(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), `ignore_tables entry \"/relay_(\\d+_feed/\" is not a valid regular expression`)
+	assert.Nil(t, mockClient.planReq, "no data plane is asked to plan")
 }
 
 // rollbackSourcePlanStore answers the rollback's source-plan lookup and
@@ -322,13 +416,14 @@ func TestExecuteRollbackPlanCarriesAndRecordsTheReviewedIgnoreTables(t *testing.
 // the same edit leaves the same refusal. The failure says where the entries
 // came from, so nobody spends the outage editing config.
 func TestExecuteRollbackPlanSaysItsIgnoreTablesCameFromThePlan(t *testing.T) {
+	ignored, err := engine.NewIgnoredTables([]string{"flyway_schema_history"})
+	require.NoError(t, err)
 	plans := &rollbackSourcePlanStore{source: rollbackSourcePlan()}
 	svc, apply := newRollbackExemptServiceWithClient(plans, &mockTernClient{
-		planErr: engine.NewIgnoredTables([]string{"flyway_schema_history"}).
-			RefuseDeclared("payments", []string{"flyway_schema_history"}),
+		planErr: ignored.RefuseDeclared("payments", []string{"flyway_schema_history"}),
 	})
 
-	_, err := svc.ExecuteRollbackPlanForApply(t.Context(), apply)
+	_, err = svc.ExecuteRollbackPlanForApply(t.Context(), apply)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "Remove the entry or the schema file",

@@ -472,8 +472,8 @@ exempt from the verdict, as they are in the MySQL engine's view of a live schema
 an archive is a retired copy kept outside declarative schema files. An archive
 that a file explicitly declares is managed like any other declared table.
 That naming convention is the only naming-based per-table exemption — a leading
-underscore means nothing on PostgreSQL. Exact `ignore_tables` matches also
-withhold live tables; a file declaring an ignored table is refused as a
+underscore means nothing on PostgreSQL. `ignore_tables` entries, exact names
+and patterns, also withhold live tables; a file declaring an ignored table is refused as a
 contradiction. `ignore_namespaces` is the per-namespace exemption. The
 plan discloses the tables it exempted, by namespace, in the PR comment and in
 `schemabot plan` and `schemabot apply` output, so a reviewer can tell an
@@ -678,8 +678,9 @@ it commits or fails, and recovery re-plans against the live target before
 further work. A privilege refusal is a permanent failed task, includes the
 required provisioning advice, and leaves the target unchanged.
 
-Rollback captures the same live table set the forward plan manages. Exact,
-case-sensitive `ignore_tables` matches are excluded before introspection, as are
+Rollback captures the same live table set the forward plan manages. Tables
+`ignore_tables` withholds, by exact case-sensitive name or by pattern, are
+excluded before introspection, as are
 archive-named tables with no schema file. An explicitly declared archive remains
 managed and keeps its original definition, so rollback can reverse its changes.
 A declared archive the forward plan creates has no original to keep: the

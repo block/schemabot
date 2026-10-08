@@ -265,7 +265,10 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	}
 
 	namespaces := sortedKeys(req.SchemaFiles)
-	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+	}
 	result := &engine.PlanResult{}
 	for _, namespace := range namespaces {
 		ns := req.SchemaFiles[namespace]
