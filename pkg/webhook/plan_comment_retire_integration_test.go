@@ -751,3 +751,58 @@ func TestPlanCommentReplacementComparesTheOutcomeOnTheSameHead(t *testing.T) {
 	assert.False(t, replacementDecision(t, h, repo, slot, true))
 	assert.False(t, replacementDecision(t, h, repo, slot, false))
 }
+
+// At shaA the plan for every environment showed DDL. The change was then
+// applied outside the PR, and a staging-only plan command posted a newer
+// no-changes reply. A schema-neutral push to shaB plans every environment
+// and finds no changes. The staging-only reply says nothing about
+// production, so it must not stand in for the answer: the comment covering
+// every environment still offers the DDL, and this head's plan replaces it.
+func TestPlanCommentReplacementReadsTheAnswerForItsOwnEnvironments(t *testing.T) {
+	const repo = "org/plan-replace-mixed-scope"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "production,staging", "shaA", 9001, "IC_every_env_ddl", false)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaA", 9002, "IC_staging_no_changes", true)
+	fake.setCurrentHead("shaB")
+
+	slot := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging", "production"}, HeadSHA: "shaB", UpToDate: true}
+	assert.True(t, replacementDecision(t, h, repo, slot, true),
+		"the outdated comment for every environment is replaced despite the newer staging-only reply")
+}
+
+// The only visible comment is a staging-only plan reply rendered at shaA. A
+// push to shaB plans every environment and finds no changes. No comment
+// covers those environments, and the reply renders a prior head, so this
+// head's plan posts and supersedes it. Once that comment is the answer for
+// every environment, later schema-neutral pushes keep it even while the
+// staging-only reply stays visible, as an apply-owned comment does under the
+// minimize-based policy.
+func TestPlanCommentReplacementSupersedesANarrowerReplyFromAPriorHead(t *testing.T) {
+	const repo = "org/plan-replace-narrower-reply"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaA", 9001, "IC_staging_reply", true)
+	fake.setCurrentHead("shaB")
+
+	slot := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging", "production"}, HeadSHA: "shaB", UpToDate: true}
+	assert.True(t, replacementDecision(t, h, repo, slot, true))
+	assert.True(t, replacementDecision(t, h, repo, slot, false))
+
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "production,staging", "shaB", 9002, "IC_every_env_no_changes", true)
+	slot.HeadSHA = "shaC"
+	fake.setCurrentHead("shaC")
+	assert.False(t, replacementDecision(t, h, repo, slot, true),
+		"the answer for every environment still matches, so the visible staging-only reply forces no post")
+}
+
+// A staging-only plan reply rendered at the current head is the only visible
+// comment. Planning every environment at that head adds nothing to replace:
+// the reply is not from a prior head, so no comment posts.
+func TestPlanCommentReplacementLeavesANarrowerReplyFromThisHead(t *testing.T) {
+	const repo = "org/plan-replace-narrower-same-head"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaB", 9001, "IC_staging_reply", true)
+	fake.setCurrentHead("shaB")
+
+	slot := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging", "production"}, HeadSHA: "shaB", UpToDate: true}
+	assert.False(t, replacementDecision(t, h, repo, slot, false))
+}

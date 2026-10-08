@@ -132,10 +132,17 @@ func (h *Handler) retireSupersededPlanComments(ctx context.Context, client *ghcl
 // must post to replace the plan answer the slot shows, for an auto-plan that
 // would otherwise post nothing.
 //
-// The slot's answer is its newest visible comment. Every post supersedes the
-// comments before it, so an older comment still visible is history — a
-// comment an apply owns stays expanded under the minimize-based policy — and
-// is never the answer to replace.
+// The answer for this plan is the newest visible comment covering the same
+// environments, the comment the auto-plan dispatch gate also reads. A
+// comment covering other environments says nothing about the ones this plan
+// covers, so it neither stands in for the answer nor hides an outdated one.
+// Every post supersedes the comments before it, so an older comment in the
+// scope that is still visible is history — a comment an apply owns stays
+// expanded under the minimize-based policy — and is never the answer to
+// replace. With no comment in the scope, the plan posts when another scope's
+// comment renders a prior head, so a reply to a narrower command is
+// superseded rather than left showing an outdated plan; the post then becomes
+// the scope's answer.
 //
 // When keepMatchingOutcome is set, the caller vouches that the answer still
 // fits this head: the push left the schema inputs unchanged, or the plan
@@ -177,7 +184,7 @@ func (h *Handler) priorHeadPlanCommentNeedsReplacing(ctx context.Context, client
 }
 
 // planCommentAnswerNeedsReplacing applies priorHeadPlanCommentNeedsReplacing's
-// outcome rules to the slot's newest visible comment.
+// outcome rules to the newest visible comment in the slot's environment scope.
 func (h *Handler) planCommentAnswerNeedsReplacing(ctx context.Context, repo string, pr int, slot planCommentSlot, keepMatchingOutcome bool, slotAttrs []any) bool {
 	comments, err := h.service.Storage().PlanComments().ListUnretiredForSlot(ctx, repo, pr, slot.Database, slot.DatabaseType)
 	if err != nil {
@@ -185,9 +192,15 @@ func (h *Handler) planCommentAnswerNeedsReplacing(ctx context.Context, repo stri
 			append(slotAttrs, "error", err)...)
 		return true
 	}
-	answer := newestPlanComment(comments)
+	scope := slot.environmentScope()
+	answer := newestPlanCommentInScope(comments, scope)
 	if answer == nil {
-		h.logger.Debug("no visible plan comment to replace", slotAttrs...)
+		if other := planCommentFromAnotherHead(comments, slot.HeadSHA); other != nil {
+			h.logger.Info("no visible plan comment covers this plan's environments, and another scope's comment renders a prior head; this head's plan comment replaces it",
+				append(planCommentAttrs(other), "current_head_sha", slot.HeadSHA, "plan_environment_scope", scope)...)
+			return true
+		}
+		h.logger.Debug("no visible plan comment to replace", append(slotAttrs, "environment_scope", scope)...)
 		return false
 	}
 	answerAttrs := append(planCommentAttrs(answer), "current_head_sha", slot.HeadSHA,
@@ -204,17 +217,32 @@ func (h *Handler) planCommentAnswerNeedsReplacing(ctx context.Context, repo stri
 	return false
 }
 
-// newestPlanComment returns the most recently recorded comment, or nil when
-// there is none. Rows are inserted right after their comment posts, so the
-// highest ID is the newest comment on the PR timeline.
-func newestPlanComment(comments []*storage.PlanComment) *storage.PlanComment {
+// newestPlanCommentInScope returns the most recently recorded comment
+// covering exactly the given environment scope, or nil when there is none.
+// Rows are inserted right after their comment posts, so the highest ID is the
+// newest comment on the PR timeline.
+func newestPlanCommentInScope(comments []*storage.PlanComment, scope string) *storage.PlanComment {
 	var newest *storage.PlanComment
 	for _, c := range comments {
+		if c.EnvironmentScope != scope {
+			continue
+		}
 		if newest == nil || c.ID > newest.ID {
 			newest = c
 		}
 	}
 	return newest
+}
+
+// planCommentFromAnotherHead returns a comment rendering a head other than
+// headSHA, or nil when every comment renders headSHA.
+func planCommentFromAnotherHead(comments []*storage.PlanComment, headSHA string) *storage.PlanComment {
+	for _, c := range comments {
+		if c.HeadSHA != headSHA {
+			return c
+		}
+	}
+	return nil
 }
 
 // retireStalePlanCommentsForPR retires every plan comment still visible on
