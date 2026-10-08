@@ -28,10 +28,9 @@ type targetWork struct {
 // sharded apply comment writes a keyspace: one line per table across the
 // targets, each change's DDL once, a heading per group of targets when they
 // diverge, and a row per failed target. Its size grows with distinct changes
-// and failures, not with the number of targets. standalone is true when the
-// rollup is the whole comment body, whose status line already counts the
-// targets that had the change.
-func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget, standalone bool) {
+// and failures, not with the number of targets. Targets that already had the
+// change ran nothing, so the rollup neither names nor counts them.
+func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
 	work := targetWorkGroups(data, g)
 	silent := unreportedTargets(data, g)
 	// A target that already had the change ran nothing and never reports
@@ -48,7 +47,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	}
 	for _, w := range work {
 		if len(work) > 1 {
-			writeTargetGroupHeading(sb, "####", targetNames(data.Model, w.members), len(g.Members))
+			writeTargetGroupHeading(sb, "####", targetNames(data.Model, w.members), changingMembers(data.Model, g))
 		}
 		first := memberDetail(data.Details, w.members[0])
 		dialect := dialectForEngine(first.Engine, data.ApplyID)
@@ -64,9 +63,6 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		}
 		restorePlan()
 		restoreGroup()
-	}
-	if converged := alreadyAppliedTargets(data, g); converged > 0 && !standalone {
-		fmt.Fprintf(sb, "_%d of %d targets already had this schema; nothing ran there._\n", converged, len(g.Members))
 	}
 	writeFailedTargets(sb, data.Model, g)
 }
@@ -93,18 +89,6 @@ func unreportedTargets(data MultiDeploymentApplyData, g presentation.Group) int 
 			continue
 		}
 		if detail := memberDetail(data.Details, i); detail == nil || len(detail.Tables) == 0 {
-			n++
-		}
-	}
-	return n
-}
-
-// alreadyAppliedTargets counts the targets that already had the change when
-// the apply was created.
-func alreadyAppliedTargets(data MultiDeploymentApplyData, g presentation.Group) int {
-	n := 0
-	for _, i := range g.Members {
-		if data.Model.Deployments[i].AlreadyApplied() {
 			n++
 		}
 	}

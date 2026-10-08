@@ -962,7 +962,7 @@ func TestRenderMultiEnvPlanComment_EachTargetPlanRendersUnderItsTargets(t *testi
 
 	_, production, found := strings.Cut(out, "Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`")
+	assert.Contains(t, production, "#### 2 of 3 targets\n\n`primary/testapp_1`, `primary/testapp_2`")
 	otherHeader := strings.Index(production, "#### Target `primary/testapp_4`")
 	details := strings.Index(production, "<details>\n<summary>Show SQL (2 statements)</summary>")
 	assert.GreaterOrEqual(t, otherHeader, 0)
@@ -988,7 +988,7 @@ func TestRenderMultiEnvPlanComment_SchemaNameSitsUnderItsTargets(t *testing.T) {
 
 	_, production, found := strings.Cut(out, "### Production")
 	require.True(t, found, "the production section is missing from:\n%s", out)
-	assert.Contains(t, production, "#### 2 of 4 targets\n\n`primary/testapp_1`, `primary/testapp_2`\n\n**Schema Name**: `testapp_production`\n\n```sql\n")
+	assert.Contains(t, production, "#### 2 of 3 targets\n\n`primary/testapp_1`, `primary/testapp_2`\n\n**Schema Name**: `testapp_production`\n\n```sql\n")
 	assert.NotContains(t, production, "#### Schema Name")
 }
 
