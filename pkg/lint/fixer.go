@@ -75,7 +75,10 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 		// Parse and fix using AST manipulation. A file counts as changed only
 		// when a fix was applied to it, never because its restored spelling
 		// differs from what was written.
-		fixed, fixes := f.fixCreateTable(content)
+		fixed, fixes, err := f.fixCreateTable(content)
+		if err != nil {
+			return nil, fmt.Errorf("fix %s: %w", filename, err)
+		}
 		if len(fixes) > 0 {
 			fileResult.FixedSQL = fixed
 			fileResult.Changed = true
@@ -113,12 +116,15 @@ func (f *Fixer) FixFiles(files map[string]string) (*FixFilesResult, error) {
 
 // fixCreateTable parses a CREATE TABLE statement, applies all fixes via AST
 // manipulation, and returns the canonical fixed SQL with the fixes applied. It
-// returns the input unchanged and no fixes when there was nothing to fix.
-func (f *Fixer) fixCreateTable(sql string) (string, []string) {
+// returns the input unchanged and no fixes when there was nothing to fix. A
+// fixed table that cannot be rendered back to SQL is an error: reporting it as
+// unfixed would tell the operator the file is clean.
+func (f *Fixer) fixCreateTable(sql string) (string, []string, error) {
 	ct, err := statement.ParseCreateTable(sql)
 	if err != nil {
-		// Not a valid CREATE TABLE, return unchanged
-		return sql, nil
+		// Not a CREATE TABLE this fixer handles. The lint pass that follows
+		// parses the file again and reports a file that does not parse.
+		return sql, nil, nil
 	}
 
 	var fixes []string
@@ -149,18 +155,17 @@ func (f *Fixer) fixCreateTable(sql string) (string, []string) {
 	// would only respell it (one backtick-quoted line, uppercase types) and
 	// turn every clean file into a diff.
 	if len(fixes) == 0 {
-		return sql, nil
+		return sql, nil, nil
 	}
 
 	// Restore to canonical form
 	var sb strings.Builder
 	rCtx := format.NewRestoreCtx(format.DefaultRestoreFlags, &sb)
 	if err := ct.Raw.Restore(rCtx); err != nil {
-		// Restore failed, return unchanged
-		return sql, nil
+		return "", nil, fmt.Errorf("render table %s after applying %s: %w", ct.TableName, strings.Join(fixes, ", "), err)
 	}
 
-	return sb.String(), fixes
+	return sb.String(), fixes, nil
 }
 
 // fixColumnPrimaryKeyType changes INT to BIGINT for AUTO_INCREMENT columns.

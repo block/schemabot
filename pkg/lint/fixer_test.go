@@ -636,7 +636,9 @@ func TestFixFiles_CleanFileLeftAsWritten(t *testing.T) {
 // A file that needs a fix is written back as the restored DDL with the fix
 // applied, and the fix is the only one reported for it.
 func TestFixFiles_FixedFileRestoredWithFix(t *testing.T) {
-	input := "CREATE TABLE `orders` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
+	// The comment, the trailing semicolon, and the final newline are not
+	// kept: the fixed file is the parser's rendering of the table alone.
+	input := "-- orders placed through checkout\nCREATE TABLE `orders` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  `user_id` bigint unsigned NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n"
 
 	result, err := NewFixer().FixFiles(map[string]string{"orders.sql": input})
 	require.NoError(t, err)
