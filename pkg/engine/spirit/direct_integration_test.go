@@ -90,7 +90,7 @@ func dropTablesOnCleanup(t *testing.T, db *sql.DB, tables ...string) {
 	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
 		for _, table := range tables {
-			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `"+table+"`")
+			_, err := db.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS "+sqlescape.EscapeIdentifier(table))
 			assert.NoError(t, err, "drop table %s", table)
 		}
 	})
@@ -568,6 +568,40 @@ func TestExactRowCountWithin(t *testing.T) {
 	require.Error(t, err, "a missing table is an error, never a zero count")
 }
 
+// The exact bounded count counts the table a name containing a backtick
+// names: a legal name is not a syntax error, and a name shaped like SQL
+// cannot turn the count into a query over something else.
+func TestExactRowCountWithinEscapesIdentifiers(t *testing.T) {
+	_, db := setupTestMySQL(t)
+	const plain = "ord`ers"
+	const crafted = "big` WHERE 0) x #"
+	dropTablesOnCleanup(t, db, plain, crafted)
+
+	for _, name := range []string{plain, crafted} {
+		_, err := db.ExecContext(t.Context(), "CREATE TABLE "+sqlescape.EscapeIdentifier(name)+" (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)")
+		require.NoError(t, err, "create %s", name)
+		var inserts strings.Builder
+		inserts.WriteString("INSERT INTO " + sqlescape.EscapeIdentifier(name) + " (v) VALUES (1)")
+		for range 19 {
+			inserts.WriteString(",(1)")
+		}
+		_, err = db.ExecContext(t.Context(), inserts.String())
+		require.NoError(t, err, "seed %s", name)
+	}
+
+	count, err := exactRowCountWithin(t.Context(), db, "testdb", plain, 100)
+	require.NoError(t, err, "a name containing a backtick is counted, not a syntax error")
+	assert.Equal(t, int64(20), count)
+
+	count, err = exactRowCountWithin(t.Context(), db, "testdb", crafted, 10)
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), count, "a table above the bound reports limit+1 whatever its name")
+
+	_, err = exactRowCountWithin(t.Context(), db, "testdb", "ord`ers_absent", 10)
+	require.Error(t, err, "a missing table is an error, never a zero count")
+	assert.Contains(t, err.Error(), "count rows of `testdb`.`ord``ers_absent` (bounded at 11)")
+}
+
 // With the policy enabled, an apply routes a statement the engine refuses —
 // a primary-key reshape — to direct execution and drives it to completion:
 // the PK actually changes on the target, the schema change ends completed,
@@ -944,8 +978,8 @@ func TestEngine_ExecuteAlterPhase_ExplicitTableLockFailsBusy(t *testing.T) {
 }
 
 // A direct statement finds the sessions blocking it through
-// performance_schema and innodb_trx, and kills them with CONNECTION_ADMIN. A
-// target user missing any of those grants would reach apply time unable to
+// performance_schema and innodb_trx, and kills them with CONNECTION_ADMIN or,
+// on RDS, through mysql.rds_kill. A target user missing any of those grants would reach apply time unable to
 // kill anything, and the statement would queue on the lock while table traffic
 // stalls behind it. So the verdict fails closed to blocked instead, and the
 // reason names the grants without the database's own error text.
@@ -960,10 +994,12 @@ func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
 	// The test context is cancelled before cleanup runs, so each drop gets its
 	// own bounded context that outlives it.
 	cleanupCtx := context.WithoutCancel(t.Context())
-	for _, tc := range []struct {
+	for i, tc := range []struct {
 		name string
 		// grants are given on top of the user's own database.
-		grants      []string
+		grants []string
+		// rdsKill creates mysql.rds_kill, as RDS provides it, for the case.
+		rdsKill     bool
 		wantMode    string
 		wantOutcome string
 	}{
@@ -991,9 +1027,20 @@ func TestResolveRefusedMode_ForceKillUnavailableBlocks(t *testing.T) {
 			grants:   []string{"SELECT ON performance_schema.*", "PROCESS ON *.*", "CONNECTION_ADMIN ON *.*"},
 			wantMode: engine.ExecutionModeDirect,
 		},
+		{
+			// RDS withholds CONNECTION_ADMIN and ends other users' sessions
+			// through its own procedure instead.
+			name:     "EXECUTE on mysql.rds_kill instead of CONNECTION_ADMIN",
+			grants:   []string{"SELECT ON performance_schema.*", "PROCESS ON *.*", "EXECUTE ON PROCEDURE mysql.rds_kill"},
+			rdsKill:  true,
+			wantMode: engine.ExecutionModeDirect,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			user := fmt.Sprintf("direct_nokill_%d", len(tc.grants))
+			if tc.rdsKill {
+				createRDSKill(t, db)
+			}
+			user := fmt.Sprintf("direct_nokill_%d", i)
 			const password = "direct_nokill_pw"
 			_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE USER '%s'@'%%' IDENTIFIED BY '%s'", user, password))
 			require.NoError(t, err, "create user %s", user)
@@ -1321,4 +1368,23 @@ func TestEngine_ExecuteAlterPhase_SparesTrafficDuringRebuild(t *testing.T) {
 	require.True(t, stillRebuilding, "the rebuild must outlast the bystander, without waiting on it, for this scenario")
 	require.Equal(t, engine.StateCompleted, r.state, "the apply completes: %s", r.errorMessage)
 	assert.NoError(t, commitErr, "a transaction that never blocked the statement is not killed")
+}
+
+// createRDSKill creates mysql.rds_kill, the procedure RDS provides for ending
+// another user's session without CONNECTION_ADMIN, and drops it when the test
+// ends. Only its existence and the EXECUTE grant on it are checked before a
+// statement runs directly, so the body does nothing.
+func createRDSKill(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(), "CREATE PROCEDURE `mysql`.`rds_kill`(IN thread BIGINT) SELECT thread")
+	require.NoError(t, err, "create mysql.rds_kill")
+	// The test context is cancelled before cleanup runs, so the drop gets its
+	// own bounded context that outlives it.
+	cleanupCtx := context.WithoutCancel(t.Context())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(cleanupCtx, 10*time.Second)
+		defer cancel()
+		_, err := db.ExecContext(ctx, "DROP PROCEDURE IF EXISTS `mysql`.`rds_kill`")
+		assert.NoError(t, err, "drop mysql.rds_kill")
+	})
 }

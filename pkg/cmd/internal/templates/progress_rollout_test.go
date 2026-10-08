@@ -37,9 +37,11 @@ type rolloutTarget struct {
 	// externalOperationID is the target's own data-plane operation.
 	externalOperationID string
 	isInstant           bool
-	// startedAt is when a driver started the target; a completed target
-	// without one already held the change when the apply was created.
+	// startedAt is when a driver started the target.
 	startedAt string
+	// alreadyConverged marks a target that already held the change when the
+	// apply was created.
+	alreadyConverged bool
 }
 
 // targetRolloutData builds a running apply of orders to production whose prod
@@ -64,6 +66,7 @@ func targetRolloutData(targets []rolloutTarget) ProgressData {
 			ExternalID:          target.externalID,
 			ExternalOperationID: target.externalOperationID,
 			StartedAt:           target.startedAt,
+			AlreadyConverged:    target.alreadyConverged,
 		})
 		if target.status == "" {
 			continue
@@ -151,18 +154,27 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 // driver ever starting it, so it reports no table progress. A finished apply
 // says so rather than claiming the target has yet to report, and a target
 // that failed before reporting is named in the attention list, not counted as
-// waiting.
+// waiting, while a stopped one is, since it reports once the apply resumes. A
+// target a reaper settled to the apply's outcome is completed and never
+// started too, but it is not marked as already having the change, so it counts
+// as completed rather than claiming its target already had the schema.
 func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
 	ran := completedTarget()
-	ran.startedAt = "2026-09-30T12:00:00Z"
-	converged := rolloutTarget{opState: state.ApplyOperation.Completed}
+	converged := rolloutTarget{opState: state.ApplyOperation.Completed, alreadyConverged: true}
 
 	finished := targetRolloutData([]rolloutTarget{ran, ran, converged})
 	finished.State = state.Apply.Completed
 	out := renderRollout(t, finished)
-	assert.Contains(t, out, "✅ prod — 3 completed (3 targets)")
+	assert.Contains(t, out, "✅ prod — 2 completed · 1 already had it (3 targets)")
 	assert.Contains(t, out, "1 of 3 targets already had this schema; nothing ran there.")
 	assert.NotContains(t, out, "have not reported progress yet", "a finished target is not waiting to report:\n%s", out)
+
+	reaped := rolloutTarget{opState: state.ApplyOperation.Completed}
+	settled := targetRolloutData([]rolloutTarget{ran, ran, reaped})
+	settled.State = state.Apply.Completed
+	out = renderRollout(t, settled)
+	assert.Contains(t, out, "✅ prod — 3 completed (3 targets)")
+	assert.NotContains(t, out, "already had", "a reaped target is not one that already had the change:\n%s", out)
 
 	failedEarly := rolloutTarget{opState: state.ApplyOperation.Failed, startedAt: "2026-09-30T12:00:00Z", err: "connection refused"}
 	running := targetRolloutData([]rolloutTarget{ran, copyingTarget(400), failedEarly, queuedTarget()})
@@ -170,6 +182,12 @@ func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
 	assert.Contains(t, out, "1 of 4 targets have not reported progress yet.", "only the queued target is waiting to report:\n%s", out)
 	assert.NotContains(t, out, "already had this schema")
 	assertLess(t, out, "Targets needing attention:", "payments-003 — failed: connection refused")
+
+	caught := rolloutTarget{opState: state.ApplyOperation.Stopped}
+	stopped := targetRolloutData([]rolloutTarget{ran, caught, converged})
+	stopped.State = state.Apply.Stopped
+	out = renderRollout(t, stopped)
+	assert.Contains(t, out, "1 of 3 targets have not reported progress yet.", "a stopped target reports once the apply resumes:\n%s", out)
 }
 
 // Sixty-four targets stay one screen: copying targets are sampled with the

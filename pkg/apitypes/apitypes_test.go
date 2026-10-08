@@ -412,6 +412,17 @@ func TestPlanResponse_AllChangesDirect(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "direct shard changes under an engine-driven collapsed namespace row",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{Namespace: "testdb", TableChanges: []*TableChangeResponse{{TableName: "orders"}}}},
+				Shards: []*ShardPlanResponse{
+					{Namespace: "testdb", Shard: "-80", Changes: []*TableChangeResponse{direct("orders")}},
+					{Namespace: "testdb", Shard: "80-", Changes: []*TableChangeResponse{direct("orders")}},
+				},
+			},
+			want: true,
+		},
+		{
 			name: "vschema change alongside a direct change",
 			resp: &PlanResponse{
 				Changes: []*SchemaChangeResponse{{

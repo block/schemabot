@@ -94,6 +94,42 @@ func TestPlanCommentDDLFillsTheCommentBeforeItIsCut(t *testing.T) {
 	assert.Contains(t, body, "schemabot apply -e production", "the sections after the DDL still render")
 }
 
+// partitionedCreate returns a CREATE TABLE partitioned by day, with one
+// partition definition per day.
+func partitionedCreate(table string, days int) string {
+	definitions := make([]string, 0, days)
+	for day := range days {
+		definitions = append(definitions, fmt.Sprintf("PARTITION `p%04d` VALUES LESS THAN (%d) ENGINE = InnoDB", day, day+1))
+	}
+	return "CREATE TABLE `" + table + "` (`id` bigint NOT NULL, `settlement_day` int NOT NULL, " +
+		"PRIMARY KEY (`id`,`settlement_day`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci " +
+		"PARTITION BY RANGE (`settlement_day`) (" + strings.Join(definitions, ",") + ")"
+}
+
+// Displayed partition definitions take a line each, which makes a heavily
+// partitioned table's DDL longer than its one-line form. The comment still
+// cuts that DDL to the room the rest of the comment leaves, mid-list, with the
+// truncation marker after it.
+func TestPlanCommentCutsWrappedPartitionDefinitionsToFit(t *testing.T) {
+	statements := make([]string, 0, 4)
+	for i := range 4 {
+		statements = append(statements, partitionedCreate(fmt.Sprintf("ledger_entries_%d", i), 365))
+	}
+	body := RenderPlanComment(PlanCommentData{
+		Database:     "ledger",
+		Environment:  "production",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Changes:      []KeyspaceChangeData{{Keyspace: "ledger_production", Statements: statements}},
+	})
+
+	assert.Equal(t, 1, strings.Count(body, ddlTruncatedMarker))
+	assert.LessOrEqual(t, len(body), commentBodyLimit)
+	assert.Greater(t, len(body), commentBodyLimit-256, "the DDL takes the room the comment leaves")
+	assert.Contains(t, body, "  PARTITION BY RANGE (`settlement_day`) (\n      PARTITION `p0000` VALUES LESS THAN (1) ENGINE = InnoDB,\n")
+	assert.Contains(t, body, "schemabot apply -e production", "the sections after the DDL still render")
+}
+
 // A multi-environment plan shares one DDL budget across its environments, so
 // two large, differing plans render under the limit together instead of each
 // taking a full comment's worth of DDL.
@@ -709,4 +745,55 @@ func TestPlanCommentCutTargetGroupNamesWhosePlanItPointsAt(t *testing.T) {
 	assert.Contains(t, rest, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_3` is available from the CLI with `schemabot list-plans -e production plan_member_3` (every target in this group runs the same DDL)._\n")
 	assert.NotContains(t, body, "for these targets")
 	assert.NotContains(t, body, ddlTruncatedMarker)
+}
+
+// When every target with work runs one plan, it renders with no heading
+// naming them, so a cut block's marker names the target whose stored plan it
+// points at itself. That holds when the plan is the primary's and other
+// targets share it, and when the only target with work is another target's.
+func TestPlanCommentCutSoleTargetPlanNamesWhosePlanItPointsAt(t *testing.T) {
+	t.Run("targets share the primary's plan", func(t *testing.T) {
+		primary := greenfieldPlan("production", "orders", 150)
+		primary.PlanID = "plan_reviewed"
+		primary.DeploymentDrift = &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "orders_1", Primary: true, Class: "planned"},
+				{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/orders_1", "primary/orders_2"}, Primary: true, Changes: primary.Changes},
+			},
+		}
+		body := RenderPlanComment(primary)
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+
+		assert.NotContains(t, body, "### Target", "one plan renders with no target heading")
+		assert.Contains(t, body, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_1` is available from the CLI with `schemabot list-plans -e production plan_reviewed` (every target runs the same DDL)._\n")
+		assert.NotContains(t, body, "for this target")
+	})
+
+	t.Run("only another target has work", func(t *testing.T) {
+		primary := greenfieldPlan("production", "orders", 0)
+		primary.PlanID = "plan_reviewed"
+		primary.Changes = nil
+		other := greenfieldPlan("production", "orders_eu", 150).Changes
+		primary.DeploymentDrift = &DeploymentDriftData{
+			Computed: true, Clean: true, Independent: true,
+			Deployments: []DeploymentDriftEntry{
+				{Deployment: "primary", Target: "orders_1", Primary: true, Class: "converged"},
+				{Deployment: "primary", Target: "orders_2", Class: "planned"},
+			},
+			Plans: []DeploymentPlanGroup{
+				{Members: []string{"primary/orders_1"}, Primary: true},
+				{Members: []string{"primary/orders_2"}, Changes: other, PlanID: "plan_member_2"},
+			},
+		}
+		body := RenderPlanComment(primary)
+		assert.LessOrEqual(t, len(body), commentBodyLimit)
+
+		assert.NotContains(t, body, "### Target", "one plan renders with no target heading")
+		assert.Contains(t, body, "_DDL truncated to fit GitHub's comment size limit; the full plan for `primary/orders_2` is available from the CLI with `schemabot list-plans -e production plan_member_2`._\n")
+		assert.NotContains(t, body, "for this target")
+	})
 }

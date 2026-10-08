@@ -865,9 +865,10 @@ be a whole number of seconds (at least `1s`).
 
 The kill reads `performance_schema` and `information_schema.innodb_trx` to
 find the blocking sessions and ends other users' sessions, so the SchemaBot
-user needs `SELECT` on `performance_schema.*`, `PROCESS`, and
-`CONNECTION_ADMIN` (or `SUPER`) for a statement to run directly; without any
-of them the statement is blocked at plan time.
+user needs `SELECT` on `performance_schema.*`, `PROCESS`, and either
+`CONNECTION_ADMIN` (or `SUPER`) or, on RDS, `EXECUTE` on `mysql.rds_kill` for a
+statement to run directly; without any of them the statement is blocked at
+plan time.
 
 Config validation fails at startup when a per-database `direct_execution`
 block — even a disabled one — is set on a non-MySQL database, when a policy is
@@ -1047,54 +1048,31 @@ defaults below.
 
 ```yaml
 spirit:
-  enable_experimental_autoscaling: true        # default: true
-  enable_experimental_lockless_checksum: true  # default: false
-  checkpoint_max_age: 72h                      # default: 72h (3 days)
-  checksum_yield_timeout: 12h                  # default: 12h
+  checkpoint_max_age: 72h  # default: 72h (3 days)
 ```
 
 The defaults, and why they were chosen:
 
-- **Thread pools are autoscaled on Aurora** (not configurable as a fixed
-  count). With `enable_experimental_autoscaling` on, Spirit sizes the copy,
-  apply, and checksum thread pools from the Aurora instance and scales them
-  dynamically from throttler feedback. A fixed thread count is the classic
-  failure mode on large targets — throughput that made sense on one instance
-  class silently starves or overloads another, and autoscaling is why there is
-  no operator knob for copy aggressiveness. Autoscaling needs Aurora's load
-  signal: on other MySQL targets Spirit leaves it disengaged and runs at fixed
-  default thread counts. Set `enable_experimental_autoscaling: false` only as
-  an incident kill switch when autoscaling misbehaves on a target fleet.
-- **The copy is verified under the snapshot checksum** unless
-  `enable_experimental_lockless_checksum: true` is set. The lockless checker
-  verifies with optimistic reads, retries, and hot-range splitting instead of a
-  checksum setup lock held over long-lived `REPEATABLE READ` snapshots, which
-  keeps a long checksum from pinning InnoDB purge on the target. Cutover locking
-  is the same either way. It is experimental and off by default, and these are
-  the terms an operator accepts by turning it on:
-  - **A continuously updated row can keep the verify phase running.** Such a
-    row is not yet supported: its chunk is deferred at the end of every pass, no
-    pass ever comes back clean, and passes repeat until an operator stops the
-    apply. The apply holds the database's active-apply slot until they do.
-  - **The verify phase reports 0% for its whole duration.** The lockless checker
-    has verified nothing conclusively until its first clean pass, so progress
-    goes from 0% straight to complete rather than climbing. Expect
-    `Checksumming to verify data (0%)` on the PR comment throughout, and a
-    stalled-task warning in the server logs every five minutes, for an apply
-    that is healthy.
-  - **`checksum_yield_timeout` does not apply.** It bounds the snapshot
-    checker's read transactions; the lockless checker holds no snapshot to
-    yield.
-
-  Setting it to `false` at the server level restates the default and overrides
-  nothing, so a database that opts itself in stays opted in.
+- **Thread pools are autoscaled on Aurora** (not configurable). Spirit sizes
+  the copy, apply, and checksum thread pools from the Aurora instance and
+  scales them dynamically from throttler feedback. A fixed thread count is the
+  classic failure mode on large targets — throughput that made sense on one
+  instance class silently starves or overloads another, and autoscaling is why
+  there is no operator knob for copy aggressiveness. Autoscaling needs Aurora's
+  load signal: on other MySQL targets Spirit leaves it disengaged and runs at
+  fixed default thread counts. An Aurora instance with fewer than 4 vCPUs is
+  too small to scale, so Spirit runs it in small-instance mode instead: every
+  pool runs one worker with small chunks and does not scale, which makes a
+  large copy on such an instance markedly slower.
+- **The copy is verified with Spirit's lockless checksum** (not configurable).
+  It verifies with optimistic reads, retries, and hot-range splitting instead
+  of a checksum setup lock held over long-lived `REPEATABLE READ` snapshots, so
+  a long checksum does not pin InnoDB purge on the target. Rows that are
+  updated continuously are settled against the change stream. Cutover still
+  requires a complete clean pass, and cutover locking is unchanged.
 - **`checkpoint_max_age: 72h`** — a checkpoint older than this is not resumed;
   the copy restarts cleanly instead of replaying days of old binlogs, which on
   a busy target is slower and riskier than starting over.
-- **`checksum_yield_timeout: 12h`** — each checksum read transaction yields its
-  `REPEATABLE READ` snapshot within this bound so a long checksum cannot pin
-  InnoDB purge and degrade the whole target instance. It bounds the snapshot
-  checker only, and has no effect where the lockless one is enabled.
 - **GTID change source is auto-detected** (no knob). Targets running with
   `gtid_mode=ON` and `enforce_gtid_consistency=ON` get Spirit's GTID-based
   change source, which tracks replication position across binlog rotation and
@@ -1102,9 +1080,15 @@ The defaults, and why they were chosen:
   the universally supported file+position source.
 
 A database can override the server-level value by setting the same key
-(`enable_experimental_autoscaling`, `enable_experimental_lockless_checksum`,
-`checkpoint_max_age`, `checksum_yield_timeout`) in its own metadata; the
-database's entry wins.
+(`checkpoint_max_age`) in its own metadata; the database's entry wins.
+
+The keys `enable_experimental_autoscaling`,
+`enable_experimental_lockless_checksum`, and `checksum_yield_timeout` were
+removed: Spirit now chooses thread autoscaling and the checksum itself. A
+config that still sets one is rejected rather than ignored, because the
+operator set it to change how runs behave. In the `spirit:` block it fails
+startup; in a database's metadata it fails building that database's engine
+client. Both errors name the key. Deleting the key is the whole remedy.
 
 These settings only apply where this server constructs the Spirit engine
 itself — local-mode MySQL databases. Databases routed to a remote deployment
@@ -1579,7 +1563,11 @@ The base branch is used, not the PR's head branch, to prevent a PR from relaxing
 
 Approval is checked at the time of `schemabot apply` and `schemabot apply-confirm`. Once an apply is executing, there is no ongoing approval check. Team membership and CODEOWNERS are evaluated fresh at each gate check.
 
-An approval counts only for the schema it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit when GitHub shows the head descends from it and no schema input changed in between: no `.sql`, `vschema.json`, or `schemabot.yaml` file anywhere in the repository, and no file under the database's schema directory. If that cannot be shown (GitHub cannot find the approved commit, a force-push rewrote it out of the branch's history, or GitHub truncates the list of changed files), the approval does not count and the reviewer must approve the current head; the Review Required comment names the reviewers whose approvals no longer count. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
+An approval counts only for the schema change it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit at which the PR's change to the database's schema inputs is the same as at the head. A database's schema inputs are its schema directory, the environment symlink that directory was resolved through (if any), its `schemabot.yaml`, and the target of every symlink inside them. Changes elsewhere in the repository, including another database's schema, do not affect the approval.
+
+The PR's change is measured against the default branch it was built on: SchemaBot finds the merge base of each commit with the base branch's current tip and compares content at all four commits. A schema input counts as unchanged when the PR turns the same base content into the same result at both commits, or when the PR leaves it as the base branch has it at both commits and the head was built on newer default branch content than the approved commit. So rebasing onto, or merging in, a newer default branch keeps the approval even when that default branch added tables beside the PR's, changed the database's `schemabot.yaml`, or removed a namespace: those changes are not the PR's, and they reached the default branch through their own PR and review. The approval stops counting when the PR edits, adds, or removes a schema input after it, including when a rebase combines the PR's edit with a default branch edit to the same file, keeps the PR's version over the default branch's, or restores content the default branch changed. Rebuilding the PR on an older default branch commit than the one it was approved on also stops the approval from counting when any schema input differs between the two, since the head would carry a version of that input nobody approved for this PR. Keeping an approval across default branch changes relies on the default branch requiring review for every change that reaches it: a change pushed to it directly, without its own review, is carried past an earlier approval like any other default branch change. Protect the default branch with required reviews when the review gate is enabled.
+
+If the PR's change differs, the Review Required comment names the reviewers whose approvals no longer count, and the reviewer must approve the current head. If the comparison cannot be completed (GitHub cannot find the approved commit, a directory is too large to list, a symlink points outside the repository, or there are more distinct symlinks than a comparison reads) and no other approval covers the head, that approval does not count and the apply is blocked with a Review Gate Error comment. The comment names the approval that did not count, lists who can approve, and asks for an approval of the latest commit, which needs no comparison. The reason goes to the server logs. Asking GitHub again would return the same answer, so the command is not retried. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
 
 ## Authentication
 

@@ -236,8 +236,9 @@ and `/health` probe wiring (`pkg/api/service.go`, `pkg/serve/serve.go`).
 ### AV-4: A transient failure never fails the work
 
 A storage or transport blip is not a schema change failure. An error writing a progress update is
-logged and the drive continues. An error reading something safety-gating ends this drive attempt
-and leaves the row claimable for another. Repeated errors observing remote progress mark the apply
+logged and the drive retries it, and a write that cannot land ends at most this drive attempt. An
+error reading something safety-gating ends this drive attempt and leaves the row claimable for
+another. Repeated errors observing remote progress mark the apply
 `failed_retryable` and never trigger a remote stop, because an observation outage only proves the
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
 the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
@@ -656,7 +657,9 @@ every path that records a check from a plan plans the other members first. A mem
 be planned is unknown work, never none. *Breaks if violated:* a PR merges green while a target still
 lacks its schema change. *Enforced:* member work counted into the stored check state
 (`upsertPlanCheckRecord` in `pkg/webhook/check_records.go`, read from `PlanRollup.MembersWithWork`
-in `pkg/api`); the rollout round the apply command and apply-confirm run before answering any
+in `pkg/api`, and stored from the rollout round when an apply runs other members' plans by
+`storeApplyCheckRecord` in `pkg/webhook/apply_check_records.go`); the rollout round the apply
+command and apply-confirm run before answering any
 primary plan (`pkg/webhook/apply_handlers.go`, `pkg/webhook/apply_execute.go`); apply creation
 refusing member work the apply's operation shape cannot carry, rather than settling that member as
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
@@ -800,8 +803,9 @@ completeness test over it (`pkg/state/metadata.go`).
 `failed_retryable` is active, not terminal: recovery re-drives it automatically. Only
 `failed_retryable` tasks reset to `pending`, so completed tasks are never re-run, and the apply
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
-*Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`) and the expiry sweep
-(`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
+*Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
+starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), and the
+expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -901,6 +905,17 @@ The two deadlines are the same deadline, which is the whole point. If the driver
 larger of the two, there would be a stretch in which a peer had legitimately claimed the work while
 the original driver was still running it.
 
+Stopping includes the engine work. A drive that ends, for whatever reason, has the engine bring
+down the in-process work it started, and only that work, and waits for it before it returns, so the
+target is released for the next driver rather than left running under nobody's claim. Work the
+engine lets finish rather than interrupt, because interrupting it would leave a partial change, is
+waited for the same way. The wait is bounded well inside the staleness window, so a drive cancelled
+while its claim is fresh does not let the claim go stale during its own teardown, and work still
+running when the bound expires is reported as still holding the target. A drive ended because its
+heartbeat failed for the whole window begins the halt with its claim already stale; the halt still
+reaches only its own work, and its writes stay lease-guarded (OW-2). The one exception is a drive that parks at a cutover barrier, which
+leaves its work waiting there by design.
+
 Storage writes are lease-guarded either way (OW-2), so a displaced driver cannot corrupt state
 whatever it believes about itself. What the shared window bounds is the thing no lease guard can
 reach: how long two processes can be running the same engine work against the same database at
@@ -909,7 +924,10 @@ the fallback; a driver that can still reach storage learns it was displaced by r
 instead (OW-4). *Enforced:* one staleness constant (`ApplyLeaseStaleAfter` in
 `pkg/storage/storage.go`) read by both the heartbeat loop (`pkg/api/operator.go`) and every claim
 query, at the apply level (`pkg/storage/internal/sqlstore/applies.go`) and the operation level
-(`pkg/storage/internal/sqlstore/apply_operations.go`).
+(`pkg/storage/internal/sqlstore/apply_operations.go`); the halt at drive exit in
+`pkg/tern/local_apply_sequential.go`, `pkg/tern/local_apply_grouped.go` and
+`pkg/tern/local_control_resume.go`, through the engine's `OwnedWorkHalter.HaltWorkOwnedBy`
+(`pkg/engine/engine.go`).
 
 ### OW-4: Lease loss is proven, never inferred
 
@@ -1497,9 +1515,16 @@ sibling was reviewed with refuses the resume instead, since nothing will run it 
 `dispatchScopeForApply` on the apply path (`pkg/tern/local_plan_drift.go`, called from
 `pkg/tern/local_client.go`);
 `verifyReplannedTaskDDL` on the resume path (`pkg/tern/local_control_resume.go`, called from
-`replanAndFilterTasks` and `resumeApplySequential`); `settleLostVerifiedTask` on the lost-work
-path (`pkg/tern/local_apply_sequential.go`, judged by `replanVerdictForTask` and reached from
-the sequential and grouped drives). The cross-deployment comparison a plan is reviewed against
+`replanAndFilterTasks` and `resumeApplySequential`, and from the re-plan before a drive starts
+again a task another run held the table from in `pkg/tern/local_apply_sequential.go`);
+`settleLostVerifiedTask` on the lost-work path (`pkg/tern/local_apply_sequential.go`, reached
+from the sequential and grouped drives). The resume, held-target and lost-work paths read the
+re-plan through `replanVerdictForTask` (`pkg/tern/local_control_resume.go`), which judges whether
+the re-plan speaks for a shard-tagged task at all. `remainingPlannedChanges` on the branch-resume
+path of the PlanetScale engine (`pkg/engine/planetscale/apply.go`) runs only reviewed DDL for the
+tables the branch still lacks, refuses a branch that differs outside the reviewed DDL, and
+validates the branch against the declared schema before creating the deploy request. The
+cross-deployment comparison a plan is reviewed against
 is a separate, earlier mechanism (`pkg/tern/change_set_compare.go`, applied on the review-drift
 and rollup paths). Rollback confirmation also re-checks the lock owner and pinned plan in the
 apply-creation transaction (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced
@@ -1521,11 +1546,11 @@ Unsafe changes (error-severity lint findings such as table and column drops) blo
 `--allow-unsafe`. Changes that destroy work already done on the target, such as discarding an
 unfinished row copy, require the operator to confirm the specific consequences disclosed to
 them. The re-plan that runs just before execution re-checks that verdict, so a plan that changed
-after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the apply-confirm flow (`pkg/api/plan_handlers.go`,
-`pkg/webhook/apply_gating.go`), including the re-check that the work of every rollout member, the
-primary target's included, is what the confirmation was given against and carries no consequence
-it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
-`pkg/webhook/apply_member_work.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
+after the confirmation stops rather than running something the operator never saw. *Enforced:* lint gates and the pull request apply flow, for both `apply` and `apply-confirm`
+(`pkg/api/plan_handlers.go`, `pkg/webhook/apply_gating.go`, `pkg/webhook/apply_execute.go`), including the re-check that the work of every rollout member, the
+primary target's included, is what the confirmation, or the comment an automatic apply posted,
+was given against and carries no consequence it did not disclose (`confirmedConvergedTargetRound`, `confirmationCoversPrimaryTarget`, `confirmationCoversMemberWork` and `memberWorkRefusal` in
+`pkg/webhook/apply_member_work.go`), with an automatic apply running other members' work only once that comment has landed (`applyCommandCore` in `pkg/webhook/apply_handlers.go`), where a member counts as disclosing its copies only when its engine read the target for every one (`MemberCopyAtStake` in `pkg/api/plan_rollup_work.go`, fed by `engine.PlanResult.ExistingCopiesChecked`); every rollout
 member's unsafe change requiring the same opt-in as the primary plan's, both at the PR gate
 (`blockUnsafeWithoutOptIn` in `pkg/webhook/apply_member_work.go`, over the per-target disclosure
 `TargetPlanUnsafeChanges` in `pkg/webhook/templates/plan.go`) and at apply creation
@@ -1568,10 +1593,10 @@ resolution (`storage.Plan.DirectExecution`, `pkg/api/plan_handlers.go`); in a ro
 member's own direct changes disclosed under that member's plan (`deploymentPlanGroups` in
 `pkg/webhook/plan_drift.go`; for a plan requested through the API, members grouped on their
 verdicts as well as their work by `planGroupKey` in `pkg/api/plan_rollout.go` and disclosed by
-`directChangeNotices` in `pkg/cmd/commands/plan.go`), with apply-confirm refusing a member whose
-execution modes differ from the confirmed round's (`roundCoversWork` in
+`directChangeNotices` in `pkg/cmd/commands/plan.go`), with a pull request apply refusing or
+pausing a member whose execution modes differ from the reviewed round's (`roundCoversWork` in
 `pkg/webhook/apply_member_work.go`), and apply creation refusing a member's own direct change for
-any caller other than that confirmed apply-confirm (`rejectUnconfirmedMemberDirectExecution` in
+any caller other than that pull request apply (`rejectUnconfirmedMemberDirectExecution` in
 `pkg/api/plan_handlers.go`).
 
 ### RV-5: A drop is never silent, and where a recovery window exists it is honored
@@ -1711,10 +1736,14 @@ and `Acquire` in `pkg/storage/internal/sqlstore/locks.go`).
 
 A PR apply requires an actor authorized for the target (configured operators, admin teams, repo
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
-their own review requirement. An approval counts only for the schema it reviewed: it was given on
-the commit being applied, or on an earlier commit from which that commit provably changed no schema
-input; when that cannot be proved, the approval does not count. *Enforced:* the review gate and actor authorization
-(`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`).
+their own review requirement. An approval counts only for the schema change it reviewed: it was
+given on the commit being applied, or on an earlier commit at which the change's own effect on every
+schema input is provably the same, so any difference between the two came from newer base branch
+content; when that cannot be proved, the approval does not count. This relies on the base branch
+requiring review for every change that reaches it: a change pushed to it without review is
+carried past an earlier approval as base branch content. *Enforced:* the review gate and actor
+authorization (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the
+comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`).
 
 ### AZ-5: Commands never guess
 

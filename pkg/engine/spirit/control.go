@@ -11,10 +11,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 
 	"github.com/block/mysql"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/engine"
@@ -330,18 +330,17 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 		"tables", tables,
 	)
 
+	// The resumed run's cancel is published with its running state, before
+	// the run starts, so a halt that finds the run active always reaches it.
+	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	e.mu.Lock()
 	rm.state = engine.StateRunning
+	rm.cancelFunc = cancel
+	rm.owner = engine.WorkOwnerFromContext(ctx)
 	e.mu.Unlock()
 
-	rm.wg.Go(func() {
-		bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	rm.goRun(func() {
 		defer cancel()
-		e.mu.Lock()
-		if e.runningSchemaChange != nil {
-			e.runningSchemaChange.cancelFunc = cancel
-		}
-		e.mu.Unlock()
 		e.resumeSchemaChange(bgCtx, host, username, password, database, originalDDLs, combinedStatement, deferCutover, directExecPolicy)
 	})
 
@@ -421,7 +420,7 @@ func (e *Engine) Cutover(ctx context.Context, req *engine.ControlRequest) (*engi
 	// Drop the sentinel table - Spirit will detect this and proceed with cutover.
 	// Cutover is asynchronous — Spirit performs the table swap in its goroutine.
 	// The caller should poll Progress() for state transitions.
-	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(database), quoteIdentifier(deferredCutoverSentinelTable)))
+	_, err = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", sqlescape.EscapeIdentifier(database), sqlescape.EscapeIdentifier(deferredCutoverSentinelTable)))
 	if err != nil {
 		return nil, fmt.Errorf("drop sentinel table: %w", err)
 	}
@@ -472,10 +471,6 @@ func (e *Engine) DeferredCutoverSignalExists(ctx context.Context, req *engine.De
 		return false, fmt.Errorf("query deferred cutover signal for database %s: %w", database, err)
 	}
 	return count > 0, nil
-}
-
-func quoteIdentifier(name string) string {
-	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
 // Revert rolls back a completed schema change. Spirit has no revert window: the

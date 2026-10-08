@@ -285,8 +285,10 @@ func (h *Handler) planForResolvedDatabaseBlocked(ctx context.Context, repo strin
 // deployment to acting; auto-plans pass zero (no comment to acknowledge).
 // commandScopeDatabases is how many databases a bare command offered by this
 // comment would reach, which decides whether its commands have to name theirs;
-// only an auto-plan reads it.
-func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64) {
+// only an auto-plan reads it. unmanagedSchema lists the schema configs the PR
+// also changes that this environment-scoped deployment does not manage; the
+// comment names them, and posts even when it has no plan to show.
+func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant string, installationID int64, requestedBy string, isAutoPlan bool, commandScopeDatabases int, postPlanComment bool, commentID int64, unmanagedSchema []templates.UnmanagedSchemaConfigNoticeData) {
 	ctx, cancel, client, err := h.commandBootstrap(context.Background(), repo, installationID)
 	if err != nil {
 		h.logger.Error("multi-env plan: failed to bootstrap command", "error", err)
@@ -447,6 +449,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 		Environments:   environments,
 		Plans:          make(map[string]*templates.PlanCommentData),
 		Errors:         make(map[string]string),
+	}
+	if len(unmanagedSchema) > 0 {
+		multiEnvData.UnmanagedSchema = unmanagedSchema
+		multiEnvData.UnmanagedEnvironments = h.service.Config().OrderedEnvironments(allowedEnvironments)
 	}
 
 	for _, env := range environments {
@@ -637,7 +643,10 @@ func (h *Handler) handleMultiEnvPlan(repo string, pr int, databaseName, tenant s
 				break
 			}
 		}
-		if !anyChanges && !rolloutHasWork && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) {
+		// Schema this deployment does not manage keeps the comment too: on an
+		// environment-scoped deployment the comment is the PR's only mention
+		// of it.
+		if !anyChanges && !rolloutHasWork && !hasErrors && !templates.AnyEnvHasDriftToShow(multiEnvData) && len(unmanagedSchema) == 0 {
 			// The no-changes outcome supersedes older plan comments just as a
 			// new plan comment would: a prior head's comment still advertises
 			// pending DDL and an apply prompt that no longer match the branch.
@@ -729,6 +738,9 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 	if errors.As(err, &configNotAuthorizedErr) {
 		data.DatabaseName = configNotAuthorizedErr.Database
 		data.SchemaPath = configNotAuthorizedErr.SchemaPath
+		// Another deployment serving a different environment may manage the
+		// directory, so the comment names the deployment making the claim.
+		data.Deployment, data.DeploymentEnvironments = h.deploymentIdentity()
 		h.logger.Warn("schema request: config outside allowed_dirs",
 			"repo", repo, "pr", pr, "environment", environment,
 			"database", data.DatabaseName, "database_type", configNotAuthorizedErr.DatabaseType,
@@ -770,7 +782,7 @@ func (h *Handler) handleSchemaRequestError(repo string, pr int, installationID i
 		}
 		// The claim is about this deployment's registry only, so the comment
 		// names the deployment making it.
-		data.Deployment = h.deploymentLabel()
+		data.Deployment, data.DeploymentEnvironments = h.deploymentIdentity()
 		// A single config names its database on the metric; several have no
 		// one database to name, the same as Multiple Databases Detected.
 		metricDatabase := databaseName
@@ -900,6 +912,12 @@ const msgDeferCutoverAllDirect = "`--defer-cutover` has no effect on this plan: 
 // is re-running apply-confirm without the flag, not restarting from apply.
 // The format verb takes the environment for the coached command.
 const msgDeferCutoverAllDirectConfirm = "`--defer-cutover` has no effect on this plan: every change runs directly as native DDL, which has no cutover to defer. The pending confirmation is preserved — re-run `schemabot apply-confirm -e %s` without the flag."
+
+// msgOtherTargetPlansUnverified answers an apply command that could not read
+// the other targets' plans before taking the lock. Nothing was applied and the
+// command holds nothing yet, so it is simply retried; once the lock is taken,
+// unverifiedMemberWorkMessage names the recovery instead.
+const msgOtherTargetPlansUnverified = "SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists."
 
 // shardedDirectChanges collects direct-execution per-shard changes, grouped by
 // (table, reason) so a change present on several shards lists them together
@@ -1306,8 +1324,6 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 			}
 		}
 	}
-
-	data.AllChangesDirect = planResp.AllChangesDirect()
 
 	data.DiscardedCopies, data.AdoptedCopies, data.RunningCopies = splitExistingCopies(planResp.ExistingCopies)
 

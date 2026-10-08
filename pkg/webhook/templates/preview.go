@@ -74,6 +74,31 @@ func PreviewCommentPlanIgnoredNamespaces() string {
 	return RenderPlanComment(data)
 }
 
+// PreviewCommentPlanUnmanagedSchema renders the plan comment a staging-scoped
+// deployment posts for a PR that also changes a schema directory it does not
+// manage. It posts no separate notice, since a deployment serving another
+// environment may manage that directory, so the plan closes with a note
+// naming it.
+func PreviewCommentPlanUnmanagedSchema() string {
+	plan := previewPlanData()
+	plan.LintViolations = nil
+	return RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
+		Database:     plan.Database,
+		SchemaName:   plan.SchemaName,
+		HeadSHA:      plan.HeadSHA,
+		Repository:   plan.Repository,
+		DatabaseType: plan.DatabaseType,
+		IsMySQL:      plan.IsMySQL,
+		RequestedBy:  plan.RequestedBy,
+		Environments: []string{"staging"},
+		Plans:        map[string]*PlanCommentData{"staging": &plan},
+		UnmanagedSchema: []UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		},
+		UnmanagedEnvironments: []string{"staging"},
+	})
+}
+
 // PreviewCommentPlanExemptTables renders a plan with archive-named live tables.
 func PreviewCommentPlanExemptTables() string {
 	return RenderPlanComment(PlanCommentData{
@@ -143,6 +168,44 @@ func PreviewCommentPlanColumnOnlyAlter() string {
 				},
 			},
 		},
+	})
+}
+
+// PreviewCommentPlanPartitionedTables renders a plan for partitioned tables:
+// a new table partitioned by month, a REORGANIZE PARTITION that splits the
+// catch-all partition, and an ALTER that adds a column and repartitions. Each
+// partition definition shows on its own line.
+func PreviewCommentPlanPartitionedTables() string {
+	return RenderPlanComment(PlanCommentData{
+		Database:     "testapp",
+		SchemaName:   "testapp",
+		Environment:  "staging",
+		HeadSHA:      previewHeadSHA,
+		Repository:   previewRepository,
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		Changes: []KeyspaceChangeData{{
+			Keyspace: "testapp",
+			Statements: []string{
+				"CREATE TABLE `ledger_entries` (`id` bigint NOT NULL AUTO_INCREMENT, `settlement_date` date NOT NULL, `amount_cents` bigint NOT NULL, " +
+					"PRIMARY KEY (`id`,`settlement_date`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci " +
+					"PARTITION BY RANGE COLUMNS(`settlement_date`) (" +
+					"PARTITION `p202601` VALUES LESS THAN ('2026-02-01') ENGINE = InnoDB," +
+					"PARTITION `p202602` VALUES LESS THAN ('2026-03-01') ENGINE = InnoDB," +
+					"PARTITION `p202603` VALUES LESS THAN ('2026-04-01') ENGINE = InnoDB," +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB);",
+				"ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (" +
+					"PARTITION `p202611` VALUES LESS THAN ('2026-12-01'), " +
+					"PARTITION `p202612` VALUES LESS THAN ('2027-01-01'), " +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE));",
+				"ALTER TABLE `payouts` ADD COLUMN `note` varchar(64) NULL DEFAULT NULL " +
+					"PARTITION BY RANGE COLUMNS (`settlement_date`) (" +
+					"PARTITION `p2025` VALUES LESS THAN ('2026-01-01')," +
+					"PARTITION `p2026` VALUES LESS THAN ('2027-01-01')," +
+					"PARTITION `future` VALUES LESS THAN (MAXVALUE));",
+			},
+		}},
 	})
 }
 
@@ -788,7 +851,7 @@ func PreviewCommentPlanDriftDetected() string {
 			Clean:    false,
 			Deployments: []DeploymentDriftEntry{
 				{Deployment: "eu", Primary: true, Class: "match"},
-				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs the primary target's plan"},
+				{Deployment: "au", Class: "diverged", Detail: "1 unexpected, 2 missing change(s) vs this plan"},
 				{Deployment: "us", Class: "errored", Detail: "diff failed; see server logs"},
 			},
 		},
@@ -799,9 +862,9 @@ func PreviewCommentPlanDriftDetected() string {
 // below are rendered for, in rollout order with the primary target first.
 func previewRolloutMembers() []DeploymentDriftEntry {
 	return []DeploymentDriftEntry{
-		{Deployment: "primary", Target: "testapp_1", Primary: true, Class: "planned"},
-		{Deployment: "primary", Target: "testapp_2", Class: "planned"},
-		{Deployment: "primary", Target: "testapp_3", Class: "planned"},
+		{Deployment: "us", Target: "testapp_1", Primary: true, Class: "planned"},
+		{Deployment: "us", Target: "testapp_2", Class: "planned"},
+		{Deployment: "us", Target: "testapp_3", Class: "planned"},
 	}
 }
 
@@ -824,8 +887,8 @@ func PreviewCommentPlanRolloutConverging() string {
 			Computed: true, Clean: true, Independent: true,
 			Deployments: previewRolloutMembers(),
 			Plans: []DeploymentPlanGroup{
-				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: samplePlanChanges()},
-				{Members: []string{"primary/testapp_3"}},
+				{Members: []string{"us/testapp_1", "us/testapp_2"}, Primary: true, Changes: samplePlanChanges()},
+				{Members: []string{"us/testapp_3"}},
 			},
 		},
 	})
@@ -851,8 +914,8 @@ func PreviewCommentPlanRolloutConvergedPrimary() string {
 			Computed: true, Clean: true, Independent: true,
 			Deployments: previewRolloutMembers(),
 			Plans: []DeploymentPlanGroup{
-				{Members: []string{"primary/testapp_1"}, Primary: true},
-				{Members: []string{"primary/testapp_2", "primary/testapp_3"}, Changes: samplePlanChanges()},
+				{Members: []string{"us/testapp_1"}, Primary: true},
+				{Members: []string{"us/testapp_2", "us/testapp_3"}, Changes: samplePlanChanges()},
 			},
 		},
 	})
@@ -879,8 +942,8 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 			Computed: true, Clean: true, Independent: true,
 			Deployments: previewRolloutMembers(),
 			Plans: []DeploymentPlanGroup{
-				{Members: []string{"primary/testapp_1", "primary/testapp_2"}, Primary: true, Changes: reviewed},
-				{Members: []string{"primary/testapp_3"}, Changes: []KeyspaceChangeData{{
+				{Members: []string{"us/testapp_1", "us/testapp_2"}, Primary: true, Changes: reviewed},
+				{Members: []string{"us/testapp_3"}, Changes: []KeyspaceChangeData{{
 					Keyspace:   "testapp",
 					Statements: []string{email, "ALTER TABLE `users` ADD INDEX `idx_email` (`email`);"},
 				}}},
@@ -896,10 +959,10 @@ func PreviewCommentPlanRolloutDistinctPlans() string {
 func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 	members := previewRolloutMembers()[:2]
 	return previewRolloutTableSizes(members, []TargetTableSize{
-		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
-		previewTargetSize("primary/testapp_1", "users", 95_000_000),
-		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
-		previewTargetSize("primary/testapp_2", "users", 98_000_000),
+		previewTargetSize("us/testapp_1", "orders", 610_000_000),
+		previewTargetSize("us/testapp_1", "users", 95_000_000),
+		previewTargetSize("us/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("us/testapp_2", "users", 98_000_000),
 	})
 }
 
@@ -910,12 +973,12 @@ func PreviewCommentPlanRolloutTwoTargetTableSizes() string {
 // understates the table.
 func PreviewCommentPlanRolloutTableSizes() string {
 	return previewRolloutTableSizes(previewRolloutMembers(), []TargetTableSize{
-		previewTargetSize("primary/testapp_1", "orders", 610_000_000),
-		previewTargetSize("primary/testapp_1", "users", 95_000_000),
-		previewTargetSize("primary/testapp_2", "orders", 23_400_000_000),
-		previewTargetSize("primary/testapp_2", "users", 98_000_000),
-		{Target: "primary/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
-		previewTargetSize("primary/testapp_3", "users", 104_000_000),
+		previewTargetSize("us/testapp_1", "orders", 610_000_000),
+		previewTargetSize("us/testapp_1", "users", 95_000_000),
+		previewTargetSize("us/testapp_2", "orders", 23_400_000_000),
+		previewTargetSize("us/testapp_2", "users", 98_000_000),
+		{Target: "us/testapp_3", Keyspace: "testapp", Size: TableSizeData{Table: "orders"}},
+		previewTargetSize("us/testapp_3", "users", 104_000_000),
 	})
 }
 
@@ -1304,6 +1367,7 @@ func PreviewCommentApplyBlockedByOtherPR() string {
 		LockRepo:     "block/myapp",
 		LockPR:       42,
 		LockCreated:  sampleTime().Add(-2 * time.Hour),
+		LockedApply:  LockedDatabaseApply{Checked: true},
 	})
 }
 
@@ -1412,8 +1476,8 @@ func PreviewCommentReviewRequiredNoOperators() string {
 }
 
 // PreviewCommentReviewRequiredStaleApproval renders the "review required"
-// comment when an authorized reviewer approved an earlier commit and schema
-// files changed after it, so that approval no longer counts.
+// comment when an authorized reviewer approved an earlier commit and the PR's
+// schema change differs at the head, so that approval no longer counts.
 func PreviewCommentReviewRequiredStaleApproval() string {
 	return RenderReviewRequired(ReviewGateData{
 		Database:          "testapp",
@@ -1422,7 +1486,7 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 		OperatorReviewers: []string{"acme/testapp-operators"},
 		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
 		PRAuthor:          previewRequestedBy,
-		StaleApprovers:    []string{"jdoe"},
+		ChangedApprovers:  []string{"jdoe"},
 	})
 }
 
@@ -1433,6 +1497,21 @@ func PreviewCommentReviewGateError() string {
 		Environment: "staging",
 		CommandName: action.Apply,
 		ErrorDetail: "Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.",
+	})
+}
+
+// PreviewCommentReviewGateErrorApprovalNotComparable renders the review gate
+// error comment when an approval on an earlier commit cannot be compared with
+// the head, so it does not count and the apply is blocked (fail-closed).
+func PreviewCommentReviewGateErrorApprovalNotComparable() string {
+	return RenderReviewGateError(ReviewGateData{
+		Database:            "testapp",
+		Environment:         "staging",
+		RequestedBy:         previewRequestedBy,
+		OperatorReviewers:   []string{"acme/testapp-operators"},
+		OtherReviewers:      []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:            previewRequestedBy,
+		UncomparedApprovers: []string{"jdoe"},
 	})
 }
 
@@ -1833,11 +1912,10 @@ func PreviewCommentApplyPlanDowngraded() string {
 		PausedApplyCause: &PausedApplyCauseData{
 			Heading: "Schema changes differ from the plan this apply was started from",
 			Entries: []string{
-				"`orders` (alter) runs a different statement than in the plan this apply was started from",
-				"`products` (alter) is in this plan but not in the one this apply was started from",
-				"`shipments` (create) was in the plan this apply was started from but is not in this one",
+				"`orders` (alter) now runs a different statement",
+				"`products` (alter) is new",
+				"`shipments` (create) is no longer planned",
 			},
-			Remedy: "The statements above are what will run. Review them, then confirm to apply them.",
 		},
 	})
 }
@@ -2791,6 +2869,81 @@ func PreviewCommentMultiTargetApplyInProgress() string {
 		RequestedBy: "aparajon",
 		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
 		Details:     details,
+	})
+}
+
+// PreviewCommentMultiTargetApplySummaryAlreadyHadIt renders the summary of a
+// finished rollout across four targets, one of which already had the change
+// when the apply was created: it ran nothing, so the comment neither names nor
+// counts it.
+func PreviewCommentMultiTargetApplySummaryAlreadyHadIt() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const rows = 1_466_232
+	var ops []presentation.Operation
+	var details []*ApplyStatusCommentData
+	for i := range 4 {
+		target := fmt.Sprintf("orders_%03d", i)
+		op := presentation.Operation{Deployment: "us", Target: target, State: state.ApplyOperation.Completed, Parallel: true, ContinueOnFailure: true}
+		if i == 3 {
+			op.NeverStarted = true
+			op.AlreadyConverged = true
+			ops = append(ops, op)
+			details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, nil))
+			continue
+		}
+		ops = append(ops, op)
+		details = append(details, sampleDeploymentDetail(target, state.Apply.Completed, []TableProgressData{
+			{TableName: "orders", DDL: addIndex, Status: state.Task.Completed, RowsCopied: rows, RowsTotal: rows},
+		}))
+	}
+
+	return RenderMultiDeploymentApplySummaryComment(MultiDeploymentApplyData{
+		Model:       presentation.Derive(ops),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().UTC().Format(time.RFC3339),
+		Details:     details,
+	})
+}
+
+// PreviewCommentMultiTargetApplyInProgressOneDeployment renders a rollout
+// whose one deployment addresses four targets: one done, one copying, one
+// queued, and one that already had the change. With no other deployment to
+// tell it apart from, the status is one line and the table lines sit under it.
+func PreviewCommentMultiTargetApplyInProgressOneDeployment() string {
+	const addIndex = "ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`)"
+	const rows = 1_466_232
+	target := func(i int, opState string) presentation.Operation {
+		return presentation.Operation{Deployment: "us", Target: fmt.Sprintf("orders_%03d", i), State: opState, Parallel: true, ContinueOnFailure: true}
+	}
+	detail := func(i int, opState, taskState string, copied, eta int64) *ApplyStatusCommentData {
+		return sampleDeploymentDetail(fmt.Sprintf("orders_%03d", i), opState, []TableProgressData{
+			{TableName: "orders", DDL: addIndex, Status: taskState, RowsCopied: copied, RowsTotal: rows, ETASeconds: eta},
+		})
+	}
+	converged := target(3, state.ApplyOperation.Completed)
+	converged.NeverStarted = true
+	converged.AlreadyConverged = true
+
+	return RenderMultiDeploymentApplyComment(MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			target(0, state.ApplyOperation.Completed),
+			target(1, state.ApplyOperation.Running),
+			target(2, state.ApplyOperation.Pending),
+			converged,
+		}),
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		Environment: "production",
+		RequestedBy: "aparajon",
+		StartedAt:   sampleTime().Add(-20 * time.Minute).UTC().Format(time.RFC3339),
+		Details: []*ApplyStatusCommentData{
+			detail(0, state.ApplyOperation.Completed, state.Task.Completed, rows, 0),
+			detail(1, state.ApplyOperation.Running, state.Task.Running, 914_707, 195),
+			nil,
+			sampleDeploymentDetail("orders_003", state.ApplyOperation.Completed, nil),
+		},
 	})
 }
 

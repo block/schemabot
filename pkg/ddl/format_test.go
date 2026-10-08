@@ -2,6 +2,7 @@ package ddl
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -41,6 +42,12 @@ func TestFormatSchemaFileForDialect(t *testing.T) {
 			dialect:  schema.DialectPostgres,
 			input:    "CREATE TABLE \"Order\" (\n  \"id\" bigint PRIMARY KEY\n);\nCREATE INDEX \"idx_id\" ON \"Order\" (\"id\");\n\n",
 			expected: "CREATE TABLE \"Order\" (\n  \"id\" bigint PRIMARY KEY\n);\nCREATE INDEX \"idx_id\" ON \"Order\" (\"id\");\n",
+		},
+		{
+			name:     "PostgreSQL list partition keeps one bound value per line",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN ('PENDING','HELD')",
+			expected: "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (\n    'PENDING',\n    'HELD'\n);\n",
 		},
 		{
 			name:    "PostgreSQL table and indexes",
@@ -453,7 +460,7 @@ func TestFormatDDL(t *testing.T) {
 				"  PARTITION BY HASH (`id`) PARTITIONS 2;",
 		},
 		{
-			name: "PARTITION BY RANGE with multiple definitions stays on one line",
+			name: "PARTITION BY RANGE expression with one definition per line",
 			input: "CREATE TABLE `events` (`id` bigint NOT NULL AUTO_INCREMENT, `created_at` datetime(3) NOT NULL, " +
 				"PRIMARY KEY (`created_at`,`id`), KEY `idx_id` (`id`)) " +
 				"ENGINE = InnoDB, CHARSET utf8mb4 " +
@@ -468,10 +475,11 @@ func TestFormatDDL(t *testing.T) {
 				"    INDEX `idx_id`(`id`)\n" +
 				") ENGINE InnoDB,\n" +
 				"  CHARSET utf8mb4\n" +
-				"  PARTITION BY RANGE (TO_DAYS(`created_at`)) " +
-				"(PARTITION `p2026_01` VALUES LESS THAN (TO_DAYS('2026-02-01'))," +
-				"PARTITION `p2026_02` VALUES LESS THAN (TO_DAYS('2026-03-01'))," +
-				"PARTITION `pmax` VALUES LESS THAN (MAXVALUE));",
+				"  PARTITION BY RANGE (TO_DAYS(`created_at`)) (\n" +
+				"      PARTITION `p2026_01` VALUES LESS THAN (TO_DAYS('2026-02-01')),\n" +
+				"      PARTITION `p2026_02` VALUES LESS THAN (TO_DAYS('2026-03-01')),\n" +
+				"      PARTITION `pmax` VALUES LESS THAN (MAXVALUE)\n" +
+				"  );",
 		},
 	}
 
@@ -985,10 +993,11 @@ func TestDisplayFormattingPreservesSQL(t *testing.T) {
 	}
 }
 
-// A displayed ENUM or SET list too long for a line of its own wraps onto
-// indented lines no wider than valueListWrapWidth, so the DDL reads without
-// scrolling and GitHub still highlights it. Short lists stay inline, and the
-// wrapped statement parses to the same SQL.
+// A displayed ENUM or SET list, or PostgreSQL list partition bound, too long
+// for a line of its own wraps onto indented lines no wider than
+// valueListWrapWidth, so the DDL reads without scrolling and GitHub still
+// highlights it. Short lists stay inline, and the wrapped statement parses to
+// the same SQL.
 func TestFormatDDLForDialectWrapsLongValueLists(t *testing.T) {
 	values := func(n int) string {
 		v := make([]string, n)
@@ -1061,6 +1070,39 @@ func TestFormatDDLForDialectWrapsLongValueLists(t *testing.T) {
 				"    'STATUS_05_VALUE'\n" +
 				");",
 		},
+		{
+			name:    "postgres list partition bound",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (" + values(6) + ")",
+			expected: "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (\n" +
+				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
+				"    'STATUS_05_VALUE'\n" +
+				");",
+		},
+		{
+			name:    "postgres list partition bound before the partition's own PARTITION BY",
+			dialect: schema.DialectPostgres,
+			input:   "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (" + values(6) + ") PARTITION BY HASH (id)",
+			expected: "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN (\n" +
+				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
+				"    'STATUS_05_VALUE'\n" +
+				") PARTITION BY HASH (id);",
+		},
+		{
+			name:    "postgres ATTACH PARTITION bound",
+			dialect: schema.DialectPostgres,
+			input:   "ALTER TABLE orders ATTACH PARTITION orders_pending FOR VALUES IN (" + values(6) + ")",
+			expected: "ALTER TABLE orders ATTACH PARTITION orders_pending FOR VALUES IN (\n" +
+				"    'STATUS_00_VALUE', 'STATUS_01_VALUE', 'STATUS_02_VALUE', 'STATUS_03_VALUE', 'STATUS_04_VALUE',\n" +
+				"    'STATUS_05_VALUE'\n" +
+				");",
+		},
+		{
+			name:     "postgres short partition bound stays on the statement line",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN ('PENDING','HELD')",
+			expected: "CREATE TABLE orders_pending PARTITION OF orders FOR VALUES IN ('PENDING', 'HELD');",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1129,4 +1171,395 @@ func TestFormatDDLForDialectLeavesPostgresSetParametersInline(t *testing.T) {
 	formatted := FormatDDLForDialect(schema.DialectPostgres, input)
 	assert.NotContains(t, formatted, "\n", "storage parameters must not wrap")
 	assert.Contains(t, formatted, "toast_tuple_target")
+}
+
+// A displayed partition definition list puts each definition on an indented
+// line of its own, whether it follows PARTITION BY in a CREATE TABLE or an
+// ALTER TABLE, or lists the new partitions of ADD PARTITION or REORGANIZE
+// PARTITION. A partitioning clause trailing other ALTER TABLE clauses gets a
+// line of its own after them. Statements with no definition list keep their
+// layout, and every wrapped statement parses to the same SQL.
+func TestFormatDDLWrapsPartitionDefinitions(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name: "CREATE TABLE RANGE COLUMNS after table options",
+			input: "CREATE TABLE `ledger_entries` (`id` bigint NOT NULL AUTO_INCREMENT, `settlement_date` date NOT NULL, " +
+				"PRIMARY KEY (`id`,`settlement_date`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci " +
+				"PARTITION BY RANGE COLUMNS(`settlement_date`) (" +
+				"PARTITION p20240101 VALUES LESS THAN ('2024-01-01') ENGINE = InnoDB, " +
+				"PARTITION p20240201 VALUES LESS THAN ('2024-02-01') ENGINE = InnoDB, " +
+				"PARTITION future VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB)",
+			expected: "CREATE TABLE `ledger_entries` (\n" +
+				"    `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"    `settlement_date` date NOT NULL,\n" +
+				"    PRIMARY KEY(`id`, `settlement_date`)\n" +
+				") ENGINE InnoDB,\n" +
+				"  CHARSET utf8mb4,\n" +
+				"  COLLATE utf8mb4_0900_ai_ci\n" +
+				"  PARTITION BY RANGE COLUMNS (`settlement_date`) (\n" +
+				"      PARTITION `p20240101` VALUES LESS THAN ('2024-01-01') ENGINE = InnoDB,\n" +
+				"      PARTITION `p20240201` VALUES LESS THAN ('2024-02-01') ENGINE = InnoDB,\n" +
+				"      PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB\n" +
+				"  );",
+		},
+		{
+			name: "CREATE TABLE from SHOW CREATE TABLE with a versioned partition comment",
+			input: "CREATE TABLE `ledger_entries` (\n" +
+				"  `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"  `settlement_date` date NOT NULL,\n" +
+				"  PRIMARY KEY (`id`,`settlement_date`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci\n" +
+				"/*!50500 PARTITION BY RANGE  COLUMNS(settlement_date)\n" +
+				"(PARTITION p20240101 VALUES LESS THAN ('2024-01-01') ENGINE = InnoDB,\n" +
+				" PARTITION future VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB) */",
+			expected: "CREATE TABLE `ledger_entries` (\n" +
+				"    `id` bigint NOT NULL AUTO_INCREMENT,\n" +
+				"    `settlement_date` date NOT NULL,\n" +
+				"    PRIMARY KEY(`id`, `settlement_date`)\n" +
+				") ENGINE InnoDB,\n" +
+				"  CHARSET utf8mb4,\n" +
+				"  COLLATE utf8mb4_0900_ai_ci\n" +
+				"  PARTITION BY RANGE COLUMNS (`settlement_date`) (\n" +
+				"      PARTITION `p20240101` VALUES LESS THAN ('2024-01-01') ENGINE = InnoDB,\n" +
+				"      PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB\n" +
+				"  );",
+		},
+		{
+			name: "CREATE TABLE LIST",
+			input: "CREATE TABLE `shipments` (`id` bigint NOT NULL, `bucket` int NOT NULL) " +
+				"PARTITION BY LIST (`bucket`) (PARTITION p_low VALUES IN (1,2,3), PARTITION p_high VALUES IN (4,5,6))",
+			expected: "CREATE TABLE `shipments` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `bucket` int NOT NULL\n" +
+				") PARTITION BY LIST (`bucket`) (\n" +
+				"    PARTITION `p_low` VALUES IN (1, 2, 3),\n" +
+				"    PARTITION `p_high` VALUES IN (4, 5, 6)\n" +
+				");",
+		},
+		{
+			name: "CREATE TABLE LIST COLUMNS with multi-column tuples",
+			input: "CREATE TABLE `stores` (`id` bigint NOT NULL, `region` varchar(8) NOT NULL, `tier` int NOT NULL) " +
+				"PARTITION BY LIST COLUMNS (`region`,`tier`) (" +
+				"PARTITION p_west VALUES IN (('west',1),('west',2)), PARTITION p_east VALUES IN (('east',1),('east',2)))",
+			expected: "CREATE TABLE `stores` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `region` varchar(8) NOT NULL,\n" +
+				"    `tier` int NOT NULL\n" +
+				") PARTITION BY LIST COLUMNS (`region`,`tier`) (\n" +
+				"    PARTITION `p_west` VALUES IN (('west', 1), ('west', 2)),\n" +
+				"    PARTITION `p_east` VALUES IN (('east', 1), ('east', 2))\n" +
+				");",
+		},
+		{
+			name: "CREATE TABLE subpartitions stay on their partition's line",
+			input: "CREATE TABLE `readings` (`id` int, `r` int) PARTITION BY RANGE (`r`) SUBPARTITION BY HASH(`id`) (" +
+				"PARTITION p_a VALUES LESS THAN (10) (SUBPARTITION s0, SUBPARTITION s1), " +
+				"PARTITION p_b VALUES LESS THAN MAXVALUE (SUBPARTITION s2, SUBPARTITION s3))",
+			expected: "CREATE TABLE `readings` (\n" +
+				"    `id` int,\n" +
+				"    `r` int\n" +
+				") PARTITION BY RANGE (`r`) SUBPARTITION BY HASH (`id`) SUBPARTITIONS 2 (\n" +
+				"    PARTITION `p_a` VALUES LESS THAN (10) (SUBPARTITION `s0`,SUBPARTITION `s1`),\n" +
+				"    PARTITION `p_b` VALUES LESS THAN (MAXVALUE) (SUBPARTITION `s2`,SUBPARTITION `s3`)\n" +
+				");",
+		},
+		{
+			name: "partition COMMENT holding a definition-like list stays whole",
+			input: "CREATE TABLE `readings` (`id` int, `r` int) PARTITION BY RANGE (`r`) (" +
+				"PARTITION p_a VALUES LESS THAN (10) COMMENT = 'was (PARTITION a, PARTITION b)', PARTITION p_b VALUES LESS THAN MAXVALUE)",
+			expected: "CREATE TABLE `readings` (\n" +
+				"    `id` int,\n" +
+				"    `r` int\n" +
+				") PARTITION BY RANGE (`r`) (\n" +
+				"    PARTITION `p_a` VALUES LESS THAN (10) COMMENT = 'was (PARTITION a, PARTITION b)',\n" +
+				"    PARTITION `p_b` VALUES LESS THAN (MAXVALUE)\n" +
+				");",
+		},
+		{
+			name:  "CREATE TABLE HASH with a partition count has no list to wrap",
+			input: "CREATE TABLE `sessions` (`id` bigint NOT NULL, `k` bigint NOT NULL) PARTITION BY HASH (`k`) PARTITIONS 8",
+			expected: "CREATE TABLE `sessions` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `k` bigint NOT NULL\n" +
+				") PARTITION BY HASH (`k`) PARTITIONS 8;",
+		},
+		{
+			name:  "CREATE TABLE KEY with a partition count has no list to wrap",
+			input: "CREATE TABLE `sessions` (`id` bigint NOT NULL, `k` bigint NOT NULL) ENGINE=InnoDB PARTITION BY KEY (`k`) PARTITIONS 4",
+			expected: "CREATE TABLE `sessions` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `k` bigint NOT NULL\n" +
+				") ENGINE InnoDB\n" +
+				"  PARTITION BY KEY (`k`) PARTITIONS 4;",
+		},
+		{
+			name: "REORGANIZE one partition into several",
+			input: "ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (" +
+				"PARTITION `p20290201` VALUES LESS THAN ('2029-02-01'), " +
+				"PARTITION `p20290301` VALUES LESS THAN ('2029-03-01'), " +
+				"PARTITION `future` VALUES LESS THAN (MAXVALUE))",
+			expected: "ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (\n" +
+				"    PARTITION `p20290201` VALUES LESS THAN ('2029-02-01'),\n" +
+				"    PARTITION `p20290301` VALUES LESS THAN ('2029-03-01'),\n" +
+				"    PARTITION `future` VALUES LESS THAN (MAXVALUE)\n" +
+				");",
+		},
+		{
+			name:  "REORGANIZE several partitions into one too long for its line",
+			input: "ALTER TABLE `events` REORGANIZE PARTITION `p20221231`,`p20230401` INTO (PARTITION `p20230401` VALUES LESS THAN ('2023-04-01'))",
+			expected: "ALTER TABLE `events` REORGANIZE PARTITION `p20221231`,`p20230401` INTO (\n" +
+				"    PARTITION `p20230401` VALUES LESS THAN ('2023-04-01')\n" +
+				");",
+		},
+		{
+			name: "ADD PARTITION",
+			input: "ALTER TABLE `events` ADD PARTITION (" +
+				"PARTITION `p20290201` VALUES LESS THAN ('2029-02-01'), PARTITION `p20290301` VALUES LESS THAN ('2029-03-01'))",
+			expected: "ALTER TABLE `events` ADD PARTITION (\n" +
+				"    PARTITION `p20290201` VALUES LESS THAN ('2029-02-01'),\n" +
+				"    PARTITION `p20290301` VALUES LESS THAN ('2029-03-01')\n" +
+				");",
+		},
+		{
+			name:     "ADD PARTITION of one short definition stays inline",
+			input:    "ALTER TABLE `events` ADD PARTITION (PARTITION `p20290201` VALUES LESS THAN ('2029-02-01'))",
+			expected: "ALTER TABLE `events` ADD PARTITION (PARTITION `p20290201` VALUES LESS THAN ('2029-02-01'));",
+		},
+		{
+			name:     "COALESCE PARTITION",
+			input:    "ALTER TABLE `sessions` COALESCE PARTITION 2",
+			expected: "ALTER TABLE `sessions` COALESCE PARTITION 2;",
+		},
+		{
+			name:     "ADD PARTITION by count",
+			input:    "ALTER TABLE `sessions` ADD PARTITION PARTITIONS 4",
+			expected: "ALTER TABLE `sessions` ADD PARTITION PARTITIONS 4;",
+		},
+		{
+			name: "PARTITION BY trailing an ADD COLUMN",
+			input: "ALTER TABLE `events` ADD COLUMN `note` varchar(64) NULL DEFAULT NULL PARTITION BY RANGE COLUMNS (`settlement_date`) (" +
+				"PARTITION `p20230401` VALUES LESS THAN ('2023-04-01'),PARTITION `future` VALUES LESS THAN (MAXVALUE))",
+			expected: "ALTER TABLE `events`\n" +
+				"    ADD COLUMN `note` varchar(64) NULL DEFAULT NULL\n" +
+				"    PARTITION BY RANGE COLUMNS (`settlement_date`) (\n" +
+				"        PARTITION `p20230401` VALUES LESS THAN ('2023-04-01'),\n" +
+				"        PARTITION `future` VALUES LESS THAN (MAXVALUE)\n" +
+				"    );",
+		},
+		{
+			name: "PARTITION BY trailing several clauses",
+			input: "ALTER TABLE `events` ADD COLUMN `note` varchar(64), ADD INDEX `idx_note` (`note`), ALGORITHM=INPLACE " +
+				"PARTITION BY KEY(`id`) PARTITIONS 4",
+			expected: "ALTER TABLE `events`\n" +
+				"    ADD COLUMN `note` varchar(64),\n" +
+				"    ADD INDEX `idx_note`(`note`),\n" +
+				"    ALGORITHM = INPLACE\n" +
+				"    PARTITION BY KEY (`id`) PARTITIONS 4;",
+		},
+		{
+			name:  "REMOVE PARTITIONING trailing a clause",
+			input: "ALTER TABLE `events` ADD COLUMN `note` varchar(64) REMOVE PARTITIONING",
+			expected: "ALTER TABLE `events`\n" +
+				"    ADD COLUMN `note` varchar(64)\n" +
+				"    REMOVE PARTITIONING;",
+		},
+		{
+			name:  "COMMENT mentioning PARTITION BY before the clause",
+			input: "ALTER TABLE `events` COMMENT 'split by PARTITION BY month' PARTITION BY HASH(`id`) PARTITIONS 4",
+			expected: "ALTER TABLE `events`\n" +
+				"    COMMENT = 'split by PARTITION BY month'\n" +
+				"    PARTITION BY HASH (`id`) PARTITIONS 4;",
+		},
+		{
+			name: "PARTITION BY alone stays on the statement line",
+			input: "ALTER TABLE `events` PARTITION BY RANGE COLUMNS (`settlement_date`) (" +
+				"PARTITION `p20230401` VALUES LESS THAN ('2023-04-01'),PARTITION `future` VALUES LESS THAN (MAXVALUE))",
+			expected: "ALTER TABLE `events` PARTITION BY RANGE COLUMNS (`settlement_date`) (\n" +
+				"    PARTITION `p20230401` VALUES LESS THAN ('2023-04-01'),\n" +
+				"    PARTITION `future` VALUES LESS THAN (MAXVALUE)\n" +
+				");",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			formatted := FormatDDL(tc.input)
+			assert.Equal(t, tc.expected, formatted)
+			assert.Equal(t, Canonicalize(tc.input), Canonicalize(formatted), "wrapping must not change the statement")
+		})
+	}
+}
+
+// A table with many partitions displays one definition per line, so the
+// statement stays readable however long the list grows.
+func TestFormatDDLWrapsLongPartitionList(t *testing.T) {
+	var definitions, expected []string
+	for month := range 60 {
+		bound := fmt.Sprintf("'%04d-%02d-01'", 2024+month/12, month%12+1)
+		name := fmt.Sprintf("`p%02d`", month)
+		definitions = append(definitions, "PARTITION "+name+" VALUES LESS THAN ("+bound+")")
+		expected = append(expected, "    PARTITION "+name+" VALUES LESS THAN ("+bound+")")
+	}
+	input := "ALTER TABLE `events` PARTITION BY RANGE COLUMNS (`settlement_date`) (" + strings.Join(definitions, ",") + ")"
+
+	formatted := FormatDDL(input)
+
+	assert.Equal(t, "ALTER TABLE `events` PARTITION BY RANGE COLUMNS (`settlement_date`) (\n"+
+		strings.Join(expected, ",\n")+"\n);", formatted)
+	assert.Equal(t, Canonicalize(input), Canonicalize(formatted))
+}
+
+// A LIST partition's VALUES IN list too long for a line of its own wraps onto
+// indented lines under its definition, the way a long ENUM list does. A LIST
+// COLUMNS partition's tuples pack whole, and short lists stay inline.
+func TestFormatDDLWrapsLongListPartitionValues(t *testing.T) {
+	codes := func(from, n int) string {
+		v := make([]string, 0, n)
+		for i := from; i < from+n; i++ {
+			v = append(v, strconv.Itoa(1000+i))
+		}
+		return strings.Join(v, ",")
+	}
+	tuples := func(region string, n int) string {
+		v := make([]string, 0, n)
+		for i := range n {
+			v = append(v, fmt.Sprintf("('%s',%d)", region, i))
+		}
+		return strings.Join(v, ",")
+	}
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name: "LIST wraps a long value list and keeps a short one inline",
+			input: "CREATE TABLE `stores` (`id` bigint NOT NULL, `store_code` int NOT NULL) PARTITION BY LIST (`store_code`) (" +
+				"PARTITION p_west VALUES IN (" + codes(0, 30) + "), PARTITION p_east VALUES IN (" + codes(30, 3) + "))",
+			expected: "CREATE TABLE `stores` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `store_code` int NOT NULL\n" +
+				") PARTITION BY LIST (`store_code`) (\n" +
+				"    PARTITION `p_west` VALUES IN (\n" +
+				"        1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014,\n" +
+				"        1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029\n" +
+				"    ),\n" +
+				"    PARTITION `p_east` VALUES IN (1030, 1031, 1032)\n" +
+				");",
+		},
+		{
+			name: "LIST COLUMNS packs whole tuples",
+			input: "CREATE TABLE `stores` (`id` bigint NOT NULL, `region` varchar(8) NOT NULL, `tier` int NOT NULL) " +
+				"PARTITION BY LIST COLUMNS (`region`,`tier`) (" +
+				"PARTITION p_west VALUES IN (" + tuples("west", 12) + "), PARTITION p_east VALUES IN (('east',1)))",
+			expected: "CREATE TABLE `stores` (\n" +
+				"    `id` bigint NOT NULL,\n" +
+				"    `region` varchar(8) NOT NULL,\n" +
+				"    `tier` int NOT NULL\n" +
+				") PARTITION BY LIST COLUMNS (`region`,`tier`) (\n" +
+				"    PARTITION `p_west` VALUES IN (\n" +
+				"        ('west', 0), ('west', 1), ('west', 2), ('west', 3), ('west', 4), ('west', 5), ('west', 6),\n" +
+				"        ('west', 7), ('west', 8), ('west', 9), ('west', 10), ('west', 11)\n" +
+				"    ),\n" +
+				"    PARTITION `p_east` VALUES IN (('east', 1))\n" +
+				");",
+		},
+		{
+			name:  "ADD PARTITION of one long LIST definition",
+			input: "ALTER TABLE `stores` ADD PARTITION (PARTITION p_north VALUES IN (" + codes(50, 30) + "))",
+			expected: "ALTER TABLE `stores` ADD PARTITION (\n" +
+				"    PARTITION `p_north` VALUES IN (\n" +
+				"        1050, 1051, 1052, 1053, 1054, 1055, 1056, 1057, 1058, 1059, 1060, 1061, 1062, 1063, 1064,\n" +
+				"        1065, 1066, 1067, 1068, 1069, 1070, 1071, 1072, 1073, 1074, 1075, 1076, 1077, 1078, 1079\n" +
+				"    )\n" +
+				");",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			formatted := FormatDDL(tc.input)
+			assert.Equal(t, tc.expected, formatted)
+			for line := range strings.SplitSeq(formatted, "\n") {
+				assert.LessOrEqual(t, len(line), valueListWrapWidth, "line %q", line)
+			}
+			assert.Equal(t, Canonicalize(tc.input), Canonicalize(formatted), "wrapping must not change the statement")
+		})
+	}
+}
+
+// A PostgreSQL partition's bound is told apart from a column list by the
+// FOR VALUES keywords right before its first parenthesis, never by text
+// inside a quoted name. A table whose quoted name mentions "for values" still
+// gets its columns one per line.
+func TestFormatDDLForDialectPartitionBoundIgnoresQuotedNames(t *testing.T) {
+	tests := []struct {
+		name     string
+		dialect  schema.Dialect
+		input    string
+		expected string
+	}{
+		{
+			name:     "postgres quoted table name",
+			dialect:  schema.DialectPostgres,
+			input:    `CREATE TABLE "audit for values log" (id bigint NOT NULL, note text)`,
+			expected: "CREATE TABLE \"audit for values log\" (\n    id bigint NOT NULL,\n    note text\n);",
+		},
+		{
+			name:     "postgres quoted table name ending in a bound keyword",
+			dialect:  schema.DialectPostgres,
+			input:    `CREATE TABLE "audit for values in" (id bigint NOT NULL, note text)`,
+			expected: "CREATE TABLE \"audit for values in\" (\n    id bigint NOT NULL,\n    note text\n);",
+		},
+		{
+			name:     "mysql quoted table name",
+			dialect:  schema.DialectMySQL,
+			input:    "CREATE TABLE `audit for values in` (`id` bigint NOT NULL, `note` text)",
+			expected: "CREATE TABLE `audit for values in` (\n    `id` bigint NOT NULL,\n    `note` text\n);",
+		},
+		{
+			name:     "postgres range bound stays on the statement line",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE orders_2026 PARTITION OF orders FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')",
+			expected: "CREATE TABLE orders_2026 PARTITION OF orders FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');",
+		},
+		{
+			name:     "postgres hash bound stays on the statement line",
+			dialect:  schema.DialectPostgres,
+			input:    "CREATE TABLE orders_h0 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
+			expected: "CREATE TABLE orders_h0 PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDER 0);",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, FormatDDLForDialect(tc.dialect, tc.input))
+		})
+	}
+}
+
+// The display wrappings are checked by canonicalizing both forms, which
+// fails closed only because a parser returns a statement it cannot read
+// unchanged. Through every registered parser, a wrap of an unparseable
+// statement is discarded rather than kept unverified.
+func TestKeepEquivalentWrapDiscardsWrapOfUnparseableStatement(t *testing.T) {
+	tests := []struct {
+		dialect   schema.Dialect
+		formatted string
+	}{
+		{schema.DialectMySQL, "ALTER TABLE `events` FROB PARTITION (PARTITION `p1` VALUES LESS THAN (1), PARTITION `p2` VALUES LESS THAN (2));"},
+		{schema.DialectPostgres, "ALTER TABLE events FROB PARTITION (PARTITION p1 VALUES IN (1), PARTITION p2 VALUES IN (2));"},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.dialect), func(t *testing.T) {
+			parser, err := ParserForDialect(tc.dialect)
+			require.NoError(t, err)
+			require.Equal(t, tc.formatted, parser.Canonicalize(tc.formatted), "the parser must return a statement it cannot read unchanged")
+			wrapped := wrapPartitionDefinitions(tc.formatted)
+			require.NotEqual(t, tc.formatted, wrapped, "the scanner must wrap the statement for this case to exercise the guard")
+
+			assert.Equal(t, tc.formatted, keepEquivalentWrap(tc.dialect, parser, tc.formatted, wrapped, "partition-definition"))
+		})
+	}
 }

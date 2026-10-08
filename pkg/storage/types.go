@@ -816,6 +816,42 @@ func (p *Plan) HasWork() bool {
 	return false
 }
 
+// AllChangesDirect reports whether every change in the plan runs as direct
+// execution, and at least one exists. A namespace to finalize is work for the
+// schema change engine, so a plan with one is not all-direct. A namespace whose
+// shards carry changes of their own runs as those shard changes, so its
+// namespace-level rows, a collapsed view of them, are not consulted.
+func (p *Plan) AllChangesDirect() bool {
+	if p == nil || len(p.FinalizerNamespaces()) > 0 {
+		return false
+	}
+	carriedByShards := map[string]bool{}
+	for _, shard := range p.Shards {
+		if len(shard.Changes) > 0 {
+			carriedByShards[shard.Namespace] = true
+		}
+	}
+	total := 0
+	for _, change := range p.FlatDDLChanges() {
+		if carriedByShards[change.Namespace] {
+			continue
+		}
+		if !change.DirectExecution() {
+			return false
+		}
+		total++
+	}
+	for _, shard := range p.Shards {
+		for _, change := range shard.Changes {
+			if !change.DirectExecution() {
+				return false
+			}
+			total++
+		}
+	}
+	return total > 0
+}
+
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
 func (p *Plan) FlatDDLChanges() []TableChange {
 	if len(p.Namespaces) == 0 {
@@ -1340,6 +1376,14 @@ type ApplyOperation struct {
 	// row's, so an operation-scoped dispatch generation rotates only on its own
 	// retry.
 	Attempt int
+
+	// AlreadyConverged is true for an operation recorded completed when its
+	// apply was created, because its target already held the change and had
+	// nothing left to run. It is set only at creation, on a completed row no
+	// driver started. A row a reaper later settled to its parent's outcome is
+	// also completed and never started, so this flag, not the missing start, is
+	// what says the target already had the change.
+	AlreadyConverged bool
 
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time

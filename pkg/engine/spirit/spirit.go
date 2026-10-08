@@ -69,10 +69,7 @@ type Engine struct {
 	disablePendingDrops bool
 
 	// Resolved Settings applied to every Spirit run; immutable after New.
-	checkpointMaxAge     time.Duration
-	checksumYieldTimeout time.Duration
-	autoscaling          bool
-	locklessChecksum     bool
+	checkpointMaxAge time.Duration
 
 	// onLog routes Spirit logs to the ApplyLogStore, with table context. It is
 	// swapped as drives hand the engine over and read from the log filter on
@@ -130,6 +127,7 @@ type runningSchemaChange struct {
 	state             engine.State
 	errorMessage      string // Error details when state is StateFailed
 	permanentFailure  bool   // The failure reproduces on every retry, so it is reported as not retryable
+	targetHeld        bool   // The run was refused the table because another run holds it (engine.ErrTargetHeld)
 	started           time.Time
 	deferCutover      bool // Whether to defer cutover until manual trigger
 
@@ -153,20 +151,38 @@ type runningSchemaChange struct {
 	// only; a resume that goes through Apply starts with an empty record.
 	quarantinedDrops map[dropTarget]pendingdrops.QuarantinedTable
 
+	// owner is the drive the run belongs to (engine.WithWorkOwner), set when
+	// Apply starts the run and again when Start resumes it, under Engine.mu.
+	owner string
+
 	// For resume support
 	cancelFunc context.CancelFunc
 	host       string
 	username   string
 	password   string
 
-	// For waiting on schema change to finish
-	wg sync.WaitGroup
+	// For waiting on schema change to finish. active counts the run goroutines
+	// still executing, so a halt can tell work that is still running from work
+	// that has already ended.
+	wg     sync.WaitGroup
+	active atomic.Int32
+}
+
+// goRun runs the schema change's background work, tracked by both wg and
+// active.
+func (rm *runningSchemaChange) goRun(run func()) {
+	rm.active.Add(1)
+	rm.wg.Go(func() {
+		defer rm.active.Add(-1)
+		run()
+	})
 }
 
 // Compile-time check that Engine implements the interface.
 var _ engine.Engine = (*Engine)(nil)
 var _ engine.Drainer = (*Engine)(nil)
 var _ engine.ShutdownHalter = (*Engine)(nil)
+var _ engine.OwnedWorkHalter = (*Engine)(nil)
 var _ engine.DeferredCutoverSignalChecker = (*Engine)(nil)
 var _ engine.CancelledArtifactReleaser = (*Engine)(nil)
 
@@ -210,23 +226,13 @@ func New(cfg Config) *Engine {
 		checkpointMaxAge = DefaultCheckpointMaxAge
 	}
 
-	checksumYieldTimeout := cfg.Settings.ChecksumYieldTimeout
-	if checksumYieldTimeout == 0 {
-		checksumYieldTimeout = DefaultChecksumYieldTimeout
-	}
-
-	autoscaling := cfg.Settings.EnableExperimentalAutoscaling == nil || *cfg.Settings.EnableExperimentalAutoscaling
-
 	eng := &Engine{
-		logger:               logger,
-		linter:               lint.New(),
-		threads:              threads,
-		lockWaitTimeout:      lockWaitTimeout,
-		disablePendingDrops:  cfg.DisablePendingDrops,
-		checkpointMaxAge:     checkpointMaxAge,
-		checksumYieldTimeout: checksumYieldTimeout,
-		autoscaling:          autoscaling,
-		locklessChecksum:     cfg.Settings.EnableExperimentalLocklessChecksum,
+		logger:              logger,
+		linter:              lint.New(),
+		threads:             threads,
+		lockWaitTimeout:     lockWaitTimeout,
+		disablePendingDrops: cfg.DisablePendingDrops,
+		checkpointMaxAge:    checkpointMaxAge,
 	}
 	eng.debugLogs.Store(cfg.DebugLogs)
 
@@ -341,18 +347,43 @@ func (e *Engine) RegistersWorkSynchronously() bool {
 // result instead of concluding no schema change ever ran. Draining an engine
 // with nothing running changes nothing: an already-retained outcome stays
 // retained.
+//
+// Drain waits without a bound, for a caller that owns the engine outright. A
+// drive waits through DrainContext instead, so it never outlives its claim.
 func (e *Engine) Drain() {
-	e.mu.Lock()
-	rm := e.runningSchemaChange
-	raceWindow := e.drainRaceWindow
+	rm, raceWindow := e.trackedForDrain()
 	if rm == nil {
-		e.mu.Unlock()
 		return
 	}
-	e.mu.Unlock()
-
 	rm.wg.Wait()
+	e.releaseDrained(rm, raceWindow)
+}
 
+// DrainContext is Drain bounded by ctx. When ctx ends before the schema change
+// exits, it returns an error and leaves the change tracked, so the engine
+// still reports it as holding the target.
+func (e *Engine) DrainContext(ctx context.Context) error {
+	rm, raceWindow := e.trackedForDrain()
+	if rm == nil {
+		return nil
+	}
+	if err := waitForRunExit(ctx, rm); err != nil {
+		return fmt.Errorf("drain schema change on database %s tables %v: still running after %w", rm.database, rm.tables, err)
+	}
+	e.releaseDrained(rm, raceWindow)
+	return nil
+}
+
+// trackedForDrain returns the schema change a drain waits for, if any.
+func (e *Engine) trackedForDrain() (*runningSchemaChange, func()) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.runningSchemaChange, e.drainRaceWindow
+}
+
+// releaseDrained stops tracking rm once its run has exited, keeping its
+// outcome for a later progress poll.
+func (e *Engine) releaseDrained(rm *runningSchemaChange, raceWindow func()) {
 	if raceWindow != nil {
 		raceWindow()
 	}
@@ -397,6 +428,7 @@ type drainedOutcome struct {
 	message      string
 	errorMessage string // Failure details when state is StateFailed
 	permanent    bool   // The failure reproduces on every retry
+	targetHeld   bool   // The run was refused the table because another run holds it
 	tables       []engine.TableProgress
 }
 
@@ -459,6 +491,7 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 		message:      fmt.Sprintf("Schema change %s", rm.state),
 		errorMessage: rm.errorMessage,
 		permanent:    rm.permanentFailure,
+		targetHeld:   rm.targetHeld,
 		tables:       tables,
 	}
 }
@@ -470,24 +503,68 @@ func newDrainedOutcome(rm *runningSchemaChange) *drainedOutcome {
 // lock while no longer renewing the apply's lease — every driver that then
 // reclaims the apply is refused the lock and burns a recovery attempt.
 //
+// A drive that hands its apply back for another driver halts its own run the
+// same way, through HaltWorkOwnedBy, for the same reason: the work must not
+// outlive the claim it was started under.
+//
 // This is not an operator stop. The tracked state is left alone so nothing
 // reads the halt as an operator's decision to park the apply: the schema change
 // is checkpointed and the apply stays active for another driver to claim and
 // resume.
 func (e *Engine) HaltForShutdown(ctx context.Context) error {
+	return e.halt(ctx, func(*runningSchemaChange) bool { return true })
+}
+
+// HaltWorkOwnedBy halts like HaltForShutdown, but only a run that owner
+// started. The run is selected and its owner compared under the same lock that
+// publishes a new run, so a run another drive starts in its place is never the
+// one this halt reaches.
+func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
+	return e.halt(ctx, func(rm *runningSchemaChange) bool {
+		if rm.owner == owner {
+			return true
+		}
+		e.schemaChangeLogger(rm).Debug("schema change belongs to another drive; leaving it running",
+			"database", rm.database, "tables", rm.tables)
+		return false
+	})
+}
+
+// halt brings the tracked run down when selected reports it is one to halt.
+// selected is called under e.mu.
+func (e *Engine) halt(ctx context.Context, selected func(*runningSchemaChange) bool) error {
 	e.mu.Lock()
 	rm := e.runningSchemaChange
 	if rm == nil {
 		e.mu.Unlock()
 		return nil
 	}
+	if !selected(rm) {
+		e.mu.Unlock()
+		return nil
+	}
+	if rm.active.Load() == 0 {
+		database, tables, state := rm.database, rm.tables, rm.state
+		e.mu.Unlock()
+		e.schemaChangeLogger(rm).Debug("schema change has already ended; nothing to halt",
+			"database", database, "tables", tables, "state", state)
+		return nil
+	}
 	runners := rm.runners
 	database := rm.database
 	tables := rm.tables
 	cancelRun := rm.cancelFunc
+	outcome := rm.state
 	e.mu.Unlock()
 
 	logger := e.schemaChangeLogger(rm)
+
+	// A change that has reached its outcome is only tearing down: checkpointing
+	// it would write progress for work that is over, and cancelling would cut
+	// short a teardown that releases the table on its own. Wait for it instead.
+	if outcome.IsTerminal() {
+		return waitForSchemaChangeExit(ctx, rm, database, tables)
+	}
 
 	// Checkpoint before cancelling. Spirit checkpoints on its own interval, so
 	// without this the driver that reclaims the apply resumes from the last
@@ -503,9 +580,29 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 		cancelRun()
 	}
 
-	// Wait off the calling goroutine so a runner that will not come down bounds
-	// shutdown at ctx rather than blocking it forever. The wait goroutine ends
-	// with the runner it is waiting on.
+	if err := waitForSchemaChangeExit(ctx, rm, database, tables); err != nil {
+		return err
+	}
+	logger.Info("schema change halted; the target's lock is released and the apply stays active for another driver",
+		"database", database, "tables", tables)
+	return nil
+}
+
+// waitForSchemaChangeExit waits for the change's run goroutines to return. It
+// waits off the calling goroutine so a runner that will not come down bounds
+// the caller at ctx rather than blocking it forever; the wait goroutine ends
+// with the runner it is waiting on.
+func waitForSchemaChangeExit(ctx context.Context, rm *runningSchemaChange, database string, tables []string) error {
+	if err := waitForRunExit(ctx, rm); err != nil {
+		return fmt.Errorf("halt schema change on database %s tables %v: still running after %w; the target may still be locked", database, tables, err)
+	}
+	return nil
+}
+
+// waitForRunExit waits off the calling goroutine for the change's run
+// goroutines to return, or for ctx to end. The wait goroutine ends with the
+// runner it is waiting on.
+func waitForRunExit(ctx context.Context, rm *runningSchemaChange) error {
 	done := make(chan struct{})
 	go func() {
 		rm.wg.Wait()
@@ -514,11 +611,9 @@ func (e *Engine) HaltForShutdown(ctx context.Context) error {
 
 	select {
 	case <-done:
-		logger.Info("schema change halted for shutdown; the target's lock is released and the apply stays active for another driver",
-			"database", database, "tables", tables)
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("halt schema change on database %s tables %v for shutdown: still running after %w; the target may still be locked", database, tables, ctx.Err())
+		return ctx.Err()
 	}
 }
 
@@ -695,14 +790,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		}
 
 		// Error-severity violations mark the change as unsafe
-		if errViolations := pc.Errors(); len(errViolations) > 0 {
-			change.IsUnsafe = true
-			msgs := make([]string, len(errViolations))
-			for i, v := range errViolations {
-				msgs[i] = v.Message
-			}
-			change.UnsafeReason = strings.Join(msgs, "; ")
-		}
+		change.UnsafeReason, change.IsUnsafe = lint.PlannedChangeUnsafeReason(pc)
 
 		// Execution-mode verdict: surface statements Spirit deterministically
 		// refuses so the operator learns at plan time how the apply will
@@ -731,14 +819,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		changes = append(changes, change)
 
 		// Collect lint violations from all severity levels
-		for _, v := range pc.Violations {
-			lintViolations = append(lintViolations, engine.LintViolation{
-				Table:    pc.TableName,
-				Linter:   v.Linter.Name(),
-				Message:  v.Message,
-				Severity: strings.ToLower(v.Severity.String()),
-			})
-		}
+		lintViolations = append(lintViolations, lint.PlannedChangeViolations(pc)...)
 	}
 
 	// Build per-namespace SchemaChanges.
@@ -862,9 +943,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		return nil, fmt.Errorf("parse DSN: %w", err)
 	}
 
-	// Wait for any in-flight migration to fully exit before starting a new one.
-	// This ensures the old Spirit runner's DB connections are released.
-	e.Drain()
+	// Wait for any in-flight schema change to fully exit before starting a new
+	// one. This ensures the old Spirit runner's DB connections are released.
+	// The wait ends with the caller's context, so a drive whose claim is gone
+	// does not sit behind a run it can no longer act on.
+	if err := e.DrainContext(ctx); err != nil {
+		return nil, fmt.Errorf("wait for the previous schema change to exit: %w", err)
+	}
 
 	// Initialize running state and start background execution.
 	// Build a table→namespace lookup from the apply request. Each SchemaChange
@@ -878,6 +963,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		}
 	}
 
+	// Start schema change in background with cancellable context.
+	// Use WithoutCancel to preserve context values (tracing) without inheriting
+	// the request deadline — the schema change must outlive the API call.
+	// Stop() and HaltForShutdown cancel via rm.cancelFunc, which is in place
+	// before the run is published, so a halt that finds the run active always
+	// reaches it.
+	bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	rm := &runningSchemaChange{
 		logger:         logger,
 		spiritLogger:   spiritLogger,
@@ -892,21 +984,13 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (*engine.A
 		host:           host,
 		username:       username,
 		password:       password,
+		cancelFunc:     cancel,
+		owner:          engine.WorkOwnerFromContext(ctx),
 	}
 	e.installRunningSchemaChange(rm)
 
-	// Start schema change in background with cancellable context.
-	// Use WithoutCancel to preserve context values (tracing) without inheriting
-	// the request deadline — the schema change must outlive the API call.
-	// Stop() cancels via rm.cancelFunc.
-	rm.wg.Go(func() {
-		bgCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	rm.goRun(func() {
 		defer cancel()
-		e.mu.Lock()
-		if e.runningSchemaChange != nil {
-			e.runningSchemaChange.cancelFunc = cancel
-		}
-		e.mu.Unlock()
 		e.executeSchemaChange(bgCtx, host, username, password, database, req.FlatDDL(), deferCutover, directExecPolicy)
 	})
 
@@ -932,6 +1016,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 				Message:      d.message,
 				ErrorMessage: d.errorMessage,
 				Retryable:    failureIsRetryable(d.state, d.permanent),
+				TargetHeld:   d.state == engine.StateFailed && d.targetHeld,
 				Tables:       slices.Clone(d.tables),
 				ResumeState:  req.ResumeState,
 			}, nil
@@ -996,6 +1081,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		Message:               message,
 		ErrorMessage:          rm.errorMessage,
 		Retryable:             failureIsRetryable(state, rm.permanentFailure),
+		TargetHeld:            state == engine.StateFailed && rm.targetHeld,
 		Tables:                tableProgress,
 		ResumeState:           req.ResumeState,
 		ResumedFromCheckpoint: spiritProgress.Resume,
@@ -1101,11 +1187,7 @@ func buildSpiritTableProgress(prog status.Progress, spiritState status.State, dd
 		// Spirit reports a single runner-wide checksum estimate (rows verified so
 		// far / total to verify), populated only during the verify phase and zero
 		// otherwise. Every table copy is complete by the time the verify phase
-		// runs, so the estimate is stamped on all tables unconditionally. The two
-		// checkers fill it differently: the snapshot one climbs through the
-		// table, while the lockless one has verified nothing conclusively until
-		// its first clean pass, so it reports zero for the phase and then the
-		// total.
+		// runs, so the estimate is stamped on all tables unconditionally.
 		tp.ChecksumRowsChecked = int64(prog.Checksum.RowsChecked)
 		tp.ChecksumRowsTotal = int64(prog.Checksum.RowsTotal)
 		// Spirit's throttle status is likewise runner-wide and already scoped to

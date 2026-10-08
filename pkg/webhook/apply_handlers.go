@@ -205,6 +205,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				LockPR:       existingLock.PullRequest,
 				LockCreated:  existingLock.CreatedAt,
 				CLIName:      h.cliName(),
+				Tenant:       h.deploymentTenant(),
+				LockedApply:  h.lockedDatabaseApplyForComment(ctx, repo, pr, environment, existingLock),
 			}))
 			return false, nil
 		}
@@ -362,10 +364,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// The rollout round runs whether or not the primary target has work: it
 	// stores the plan each other target runs, bound to this plan, and an apply
 	// created from this plan has nothing to run on a target without one. When
-	// other targets have work, the apply runs their own plans, and it always
-	// stops for apply-confirm: the one-step gates below read only the reviewed
-	// plan, so the operator confirms against the comment that renders every
-	// target's plan instead.
+	// other targets have work, the apply runs their own plans in the same step,
+	// as it runs the primary plan: every gate below reads each target's plan,
+	// and the comment the apply posts renders every target's plan.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 	primaryTargetConverged := !planResp.HasChanges()
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
@@ -393,15 +394,15 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"plan_id", planResp.PlanID, "error", refusalErr)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-					"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+					msgOtherTargetPlansUnverified)
 			}
 			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
 		}
-		if refusal != "" {
+		if refusal.refuses() {
 			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}
-		h.logger.Info("apply: other targets have plans of their own; they will run once confirmed",
+		h.logger.Info("apply: other targets have plans of their own; the apply runs each of them",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged,
 			"targets_pending", rollout.work.pending, "targets", rollout.work.members,
@@ -446,15 +447,30 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// --defer-cutover only affects engine-driven statements; an all-direct
-	// plan has no cutover to defer, so reject the flag instead of silently
-	// ignoring it.
-	if result.DeferCutover && planResp.AllChangesDirect() {
-		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan",
-			"repo", repo, "pr", pr, "database", database, "environment", environment)
-		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-			msgDeferCutoverAllDirect)
-		return false, nil
+	// --defer-cutover only affects engine-driven statements; an apply whose
+	// every target runs only direct statements has no cutover to defer, so
+	// reject the flag instead of silently ignoring it. No lock is held yet, so
+	// a plan that cannot be read leaves the command retryable.
+	if result.DeferCutover {
+		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+		if deferErr != nil {
+			h.logger.Error("apply rejected: could not read every target's plan to tell whether --defer-cutover has a cutover to defer",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"plan_id", planResp.PlanID, "error", deferErr)
+			if !result.SuppressRetryComments {
+				h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+					msgOtherTargetPlansUnverified)
+			}
+			return true, fmt.Errorf("apply command defer-cutover check %s#%d: %w", repo, pr, deferErr)
+		}
+		if nothingToDefer {
+			h.logger.Info("apply rejected: --defer-cutover on an apply whose every target runs only direct changes",
+				"repo", repo, "pr", pr, "database", database, "environment", environment,
+				"plan_id", planResp.PlanID, "runs_other_targets", runsMemberWork)
+			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+				msgDeferCutoverAllDirect)
+			return false, nil
+		}
 	}
 
 	// Block unsafe changes unless --allow-unsafe was specified, on every target
@@ -522,6 +538,8 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner
 	commentData.LockAcquired = time.Now().UTC().Format("2006-01-02 15:04:05 UTC")
+	// The check above refused --defer-cutover when no target has a cutover to
+	// defer, so the apply-confirm the comment suggests keeps the flag.
 	commentData.DeferCutover = result.DeferCutover
 	commentData.SkipRevert = result.SkipRevert
 	commentData.AllowUnsafe = result.AllowUnsafe
@@ -548,14 +566,6 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
-	// Other targets have work, so the apply runs their own plans, and it never
-	// does so in one step: the gates that let an apply proceed automatically
-	// read only the primary plan. The operator confirms against this comment,
-	// which renders every target's plan.
-	if runsMemberWork {
-		return h.pauseForMemberWorkConfirmation(ctx, repo, pr, installationID, schemaResult, planResp, environment, rollout, commentData, primaryTargetConverged)
-	}
-
 	// Discarding an unfinished copy destroys work already done on the target —
 	// often hours of it — so it never happens in one step. Downgrade to the
 	// two-step confirm against the locked comment that discloses what is being
@@ -571,7 +581,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		// (keyed on this plan's intent) and stays retryable — the re-drive
 		// re-plans from the top, reacquires the lock, and reaches this gate
 		// again — so the pause is never acknowledged over unknown check state.
-		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+		headSHA, checkRunErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)
 		if checkRunErr != nil {
 			h.logger.Error("failed to store check state for copy-discard downgrade; the merge gate does not reflect the pending changes, so the command stays retryable",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
@@ -606,11 +616,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		commentData.PendingManualConfirmation = true
 		commentData.PausedApplyCause = &templates.PausedApplyCauseData{
 			Heading: "The plan this apply would be checked against could not be read",
-			Remedy: "Nothing has run. The statements above were planned fresh from this pull request; " +
-				"review them, then confirm to apply them.",
 		}
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
-		headSHA, checkRunErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+		headSHA, checkRunErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)
 		if checkRunErr != nil {
 			h.logger.Error("failed to create apply plan check run", "repo", repo, "pr", pr, "error", checkRunErr)
 		}
@@ -625,7 +633,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// releases the lock (keyed on this plan's intent) and stays retryable — the
 	// re-drive re-plans from the top, reacquires the lock, and stores again —
 	// so the apply never dispatches over unknown check state.
-	headSHA, checkErr := h.storeApplyPlanCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment)
+	headSHA, checkErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)
 	if checkErr != nil {
 		h.logger.Error("failed to store check state for automatic apply; the merge gate does not reflect the pending changes, so nothing was dispatched and the command stays retryable",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
@@ -640,7 +648,22 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if headSHA != "" {
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 	}
-	h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	// This comment is what discloses the other targets' plans an automatic
+	// apply runs without a confirmation, so that work dispatches only once it
+	// lands. A failed post releases the lock and stays retryable, as a pending
+	// confirmation whose comment never appeared does; the stored check keeps
+	// blocking merge on the pending changes meanwhile.
+	if runsMemberWork {
+		if postErr := h.postCommentReportingError(repo, pr, installationID, templates.RenderPlanComment(commentData)); postErr != nil {
+			h.logger.Error("failed to post the comment disclosing the other targets' plans, so nothing was dispatched; releasing the lock",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+				"environment", environment, "plan_id", planResp.PlanID, "error", postErr)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, planResp.PlanID, "automatic apply disclosure post failure")
+			return true, fmt.Errorf("apply command disclosure of the other targets' plans %s#%d: %w", repo, pr, postErr)
+		}
+	} else {
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+	}
 
 	// Check 2 (DDL drift) happens inside executeApply after re-plan
 	h.executeApply(ctx, client, repo, pr, schemaResult, environment, installationID, requestedBy, result, storedPlan, storedPlan, planResp.PlanID, lock.DisclosedCopyDiscard)
@@ -900,6 +923,8 @@ func (h *Handler) applyConfirmCommandCore(parent context.Context, repo string, p
 			LockPR:       existingLock.PullRequest,
 			LockCreated:  existingLock.CreatedAt,
 			CLIName:      h.cliName(),
+			Tenant:       h.deploymentTenant(),
+			LockedApply:  h.lockedDatabaseApplyForComment(ctx, repo, pr, environment, existingLock),
 		}))
 		return false, nil
 	}
@@ -1297,22 +1322,20 @@ func (h *Handler) unlockCommandCore(parent context.Context, issuedAt time.Time, 
 	// fails closed: storage uncertainty must never release a lock that could be
 	// protecting an in-flight apply.
 	for _, lock := range locks {
-		applies, err := h.service.Storage().Applies().GetByDatabase(ctx, lock.DatabaseName, lock.DatabaseType, "")
+		running, err := h.runningApplyOnLockedDatabase(ctx, lock)
 		if err != nil {
 			h.logger.Error("unlock refused: cannot verify active applies, no locks will be released",
 				"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType, "error", err)
 			if !result.SuppressRetryComments {
 				h.postCommandError(repo, pr, installationID, action.Unlock, "", requestedBy,
-					"Failed to verify active applies for database `"+lock.DatabaseName+"`: "+err.Error()+". No locks were released.")
+					"Failed to verify active applies for database `"+lock.DatabaseName+"`. No locks were released; retry the command.")
 			}
 			return true, fmt.Errorf("unlock command verify active applies %s#%d database %s: %w", repo, pr, lock.DatabaseName, err)
 		}
-		for _, a := range applies {
-			if a.Database == lock.DatabaseName && !state.IsTerminalApplyState(a.State) {
-				h.postComment(repo, pr, installationID, templates.RenderCannotUnlock(
-					lock.DatabaseName, a.Environment, a.ApplyIdentifier, a.State))
-				return false, nil
-			}
+		if running != nil {
+			h.postComment(repo, pr, installationID, templates.RenderCannotUnlock(
+				lock.DatabaseName, running.Environment, running.ApplyIdentifier, running.State))
+			return false, nil
 		}
 	}
 
@@ -1417,6 +1440,44 @@ func isLockAcquiredSinceVetting(err error) bool {
 func isVettedLockGone(err error) bool {
 	return errors.Is(err, storage.ErrLockNotFound) ||
 		errors.Is(err, storage.ErrLockNotOwned)
+}
+
+// runningApplyOnLockedDatabase returns the non-terminal apply recorded for the
+// locked database, or nil when none is. While one runs, neither closing the
+// holding PR nor an unlock releases the lock; unlock refuses on this check.
+func (h *Handler) runningApplyOnLockedDatabase(ctx context.Context, lock *storage.Lock) (*storage.Apply, error) {
+	applies, err := h.service.Storage().Applies().GetByDatabase(ctx, lock.DatabaseName, lock.DatabaseType, "")
+	if err != nil {
+		return nil, fmt.Errorf("list applies for locked database %s (%s): %w", lock.DatabaseName, lock.DatabaseType, err)
+	}
+	for _, a := range applies {
+		if a.Database == lock.DatabaseName && !state.IsTerminalApplyState(a.State) {
+			return a, nil
+		}
+	}
+	return nil, nil
+}
+
+// lockedDatabaseApplyForComment looks up the running apply for a lock-conflict
+// comment. The comment only words its release hint from the answer, so a
+// lookup failure is logged and returned unchecked: the hint then says only
+// what holds without it.
+func (h *Handler) lockedDatabaseApplyForComment(ctx context.Context, repo string, pr int, environment string, lock *storage.Lock) templates.LockedDatabaseApply {
+	running, err := h.runningApplyOnLockedDatabase(ctx, lock)
+	if err != nil {
+		h.logger.Warn("lock conflict comment will not suggest an unlock: running apply lookup failed",
+			"repo", repo, "pr", pr, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+			"environment", environment, "lock_owner", lock.Owner, "error", err)
+		return templates.LockedDatabaseApply{}
+	}
+	if running == nil {
+		return templates.LockedDatabaseApply{Checked: true}
+	}
+	return templates.LockedDatabaseApply{
+		Checked:              true,
+		RunningApplyID:       running.ApplyIdentifier,
+		RunningIsLockHolders: strings.EqualFold(running.Repository, lock.Repository) && running.PullRequest == lock.PullRequest,
+	}
 }
 
 func (h *Handler) locksForUnlock(ctx context.Context, repo string, pr int, result CommandResult) ([]*storage.Lock, error) {

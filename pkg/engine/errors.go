@@ -6,6 +6,13 @@ import (
 	"strings"
 )
 
+// ErrTargetHeld reports that an engine could not start a schema change because
+// another run already holds the target, such as a run an earlier driver of the
+// same apply started and has not yet brought down. The refusal is not a failure
+// of the schema change: the work can start once the holder releases the target,
+// and retrying sooner is only refused again.
+var ErrTargetHeld = errors.New("target is held by another run of a schema change")
+
 // PermanentError wraps an error to indicate it should not be retried.
 // Engines return this when the error is permanent.
 type PermanentError struct {

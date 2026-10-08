@@ -344,10 +344,12 @@ func TestBuildApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t *testi
 	assert.Equal(t, state.ApplyOperation.Pending, groups[0].Operation.State)
 	require.Len(t, groups[0].Tasks, 1)
 	assert.False(t, groups[0].Operation.IsConvergedPlaceholder(), "the working member is dispatched")
+	assert.False(t, groups[0].Operation.AlreadyConverged, "the member with work has the change still to run")
 
 	converged := groups[1].Operation
 	assert.Empty(t, groups[1].Tasks, "a converged member has no work to drive")
 	assert.Equal(t, state.ApplyOperation.Completed, converged.State)
+	assert.True(t, converged.AlreadyConverged, "the member is recorded as already holding the change")
 	assert.Nil(t, converged.StartedAt, "a converged member never started: nothing ran on its target")
 	require.NotNil(t, converged.CompletedAt)
 	assert.Equal(t, pershardTestTime(), *converged.CompletedAt)
@@ -646,6 +648,7 @@ func TestBuildApplyOperationGroups_ConvergedPrimaryIsCompletedWhenASiblingHasWor
 	assert.Empty(t, groups[0].Tasks, "the primary's own target already holds the change")
 	assert.Equal(t, state.ApplyOperation.Completed, groups[0].Operation.State)
 	assert.True(t, groups[0].Operation.IsConvergedPlaceholder(), "the primary's row is written in the shape the remote manifest leaves out")
+	assert.True(t, groups[0].Operation.AlreadyConverged)
 
 	assert.Equal(t, state.ApplyOperation.Pending, groups[1].Operation.State)
 	require.Len(t, groups[1].Tasks, 1, "the sibling's own DDL is still driven")
@@ -945,6 +948,8 @@ func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation
 	assert.Equal(t, now, *byTarget["testapp-002"].CompletedAt)
 	assert.Nil(t, byTarget["testapp-002"].StartedAt, "nothing ran on the converged member")
 	assert.True(t, byTarget["testapp-002"].IsConvergedPlaceholder(), "the finalizer row is written in the shape the remote manifest leaves out")
+	assert.True(t, byTarget["testapp-002"].AlreadyConverged)
+	assert.False(t, byTarget["testapp-001"].AlreadyConverged)
 }
 
 // The primary target and another target both add a column, and the other
@@ -1181,6 +1186,7 @@ func TestBuildShardedApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t
 	require.NotNil(t, settled.Operation.CompletedAt)
 	assert.Equal(t, now, *settled.Operation.CompletedAt)
 	assert.Nil(t, settled.Operation.StartedAt, "nothing ran on the converged member")
+	assert.True(t, settled.Operation.AlreadyConverged)
 	assert.Equal(t, int64(11), settled.Operation.PlanID)
 	assert.True(t, settled.Operation.IsConvergedPlaceholder(), "the sharded row is written in the shape the remote manifest leaves out")
 }

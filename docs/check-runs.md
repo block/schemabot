@@ -154,6 +154,13 @@ do not touch managed schema files. For those PRs, SchemaBot publishes a passing
 and allow the PR to merge. Skipping check creation would leave the required
 check missing, which GitHub treats as not passing.
 
+A PR whose schema changes all sit under directories the deployment does not
+manage gets a passing aggregate too, titled for what it covers instead:
+`No schema changes managed in <environment>` on a deployment scoped to some
+environments, or `No schema changes managed by SchemaBot` on one serving every
+environment. Its summary lists each unmanaged schema directory and the database
+it declares.
+
 When all environments are owned by one SchemaBot deployment, require this check:
 
 ```text
@@ -946,26 +953,34 @@ When other targets have work under plans of their own, whether or not the
 primary target does,
 SchemaBot stores `action_required` before anything else can end the apply, so
 an apply that loses the lock race or fails a later gate still leaves the record
-blocking. It then acquires the lock and pauses for `apply-confirm` behind a
-comment that renders each target's own plan, since the one-step gates read only
-the primary target's plan. Confirming runs each target's plan on that target, and the
-record keeps blocking merge until every target has the change (MG-12).
+blocking. It then acquires the lock, posts a comment that renders each
+target's own plan, and submits the apply in the same step, as it does for the
+primary target alone, since every one-step gate reads each target's plan. The
+apply runs each target's plan on that target, and the record, stored from the
+rollout round rather than from the primary target's plan alone, keeps blocking
+merge until every target has the change (MG-12). The re-plan that runs just
+before submitting pauses it for `apply-confirm` when any target's work differs
+from what that comment showed, keeping the lock pinned to a fresh comment that
+shows each target's plan as it is now.
 
 The apply is refused instead, with nothing run and the record left
 `action_required` (or `failure` for drift), when a target could not be
 confirmed, when the comment cannot render every target's plan, or when a
-target's plan carries work that comment cannot disclose for confirmation. That
-is a change its engine refuses, an unfinished copy it would discard, work the
-apply's operation shape has no place for, or an unsafe change the primary target's plan
-does not carry. An unsafe change the primary target's plan carries too, in the same
-statement up to its schema qualifier, runs under `--allow-unsafe` like the
-primary target's own. When the primary target is already at the desired schema, any
-unsafe, per-shard or finalizer change on another target is refused, since the
-primary target's plan discloses none. A target's direct-execution change is not
-refused: the comment discloses it under that target, and confirming runs it
-there as native DDL that blocks writes to the table until it finishes. It runs
-only from that apply-confirm; an apply created any other way, such as a
-`POST /api/apply` of the primary target's plan, refuses it. A target whose data plane
+target's plan carries work the apply cannot run as planned. That is a change
+its engine refuses, an unfinished copy it would discard, or work the apply's
+operation shape has no place for. When the primary target is already at the
+desired schema, that includes any per-shard or finalizer change on another
+target. These refusals come before the pause for a fresh confirmation, so an
+apply never asks for a confirmation that could not run. An unsafe change on
+another target is not refused: the comment discloses it under that target, and
+it runs under `--allow-unsafe` like the primary target's own, whether or not the
+primary target has work. A target's direct-execution change is not refused
+either: the comment discloses it under that target, and the apply runs it
+there as native DDL that blocks writes to the table until it finishes. An
+apply created any other way, such as a
+`POST /api/apply` of the primary target's plan, refuses another target's
+direct-execution change, and its unsafe changes unless the primary target's
+plan carries the same statement up to its schema qualifier. A target whose data plane
 could not say whether it holds an unfinished copy, because it does not look or
 its lookup failed, is refused the same way. The plan comment offers no apply
 for a rollout it knows would be refused, and says why in its place.
@@ -979,13 +994,23 @@ which namespaces end with a finalizer, and the VSchema each of those writes.
 The primary target is held to the confirmed plan while the environment has
 several targets, and also when the confirmed round stored plans for other
 targets, even if the rollout has since shrunk to the primary target alone.
+If the primary member's deployment or target changed since review, confirmation
+refuses even identical DDL, releases the pending confirmation, and asks for a fresh
+apply to review the current targets. It does not remap consent between members,
+and the same refusal, with the same reason, applies whichever comment the
+confirmation acts on, a single target's included: a target whose deployment or
+target changed is not the one the comment reviewed. An automatic apply plans and
+re-plans within one command against one configuration, so its primary target
+cannot change between the comment it posts and the apply it creates.
+A fully converged rollout still reports no changes without creating an apply.
 So a statement on the primary target whose DDL is unchanged but that now runs as
 direct execution, or is now blocked, refuses here and releases the lock rather
 than pausing again or being rejected as blocked, as it would on a single
 target. The refusal names the target whose plan changed and the part of its
 work that differs: its statements, how they run, which namespaces it
-finalizes, or the VSchema it writes. An automatic apply never runs other
-targets' work.
+finalizes, or the VSchema it writes. If that re-check cannot read the plans it
+compares, apply-confirm keeps the pending confirmation for a retry, and an
+automatic apply releases the lock.
 
 ### Apply confirmed
 

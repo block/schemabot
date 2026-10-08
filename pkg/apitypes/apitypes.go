@@ -89,6 +89,8 @@ const (
 	ErrCodeSourcePolicyDenied   = "source_policy_denied"   // Source repo/path is not authorized for the database
 	ErrCodeLockNotOwned         = "lock_not_owned"         // Lock release denied because the caller is not the owner
 	ErrCodeRateLimited          = "rate_limited"           // Caller or target exceeded its request budget; retry after the advertised delay
+	ErrCodeUnsafeOptInRequired  = "unsafe_opt_in_required" // Plan carries an unsafe change; retry with allow_unsafe=true to consent to it
+	ErrCodePlanBlocked          = "plan_blocked"           // Plan carries a change the engine refuses; no retry or option can apply it
 )
 
 var retryableErrorCodes = map[string]bool{
@@ -1339,10 +1341,19 @@ func (r *PlanResponse) DirectChanges() []*TableChangeResponse {
 // AllChangesDirect reports whether every planned change is a direct-execution
 // change (and at least one exists). Options that only affect engine-driven
 // statements — like a deferred cutover — have nothing to act on in such a
-// plan, so their commands are rejected rather than silently ignored.
+// plan, so their commands are rejected rather than silently ignored. A
+// namespace whose shards carry changes of their own runs as those shard
+// changes, so its namespace-level table changes, a collapsed view of them, are
+// not consulted.
 func (r *PlanResponse) AllChangesDirect() bool {
 	if r == nil {
 		return false
+	}
+	carriedByShards := map[string]bool{}
+	for _, sp := range r.Shards {
+		if sp != nil && len(sp.Changes) > 0 {
+			carriedByShards[sp.Namespace] = true
+		}
 	}
 	total := 0
 	for _, sc := range r.Changes {
@@ -1351,6 +1362,9 @@ func (r *PlanResponse) AllChangesDirect() bool {
 		}
 		if sc.HasVSchemaChange() || sc.NeedsFinalizer() {
 			return false
+		}
+		if carriedByShards[sc.Namespace] {
+			continue
 		}
 		total += len(sc.TableChanges)
 		for _, t := range sc.TableChanges {
@@ -1748,8 +1762,12 @@ type ProgressOperationResponse struct {
 	OnFailure    string `json:"on_failure,omitempty"`
 	ErrorCode    string `json:"error_code,omitempty"`
 	ErrorMessage string `json:"error_message,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	CompletedAt  string `json:"completed_at,omitempty"`
+	// AlreadyConverged is true for an operation recorded completed when the
+	// apply was created, because its target already held the change and
+	// nothing ran there.
+	AlreadyConverged bool   `json:"already_converged,omitempty"`
+	StartedAt        string `json:"started_at,omitempty"`
+	CompletedAt      string `json:"completed_at,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.

@@ -338,6 +338,63 @@ schemabot apply -e staging
 </details>
 
 <details>
+<summary><a name="mysql-plan-partitioned-tables"></a><strong>MySQL Plan (Partitioned Tables)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `ledger_entries` (
+    `id` bigint NOT NULL AUTO_INCREMENT,
+    `settlement_date` date NOT NULL,
+    `amount_cents` bigint NOT NULL,
+    PRIMARY KEY(`id`, `settlement_date`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci
+  PARTITION BY RANGE COLUMNS (`settlement_date`) (
+      PARTITION `p202601` VALUES LESS THAN ('2026-02-01') ENGINE = InnoDB,
+      PARTITION `p202602` VALUES LESS THAN ('2026-03-01') ENGINE = InnoDB,
+      PARTITION `p202603` VALUES LESS THAN ('2026-04-01') ENGINE = InnoDB,
+      PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB
+  );
+```
+
+```sql
+ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (
+    PARTITION `p202611` VALUES LESS THAN ('2026-12-01'),
+    PARTITION `p202612` VALUES LESS THAN ('2027-01-01'),
+    PARTITION `future` VALUES LESS THAN (MAXVALUE)
+);
+```
+
+```sql
+ALTER TABLE `payouts`
+    ADD COLUMN `note` varchar(64) NULL DEFAULT NULL
+    PARTITION BY RANGE COLUMNS (`settlement_date`) (
+        PARTITION `p2025` VALUES LESS THAN ('2026-01-01'),
+        PARTITION `p2026` VALUES LESS THAN ('2027-01-01'),
+        PARTITION `future` VALUES LESS THAN (MAXVALUE)
+    );
+```
+
+📋 **Plan**: **1** table to create, **2** tables to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
 <summary><a name="mysql-plan-ignored-namespaces"></a><strong>MySQL Plan (Ignored Namespaces)</strong></summary>
 
 
@@ -390,6 +447,64 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 schemabot apply -e staging
 ```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-unmanaged-schema-alongside"></a><strong>MySQL Plan (Unmanaged Schema Alongside)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `users` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `email` varchar(255) NOT NULL,
+    `created_at` timestamp DEFAULT current_timestamp(),
+    PRIMARY KEY(`id`),
+    INDEX `idx_email`(`email`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+CREATE TABLE `orders` (
+    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+    `user_id` bigint NOT NULL,
+    `total_cents` bigint NOT NULL,
+    `status` varchar(50) NOT NULL DEFAULT 'pending',
+    PRIMARY KEY(`id`),
+    INDEX `idx_user_id`(`user_id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+```sql
+ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
+```
+
+📊 **Table sizes**:
+- `products`: ~1.1 GB
+
+📋 **Plan**: **2** tables to create, **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+ℹ️ This PR also changes schema under paths SchemaBot does not manage in `staging`, so this plan does not cover them:
+
+- `services/inventory/schema` declares database `inventory`
 
 </details>
 
@@ -1775,9 +1890,9 @@ schemabot apply -e production
 
 **Same plan on all 3 deployments** (`eu`, `au`, `us`).
 
-- `eu` (primary) ✅ matches the primary target's plan
-- `au` ✅ matches the primary target's plan · blocked: 1
-- `us` ✅ matches the primary target's plan
+- `eu` ✅ matches this plan
+- `au` ✅ matches this plan · blocked: 1
+- `us` ✅ matches this plan
 
 ```sql
 CREATE TABLE `users` (
@@ -1833,10 +1948,10 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-⚠️ **Deployment drift detected** — some deployments no longer match the primary target's plan, so the plan check is failing closed:
+⚠️ **Deployment drift detected** — some deployments no longer match this plan, so the plan check is failing closed:
 
-- `eu` (primary) ✅ matches the primary target's plan
-- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs the primary target's plan
+- `eu` ✅ matches this plan
+- `au` ⚠️ diverged — 1 unexpected, 2 missing change(s) vs this plan
 - `us` ❌ could not verify — diff failed; see server logs
 
 ```sql
@@ -1868,7 +1983,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (primary target `eu` only; other targets not shown):
+📊 **Table sizes** (`eu` only; other targets not shown):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
@@ -1924,7 +2039,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📊 **Table sizes** (primary target only; targets could not be listed):
+📊 **Table sizes** (one target only; targets could not be listed):
 - `products`: ~1.1 GB
 
 📋 **Plan**: **2** tables to create, **1** table to alter
@@ -1949,10 +2064,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-### 2 of 3 targets
-
-`primary/testapp_1`, `primary/testapp_2`
-
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -1982,11 +2093,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-### Target `primary/testapp_3`
-
-No schema changes detected
-
-📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to targets `us/testapp_1`, `us/testapp_2`
 
 
 ---
@@ -2008,10 +2115,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-### 2 of 3 targets
-
-`primary/testapp_2`, `primary/testapp_3`
-
 ```sql
 CREATE TABLE `users` (
     `id` bigint unsigned NOT NULL AUTO_INCREMENT,
@@ -2041,11 +2144,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-### Target `primary/testapp_1`
-
-No schema changes detected
-
-📋 **Plan**: **2** tables to create, **1** table to alter across 2 of 3 targets
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to targets `us/testapp_2`, `us/testapp_3`
 
 
 ---
@@ -2069,13 +2168,13 @@ schemabot apply -e production
 
 ### 2 of 3 targets
 
-`primary/testapp_1`, `primary/testapp_2`
+`us/testapp_1`, `us/testapp_2`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ```
 
-### Target `primary/testapp_3`
+### Target `us/testapp_3`
 
 ```sql
 ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
@@ -2085,7 +2184,7 @@ ALTER TABLE `users` ADD COLUMN `email` varchar(255) NULL;
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-📋 **Plan**: **1** table to alter across 3 targets
+📋 **Plan**: **1** table to alter · rolling out to all 3 targets
 
 
 ---
@@ -2107,10 +2206,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-### 2 targets
-
-`primary/testapp_1`, `primary/testapp_2`
-
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 ```
@@ -2120,10 +2215,10 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📊 **Table sizes**:
-- `orders`: ~24.0 GB across 2 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB
-- `users`: ~193 MB across 2 targets · largest ~98.0 MB on `primary/testapp_2` · smallest ~95.0 MB
+- `orders`: ~24.0 GB across 2 targets · largest ~23.4 GB on `us/testapp_2` · smallest ~610 MB
+- `users`: ~193 MB across 2 targets · largest ~98.0 MB on `us/testapp_2` · smallest ~95.0 MB
 
-📋 **Plan**: **2** tables to alter across 2 targets
+📋 **Plan**: **2** tables to alter · rolling out to both targets
 
 
 ---
@@ -2145,10 +2240,6 @@ schemabot apply -e production
 
 *Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
 
-### 3 targets
-
-`primary/testapp_1`, `primary/testapp_2`, `primary/testapp_3`
-
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 ```
@@ -2158,10 +2249,10 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
 📊 **Table sizes**:
-- `orders`: ~24.0 GB across 2 of 3 targets · largest ~23.4 GB on `primary/testapp_2` · smallest ~610 MB · size estimate unavailable on `primary/testapp_3`
-- `users`: ~297 MB across 3 targets · largest ~104 MB on `primary/testapp_3` · smallest ~95.0 MB
+- `orders`: ~24.0 GB across 2 of 3 targets · largest ~23.4 GB on `us/testapp_2` · smallest ~610 MB · size estimate unavailable on `us/testapp_3`
+- `users`: ~297 MB across 3 targets · largest ~104 MB on `us/testapp_3` · smallest ~95.0 MB
 
-📋 **Plan**: **2** tables to alter across 3 targets
+📋 **Plan**: **2** tables to alter · rolling out to all 3 targets
 
 
 ---
@@ -2185,9 +2276,9 @@ schemabot apply -e production
 
 ⚠️ **Some targets could not be planned** — every target must have a plan before an apply can run, so the plan check is failing closed:
 
-- `primary/testapp_1` (primary) ✅ planned against its own schema
-- `primary/testapp_2` ✅ planned against its own schema
-- `primary/testapp_3` ❌ could not plan — diff failed; see server logs
+- `us/testapp_1` ✅ planned against its own schema
+- `us/testapp_2` ✅ planned against its own schema
+- `us/testapp_3` ❌ could not plan — diff failed; see server logs
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
@@ -2197,7 +2288,7 @@ ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 
-📊 **Table sizes** (primary target `primary/testapp_1` only; other targets not shown):
+📊 **Table sizes** (`us/testapp_1` only; other targets not shown):
 - `orders`: ~610 MB
 - `users`: ~95.0 MB
 
@@ -2717,11 +2808,13 @@ type: mysql
 
 ## ⚠️ Schema Changes Not Managed by SchemaBot
 
-This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
+**Environments**: `staging`, `production`
+
+This PR changes schema under the following path(s), which SchemaBot is not configured to manage in any environment:
 
 - `services/inventory/schema` — declares database `inventory`
 
-These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
+These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's `allowed_dirs` in the server config; otherwise remove these schema changes from this PR.
 <!-- schemabot:offer-support-channel -->
@@ -2853,6 +2946,57 @@ That command wasn't recognized. Available commands:
 📋 Plan: 2 tables to create, 1 table to alter
 
 Options: ⏸️ Defer Cutover
+
+```
+</details>
+
+<details>
+<summary><a name="plan-mysql-partitioned-tables"></a><strong>Plan (MySQL, Partitioned Tables)</strong></summary>
+
+```
+
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Plan                   │
+│                                             │
+│  Database: testapp                          │
+│  Environment: staging                       │
+│  Schema name: testapp                       │
+╰─────────────────────────────────────────────╯
+
+     + ledger_entries
+       CREATE TABLE `ledger_entries` (
+           `id` bigint NOT NULL AUTO_INCREMENT,
+           `settlement_date` date NOT NULL,
+           `amount_cents` bigint NOT NULL,
+           PRIMARY KEY(`id`, `settlement_date`)
+       ) ENGINE InnoDB,
+         CHARSET utf8mb4,
+         COLLATE utf8mb4_0900_ai_ci
+         PARTITION BY RANGE COLUMNS (`settlement_date`) (
+             PARTITION `p202601` VALUES LESS THAN ('2026-02-01') ENGINE = InnoDB,
+             PARTITION `p202602` VALUES LESS THAN ('2026-03-01') ENGINE = InnoDB,
+             PARTITION `p202603` VALUES LESS THAN ('2026-04-01') ENGINE = InnoDB,
+             PARTITION `future` VALUES LESS THAN (MAXVALUE) ENGINE = InnoDB
+         );
+
+     ~ events
+       ALTER TABLE `events` REORGANIZE PARTITION `future` INTO (
+           PARTITION `p202611` VALUES LESS THAN ('2026-12-01'),
+           PARTITION `p202612` VALUES LESS THAN ('2027-01-01'),
+           PARTITION `future` VALUES LESS THAN (MAXVALUE)
+       );
+
+     ~ payouts
+       ALTER TABLE `payouts`
+           ADD COLUMN `note` varchar(64) NULL DEFAULT NULL
+           PARTITION BY RANGE COLUMNS (`settlement_date`) (
+               PARTITION `p2025` VALUES LESS THAN ('2026-01-01'),
+               PARTITION `p2026` VALUES LESS THAN ('2027-01-01'),
+               PARTITION `future` VALUES LESS THAN (MAXVALUE)
+           );
+
+📋 Plan: 1 table to create, 2 tables to alter
+
 
 ```
 </details>
@@ -3488,11 +3632,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `products`: ~1.1 GB
 
 ⚠️ **Schema changes differ from the plan this apply was started from**
-- `orders` (alter) runs a different statement than in the plan this apply was started from
-- `products` (alter) is in this plan but not in the one this apply was started from
-- `shipments` (create) was in the plan this apply was started from but is not in this one
-
-The statements above are what will run. Review them, then confirm to apply them.
+- `orders` (alter) now runs a different statement
+- `products` (alter) is new
+- `shipments` (create) is no longer planned
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -3633,7 +3775,7 @@ Another PR currently holds the lock for this database.
 **Locked by**: [block/myapp#42](https://github.com/block/myapp/pull/42)
 **Since**: 2026-03-15 12:30:00 UTC
 
-Wait for the other PR to complete or ask the lock holder to run `schemabot unlock`.
+The lock is released when that PR is merged or closed, or when `schemabot unlock` is commented on it.
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -3808,6 +3950,23 @@ schemabot apply -e production -d testapp --defer-cutover
 ```
 
 _Requested by @jackjackbits_
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="applyconfirm-refused-primary-target-changed"></a><strong>Apply-confirm Refused: Primary Target Changed</strong></summary>
+
+
+## ❌ Apply-confirm Failed
+
+**Environment**: `production`
+
+*Requested by @jackjackbits at 2026-03-15 14:30:00 UTC*
+
+### Error
+
+> This confirmation no longer covers what the apply would run: target `us` is not the target the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target&#39;s own plan.
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -4008,7 +4167,7 @@ Schema changes require approval from an authorized reviewer before applying.
 
 Schema changes require approval from an authorized reviewer before applying.
 
-Approvals on an earlier commit no longer count, because schema files changed since then or SchemaBot could not confirm they did not: @jdoe. Ask for an approval of the latest commit.
+Approvals on an earlier commit no longer count because this PR's schema change is different now: @jdoe. Ask for an approval of the latest commit.
 
 **Operators of `testapp`**:
 - @acme/testapp-operators
@@ -4037,6 +4196,31 @@ Approvals on an earlier commit no longer count, because schema files changed sin
 
 > Review gate check failed; see server logs for details. If approval is granted through a GitHub team, verify the GitHub App can read organization members and team membership.
 <!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
+<summary><a name="apply-blocked-review-gate-error-approval-not-comparable"></a><strong>Apply Blocked: Review Gate Error (Approval Not Comparable)</strong></summary>
+
+
+## ❌ Review Gate Error
+
+**Database**: `testapp` | **Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+**This apply needs an approval of the latest commit.** @jdoe approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.
+
+**Operators of `testapp`**:
+- @acme/testapp-operators
+
+**Other authorized reviewers**:
+- @acme/schema-reviewers
+- @jdoe
+
+### Next steps
+1. Ask anyone listed above to approve the latest commit
+2. Once approved, run `schemabot apply -e staging` again
 
 </details>
 
@@ -8336,6 +8520,59 @@ schemabot stop apply-a1b2c3d4e5f6 -e production
 ```
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="multitarget-rollout-in-progress-one-deployment"></a><strong>Multi-target Rollout In Progress (One Deployment)</strong></summary>
+
+
+## Schema Change Status — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+🔄 Rolling out: 1 of 3 targets done, 1 running, 1 queued
+
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 81% · 1 complete, 1 running
+- Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
+- Running: `orders_001`
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
+
+---
+
+To stop this schema change:
+```
+schemabot stop apply-a1b2c3d4e5f6 -e production
+```
+
+_Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
+
+</details>
+
+<details>
+<summary><a name="summary-multitarget-rollout-with-a-target-that-already-had-it"></a><strong>Summary: Multi-target Rollout With A Target That Already Had It</strong></summary>
+
+
+## ✅ Schema Change Applied — Production
+
+**Apply ID**: `apply-a1b2c3d4e5f6`
+
+*Applied by @aparajon at 2026-01-01 00:00:00 UTC*
+
+✅ Rolled out to 3 targets
+
+**`orders`**: ✅ Complete (3 targets)
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
+```
+
 
 </details>
 

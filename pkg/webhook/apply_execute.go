@@ -12,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
@@ -117,27 +118,40 @@ func (h *Handler) executeApply(
 	// A confirmation given against the comment saying the primary target
 	// already had this schema, which showed only the other targets' plans, does
 	// not cover changes the primary target has gained since: none of them were
-	// on that comment, so they never run on the strength of it. Any other
-	// confirmation was given against the primary target's own plan, and the
-	// gates below re-check that.
+	// on that comment, so they never run on the strength of it. Nor does it
+	// cover a primary target that is another member now, even one whose plan
+	// that comment showed: consent given under one target does not transfer to
+	// the target that leads the rollout since. Any other confirmation was given
+	// against the primary target's own plan, and the gates below re-check that.
 	if storedPlan == nil && planResp.HasChanges() {
-		confirmedConverged, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, environment)
+		refusal, primary, roundErr := h.confirmedConvergedTargetRound(ctx, expectedPendingPlanID, planResp.PlanID, environment)
 		if roundErr != nil {
-			h.logger.Error("apply-confirm rejected: could not load the confirmed plan and its review round to compare with the primary target's changes; the pending confirmation is preserved",
+			h.logger.Error("apply-confirm rejected: could not load the confirmed plan, its review round, or the re-plan to compare with the primary target's changes; the pending confirmation is preserved",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", roundErr)
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
 				"SchemaBot could not verify the plan this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
 			return
 		}
-		if confirmedConverged {
+		switch refusal {
+		case convergedRoundPrimaryMoved:
+			reason := primaryTargetDifferenceReason(primary, workTarget)
+			h.logger.Info("apply-confirm refused: the primary target is not the one the confirmed comment showed as converged",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				unconfirmedWorkMessage(memberWork{}, reason))
+			return
+		case convergedRoundPrimaryGainedWork:
 			h.logger.Info("apply-confirm refused: the primary target has changes the confirmed comment did not show",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID)
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the primary target has changes the confirmation did not cover")
 			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				"The comment this confirmation acts on showed the primary target already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.")
+				fmt.Sprintf("The comment this confirmation acts on showed target `%s` already at the desired schema, but it now has changes of its own, so nothing was applied. Run apply again for this environment to review and confirm the current plans.", primary))
 			return
+		case convergedRoundAccepts:
 		}
 	}
 
@@ -151,10 +165,11 @@ func (h *Handler) executeApply(
 	// created from this re-plan, and each other target runs the plan this round
 	// stores for it, bound to this re-plan.
 	//
-	// Other targets' work runs only from apply-confirm, and only when the
-	// confirmation was given against exactly that work. An automatic apply
-	// reaching here with other targets' work saw it appear after its comment was
-	// posted without it, so it refuses.
+	// Other targets' work runs only when the comment behind this apply showed
+	// exactly that work: on apply-confirm, the comment the confirmation was
+	// given against, and on an automatic apply, the comment the apply command
+	// posted with every target's plan just before this re-plan. Work that comment
+	// did not show stops for a fresh confirmation or is refused.
 	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
 	primaryTargetConverged := !planResp.HasChanges()
 	refuseRollout := func(reason string) {
@@ -162,56 +177,97 @@ func (h *Handler) executeApply(
 		h.refusePendingRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged)
 	}
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
-	// confirmedMemberWork records that this confirmation was checked against
-	// every other target's work, so apply creation may run the direct changes
-	// the comment disclosed under those targets.
+	// confirmedMemberWork records that this apply was checked against every
+	// other target's work on the comment behind it, so apply creation may run
+	// the direct changes that comment disclosed under those targets.
 	confirmedMemberWork := false
 	switch {
-	case runsMemberWork && storedPlan == nil:
-		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment)
+	case runsMemberWork:
+		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, func() string {
+			return h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment)
+		})
 		if coverErr != nil {
-			// The confirmation is kept: nothing is known to be wrong with it,
-			// and a retry can still confirm the plans the operator reviewed.
-			h.logger.Error("apply-confirm rejected: could not verify that the confirmation covers the other targets' work; the pending confirmation is preserved",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", coverErr)
-			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				"SchemaBot could not verify the plans this confirmation covers, so nothing was applied. Retry the command, and see server logs if it persists.")
+			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
+				"could not verify that the reviewed plans cover the other targets' work", coverErr,
+				"the plans this apply covers")
 			return
 		}
-		if !covered {
-			h.logger.Info("apply-confirm refused: the other targets' work is not what the confirmation was given against",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
-			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the rollout's work is not what was confirmed")
-			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
-			return
-		}
-		// The statements match the confirmed round's, but a copy can appear on
-		// a target after the comment was posted, and work the apply cannot run
-		// is refused here, releasing the confirmation, rather than at apply
-		// creation, which would leave it pinned.
+		// Work the apply cannot run is refused before anything else, releasing
+		// the lock, whether or not the comment showed it: a copy can appear on
+		// a target after the comment was posted, a fresh confirmation could
+		// never run it, and apply creation would refuse it with the lock still
+		// pinned.
+		// When the confirmation is also stale, the refusal is the reason the
+		// operator is told: it is the one that blocks any confirmation, where
+		// a stale one would only send them to confirm again into the same
+		// refusal.
 		refusal, refusalErr := h.memberWorkRefusal(ctx, planResp.PlanID, environment, rollout, primaryTargetConverged)
 		if refusalErr != nil {
-			h.logger.Error("apply-confirm rejected: could not verify that the other targets' plans can run from this apply; the pending confirmation is preserved",
-				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "error", refusalErr)
-			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-				"SchemaBot could not verify the other targets' plans, so nothing was applied. Retry the command, and see server logs if it persists.")
+			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
+				"could not verify that the other targets' plans can run from this apply", refusalErr,
+				"the other targets' plans")
 			return
 		}
-		if refusal != "" {
+		if refusal.refuses() {
+			h.logger.Info("apply refused: the other targets' work cannot run from this apply",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", refusal.String())
 			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "the other targets' work cannot run from this apply")
 			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return
 		}
+		// A primary plan the engine now blocks cannot run from any
+		// confirmation, so an automatic apply rejects it here rather than
+		// pausing on a confirmation that would only be rejected in turn.
+		if storedPlan != nil && planResp.HasBlockedChanges() {
+			h.rejectBlockedChanges(ctx, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, result, expectedPendingPlanID)
+			return
+		}
+		if !covered && storedPlan != nil {
+			// The apply command posted every target's plan moments ago, and a
+			// target's schema changed before this re-plan. As with a primary
+			// plan whose DDL drifted, stop and ask against a comment that
+			// shows each target's plan as it is now, naming each target whose
+			// plan changed and how.
+			cause, causeErr := h.rolloutPlansChangedCause(ctx, expectedPendingPlanID, planResp.PlanID, environment)
+			if causeErr != nil {
+				h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, true, expectedPendingPlanID, planResp.PlanID,
+					"could not read the targets' plans to say how they changed", causeErr,
+					"the plans this apply covers")
+				return
+			}
+			h.logger.Info("automatic apply downgraded: a target's plan changed after the apply posted it",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
+				cause, rolloutPreview, runsMemberWork); err != nil {
+				h.logger.Error("failed to post the comment showing the targets' changed plans, so the pending confirmation was not moved",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				return
+			}
+			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+				h.logger.Error("failed to re-pin the pending confirmation onto the plan whose comment shows the targets' changed plans",
+					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+					"environment", environment, "plan_id", planResp.PlanID, "error", err)
+				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+					"The targets' plans changed before this apply could start. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to review them.")
+			}
+			return
+		}
+		if !covered {
+			h.logger.Info("apply-confirm refused: the confirmation does not cover the work the rollout would run",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+				"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, reason)
+			h.refuseRollout(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, rollout, primaryTargetConverged, unconfirmedWorkMessage(rollout.work, reason))
+			return
+		}
 		confirmedMemberWork = true
-		h.logger.Info("apply-confirm: running the confirmed plans of the other targets that still need the change",
+		h.logger.Info("apply: running the reviewed plans of the other targets that still need the change",
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
-			"plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names)
-	case runsMemberWork:
-		refuseRollout("other targets' work was not on the comment this automatic apply acts on")
-		return
+			"action", actionName, "plan_id", planResp.PlanID, "primary_target_converged", primaryTargetConverged, "pending_targets", rollout.work.names)
 	case rollout.blocks():
 		refuseRollout("the rollout round could not confirm every target's plan")
 		return
@@ -248,7 +304,7 @@ func (h *Handler) executeApply(
 				return
 			}
 			if difference != workUnchanged {
-				reason := primaryTargetDifferenceReason(difference)
+				reason := primaryTargetDifferenceReason(h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment), difference)
 				h.logger.Info("apply-confirm refused: the primary target would run work the confirmed plan did not show",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 					"pending_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "reason", reason)
@@ -270,12 +326,7 @@ func (h *Handler) executeApply(
 	// statement newly resolved to blocked above instead, since how each
 	// statement runs is part of the confirmed plan it is held to.
 	if planResp.HasBlockedChanges() {
-		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
-		commentData.ScopedDatabase = result.Database
-		h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
-		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
-		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "engine-blocked changes rejection")
+		h.rejectBlockedChanges(ctx, repo, pr, installationID, schemaResult, planResp, environment, requestedBy, actionName, result, expectedPendingPlanID)
 		return
 	}
 
@@ -285,7 +336,7 @@ func (h *Handler) executeApply(
 		h.logger.Info("automatic apply downgraded: DDL drift detected",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			planDriftCause(planResp, storedPlan), rolloutPreview); err != nil {
+			planDriftCause(planResp, storedPlan), rolloutPreview, runsMemberWork); err != nil {
 			h.logger.Error("failed to post the DDL-drift downgrade comment",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "error", err)
@@ -314,7 +365,7 @@ func (h *Handler) executeApply(
 				"environment", environment, "action", actionName,
 				"plan_id", planResp.PlanID, "disclosed_plan_id", disclosedPlan.PlanIdentifier, "newly_direct", len(newlyDirect))
 			if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-				newlyDirectCause(newlyDirect), rolloutPreview); err != nil {
+				newlyDirectCause(newlyDirect), rolloutPreview, runsMemberWork); err != nil {
 				h.logger.Error("failed to post the comment disclosing the newly-direct changes, so the pending confirmation was not moved",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -354,7 +405,7 @@ func (h *Handler) executeApply(
 		// lands must leave no consent behind: the next attempt stops and asks
 		// again rather than dispatching over a disclosure nobody read.
 		if err := h.postAutoConfirmDowngrade(ctx, client, repo, pr, installationID, schemaResult, planResp, environment, result, requestedBy,
-			nil, rolloutPreview); err != nil {
+			nil, rolloutPreview, runsMemberWork); err != nil {
 			h.logger.Error("failed to post the comment disclosing the discard, so no consent was recorded",
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -373,20 +424,40 @@ func (h *Handler) executeApply(
 		return
 	}
 
-	// --defer-cutover only affects engine-driven statements; an all-direct
-	// plan has no cutover to defer, so reject the flag instead of silently
-	// ignoring it. Only apply-confirm reaches this gate (the apply command
-	// rejects the flag before locking on an all-direct plan, and an apply whose
-	// re-plan routes changes to direct execution that the disclosed plan did
-	// not stops above), so keep the lock: it still
-	// pins the plan the operator confirmed against, and re-running
-	// apply-confirm without the flag executes it.
-	if result.DeferCutover && planResp.AllChangesDirect() {
-		h.logger.Info("apply rejected: --defer-cutover on an all-direct plan; the pending confirmation is preserved",
-			"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName)
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-			fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
-		return
+	// --defer-cutover only affects engine-driven statements; an apply whose
+	// every target runs only direct statements has no cutover to defer, so
+	// reject the flag instead of silently ignoring it. Apply-confirm keeps the
+	// lock: it still pins the plan the operator confirmed against, and
+	// re-running apply-confirm without the flag executes it. An automatic
+	// apply releases it, as on its other rejections, so the apply command
+	// starts over. The apply command rejects the flag before locking on an
+	// apply with nothing to defer, so an automatic apply normally rejects
+	// here only when reading the targets' plans fails.
+	if result.DeferCutover {
+		automatic := storedPlan != nil
+		nothingToDefer, deferErr := h.deferCutoverHasNothingToDefer(ctx, planResp, environment, runsMemberWork)
+		if deferErr != nil {
+			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, automatic, expectedPendingPlanID, planResp.PlanID,
+				"could not read every target's plan to tell whether --defer-cutover has a cutover to defer", deferErr,
+				"the other targets' plans")
+			return
+		}
+		if nothingToDefer && automatic {
+			h.logger.Info("automatic apply rejected: --defer-cutover on an apply whose every target runs only direct changes; releasing the lock",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "action", actionName,
+				"posted_plan_id", expectedPendingPlanID, "plan_id", planResp.PlanID, "runs_other_targets", runsMemberWork)
+			h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "--defer-cutover has nothing to defer")
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, msgDeferCutoverAllDirect)
+			return
+		}
+		if nothingToDefer {
+			h.logger.Info("apply rejected: --defer-cutover on an apply whose every target runs only direct changes; the pending confirmation is preserved",
+				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "action", actionName,
+				"plan_id", planResp.PlanID, "runs_other_targets", runsMemberWork)
+			h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
+				fmt.Sprintf(msgDeferCutoverAllDirectConfirm, environment))
+			return
+		}
 	}
 
 	// Block unsafe changes on confirm (re-plan may have detected new unsafe
@@ -512,6 +583,177 @@ func (h *Handler) executeApply(
 	}
 }
 
+// rolloutPlansChangedCause heads the comment an automatic apply posts when a
+// target's plan changed between the comment the apply command posted and the
+// re-plan the apply runs from. It names each target whose plan changed and,
+// per table, how, so the reader sees what moved without diffing two comments.
+// A target whose statements are unchanged but whose plan still differs, in how
+// a statement runs, which statements are unsafe, the namespaces it finalizes,
+// or the VSchema it writes, gets one entry naming that part.
+func (h *Handler) rolloutPlansChangedCause(ctx context.Context, postedPlanID, planID, environment string) (*templates.PausedApplyCauseData, error) {
+	postedPrimary, posted, err := h.reviewRoundPlans(ctx, postedPlanID, environment)
+	if err != nil {
+		return nil, fmt.Errorf("load the round the apply posted: %w", err)
+	}
+	currentPrimary, current, err := h.reviewRoundPlans(ctx, planID, environment)
+	if err != nil {
+		return nil, fmt.Errorf("load the round the apply re-planned: %w", err)
+	}
+	started := roundWithPrimary(postedPrimary, posted)
+	now := roundWithPrimary(currentPrimary, current)
+	members := make(map[string]struct{}, len(started)+len(now))
+	for member := range started {
+		members[member] = struct{}{}
+	}
+	for member := range now {
+		members[member] = struct{}{}
+	}
+
+	type changedTarget struct {
+		name    string
+		was, is *storage.Plan
+	}
+	var changed []changedTarget
+	for _, member := range slices.Sorted(maps.Keys(members)) {
+		was, is := started[member], now[member]
+		named, round := is, now
+		if named == nil {
+			named, round = was, started
+		}
+		target := changedTarget{name: roundMemberName(named, round), was: was, is: is}
+		if len(targetPlanDriftEntries(target.was, target.is, "")) > 0 {
+			changed = append(changed, target)
+		}
+	}
+	// One changed target is named in the heading, so its entries need not
+	// repeat it; with several, each entry says which target it is on.
+	var entries []string
+	for _, target := range changed {
+		name := ""
+		if len(changed) > 1 {
+			name = target.name
+		}
+		entries = append(entries, targetPlanDriftEntries(target.was, target.is, name)...)
+	}
+	if len(entries) > planDriftEntryCap {
+		remaining := len(entries) - planDriftEntryCap
+		entries = append(entries[:planDriftEntryCap:planDriftEntryCap],
+			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("change", "changes", remaining)))
+	}
+
+	heading := "The targets' plans changed before this apply could start"
+	switch {
+	case len(changed) == 1:
+		heading = fmt.Sprintf("The plan for target `%s` changed before this apply could start", changed[0].name)
+	case len(changed) > 1:
+		heading = fmt.Sprintf("The plans for %d targets changed before this apply could start", len(changed))
+	}
+	return &templates.PausedApplyCauseData{
+		Heading: heading,
+		Entries: entries,
+	}, nil
+}
+
+// roundWithPrimary is a round's plans keyed by member, the primary target's
+// own plan included.
+func roundWithPrimary(primary *storage.Plan, members map[string]*storage.Plan) map[string]*storage.Plan {
+	round := maps.Clone(members)
+	if round == nil {
+		round = make(map[string]*storage.Plan, 1)
+	}
+	round[qualifiedTargetName(routing.ExecutionTarget{Deployment: primary.Deployment, Target: primary.Target})] = primary
+	return round
+}
+
+// targetPlanDriftEntries says how one target's plan now differs from the plan
+// the apply was started from, either of which may be absent. A non-empty name
+// starts each entry, for an apply whose entries span several targets.
+func targetPlanDriftEntries(was, is *storage.Plan, name string) []string {
+	var wasIDs, isIDs map[planChangeIdentity]int
+	if was != nil {
+		wasIDs = storedPlanIdentities(was)
+	}
+	if is != nil {
+		isIDs = storedPlanIdentities(is)
+	}
+	tablePrefix, subject := "", "It"
+	if name != "" {
+		tablePrefix, subject = fmt.Sprintf("Target `%s`: ", name), fmt.Sprintf("Target `%s`", name)
+	}
+	if entries := planDriftEntries(planDriftStatements(isIDs), planDriftStatements(wasIDs), tablePrefix); len(entries) > 0 {
+		return entries
+	}
+	switch {
+	case was == nil && is != nil && is.HasWork():
+		return []string{subject + " now has changes to apply"}
+	case was != nil && is == nil && was.HasWork():
+		return []string{subject + " no longer has changes to apply"}
+	case was != nil && is != nil:
+		if difference := memberWorkDifference(was, is); difference != workUnchanged {
+			if name == "" {
+				return []string{fmt.Sprintf("%s changed", ui.CapitalizeFirst(string(difference)))}
+			}
+			return []string{fmt.Sprintf("%s: %s changed", subject, difference)}
+		}
+	}
+	return nil
+}
+
+// rejectUnverifiedMemberWork answers an apply that could not read what it needs
+// to tell whether the other targets' work is what the comment behind it showed.
+// Nothing is known to be wrong with that comment, so an apply-confirm keeps its
+// pending confirmation for a retry. An automatic apply releases the lock it
+// took, as its other failures past the hand-off do: the operator's recovery is
+// re-issuing the command.
+func (h *Handler) rejectUnverifiedMemberWork(
+	ctx context.Context, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
+	environment, requestedBy, actionName string, automatic bool, expectedPendingPlanID, planID string,
+	what string, err error, unverified string,
+) {
+	database, dbType := schemaResult.Database, schemaResult.Type
+	if automatic {
+		h.logger.Error("automatic apply rejected: "+what+"; releasing the lock",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"posted_plan_id", expectedPendingPlanID, "plan_id", planID, "error", err)
+		h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, what)
+	} else {
+		h.logger.Error("apply-confirm rejected: "+what+"; the pending confirmation is preserved",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"pending_plan_id", expectedPendingPlanID, "plan_id", planID, "error", err)
+	}
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, unverifiedMemberWorkMessage(unverified, environment, automatic))
+}
+
+// rejectBlockedChanges rejects an apply whose re-plan the engine blocks and
+// releases its lock: no retry of the command can succeed, so holding the lock
+// would only force a manual unlock after the schema is rewritten.
+func (h *Handler) rejectBlockedChanges(
+	ctx context.Context, repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
+	planResp *apitypes.PlanResponse, environment, requestedBy, actionName string, result CommandResult, expectedPendingPlanID string,
+) {
+	database, dbType := schemaResult.Database, schemaResult.Type
+	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+	commentData.ScopedDatabase = result.Database
+	h.logger.Info("apply rejected: re-plan contains engine-blocked changes",
+		"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+		"action", actionName, "plan_id", planResp.PlanID)
+	h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
+	h.releaseApplyLockIfIntentUnchanged(ctx, repo, pr, database, dbType, environment, expectedPendingPlanID, "engine-blocked changes rejection")
+}
+
+// unverifiedMemberWorkMessage tells the operator that nothing ran because
+// SchemaBot could not verify the named plans, and how to recover from the
+// state the rejection left: an automatic apply releases its lock unless the
+// intent changed, so the apply command starts over, while apply-confirm kept the pending confirmation, so
+// confirming again with the same flags retries against the same comment.
+func unverifiedMemberWorkMessage(unverified, environment string, automatic bool) string {
+	recovery := fmt.Sprintf("The pending confirmation is preserved; re-run `schemabot %s -e %s` with the same flags, and see server logs if it persists.", action.ApplyConfirm, environment)
+	if automatic {
+		recovery = "Run apply again, and see server logs if it persists."
+	}
+	return fmt.Sprintf("SchemaBot could not verify %s, so nothing was applied. %s", unverified, recovery)
+}
+
 func applyExecutionErrorMessage(command, environment string, err error) string {
 	return dispatchErrorMessage(err, dispatchMessages{
 		command:     command,
@@ -607,7 +849,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 	ctx context.Context, client *ghclient.InstallationClient,
 	repo string, pr int, installationID int64, schemaResult *ghclient.SchemaRequestResult,
 	planResp *apitypes.PlanResponse, environment string, result CommandResult, requestedBy string,
-	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData,
+	cause *templates.PausedApplyCauseData, rolloutPreview *templates.DeploymentDriftData, runsMemberWork bool,
 ) error {
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
@@ -616,6 +858,9 @@ func (h *Handler) postAutoConfirmDowngrade(
 	commentData.LockOwner = fmt.Sprintf("%s#%d", repo, pr)
 	commentData.AllowUnsafe = result.AllowUnsafe
 	commentData.DeferCutover = result.DeferCutover
+	if result.DeferCutover {
+		commentData.NoCutoverToDefer = h.confirmCommandHasNoCutoverToDefer(ctx, repo, pr, planResp, environment, runsMemberWork)
+	}
 	commentData.SkipRevert = result.SkipRevert
 	commentData.PendingManualConfirmation = true
 	commentData.PausedApplyCause = cause
@@ -744,40 +989,7 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 	now := planDriftStatements(responsePlanIdentities(planResp))
 	started := planDriftStatements(storedPlanIdentities(storedPlan))
 
-	// The namespace distinguishes the same table under two keyspaces, so it is
-	// named only when the drift spans more than one — on the single-namespace
-	// database it is noise the rest of the comment does not carry either.
-	namespaces := make(map[string]struct{})
-	for change := range now {
-		namespaces[change.namespace] = struct{}{}
-	}
-	for change := range started {
-		namespaces[change.namespace] = struct{}{}
-	}
-	qualify := len(namespaces) > 1
-
-	changes := slices.SortedFunc(
-		maps.Keys(planDriftUnion(now, started)),
-		func(a, b planDriftChange) int {
-			return cmp.Or(
-				cmp.Compare(a.namespace, b.namespace),
-				cmp.Compare(a.table, b.table),
-				cmp.Compare(a.operation, b.operation),
-			)
-		})
-
-	var entries []string
-	for _, change := range changes {
-		phrase, drifted := planDriftPhrase(now[change], started[change])
-		if !drifted {
-			continue
-		}
-		subject := fmt.Sprintf("`%s`", change.table)
-		if qualify {
-			subject = fmt.Sprintf("`%s` in `%s`", change.table, change.namespace)
-		}
-		entries = append(entries, fmt.Sprintf("%s (%s) %s", subject, change.operation, phrase))
-	}
+	entries := planDriftEntries(now, started, "")
 
 	if len(entries) > planDriftEntryCap {
 		remaining := len(entries) - planDriftEntryCap
@@ -788,7 +1000,6 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 	return &templates.PausedApplyCauseData{
 		Heading: "Schema changes differ from the plan this apply was started from",
 		Entries: entries,
-		Remedy:  "The statements above are what will run. Review them, then confirm to apply them.",
 	}
 }
 
@@ -877,8 +1088,8 @@ func newlyDirectChanges(planResp *apitypes.PlanResponse, disclosedPlan *storage.
 
 // newlyDirectCause names each table the re-plan newly routes to direct
 // execution, once per table with the shards it moved on. How the statements
-// run is disclosed in the direct execution section above this cause, so the
-// entries only say which tables moved.
+// run is disclosed in the direct execution section, so the entries only say
+// which tables moved.
 func newlyDirectCause(newly []directChangeIdentity) *templates.PausedApplyCauseData {
 	type tableKey struct{ namespace, table string }
 	var order []tableKey
@@ -913,8 +1124,48 @@ func newlyDirectCause(newly []directChangeIdentity) *templates.PausedApplyCauseD
 	return &templates.PausedApplyCauseData{
 		Heading: "Changes run differently from the plan this apply was started from",
 		Entries: entries,
-		Remedy:  "The direct execution section above shows how they will run. Review it, then confirm to apply.",
 	}
+}
+
+// planDriftEntries lists, per table, how the changes now differ from the ones
+// the apply was started from. prefix, when set, starts each entry, for example
+// with the target the table is on.
+func planDriftEntries(now, started map[planDriftChange]map[string]int, prefix string) []string {
+	// The namespace distinguishes the same table under two keyspaces, so it is
+	// named only when the drift spans more than one — on the single-namespace
+	// database it is noise the rest of the comment does not carry either.
+	namespaces := make(map[string]struct{})
+	for change := range now {
+		namespaces[change.namespace] = struct{}{}
+	}
+	for change := range started {
+		namespaces[change.namespace] = struct{}{}
+	}
+	qualify := len(namespaces) > 1
+
+	changes := slices.SortedFunc(
+		maps.Keys(planDriftUnion(now, started)),
+		func(a, b planDriftChange) int {
+			return cmp.Or(
+				cmp.Compare(a.namespace, b.namespace),
+				cmp.Compare(a.table, b.table),
+				cmp.Compare(a.operation, b.operation),
+			)
+		})
+
+	var entries []string
+	for _, change := range changes {
+		phrase, drifted := planDriftPhrase(now[change], started[change])
+		if !drifted {
+			continue
+		}
+		subject := fmt.Sprintf("`%s`", change.table)
+		if qualify {
+			subject = fmt.Sprintf("`%s` in `%s`", change.table, change.namespace)
+		}
+		entries = append(entries, fmt.Sprintf("%s%s (%s) %s", prefix, subject, change.operation, phrase))
+	}
+	return entries
 }
 
 // planDriftUnion is every table change either plan carries, so one pass over it
@@ -936,13 +1187,13 @@ func planDriftUnion(now, started map[planDriftChange]map[string]int) map[planDri
 func planDriftPhrase(now, started map[string]int) (string, bool) {
 	switch {
 	case len(started) == 0:
-		return "is in this plan but not in the one this apply was started from", true
+		return "is new", true
 	case len(now) == 0:
-		return "was in the plan this apply was started from but is not in this one", true
+		return "is no longer planned", true
 	case maps.Equal(now, started):
 		return "", false
 	default:
-		return "runs a different statement than in the plan this apply was started from", true
+		return "now runs a different statement", true
 	}
 }
 

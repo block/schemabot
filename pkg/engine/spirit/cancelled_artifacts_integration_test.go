@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,7 +29,7 @@ func releaseTestCleanup(t *testing.T, db *sql.DB, tables ...string) {
 	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
 		_, err := db.ExecContext(cleanupCtx,
-			fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(pendingdrops.Database)))
+			fmt.Sprintf("DROP DATABASE IF EXISTS %s", sqlescape.EscapeIdentifier(pendingdrops.Database)))
 		assert.NoError(t, err, "drop pending drops database")
 	})
 }
@@ -38,10 +39,10 @@ func releaseTestCleanup(t *testing.T, db *sql.DB, tables ...string) {
 func seedArtifact(t *testing.T, db *sql.DB, name string, rows int) {
 	t.Helper()
 	_, err := db.ExecContext(t.Context(),
-		fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY AUTO_INCREMENT)", quoteIdentifier(name)))
+		fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY AUTO_INCREMENT)", sqlescape.EscapeIdentifier(name)))
 	require.NoError(t, err, "create artifact %s", name)
 	for range rows {
-		_, err := db.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO %s VALUES ()", quoteIdentifier(name)))
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("INSERT INTO %s VALUES ()", sqlescape.EscapeIdentifier(name)))
 		require.NoError(t, err, "seed artifact %s", name)
 	}
 }
@@ -51,7 +52,7 @@ func quarantinedRowCount(t *testing.T, db *sql.DB, name string) int {
 	t.Helper()
 	var count int
 	require.NoError(t, db.QueryRowContext(t.Context(),
-		fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", quoteIdentifier(pendingdrops.Database), quoteIdentifier(name)),
+		fmt.Sprintf("SELECT COUNT(*) FROM %s.%s", sqlescape.EscapeIdentifier(pendingdrops.Database), sqlescape.EscapeIdentifier(name)),
 	).Scan(&count), "count rows in quarantined %s", name)
 	return count
 }
@@ -427,11 +428,11 @@ func TestEngine_ReleaseCancelledArtifacts_StaysInItsOwnSchema(t *testing.T) {
 	cleanupCtx := context.WithoutCancel(t.Context())
 	t.Cleanup(func() {
 		_, err := db.ExecContext(cleanupCtx,
-			fmt.Sprintf("DROP DATABASE IF EXISTS %s", quoteIdentifier(neighbour)))
+			fmt.Sprintf("DROP DATABASE IF EXISTS %s", sqlescape.EscapeIdentifier(neighbour)))
 		assert.NoError(t, err, "drop neighbouring database")
 	})
 	_, err := db.ExecContext(t.Context(),
-		fmt.Sprintf("CREATE DATABASE %s", quoteIdentifier(neighbour)))
+		fmt.Sprintf("CREATE DATABASE %s", sqlescape.EscapeIdentifier(neighbour)))
 	require.NoError(t, err, "create neighbouring database")
 
 	const target = "orders"
@@ -440,7 +441,7 @@ func TestEngine_ReleaseCancelledArtifacts_StaysInItsOwnSchema(t *testing.T) {
 		sharedCheckpointTable, deferredCutoverSentinelTable,
 	} {
 		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s.%s (id INT PRIMARY KEY)",
-			quoteIdentifier(neighbour), quoteIdentifier(name)))
+			sqlescape.EscapeIdentifier(neighbour), sqlescape.EscapeIdentifier(name)))
 		require.NoError(t, err, "seed %s in the neighbouring database", name)
 	}
 	neighbourBefore := tablesIn(t, db, neighbour)
@@ -556,7 +557,7 @@ func TestEngine_ReleaseCancelledArtifacts_RetainsSharedMetadataWhileTheSchemaIsB
 	assert.Equal(t, "testdb."+utils.NewTableName(cancelled), result.Preserved[0].Source)
 
 	for _, name := range []string{utils.NewTableName(live), utils.CheckpointTableName(live)} {
-		_, err := db.ExecContext(t.Context(), fmt.Sprintf("DROP TABLE %s", quoteIdentifier(name)))
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("DROP TABLE %s", sqlescape.EscapeIdentifier(name)))
 		require.NoError(t, err, "drop %s", name)
 	}
 	seedArtifact(t, db, utils.CheckpointTableName(cancelled), 1)
@@ -580,7 +581,7 @@ func pinArtifact(t *testing.T, db *sql.DB, artifact string) {
 	const holder = "artifact_pin"
 	_, err := db.ExecContext(t.Context(), fmt.Sprintf(
 		"CREATE TABLE %s (id INT PRIMARY KEY, FOREIGN KEY (id) REFERENCES %s (id))",
-		quoteIdentifier(holder), quoteIdentifier(artifact)))
+		sqlescape.EscapeIdentifier(holder), sqlescape.EscapeIdentifier(artifact)))
 	require.NoError(t, err, "pin artifact %s", artifact)
 	// Registered after the release's own cleanup, so it runs first and the
 	// pinned artifact can be dropped behind it.

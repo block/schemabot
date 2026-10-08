@@ -29,6 +29,31 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
+func TestBaselinePolicyTableMembership(t *testing.T) {
+	declared := map[string]bool{"users": true, "audit_log_archive_2019": true}
+	ignored := engine.NewIgnoredTables([]string{"flyway_schema_history", "audit_log_archive_2018"})
+	tests := []struct {
+		table              string
+		wantRollbackReason string
+	}{
+		{table: "users"},
+		{table: "legacy_users"},
+		{table: "flyway_schema_history", wantRollbackReason: engine.ExemptReasonIgnoreTables},
+		{table: "Flyway_schema_history"},
+		{table: "audit_log_archive_2019"},
+		{table: "audit_log_archive_2020", wantRollbackReason: exemptReasonArchiveNaming},
+		{table: "audit_log_archive_2018", wantRollbackReason: engine.ExemptReasonIgnoreTables},
+	}
+	for _, tt := range tests {
+		t.Run(tt.table, func(t *testing.T) {
+			assert.Equal(t, tt.wantRollbackReason, rollbackBaseline(declared, ignored).exclusionReason(tt.table))
+			assert.Empty(t, pulledBaseline.exclusionReason(tt.table), "pull exports every enumerated table")
+		})
+	}
+	assert.Equal(t, engine.ExemptReasonIgnoreTables, rollbackBaseline(declared, engine.NewIgnoredTables([]string{"audit_log_archive_2019"})).exclusionReason("audit_log_archive_2019"),
+		"the exact ignore policy withholds a named table before introspection; the plan separately refuses declared contradictions")
+}
+
 func TestExecutionVerdict(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -1376,6 +1401,7 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 var optionalCapabilityVerdicts = map[reflect.Type]bool{
 	reflect.TypeFor[engine.Drainer]():                         true,
 	reflect.TypeFor[engine.ShutdownHalter]():                  true,
+	reflect.TypeFor[engine.OwnedWorkHalter]():                 true,
 	reflect.TypeFor[engine.SynchronousWorkRegistration]():     true,
 	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    false,
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,

@@ -45,9 +45,14 @@ type SchemaErrorData struct {
 	UnregisteredConfigs []UnregisteredSchemaConfigData
 	// Deployment names the SchemaBot deployment making a claim about its own
 	// registry: the one environment it serves. Empty when it serves several
-	// or every environment, and the comment then speaks for "this" deployment
-	// and renders the environment header instead.
+	// or every environment, and the comment then renders the environment
+	// header instead.
 	Deployment string
+	// DeploymentEnvironments names, in promotion order, the environments a
+	// deployment serving several but not every environment speaks for, so a
+	// claim about its registry says which environments it covers. Empty for a
+	// deployment serving one environment (Deployment names it) or every one.
+	DeploymentEnvironments []string
 }
 
 // UnregisteredSchemaConfigData identifies one schema config whose database the
@@ -87,10 +92,26 @@ func (d SchemaErrorData) DeploymentHeader() string {
 // DeploymentSubject names the deployment making the claim as the subject of a
 // sentence.
 func (d SchemaErrorData) DeploymentSubject() string {
-	if d.Deployment != "" {
+	switch {
+	case d.Deployment != "":
 		return "The " + flattenIdentifier(d.Deployment) + " SchemaBot deployment"
+	case len(d.DeploymentEnvironments) > 0:
+		return "The SchemaBot deployment serving " + joinWithAnd(inlineCodeList(d.DeploymentEnvironments))
+	default:
+		return "This SchemaBot deployment"
 	}
-	return "This SchemaBot deployment"
+}
+
+// DeploymentSubjectLower is DeploymentSubject for use mid-sentence.
+func (d SchemaErrorData) DeploymentSubjectLower() string {
+	switch {
+	case d.Deployment != "":
+		return "the " + flattenIdentifier(d.Deployment) + " SchemaBot deployment"
+	case len(d.DeploymentEnvironments) > 0:
+		return "the SchemaBot deployment serving " + joinWithAnd(inlineCodeList(d.DeploymentEnvironments))
+	default:
+		return "this SchemaBot deployment"
+	}
 }
 
 // SearchedDirsCode renders the directories a scoped search probed as code
@@ -327,19 +348,21 @@ const configOutsideAllowedDirsTemplate = "## " + glyph.Attention + ` SchemaBot C
 
 {{.Attribution}}
 
-SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but this SchemaBot instance is not configured to manage its schema directory.
+SchemaBot found a ` + "`schemabot.yaml`" + ` configuration, but {{.DeploymentSubjectLower}} is not configured to manage its schema directory.
 
 **Schema directory**: {{.SchemaPathCode}}
 
 Ask a SchemaBot operator to add this directory to {{.AllowedDirsKey}} in the server config, or move the schema config and files under an allowed directory.`
 
 const unmanagedSchemaConfigsNoticeTemplate = "## " + glyph.Attention + ` Schema Changes Not Managed by SchemaBot
-
-This PR changes schema under the following path(s), which this SchemaBot instance is not configured to manage:
+{{with .Environments}}
+**Environments**: {{.}}
+{{end}}
+This PR changes schema under the following path(s), which SchemaBot is not configured to manage in any environment:
 
 {{range .Configs}}- {{.SchemaPath}} — declares database {{.Database}}
 {{end}}
-These schema changes will **not** be planned or applied, and the SchemaBot checks on this PR do not cover them.
+These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.
 
 If SchemaBot should manage them, ask a SchemaBot operator to add the directory to the database's ` + "`allowed_dirs`" + ` in the server config; otherwise remove these schema changes from this PR.`
 
@@ -453,7 +476,7 @@ func RenderNoConfig(data SchemaErrorData) string {
 // as code spans they cannot break out of.
 func RenderConfigNotAuthorizedLine(database, schemaPath string) string {
 	return strings.Join([]string{
-		"SchemaBot found a `schemabot.yaml` configuration, but this SchemaBot instance is not configured to manage its schema directory.",
+		"SchemaBot found a `schemabot.yaml` configuration, but this SchemaBot deployment is not configured to manage its schema directory.",
 		"Schema directory: " + inlineCode(schemaPath) + ".",
 		"Ask a SchemaBot operator to add this directory to " + allowedDirsKey(database) + " in the server config, or move the schema config and files under an allowed directory.",
 	}, " ")
@@ -474,10 +497,13 @@ type UnmanagedSchemaConfigNoticeData struct {
 
 // RenderUnmanagedSchemaConfigsNotice renders the notice posted when a PR
 // changes schema under configs this deployment is not authorized to manage
-// and no other deployment is expected to handle them. The database names and
-// paths come from the PR's own schemabot.yaml files — untrusted input — so
-// each is normalized into a safe inline code span before rendering.
-func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeData) string {
+// and no other deployment is expected to handle them. Only a deployment
+// serving every environment posts it, so the claim covers every environment,
+// and environments names them in promotion order; the header is omitted when
+// none are known. The database names and paths come from the PR's own
+// schemabot.yaml files — untrusted input — so each is normalized into a safe
+// inline code span before rendering.
+func RenderUnmanagedSchemaConfigsNotice(environments []string, configs []UnmanagedSchemaConfigNoticeData) string {
 	normalized := make([]UnmanagedSchemaConfigNoticeData, len(configs))
 	for i, cfg := range configs {
 		normalized[i] = UnmanagedSchemaConfigNoticeData{
@@ -487,19 +513,65 @@ func RenderUnmanagedSchemaConfigsNotice(configs []UnmanagedSchemaConfigNoticeDat
 	}
 	var sb strings.Builder
 	data := struct {
-		Configs []UnmanagedSchemaConfigNoticeData
-	}{Configs: normalized}
+		Environments string
+		Configs      []UnmanagedSchemaConfigNoticeData
+	}{Environments: strings.Join(inlineCodeList(environments), ", "), Configs: normalized}
 	if err := tmplUnmanagedNotice.Execute(&sb, data); err != nil {
 		return fmt.Sprintf("Error rendering template: %v", err)
 	}
 	return offerSupportChannel(sb.String())
 }
 
+// RenderUnmanagedSchemaPassingCheck renders the title and summary of the
+// passing aggregate Check Run for a PR whose schema changes all sit under
+// configs this deployment does not manage. "No schema files changed" would be
+// false there: the PR does change schema, just none this deployment plans.
+// environment names the environment the Check Run covers, empty for a
+// deployment serving every environment. The database names and paths come
+// from the PR's own schemabot.yaml files, so each renders as a code span it
+// cannot break out of.
+func RenderUnmanagedSchemaPassingCheck(environment string, configs []UnmanagedSchemaConfigNoticeData) (title, summary string) {
+	scope := "in any environment"
+	title = "No schema changes managed by SchemaBot"
+	if environment != "" {
+		scope = "in " + inlineCode(environment)
+		title = "No schema changes managed in " + flattenIdentifier(environment)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "This PR changes schema only under paths SchemaBot does not manage %s, so there is nothing to plan or apply %s:\n\n", scope, scope)
+	for _, cfg := range configs {
+		fmt.Fprintf(&sb, "- %s declares database %s\n", inlineCode(cfg.SchemaPath), inlineCode(cfg.Database))
+	}
+	return title, sb.String()
+}
+
+// RenderUnmanagedSchemaPlanNote renders the note a plan comment carries when
+// the PR also changes schema under configs this deployment does not manage.
+// An environment-scoped deployment posts no separate notice, since a sibling
+// serving another environment may manage those configs, so the plan comment
+// is where the PR shows that this deployment left them out. environments
+// names the environments this deployment serves, and the note makes no claim
+// about any other. It renders nothing when configs is empty. The database
+// names and paths come from the PR's own schemabot.yaml files, so each renders
+// as a code span it cannot break out of.
+func RenderUnmanagedSchemaPlanNote(environments []string, configs []UnmanagedSchemaConfigNoticeData) string {
+	if len(configs) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s This PR also changes schema under paths SchemaBot does not manage in %s, so this plan does not cover them:\n\n",
+		glyph.Info, joinWithAnd(inlineCodeList(environments)))
+	for _, cfg := range configs {
+		fmt.Fprintf(&sb, "- %s declares database %s\n", inlineCode(cfg.SchemaPath), inlineCode(cfg.Database))
+	}
+	return sb.String()
+}
+
 // PreviewCommentUnmanagedSchemaConfigsNotice renders a sample notice for
 // schema changes under configs this deployment does not manage, with the
 // support-channel footer a configured deployment appends to it.
 func PreviewCommentUnmanagedSchemaConfigsNotice() string {
-	return RenderSupportChannelFooter(RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+	return RenderSupportChannelFooter(RenderUnmanagedSchemaConfigsNotice([]string{"staging", "production"}, []UnmanagedSchemaConfigNoticeData{
 		{Database: "inventory", SchemaPath: "services/inventory/schema"},
 	}), previewSupportChannel())
 }
@@ -627,15 +699,18 @@ func MemberPlanUnsafeWithoutOptInDetail(target, table, namespace string) string 
 
 // MemberPlanUndisclosedUnsafeDetail is the error line for an apply whose
 // creation refused one rollout target's own plan for an unsafe change the
-// primary plan does not carry. The comment's unsafe disclosure names only the
-// primary plan's changes, so no `--allow-unsafe` covers it, and the line does
-// not suggest one. Like MemberPlanBlockedDetail, it is built from names
-// SchemaBot controls; table is empty for a VSchema change in namespace.
+// comment behind the apply did not show: it showed one plan, which does not
+// carry the change. No `--allow-unsafe` covers a change the comment never
+// disclosed, so the line points at a fresh apply, whose comment shows each
+// target's own plan, and says that is what lets `--allow-unsafe` consent to the
+// change. Like
+// MemberPlanBlockedDetail, it is built from names SchemaBot controls; table is
+// empty for a VSchema change in namespace.
 func MemberPlanUndisclosedUnsafeDetail(target, table, namespace string) string {
 	subject := "table " + inlineCode(table)
 	if table == "" {
 		subject = "the VSchema of namespace " + inlineCode(namespace)
 	}
-	return fmt.Sprintf("Target %s has an unsafe change on %s that the primary target's plan does not carry, so the plan comment never disclosed it and `--allow-unsafe` cannot consent to it. Nothing was applied. A target's unsafe change runs only when the primary target's plan carries the same change.",
+	return fmt.Sprintf("Target %s has an unsafe change on %s that the plan comment never showed, so nothing was applied. Run apply again for this environment: its comment shows each target's own plan, and `--allow-unsafe` can then consent to this change.",
 		inlineCode(target), subject)
 }

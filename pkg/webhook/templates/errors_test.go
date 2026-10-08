@@ -157,24 +157,55 @@ func TestRenderMultipleConfigsUsageExample(t *testing.T) {
 }
 
 func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
-	t.Run("lists each dropped config with its database", func(t *testing.T) {
-		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+	t.Run("lists each dropped config with its database across every environment", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice([]string{"staging", "production"}, []UnmanagedSchemaConfigNoticeData{
 			{Database: "inventory", SchemaPath: "services/inventory/schema"},
 			{Database: "billing", SchemaPath: "services/billing/schema"},
 		})
-		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot\n\n**Environments**: `staging`, `production`\n\nThis PR changes schema")
+		assert.Contains(t, body, "which SchemaBot is not configured to manage in any environment")
 		assert.Contains(t, body, "- `services/inventory/schema` — declares database `inventory`")
 		assert.Contains(t, body, "- `services/billing/schema` — declares database `billing`")
-		assert.Contains(t, body, "will **not** be planned or applied")
+		assert.Contains(t, body, "These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.")
 		assert.Contains(t, body, "`allowed_dirs`")
 	})
 
+	t.Run("omits the environments header when none are known", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice(nil, []UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		})
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot\n\nThis PR changes schema")
+		assert.NotContains(t, body, "**Environments**")
+	})
+
 	t.Run("normalizes values that would break markdown code spans", func(t *testing.T) {
-		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+		body := RenderUnmanagedSchemaConfigsNotice(nil, []UnmanagedSchemaConfigNoticeData{
 			{Database: "inven`tory", SchemaPath: "services/inventory\nschema"},
 		})
 		assert.Contains(t, body, "- `services/inventory schema` — declares database `` inven`tory ``")
 		assert.NotContains(t, body, "inventory\nschema")
+	})
+}
+
+func TestRenderUnmanagedSchemaPassingCheck(t *testing.T) {
+	configs := []UnmanagedSchemaConfigNoticeData{
+		{Database: "merchants", SchemaPath: "services/merchants/schema"},
+		{Database: "ledger_sandbox", SchemaPath: "services/ledger/schema_sandbox"},
+	}
+
+	t.Run("names the environment the check covers", func(t *testing.T) {
+		title, summary := RenderUnmanagedSchemaPassingCheck("production", configs)
+		assert.Equal(t, "No schema changes managed in production", title)
+		assert.Equal(t, "This PR changes schema only under paths SchemaBot does not manage in `production`, so there is nothing to plan or apply in `production`:\n\n"+
+			"- `services/merchants/schema` declares database `merchants`\n"+
+			"- `services/ledger/schema_sandbox` declares database `ledger_sandbox`\n", summary)
+	})
+
+	t.Run("covers every environment for a deployment serving all of them", func(t *testing.T) {
+		title, summary := RenderUnmanagedSchemaPassingCheck("", configs[:1])
+		assert.Equal(t, "No schema changes managed by SchemaBot", title)
+		assert.Equal(t, "This PR changes schema only under paths SchemaBot does not manage in any environment, so there is nothing to plan or apply in any environment:\n\n"+
+			"- `services/merchants/schema` declares database `merchants`\n", summary)
 	})
 }
 

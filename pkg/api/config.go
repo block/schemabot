@@ -215,9 +215,9 @@ type ServerConfig struct {
 	// Spirit overrides the Spirit engine's default run settings for every
 	// MySQL database this server drives directly. Unset fields keep the
 	// engine defaults (see pkg/engine/spirit), so the block is only needed
-	// to deviate — for example to disable write-thread autoscaling as an
-	// incident kill switch. A database's own metadata entry for the same
-	// key wins over this server-level value.
+	// to deviate — for example to change how old a checkpoint may be and still
+	// be resumed. A database's own metadata entry for the same key wins over
+	// this server-level value.
 	Spirit SpiritConfig `yaml:"spirit,omitempty"`
 
 	// DirectExecution is the server-wide direct execution policy. It applies
@@ -528,33 +528,11 @@ func validateRateLimits(cfg RateLimitsConfig) error {
 // here are merged into every locally driven MySQL database's metadata unless
 // the database sets the same key itself.
 type SpiritConfig struct {
-	// EnableExperimentalAutoscaling controls whether Spirit scales its thread
-	// pools dynamically from throttler feedback. It engages on Aurora targets
-	// only; other MySQL targets run at fixed thread counts. Defaults to true
-	// when not configured (nil = enabled); set false as the operator kill
-	// switch when autoscaling misbehaves on a target fleet.
-	EnableExperimentalAutoscaling *bool `yaml:"enable_experimental_autoscaling"`
-
-	// EnableExperimentalLocklessChecksum verifies the copy with optimistic
-	// reads and retries instead of a checksum setup lock held over long-lived
-	// snapshots, leaving cutover locking unchanged. Defaults to false: a row
-	// updated continuously throughout the checksum is not yet supported, so
-	// the lockless checker can fail to converge where the snapshot one
-	// completes. Absent and false are the same thing here, so this needs no
-	// tri-state.
-	EnableExperimentalLocklessChecksum bool `yaml:"enable_experimental_lockless_checksum,omitempty"`
-
 	// CheckpointMaxAge bounds how old a Spirit checkpoint may be and still be
 	// resumed, as a Go duration string (e.g. "72h"). Defaults to 3 days:
 	// a copy stalled that long restarts cleanly instead of replaying days of
 	// old binlogs.
 	CheckpointMaxAge string `yaml:"checkpoint_max_age,omitempty"`
-
-	// ChecksumYieldTimeout bounds each checksum read transaction before it
-	// yields its REPEATABLE READ snapshot, as a Go duration string (e.g.
-	// "12h"). Defaults to 12 hours so a long checksum cannot pin InnoDB purge
-	// on the target.
-	ChecksumYieldTimeout string `yaml:"checksum_yield_timeout,omitempty"`
 }
 
 // SpiritMetadata validates the configured Spirit overrides and returns them as
@@ -563,19 +541,7 @@ type SpiritConfig struct {
 // construction instead of silently running applies with the defaults.
 func (c *ServerConfig) SpiritMetadata() (map[string]string, error) {
 	metadata := map[string]string{}
-	if c.Spirit.EnableExperimentalAutoscaling != nil {
-		metadata[spirit.MetadataEnableExperimentalAutoscaling] = strconv.FormatBool(*c.Spirit.EnableExperimentalAutoscaling)
-	}
-	// Only the enabling value is recorded. A server-level false would be
-	// indistinguishable from the default it restates, and it could not
-	// override a database that set the key itself — the database's entry wins.
-	if c.Spirit.EnableExperimentalLocklessChecksum {
-		metadata[spirit.MetadataEnableExperimentalLocklessChecksum] = strconv.FormatBool(true)
-	}
 	if err := setSpiritDuration(metadata, spirit.MetadataCheckpointMaxAge, c.Spirit.CheckpointMaxAge); err != nil {
-		return nil, err
-	}
-	if err := setSpiritDuration(metadata, spirit.MetadataChecksumYieldTimeout, c.Spirit.ChecksumYieldTimeout); err != nil {
 		return nil, err
 	}
 	return metadata, nil
@@ -2133,6 +2099,9 @@ func ParseServerConfig(data []byte) (*ServerConfig, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&config); err != nil {
+		if key, ok := removedSpiritKey(data); ok {
+			return nil, fmt.Errorf("invalid config: spirit.%s was removed: Spirit now chooses this itself; delete the key from the spirit block: %w", key, err)
+		}
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
@@ -2149,6 +2118,27 @@ func ParseServerConfig(data []byte) (*ServerConfig, error) {
 	}
 
 	return &config, nil
+}
+
+// removedSpiritKey reports the first run setting a config's spirit block still
+// sets that Spirit now chooses itself. The strict decode rejects such a key
+// only as an unknown field; naming it as removed tells the operator that
+// deleting it is the whole remedy. It runs only once the strict decode has
+// failed, so YAML that does not parse here is already reported by that
+// decode's error.
+func removedSpiritKey(data []byte) (string, bool) {
+	var doc struct {
+		Spirit map[string]any `yaml:"spirit"`
+	}
+	if yaml.Unmarshal(data, &doc) != nil {
+		return "", false
+	}
+	for _, key := range spirit.RemovedSettingKeys() {
+		if _, ok := doc.Spirit[key]; ok {
+			return key, true
+		}
+	}
+	return "", false
 }
 
 func (c *ServerConfig) canonicalizeRepositories() error {

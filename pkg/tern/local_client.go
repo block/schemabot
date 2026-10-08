@@ -162,9 +162,7 @@ type LocalConfig struct {
 	// direct_execution_lock_acquisition_timeout_seconds (positive bound on
 	// each direct statement's lock acquisition; engine default when absent);
 	// plus the run-settings overrides parsed by spirit.SettingsFromMetadata
-	// (enable_experimental_autoscaling,
-	// enable_experimental_lockless_checksum, checkpoint_max_age,
-	// checksum_yield_timeout).
+	// (checkpoint_max_age).
 	Metadata map[string]string
 
 	// SchemaOverrides maps a requested canonical namespace to the
@@ -199,6 +197,9 @@ type LocalConfig struct {
 // supply an engine without the core depending on its package.
 type EngineFactory func(cfg LocalConfig, logger *slog.Logger) (engine.Engine, error)
 
+// defaultHeartbeatInterval is how often a drive renews its claim.
+const defaultHeartbeatInterval = 10 * time.Second
+
 // LocalClient implements Client by calling an embedded engine directly — the
 // built-in Spirit (mysql) or PlanetScale (vitess) engine, or an engine supplied
 // by an embedder for another database type. It uses SchemaBot's storage for
@@ -217,13 +218,19 @@ type LocalClient struct {
 	// at the drive's ingest points. Zero value is ready.
 	unrecognizedStatuses unrecognizedStatusReporter
 
+	// targetHeld measures how long each apply's drives have been refused the
+	// target by another run, so a hold that persists is escalated. Zero value
+	// is ready.
+	targetHeld targetHeldWaits
+
 	// heartbeatInterval controls how often the apply heartbeat updates updated_at.
-	// Defaults to 10s. Tests may lower this to verify heartbeat behavior.
+	// Defaults to defaultHeartbeatInterval. Tests may lower this to verify
+	// heartbeat behavior.
 	heartbeatInterval time.Duration
 
 	// taskPollIntervalOverride, when positive, replaces defaultTaskPollInterval
-	// as the sequential drive's progress poll cadence. Tests may lower it to
-	// drive many polls quickly.
+	// as the sequential drive's progress poll cadence, and targetHeldRetryInterval
+	// as its wait on a held target. Tests may lower it to drive many polls quickly.
 	taskPollIntervalOverride time.Duration
 
 	// taskStallWarnIntervalOverride, when positive, replaces
@@ -356,7 +363,7 @@ func NewLocalClient(cfg LocalConfig, stor storage.Storage, logger *slog.Logger) 
 		customEngine:      customEngine,
 		psClientFunc:      psClientFunc,
 		logger:            logger,
-		heartbeatInterval: 10 * time.Second,
+		heartbeatInterval: defaultHeartbeatInterval,
 	}, nil
 }
 
@@ -605,6 +612,7 @@ func (c *LocalClient) remapsPostgresNamespaces() bool {
 }
 
 func (c *LocalClient) applyWithEngine(ctx context.Context, eng engine.Engine, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	ctx = withDriveWorkOwner(ctx)
 	req = applyRequestWithStatedDirectExecution(req)
 	if !c.remapsPostgresNamespaces() {
 		return eng.Apply(ctx, req)

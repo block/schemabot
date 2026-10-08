@@ -496,7 +496,7 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	}
 
 	installClient := ghclient.NewInstallationClientWithSlug(client, h.logger, "schemabot")
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222", nil)
 	select {
 	case cr := <-checkRuns:
 		require.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "passing aggregate must not be published while a started apply blocks the PR")
@@ -1039,7 +1039,7 @@ func TestE2EDisabledRepoChecksSkipAggregatePublishing(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, h.logger)
 
 	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "abc123")
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", nil)
 	h.postFailingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", map[string]string{
 		"staging": "Plan failed",
 	})
@@ -1085,7 +1085,7 @@ func TestE2EPassingAggregateRequiresGitHubHeadVerification(t *testing.T) {
 
 	h := newE2EHandler(t, svc, client)
 	installClient := ghclient.NewInstallationClient(client, h.logger)
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", nil)
 
 	// Without head verification, SchemaBot must not publish or store a passing
 	// aggregate check that could incorrectly unblock branch protection.

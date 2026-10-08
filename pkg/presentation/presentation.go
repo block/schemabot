@@ -56,6 +56,10 @@ type Operation struct {
 	Finalizer    bool
 	NeverStarted bool
 
+	// AlreadyConverged carries the stored row's mark that its target already
+	// held the change when the apply was created, so nothing ran there.
+	AlreadyConverged bool
+
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
 	// by the caller from storage.CutoverPolicyBarrier). Under barrier an earlier
 	// sibling stops blocking a later copy once it reaches the cutover barrier or
@@ -141,6 +145,14 @@ const (
 	StateRevertWindow
 	StateCancelled
 	StateReverted
+	// StateAlreadyApplied is a member whose target already held the change
+	// when the apply was created, so nothing ran there. It is neither a
+	// completed rollout member nor one still to report.
+	StateAlreadyApplied
+
+	// presentationStateCount is one past the last state, so a test can visit
+	// every state and fail when a new one has no histogram category.
+	presentationStateCount
 )
 
 // Deployment is the derived presentation for one deployment of the apply.
@@ -192,6 +204,10 @@ type Deployment struct {
 
 	// NeverStarted is whether no driver ever claimed the member's operation.
 	NeverStarted bool
+
+	// AlreadyConverged is whether the member's operation was recorded as a
+	// target that already held the change when the apply was created.
+	AlreadyConverged bool
 }
 
 // NextActionKind is the semantic operator action the aggregate suggests. The
@@ -343,7 +359,7 @@ var attentionOrder = []PresentationState{
 	StateFailed, StateRetrying, StatePaused, StateHalted, StateStopped,
 	StateReadyForCutoverNext, StateCuttingOver, StateRunningCopy, StateRevertWindow,
 	StateReadyForCutoverWaiting, StateWaiting, StateQueuedNext,
-	StateCancelled, StateReverted, StateCompleted,
+	StateCancelled, StateReverted, StateCompleted, StateAlreadyApplied,
 }
 
 // attentionRank is ps's position in attentionOrder; unnamed states rank last.
@@ -439,10 +455,15 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	d := Deployment{
 		Deployment: op.Deployment, Target: op.Target, Name: names[i], State: op.State, Error: op.Error,
 		ExternalID: op.ExternalID, ExternalOperationID: op.ExternalOperationID, NeverStarted: op.NeverStarted,
+		AlreadyConverged: op.AlreadyConverged,
 	}
 
 	switch op.State {
 	case state.ApplyOperation.Completed:
+		if d.AlreadyApplied() {
+			d.set(StateAlreadyApplied, AlreadyAppliedLabel, "✅", false)
+			break
+		}
 		d.set(StateCompleted, "completed", "✅", false)
 	case state.ApplyOperation.Running:
 		d.set(StateRunningCopy, "running table copy", "🔄", true)
@@ -725,6 +746,7 @@ var summaryCategoryOrder = []struct {
 	states []PresentationState
 }{
 	{"completed", []PresentationState{StateCompleted}},
+	{AlreadyAppliedLabel, []PresentationState{StateAlreadyApplied}},
 	{"cutting over", []PresentationState{StateCuttingOver}},
 	{"ready for cutover", []PresentationState{StateReadyForCutoverNext, StateReadyForCutoverWaiting}},
 	{"running", []PresentationState{StateRunningCopy}},
@@ -779,9 +801,76 @@ func firstWithPresentation(deps []Deployment, ps PresentationState) (Deployment,
 	return Deployment{}, false
 }
 
+// AlreadyAppliedLabel is the status of a member whose target already had the
+// change, so a surface that leaves such targets out can find its count.
+const AlreadyAppliedLabel = "already had it"
+
+// AlreadyApplied reports whether the member's target already held the change
+// when the apply was created, so nothing ran there. It reads the stored mark the
+// apply records, never a missing start: an operation a reaper settled to its
+// parent's outcome is completed without a start too, and its target may never
+// have received the change.
+func (d Deployment) AlreadyApplied() bool {
+	return state.IsState(d.State, state.ApplyOperation.Completed) && d.AlreadyConverged
+}
+
 func (d *Deployment) set(ps PresentationState, label, emoji string, open bool) {
 	d.Presentation = ps
 	d.Label = label
 	d.Emoji = emoji
 	d.Open = open
+}
+
+// TargetProgress is a multi-target group's progress as one status line reads
+// it: how many of its targets finished running the change, how many already
+// had it, and the histogram of the rest.
+type TargetProgress struct {
+	// Total is every target the group addresses.
+	Total int
+	// Done is the targets that ran the change to completion.
+	Done int
+	// AlreadyHad is the targets that already held the change, so ran nothing.
+	AlreadyHad int
+	// Others is the histogram of the remaining targets, in display order.
+	Others []StateCount
+	// Unsettled is the targets that can still change in this apply: every
+	// target whose status is not final, an unknown one included. An apply can
+	// settle while one of them is still going, so it is counted on its own.
+	Unsettled int
+}
+
+// TargetProgress counts g's targets for its status line. Done and AlreadyHad
+// are counted apart from the rest, so Done + AlreadyHad plus the Others counts
+// is always Total.
+func (a Apply) TargetProgress(g Group) TargetProgress {
+	p := TargetProgress{Total: len(g.Members)}
+	var rest []Deployment
+	for _, i := range g.Members {
+		d := a.Deployments[i]
+		switch d.Presentation {
+		case StateCompleted:
+			p.Done++
+		case StateAlreadyApplied:
+			p.AlreadyHad++
+		default:
+			rest = append(rest, d)
+		}
+		if !d.Presentation.final() {
+			p.Unsettled++
+		}
+	}
+	p.Others = summaryCounts(rest)
+	return p
+}
+
+// final reports whether a member's status is the outcome it keeps for this
+// apply: it ran the change, already had it, or ended without it and will not
+// run again. Every other status, an unknown one included, can still change.
+func (s PresentationState) final() bool {
+	switch s {
+	case StateCompleted, StateAlreadyApplied, StateFailed, StateHalted, StateCancelled, StateReverted:
+		return true
+	default:
+		return false
+	}
 }

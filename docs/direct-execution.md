@@ -60,11 +60,14 @@ when it is not set.
 
 The kill needs `SELECT` on `performance_schema` and `PROCESS` to find the
 blockers (`PROCESS` covers `information_schema.innodb_trx`, which it reads to
-spare large transactions), and `CONNECTION_ADMIN` (or `SUPER`) to kill
-sessions of other users. A target whose SchemaBot user lacks any of them
-blocks the statement at plan time rather than running it without the kill.
-`CONNECTION_ADMIN` is read from `SHOW GRANTS`; on RDS, holding
-`rds_superuser_role` counts when `activate_all_roles_on_login` is on.
+spare large transactions), and a way to kill sessions of other users:
+`CONNECTION_ADMIN` (or `SUPER`) for `KILL`, or on RDS, `EXECUTE` on
+`mysql.rds_kill`, which the kill calls when `KILL` is denied. A target whose
+SchemaBot user lacks any of them blocks the statement at plan time rather than
+running it without the kill. Both are read from `SHOW GRANTS`, which lists the
+privileges of the user's active roles, so a role such as RDS's
+`rds_superuser_role` counts only for the privileges it actually grants, and
+`EXECUTE` counts only on a server where `mysql.rds_kill` exists.
 
 ## Routing
 
@@ -300,7 +303,9 @@ confirmation step:
   `apply` or at `apply-confirm`, that routes a statement to direct execution
   that the comment the operator was shown ran through Spirit pauses for
   `apply-confirm` against a comment that discloses it, the same way a
-  re-plan whose DDL changed does. An `apply-confirm` given on a comment that
+  re-plan whose DDL changed does. On a `schemabot apply` that runs several
+  targets' plans, that holds for every target's statements, whichever target
+  runs them. An `apply-confirm` given on a comment that
   rendered several targets' plans does not pause again: a statement on the
   primary target that now runs differently, as direct execution or blocked,
   refuses the apply and releases the lock, because how each statement runs
@@ -309,7 +314,9 @@ confirmation step:
 - Other gates still apply: a direct statement that is also an unsafe change,
   such as dropping a primary key, still needs `--allow-unsafe`.
 - `--defer-cutover` is rejected on an all-direct plan — a direct statement has
-  no cutover to defer. On a mixed plan it applies to the engine-driven
+  no cutover to defer. For an environment with several targets, the plan is
+  all-direct when every target with work runs only direct statements, whichever
+  target that is. On a mixed plan it applies to the engine-driven
   statements only. The disclosure on the apply's comment says so, and so
   does the disclosure on a paused comment, since the flag can still be
   passed to `apply-confirm`.
@@ -340,5 +347,5 @@ the statement and MySQL error), a spike in `blocked_size_unknown` means table
 size statistics are unavailable (check target connectivity and
 `information_schema` access), `blocked_force_kill_unavailable` means the
 SchemaBot user lacks a grant the kill needs on the target (grant `SELECT`
-on `performance_schema.*`, `PROCESS`, and `CONNECTION_ADMIN` or `SUPER`), and `blocked_force_kill_unknown`
+on `performance_schema.*`, `PROCESS`, and `CONNECTION_ADMIN` or `SUPER`, or on RDS `EXECUTE` on `mysql.rds_kill`), and `blocked_force_kill_unknown`
 means checking those grants failed (check target connectivity).
