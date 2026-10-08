@@ -75,6 +75,19 @@ func TestValidateIgnoreTablesPatterns(t *testing.T) {
 	assert.Contains(t, err.Error(), "must not have leading or trailing whitespace")
 }
 
+// An entry wrapped in slashes is a pattern, but one whose expression requires a
+// slash is a path no table name can match, and is refused the way a plain path
+// entry is rather than compiled into a pattern that withholds nothing. A class
+// that merely allows a slash is a pattern like any other.
+func TestValidateIgnoreTablesRefusesPatternRequiringSlash(t *testing.T) {
+	for _, entry := range []string{`/var/lib/app/`, `/relay\/feed/`, `/relay\x2ffeed/`, `/a|b/c/`} {
+		err := ValidateIgnoreTables([]string{entry})
+		require.Error(t, err, entry)
+		assert.Contains(t, err.Error(), "must be a table name or a pattern, not a path", entry)
+	}
+	assert.NoError(t, ValidateIgnoreTables([]string{`/[^/]+_feed/`}))
+}
+
 func TestIsIgnoreTablePattern(t *testing.T) {
 	assert.True(t, IsIgnoreTablePattern(`/relay_\d+_feed/`))
 	assert.True(t, IsIgnoreTablePattern("//"))

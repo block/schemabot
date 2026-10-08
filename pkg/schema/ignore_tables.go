@@ -35,7 +35,8 @@ const maxIgnoreTablePatternsTotalBytes = 1024
 // table: blank entries, entries padded with whitespace (a target spells a
 // table name without padding, so such an entry would silently withhold
 // nothing), entries with path separators, which name a file rather than a
-// table, and pattern entries whose expression does not compile.
+// table, and pattern entries whose expression does not compile, as written or
+// folded, or that requires a slash.
 //
 // A plain entry is a literal table name. Unlike ignore_namespaces there is no
 // $ENV substitution: an entry is matched against the target's own catalog,
@@ -53,8 +54,12 @@ func ValidateIgnoreTables(tables []string) error {
 			return fmt.Errorf("ignore_tables entry %s must not have leading or trailing whitespace", QuoteIgnoreTablesEntry(name))
 		}
 		if IsIgnoreTablePattern(name) {
-			if _, err := CompileIgnoreTablePattern(name, false); err != nil {
-				return err
+			// Both forms a plan compiles are compiled here, so an entry that
+			// passes validation never fails a plan for its expression.
+			for _, foldCase := range []bool{false, true} {
+				if _, err := CompileIgnoreTablePattern(name, foldCase); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -137,6 +142,9 @@ func CompileIgnoreTablePattern(entry string, foldCase bool) (*regexp.Regexp, err
 	if err != nil {
 		return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)
 	}
+	if requiresSlash(parsed) {
+		return nil, fmt.Errorf("ignore_tables entry %s must be a table name or a pattern, not a path: a pattern cannot require a slash, since a plain entry cannot name a table that has one", QuoteIgnoreTablesEntry(entry))
+	}
 	if foldCase {
 		foldRegexpCase(parsed)
 	}
@@ -146,6 +154,18 @@ func CompileIgnoreTablePattern(entry string, foldCase bool) (*regexp.Regexp, err
 		return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)
 	}
 	return re, nil
+}
+
+// requiresSlash reports whether any literal in a parsed expression is a slash,
+// escaped or not. An entry such as /var/lib/app/ starts and ends with the
+// pattern delimiter, but it is a path: read as a pattern it would compile and
+// withhold nothing, where a plain path entry is refused. A slash a character
+// class merely allows, as in [^/], is not refused.
+func requiresSlash(re *syntax.Regexp) bool {
+	if re.Op == syntax.OpLiteral && slices.Contains(re.Rune, '/') {
+		return true
+	}
+	return slices.ContainsFunc(re.Sub, requiresSlash)
 }
 
 // foldRegexpCase makes a parsed expression match every name that a spelling

@@ -114,6 +114,10 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 		}
 	}
 
+	// Every member is checked against the same exclusions, so they are compiled
+	// once and shared: a compiled IgnoredTables is safe for concurrent use.
+	ignored, ignoredErr := engine.NewIgnoredTables(req.IgnoreTables)
+
 	results := make([]DeploymentPlanDiff, len(targets))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(planDeploymentDiffConcurrency)
@@ -197,7 +201,7 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			// becomes its stored plan. A data plane that did not apply
 			// ignore_tables and planned a withheld table's drop must block the
 			// rollup, not stage it.
-			if err := s.refuseMemberWithheldDrops(req, target, resp); err != nil {
+			if err := s.refuseMemberWithheldDrops(req, target, resp, ignored, ignoredErr); err != nil {
 				s.logger.Warn("plan deployment diff proposes dropping tables ignore_tables withholds; deployment will block the review rollup",
 					"database", req.Database,
 					"environment", req.Environment,
@@ -312,11 +316,11 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 }
 
 // refuseMemberWithheldDrops holds a rollout member's diff to the refusal the
-// primary's plan gets for dropping a table ignore_tables withholds.
-func (s *Service) refuseMemberWithheldDrops(req PlanRequest, target routing.ExecutionTarget, resp *ternv1.PlanDiffResponse) error {
-	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
-	if err != nil {
-		return fmt.Errorf("check the plan diff from deployment %q target %q against ignore_tables: %w", target.Deployment, target.Target, err)
+// primary's plan gets for dropping a table ignore_tables withholds. ignored and
+// ignoredErr are the request's exclusions, compiled once for every member.
+func (s *Service) refuseMemberWithheldDrops(req PlanRequest, target routing.ExecutionTarget, resp *ternv1.PlanDiffResponse, ignored engine.IgnoredTables, ignoredErr error) error {
+	if ignoredErr != nil {
+		return fmt.Errorf("check the plan diff from deployment %q target %q against ignore_tables: %w", target.Deployment, target.Target, ignoredErr)
 	}
 	if ignored.Empty() {
 		return nil

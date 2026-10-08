@@ -279,6 +279,19 @@ func TestExecutePlanRefusesShardDropsOfAPatternWithheldFamily(t *testing.T) {
 	assert.Nil(t, plans.created, "a plan that would drop a withheld table on a shard is not stored")
 }
 
+// A table dropped on every shard is one table to look at, so the refusal names
+// it once rather than once per shard and per namespace change.
+func TestPlannedDropsWithheldByNamesEachTableOnce(t *testing.T) {
+	ignored, err := engine.NewIgnoredTables([]string{`/^relay_\d+_feed$/`})
+	require.NoError(t, err)
+	var shards []*ternv1.ShardPlan
+	for _, shard := range []string{"-40", "40-80", "80-c0", "c0-"} {
+		shards = append(shards, &ternv1.ShardPlan{Shard: shard, Namespace: "payments", Changes: dropsPlan("payments", "relay_1_feed", "relay_2_feed")[0].TableChanges})
+	}
+	assert.Equal(t, []string{"relay_1_feed", "relay_2_feed"},
+		plannedDropsWithheldBy(dropsPlan("payments", "relay_1_feed"), shards, ignored))
+}
+
 // A rollout member's diff becomes its stored plan, so a member whose data plane
 // did not apply a pattern, and plans a withheld table's drop, blocks the review
 // rollup instead of staging the drop the primary's plan would be refused for.
