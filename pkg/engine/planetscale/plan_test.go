@@ -84,6 +84,35 @@ func TestPlan_ReportsKeyspaceLintViolations(t *testing.T) {
 	}}, result.LintViolations)
 }
 
+// Every planned statement's lint findings reach the plan, across every
+// statement in a keyspace and across keyspaces, not only the first or last
+// one: a PR that adds three tables with signed INT primary keys sees the
+// warning on all three.
+func TestPlan_ReportsLintViolationsOfEveryStatement(t *testing.T) {
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) { return &emptyMainBranchClient{}, nil })
+	intPK := func(name string) string {
+		return "CREATE TABLE `" + name + "` (\n  `id` int NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;"
+	}
+	result, err := e.Plan(t.Context(), &engine.PlanRequest{
+		Database: "commerce",
+		SchemaFiles: schema.SchemaFiles{
+			"commerce": &schema.Namespace{Files: map[string]string{"orders.sql": intPK("orders"), "refunds.sql": intPK("refunds")}},
+			"billing":  &schema.Namespace{Files: map[string]string{"invoices.sql": intPK("invoices")}},
+		},
+		Credentials: &engine.Credentials{Metadata: map[string]string{"organization": "org", "token_name": "tn", "token_value": "tv"}},
+	})
+	require.NoError(t, err)
+
+	var tables []string
+	for _, v := range result.LintViolations {
+		assert.Equal(t, "primary_key", v.Linter)
+		tables = append(tables, v.Table)
+	}
+	// Spirit does not fix the order of findings within a statement.
+	assert.ElementsMatch(t, []string{"orders", "refunds", "invoices"}, tables)
+}
+
 // A desired schema the plan cannot read fails the plan with the reason,
 // rather than producing a plan that silently leaves the keyspace out.
 func TestPlan_DesiredSchemaErrorFailsThePlan(t *testing.T) {
