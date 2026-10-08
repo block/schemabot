@@ -856,6 +856,13 @@ type ApplyStore interface {
 	// when the marker was earned.
 	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
 
+	// GetSupersededBy returns the apply's superseded_by marker, the identifier
+	// of the apply that took over its work, or "" when nothing has. It reads
+	// the one column, so a driver checking the marker on every projection pass
+	// does not reload the whole row. It returns ErrApplyNotFound when the apply
+	// does not exist.
+	GetSupersededBy(ctx context.Context, applyID int64) (string, error)
+
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.
 	CheckLease(ctx context.Context, lease ApplyLease) error

@@ -298,8 +298,8 @@ func (s *listingApplyOperationStore) ListByApply(context.Context, int64) ([]*sto
 // recordingApplyStore captures the projection persisted by UpdateDerivedState so
 // the test can assert the derived state and completed_at stamping. swapped is
 // returned to model whether the compare-and-swap matched the expected state.
-// supersededBy is the handoff marker the stored row carries, which a reload
-// returns whatever the caller's copy says.
+// supersededBy is the handoff marker the stored row carries, which the
+// projection reads from storage whatever the caller's copy says.
 type recordingApplyStore struct {
 	storage.ApplyStore
 	updated       *storage.Apply
@@ -308,8 +308,8 @@ type recordingApplyStore struct {
 	supersededBy  string
 }
 
-func (s *recordingApplyStore) Get(_ context.Context, id int64) (*storage.Apply, error) {
-	return &storage.Apply{ID: id, SupersededBy: s.supersededBy}, nil
+func (s *recordingApplyStore) GetSupersededBy(context.Context, int64) (string, error) {
+	return s.supersededBy, nil
 }
 
 func (s *recordingApplyStore) UpdateDerivedState(_ context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {

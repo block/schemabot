@@ -653,7 +653,10 @@ func activeApplyHoldersForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 // did attach has settled. It must be running, declare a manifest, have at
 // least one attached operation and at least one declared operation missing,
 // and carry no unsettled operation and no unfinished task, so it provably has
-// no engine work in flight. Anything else is a live apply.
+// no engine work in flight. The verdict over what attached must also be one
+// the projection holds for the manifest (state.IsManifestGatedVerdict): a
+// generation whose attached operations failed or were cancelled settles on
+// its own and was never held. Anything else is a live apply.
 func settledManifestHold(ctx context.Context, tx *rebindTx, holder activeApplyHolder) (bool, error) {
 	if !state.IsState(holder.state, state.Apply.Running) {
 		return false, nil
@@ -689,10 +692,15 @@ func settledManifestHold(ctx context.Context, tx *rebindTx, holder activeApplyHo
 	if len(ops) == 0 || len(held.MissingExpectedOperationKeys(ops)) == 0 {
 		return false, nil
 	}
-	for _, op := range ops {
+	opStates := make([]string, len(ops))
+	for i, op := range ops {
 		if !slices.Contains(settledApplyStates(), state.NormalizeState(op.State)) {
 			return false, nil
 		}
+		opStates[i] = op.State
+	}
+	if !state.IsManifestGatedVerdict(state.DeriveApplyState(opStates)) {
+		return false, nil
 	}
 
 	var unfinished int
@@ -2780,6 +2788,19 @@ func (s *applyStore) MarkSuperseded(ctx context.Context, applyID int64, successo
 		return fmt.Errorf("mark apply %d superseded by %s (marker holds %q): %w", applyID, successor, stored, storage.ErrApplyAlreadySuperseded)
 	}
 	return nil
+}
+
+// GetSupersededBy reads only the superseded_by column. See storage.ApplyStore.
+func (s *applyStore) GetSupersededBy(ctx context.Context, applyID int64) (string, error) {
+	var successor string
+	err := s.db.QueryRowContext(ctx, `SELECT superseded_by FROM applies WHERE id = ?`, applyID).Scan(&successor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("read superseded_by: %w", storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("read superseded_by: %w", err)
+	}
+	return successor, nil
 }
 
 // ReleaseClaim clears the lease fields and backdates the heartbeat past the

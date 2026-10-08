@@ -841,11 +841,19 @@ func TestApplies(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, stored)
 		assert.Equal(t, next.ApplyIdentifier, stored.SupersededBy, "the admission records the generation that took over the held apply's work")
+		successor, err := store.Applies().GetSupersededBy(ctx, held.ID)
+		require.NoError(t, err)
+		assert.Equal(t, next.ApplyIdentifier, successor, "the narrow read returns the same marker the row carries")
 		assert.Equal(t, state.Apply.Running, stored.State, "the admission leaves the held apply's verdict to its driver")
 		storedNext, err := store.Applies().Get(ctx, next.ID)
 		require.NoError(t, err)
 		require.NotNil(t, storedNext)
 		assert.Empty(t, storedNext.SupersededBy)
+		successor, err = store.Applies().GetSupersededBy(ctx, next.ID)
+		require.NoError(t, err)
+		assert.Empty(t, successor, "nothing has taken over the admitted generation")
+		_, err = store.Applies().GetSupersededBy(ctx, next.ID+1000)
+		require.ErrorIs(t, err, storage.ErrApplyNotFound)
 
 		late := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-001", Target: "target-001", State: state.ApplyOperation.Pending}
 		lateTask := newTask(held, "task_manifest_held_late", "users", time.Now())
@@ -958,6 +966,8 @@ func TestApplies(t *testing.T, h Harness) {
 			{"a task still unfinished", []string{"target-001", "target-002"}, state.Apply.Running, state.ApplyOperation.Completed, state.Task.Pending},
 			{"every declared operation attached", []string{"target-002"}, state.Apply.Running, state.ApplyOperation.Completed, state.Task.Completed},
 			{"apply not yet driven", []string{"target-001", "target-002"}, state.Apply.Pending, state.ApplyOperation.Completed, state.Task.Completed},
+			{"attached operation failed", []string{"target-001", "target-002"}, state.Apply.Running, state.ApplyOperation.Failed, state.Task.Failed},
+			{"attached operation cancelled", []string{"target-001", "target-002"}, state.Apply.Running, state.ApplyOperation.Cancelled, state.Task.Cancelled},
 		}
 		for i, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {

@@ -2881,30 +2881,16 @@ func projectionOwnsActiveAppliesGauge(apply *storage.Apply, ops []*storage.Apply
 	return len(ops) > 1 || len(apply.MissingExpectedOperationKeys(ops)) > 0
 }
 
-// manifestGatedVerdict reports whether a derived apply state asserts a
-// whole-generation outcome: completed claims every declared operation applied,
-// and reverted claims every declared operation was unwound. Neither claim is
-// honest while manifest-declared operations have not attached, so the
-// generation-manifest hold gates both. Failure verdicts are not gated: a
-// failed generation must not wait for siblings that may never dispatch.
-func manifestGatedVerdict(derived string) bool {
-	return state.IsState(derived, state.Apply.Completed) ||
-		state.IsState(derived, state.Apply.Reverted)
-}
-
 // manifestHoldSuccessor returns the apply that took over the work of an apply
 // held open for its generation manifest, or "" when none has. It reads the
 // marker from storage rather than from the caller's copy, which can predate the
 // admission that recorded it.
 func (s *Service) manifestHoldSuccessor(ctx context.Context, apply *storage.Apply) (string, error) {
-	fresh, err := s.storage.Applies().Get(ctx, apply.ID)
+	successor, err := s.storage.Applies().GetSupersededBy(ctx, apply.ID)
 	if err != nil {
-		return "", fmt.Errorf("reload apply %s held open for its manifest: %w", apply.ApplyIdentifier, err)
+		return "", fmt.Errorf("read the successor of apply %s held open for its manifest: %w", apply.ApplyIdentifier, err)
 	}
-	if fresh == nil {
-		return "", fmt.Errorf("reload apply %s held open for its manifest: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
-	}
-	return fresh.SupersededBy, nil
+	return successor, nil
 }
 
 // updateApplyStateFromOperations re-derives applies.state from the apply's child
@@ -2988,7 +2974,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// from then on refuses the missing operations, so they can no longer arrive
 	// and the verdict is the one over what did.
 	manifestHeld := false
-	if manifestGatedVerdict(derived) {
+	if state.IsManifestGatedVerdict(derived) {
 		if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
 			successor, err := s.manifestHoldSuccessor(ctx, apply)
 			if err != nil {

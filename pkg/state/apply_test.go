@@ -818,3 +818,15 @@ func TestDeriveRolloutApplyState_OrphanedFinalizer(t *testing.T) {
 		})
 	}
 }
+
+// TestIsManifestGatedVerdict verifies that only verdicts claiming the whole
+// generation's outcome wait on a generation manifest, so a failed or cancelled
+// generation settles without its never-attached siblings.
+func TestIsManifestGatedVerdict(t *testing.T) {
+	assert.True(t, IsManifestGatedVerdict(Apply.Completed))
+	assert.True(t, IsManifestGatedVerdict(Apply.Reverted))
+	assert.True(t, IsManifestGatedVerdict("STATE_COMPLETED"), "proto-prefixed states normalize")
+	for _, s := range []string{Apply.Failed, Apply.Cancelled, Apply.Running, Apply.Stopped, Apply.Pending} {
+		assert.False(t, IsManifestGatedVerdict(s), s)
+	}
+}
