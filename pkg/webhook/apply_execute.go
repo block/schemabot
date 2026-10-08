@@ -252,7 +252,7 @@ func (h *Handler) executeApply(
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
 				h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy,
-					"The targets' plans changed while this apply was starting. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to review them.")
+					"The targets' plans changed before this apply could start. SchemaBot stopped the apply but could not record the confirmation; re-run `schemabot apply -e "+environment+"` to review them.")
 			}
 			return
 		}
@@ -641,17 +641,16 @@ func (h *Handler) rolloutPlansChangedCause(ctx context.Context, postedPlanID, pl
 			fmt.Sprintf("and %d more %s", remaining, ui.PluralizeLabel("change", "changes", remaining)))
 	}
 
-	heading := "The targets' plans changed while this apply was starting"
+	heading := "The targets' plans changed before this apply could start"
 	switch {
 	case len(changed) == 1:
-		heading = fmt.Sprintf("The plan for target `%s` changed while this apply was starting", changed[0].name)
+		heading = fmt.Sprintf("The plan for target `%s` changed before this apply could start", changed[0].name)
 	case len(changed) > 1:
-		heading = fmt.Sprintf("The plans for %d targets changed while this apply was starting", len(changed))
+		heading = fmt.Sprintf("The plans for %d targets changed before this apply could start", len(changed))
 	}
 	return &templates.PausedApplyCauseData{
 		Heading: heading,
 		Entries: entries,
-		Remedy:  "Nothing has run.",
 	}, nil
 }
 
@@ -1001,7 +1000,6 @@ func planDriftCause(planResp *apitypes.PlanResponse, storedPlan *storage.Plan) *
 	return &templates.PausedApplyCauseData{
 		Heading: "Schema changes differ from the plan this apply was started from",
 		Entries: entries,
-		Remedy:  "Nothing has run.",
 	}
 }
 
@@ -1126,7 +1124,6 @@ func newlyDirectCause(newly []directChangeIdentity) *templates.PausedApplyCauseD
 	return &templates.PausedApplyCauseData{
 		Heading: "Changes run differently from the plan this apply was started from",
 		Entries: entries,
-		Remedy:  "Nothing has run.",
 	}
 }
 
@@ -1190,7 +1187,7 @@ func planDriftUnion(now, started map[planDriftChange]map[string]int) map[planDri
 func planDriftPhrase(now, started map[string]int) (string, bool) {
 	switch {
 	case len(started) == 0:
-		return "is new since this apply was started", true
+		return "is new", true
 	case len(now) == 0:
 		return "is no longer planned", true
 	case maps.Equal(now, started):

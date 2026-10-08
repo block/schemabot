@@ -392,10 +392,9 @@ func TestPlanDriftCause(t *testing.T) {
 
 	assert.Equal(t, "Schema changes differ from the plan this apply was started from", cause.Heading)
 	assert.Equal(t, []string{
-		"`products` (alter) is new since this apply was started",
+		"`products` (alter) is new",
 		"`shipments` (create) is no longer planned",
 	}, cause.Entries, "the unchanged `users` alter is not drift and is not listed")
-	assert.Equal(t, "Nothing has run.", cause.Remedy, "the footer carries the command that confirms")
 }
 
 // A rollout's cause says, per target, what moved in its plan. A table change is
@@ -419,7 +418,7 @@ func TestTargetPlanDriftEntries(t *testing.T) {
 		targetPlanDriftEntries(alter(addEmail), alter(modifyEmail), ""))
 	assert.Equal(t, []string{"Target `us`: `users` (alter) now runs a different statement"},
 		targetPlanDriftEntries(alter(addEmail), alter(modifyEmail), "us"))
-	assert.Equal(t, []string{"Target `us`: `users` (alter) is new since this apply was started"},
+	assert.Equal(t, []string{"Target `us`: `users` (alter) is new"},
 		targetPlanDriftEntries(nil, alter(addEmail), "us"))
 	assert.Equal(t, []string{"How its statements run changed"},
 		targetPlanDriftEntries(alter(addEmail), direct, ""))
@@ -491,7 +490,7 @@ func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
 		}},
 	)
 	assert.Equal(t, []string{
-		"`orders` in `shard_a` (create) is new since this apply was started",
+		"`orders` in `shard_a` (create) is new",
 		"`orders` in `shard_b` (create) is no longer planned",
 	}, sameTableTwoKeyspaces.Entries)
 
@@ -504,7 +503,7 @@ func TestPlanDriftCauseNamesTheNamespaceOnlyWhenItDisambiguates(t *testing.T) {
 		&storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"mydb": {}}},
 	)
 	assert.Equal(t, []string{
-		"`orders` (create) is new since this apply was started",
+		"`orders` (create) is new",
 	}, oneKeyspace.Entries)
 }
 
@@ -620,5 +619,4 @@ func TestNewlyDirectCauseNamesEachTable(t *testing.T) {
 		"`events` (shards `-80`, `80-`) now runs as direct execution",
 		"`orders` (shard `80-`) now runs as direct execution",
 	}, cause.Entries)
-	assert.Equal(t, "Nothing has run.", cause.Remedy)
 }

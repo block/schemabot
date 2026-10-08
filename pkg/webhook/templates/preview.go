@@ -1913,10 +1913,9 @@ func PreviewCommentApplyPlanDowngraded() string {
 			Heading: "Schema changes differ from the plan this apply was started from",
 			Entries: []string{
 				"`orders` (alter) now runs a different statement",
-				"`products` (alter) is new since this apply was started",
+				"`products` (alter) is new",
 				"`shipments` (create) is no longer planned",
 			},
-			Remedy: "Nothing has run.",
 		},
 	})
 }

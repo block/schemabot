@@ -218,8 +218,8 @@ func TestE2EConvergedPrimaryWithPendingTargetAppliesEveryTarget(t *testing.T) {
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "ADD COLUMN `email`")
-	assert.Contains(t, body, "rolling out to 1 of 2 targets (1 already has it)", "eu is counted as already at the desired schema")
-	assert.Contains(t, body, "Needs it: `us` · Already has it: `eu`")
+	assert.Contains(t, body, " · rolling out to target `us`\n", "only the target that needs the change is named")
+	assert.NotContains(t, body, "`eu`", "eu is already at the desired schema, so it is not named")
 	assert.NotContains(t, body, "✅ **No schema changes detected**", "a target still has work, so the comment never closes as a no-op")
 	assert.NotContains(t, body, "Confirmation required", "the apply runs every target's plan in one step")
 	assert.NotContains(t, body, "schemabot apply-confirm")
@@ -267,7 +267,7 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
 	body := awaitCommentContaining(t, apply, "ADD COLUMN `email`")
-	assert.Contains(t, body, "`eu`, `us`", "the comment names every target the plan runs on")
+	assert.Contains(t, body, " · rolling out to both targets\n", "the plan runs on every target")
 	assert.NotContains(t, body, "Confirmation required", "the apply runs every target's plan in one step")
 
 	created := awaitRolloutApply(t, svc, dbName, apply)
@@ -298,7 +298,7 @@ func TestE2EIndependentRolloutWithWorkOnTheReviewedTargetAppliesEveryTarget(t *t
 // execution policy, both reshaping the users primary key: the schema change
 // engine refuses the reshape and the policy routes it to native DDL on each
 // target. The comment the apply command posts discloses that direct change
-// under the targets that run it, and the apply it creates in the same step
+// on the plan both targets run, and the apply it creates in the same step
 // gives us's task us's own direct verdict.
 func TestE2EApplyRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 	dbName := "webhook_rollout_direct"
@@ -315,7 +315,7 @@ func TestE2EApplyRunsAnotherTargetsDisclosedDirectChange(t *testing.T) {
 
 	apply := runRolloutCommandWithFiles(t, svc, dbName, "schemabot apply -e "+driftEnv+" --allow-unsafe", files)
 	body := awaitCommentContaining(t, apply, "**Direct execution**")
-	assert.Contains(t, body, "`eu`, `us`", "the comment discloses the direct change under the targets that run it")
+	assert.Contains(t, body, " · rolling out to both targets\n", "the direct change is disclosed on the plan every target runs")
 
 	created := awaitRolloutApply(t, svc, dbName, apply)
 
@@ -498,8 +498,8 @@ func TestE2EAutoPlanPostsCommentWhenOnlyAnotherTargetHasWork(t *testing.T) {
 	}, nil))
 
 	body := awaitCommentContaining(t, result, "ADD COLUMN `email`")
-	assert.Contains(t, body, "rolling out to 1 of 2 targets (1 already has it)")
-	assert.Contains(t, body, "Needs it: `us` · Already has it: `eu`")
+	assert.Contains(t, body, " · rolling out to target `us`\n")
+	assert.NotContains(t, body, "`eu`", "eu is already at the desired schema, so it is not named")
 	assert.Equal(t, "action_required", rolloutCheck(t, svc, dbName).Conclusion)
 }
 
@@ -1444,7 +1444,7 @@ func TestE2EApplyStopsForConfirmationWhenAnotherTargetsPlanChangesWhileStarting(
 	}
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "The plan for target `us` changed while this apply was starting")
+	body := awaitCommentContaining(t, apply, "The plan for target `us` changed before this apply could start")
 	assert.Contains(t, body, "- `users` (alter) now runs a different statement\n", "the cause names how us's plan changed")
 	assert.Contains(t, body, "Confirmation required")
 	assert.Contains(t, body, "MODIFY COLUMN `email`", "the comment shows us's plan as it is now")
@@ -1494,7 +1494,7 @@ func TestE2EApplyNamesThePrimarysDriftWhenItStopsARolloutWhileStarting(t *testin
 	}
 
 	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
-	body := awaitCommentContaining(t, apply, "The plan for target `eu` changed while this apply was starting")
+	body := awaitCommentContaining(t, apply, "The plan for target `eu` changed before this apply could start")
 	assert.Contains(t, body, "- `users` (alter) now runs a different statement\n", "the cause names the primary's drifted statement")
 	assert.Contains(t, body, "MODIFY COLUMN `email`", "the comment shows eu's plan as it is now")
 	assert.Contains(t, body, "Confirmation required")

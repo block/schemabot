@@ -229,7 +229,6 @@ func TestRenderPlanComment_ManualConfirmationKeepsAttributedChanges(t *testing.T
 		PendingManualConfirmation: true,
 		PausedApplyCause: &templates.PausedApplyCauseData{
 			Heading: "The plan this apply would be checked against could not be read",
-			Remedy:  "Nothing has run. Review the statements above, then confirm to apply them.",
 		},
 	}
 

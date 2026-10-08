@@ -2093,14 +2093,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to 2 of 3 targets (1 already has it)
-
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_1`, `us/testapp_2` · Already has it: `us/testapp_3`
-
-</details>
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to targets `us/testapp_1`, `us/testapp_2`
 
 
 ---
@@ -2151,14 +2144,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to 2 of 3 targets (1 already has it)
-
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_2`, `us/testapp_3` · Already has it: `us/testapp_1`
-
-</details>
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to targets `us/testapp_2`, `us/testapp_3`
 
 
 ---
@@ -2234,13 +2220,6 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 📋 **Plan**: **2** tables to alter · rolling out to both targets
 
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_1`, `us/testapp_2`
-
-</details>
-
 
 ---
 
@@ -2274,13 +2253,6 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 - `users`: ~297 MB across 3 targets · largest ~104 MB on `us/testapp_3` · smallest ~95.0 MB
 
 📋 **Plan**: **2** tables to alter · rolling out to all 3 targets
-
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_1`, `us/testapp_2`, `us/testapp_3`
-
-</details>
 
 
 ---
@@ -3661,10 +3633,8 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 
 ⚠️ **Schema changes differ from the plan this apply was started from**
 - `orders` (alter) now runs a different statement
-- `products` (alter) is new since this apply was started
+- `products` (alter) is new
 - `shipments` (create) is no longer planned
-
-Nothing has run.
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 

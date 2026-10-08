@@ -73,8 +73,7 @@ func withDistinctPlan(data PlanCommentData) PlanCommentData {
 // target heading. The unsafe changes it discloses are every such target's,
 // so they name none. The existing copies are read from one target alone, so
 // they name it: a reader would otherwise take them for every target's. The
-// converged orders_b gets no section, only the count and names under the plan
-// summary.
+// converged orders_b is not named anywhere.
 func TestRenderPlanComment_RolloutDisclosuresNameOnlyTheTargetCopiesWereReadFrom(t *testing.T) {
 	body := RenderPlanComment(primaryDropsLegacyPlan("production"))
 
@@ -83,30 +82,19 @@ func TestRenderPlanComment_RolloutDisclosuresNameOnlyTheTargetCopiesWereReadFrom
 	assert.Equal(t, 1, strings.Count(body, "unsafe change detected"), "the warning is said once")
 	assert.Equal(t, 1, strings.Count(body, "destroys work in progress"), "the copy is said once")
 	assert.NotContains(t, body, groupNoChanges, "the converged target has no section")
-	assert.Contains(t, body, "rolling out to 1 of 2 targets (1 already has it)")
-	assert.Contains(t, body, "Needs it: `shop/orders_a` · Already has it: `shop/orders_b`")
+	assert.Contains(t, body, " · rolling out to target `shop/orders_a`\n")
+	assert.NotContains(t, body, "orders_b", "the target already there is not named")
 }
 
 // When targets run different plans, each plan's heading names the targets
-// that run it, so the Targets block under the plan summary does not list them
-// again: it lists only the targets already at the schema, and is left out
-// when every target has work.
-func TestRenderPlanComment_HeadedRolloutListsOnlyTargetsThatAlreadyHaveIt(t *testing.T) {
+// that run it and the summary counts them; the target already at the schema
+// is not named.
+func TestRenderPlanComment_HeadedRolloutCountsOnlyTargetsWithWork(t *testing.T) {
 	body := RenderPlanComment(withDistinctPlan(primaryDropsLegacyPlan("production")))
 
 	assert.Contains(t, body, "### Target `shop/orders_c`")
-	assert.Contains(t, body, "<details>\n<summary>Targets</summary>\n\nAlready has it: `shop/orders_b`\n\n</details>\n")
-	assert.NotContains(t, body, "Needs it:")
-
-	data := withDistinctPlan(primaryDropsLegacyPlan("production"))
-	drift := *data.DeploymentDrift
-	drift.Plans = slices.DeleteFunc(slices.Clone(drift.Plans), DeploymentPlanGroup.Empty)
-	drift.Deployments = slices.DeleteFunc(slices.Clone(drift.Deployments), func(d DeploymentDriftEntry) bool { return d.Target == "orders_b" })
-	data.DeploymentDrift = &drift
-	body = RenderPlanComment(data)
-
-	assert.Contains(t, body, "### Target `shop/orders_c`")
-	assert.NotContains(t, body, "<summary>Targets</summary>", "every target with work is named by its plan's heading")
+	assert.Contains(t, body, " · rolling out to 2 targets\n")
+	assert.NotContains(t, body, "orders_b", "the target already there is not named")
 }
 
 // A target that shares its plan with other targets is still named on its
@@ -120,7 +108,7 @@ func TestRenderPlanComment_RolloutCopiesNameTheirTargetInASharedPlan(t *testing.
 
 	assert.NotContains(t, body, "### ", "one plan renders with no target heading")
 	assert.Contains(t, body, "On target `shop/orders_a`:\n\n⚠️ **Applying destroys work in progress**")
-	assert.Contains(t, body, "rolling out to 2 of 3 targets (1 already has it)")
+	assert.Contains(t, body, " · rolling out to targets `shop/orders_a`, `shop/orders_c`\n")
 }
 
 // When targets run different plans, the disclosures read from the target
