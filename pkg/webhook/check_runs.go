@@ -172,7 +172,7 @@ var namespacePlacementRefusedBlock = checkBlockReason{
 // (MG-12).
 var narrowedApplyBlock = checkBlockReason{
 	blockingReason: checkstate.BlockNarrowedApply,
-	message:        "An apply ran on one target only; plan the whole environment to check every target before this check can pass.",
+	message:        "An apply was requested for one target only; plan the whole environment to check every target before this check can pass.",
 }
 
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
@@ -35,9 +36,11 @@ func (h *Handler) storeApplyCheckRecord(ctx context.Context, client *ghclient.In
 }
 
 // narrowedApplyCheckSummary is the stored Change column for an environment
-// whose last apply was narrowed to one target. The apply comment names the
+// whose last apply was narrowed to one target. It is written before the apply
+// dispatches and kept once it completes, so it says the apply was requested,
+// which holds whether or not it went on to run. The apply comment names the
 // target.
-const narrowedApplyCheckSummary = "an apply ran on one target only; plan the whole environment to check every target"
+const narrowedApplyCheckSummary = "an apply was requested for one target only; plan the whole environment to check every target"
 
 // storeNarrowedApplyCheck blocks the environment's check before an apply
 // narrowed to one rollout member dispatches. The narrowed plan says nothing
@@ -51,7 +54,15 @@ func (h *Handler) storeNarrowedApplyCheck(ctx context.Context, client *ghclient.
 		"repo", repo, "pr", pr, "head_sha", schema.HeadSHA, "environment", environment,
 		"database_type", schema.Type, "database", schema.Database,
 		"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
-	blocked := reviewDriftOutcome{state: driftBlocked, summary: narrowedApplyCheckSummary, block: narrowedApplyBlock}
+	// A row already blocked for reconciliation keeps that block: work may have
+	// reached the target, and narrowed_apply would trade "reconcile the target"
+	// for "re-plan", which an ordinary plan of the whole environment lifts.
+	blocked := reviewDriftOutcome{
+		state:    driftBlocked,
+		summary:  narrowedApplyCheckSummary,
+		block:    narrowedApplyBlock,
+		preserve: checkstate.ReconciliationBlockingReasons(),
+	}
 	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
 	if err != nil {
 		return headSHA, fmt.Errorf("block check for apply narrowed to %s: %w", planResp.NarrowedTo, err)

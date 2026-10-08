@@ -14,6 +14,8 @@
 package checkstate
 
 import (
+	"slices"
+
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -138,6 +140,21 @@ var blockClasses = map[string]blockClass{
 func BlockingReasonIsClassified(reason string) bool {
 	_, ok := blockClasses[reason]
 	return ok
+}
+
+// ReconciliationBlockingReasons returns every durable blocking reason that
+// says work may have reached the target, sorted. A guard block written over a
+// row carrying one of them would trade "reconcile the target" for "re-plan",
+// so writers that must not weaken a block keep these rows as they are.
+func ReconciliationBlockingReasons() []string {
+	var reasons []string
+	for reason, class := range blockClasses {
+		if class == blockReconciliation {
+			reasons = append(reasons, reason)
+		}
+	}
+	slices.Sort(reasons)
+	return reasons
 }
 
 // Reason codes for why a stored check row reads the way it does on a given

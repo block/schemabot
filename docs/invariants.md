@@ -585,7 +585,10 @@ and `settleChecksReplacedByNewType` in `pkg/webhook/pull_request.go`, the latter
 `handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and `checkHasStartedApply` in
 `pkg/webhook/check_aggregate.go`), and the storage write that marks a stale plan successful only
 while no apply owns the row (`MarkStalePlanSuccessful` in `pkg/storage/internal/sqlstore/checks.go`);
-close and reopen handlers release nothing they cannot read (`pkg/webhook/pull_request.go`).
+close and reopen handlers release nothing they cannot read (`pkg/webhook/pull_request.go`); and the
+guard block a narrowed apply writes, which keeps a reconciliation block in place instead of replacing
+it (`storeNarrowedApplyCheck` in `pkg/webhook/apply_check_records.go`, `UpsertGuardBlock` in
+`pkg/storage/internal/sqlstore/checks.go`).
 
 ### MG-7: A completed rollback never shows green
 

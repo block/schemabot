@@ -52,6 +52,10 @@ type reviewDriftOutcome struct {
 	// apply it refuses names the right fix. Unset is review-time deployment
 	// drift, which is what the rollup reports.
 	block checkBlockReason
+	// preserve lists stored blocking reasons a blocked outcome must not
+	// replace: a row already carrying one keeps it, because it is the stronger
+	// block. Empty for outcomes the rollup reports, which rewrite any block.
+	preserve []string
 }
 
 // blockingReason is the stored reason for a blocked outcome.
@@ -387,7 +391,12 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		BlockingReason: blockingReason,
 		ChangeSummary:  changeSummary,
 	}
-	stored, err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	var stored bool
+	if driftBlocked && len(drift.preserve) > 0 {
+		stored, err = h.service.Storage().Checks().UpsertGuardBlock(ctx, check, drift.preserve)
+	} else {
+		stored, err = h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	}
 	if errors.Is(err, storage.ErrCheckNotFound) {
 		// The PR closed and its check state was cleaned up while this plan ran.
 		// There is no gate left for the result to land on, so the plan itself is

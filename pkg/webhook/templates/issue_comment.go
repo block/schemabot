@@ -55,10 +55,11 @@ func RenderUnsupportedTargetFlag(action string) string {
 // RenderTargetMissingEnv renders the message posted when `--target` is given
 // without `-e`. A target is a member of one environment's rollout, so the
 // usage line keeps the target the caller typed and asks only for the
-// environment.
+// environment. The target is unvalidated text from the comment, so the usage
+// line is a code span it cannot break out of.
 func RenderTargetMissingEnv(action, target string) string {
-	return fmt.Sprintf("`--target` picks a target inside one environment, so it needs `-e` too.\n\n"+
-		"**Usage**: `schemabot %s -e <environment> --target %s`", action, target)
+	return "`--target` picks a target inside one environment, so it needs `-e` too.\n\n" +
+		"**Usage**: " + inlineCode(fmt.Sprintf("schemabot %s -e <environment> --target %s", action, target))
 }
 
 // StopCommandAcceptedData contains data for a PR comment stop acknowledgement.

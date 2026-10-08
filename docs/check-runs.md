@@ -533,7 +533,7 @@ Run output remains human-readable and may change.
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
 | `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
 | `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the database's server-configured environments are allowed for this deployment. |
-| `narrowed_apply` | Per-database row | An apply ran on one target of the rollout (`--target`), so nothing shows the other targets have the change. A plan of the whole environment (`schemabot plan -e <environment>`) replaces it with that plan's result. |
+| `narrowed_apply` | Per-database row | An apply was requested for one target of the rollout (`--target`), so nothing shows the other targets have the change. It does not replace a reconciliation block already on the row. A plan of the whole environment (`schemabot plan -e <environment>`) replaces it with that plan's result. |
 
 Generic plan and apply errors can still publish `completed` / `failure` without
 a stable `blocking_reason` when the error is not one of the explicit classes

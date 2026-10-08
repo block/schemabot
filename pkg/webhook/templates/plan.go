@@ -936,11 +936,11 @@ func writeNarrowedTarget(sb *strings.Builder, data PlanCommentData) {
 		return
 	}
 	if data.IsLocked {
-		fmt.Fprintf(sb, "\n"+glyph.Attention+" **Target `%s` only.** Other targets in `%s` are left as they are, and the schema check blocks merge until a plan of every target shows the change is complete.\n",
-			data.Target, data.Environment)
+		fmt.Fprintf(sb, "\n"+glyph.Attention+" **Target %s only.** Other targets in `%s` are left as they are, and the schema check blocks merge until a plan of every target shows the change is complete.\n",
+			inlineCode(data.Target), data.Environment)
 	} else {
-		fmt.Fprintf(sb, "\n"+glyph.Attention+" **Target `%s` only.** Other targets in `%s` are not planned, and this plan does not update the schema check.\n",
-			data.Target, data.Environment)
+		fmt.Fprintf(sb, "\n"+glyph.Attention+" **Target %s only.** Other targets in `%s` are not planned, and this plan does not update the schema check.\n",
+			inlineCode(data.Target), data.Environment)
 	}
 	fmt.Fprintf(sb, "Once every target has the change, run `%s` to update the check.\n",
 		scopedCommand("schemabot plan", data.Environment, data.ScopedDatabase, data.Tenant))
@@ -964,7 +964,7 @@ func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 		parts = append(parts, fmt.Sprintf("**Schema Name**: %s", inlineCode(data.SchemaName)))
 	}
 	if data.Target != "" {
-		parts = append(parts, fmt.Sprintf("**Target**: `%s`", data.Target))
+		parts = append(parts, fmt.Sprintf("**Target**: %s", inlineCode(data.Target)))
 	}
 	if data.Tenant != "" {
 		parts = append(parts, fmt.Sprintf("**Tenant**: `%s`", data.Tenant))

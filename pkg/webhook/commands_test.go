@@ -1493,11 +1493,11 @@ func TestParseCommand_QuoteReply(t *testing.T) {
 }
 
 // `--target` narrows plan and apply to one rollout member. Its value is the
-// target's name or deployment/target, kept exactly as typed because it is
-// matched against the server config. A value that is missing, carries
-// punctuation, or holds a stray separator rejects the line as malformed rather
-// than narrowing to a name nobody typed, and the value is never read as a
-// plain word that turns the line into prose.
+// target's name or deployment/target, and target names are opaque, so it is
+// forwarded exactly as typed, never trimmed: the server matches it against the
+// rollout and names the valid targets when it matches none. A missing value
+// rejects the line as malformed, and the value is never read as a plain word
+// that turns the line into prose.
 func TestParseCommandTargetFlag(t *testing.T) {
 	parser := NewCommandParser()
 
@@ -1540,14 +1540,20 @@ func TestParseCommandTargetFlag(t *testing.T) {
 			expected: CommandResult{IsMention: true},
 		},
 		{
-			name:     "trailing punctuation",
-			body:     "schemabot apply -e staging --target payments-002.",
-			expected: CommandResult{IsMention: true},
+			name: "opaque target name forwarded as typed",
+			body: "schemabot apply -e staging --target .payments@002",
+			expected: CommandResult{
+				Action: "apply", Environment: "staging", Target: ".payments@002",
+				Found: true, IsMention: true,
+			},
 		},
 		{
-			name:     "two separators",
-			body:     "schemabot apply -e staging --target prod/west/payments-002",
-			expected: CommandResult{IsMention: true},
+			name: "trailing punctuation kept, never trimmed",
+			body: "schemabot apply -e staging --target payments-002.",
+			expected: CommandResult{
+				Action: "apply", Environment: "staging", Target: "payments-002.",
+				Found: true, IsMention: true,
+			},
 		},
 		{
 			name:     "given twice",

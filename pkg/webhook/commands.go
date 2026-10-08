@@ -116,7 +116,6 @@ type CommandParser struct {
 	environmentNameRegex *regexp.Regexp
 	databaseNameRegex    *regexp.Regexp
 	tenantRegex          *regexp.Regexp
-	targetRegex          *regexp.Regexp
 }
 
 // NewCommandParser creates a new command parser.
@@ -128,10 +127,6 @@ func NewCommandParser() *CommandParser {
 		environmentNameRegex: regexp.MustCompile(`^[a-z0-9][a-z0-9_]*(?:-[a-z0-9_]+)*$`),
 		databaseNameRegex:    regexp.MustCompile(`^[a-zA-Z0-9_-]+$`),
 		tenantRegex:          regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`),
-		// A rollout member is named by its target, or by deployment/target.
-		// Each part opens and closes on a letter or digit, so trailing
-		// punctuation is never trimmed into a name.
-		targetRegex: regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?(?:/[a-zA-Z0-9](?:[a-zA-Z0-9._-]*[a-zA-Z0-9])?)?$`),
 	}
 }
 
@@ -372,7 +367,11 @@ func (p *CommandParser) parseDirective(words []string) directive {
 	if database, given := d.values["-d"]; given && !p.databaseNameRegex.MatchString(database) {
 		malformed = true
 	}
-	if target, given := d.values["--target"]; given && !p.targetRegex.MatchString(target) {
+	// Target names are opaque to the parser: the server matches the selector
+	// exactly against the rollout and names the valid ones when it matches
+	// none, so the word is forwarded as typed and only a missing one is
+	// rejected here.
+	if target, given := d.values["--target"]; given && target == "" {
 		malformed = true
 	}
 	if malformed {

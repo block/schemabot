@@ -65,6 +65,22 @@ func TestPlanCommentWithoutTargetNamesNone(t *testing.T) {
 	assert.NotContains(t, rendered, "--target")
 }
 
+// A narrowed comment echoes the target inside code spans it cannot break
+// out of. Target names are opaque, and the missing-environment reply echoes
+// one the server has not yet matched, so a backtick in the name must not end
+// the span and turn the rest of the comment into markdown.
+func TestNarrowedTargetStaysInsideItsCodeSpan(t *testing.T) {
+	data := narrowedPlan()
+	data.Target = "pay`ments"
+	rendered := RenderPlanComment(data)
+
+	assert.Contains(t, rendered, "**Target**: `` pay`ments ``")
+	assert.Contains(t, rendered, "**Target `` pay`ments `` only.**")
+	assert.Equal(t, "`--target` picks a target inside one environment, so it needs `-e` too.\n\n"+
+		"**Usage**: `` schemabot plan -e <environment> --target **x`y** ``",
+		RenderTargetMissingEnv("plan", "**x`y**"))
+}
+
 func TestRenderTargetFlagUsage(t *testing.T) {
 	assert.Equal(t, "The `--target` flag is not supported for `rollback`. Only `plan` and `apply` take it.",
 		RenderUnsupportedTargetFlag("rollback"))
