@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
@@ -37,12 +38,14 @@ func TestLocalClient_IgnoreTablesPatternWithholdsRuntimeTablesThroughApply(t *te
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 
 	familyTables := []string{"relay_1_feed", "relay_2_feed"}
+	const dropFamily = "DROP TABLE IF EXISTS `relay_1_feed`, `relay_2_feed`"
+	_, err = db.ExecContext(ctx, dropFamily)
+	require.NoError(t, err, "drop feed tables left by an earlier run")
 	t.Cleanup(func() {
-		for _, name := range familyTables {
-			if _, err := db.ExecContext(context.WithoutCancel(t.Context()), "DROP TABLE IF EXISTS `"+name+"`"); err != nil {
-				t.Logf("drop %s: %v", name, err)
-			}
-		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
+		defer cancel()
+		_, err := db.ExecContext(cleanupCtx, dropFamily)
+		assert.NoError(t, err, "drop feed tables")
 	})
 
 	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")
