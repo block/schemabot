@@ -183,7 +183,9 @@ func (h *Handler) executeApply(
 	confirmedMemberWork := false
 	switch {
 	case runsMemberWork:
-		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment))
+		covered, reason, coverErr := h.confirmationCoversMemberWork(ctx, expectedPendingPlanID, planResp.PlanID, environment, func() string {
+			return h.primaryTargetName(rollout.work, planResp, schemaResult.Database, environment)
+		})
 		if coverErr != nil {
 			h.rejectUnverifiedMemberWork(ctx, repo, pr, installationID, schemaResult, environment, requestedBy, actionName, storedPlan != nil, expectedPendingPlanID, planResp.PlanID,
 				"could not verify that the reviewed plans cover the other targets' work", coverErr,

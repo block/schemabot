@@ -701,8 +701,9 @@ func MemberPlanUnsafeWithoutOptInDetail(target, table, namespace string) string 
 // creation refused one rollout target's own plan for an unsafe change the
 // comment behind the apply did not show: it showed one plan, which does not
 // carry the change. No `--allow-unsafe` covers a change the comment never
-// disclosed, so the line does not suggest one, and points instead at a fresh
-// apply, whose comment shows each target's own plan. Like
+// disclosed, so the line points at a fresh apply, whose comment shows each
+// target's own plan, and says that is what lets `--allow-unsafe` consent to the
+// change. Like
 // MemberPlanBlockedDetail, it is built from names SchemaBot controls; table is
 // empty for a VSchema change in namespace.
 func MemberPlanUndisclosedUnsafeDetail(target, table, namespace string) string {
@@ -710,6 +711,6 @@ func MemberPlanUndisclosedUnsafeDetail(target, table, namespace string) string {
 	if table == "" {
 		subject = "the VSchema of namespace " + inlineCode(namespace)
 	}
-	return fmt.Sprintf("Target %s has an unsafe change on %s that the plan comment never disclosed, so `--allow-unsafe` cannot consent to it. Nothing was applied. Run apply again for this environment to review each target's own plan.",
+	return fmt.Sprintf("Target %s has an unsafe change on %s that the plan comment never showed, so nothing was applied. Run apply again for this environment: its comment shows each target's own plan, and `--allow-unsafe` can then consent to this change.",
 		inlineCode(target), subject)
 }

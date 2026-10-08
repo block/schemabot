@@ -58,12 +58,16 @@ func (h *Handler) refusePendingRollout(ctx context.Context, client *ghclient.Ins
 // is read against the environment's configured targets instead, so a
 // deployment that addresses several targets still qualifies it. Targets that
 // cannot be resolved leave the name qualified, which never reads as another
-// target.
+// target. A plan with no target is named by its deployment alone, the only
+// name it has.
 func (h *Handler) primaryTargetName(work memberWork, planResp *apitypes.PlanResponse, database, environment string) string {
 	if work.primary != "" {
 		return work.primary
 	}
 	primary := plannedPrimaryMember(planResp)
+	if primary.Target == "" {
+		return primary.Deployment
+	}
 	targets, err := h.service.Config().ResolveDatabaseTargets(database, environment)
 	if err != nil {
 		h.logger.Warn("could not resolve the environment's targets to name the primary target; naming it with its target",
@@ -379,7 +383,11 @@ func unconfirmedWorkMessage(work memberWork, reason string) string {
 // work now must have been planned with the same work in the confirmed round,
 // and work the confirmed comment did not show never runs on the strength of
 // that confirmation.
-func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID, currentPlanID, environment, primary string) (bool, string, error) {
+//
+// primary names the target current was planned against. It is called only to
+// build a refusal, so naming the target costs nothing on a confirmation that
+// covers the work.
+func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID, currentPlanID, environment string, primary func() string) (bool, string, error) {
 	plans := h.service.Storage().Plans()
 	pinned, err := plans.Get(ctx, pinnedPlanID)
 	if err != nil {
@@ -400,7 +408,7 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 	// afterwards would keep a confirmation already known not to cover the work.
 	if primaryTargetChanged(pinned, current) {
 		h.logConfirmedPrimaryTargetChanged(pinned, current, environment)
-		return false, primaryTargetDifferenceReason(primary, workTarget), nil
+		return false, primaryTargetDifferenceReason(primary(), workTarget), nil
 	}
 	confirmed, err := h.service.MemberPlansForReviewRound(ctx, pinned, environment)
 	if err != nil {
@@ -417,7 +425,7 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 // roundCoversWork reports whether the confirm-time round runs only work the
 // confirmed round planned, with a reason naming the target and the part of its
 // work that differs when it does not. primary names the target current was
-// planned against. The primary member must still be the reviewed member, even
+// planned against, called only when the refusal names it. The primary member must still be the reviewed member, even
 // when it converged while other targets still have work. With that identity
 // fixed, only targets with work are compared.
 //
@@ -426,13 +434,13 @@ func (h *Handler) confirmationCoversMemberWork(ctx context.Context, pinnedPlanID
 // before reading the member plans this function compares. That earlier refusal
 // is the enforcement point; this one keeps the comparison complete on its own
 // for any caller that has the plans already.
-func roundCoversWork(primary string, pinned, current *storage.Plan, confirmed, now map[string]*storage.Plan) (bool, string) {
+func roundCoversWork(primary func() string, pinned, current *storage.Plan, confirmed, now map[string]*storage.Plan) (bool, string) {
 	if primaryTargetChanged(pinned, current) {
-		return false, primaryTargetDifferenceReason(primary, workTarget)
+		return false, primaryTargetDifferenceReason(primary(), workTarget)
 	}
 	if current.HasWork() {
 		if difference := memberWorkDifference(pinned, current); difference != workUnchanged {
-			return false, primaryTargetDifferenceReason(primary, difference)
+			return false, primaryTargetDifferenceReason(primary(), difference)
 		}
 	}
 	for _, member := range slices.Sorted(maps.Keys(now)) {
