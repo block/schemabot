@@ -1029,7 +1029,8 @@ type EtreConfig struct {
 	Addr string `yaml:"addr"`
 	// DatabaseType selects the engine the resolver assembles connections for and
 	// is required (no implicit default): "mysql" and "strata" read the MySQL
-	// block; "vitess" reads the Vitess block.
+	// block; "vitess" reads the Vitess block; "postgres" reads the Postgres
+	// block.
 	DatabaseType string `yaml:"database_type"`
 	// EntityType is the Etre entity type recording the target clusters.
 	EntityType string `yaml:"entity_type"`
@@ -1050,6 +1051,9 @@ type EtreConfig struct {
 	MySQL EtreMySQLConfig `yaml:"mysql,omitempty"`
 	// Vitess holds the Vitess engine knobs, read when DatabaseType is "vitess".
 	Vitess EtreVitessConfig `yaml:"vitess,omitempty"`
+	// Postgres holds the PostgreSQL engine knobs, read when DatabaseType is
+	// "postgres".
+	Postgres EtrePostgresConfig `yaml:"postgres,omitempty"`
 	// Credentials configures the credentials for the connection.
 	Credentials EtreCredentialsConfig `yaml:"credentials"`
 }
@@ -1097,6 +1101,25 @@ type EtreVitessConfig struct {
 	HostField string `yaml:"host_field,omitempty"`
 	// DefaultPort is appended to the vtgate host when it carries no port.
 	DefaultPort string `yaml:"default_port,omitempty"`
+}
+
+// EtrePostgresConfig holds the PostgreSQL knobs for an Etre resolver: how to
+// find the host, how to verify the server, and which role owns the tables the
+// engine creates. The database a connection is made to comes from the
+// credential secret, read as JSON {username, password, dbname} (the format AWS
+// uses for RDS database secrets).
+type EtrePostgresConfig struct {
+	// HostField is the entity field holding the connection host.
+	HostField string `yaml:"host_field"`
+	// DefaultPort is appended to the host when it has no port.
+	DefaultPort string `yaml:"default_port,omitempty"`
+	// CARef selects the CA bundle the server certificate is verified against:
+	// "embedded:rds-global" or "file:<absolute-path>". Optional for RDS
+	// endpoints, which default to the embedded RDS bundle; required otherwise.
+	CARef string `yaml:"ca_ref,omitempty"`
+	// TableOwner is the role new tables are created as. Optional: empty creates
+	// them as the connected role.
+	TableOwner string `yaml:"table_owner,omitempty"`
 }
 
 // EtreCredentialsConfig configures credentials for an Etre-resolved target.
