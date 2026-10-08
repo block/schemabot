@@ -9503,6 +9503,83 @@ func TestGenerationOperationKeys(t *testing.T) {
 		"a retry's manifest is its own operation key alone")
 }
 
+// A member settled at creation never dispatches, regardless of whether the
+// rollout uses work or finalizer operations. Pending task-less operations and
+// siblings that already dispatched still belong to the generation, and target
+// qualification depends on the full rollout, including its converged member.
+func TestGenerationOperationKeys_ConvergedMembers(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name    string
+		sibling storage.ApplyOperation
+		include bool
+	}{
+		{name: "converged work", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, OperationKind: storage.ApplyOperationKindWork}},
+		{name: "converged finalizer", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, OperationKind: storage.ApplyOperationKindGroupFinalizer}},
+		{name: "pending taskless work", sibling: storage.ApplyOperation{State: state.ApplyOperation.Pending, OperationKind: storage.ApplyOperationKindWork}, include: true},
+		{name: "pending finalizer", sibling: storage.ApplyOperation{State: state.ApplyOperation.Pending, OperationKind: storage.ApplyOperationKindGroupFinalizer}, include: true},
+		{name: "completed started work", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, StartedAt: &now}, include: true},
+		{name: "completed started finalizer", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, OperationKind: storage.ApplyOperationKindGroupFinalizer, StartedAt: &now}, include: true},
+		{name: "completed remote apply", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, ExternalID: "remote-apply"}, include: true},
+		{name: "completed legacy remote apply", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, EngineResumeContext: "remote-apply"}, include: true},
+		{name: "completed remote operation", sibling: storage.ApplyOperation{State: state.ApplyOperation.Completed, ExternalOperationID: "remote-operation"}, include: true},
+		{name: "failed never started", sibling: storage.ApplyOperation{State: state.ApplyOperation.Failed}, include: true},
+		{name: "stopped never started", sibling: storage.ApplyOperation{State: state.ApplyOperation.Stopped}, include: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sibling := tc.sibling
+			sibling.ID, sibling.ApplyID = 2, 100
+			sibling.Deployment, sibling.Target, sibling.OperationKey = "default", "payments-001", "payments-001"
+			if sibling.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+				sibling.OperationKey += "/group_finalizer"
+			}
+			ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+				1: {ID: 1, ApplyID: 100, Deployment: "default", Target: "payments-002", OperationKey: "payments-002/commerce/80-/users", State: state.ApplyOperation.Pending},
+				2: &sibling,
+				3: {ID: 3, ApplyID: 100, Deployment: "other", Target: "payments-003", OperationKey: "payments-003"},
+			}}
+			client := &GRPCClient{storage: &mockStorage{operations: ops}}
+			apply := &storage.Apply{ID: 100, ApplyIdentifier: "apply-converged-member"}
+			scope, err := client.loadOperationApplyTaskScope(t.Context(), apply, 1)
+			require.NoError(t, err)
+			want := []string{"payments-002/commerce/80-/users"}
+			if tc.include {
+				want = append([]string{sibling.OperationKey}, want...)
+			}
+			assert.Equal(t, want, scope.generationOperationKeys())
+			assert.Equal(t, "payments-002", scope.memberTarget, "the converged target still qualifies the working member's dispatch")
+
+			ops.ops[1].State, ops.ops[1].StartedAt = state.ApplyOperation.Completed, &now
+			completed, err := client.loadOperationApplyTaskScope(t.Context(), apply, 1)
+			require.NoError(t, err)
+			assert.Equal(t, want, completed.generationOperationKeys(), "completion after dispatch must not narrow the generation")
+			completed.operation.Attempt = 1
+			assert.Equal(t, []string{ops.ops[1].OperationKey}, completed.generationOperationKeys(), "deliberate retries still declare only their own key")
+		})
+	}
+}
+
+// A dispatch always declares its own key. The manifest is built from the rows
+// of the claimed operation's deployment, and the claimed row is the one key
+// this dispatch is about to send, so it stays in the manifest even when its
+// row has the shape of a converged placeholder: a data plane must never
+// receive an operation its generation does not list.
+func TestGenerationOperationKeys_ClaimedOperationAlwaysDeclaresItself(t *testing.T) {
+	ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		1: {ID: 1, ApplyID: 100, Deployment: "default", Target: "payments-001", OperationKey: "payments-001/commerce/80-/users", State: state.ApplyOperation.Completed},
+		2: {ID: 2, ApplyID: 100, Deployment: "default", Target: "payments-002", OperationKey: "payments-002/commerce/80-/users", State: state.ApplyOperation.Completed},
+		3: {ID: 3, ApplyID: 100, Deployment: "default", Target: "payments-003", OperationKey: "payments-003/commerce/80-/users", State: state.ApplyOperation.Pending},
+	}}
+	require.True(t, ops.ops[1].IsConvergedPlaceholder(), "the claimed row has the placeholder shape")
+	client := &GRPCClient{storage: &mockStorage{operations: ops}}
+	apply := &storage.Apply{ID: 100, ApplyIdentifier: "apply-claimed-placeholder"}
+
+	scope, err := client.loadOperationApplyTaskScope(t.Context(), apply, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"payments-001/commerce/80-/users", "payments-003/commerce/80-/users"}, scope.generationOperationKeys(),
+		"the claimed operation declares itself; the converged sibling is left out")
+}
+
 // The idempotency key and the generation manifest are derived independently
 // from the same scope, so they must rotate together on a deliberate retry: a
 // rotated key paired with a still-full manifest (or an unrotated key paired

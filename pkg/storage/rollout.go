@@ -21,3 +21,16 @@ func (op *ApplyOperation) RolloutOperation(released bool) state.RolloutOperation
 		PauseOnFailure:    isPause && !released,
 	}
 }
+
+// IsConvergedPlaceholder reports whether the row records a member that apply
+// creation settled on the spot because its target already held the change:
+// completed without ever starting and with no remote identity, so no driver
+// claimed it and nothing was dispatched for it. Apply creation writes every
+// converged member in this shape, work and finalizer alike, and a driven
+// operation can never reach it: a claim stamps StartedAt before dispatch and a
+// remote dispatch records the data plane's id. The remote manifest reads this
+// to leave out keys that will never arrive.
+func (op *ApplyOperation) IsConvergedPlaceholder() bool {
+	return state.IsState(op.State, state.ApplyOperation.Completed) && op.StartedAt == nil &&
+		op.RemoteApplyID() == "" && op.ExternalOperationID == ""
+}
