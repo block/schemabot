@@ -2892,6 +2892,21 @@ func manifestGatedVerdict(derived string) bool {
 		state.IsState(derived, state.Apply.Reverted)
 }
 
+// manifestHoldSuccessor returns the apply that took over the work of an apply
+// held open for its generation manifest, or "" when none has. It reads the
+// marker from storage rather than from the caller's copy, which can predate the
+// admission that recorded it.
+func (s *Service) manifestHoldSuccessor(ctx context.Context, apply *storage.Apply) (string, error) {
+	fresh, err := s.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("reload apply %s held open for its manifest: %w", apply.ApplyIdentifier, err)
+	}
+	if fresh == nil {
+		return "", fmt.Errorf("reload apply %s held open for its manifest: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	return fresh.SupersededBy, nil
+}
+
 // updateApplyStateFromOperations re-derives applies.state from the apply's child
 // apply_operations rows and persists it when it differs from the current value.
 //
@@ -2967,19 +2982,20 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// early would make later dispatches refuse to attach, silently diverging
 	// the declared shards from the recorded outcome.
 	//
-	// A newer apply on the same targets ends the wait. Admission lets a new
-	// generation in beside this one only once everything attached here has
-	// settled, and from then on refuses the missing operations, so they can no
-	// longer arrive and the verdict is the one over what did.
+	// A newer generation taking over this apply's work ends the wait.
+	// Admission lets one in beside this apply only once everything attached
+	// here has settled, records the handoff on this apply (SupersededBy), and
+	// from then on refuses the missing operations, so they can no longer arrive
+	// and the verdict is the one over what did.
 	manifestHeld := false
 	if manifestGatedVerdict(derived) {
 		if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
-			successor, err := s.storage.Applies().NewerApplyOnTargets(ctx, apply)
+			successor, err := s.manifestHoldSuccessor(ctx, apply)
 			if err != nil {
-				return applyProjectionResult{}, fmt.Errorf("check for a newer apply on the targets of apply %s held open for its manifest: %w", apply.ApplyIdentifier, err)
+				return applyProjectionResult{}, err
 			}
 			if successor != "" {
-				s.logger.Warn("operator: settling apply held open for manifest operations that never attached; a newer apply holds its targets, so they can no longer arrive",
+				s.logger.Warn("operator: settling apply held open for manifest operations that never attached; a newer apply took over its work, so they can no longer arrive",
 					append(apply.LogAttrs(),
 						"driver", driverID,
 						"missing_operation_keys", missing,

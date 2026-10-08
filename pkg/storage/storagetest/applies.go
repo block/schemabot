@@ -810,37 +810,42 @@ func TestApplies(t *testing.T, h Harness) {
 	// ever attached: target-001 already held the change, so its operation was
 	// never dispatched, and the apply is held running for it. Everything that
 	// attached has finished. The dispatcher's next generation on the deployment
-	// is admitted past it, a late operation of the old generation is refused
-	// whether or not the newer apply has finished, and the old apply can see
-	// the newer one that ended its wait. An apply
-	// that declares no generation is still refused, so only a new generation
-	// from the dispatcher proves the missing operations will not come.
+	// is admitted past it and records that it took over the held apply's work.
+	// From then on a late operation of the old generation is refused whether or
+	// not the newer apply has finished, and the held apply reserves nothing, so
+	// the newer generation runs, stops, and starts again beside it before its
+	// driver settles it. An apply that declares no generation is still refused,
+	// so only a new generation from the dispatcher proves the missing operations
+	// will not come.
 	t.Run("Create_NewGenerationAdmittedPastSettledManifestHold", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 		lock := CreateLock(t, store, "apply_manifest_hold_db", storage.DatabaseTypeMySQL)
 		held := createManifestGeneration(t, store, lock, "apply_manifest_held", 9400, []string{"target-001", "target-002"},
-			"target-002", state.ApplyOperation.Completed, state.Task.Completed)
+			state.ApplyOperation.Completed, state.Task.Completed)
 		held.State = state.Apply.Running
 		require.NoError(t, store.Applies().Update(ctx, held))
 
 		err := createApplyOnDeployment(t, store, lock, "apply_without_generation", 9401, "default")
 		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "an apply that declares no generation does not end another's")
 		assert.Contains(t, err.Error(), "apply_manifest_held", "the refusal names the apply holding the deployment")
-
-		newer, err := store.Applies().NewerApplyOnTargets(ctx, held)
+		stored, err := store.Applies().Get(ctx, held.ID)
 		require.NoError(t, err)
-		assert.Empty(t, newer, "nothing newer holds the targets yet")
+		require.NotNil(t, stored)
+		assert.Empty(t, stored.SupersededBy, "a refused create takes nothing over")
 
 		next := createManifestGeneration(t, store, lock, "apply_next_generation", 9402, []string{"target-001", "target-002"},
-			"target-002", state.ApplyOperation.Pending, state.Task.Pending)
+			state.ApplyOperation.Pending, state.Task.Pending)
 
-		newer, err = store.Applies().NewerApplyOnTargets(ctx, held)
+		stored, err = store.Applies().Get(ctx, held.ID)
 		require.NoError(t, err)
-		assert.Equal(t, next.ApplyIdentifier, newer, "the held apply sees the generation that ended its wait")
-		newer, err = store.Applies().NewerApplyOnTargets(ctx, next)
+		require.NotNil(t, stored)
+		assert.Equal(t, next.ApplyIdentifier, stored.SupersededBy, "the admission records the generation that took over the held apply's work")
+		assert.Equal(t, state.Apply.Running, stored.State, "the admission leaves the held apply's verdict to its driver")
+		storedNext, err := store.Applies().Get(ctx, next.ID)
 		require.NoError(t, err)
-		assert.Empty(t, newer)
+		require.NotNil(t, storedNext)
+		assert.Empty(t, storedNext.SupersededBy)
 
 		late := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-001", Target: "target-001", State: state.ApplyOperation.Pending}
 		lateTask := newTask(held, "task_manifest_held_late", "users", time.Now())
@@ -848,15 +853,93 @@ func TestApplies(t *testing.T, h Harness) {
 		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "a late operation of the old generation must not run beside the newer apply")
 		assert.Contains(t, err.Error(), "apply_next_generation")
 
-		next.State = state.Apply.Completed
+		next.State = state.Apply.Running
+		require.NoError(t, store.Applies().Update(ctx, next), "the held apply no longer reserves the deployment, so the newer generation runs")
+		next.State = state.Apply.Stopped
 		require.NoError(t, store.Applies().Update(ctx, next))
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   next.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		resumed, err := store.Applies().ClaimApplyByID(ctx, next.ID, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, resumed, "the newer generation starts again beside the held apply")
+		storedNext, err = store.Applies().Get(ctx, next.ID)
+		require.NoError(t, err)
+		require.NotNil(t, storedNext)
+		assert.Equal(t, state.Apply.Resuming, storedNext.State)
+
+		err = createApplyOnDeployment(t, store, lock, "apply_without_generation_beside_next", 9403, "default")
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "the newer generation reserves the deployment")
+		assert.Contains(t, err.Error(), "apply_next_generation")
+		assert.NotContains(t, err.Error(), "apply_manifest_held", "the held apply reserves nothing once its work was taken over")
+
+		resumed.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ctx, resumed))
 		lateTask = newTask(held, "task_manifest_held_late_after_next", "users", time.Now())
 		err = store.Applies().AttachOperationWithTasks(ctx, held, late, []*storage.Task{lateTask})
-		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "the newer apply finishing does not hand its targets back to the old generation")
+		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "the newer apply finishing does not hand the work back to the old generation")
 
 		ops, err := store.ApplyOperations().ListByApply(ctx, held.ID)
 		require.NoError(t, err)
 		assert.Len(t, ops, 1, "the refused attaches leave no operation behind")
+		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_after_takeover", 9404, "default"),
+			"with the newer generation finished, the held apply still running does not reserve the deployment")
+	})
+
+	// A deployment-keyed generation is stopped after only target-002 attached
+	// and finished. An unrelated apply then runs and finishes on the same
+	// deployment, and the generation is started again. The unrelated apply was
+	// never admitted past the generation, so it took nothing over: target-001
+	// still attaches, and the generation carries no handoff that would let its
+	// driver settle it without target-001.
+	t.Run("Create_UnrelatedApplyDoesNotTakeOverAResumedGeneration", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_manifest_resumed_db", storage.DatabaseTypeMySQL)
+		generation := createManifestGeneration(t, store, lock, "apply_manifest_resumed", 9420, []string{"target-001", "target-002"},
+			state.ApplyOperation.Completed, state.Task.Completed)
+		generation.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, generation))
+
+		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_unrelated_between", 9421, "default"),
+			"a stopped generation reserves nothing")
+		unrelated, err := store.Applies().GetByApplyIdentifier(ctx, "apply_unrelated_between")
+		require.NoError(t, err)
+		require.NotNil(t, unrelated)
+		unrelated.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ctx, unrelated))
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   generation.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		resumed, err := store.Applies().ClaimApplyByID(ctx, generation.ID, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, resumed, "the stopped generation starts again")
+		resumed.State = state.Apply.Running
+		require.NoError(t, store.Applies().Update(ctx, resumed))
+
+		stored, err := store.Applies().Get(ctx, generation.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Empty(t, stored.SupersededBy, "an unrelated apply that ran in between takes nothing over")
+
+		late := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-001", Target: "target-001", State: state.ApplyOperation.Pending}
+		lateTask := newTask(generation, "task_manifest_resumed_late", "users", time.Now())
+		require.NoError(t, store.Applies().AttachOperationWithTasks(ctx, generation, late, []*storage.Task{lateTask}),
+			"the generation's own missing operation still attaches")
+		ops, err := store.ApplyOperations().ListByApply(ctx, generation.ID)
+		require.NoError(t, err)
+		assert.Len(t, ops, 2)
 	})
 
 	// A new generation is admitted only past an apply that provably has no work
@@ -881,14 +964,14 @@ func TestApplies(t *testing.T, h Harness) {
 				ctx := t.Context()
 				store := h.NewStorage(t)
 				lock := CreateLock(t, store, "apply_live_hold_db", storage.DatabaseTypeMySQL)
-				live := createManifestGeneration(t, store, lock, "apply_live_hold", int64(9410+2*i), tc.manifest, "target-002", tc.opState, tc.taskState)
+				live := createManifestGeneration(t, store, lock, "apply_live_hold", int64(9410+2*i), tc.manifest, tc.opState, tc.taskState)
 				if !state.IsState(tc.applyState, state.Apply.Pending) {
 					live.State = tc.applyState
 					require.NoError(t, store.Applies().Update(ctx, live))
 				}
 
 				_, err := createManifestGenerationErr(t, store, lock, "apply_refused_generation", int64(9411+2*i), []string{"target-001", "target-002"},
-					"target-002", state.ApplyOperation.Pending, state.Task.Pending)
+					state.ApplyOperation.Pending, state.Task.Pending)
 				require.ErrorIs(t, err, storage.ErrActiveApplyExists)
 				assert.Contains(t, err.Error(), "apply_live_hold")
 			})
@@ -1151,16 +1234,16 @@ func createApplyOnDeployment(t *testing.T, store storage.Storage, lock *storage.
 
 // createManifestGeneration creates the first dispatch of a deployment-keyed
 // generation on the lock's "default" production deployment: an apply declaring
-// the manifest, with one attached operation for target and one task, in the
-// given states.
-func createManifestGeneration(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, manifest []string, target, opState, taskState string) *storage.Apply {
+// the manifest, with one attached operation for target-002 and one task, in
+// the given states.
+func createManifestGeneration(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, manifest []string, opState, taskState string) *storage.Apply {
 	t.Helper()
-	apply, err := createManifestGenerationErr(t, store, lock, identifier, planID, manifest, target, opState, taskState)
+	apply, err := createManifestGenerationErr(t, store, lock, identifier, planID, manifest, opState, taskState)
 	require.NoError(t, err)
 	return apply
 }
 
-func createManifestGenerationErr(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, manifest []string, target, opState, taskState string) (*storage.Apply, error) {
+func createManifestGenerationErr(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, manifest []string, opState, taskState string) (*storage.Apply, error) {
 	t.Helper()
 	apply := &storage.Apply{
 		ApplyIdentifier:       identifier,
@@ -1178,7 +1261,7 @@ func createManifestGenerationErr(t *testing.T, store storage.Storage, lock *stor
 	}
 	task := newTask(apply, "task_"+identifier, "users", time.Now())
 	task.State = taskState
-	op := &storage.ApplyOperation{Deployment: "default", OperationKey: target, Target: target, State: opState}
+	op := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-002", Target: "target-002", State: opState}
 	id, err := store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{op})
 	if err != nil {
 		return nil, err

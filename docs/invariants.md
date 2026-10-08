@@ -959,8 +959,9 @@ drive can still reopen it (ST-1). An operation is in progress from the moment a 
 until it reaches a terminal state, and one awaiting a retry only while a driver is retrying it.
 An apply held open only for operations its generation declared but never attached stops reserving
 its targets once every operation it did attach has settled and a newer generation of those targets
-is created: the newer generation is admitted, no operation can attach to the older apply after
-that, and the older apply's driver settles it over what attached.
+is created: the newer generation is admitted and records that it took over the older apply's work,
+no operation can attach to the older apply after that, and the older apply's driver settles it over
+what attached.
 
 The check runs whenever an apply is created or moved back into an active state, serialized across
 instances by an advisory lock keyed on (database, database type, environment) and held for the
@@ -977,8 +978,10 @@ active parents and over terminal parents with an operation in progress
 (`checkNoActiveApplyForTargets`, `checkNoInProgressRolloutForTargets`), under the apply target lock
 (`pkg/storage/internal/sqlstore/applies.go`, `pkg/storage/internal/sqlstore/locks.go`). The
 admission past a settled manifest hold is `checkNoActiveApplyForNewGeneration` and
-`settledManifestHold`, the attach refusal is `checkAttachTargetsNotTakenOver` in the same file, and
-the driver settles the held apply once `NewerApplyOnTargets` names a successor
+`settledManifestHold`, which record the handoff in the create's transaction (`markAdmittedPast`);
+`activeApplyHoldersForTargets` stops counting the held apply once it carries the handoff, and
+`AttachOperationWithTasks` refuses an attach to it, all in the same file. The driver settles the
+held apply once its stored row names the apply that took over its work
 (`updateApplyStateFromOperations`, `pkg/api/operator.go`).
 
 ### OW-6: There is one way to claim work

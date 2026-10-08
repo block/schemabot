@@ -2876,19 +2876,19 @@ func (c *LocalClient) refuseAttachToTerminalApply(ctx context.Context, req *tern
 }
 
 // refuseAttachToTakenOverApply refuses an operation arriving for an apply whose
-// targets a newer apply now holds. The newer generation was admitted because
-// this one had settled everything that attached and was waiting only for
-// operations like this one, so running it now would run work the newer apply
-// owns on the same deployment.
+// work a newer apply took over. The newer generation was admitted because this
+// one had settled everything that attached and was waiting only for operations
+// like this one, so running it now would run work the newer apply owns on the
+// same deployment.
 func (c *LocalClient) refuseAttachToTakenOverApply(req *ternv1.ApplyRequest, apply *storage.Apply, operationKey string, err error) *ternv1.ApplyResponse {
-	c.logger.Warn("Apply: refusing to attach operation to an apply whose targets a newer apply holds; dispatch is rejected",
+	c.logger.Warn("Apply: refusing to attach operation to an apply whose work a newer apply took over; dispatch is rejected",
 		append(apply.LogAttrs(),
 			"operation_key", operationKey,
 			"idempotency_key", req.IdempotencyKey,
 			"error", err)...)
 	return &ternv1.ApplyResponse{
 		Accepted:     false,
-		ErrorMessage: fmt.Sprintf("a newer apply holds the targets of apply %s; operation %s cannot attach", apply.ApplyIdentifier, operationKey),
+		ErrorMessage: fmt.Sprintf("a newer apply took over the work of apply %s; operation %s cannot attach", apply.ApplyIdentifier, operationKey),
 	}
 }
 
@@ -2908,18 +2908,13 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 			fmt.Errorf("apply %s records operation keys leading with their target = %t, but this dispatch names member target %q", apply.ApplyIdentifier, keysLeadWithTarget, scope.memberTarget)), nil
 	}
 
-	// A newer apply on this apply's targets means a later generation was
-	// admitted past it, so this operation is refused as late before the table
-	// conflict with that newer apply's tasks can refuse it without saying so.
-	// The attach re-checks under the target lock, which is what makes the
-	// refusal hold.
-	successor, err := c.storage.Applies().NewerApplyOnTargets(ctx, apply)
-	if err != nil {
-		return nil, fmt.Errorf("check for a newer apply on the targets of apply %s before attaching operation %s: %w", apply.ApplyIdentifier, operationKey, err)
-	}
-	if successor != "" {
+	// A newer generation admitted past this apply took over its work, so this
+	// operation is refused as late before the table conflict with that newer
+	// apply's tasks can refuse it without saying so. The attach re-checks the
+	// marker under the target lock, which is what makes the refusal hold.
+	if apply.SupersededBy != "" {
 		return c.refuseAttachToTakenOverApply(req, apply, operationKey,
-			fmt.Errorf("apply %s holds the targets of apply %s: %w", successor, apply.ApplyIdentifier, storage.ErrApplyTakenOver)), nil
+			fmt.Errorf("apply %s took over the work of apply %s: %w", apply.SupersededBy, apply.ApplyIdentifier, storage.ErrApplyTakenOver)), nil
 	}
 
 	// An attach already belongs to a keyed apply, so a conflict here is another

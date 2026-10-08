@@ -587,9 +587,10 @@ func TestLocalClient_Apply_MemberTargetKeyingCannotMixWithinADeployment(t *testi
 // is ever dispatched, and it completes. Its apply stays open waiting for
 // payments-001. The operator re-runs the apply: the new generation is
 // admitted rather than refused as a conflict, because everything the held
-// apply attached has settled. A payments-001 dispatch arriving late for the
-// held apply is then refused, so the held apply can never start work on a
-// target the new generation now owns.
+// apply attached has settled, and it records that it took over the held
+// apply's work. A payments-001 dispatch arriving late for the held apply is
+// then refused, so the held apply can never start work on a target the new
+// generation now owns.
 func TestLocalClient_Apply_RerunAdmittedPastSettledManifestHold(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -613,18 +614,22 @@ func TestLocalClient_Apply_RerunAdmittedPastSettledManifestHold(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, admitted.Accepted, "the re-run must be admitted past the settled hold: %s", admitted.ErrorMessage)
 	assert.NotEqual(t, held.ApplyId, admitted.ApplyId, "the re-run runs under its own apply")
+	storedHeld, err := stor.Applies().GetByApplyIdentifier(ctx, held.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, storedHeld)
+	assert.Equal(t, admitted.ApplyId, storedHeld.SupersededBy, "the re-run records that it took over the held apply's work")
 
 	late, err := client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, heldKey, "payments-001"))
 	require.NoError(t, err)
 	assert.False(t, late.Accepted, "a late operation for the held apply must be refused while the re-run is in flight")
-	assert.Contains(t, late.ErrorMessage, "a newer apply holds the targets of apply "+held.ApplyId,
+	assert.Contains(t, late.ErrorMessage, "a newer apply took over the work of apply "+held.ApplyId,
 		"the refusal names the takeover, not the re-run's table conflict")
 
 	settleDispatchedApply(t, stor, admitted.ApplyId, state.Apply.Completed)
 	late, err = client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, heldKey, "payments-001"))
 	require.NoError(t, err)
 	assert.False(t, late.Accepted, "a late operation for the held apply must be refused after the re-run finishes")
-	assert.Contains(t, late.ErrorMessage, "a newer apply holds the targets of apply "+held.ApplyId)
+	assert.Contains(t, late.ErrorMessage, "a newer apply took over the work of apply "+held.ApplyId)
 
 	ops, err := stor.ApplyOperations().ListByApply(ctx, heldApply.ID)
 	require.NoError(t, err)

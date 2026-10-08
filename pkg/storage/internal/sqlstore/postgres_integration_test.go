@@ -187,10 +187,10 @@ func testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t *testing.T, h post
 // against a successor that commits while the attach waits for the apply target
 // lock. An apply is held open for target-001, which never attached, and
 // everything it did attach has settled. A late attach of target-001 waits
-// while the target lock is held; a newer apply on the same deployment commits
-// and the lock is released. The attach must see that newer apply and refuse,
-// so its snapshot has to be taken after the lock is granted rather than
-// before the wait.
+// while the target lock is held; a newer generation's admission commits, with
+// the handoff it records on the held apply, and the lock is released. The
+// attach must see that handoff and refuse, so its snapshot has to be taken
+// after the lock is granted rather than before the wait.
 func testPostgresAttachSeesSuccessorAdmittedWhileWaiting(t *testing.T, h postgresHarness) {
 	ctx := t.Context()
 	store := h.NewStorage(t)
@@ -233,18 +233,23 @@ func testPostgresAttachSeesSuccessorAdmittedWhileWaiting(t *testing.T, h postgre
 	}()
 	waitForPostgresAdvisoryLockWaiter(t, h.db)
 
-	_, err = h.db.ExecContext(ctx, `
+	admission, err := h.db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = admission.ExecContext(ctx, `
 		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type, repository, pull_request, environment, deployment, engine, state, options)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '{}')
 	`, "apply_attach_race_successor", lock.ID, 9502, held.Database, held.DatabaseType, held.Repository, held.PullRequest, held.Environment, held.Deployment, held.Engine, state.Apply.Pending)
 	require.NoError(t, err)
+	_, err = admission.ExecContext(ctx, `UPDATE applies SET superseded_by = $1 WHERE id = $2`, "apply_attach_race_successor", held.ID)
+	require.NoError(t, err)
+	require.NoError(t, admission.Commit())
 	released, err := namedlock.Postgres{}.Release(ctx, lockConn, lockName)
 	require.NoError(t, err)
 	require.True(t, released)
 
 	select {
 	case err := <-attachErr:
-		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "the attach must see the successor that committed while it waited")
+		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "the attach must see the handoff that committed while it waited")
 		assert.Contains(t, err.Error(), "apply_attach_race_successor")
 	case <-time.After(attachRaceDeadline):
 		require.FailNow(t, "the attach did not return after the target lock was released")

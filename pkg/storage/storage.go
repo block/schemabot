@@ -633,17 +633,11 @@ type ApplyStore interface {
 	// operation keyed by its target is refused with
 	// ErrApplyOperationKeyingMismatch when the deployment's existing work
 	// operations of the apply are not keyed that way, and the reverse, so one
-	// target's work can never attach under two keys. On success the operation's ID and every
+	// target's work can never attach under two keys. An attach to an apply
+	// whose work a newer generation took over (Apply.SupersededBy) fails with
+	// ErrApplyTakenOver. On success the operation's ID and every
 	// task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
-
-	// NewerApplyOnTargets returns the identifier of the earliest apply created
-	// after the given one that reserves one of its deployments, in any state, or
-	// "" when there is none. A newer apply on an apply's targets proves its
-	// generation is over: admission lets one in beside an active apply only
-	// past a generation held open for operations that never attached, and
-	// refuses those operations once it has.
-	NewerApplyOnTargets(ctx context.Context, apply *Apply) (string, error)
 
 	// Get returns an apply by ID, or nil if not found.
 	Get(ctx context.Context, id int64) (*Apply, error)
