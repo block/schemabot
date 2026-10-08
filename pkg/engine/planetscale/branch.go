@@ -104,10 +104,11 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 			continue
 		}
 
-		ddlChanges, vschemaChanged, _, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
+		diff, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
 		if err != nil {
 			return fmt.Errorf("validate keyspace %s: %w", ks, err)
 		}
+		ddlChanges, vschemaChanged := diff.tableChanges, diff.vschemaChanged
 
 		if len(ddlChanges) > 0 {
 			var summaries []string
@@ -216,11 +217,26 @@ func (e *Engine) fetchBranchSchemaViaMySQL(ctx context.Context, password *ps.Dat
 	return result, nil
 }
 
+// keyspaceDiff is the result of diffing one keyspace's desired schema files
+// against its current schema.
+type keyspaceDiff struct {
+	// tableChanges holds one entry per planned DDL statement.
+	tableChanges []engine.TableChange
+	// violations holds the lint findings on the planned statements, in
+	// statement order.
+	violations []engine.LintViolation
+	// vschemaChanged reports whether the desired VSchema differs from the
+	// current one.
+	vschemaChanged bool
+	// currentVSchemaRaw is the current VSchema fetched for the comparison,
+	// empty when the keyspace has none or no VSchema is desired.
+	currentVSchemaRaw string
+}
+
 // diffKeyspace diffs a single keyspace's schema between a branch and the
-// desired schema files. Returns DDL changes, whether VSchema differs, and the
-// current VSchema content fetched for that diff.
+// desired schema files, linting the planned statements in the same pass.
 // Shared by Plan() and verifyBranchMatchesDesired().
-func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) ([]engine.TableChange, bool, string, error) {
+func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) (keyspaceDiff, error) {
 	var currentTableSchemas []table.TableSchema
 	if tables, ok := currentSchema[ks]; ok {
 		currentTableSchemas = append(currentTableSchemas, tables...)
@@ -228,12 +244,12 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 
 	desiredTableSchemas, parseErr := parseDesiredSchemas(ks, ns)
 	if parseErr != nil {
-		return nil, false, "", parseErr
+		return keyspaceDiff{}, parseErr
 	}
 
 	plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
 	if planErr != nil {
-		return nil, false, "", fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
+		return keyspaceDiff{}, fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
 	}
 
 	if len(plan.Changes) > 0 {
@@ -266,10 +282,12 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 	}
 
 	var tableChanges []engine.TableChange
+	var violations []engine.LintViolation
 	for _, pc := range plan.Changes {
+		violations = append(violations, lint.PlannedChangeViolations(pc)...)
 		stmtType, _, classifyErr := ddl.ClassifyStatement(pc.Statement)
 		if classifyErr != nil {
-			return nil, false, "", fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
+			return keyspaceDiff{}, fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
 		}
 		change := engine.TableChange{
 			Table:     pc.TableName,
@@ -287,7 +305,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 		if stmtType == ddl.StatementCreateTable || stmtType == ddl.StatementAlterTable {
 			declaresFK, fkErr := ddl.DeclaresForeignKey(pc.Statement)
 			if fkErr != nil {
-				return nil, false, "", fmt.Errorf("foreign key check for table %s in keyspace %s: %w", pc.TableName, ks, fkErr)
+				return keyspaceDiff{}, fmt.Errorf("foreign key check for table %s in keyspace %s: %w", pc.TableName, ks, fkErr)
 			}
 			if declaresFK {
 				change.ExecutionMode = engine.ExecutionModeBlocked
@@ -312,7 +330,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 		if fetchErr != nil {
 			var psErr *ps.Error
 			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
-				return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+				return keyspaceDiff{}, fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
 			}
 			// Keyspace has no VSchema on this branch yet — either it has
 			// never had one, or the API has not converged after a recent
@@ -336,7 +354,12 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 		}
 	}
 
-	return tableChanges, vschemaChanged, currentVSchemaRaw, nil
+	return keyspaceDiff{
+		tableChanges:      tableChanges,
+		violations:        violations,
+		vschemaChanged:    vschemaChanged,
+		currentVSchemaRaw: currentVSchemaRaw,
+	}, nil
 }
 
 // verifyBranchMatchesMain uses Spirit's differ to compare the branch schema
@@ -374,13 +397,13 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 			mainNS.Files[t.Name+".sql"] = t.Schema + ";"
 		}
 
-		changes, _, _, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
+		diff, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
 		if diffErr != nil {
 			return fmt.Errorf("diff branch vs main for %s: %w", ks, diffErr)
 		}
-		if len(changes) > 0 {
+		if len(diff.tableChanges) > 0 {
 			return fmt.Errorf("keyspace %s: branch has %d DDL differences from main after refresh — branch has stale state from a previous apply",
-				ks, len(changes))
+				ks, len(diff.tableChanges))
 		}
 	}
 

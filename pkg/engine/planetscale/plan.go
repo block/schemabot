@@ -15,7 +15,6 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/lint"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/vschema"
 )
@@ -135,15 +134,16 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		g.Go(func() error {
 			ns := req.SchemaFiles[ks]
 
-			tableChanges, vschemaChanged, currentVSchemaRaw, diffErr := e.diffKeyspace(gCtx, client, org, req.Database, branch, ks, ns, currentSchema)
+			diff, diffErr := e.diffKeyspace(gCtx, client, org, req.Database, branch, ks, ns, currentSchema)
 			if diffErr != nil {
 				return diffErr
 			}
+			vschemaChanged, currentVSchemaRaw := diff.vschemaChanged, diff.currentVSchemaRaw
 
 			sc := engine.SchemaChange{
 				Namespace:    ks,
 				Metadata:     make(map[string]string),
-				TableChanges: tableChanges,
+				TableChanges: diff.tableChanges,
 			}
 			if tables, ok := currentSchema[ks]; ok {
 				sc.OriginalFiles = make(map[string]string, len(tables)+1)
@@ -184,24 +184,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				}
 			}
 
-			var currentTableSchemas []table.TableSchema
-			if tables, ok := currentSchema[ks]; ok {
-				currentTableSchemas = append(currentTableSchemas, tables...)
-			}
-			desiredTableSchemas, _ := parseDesiredSchemas(ks, ns)
-			plan, _ := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
-
-			var violations []engine.LintViolation
-			if plan != nil {
-				for _, pc := range plan.Changes {
-					violations = append(violations, lint.PlannedChangeViolations(pc)...)
-				}
-			}
-
 			mu.Lock()
 			results[ks] = &keyspaceResult{
 				change:     sc,
-				violations: violations,
+				violations: diff.violations,
 				hasChanges: len(sc.TableChanges) > 0 || sc.Metadata["vschema_changed"] == "true",
 			}
 			mu.Unlock()

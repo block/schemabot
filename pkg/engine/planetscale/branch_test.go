@@ -39,9 +39,9 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 				"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 			},
 		}
-		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
-		assert.Empty(t, changes, "matching schemas should produce no changes")
+		assert.Empty(t, diff.tableChanges, "matching schemas should produce no changes")
 	})
 
 	t.Run("missing column detected as ALTER", func(t *testing.T) {
@@ -55,11 +55,11 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 				"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  `phone` varchar(20) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 			},
 		}
-		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
-		require.Len(t, changes, 1, "should detect one ALTER TABLE change")
-		assert.Equal(t, "users", changes[0].Table)
-		assert.Contains(t, changes[0].DDL, "phone")
+		require.Len(t, diff.tableChanges, 1, "should detect one ALTER TABLE change")
+		assert.Equal(t, "users", diff.tableChanges[0].Table)
+		assert.Contains(t, diff.tableChanges[0].DDL, "phone")
 	})
 
 	t.Run("extra column on branch detected as ALTER DROP", func(t *testing.T) {
@@ -73,11 +73,11 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 				"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `email` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 			},
 		}
-		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
-		require.Len(t, changes, 1, "should detect DROP COLUMN for stale column")
-		assert.Equal(t, "users", changes[0].Table)
-		assert.Contains(t, changes[0].DDL, "stale_col")
+		require.Len(t, diff.tableChanges, 1, "should detect DROP COLUMN for stale column")
+		assert.Equal(t, "users", diff.tableChanges[0].Table)
+		assert.Contains(t, diff.tableChanges[0].DDL, "stale_col")
 	})
 
 	t.Run("missing table detected as CREATE", func(t *testing.T) {
@@ -89,11 +89,11 @@ func TestDiffKeyspace_DetectsSchemaChanges(t *testing.T) {
 				"users.sql": "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
 			},
 		}
-		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
-		require.Len(t, changes, 1, "should detect CREATE TABLE")
-		assert.Equal(t, "users", changes[0].Table)
-		assert.Equal(t, ddl.StatementCreateTable, changes[0].Operation)
+		require.Len(t, diff.tableChanges, 1, "should detect CREATE TABLE")
+		assert.Equal(t, "users", diff.tableChanges[0].Table)
+		assert.Equal(t, ddl.StatementCreateTable, diff.tableChanges[0].Operation)
 	})
 }
 
@@ -117,12 +117,12 @@ func TestDiffKeyspace_RefusesForeignKeys(t *testing.T) {
 			},
 		}
 
-		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
-		require.Len(t, changes, 1)
-		assert.Equal(t, "orders", changes[0].Table)
-		assert.Equal(t, engine.ExecutionModeBlocked, changes[0].ExecutionMode)
-		assert.Equal(t, foreignKeyRefusalReason, changes[0].ModeReason)
+		require.Len(t, diff.tableChanges, 1)
+		assert.Equal(t, "orders", diff.tableChanges[0].Table)
+		assert.Equal(t, engine.ExecutionModeBlocked, diff.tableChanges[0].ExecutionMode)
+		assert.Equal(t, foreignKeyRefusalReason, diff.tableChanges[0].ModeReason)
 	})
 
 	t.Run("an unrelated change to a table that has one is applicable", func(t *testing.T) {
@@ -134,11 +134,11 @@ func TestDiffKeyspace_RefusesForeignKeys(t *testing.T) {
 			},
 		}
 
-		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.NoError(t, err)
-		require.Len(t, changes, 1)
-		assert.Contains(t, changes[0].DDL, "note")
-		assert.Empty(t, changes[0].ExecutionMode, "adding a column is not the constraint Vitess refuses")
+		require.Len(t, diff.tableChanges, 1)
+		assert.Contains(t, diff.tableChanges[0].DDL, "note")
+		assert.Empty(t, diff.tableChanges[0].ExecutionMode, "adding a column is not the constraint Vitess refuses")
 	})
 }
 
@@ -164,9 +164,9 @@ func TestDiffKeyspace_RefusesTableDeclaredTwice(t *testing.T) {
 	// Map iteration order varies between runs, so plan repeatedly: every run
 	// must refuse with the same, fully named error.
 	for range 20 {
-		changes, _, _, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), nil, "", "", "", "myapp", desired, currentSchema)
 		require.EqualError(t, err, `table "orders" is declared by both schema files "myapp/orders.sql" and "myapp/orders_extras.sql". Declare each table in exactly one schema file`)
-		assert.Empty(t, changes)
+		assert.Empty(t, diff.tableChanges)
 	}
 }
 
@@ -203,32 +203,32 @@ func TestDiffKeyspace_VSchemaFetchErrors(t *testing.T) {
 
 	t.Run("NotFound treated as empty current VSchema", func(t *testing.T) {
 		client := &vschemaFetchStubClient{err: &ps.Error{Code: ps.ErrNotFound}}
-		changes, vschemaChanged, currentRaw, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema)
 		require.NoError(t, err)
-		assert.Empty(t, changes)
-		assert.True(t, vschemaChanged, "desired VSchema must surface as a change against a missing one")
-		assert.Empty(t, currentRaw)
+		assert.Empty(t, diff.tableChanges)
+		assert.True(t, diff.vschemaChanged, "desired VSchema must surface as a change against a missing one")
+		assert.Empty(t, diff.currentVSchemaRaw)
 	})
 
 	t.Run("non-NotFound API error fails the diff", func(t *testing.T) {
 		client := &vschemaFetchStubClient{err: &ps.Error{Code: ps.ErrInternal}}
-		_, _, _, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema)
+		_, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema)
 		require.ErrorContains(t, err, "fetch VSchema for keyspace myapp")
 	})
 
 	t.Run("non-API error fails the diff", func(t *testing.T) {
 		client := &vschemaFetchStubClient{err: errors.New("dial tcp: connection refused")}
-		_, _, _, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema)
+		_, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema)
 		require.ErrorContains(t, err, "fetch VSchema for keyspace myapp")
 	})
 
 	t.Run("matching VSchema reports no change", func(t *testing.T) {
 		client := &vschemaFetchStubClient{vschema: &ps.VSchema{Raw: desiredVSchema}}
-		changes, vschemaChanged, currentRaw, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema)
+		diff, err := e.diffKeyspace(t.Context(), client, "org", "mydb", "schemabot-mydb-abc", "myapp", desired, currentSchema)
 		require.NoError(t, err)
-		assert.Empty(t, changes)
-		assert.False(t, vschemaChanged)
-		assert.Equal(t, desiredVSchema, currentRaw)
+		assert.Empty(t, diff.tableChanges)
+		assert.False(t, diff.vschemaChanged)
+		assert.Equal(t, desiredVSchema, diff.currentVSchemaRaw)
 	})
 }
 
