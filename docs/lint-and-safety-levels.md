@@ -72,6 +72,13 @@ human decision. `--dry-run` previews the fixes without writing anything. Run it
 locally when a plan comes back with lint warnings you agree with — it edits
 your declarative files, so the fixes land in the same PR as the change.
 
+Only files that need a fix are rewritten, and only those are listed. A file
+with nothing to fix keeps its exact bytes, so a file in the
+`SHOW CREATE TABLE` form `onboard` writes stays in that form. A fixed file is
+written back as the parser's canonical rendering of the fixed table: one line,
+backtick-quoted identifiers, uppercase types. SQL comments in the file, the
+trailing semicolon, and the final newline are not kept.
+
 It reads the same files `plan` does: `.sql` files directly in the schema
 directory, or one level of namespace subdirectories (`<schema-dir>/<namespace>/*.sql`),
 and writes each fix back to the file it came from. Namespaces listed in
