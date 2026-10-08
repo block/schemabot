@@ -130,15 +130,17 @@ func CompileIgnoreTablePattern(entry string, foldCase bool) (*regexp.Regexp, err
 	if _, err := regexp.Compile(expr); err != nil {
 		return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)
 	}
-	if foldCase {
-		parsed, err := syntax.Parse(expr, syntax.Perl)
-		if err != nil {
-			return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)
-		}
-		foldRegexpCase(parsed)
-		expr = parsed.String()
+	// The anchors wrap the parsed expression's canonical form, not the text as
+	// written: a quote opened by \Q runs to the end of the text, so wrapped
+	// as written it would swallow the closing group and anchor.
+	parsed, err := syntax.Parse(expr, syntax.Perl)
+	if err != nil {
+		return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)
 	}
-	anchored := `\A(?:` + expr + `)\z`
+	if foldCase {
+		foldRegexpCase(parsed)
+	}
+	anchored := `\A(?:` + parsed.String() + `)\z`
 	re, err := regexp.Compile(anchored)
 	if err != nil {
 		return nil, fmt.Errorf("ignore_tables entry %s is not a valid regular expression: %w", QuoteIgnoreTablesEntry(entry), err)

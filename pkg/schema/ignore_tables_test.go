@@ -100,6 +100,17 @@ func TestCompileIgnoreTablePattern(t *testing.T) {
 	assert.True(t, folded.MatchString("Relay_12_Feed"))
 	assert.False(t, folded.MatchString("Relay_12_Feed_old"))
 
+	// \Q quotes to the end of the expression, so the anchors must not be
+	// appended to the text as written.
+	for _, foldCase := range []bool{false, true} {
+		quoted, err := CompileIgnoreTablePattern(`/\Qrelay.feed/`, foldCase)
+		require.NoError(t, err)
+		assert.True(t, quoted.MatchString("relay.feed"))
+		assert.False(t, quoted.MatchString("relayxfeed"), "the quoted dot is literal")
+		assert.False(t, quoted.MatchString("relay.feed_old"), "a quoted pattern still matches the whole name")
+		assert.Equal(t, foldCase, quoted.MatchString("Relay.Feed"))
+	}
+
 	_, err = CompileIgnoreTablePattern("relay_feed", false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `ignore_tables entry "relay_feed" is not a pattern`)
