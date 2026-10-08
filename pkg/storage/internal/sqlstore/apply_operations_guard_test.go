@@ -68,9 +68,12 @@ func TestOperationWriteGuardUpdateStatement(t *testing.T) {
 	}
 }
 
-// First-start admission checks an earlier member's failure independently of
-// cutover policy, while the shared release exemption and dispatched-plane
-// bypass still apply to both failure admission and phase sequencing.
+// First-start admission binds the earlier member's failure state ahead of the
+// cutover policy arms, with the release exemption bound last, on both
+// dialects. The gate's behavior on each dialect is covered by the storage
+// parity suite; this pins only the placeholder-to-argument alignment, which
+// no behavioral test can catch when a binding shifts into a neighbor's slot
+// of the same type.
 func TestWorkStartGateFailureAdmission(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -83,12 +86,6 @@ func TestWorkStartGateFailureAdmission(t *testing.T) {
 			gate := workStartGateSQL(tc.dialect)
 			args := workStartGateArgs()
 			assert.Equal(t, strings.Count(gate, "?"), len(args), "each admission placeholder has a positional argument")
-			assert.Contains(t, strings.Join(strings.Fields(gate), " "),
-				"AND ( earlier.state = ? OR ( apply_operations.cutover_policy = ?", "failure admission does not depend on cutover policy")
-			assert.Contains(t, gate, earlierRolloutMemberSQL, "a member's own shard copies remain unordered")
-			assert.Contains(t, gate, rolloutMembersOrderedHereSQL, "the data plane leaves admission to the dispatcher")
-			assert.True(t, strings.HasSuffix(gate, "AND "+releasedFailureExemptionSQL(tc.dialect)+"\n)"),
-				"continue and released pause exempt the failure admission arm too")
 			assert.Equal(t, []any{
 				state.ApplyOperation.Failed,
 				storage.CutoverPolicyBarrier,
