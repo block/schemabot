@@ -649,10 +649,13 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// Build list of desired table schemas from all namespaces. Every namespace
 	// is diffed as one set against the database, so a table two schema files
 	// declare, in one namespace or across them, is refused; files are read in
-	// sorted order so the refusal names the same pair on every run.
+	// sorted order so the refusal names the same pair on every run. Each
+	// table's namespace is recorded from its declaration, so the plan groups
+	// changes by namespace from the parse rather than by searching the files.
 	var desiredSchemas []table.TableSchema
 	var declared ddl.TableDeclarations
 	declaredByNamespace := make(map[string][]string, len(req.SchemaFiles))
+	namespaceByTable := make(map[string]string)
 	for _, namespace := range slices.Sorted(maps.Keys(req.SchemaFiles)) {
 		ns := req.SchemaFiles[namespace]
 		for _, filename := range slices.Sorted(maps.Keys(ns.Files)) {
@@ -675,6 +678,7 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 				}
 				desiredSchemas = append(desiredSchemas, table.TableSchema{Name: ct.TableName, Schema: stmt})
 				declaredByNamespace[namespace] = append(declaredByNamespace[namespace], ct.TableName)
+				namespaceByTable[ct.TableName] = namespace
 			}
 		}
 	}
@@ -822,47 +826,9 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		lintViolations = append(lintViolations, lint.PlannedChangeViolations(pc)...)
 	}
 
-	// Build per-namespace SchemaChanges.
-	// Spirit operates on a single database, but we group table changes by the
-	// namespace they belong to (from SchemaFiles keys) for consistency with
-	// multi-namespace engines like PlanetScale.
-	changesByNS := make(map[string][]engine.TableChange)
-	for _, tc := range changes {
-		ns, err := namespaceForTable(tc.Table, req.SchemaFiles)
-		if err != nil {
-			return nil, fmt.Errorf("namespace lookup for table %q: %w", tc.Table, err)
-		}
-		changesByNS[ns] = append(changesByNS[ns], tc)
-	}
-	originalFilesByNS := make(map[string]map[string]string, len(changesByNS))
-	for ns := range changesByNS {
-		originalFilesByNS[ns] = map[string]string{}
-	}
-	if len(req.SchemaFiles) == 1 {
-		for ns := range req.SchemaFiles {
-			for _, ts := range currentSchema {
-				originalFilesByNS[ns][ts.Name+".sql"] = ts.Schema
-			}
-		}
-	} else {
-		for _, ts := range currentSchema {
-			ns, err := namespaceForTable(ts.Name, req.SchemaFiles)
-			if err != nil {
-				return nil, fmt.Errorf("namespace lookup for original table %q: %w", ts.Name, err)
-			}
-			if _, ok := originalFilesByNS[ns]; ok {
-				originalFilesByNS[ns][ts.Name+".sql"] = ts.Schema
-			}
-		}
-	}
-	var schemaChanges []engine.SchemaChange
-	for ns, tableChanges := range changesByNS {
-		schemaChanges = append(schemaChanges, engine.SchemaChange{
-			Namespace:             ns,
-			TableChanges:          tableChanges,
-			OriginalFiles:         originalFilesByNS[ns],
-			OriginalFilesCaptured: true,
-		})
+	schemaChanges, err := groupChangesByNamespace(changes, currentSchema, namespaceByTable, req.SchemaFiles)
+	if err != nil {
+		return nil, err
 	}
 
 	// Applying this plan can meet a copy an earlier schema change left on the

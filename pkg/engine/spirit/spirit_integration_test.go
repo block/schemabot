@@ -677,6 +677,57 @@ func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
 	})
 }
 
+// The live database has `orders (id, status)`. In a two-namespace request,
+// billing/orders.sql declares a new `invoices` table and testdb/tables.sql
+// declares `orders` with an added `note` column. Each change is grouped under
+// the namespace whose file declares its table, not one whose file happens to
+// be named after it: the ALTER on `orders` belongs to testdb and the CREATE
+// of `invoices` to billing, on every run.
+func TestEngine_Plan_GroupsChangesByDeclaringNamespace(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create table")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	req := &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: schema.SchemaFiles{
+			"billing": &schema.Namespace{Files: map[string]string{"orders.sql": `CREATE TABLE invoices (
+				id INT NOT NULL,
+				PRIMARY KEY (id)
+			)`}},
+			"testdb": &schema.Namespace{Files: map[string]string{"tables.sql": `CREATE TABLE orders (
+				id INT NOT NULL,
+				status VARCHAR(50) NOT NULL,
+				note VARCHAR(50),
+				PRIMARY KEY (id)
+			)`}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	for range 20 {
+		result, err := eng.Plan(t.Context(), req)
+		require.NoError(t, err, "Plan()")
+		tablesByNamespace := make(map[string][]string)
+		var namespaces []string
+		for _, sc := range result.Changes {
+			namespaces = append(namespaces, sc.Namespace)
+			for _, tc := range sc.TableChanges {
+				tablesByNamespace[sc.Namespace] = append(tablesByNamespace[sc.Namespace], tc.Table)
+			}
+		}
+		require.Equal(t, []string{"billing", "testdb"}, namespaces)
+		require.Equal(t, map[string][]string{"billing": {"invoices"}, "testdb": {"orders"}}, tablesByNamespace)
+	}
+}
+
 func TestEngine_Plan_NewTable(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 

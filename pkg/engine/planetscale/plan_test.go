@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
@@ -111,6 +112,71 @@ func TestPlan_ReportsLintViolationsOfEveryStatement(t *testing.T) {
 	}
 	// Spirit does not fix the order of findings within a statement.
 	assert.ElementsMatch(t, []string{"orders", "refunds", "invoices"}, tables)
+}
+
+// Keyspaces `commerce` and `billing` each declare a table twice. Keyspaces
+// are diffed in parallel, but the plan reports the refusal of the first
+// keyspace in sorted order, `billing`, on every run, not whichever keyspace
+// finished first.
+func TestPlan_RefusalAcrossKeyspacesIsDeterministic(t *testing.T) {
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) { return &emptyMainBranchClient{}, nil })
+	table := func(name string) string {
+		return "CREATE TABLE `" + name + "` (`id` bigint NOT NULL, PRIMARY KEY (`id`));"
+	}
+	req := &engine.PlanRequest{
+		Database: "shop",
+		SchemaFiles: schema.SchemaFiles{
+			"commerce": &schema.Namespace{Files: map[string]string{"orders.sql": table("orders"), "orders_v2.sql": table("orders")}},
+			"billing":  &schema.Namespace{Files: map[string]string{"invoices.sql": table("invoices"), "invoices_v2.sql": table("invoices")}},
+		},
+		Credentials: &engine.Credentials{Metadata: map[string]string{"organization": "org", "token_name": "tn", "token_value": "tv"}},
+	}
+
+	for range 50 {
+		result, err := e.Plan(t.Context(), req)
+		require.EqualError(t, err, `table "invoices" is declared by both schema files "billing/invoices.sql" and "billing/invoices_v2.sql". Declare each table in exactly one schema file`)
+		assert.Nil(t, result)
+	}
+}
+
+// slowVSchemaClient serves an empty main branch whose VSchema reads take a
+// while to answer, returning early only when the caller gives up on them.
+type slowVSchemaClient struct {
+	emptyMainBranchClient
+	delay time.Duration
+}
+
+func (c *slowVSchemaClient) GetKeyspaceVSchema(ctx context.Context, _ *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(c.delay):
+		return &ps.VSchema{Raw: "{}"}, nil
+	}
+}
+
+// Keyspace `billing` is valid but slow to diff, because its VSchema read takes
+// a while; keyspace `commerce` declares a table twice and fails at once. The
+// failing keyspace does not cut the slow one short, so the plan reports the
+// one real problem, commerce's refusal, rather than an aborted VSchema read
+// in billing.
+func TestPlan_FailingKeyspaceDoesNotAbortOthers(t *testing.T) {
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) {
+			return &slowVSchemaClient{delay: 100 * time.Millisecond}, nil
+		})
+	table := "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`));"
+	result, err := e.Plan(t.Context(), &engine.PlanRequest{
+		Database: "shop",
+		SchemaFiles: schema.SchemaFiles{
+			"billing":  &schema.Namespace{Files: map[string]string{"vschema.json": "{}"}},
+			"commerce": &schema.Namespace{Files: map[string]string{"orders.sql": table, "orders_v2.sql": table}},
+		},
+		Credentials: &engine.Credentials{Metadata: map[string]string{"organization": "org", "token_name": "tn", "token_value": "tv"}},
+	})
+	require.EqualError(t, err, `table "orders" is declared by both schema files "commerce/orders.sql" and "commerce/orders_v2.sql". Declare each table in exactly one schema file`)
+	assert.Nil(t, result)
 }
 
 // A desired schema the plan cannot read fails the plan with the reason,
