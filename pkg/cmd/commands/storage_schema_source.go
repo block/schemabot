@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -259,7 +260,7 @@ func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect sch
 		return nil, err
 	}
 
-	client := &http.Client{CheckRedirect: refuseInsecureRedirect(converging)}
+	client := releaseFetchClient(converging)
 	listing, err := listReleaseSchemaFiles(ctx, client, repo, tag, directory)
 	if err != nil {
 		return nil, err
@@ -279,20 +280,31 @@ func storageSchemaFromRelease(ctx context.Context, repo, tag string, dialect sch
 	return api.StorageSchemaFromFiles(description, files)
 }
 
+// releaseFetchClient is the HTTP client a release's schema files are fetched
+// with. Its redirect policy is what keeps the token on the origin it was sent
+// to and holds every hop to the plaintext rule, see refuseInsecureRedirect.
+func releaseFetchClient(converging bool) *http.Client {
+	return &http.Client{CheckRedirect: refuseInsecureRedirect(converging)}
+}
+
 // refuseInsecureRedirect holds every hop of a fetch to the rule the first hop
 // was checked against.
 //
 // Guarding only the URL the request started at is not enough. Go carries the
-// Authorization header across a redirect that stays on the same host, and it
-// compares hosts without comparing schemes — so a same-host redirect from
-// https to http forwards the token in plaintext, which is the exact outcome
-// the first check exists to prevent. The guard belongs on every destination,
-// not on the one the operator typed.
-// The check is on the header rather than on the environment, because the header
-// is what actually travels: net/http copies it onto the redirect request — and
-// drops it when the destination is a different host — before consulting this
-// policy, so its presence here is exactly the question of whether this hop
-// carries the token.
+// Authorization header across a redirect to the same hostname or a subdomain
+// of it, comparing hostnames without comparing schemes or ports — so a
+// redirect from https://api.example to https://uploads.api.example,
+// https://api.example:8443, or http://api.example forwards the token to a
+// server it was not sent to. The token is withheld from every hop once the
+// chain leaves the origin (scheme, host, and port) of the first request, the
+// rule the CLI's own bearer transport applies to SchemaBot's token; the
+// redirect is still followed, unauthenticated.
+//
+// The checks below are on the header rather than on the environment, because
+// the header is what actually travels: net/http copies it onto the redirect
+// request — and drops it when the destination is an unrelated host — before
+// consulting this policy, so its presence after the origin check is exactly
+// the question of whether this hop carries the token.
 //
 // A hop with no token has nothing to protect on the wire, but it still decides
 // which channel the files arrive over, so it is held to the rule the
@@ -305,6 +317,7 @@ func refuseInsecureRedirect(converging bool) func(*http.Request, []*http.Request
 		if len(via) >= maxStorageSchemaRedirects {
 			return fmt.Errorf("stopped after %d redirects fetching release schema files", maxStorageSchemaRedirects)
 		}
+		withholdTokenOffOrigin(request, via)
 		if request.Header.Get("Authorization") == "" {
 			// Nothing to leak on this hop, but the files still arrive over
 			// whatever channel the redirect chose, and the check on the
@@ -321,10 +334,29 @@ func refuseInsecureRedirect(converging bool) func(*http.Request, []*http.Request
 			return nil
 		}
 		if err := cmdclient.GuardInsecureToken(request.URL); err != nil {
-			return fmt.Errorf("refusing a redirect to %s://%s: %w; the redirect stays on the same host, so the token would follow it in plaintext", request.URL.Scheme, request.URL.Host, err)
+			return fmt.Errorf("refusing a redirect to %s://%s: %w; the redirect stays on the same origin, so the token would follow it in plaintext", request.URL.Scheme, request.URL.Host, err)
 		}
 		return nil
 	}
+}
+
+// withholdTokenOffOrigin removes the Authorization header from a redirect
+// request once the chain has left the origin of the first request, and says so
+// when that first request carried a token, so a later 401 is explainable. The
+// whole chain is checked rather than the last hop, so a redirect that bounces
+// back to the first origin stays unauthenticated: net/http copies the header
+// from the first request onto every hop, and the request arriving back was
+// shaped by a server the token was never sent to.
+func withholdTokenOffOrigin(request *http.Request, via []*http.Request) {
+	if cmdclient.StayedOnFirstOrigin(slices.Concat(via, []*http.Request{request})) {
+		// Every hop so far, this one included, is on the origin the token was
+		// sent to, so it travels as net/http copied it.
+		return
+	}
+	if via[0].Header.Get("Authorization") != "" {
+		cmdclient.WarnUnauthenticatedRedirect("it is on another origin", cmdclient.RequestOrigin(via[0].URL), cmdclient.RequestOrigin(request.URL))
+	}
+	request.Header.Del("Authorization")
 }
 
 // maxStorageSchemaRedirects matches the ceiling net/http applies when a client

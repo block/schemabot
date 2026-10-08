@@ -123,6 +123,166 @@ func TestRefuseInsecureRedirect(t *testing.T) {
 	require.NoError(t, converging(secure, nil))
 }
 
+// releaseFetchToken is the token the redirect tests fetch with.
+const releaseFetchToken = "fetch-token"
+
+// fetchReleasePathWithToken reads one release path through client from base,
+// carrying releaseFetchToken, the way a plan reads one schema file.
+func fetchReleasePathWithToken(t *testing.T, client *http.Client, base string) error {
+	t.Helper()
+	t.Setenv("GITHUB_API_URL", base)
+	t.Setenv("GITHUB_TOKEN", releaseFetchToken)
+	_, err := getReleaseContents(t.Context(), client, "example/schemabot", "v1.4.0", "pkg/schema/mysql/applies.sql", "application/vnd.github.raw")
+	return err
+}
+
+// authRecorder is a server that records the Authorization header of the last
+// request it answered, and whether it answered one at all.
+type authRecorder struct {
+	*httptest.Server
+	reached bool
+	auth    string
+}
+
+// newAuthRecorder starts a server that records each request's Authorization
+// header and then hands the request to next, which writes the response.
+func newAuthRecorder(t *testing.T, newServer func(http.Handler) *httptest.Server, next http.HandlerFunc) *authRecorder {
+	t.Helper()
+	recorder := &authRecorder{}
+	recorder.Server = newServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder.reached = true
+		recorder.auth = r.Header.Get("Authorization")
+		next(w, r)
+	}))
+	t.Cleanup(recorder.Close)
+	return recorder
+}
+
+// answerSchemaFile answers with a schema file body.
+func answerSchemaFile(t *testing.T) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		_, err := w.Write([]byte("CREATE TABLE `applies` (`id` BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY)"))
+		assert.NoError(t, err)
+	}
+}
+
+// redirectTo answers every request with a 307 to target()+the request's path,
+// so the redirected request keeps its method.
+func redirectTo(target func() string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target()+r.URL.Path, http.StatusTemporaryRedirect)
+	}
+}
+
+// A repository host that redirects a read to another path on itself is still
+// the server the token was sent to, so the redirected read arrives
+// authenticated.
+func TestReleaseFetch_KeepsTokenOnSameOriginRedirect(t *testing.T) {
+	var movedAuth string
+	server := newAuthRecorder(t, httptest.NewServer, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/repos/") {
+			http.Redirect(w, r, "/moved"+r.URL.Path, http.StatusTemporaryRedirect)
+			return
+		}
+		movedAuth = r.Header.Get("Authorization")
+		answerSchemaFile(t)(w, r)
+	})
+
+	require.NoError(t, fetchReleasePathWithToken(t, releaseFetchClient(false), server.URL))
+	assert.Equal(t, "Bearer "+releaseFetchToken, movedAuth)
+}
+
+// A repository host that redirects a read to a server on another origin hands
+// the request to a server the token was not sent to. The redirect is followed,
+// so a public file still arrives, but the second server never sees the token.
+// Another hostname, another port of the same hostname, and an https to http
+// downgrade all leave the origin; net/http alone strips the header only for
+// the first of them.
+func TestReleaseFetch_WithholdsTokenFromAnotherOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		newSource func(http.Handler) *httptest.Server
+		// target renders the URL the source redirects to, given the
+		// destination server's own URL.
+		target func(destination string) string
+	}{
+		{
+			name:      "another host",
+			newSource: httptest.NewServer,
+			target:    func(destination string) string { return strings.Replace(destination, "127.0.0.1", "localhost", 1) },
+		},
+		{
+			name:      "another port",
+			newSource: httptest.NewServer,
+			target:    func(destination string) string { return destination },
+		},
+		{
+			// Two servers cannot share a port, so the downgrade also
+			// changes the port; the scheme alone already leaves the origin.
+			name:      "https to http",
+			newSource: httptest.NewTLSServer,
+			target:    func(destination string) string { return destination },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			destination := newAuthRecorder(t, httptest.NewServer, answerSchemaFile(t))
+			source := newAuthRecorder(t, tc.newSource, redirectTo(func() string { return tc.target(destination.URL) }))
+			client := releaseFetchClient(false)
+			client.Transport = source.Client().Transport
+
+			require.NoError(t, fetchReleasePathWithToken(t, client, source.URL))
+			assert.Equal(t, "Bearer "+releaseFetchToken, source.auth, "the server the token was sent to receives it")
+			assert.True(t, destination.reached, "the redirect is followed")
+			assert.Empty(t, destination.auth, "a server on another origin never receives the token")
+		})
+	}
+}
+
+// A chain that leaves the origin and comes back stays unauthenticated: the
+// request arriving back at the first origin was shaped by a server the token
+// was never sent to.
+func TestReleaseFetch_WithholdsTokenAfterChainLeavesOrigin(t *testing.T) {
+	var source *authRecorder
+	detour := newAuthRecorder(t, httptest.NewServer, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, source.URL+"/back"+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+	source = newAuthRecorder(t, httptest.NewServer, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/back/") {
+			answerSchemaFile(t)(w, r)
+			return
+		}
+		http.Redirect(w, r, detour.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	})
+
+	require.NoError(t, fetchReleasePathWithToken(t, releaseFetchClient(false), source.URL))
+	assert.Empty(t, detour.auth, "the detour is on another origin")
+	assert.Empty(t, source.auth, "the hop back to the first origin follows a detour, so it carries no token")
+}
+
+// A subdomain is another origin. net/http keeps the header across a redirect
+// to a subdomain of the first host; the policy removes it. A redirect that
+// spells the first origin's default port explicitly is the same origin and
+// keeps it. The policy is exercised directly because a subdomain of a test
+// server's address does not resolve.
+func TestRefuseInsecureRedirect_WithholdsTokenFromSubdomain(t *testing.T) {
+	withToken := func(rawURL string) *http.Request {
+		request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, rawURL, nil)
+		require.NoError(t, err)
+		request.Header.Set("Authorization", "Bearer "+releaseFetchToken)
+		return request
+	}
+	first := withToken("https://api.example/repos/example/schemabot/contents/pkg")
+	policy := refuseInsecureRedirect(false)
+
+	subdomain := withToken("https://uploads.api.example/repos/example/schemabot/contents/pkg")
+	require.NoError(t, policy(subdomain, []*http.Request{first}))
+	assert.Empty(t, subdomain.Header.Get("Authorization"))
+
+	samePort := withToken("https://API.example:443/repos/example/schemabot/contents/pkg")
+	require.NoError(t, policy(samePort, []*http.Request{first}))
+	assert.Equal(t, "Bearer "+releaseFetchToken, samePort.Header.Get("Authorization"))
+}
+
 // A command that names no release asks the target about its own embedded
 // schema: resolving reads nothing, fetches nothing, and needs no dialect. An
 // convergence that names no release is the caller that does this — the schema a convergence runs

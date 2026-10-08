@@ -386,8 +386,8 @@ func TestAuthTokenWithheldFromHTTPSDowngradeRedirect(t *testing.T) {
 	require.NoError(t, err)
 	plaintextURL, err := url.Parse(plaintext.URL)
 	require.NoError(t, err)
-	assert.Equal(t, "Warning: not sending the auth token for "+requestOrigin(sourceURL)+
-		" to redirect target "+requestOrigin(plaintextURL)+
+	assert.Equal(t, "Warning: not sending the auth token for "+RequestOrigin(sourceURL)+
+		" to redirect target "+RequestOrigin(plaintextURL)+
 		" because it is on another origin; the request continues unauthenticated\n", warnings.String())
 }
 
@@ -466,7 +466,7 @@ func TestRequestOriginNormalizesDefaultPortAndCase(t *testing.T) {
 	} {
 		u, err := url.Parse(tc.raw)
 		require.NoError(t, err)
-		assert.Equal(t, tc.want, requestOrigin(u), tc.raw)
+		assert.Equal(t, tc.want, RequestOrigin(u), tc.raw)
 	}
 }
 
