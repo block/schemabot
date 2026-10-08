@@ -1452,11 +1452,12 @@ func (c *DirectExecutionConfig) EngineMetadata() (map[string]string, error) {
 // the system carries it in: forwarded to the server that will run the
 // statement, and recorded on the apply that statement belongs to.
 //
-// Nil means the configuration states nothing, and a request that states
-// nothing leaves refused statements blocked wherever it lands. A configured
-// block that is disabled is not nothing: it is an opt-out, and it resolves to
-// a disabled policy so that it travels and overrides a grant the server that
-// runs the statement holds of its own.
+// Nil means this block states nothing and resolves to no policy: a request
+// carrying none leaves the executing server's own policy in force, which
+// ServerConfig.ResolveDirectExecution fills with the default when that server
+// states none. A configured block that is disabled is not nothing: it is an
+// opt-out, and it resolves to a disabled policy so that it travels and
+// overrides a grant the server that runs the statement holds of its own.
 func (c *DirectExecutionConfig) Policy() (*storage.DirectExecutionPolicy, error) {
 	if c == nil {
 		return nil, nil

@@ -1151,8 +1151,7 @@ type PlanRequest struct {
 	// environment. A control plane forwards it so the target that runs the
 	// statement judges it under the policy the control plane's config states.
 	// Absent means the caller states no policy and the executing server's own
-	// configuration decides, which with none configured leaves every statement
-	// the engine refuses blocked.
+	// configuration decides, which with none configured is the default policy.
 	DirectExecution *DirectExecutionPolicy `protobuf:"bytes,14,opt,name=direct_execution,json=directExecution,proto3" json:"direct_execution,omitempty"`
 	// Declared namespaces the caller left out of schema_files because the
 	// target's entry in its database's targets list selects only other

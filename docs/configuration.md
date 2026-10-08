@@ -751,11 +751,15 @@ MySQL database the server drives:
 
 ```yaml
 direct_execution:
-  enabled: true           # default: true
+  enabled: true           # required to enable; omitted in a stated block means false
   max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
-                          # or max_table_bytes (default: max_table_bytes: 100MiB)
+                          # or max_table_bytes (e.g. max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
+
+Only omitting the block entirely selects the default policy. A stated block is
+taken as written: it does not inherit the default's size bound, so one that
+enables direct execution must name its own.
 
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more

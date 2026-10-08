@@ -223,16 +223,16 @@ which table the engine chooses to keep, not where the change ran.
 
 ### Direct execution
 
-This is a third path, MySQL only, and it is deliberately hard to turn on. Some statements can
-never run through a copy: dropping a primary key and adding a foreign key are the usual examples.
-By default they block the apply. An operator can enable a policy, per environment, that lets those
-statements run as ordinary MySQL DDL instead. The policy covers only tables under a configured row
-count, and the plan comment discloses each statement that will run this way.
+This is a third path, MySQL only, and it is deliberately bounded. Some statements can never run
+through a copy: dropping a primary key and adding a foreign key are the usual examples. By default
+they run as ordinary MySQL DDL when the table holds at most 100MiB of data and indexes, and block
+the apply above that. An operator can replace that policy server-wide or per environment, bounding
+it by row count or by bytes instead, or turn it off so those statements always block. The plan
+comment discloses each statement that will run this way.
 
 What runs then is not an online change. It is synchronous, it blocks writes to the table for its
-full duration, nothing throttles it, and nothing checkpoints it. The row
-count in the policy is what bounds that outage, since how long the table is blocked scales with
-its size. The other bound is on the way in: native DDL queues on the table's metadata lock behind
+full duration, nothing throttles it, and nothing checkpoints it. The size bound in the policy is
+what bounds that outage, since how long the table is blocked scales with its size. The other bound is on the way in: native DDL queues on the table's metadata lock behind
 any open transaction that has touched it, and everything arriving after queues behind the DDL, so
 a statement that cannot take the lock quickly stalls all traffic to the table rather than just
 waiting. Direct statements run with a short lock acquisition timeout and kill the transactions
