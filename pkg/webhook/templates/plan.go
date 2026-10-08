@@ -2289,7 +2289,7 @@ func writeTargetPlans(sb *strings.Builder, data PlanCommentData, budget *ddlBloc
 			continue
 		}
 		if headed {
-			writeTargetGroupHeading(sb, level, g.Members, len(drift.Deployments))
+			writeTargetGroupHeading(sb, level, g.Members, changingTargetCount(drift))
 		}
 		group := data
 		group.namespaceLabelsInline = namespaceLabelsInline

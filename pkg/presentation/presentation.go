@@ -461,7 +461,7 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	switch op.State {
 	case state.ApplyOperation.Completed:
 		if d.AlreadyApplied() {
-			d.set(StateAlreadyApplied, "already had it", "✅", false)
+			d.set(StateAlreadyApplied, AlreadyAppliedLabel, "✅", false)
 			break
 		}
 		d.set(StateCompleted, "completed", "✅", false)
@@ -746,7 +746,7 @@ var summaryCategoryOrder = []struct {
 	states []PresentationState
 }{
 	{"completed", []PresentationState{StateCompleted}},
-	{"already had it", []PresentationState{StateAlreadyApplied}},
+	{AlreadyAppliedLabel, []PresentationState{StateAlreadyApplied}},
 	{"cutting over", []PresentationState{StateCuttingOver}},
 	{"ready for cutover", []PresentationState{StateReadyForCutoverNext, StateReadyForCutoverWaiting}},
 	{"running", []PresentationState{StateRunningCopy}},
@@ -800,6 +800,10 @@ func firstWithPresentation(deps []Deployment, ps PresentationState) (Deployment,
 	}
 	return Deployment{}, false
 }
+
+// AlreadyAppliedLabel is the status of a member whose target already had the
+// change, so a surface that leaves such targets out can find its count.
+const AlreadyAppliedLabel = "already had it"
 
 // AlreadyApplied reports whether the member's target already held the change
 // when the apply was created, so nothing ran there. It reads the stored mark the
