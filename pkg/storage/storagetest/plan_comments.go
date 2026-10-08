@@ -101,6 +101,35 @@ func TestPlanComments(t *testing.T, h Harness) {
 		assert.Empty(t, comments)
 	})
 
+	t.Run("UpToDate_RoundTrips", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A comment recorded without an outcome reads back as not up to date,
+		// which is what makes a later plan replace it rather than keep it.
+		unknown := InsertPlanComment(t, store, "org/repo", 42, "orders", "mysql", "staging", "sha1", 100)
+		upToDate := &storage.PlanComment{
+			Repository:       "org/repo",
+			PullRequest:      42,
+			DatabaseName:     "orders",
+			DatabaseType:     "mysql",
+			EnvironmentScope: "staging",
+			HeadSHA:          "sha2",
+			GitHubCommentID:  200,
+			GitHubNodeID:     "IC_node200",
+			UpToDate:         true,
+		}
+		require.NoError(t, store.PlanComments().Insert(ctx, upToDate))
+
+		comments, err := store.PlanComments().ListUnretiredForSlot(ctx, "org/repo", 42, "orders", "mysql")
+		require.NoError(t, err)
+		require.Len(t, comments, 2)
+		assert.Equal(t, unknown.ID, comments[0].ID)
+		assert.False(t, comments[0].UpToDate)
+		assert.Equal(t, upToDate.ID, comments[1].ID)
+		assert.True(t, comments[1].UpToDate)
+	})
+
 	t.Run("ListUnretiredForRepoPR", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
