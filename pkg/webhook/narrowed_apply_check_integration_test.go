@@ -188,6 +188,30 @@ func TestNarrowedApplyBlocksCheckUntilWholeEnvironmentPlan(t *testing.T) {
 	assert.Empty(t, lifted.BlockingReason)
 }
 
+// An operator rolls a change out to payments-002 first, then applies the
+// rest of production. The apply of the whole environment records its own
+// check state in place of narrowed_apply, so finishing the rollout is the
+// only step the operator takes.
+func TestWholeEnvironmentApplyReplacesNarrowedApplyBlock(t *testing.T) {
+	f := newNarrowedApplyCheckFixture(t, "octocat/narrowed-apply-then-whole", 11, "narrowed_apply_then_whole_db")
+	f.storeNarrowedApply(t)
+	require.Equal(t, narrowedApplyBlock.blockingReason, f.check(t).BlockingReason)
+
+	wholePlan := &apitypes.PlanResponse{
+		PlanID: "plan-rest-of-rollout",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace:    f.schema.Database,
+			TableChanges: []*apitypes.TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: "alter"}},
+		}},
+	}
+	_, err := f.h.storeApplyCheckRecord(t.Context(), f.client, f.repo, f.pr, f.schema, wholePlan, f.env, reviewDriftOutcome{state: driftClean}, false)
+	require.NoError(t, err)
+
+	replaced := f.check(t)
+	assert.Empty(t, replaced.BlockingReason, "the whole-environment apply speaks for every target")
+	assert.NotEqual(t, narrowedApplyCheckSummary, replaced.ChangeSummary)
+}
+
 // A commit removed the schema change after an earlier apply on production
 // had started, so the check is blocked for reconciliation: the target may
 // carry work the PR no longer describes (MG-6). An operator then lands a

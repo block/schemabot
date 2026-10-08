@@ -168,11 +168,11 @@ var namespacePlacementRefusedBlock = checkBlockReason{
 // narrowedApplyBlock is used for an apply narrowed to one rollout member with
 // --target: from the moment it is dispatched, and once it completes. It ran on
 // one target, so it cannot show that the environment as a whole has the
-// change, and the check stays blocked until a plan of every target does
-// (MG-12).
+// change, and the check stays blocked until a plan or apply of every target
+// does (MG-12).
 var narrowedApplyBlock = checkBlockReason{
 	blockingReason: checkstate.BlockNarrowedApply,
-	message:        "An apply was requested for one target only; plan the whole environment to check every target before this check can pass.",
+	message:        "Rolling out one target at a time. Apply the rest of the environment to finish.",
 }
 
 // noAllowedConfiguredEnvironmentsBlock is used when schema files changed but

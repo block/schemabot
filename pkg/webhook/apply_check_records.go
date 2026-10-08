@@ -37,18 +37,19 @@ func (h *Handler) storeApplyCheckRecord(ctx context.Context, client *ghclient.In
 
 // narrowedApplyCheckSummary is the stored Change column for an environment
 // whose last apply was narrowed to one target. It is written before the apply
-// dispatches and kept once it completes, so it says the apply was requested,
-// which holds whether or not it went on to run. The apply comment names the
-// target.
-const narrowedApplyCheckSummary = "an apply was requested for one target only; plan the whole environment to check every target"
+// dispatches and kept once it completes, so it describes the rollout rather
+// than the apply, which holds whether or not it went on to run. Rolling out
+// one target at a time is an ordinary rollout, so it names the next step
+// rather than a problem. The apply comment names the target.
+const narrowedApplyCheckSummary = "rolling out one target at a time; apply the rest of the environment to finish"
 
 // storeNarrowedApplyCheck blocks the environment's check before an apply
 // narrowed to one rollout member dispatches. The narrowed plan says nothing
 // about the other targets, so it cannot be recorded as the environment's plan
 // result, and the check must not keep reading as a pass from an earlier plan
 // while one target changes (MG-12). The block holds after the apply completes
-// (updateCheckRecordForApplyResult) and lifts when a plan of the whole
-// environment records its own result.
+// (updateCheckRecordForApplyResult) and lifts when an apply or plan of the
+// whole environment records its own result.
 func (h *Handler) storeNarrowedApplyCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) (string, error) {
 	h.logger.Info("apply narrowed to one target; blocking the environment's check until a plan of every target records its result",
 		"repo", repo, "pr", pr, "head_sha", schema.HeadSHA, "environment", environment,

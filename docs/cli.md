@@ -493,8 +493,8 @@ other targets still need the change. On a pull request, `schemabot plan -e
 <env> --target <target>` and `schemabot apply -e <env> --target <target>`
 narrow the same way. A narrowed plan comment leaves the schema check as it
 was; a narrowed apply blocks it with `narrowed_apply` from the moment it is
-dispatched, and a plan of the whole environment lifts that block once every
-target has the change. `apply-confirm` takes no `--target`: it confirms the
+dispatched, and an apply or plan of the whole environment lifts that block
+once every target has the change. `apply-confirm` takes no `--target`: it confirms the
 target its apply named. The server records the narrowing on the
 stored plan and refuses to apply it anywhere but the target it was made for,
 and a narrowed apply cannot be rolled back with `rollback`: restore that

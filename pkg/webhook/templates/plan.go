@@ -146,9 +146,8 @@ type PlanCommentData struct {
 	// Target is the --target selector a plan or apply was narrowed to: one
 	// rollout member of Environment, named by its target or as
 	// deployment/target. Empty means the comment covers every target. The
-	// comment says what the narrowing leaves undone, and its copy-paste
-	// apply carries the selector, because an apply of a narrowed plan has
-	// to name the same target.
+	// metadata line names it, and the copy-paste apply carries it, because
+	// an apply of a narrowed plan has to name the same target.
 	Target string
 
 	Tenant       string
@@ -551,8 +550,6 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 		sb.WriteString("\n")
 	}
 
-	writeNarrowedTarget(&sb, data)
-
 	sb.WriteString("\n")
 
 	// Review-time deployment drift is shown before the change list — and before
@@ -924,26 +921,6 @@ func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData)
 			inlineCode(d.Table), caller.PullRequestMarkdownLink(d.Repository, d.PullRequest))
 	}
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
-}
-
-// writeNarrowedTarget says, on a comment narrowed to one target, what the
-// narrowing leaves undone: the other targets of the environment, and the
-// schema check, which only a plan of the whole environment can bring up to
-// date. It names that plan so the reader can run it once every target has the
-// change.
-func writeNarrowedTarget(sb *strings.Builder, data PlanCommentData) {
-	if data.Target == "" {
-		return
-	}
-	if data.IsLocked {
-		fmt.Fprintf(sb, "\n"+glyph.Attention+" **Target %s only.** Other targets in `%s` are left as they are, and the schema check blocks merge until a plan of every target shows the change is complete.\n",
-			inlineCode(data.Target), data.Environment)
-	} else {
-		fmt.Fprintf(sb, "\n"+glyph.Attention+" **Target %s only.** Other targets in `%s` are not planned, and this plan does not update the schema check.\n",
-			inlineCode(data.Target), data.Environment)
-	}
-	fmt.Fprintf(sb, "Once every target has the change, run `%s` to update the check.\n",
-		scopedCommand("schemabot plan", data.Environment, data.ScopedDatabase, data.Tenant))
 }
 
 // appendTargetFlag appends the --target flag to a pasteable command hint when
