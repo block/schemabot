@@ -1974,7 +1974,15 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		if op.ID == applyOperationID {
 			found = true
 		}
-		if op.Deployment == operation.Deployment && !isConvergedOperationPlaceholder(op) {
+		if op.Deployment != operation.Deployment {
+			continue
+		}
+		// The manifest promises the data plane which keys will arrive. A
+		// converged placeholder never dispatches, so its key is left out;
+		// dispatched siblings keep StartedAt or a remote id and stay in. The
+		// claimed operation is the one key this dispatch is about to send, so
+		// it is always declared, whatever shape its row is in.
+		if op.ID == applyOperationID || !op.IsConvergedPlaceholder() {
 			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
 		}
 	}
@@ -1997,15 +2005,6 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		deploymentOperationKeys: deploymentOperationKeys,
 		memberTarget:            memberTarget,
 	}, nil
-}
-
-// isConvergedOperationPlaceholder identifies members settled at creation with
-// nothing to dispatch, including finalizer-only members. A claimed operation
-// stamps StartedAt before dispatch; a recorded remote id also proves it was
-// dispatched, so completed siblings remain in the immutable generation manifest.
-func isConvergedOperationPlaceholder(op *storage.ApplyOperation) bool {
-	return state.IsState(op.State, state.ApplyOperation.Completed) && op.StartedAt == nil &&
-		op.RemoteApplyID() == "" && op.ExternalOperationID == ""
 }
 
 // deploymentAddressesSeveralTargets reports whether the operations of one

@@ -9559,6 +9559,27 @@ func TestGenerationOperationKeys_ConvergedMembers(t *testing.T) {
 	}
 }
 
+// A dispatch always declares its own key. The manifest is built from the rows
+// of the claimed operation's deployment, and the claimed row is the one key
+// this dispatch is about to send, so it stays in the manifest even when its
+// row has the shape of a converged placeholder: a data plane must never
+// receive an operation its generation does not list.
+func TestGenerationOperationKeys_ClaimedOperationAlwaysDeclaresItself(t *testing.T) {
+	ops := &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{
+		1: {ID: 1, ApplyID: 100, Deployment: "default", Target: "payments-001", OperationKey: "payments-001/commerce/80-/users", State: state.ApplyOperation.Completed},
+		2: {ID: 2, ApplyID: 100, Deployment: "default", Target: "payments-002", OperationKey: "payments-002/commerce/80-/users", State: state.ApplyOperation.Completed},
+		3: {ID: 3, ApplyID: 100, Deployment: "default", Target: "payments-003", OperationKey: "payments-003/commerce/80-/users", State: state.ApplyOperation.Pending},
+	}}
+	require.True(t, ops.ops[1].IsConvergedPlaceholder(), "the claimed row has the placeholder shape")
+	client := &GRPCClient{storage: &mockStorage{operations: ops}}
+	apply := &storage.Apply{ID: 100, ApplyIdentifier: "apply-claimed-placeholder"}
+
+	scope, err := client.loadOperationApplyTaskScope(t.Context(), apply, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"payments-001/commerce/80-/users", "payments-003/commerce/80-/users"}, scope.generationOperationKeys(),
+		"the claimed operation declares itself; the converged sibling is left out")
+}
+
 // The idempotency key and the generation manifest are derived independently
 // from the same scope, so they must rotate together on a deliberate retry: a
 // rotated key paired with a still-full manifest (or an unrotated key paired
