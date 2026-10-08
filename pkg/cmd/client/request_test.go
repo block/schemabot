@@ -386,8 +386,8 @@ func TestAuthTokenWithheldFromHTTPSDowngradeRedirect(t *testing.T) {
 	require.NoError(t, err)
 	plaintextURL, err := url.Parse(plaintext.URL)
 	require.NoError(t, err)
-	assert.Equal(t, "Warning: not sending the auth token for "+requestOrigin(sourceURL)+
-		" to redirect target "+requestOrigin(plaintextURL)+
+	assert.Equal(t, "Warning: not sending the auth token for "+RequestOrigin(sourceURL)+
+		" to redirect target "+RequestOrigin(plaintextURL)+
 		" because it is on another origin; the request continues unauthenticated\n", warnings.String())
 }
 
@@ -466,8 +466,21 @@ func TestRequestOriginNormalizesDefaultPortAndCase(t *testing.T) {
 	} {
 		u, err := url.Parse(tc.raw)
 		require.NoError(t, err)
-		assert.Equal(t, tc.want, requestOrigin(u), tc.raw)
+		assert.Equal(t, tc.want, RequestOrigin(u), tc.raw)
 	}
+}
+
+// An empty redirect chain has sent nothing, so it has left no origin; a chain
+// that changes port has.
+func TestStayedOnFirstOrigin(t *testing.T) {
+	assert.True(t, StayedOnFirstOrigin(nil))
+	request := func(raw string) *http.Request {
+		r, err := http.NewRequestWithContext(t.Context(), http.MethodGet, raw, nil)
+		require.NoError(t, err)
+		return r
+	}
+	assert.True(t, StayedOnFirstOrigin([]*http.Request{request("https://a.example/x"), request("https://A.example:443/y")}))
+	assert.False(t, StayedOnFirstOrigin([]*http.Request{request("https://a.example/x"), request("https://a.example:8443/y")}))
 }
 
 func TestNoTokenAllowedOverInsecureRemote(t *testing.T) {
