@@ -55,14 +55,17 @@ func (h *Handler) storeNarrowedApplyCheck(ctx context.Context, client *ghclient.
 		"repo", repo, "pr", pr, "head_sha", schema.HeadSHA, "environment", environment,
 		"database_type", schema.Type, "database", schema.Database,
 		"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
-	// A row already blocked for reconciliation keeps that block: work may have
-	// reached the target, and narrowed_apply would trade "reconcile the target"
-	// for "re-plan", which an ordinary plan of the whole environment lifts.
+	// A narrowed apply evaluates neither reconciliation nor review-time drift,
+	// so a row already blocked for either keeps that block. A reconciliation
+	// block says work may have reached the target, and a drift or placement
+	// block depends on live deployment state that only a fresh rollup may
+	// clear; narrowed_apply would trade either for a block that reads as the
+	// next step of an ordinary rollout.
 	blocked := reviewDriftOutcome{
 		state:    driftBlocked,
 		summary:  narrowedApplyCheckSummary,
 		block:    narrowedApplyBlock,
-		preserve: checkstate.ReconciliationBlockingReasons(),
+		preserve: append(checkstate.ReconciliationBlockingReasons(), checkstate.RollupBlockingReasons()...),
 	}
 	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
 	if err != nil {

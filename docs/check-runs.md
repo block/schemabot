@@ -533,7 +533,7 @@ Run output remains human-readable and may change.
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
 | `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
 | `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the database's server-configured environments are allowed for this deployment. |
-| `narrowed_apply` | Per-database row | The rollout is going one target at a time (`--target`), so nothing yet shows the other targets have the change. It does not replace a reconciliation block already on the row. An apply or plan of the whole environment (`schemabot apply -e <environment>`) replaces it with its own result. |
+| `narrowed_apply` | Per-database row | The rollout is going one target at a time (`--target`), so nothing yet shows the other targets have the change. It does not replace a reconciliation, review-time drift, or namespace placement block already on the row: the narrowed apply evaluated none of them. An apply or plan of the whole environment (`schemabot apply -e <environment>`) replaces it with its own result. |
 
 Generic plan and apply errors can still publish `completed` / `failure` without
 a stable `blocking_reason` when the error is not one of the explicit classes
@@ -935,7 +935,11 @@ record: it speaks for one target, so it cannot move the environment's check in
 either direction. An apply narrowed the same way stores `narrowed_apply` on the
 environment's record before it dispatches and keeps it there when it completes,
 so the check blocks until an apply or plan of the whole environment records
-its own result (MG-12).
+its own result (MG-12). A record already blocked for reconciliation, review-time
+drift, or namespace placement keeps that block. A narrowed apply is not refused
+on drift, since applying one target at a time is how diverged targets are
+brought back in line; the drift block stays until a rollup of the whole
+environment finds them converged.
 
 ### Apply requested
 

@@ -157,6 +157,16 @@ func ReconciliationBlockingReasons() []string {
 	return reasons
 }
 
+// RollupBlockingReasons returns the durable blocking reasons that only a
+// fresh review-time rollup may clear, sorted. They depend on live deployment
+// state rather than PR content, so a writer that did not run the rollup keeps
+// rows carrying them as they are.
+func RollupBlockingReasons() []string {
+	reasons := []string{BlockReviewTimeDeploymentDrift, BlockNamespacePlacementRefused}
+	slices.Sort(reasons)
+	return reasons
+}
+
 // Reason codes for why a stored check row reads the way it does on a given
 // commit. They are stable identifiers: an operator greps for one and a script
 // branches on it.

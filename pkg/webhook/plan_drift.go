@@ -59,7 +59,10 @@ func plannedPrimaryMember(planResp *apitypes.PlanResponse) routing.ExecutionTarg
 // rollup compares every deployment against the rollout's primary member, and a
 // narrowed plan is of whichever member it names. It is reported not evaluated,
 // which records nothing about drift; a narrowed apply blocks the check on its
-// own terms (storeNarrowedApplyCheck).
+// own terms (storeNarrowedApplyCheck) and keeps a drift block already stored.
+// A narrowed apply is not refused on drift: applying to one target at a time
+// is how an operator brings diverged targets back in line, and the stored
+// block stays until a rollup of the whole environment finds them converged.
 //
 // primaryPlan is the primary plan proto returned by
 // executePlanProtoWithTransientRetry, reused as the rollup baseline so the

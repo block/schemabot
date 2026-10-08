@@ -253,3 +253,34 @@ func TestNarrowedApplyKeepsReconciliationBlock(t *testing.T) {
 	assert.Equal(t, earlierID, kept.ApplyID, "the started apply still owns the row")
 	assert.Equal(t, f.headSHA, kept.HeadSHA, "the row moves to the current head so the aggregate reads it")
 }
+
+// A plan of production found its targets diverged (or a namespace placed on
+// the wrong target) and blocked the check on live deployment state. An
+// operator then lands a narrowed apply, which runs no rollup. The check keeps
+// the stored block, which only a fresh rollup of the whole environment may
+// clear, rather than taking narrowed_apply and reading as the next step of an
+// ordinary rollout.
+func TestNarrowedApplyKeepsRollupBlock(t *testing.T) {
+	for i, block := range []checkBlockReason{reviewTimeDeploymentDriftBlock, namespacePlacementRefusedBlock} {
+		t.Run(block.blockingReason, func(t *testing.T) {
+			f := newNarrowedApplyCheckFixture(t, "octocat/narrowed-apply-rollup", 20+i, "narrowed_apply_rollup_db")
+			require.NoError(t, f.st.Checks().Upsert(t.Context(), &storage.Check{
+				Repository: f.repo, PullRequest: f.pr, HeadSHA: "older-sha", Environment: f.env,
+				DatabaseType: "mysql", DatabaseName: f.schema.Database, CheckRunID: 1,
+				HasChanges: true, Status: checkStatusCompleted, Conclusion: checkConclusionFailure,
+				BlockingReason: block.blockingReason,
+				ErrorMessage:   block.message,
+				ChangeSummary:  "targets diverged at review time",
+			}))
+
+			f.storeNarrowedApply(t)
+
+			kept := f.check(t)
+			assert.Equal(t, block.blockingReason, kept.BlockingReason, "a block only a rollup may clear is never traded for narrowed_apply")
+			assert.Equal(t, checkConclusionFailure, kept.Conclusion)
+			assert.Equal(t, block.message, kept.ErrorMessage)
+			assert.Equal(t, "targets diverged at review time", kept.ChangeSummary)
+			assert.Equal(t, f.headSHA, kept.HeadSHA, "the row moves to the current head so the aggregate reads it")
+		})
+	}
+}
