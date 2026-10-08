@@ -1617,6 +1617,41 @@ func TestRenderMultiDeploymentApplyComment_DeploymentThatAlreadyHadTheChangeIsLe
 	}
 }
 
+// When every target of every multi-target deployment already had the change,
+// nothing ran anywhere. Each deployment still appears, labelled as already
+// having it, so the reader learns the rollout was a no-op rather than seeing
+// empty labels.
+func TestRenderMultiDeploymentApplyComment_EveryDeploymentAlreadyHadTheChange(t *testing.T) {
+	converged := func(deployment, target string) presentation.Operation {
+		return presentation.Operation{Deployment: deployment, Target: target, State: so.Completed, Parallel: true, ContinueOnFailure: true, NeverStarted: true, AlreadyConverged: true}
+	}
+	data := MultiDeploymentApplyData{
+		Model: presentation.Derive([]presentation.Operation{
+			converged("primary", "testapp-001"),
+			converged("primary", "testapp-002"),
+			converged("eu", "orders-001"),
+			converged("eu", "orders-002"),
+		}),
+		ApplyID: "apply-123", Environment: "production",
+		Details: []*ApplyStatusCommentData{nil, nil, nil, nil},
+	}
+
+	for name, out := range map[string]string{
+		"status":  RenderMultiDeploymentApplyComment(data),
+		"summary": RenderMultiDeploymentApplySummaryComment(data),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, out, "\n**Targets**: 4 already had it\n")
+			assert.Contains(t, out, "- ✅ `primary` — already had it (2 targets)\n")
+			assert.Contains(t, out, "- ✅ `eu` — already had it (2 targets)\n")
+			assert.Contains(t, out, "<summary>✅ primary — already had it (2 targets)</summary>")
+			assert.Contains(t, out, "<summary>✅ eu — already had it (2 targets)</summary>")
+			assert.Equal(t, 2, strings.Count(out, "_Every target already had this schema; nothing ran._"))
+			assert.NotContains(t, out, "(0 targets)")
+		})
+	}
+}
+
 // A rollback across one deployment's targets states its status as a rollback
 // on both the live comment and the summary, and a stopped rollout reads as
 // still in progress rather than finished, since its targets run again once it

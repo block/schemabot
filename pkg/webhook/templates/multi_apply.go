@@ -270,9 +270,12 @@ func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData, 
 // writeDeploymentCounts writes the per-status histogram so an operator sees
 // rollout health at a glance without expanding anything. The histogram counts
 // members, so once a deployment addresses several targets it counts targets.
-// Members that already had the change are left out.
+// Members that already had the change are left out, unless every member
+// already had it: then the count is how the reader learns nothing ran.
 func writeDeploymentCounts(sb *strings.Builder, counts []presentation.StateCount, groups []presentation.Group) {
-	counts = countsWithChanges(counts)
+	if changed := countsWithChanges(counts); len(changed) > 0 {
+		counts = changed
+	}
 	if len(counts) == 0 {
 		return
 	}
@@ -478,9 +481,14 @@ func writeDeploymentSummaryList(sb *strings.Builder, model presentation.Apply, g
 }
 
 // groupCountsLabel is a multi-target deployment's status: its own histogram
-// and how many of its targets get the change.
+// and how many of its targets get the change. A deployment whose every target
+// already had the change says so, since nothing else ran there.
 func groupCountsLabel(model presentation.Apply, g presentation.Group) string {
-	return fmt.Sprintf("%s (%s)", countsPhrase(countsWithChanges(g.Counts)), targetCount(changingMembers(model, g)))
+	changing := changingMembers(model, g)
+	if changing == 0 {
+		return fmt.Sprintf("%s (%s)", presentation.AlreadyAppliedLabel, targetCount(len(g.Members)))
+	}
+	return fmt.Sprintf("%s (%s)", countsPhrase(countsWithChanges(g.Counts)), targetCount(changing))
 }
 
 // countsWithChanges drops the count of members that already had the change:
@@ -550,7 +558,11 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		if len(g.Members) > 1 {
 			fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n<dl><dd>\n\n", openAttr,
 				glyphTag(g.Lead.Emoji, html.EscapeString(flattenIdentifier(g.Deployment))), groupCountsLabel(data.Model, g))
-			writeTargetRollup(sb, data, g, budget)
+			if changingMembers(data.Model, g) == 0 {
+				sb.WriteString("_Every target already had this schema; nothing ran._\n")
+			} else {
+				writeTargetRollup(sb, data, g, budget)
+			}
 			sb.WriteString("\n</dd></dl>\n</details>\n")
 			continue
 		}
