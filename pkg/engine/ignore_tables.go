@@ -29,7 +29,8 @@ const ExemptReasonIgnoreTables = "ignore_tables"
 type IgnoredTables struct {
 	entries map[string]bool
 
-	// folded maps each entry's case-folded form to every entry the config
+	// folded maps each entry's case-folded form, its schema.CaseFoldKey, to
+	// every entry the config
 	// spells that way, for RefuseDeclared. Only the contradiction check
 	// consults it: see RefuseDeclared for why that check is the one that
 	// ignores case. A config can spell one folded name several ways, and
@@ -59,13 +60,17 @@ type ignoredTablePattern struct {
 // NewIgnoredTables indexes the config's ignore_tables entries for matching.
 // The zero value and an empty list both withhold nothing.
 //
-// A pattern entry that does not compile is an error naming it. It fails the
+// A pattern entry that does not compile is an error naming it, and so are
+// pattern entries longer together than the schema package's budget. It fails the
 // plan or apply that asked for it rather than being skipped: an entry dropped
 // for being malformed withholds nothing, and the live tables it was written to
 // protect would come back as DROP TABLE proposals.
 func NewIgnoredTables(entries []string) (IgnoredTables, error) {
 	if len(entries) == 0 {
 		return IgnoredTables{}, nil
+	}
+	if err := schema.CheckIgnoreTablePatternBudget(entries); err != nil {
+		return IgnoredTables{}, err
 	}
 	indexed := make(map[string]bool, len(entries))
 	folded := make(map[string][]string, len(entries))
@@ -95,7 +100,7 @@ func NewIgnoredTables(entries []string) (IgnoredTables, error) {
 		}
 		indexed[name] = true
 		order = append(order, name)
-		key := strings.ToLower(name)
+		key := schema.CaseFoldKey(name)
 		folded[key] = append(folded[key], name)
 	}
 	for _, spellings := range folded {
@@ -202,7 +207,9 @@ func (i IgnoredTables) Unmatched(withheld []string) []string {
 // ignores case, because refusing a repository that meant two tables costs a
 // plan and an error naming both spellings, while letting a real contradiction
 // through costs an apply that fails part way with the target already holding
-// a table the plan believed it was creating.
+// a table the plan believed it was creating. Plain entries and patterns compare
+// case by the same rule, schema.CaseFoldKey, so a spelling one kind of entry is
+// refused for is refused for the other too.
 //
 // A pattern entry is checked the same way: it is refused when, ignoring case,
 // it matches a declared table. A pattern is written for a family of tables no
@@ -226,7 +233,7 @@ func (i IgnoredTables) RefuseDeclared(namespace string, declared []string) error
 	var collisions []string
 	seen := make(map[string]bool)
 	for _, table := range declared {
-		spellings, withheld := i.folded[strings.ToLower(table)]
+		spellings, withheld := i.folded[schema.CaseFoldKey(table)]
 		if !withheld {
 			continue
 		}

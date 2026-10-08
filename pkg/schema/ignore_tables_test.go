@@ -1,6 +1,9 @@
 package schema
 
 import (
+	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"unicode"
@@ -138,17 +141,50 @@ func TestCompileIgnoreTablePatternFoldsCaseDespiteEmbeddedFlags(t *testing.T) {
 	assert.False(t, asWritten.MatchString("Relay_1_Feed"), "withholding keeps the expression's own case rules")
 }
 
-// foldableRunes only scans the runes between the first and last entries of
-// unicode.CaseRanges, which holds only while no rune outside them folds to
-// another.
+// caseEquivalents only scans the runes between the first and last entries of
+// unicode.CaseRanges, which holds only while no rune outside them folds or
+// changes case.
 func TestCaseRangesBoundEveryFold(t *testing.T) {
-	minFold := rune(unicode.CaseRanges[0].Lo)
-	maxFold := rune(unicode.CaseRanges[len(unicode.CaseRanges)-1].Hi)
+	minCase := rune(unicode.CaseRanges[0].Lo)
+	maxCase := rune(unicode.CaseRanges[len(unicode.CaseRanges)-1].Hi)
 	for c := rune(0); c <= unicode.MaxRune; c++ {
-		if c >= minFold && c <= maxFold {
+		if c >= minCase && c <= maxCase {
 			continue
 		}
 		require.Equal(t, c, unicode.SimpleFold(c), "rune %U folds but lies outside unicode.CaseRanges", c)
+		require.Equal(t, c, unicode.ToLower(c), "rune %U lower-cases but lies outside unicode.CaseRanges", c)
+	}
+}
+
+// CaseFoldKey equates every rune with the rune it folds to and with its lower
+// case, the two rules a target may fold table names by.
+func TestCaseFoldKeyCoversFoldingAndLowerCasing(t *testing.T) {
+	for c := rune(0); c <= unicode.MaxRune; c++ {
+		key := CaseFoldKey(string(c))
+		require.Equal(t, key, CaseFoldKey(string(unicode.SimpleFold(c))), "rune %U and its fold", c)
+		require.Equal(t, key, CaseFoldKey(string(unicode.ToLower(c))), "rune %U and its lower case", c)
+	}
+	assert.Equal(t, CaseFoldKey("orders"), CaseFoldKey("ORDERS"))
+	assert.Equal(t, CaseFoldKey("i"), CaseFoldKey("\u0130"), "the dotted capital I lower-cases to i")
+	assert.Equal(t, CaseFoldKey("s"), CaseFoldKey("\u017f"), "the long s folds to s")
+	assert.NotEqual(t, CaseFoldKey("orders"), CaseFoldKey("order"))
+}
+
+// A folded pattern collides with exactly the spellings a plain entry collides
+// with: a pattern naming one rune matches every rune CaseFoldKey equates with it.
+func TestFoldedPatternMatchesEveryCaseEquivalent(t *testing.T) {
+	eq := caseEquivalents()
+	for _, r := range eq.runes {
+		folded, err := CompileIgnoreTablePattern("/"+regexp.QuoteMeta(string(r))+"/", true)
+		require.NoError(t, err)
+		for _, m := range eq.members[eq.key[r]] {
+			require.True(t, folded.MatchString(string(m)), "folded pattern for %U must match %U", r, m)
+		}
+	}
+	for _, entry := range []string{`/i/`, `/[h-j]/`} {
+		folded, err := CompileIgnoreTablePattern(entry, true)
+		require.NoError(t, err)
+		assert.True(t, folded.MatchString("\u0130"), "%s folded must match the dotted capital I", entry)
 	}
 }
 
@@ -171,6 +207,30 @@ func TestCompileIgnoreTablePatternLengthCap(t *testing.T) {
 	err = ValidateIgnoreTables([]string{tooLong})
 	require.Error(t, err, "config validation refuses an over-long pattern")
 	assert.Contains(t, err.Error(), "is longer than 256 bytes")
+}
+
+// Patterns are budgeted together as well as one by one, so a config cannot
+// bound each entry and still list enough of them to stall a plan. A repeated
+// entry counts once, and plain entries do not count at all.
+func TestCheckIgnoreTablePatternBudget(t *testing.T) {
+	pattern := func(i int) string {
+		return fmt.Sprintf("/^relay_%03d_[0-9]+_feed_%s$/", i, strings.Repeat("x", 30))
+	}
+	var withinBudget []string
+	for i := 0; len(strings.Join(withinBudget, ""))+len(pattern(i)) <= maxIgnoreTablePatternsTotalBytes; i++ {
+		withinBudget = append(withinBudget, pattern(i))
+	}
+	require.NoError(t, CheckIgnoreTablePatternBudget(withinBudget))
+	require.NoError(t, CheckIgnoreTablePatternBudget(append(slices.Clone(withinBudget), withinBudget[0], strings.Repeat("t", 2000))),
+		"a repeated pattern and a plain entry do not count against the budget")
+
+	overBudget := append(slices.Clone(withinBudget), pattern(len(withinBudget)))
+	err := CheckIgnoreTablePatternBudget(overBudget)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "over the 1024-byte limit for all patterns together")
+	err = ValidateIgnoreTables(overBudget)
+	require.Error(t, err, "config validation refuses an over-budget config")
+	assert.Contains(t, err.Error(), "over the 1024-byte limit")
 }
 
 func TestQuoteIgnoreTablesEntry(t *testing.T) {

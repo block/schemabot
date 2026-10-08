@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -210,6 +211,16 @@ func TestNewIgnoredTablesRefusesInvalidPattern(t *testing.T) {
 	_, err = NewIgnoredTables([]string{"//"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `ignore_tables entry "//" is an empty pattern`)
+
+	// A stored plan's entries are budgeted again where they are matched, so
+	// entries that bypassed config validation are refused before compiling.
+	var overBudget []string
+	for i := range 50 {
+		overBudget = append(overBudget, fmt.Sprintf("/^relay_%02d_[0-9]+_feed$/", i))
+	}
+	_, err = NewIgnoredTables(overBudget)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "over the 1024-byte limit for all patterns together")
 }
 
 // A pattern written for a family of undeclared tables that also reaches a
@@ -242,6 +253,17 @@ func TestIgnoredTablesRefuseDeclaredPattern(t *testing.T) {
 		`ignore_tables entry "/(?-i)relay_\d+_feed/" matches "Relay_1_Feed", which a schema file in namespace "app" declares. Narrow the pattern so it no longer matches it, or remove the schema file`,
 		err.Error())
 	assert.False(t, flagged.Withholds("Relay_1_Feed"))
+
+	// Plain entries and patterns refuse by the same case rule: the dotted
+	// capital I lower-cases to i, and the long s folds to s.
+	for _, entry := range []string{"i", `/i/`} {
+		err = mustIgnoredTables(t, entry).RefuseDeclared("app", []string{"\u0130"})
+		assert.Error(t, err, "%s must refuse a declared table spelled with the dotted capital I", entry)
+	}
+	for _, entry := range []string{"s", `/s/`} {
+		err = mustIgnoredTables(t, entry).RefuseDeclared("app", []string{"\u017f"})
+		assert.Error(t, err, "%s must refuse a declared table spelled with the long s", entry)
+	}
 
 	// A pattern colliding alongside a plain entry is listed with it.
 	mixed := mustIgnoredTables(t, "legacy_audit_log", `/relay_\d+_feed/`)

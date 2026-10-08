@@ -26,6 +26,11 @@ const ignoreTablePatternDelimiter = "/"
 // describes one never needs to come close to the cap.
 const maxIgnoreTablePatternBytes = 256
 
+// maxIgnoreTablePatternsTotalBytes caps the length of a config's distinct
+// pattern entries taken together, so the compilation work a plan does before
+// it reads the target is bounded however many entries the config lists.
+const maxIgnoreTablePatternsTotalBytes = 1024
+
 // ValidateIgnoreTables rejects ignore_tables entries that cannot match a live
 // table: blank entries, entries padded with whitespace (a target spells a
 // table name without padding, so such an entry would silently withhold
@@ -37,6 +42,9 @@ const maxIgnoreTablePatternBytes = 256
 // exactly and case-sensitively. An entry wrapped in slashes is a pattern (see
 // CompileIgnoreTablePattern).
 func ValidateIgnoreTables(tables []string) error {
+	if err := CheckIgnoreTablePatternBudget(tables); err != nil {
+		return err
+	}
 	for _, name := range tables {
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("ignore_tables entries must not be blank")
@@ -53,6 +61,26 @@ func ValidateIgnoreTables(tables []string) error {
 		if strings.ContainsAny(name, `/\`) {
 			return fmt.Errorf("ignore_tables entry %s must be a table name, not a path. To match a family of tables, wrap a regular expression in slashes, such as \"/^events_[0-9]+$/\"", QuoteIgnoreTablesEntry(name))
 		}
+	}
+	return nil
+}
+
+// CheckIgnoreTablePatternBudget refuses a config whose distinct pattern
+// entries, taken together, are longer than maxIgnoreTablePatternsTotalBytes.
+// It runs before any pattern compiles, so an over-budget config costs nothing
+// to refuse.
+func CheckIgnoreTablePatternBudget(entries []string) error {
+	seen := make(map[string]bool)
+	total := 0
+	for _, entry := range entries {
+		if !IsIgnoreTablePattern(entry) || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		total += len(entry)
+	}
+	if total > maxIgnoreTablePatternsTotalBytes {
+		return fmt.Errorf("ignore_tables pattern entries total %d bytes, over the %d-byte limit for all patterns together: remove or shorten pattern entries", total, maxIgnoreTablePatternsTotalBytes)
 	}
 	return nil
 }
@@ -119,11 +147,11 @@ func CompileIgnoreTablePattern(entry string, foldCase bool) (*regexp.Regexp, err
 }
 
 // foldRegexpCase makes a parsed expression match every name that a spelling
-// differing from it only in case would match as written, whatever flags the
-// expression sets: those are the names a case-folding target would treat as a
-// table the pattern withholds. Each literal and character class is closed under
-// case folding; a negated class is folded after negation, so `[^a-z]`, which as
-// written matches A, also matches a.
+// equivalent to it under CaseFoldKey would match as written, whatever flags the
+// expression sets: those are the names a case-folding target could treat as a
+// table the pattern withholds. Each literal rune and character class is widened
+// to every rune case-equivalent to one it holds; a negated class is widened
+// after negation, so `[^a-z]`, which as written matches A, also matches a.
 //
 // A word boundary is treated as always holding. Whether one holds depends on
 // which spelling of the neighboring runes the name uses, since only ASCII runes
@@ -134,9 +162,18 @@ func CompileIgnoreTablePattern(entry string, foldCase bool) (*regexp.Regexp, err
 func foldRegexpCase(re *syntax.Regexp) {
 	switch re.Op {
 	case syntax.OpLiteral:
-		re.Flags |= syntax.FoldCase
+		classes := make([]*syntax.Regexp, 0, len(re.Rune))
+		for _, r := range re.Rune {
+			classes = append(classes, &syntax.Regexp{Op: syntax.OpCharClass, Rune: equivalentRanges([]rune{r, r})})
+		}
+		if len(classes) == 1 {
+			*re = *classes[0]
+			return
+		}
+		*re = syntax.Regexp{Op: syntax.OpConcat, Sub: classes}
+		return
 	case syntax.OpCharClass:
-		re.Rune = foldedRanges(re.Rune)
+		re.Rune = equivalentRanges(re.Rune)
 	case syntax.OpWordBoundary, syntax.OpNoWordBoundary:
 		re.Op = syntax.OpEmptyMatch
 	}
@@ -145,35 +182,100 @@ func foldRegexpCase(re *syntax.Regexp) {
 	}
 }
 
-// foldableRunes lists, in order, every rune that folds to another. Only runes
-// between the first and last entries of unicode.CaseRanges do, so the scan that
-// builds the list is bounded, and it runs once per process.
-var foldableRunes = sync.OnceValue(func() []rune {
-	minFold := rune(unicode.CaseRanges[0].Lo)
-	maxFold := rune(unicode.CaseRanges[len(unicode.CaseRanges)-1].Hi)
-	var runes []rune
-	for c := minFold; c <= maxFold; c++ {
-		if unicode.SimpleFold(c) != c {
-			runes = append(runes, c)
+// caseEquivalence partitions the runes that have another case into classes
+// SchemaBot treats as one table-name character wherever a target may fold
+// case. Two runes share a class when one folds to the other under Unicode
+// simple case folding or when both lower-case to the same rune, and classes
+// are closed under both. Neither relation alone covers the other: the dotted
+// capital I lower-cases to i without folding to it, and the long s folds to s
+// without lower-casing to it. Refusing a contradiction costs a plan, while
+// missing one costs an apply, so the refusal takes the union.
+type caseEquivalence struct {
+	// key maps each rune in a class to the class's smallest rune.
+	key map[rune]rune
+	// members maps a class's smallest rune to the class, sorted.
+	members map[rune][]rune
+	// runes lists every rune in a class, sorted.
+	runes []rune
+}
+
+// caseEquivalents builds the classes once per process. Only runes between the
+// first and last entries of unicode.CaseRanges fold or change case, so the scan
+// that builds them is bounded.
+var caseEquivalents = sync.OnceValue(func() caseEquivalence {
+	parent := map[rune]rune{}
+	var find func(r rune) rune
+	find = func(r rune) rune {
+		p, ok := parent[r]
+		if !ok || p == r {
+			return r
+		}
+		root := find(p)
+		parent[r] = root
+		return root
+	}
+	union := func(a, b rune) {
+		ra, rb := find(a), find(b)
+		if ra == rb {
+			return
+		}
+		parent[max(ra, rb)] = min(ra, rb)
+		parent[min(ra, rb)] = min(ra, rb)
+	}
+	minCase := rune(unicode.CaseRanges[0].Lo)
+	maxCase := rune(unicode.CaseRanges[len(unicode.CaseRanges)-1].Hi)
+	for c := minCase; c <= maxCase; c++ {
+		if f := unicode.SimpleFold(c); f != c {
+			union(c, f)
+		}
+		if l := unicode.ToLower(c); l != c {
+			union(c, l)
 		}
 	}
-	return runes
+	eq := caseEquivalence{key: make(map[rune]rune, len(parent)), members: map[rune][]rune{}}
+	for r := range parent {
+		root := find(r)
+		eq.key[r] = root
+		eq.members[root] = append(eq.members[root], r)
+		eq.runes = append(eq.runes, r)
+	}
+	for _, members := range eq.members {
+		slices.Sort(members)
+	}
+	slices.Sort(eq.runes)
+	return eq
 })
 
-// foldedRanges adds to a character class's rune ranges every rune that a rune
-// in them folds to. It visits only the foldable runes inside each range, so a
-// class costs at most one visit per foldable rune however wide it is.
-func foldedRanges(ranges []rune) []rune {
-	foldable := foldableRunes()
+// CaseFoldKey returns the form two table names share when SchemaBot treats
+// them as one table on a target that folds case: each rune is replaced by the
+// smallest rune case-equivalent to it. It is the one rule both the plain
+// ignore_tables entries and the patterns refuse declared tables by, so the two
+// kinds of entry can never disagree about which spellings collide.
+func CaseFoldKey(name string) string {
+	eq := caseEquivalents()
+	return strings.Map(func(r rune) rune {
+		if key, ok := eq.key[r]; ok {
+			return key
+		}
+		return r
+	}, name)
+}
+
+// equivalentRanges adds to a character class's rune ranges every rune
+// case-equivalent to a rune in them. It visits only the runes that have
+// another case inside each range, so a class costs at most one visit per such
+// rune however wide it is.
+func equivalentRanges(ranges []rune) []rune {
+	eq := caseEquivalents()
 	out := slices.Clone(ranges)
 	for i := 0; i+1 < len(ranges); i += 2 {
-		start, _ := slices.BinarySearch(foldable, ranges[i])
-		for _, c := range foldable[start:] {
+		start, _ := slices.BinarySearch(eq.runes, ranges[i])
+		for _, c := range eq.runes[start:] {
 			if c > ranges[i+1] {
 				break
 			}
-			for f := unicode.SimpleFold(c); f != c; f = unicode.SimpleFold(f) {
-				out = append(out, f, f)
+			for _, m := range eq.members[eq.key[c]] {
+				out = append(out, m, m)
 			}
 		}
 	}

@@ -10,6 +10,7 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -195,6 +196,17 @@ func (s *Service) PlanDeploymentDiffs(ctx context.Context, req PlanRequest, prim
 			// A member is held to the same refusal as the primary: its diff
 			// becomes its stored plan, so a data plane that planned another
 			// target's namespace as drops must block the rollup, not stage them.
+			if err := s.refuseMemberWithheldDrops(req, target, resp); err != nil {
+				s.logger.Warn("plan deployment diff proposes dropping tables ignore_tables withholds; deployment will block the review rollup",
+					"database", req.Database,
+					"environment", req.Environment,
+					"deployment", target.Deployment,
+					"target", target.Target,
+					"error", err)
+				metrics.RecordDeploymentDiff(gctx, req.Database, target.Deployment, req.Environment, "errored")
+				results[i].Err = err
+				return nil
+			}
 			if err := s.refuseDropsOfUnselectedTables(req, req.SchemaFiles, unselectedNamespaces(req.SchemaFiles, target), target, resp.Changes, resp.Shards); err != nil {
 				s.logger.Warn("plan deployment diff proposes dropping tables of unselected namespaces; deployment will block the review rollup",
 					"database", req.Database,
@@ -294,6 +306,19 @@ func (s *Service) planDeploymentDiff(ctx context.Context, req PlanRequest, targe
 		return nil, fmt.Errorf("plan diff on deployment %q target %q: %w", target.Deployment, target.Target, err)
 	}
 	return resp, nil
+}
+
+// refuseMemberWithheldDrops holds a rollout member's diff to the refusal the
+// primary's plan gets for dropping a table ignore_tables withholds.
+func (s *Service) refuseMemberWithheldDrops(req PlanRequest, target routing.ExecutionTarget, resp *ternv1.PlanDiffResponse) error {
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return fmt.Errorf("check the plan diff from deployment %q target %q against ignore_tables: %w", target.Deployment, target.Target, err)
+	}
+	if ignored.Empty() {
+		return nil
+	}
+	return s.refuseWithheldDrops(req, ignored, target.Deployment, resp.Changes, resp.Shards)
 }
 
 // memberSchemaFiles returns the desired state one rollout member is planned

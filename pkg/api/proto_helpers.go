@@ -300,26 +300,18 @@ func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
 	return slices.Compact(tables)
 }
 
-// plannedDropsWithheldBy returns the tables the plan proposes dropping that
-// ignored withholds, sorted. A planner that honored the config never sees
-// those tables, so any such drop comes from one that was never shown the
-// exclusion, or could not read it.
-func plannedDropsWithheldBy(changes []*ternv1.SchemaChange, ignored engine.IgnoredTables) []string {
+// plannedDropsWithheldBy returns the tables the plan proposes dropping, in its
+// namespace changes or its per-shard changes, that ignored withholds, sorted. A
+// planner that honored the config never sees those tables, so any such drop
+// comes from one that was never shown the exclusion, or could not read it.
+func plannedDropsWithheldBy(changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, ignored engine.IgnoredTables) []string {
 	if ignored.Empty() {
 		return nil
 	}
 	var dropped []string
-	for _, change := range changes {
-		if change == nil {
-			continue
-		}
-		for _, tc := range change.TableChanges {
-			if tc == nil || tc.ChangeType != ternv1.ChangeType_CHANGE_TYPE_DROP {
-				continue
-			}
-			if ignored.Withholds(tc.TableName) {
-				dropped = append(dropped, tc.TableName)
-			}
+	for _, drop := range plannedTableDrops(changes, shards) {
+		if ignored.Withholds(drop.table) {
+			dropped = append(dropped, drop.table)
 		}
 	}
 	slices.Sort(dropped)

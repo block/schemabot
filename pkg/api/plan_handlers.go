@@ -1188,9 +1188,22 @@ func (s *Service) refuseDropsOfWithheldTables(req PlanRequest, resp *ternv1.Plan
 			"unmatched_entries", unmatched,
 		)
 	}
-	dropped := plannedDropsWithheldBy(resp.Changes, ignored)
+	return s.refuseWithheldDrops(req, ignored, deployment, resp.Changes, resp.Shards)
+}
+
+// refuseWithheldDrops refuses a plan or diff whose namespace or per-shard
+// changes drop a table ignored withholds. A rollout member's diff runs it too:
+// the member's diff becomes its stored plan, so a member planned by a data
+// plane that did not apply the exclusion would otherwise stage the drop the
+// primary's plan was refused for.
+func (s *Service) refuseWithheldDrops(req PlanRequest, ignored engine.IgnoredTables, deployment string, changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan) error {
+	dropped := plannedDropsWithheldBy(changes, shards, ignored)
 	if len(dropped) == 0 {
 		return nil
+	}
+	var prInt int
+	if req.PullRequest != nil {
+		prInt = int(*req.PullRequest)
 	}
 	s.logger.Error("plan proposes dropping tables that ignore_tables withholds",
 		"database", req.Database,

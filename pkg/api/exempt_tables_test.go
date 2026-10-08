@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -245,6 +246,63 @@ func TestExecutePlanRefusesDropsOfAPatternWithheldFamily(t *testing.T) {
 	assert.NotContains(t, err.Error(), "relay_settings", "a drop the config does not withhold is left to review")
 	assert.Contains(t, err.Error(), "Upgrade that deployment to a build that supports ignore_tables patterns")
 	assert.Nil(t, plans.created, "a plan that would drop a withheld table is not stored")
+}
+
+// A sharded plan carries its executable drops per shard as well as per
+// namespace, so a data plane that read the pattern as a literal name and
+// planned the family's drops only on its shards is refused the same way.
+func TestExecutePlanRefusesShardDropsOfAPatternWithheldFamily(t *testing.T) {
+	plans := &capturingPlanStore{}
+	mockClient := &mockTernClient{planResp: &ternv1.PlanResponse{
+		PlanId: "plan-literal-pattern-shards",
+		Shards: []*ternv1.ShardPlan{{
+			Shard:     "-80",
+			Namespace: "payments",
+			Changes:   dropsPlan("payments", "relay_1_feed", "relay_settings")[0].TableChanges,
+		}},
+	}}
+	svc := withheldDropService(plans, mockClient)
+
+	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+		Database:    "payments",
+		Environment: "staging",
+		Type:        storage.DatabaseTypeMySQL,
+		SchemaFiles: map[string]*ternv1.SchemaFiles{
+			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+		},
+		IgnoreTables: []string{`/^relay_\d+_feed$/`},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `proposes dropping "relay_1_feed", which ignore_tables withholds`)
+	assert.NotContains(t, err.Error(), "relay_settings")
+	assert.Nil(t, plans.created, "a plan that would drop a withheld table on a shard is not stored")
+}
+
+// A rollout member's diff becomes its stored plan, so a member whose data plane
+// did not apply a pattern, and plans a withheld table's drop, blocks the review
+// rollup instead of staging the drop the primary's plan would be refused for.
+func TestRollupReviewTimeDrift_MemberDropOfWithheldTableBlocks(t *testing.T) {
+	primary := routing.ExecutionTarget{Deployment: "eu", Target: "orders-001", Namespaces: []string{"ns_0"}}
+	reviewed := &ternv1.PlanResponse{PlanId: "plan-primary", Engine: ternv1.Engine_ENGINE_SPIRIT}
+	client := &mockTernClient{planDiffResp: &ternv1.PlanDiffResponse{
+		Engine: ternv1.Engine_ENGINE_SPIRIT,
+		Shards: []*ternv1.ShardPlan{{Shard: "-80", Changes: dropsPlan("", "relay_7_feed")[0].TableChanges}},
+	}}
+	plans := &recordingPlanStore{}
+	svc := namespaceSelectionService(t, client, plans)
+	req := placedNamespacesRequest()
+	req.IgnoreTables = []string{`/^relay_\d+_feed$/`}
+
+	rollup, err := svc.RollupReviewTimeDrift(t.Context(), req, reviewed, primary)
+	require.NoError(t, err)
+	assert.False(t, rollup.Clean)
+	require.Len(t, rollup.Entries, 2)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class)
+	require.Error(t, rollup.Entries[1].Err)
+	assert.Contains(t, rollup.Entries[1].Err.Error(), `proposes dropping "relay_7_feed", which ignore_tables withholds`)
+	assert.Contains(t, rollup.Entries[1].Err.Error(), "Upgrade that deployment to a build that supports ignore_tables patterns")
+	assert.Empty(t, plans.created, "the refused member plan is never stored")
 }
 
 // A pattern the plan matched is not reported as unmatched, and the plan that
