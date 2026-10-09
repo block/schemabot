@@ -55,16 +55,11 @@ const (
 )
 
 // ListsParts reports whether a table in status lists its parts one per line
-// under it: only while the change is in flight on it. A table that has not
-// started, or has settled, says where it stands on its own line, so the PR
-// comment and the CLI both leave the listing out then.
+// under it: only while the change is in flight on it (state.IsInFlightTaskState).
+// A table that has not started, or has settled, says where it stands on its
+// own line, so the PR comment and the CLI both leave the listing out then.
 func ListsParts(status string) bool {
-	switch state.NormalizeTaskStatus(status) {
-	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
-		return true
-	default:
-		return false
-	}
+	return state.IsInFlightTaskState(state.NormalizeTaskStatus(status))
 }
 
 // ListsTargets reports whether a table across a rollout's targets in status
