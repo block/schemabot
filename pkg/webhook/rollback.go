@@ -319,13 +319,20 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 // the plan in full: the schema files hold the desired schema, not the
 // statements that reverse it.
 func (h *Handler) rollbackPlanCommentData(apply *storage.Apply, planResp *apitypes.PlanResponse, requestedBy string) templates.PlanCommentData {
+	return h.rollbackCommentData(apply.Database, apply.DatabaseType, apply.Environment, apply.ApplyIdentifier, planResp, requestedBy)
+}
+
+// rollbackCommentData builds the comment data for a rollback plan, naming every
+// unsafe change it carries, a divergent shard's included, so the change an
+// operator consents to with --allow-unsafe is one the comment showed.
+func (h *Handler) rollbackCommentData(database, dbType, environment, sourceApplyID string, planResp *apitypes.PlanResponse, requestedBy string) templates.PlanCommentData {
 	commentData := templates.PlanCommentData{
-		Database:     apply.Database,
-		Environment:  apply.Environment,
+		Database:     database,
+		Environment:  environment,
 		RequestedBy:  requestedBy,
-		DatabaseType: apply.DatabaseType,
-		IsMySQL:      apply.DatabaseType == "mysql",
-		ApplyID:      apply.ApplyIdentifier,
+		DatabaseType: dbType,
+		IsMySQL:      dbType == "mysql",
+		ApplyID:      sourceApplyID,
 		PlanID:       planResp.PlanID,
 		Tenant:       h.deploymentTenant(),
 		AgentHint:    h.agentHint(),
@@ -333,6 +340,10 @@ func (h *Handler) rollbackPlanCommentData(apply *storage.Apply, planResp *apityp
 	}
 
 	commentData.Changes = rollbackKeyspaceChanges(planResp.Changes)
+	if unsafe := planUnsafeChanges(planResp); len(unsafe) > 0 {
+		commentData.HasUnsafeChanges = true
+		commentData.UnsafeChanges = unsafe
+	}
 
 	for _, w := range planResp.LintNonErrors() {
 		commentData.LintViolations = append(commentData.LintViolations, templates.LintViolationData{
@@ -475,8 +486,9 @@ func isRollbackConfirmRejection(err error) bool {
 //     attempt.
 //   - retry=false, err=nil — a terminal outcome that is the command's answer
 //     (no pending rollback, a deterministic pinned-plan rejection, an
-//     authorization block on the merits, nothing left to roll back, or any
-//     exit at or after the ExecuteApply dispatch).
+//     authorization block on the merits, nothing left to roll back, unsafe
+//     changes refused without --allow-unsafe, or any exit at or after the
+//     ExecuteApply dispatch).
 //   - retry=false, err!=nil — a deterministic failure a re-drive would only
 //     reproduce (a GitHub App resolution failure): the delivery must not be
 //     re-driven, but the command never ran and no PR comment could be posted,
@@ -563,10 +575,10 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		PullRequest: pr,
 	}
 
-	// Rollback-confirm executes DDL with unsafe changes allowed, so the actor
-	// must be an authorized admin/operator before any lock is released or acted
-	// on. The database comes from the lock-pinned rollback plan instead of
-	// current PR files so confirmation follows the reviewed rollback artifact.
+	// Rollback-confirm executes DDL on the target, so the actor must be an
+	// authorized admin/operator before any lock is released or acted on. The
+	// database comes from the lock-pinned rollback plan instead of current PR
+	// files so confirmation follows the reviewed rollback artifact.
 	blocked, authErr := h.enforcePRCommandActorAuthorization(ctx, client, repo, pr, installationID, requestedBy, database, dbType, environment, action.RollbackConfirm, result.SuppressRetryComments)
 	if authErr != nil {
 		return true, fmt.Errorf("rollback-confirm command actor authorization gate %s#%d database %s: %w", repo, pr, database, authErr)
@@ -605,13 +617,23 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 		return false, nil
 	}
 
-	// Build apply options — rollback always allows unsafe changes, and is marked
-	// as a rollback so the terminal check update lands action_required (the PR's
-	// change is reverted) even when an operator driver, not this command's
-	// observer, publishes the terminal result.
+	// A rollback runs its unsafe changes only with --allow-unsafe, like an
+	// apply. The refusal leaves the lock pin in place, so re-issuing the
+	// command with the flag confirms the same plan.
+	if h.blockRollbackUnsafeWithoutOptIn(repo, pr, installationID, rollbackPlan, environment, requestedBy, result) {
+		return false, nil
+	}
+
+	// Build apply options. The apply is marked as a rollback so the terminal
+	// check update lands action_required (the PR's change is reverted) even
+	// when an operator driver, not this command's observer, publishes the
+	// terminal result. Consent to unsafe changes is sent only when the
+	// operator gave it.
 	options := map[string]string{
-		"allow_unsafe": "true",
-		"rollback":     "true",
+		"rollback": "true",
+	}
+	if result.AllowUnsafe {
+		options["allow_unsafe"] = "true"
 	}
 	if result.DeferCutover {
 		options["defer_cutover"] = "true"
@@ -646,8 +668,9 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	// The expected lock owner and pending plan pin the rollback to the lock
 	// intent the confirm resolved: storage re-checks both in the transaction
 	// that stores the apply, so an unlock or a newer pin landing after the
-	// resolution above rejects the rollback instead of running it with unsafe
-	// changes allowed under a lock that no longer names this plan.
+	// resolution above rejects the rollback instead of running it, and any
+	// unsafe changes it was consented for, under a lock that no longer names
+	// this plan.
 	applyReq := api.ApplyRequest{
 		PlanID:                rollbackPlan.PlanIdentifier,
 		Environment:           environment,
@@ -731,6 +754,62 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 	progressBody := formatProgressComment(apply, nil, nil, h.deploymentTenant())
 	h.postInitialProgressComment(ctx, repo, pr, installationID, apply, progressBody)
 	return false, nil
+}
+
+// blockRollbackUnsafeWithoutOptIn posts the unsafe-changes refusal and reports
+// true when the pinned rollback plan carries an unsafe change and
+// rollback-confirm was not given --allow-unsafe. The refusal lists every unsafe
+// change, a divergent shard's included, and names the command to re-issue.
+func (h *Handler) blockRollbackUnsafeWithoutOptIn(repo string, pr int, installationID int64, plan *storage.Plan, environment, requestedBy string, result CommandResult) bool {
+	if result.AllowUnsafe {
+		return false
+	}
+	unsafe := rollbackPlanUnsafeChanges(plan)
+	if len(unsafe) == 0 {
+		h.logger.Debug("rollback-confirm plan carries no unsafe changes; no --allow-unsafe needed",
+			"repo", repo, "pr", pr, "database", plan.Database, "database_type", plan.DatabaseType,
+			"environment", environment, "plan_id", plan.PlanIdentifier)
+		return false
+	}
+	planResp := api.PlanContentFromStorage(plan)
+	commentData := h.rollbackCommentData(plan.Database, plan.DatabaseType, environment, "", planResp, requestedBy)
+	commentData.HasUnsafeChanges = true
+	commentData.UnsafeChanges = unsafe
+	h.logger.Info("rollback-confirm blocked by unsafe changes without --allow-unsafe; the lock still pins the rollback plan",
+		"repo", repo, "pr", pr, "database", plan.Database, "database_type", plan.DatabaseType,
+		"environment", environment, "plan_id", plan.PlanIdentifier, "unsafe", len(unsafe))
+	h.postComment(repo, pr, installationID, templates.RenderRollbackUnsafeChangesBlocked(commentData))
+	return true
+}
+
+// rollbackPlanUnsafeChanges lists the unsafe changes a stored rollback plan
+// carries: the table changes as a plan comment lists them, with the shards a
+// change confined to some shards applies to, and the VSchema changes the
+// stored plan's own unsafe gate reports. Apply creation refuses the same plan
+// without allow_unsafe on the stored plan's verdicts, so when those name a
+// table change the comment view does not, the stored change is listed rather
+// than letting the refusal claim nothing is unsafe.
+func rollbackPlanUnsafeChanges(plan *storage.Plan) []templates.UnsafeChangeData {
+	unsafe := planUnsafeChanges(api.PlanContentFromStorage(plan))
+	if len(unsafe) == 0 {
+		for _, tc := range plan.UnsafeDDLChanges() {
+			unsafe = append(unsafe, templates.UnsafeChangeData{
+				Table:      tc.Table,
+				Reason:     tc.UnsafeOptInReason(),
+				DDL:        tc.DDL,
+				ChangeType: tc.Operation,
+			})
+		}
+	}
+	for _, vc := range plan.UnsafeVSchemaChanges() {
+		unsafe = append(unsafe, templates.UnsafeChangeData{
+			Table:            vc.Namespace + "/vschema.json",
+			Reason:           vc.Reason,
+			ChangeType:       apitypes.VSchemaChangeType,
+			VSchemaNamespace: vc.Namespace,
+		})
+	}
+	return unsafe
 }
 
 // msgRollbackLockIntentChanged is the rollback-confirm answer when the lock

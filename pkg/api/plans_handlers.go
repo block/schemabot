@@ -208,19 +208,21 @@ func storedPlanResponseFromStorage(plan *storage.Plan) *apitypes.StoredPlanRespo
 		PlanSummaryResponse: *planSummaryFromStorage(plan),
 		SchemaPath:          plan.SchemaPath,
 		Target:              plan.Target,
-		Plan:                planContentFromStorage(plan),
+		Plan:                PlanContentFromStorage(plan),
 	}
 }
 
-// planContentFromStorage reconstructs the POST /api/plan response shape from a
-// stored plan so both render through the same code paths. Lint results and
-// errors are not persisted with a plan, so they are always empty here.
+// PlanContentFromStorage reconstructs the POST /api/plan response shape from a
+// stored plan so both render through the same code paths. It is exported so a
+// PR command that acts on a stored plan, such as rollback confirmation, can
+// render that plan without re-planning. Lint results and errors are not
+// persisted with a plan, so they are always empty here.
 //
 // The member the plan was created against is carried as both halves of its
 // identity. Reporting the deployment alone would read as the member addressing
 // the unnamed target, which is a different member than the one the row records
 // whenever that deployment addresses a named one.
-func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
+func PlanContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 	resp := &apitypes.PlanResponse{
 		PlanID:       plan.PlanIdentifier,
 		Database:     plan.Database,
