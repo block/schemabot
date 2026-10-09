@@ -196,6 +196,50 @@ The PostgreSQL shape differs from MySQL in three ways:
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
 
+### PostgreSQL Etre targets
+
+An `etre` resolver with `database_type: postgres` discovers PostgreSQL targets
+the same way it discovers MySQL ones: it looks the opaque target up by a label,
+reads the host from an entity field, and fetches credentials from the
+configured backend. It reads its own `postgres` block.
+
+```yaml
+target_resolver:
+  etre:
+    - addr: "https://etre.example.com"
+      database_type: postgres
+      entity_type: db_cluster
+      target_label: target_id
+      env_label: env
+      attribute_fields: [cluster_name]
+      postgres:
+        host_field: writer_endpoint
+        table_owner: "app_owner"           # optional; see table_owner above
+        ca_ref: "embedded:rds-global"      # optional for RDS endpoints
+      credentials:
+        type: awssm
+        region: us-east-1
+        secret_name: "db/{cluster_name}/schemabot"
+```
+
+A PostgreSQL connection is made to one database, so the resolver needs its
+name. It comes from the credential secret, which is read as JSON in the format
+AWS uses for RDS database secrets; any `engine`, `host`, or `port` fields are
+ignored, because the entity decides where to connect:
+
+```json
+{"username": "schemabot", "password": "...", "dbname": "orders"}
+```
+
+Because the secret names the user, leave `credentials.username` unset. A
+resolver whose engine decodes its secret (`postgres` or `vitess`) refuses to
+start when a username is configured, on both the `secret_ref` and `awssm`
+backends, rather than ignoring it.
+
+`table_owner` and `ca_ref` mean the same as on a `dsn_from` target. They apply
+to every target the resolver serves, so a resolver serves clusters that share
+one owner role.
+
 ## gRPC Mode
 
 SchemaBot delegates to remote services that implement the Tern proto. This is useful for distributed deployments where schema changes need to run in separate isolated environments.
