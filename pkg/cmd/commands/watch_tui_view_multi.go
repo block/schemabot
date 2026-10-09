@@ -12,7 +12,10 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-func (m WatchModel) multiDeploymentProgressView() string {
+// multiDeploymentProgressSections renders the rollout as its body (the header
+// and each deployment's section) and its footer (the rollout's next command
+// and the keys the operator can press).
+func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.released))
 	groups := model.Groups()
 	view := templates.RolloutView{
@@ -43,11 +46,12 @@ func (m WatchModel) multiDeploymentProgressView() string {
 	}
 
 	b.WriteString(templates.FormatThrottleReference(m.tables))
+	var f strings.Builder
 	if footer := templates.FormatRolloutFooter(view); footer != "" {
-		b.WriteString(footer + "\n")
+		f.WriteString(footer + "\n")
 	}
-	m.writeMultiDeploymentFooter(&b, model)
-	return b.String()
+	m.writeMultiDeploymentFooter(&f, model)
+	return b.String(), f.String()
 }
 
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply, groups []presentation.Group) {
