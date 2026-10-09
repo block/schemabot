@@ -70,6 +70,41 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 			"a refusal kind with no line of its own never renders the error text")
 	})
 
+	// A stored plan the apply cannot run is named from the fields SchemaBot
+	// stored with it, followed by the apply that creates a new plan; the
+	// refusal's text, written for an API caller, never reaches the comment.
+	t.Run("plan refusals name the plan and the apply to re-plan", func(t *testing.T) {
+		const replan = "Run `schemabot apply -e production` to create a new plan."
+		tests := []struct {
+			name string
+			err  error
+			want string
+		}{
+			{
+				name: "not found",
+				err:  &api.PlanNotFoundError{PlanID: "plan-7f3a"},
+				want: "Plan `plan-7f3a` no longer exists, so nothing was applied. " + replan,
+			},
+			{
+				name: "environment mismatch",
+				err:  &api.PlanEnvironmentMismatchError{PlanID: "plan-7f3a", PlanEnvironment: "staging", RequestedEnvironment: "production"},
+				want: "Plan `plan-7f3a` was created for `staging`, not `production`, so nothing was applied. " + replan,
+			},
+			{
+				name: "missing routing",
+				err:  &api.PlanRoutingMetadataError{PlanID: "plan-7f3a", Field: "target"},
+				want: "Plan `plan-7f3a` was stored without its `target`, so SchemaBot cannot route it and nothing was applied. " + replan,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				msg := applyExecutionErrorMessage(action.ApplyConfirm, "production", tt.err)
+				assert.Equal(t, tt.want, msg)
+				assert.NotContains(t, msg, tt.err.Error())
+			})
+		}
+	})
+
 	t.Run("internal error remains sanitized", func(t *testing.T) {
 		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "staging", errors.New("secret DSN")))
 	})
@@ -99,6 +134,42 @@ func TestRollbackExecutionErrorMessage(t *testing.T) {
 				"Run `schemabot rollback-confirm -e staging` again without `--defer-cutover`. "+
 				"The pending rollback stays pinned for it.",
 			rollbackExecutionErrorMessage("staging", err))
+	})
+
+	// A stored plan the dispatch cannot run is named from the fields SchemaBot
+	// stored with it, followed by the commands that replace it; the refusal's
+	// text, written for an API caller, never reaches the comment.
+	t.Run("plan refusals name the plan and the rollback to re-plan", func(t *testing.T) {
+		const replan = "Run `schemabot rollback` again for the same apply to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`."
+		tests := []struct {
+			name string
+			err  error
+			want string
+		}{
+			{
+				name: "not found",
+				err:  &api.PlanNotFoundError{PlanID: "rbplan-1"},
+				want: "Plan `rbplan-1` no longer exists, so nothing was applied. " + replan,
+			},
+			{
+				name: "environment mismatch",
+				err:  &api.PlanEnvironmentMismatchError{PlanID: "rbplan-1", PlanEnvironment: "production", RequestedEnvironment: "staging"},
+				want: "Plan `rbplan-1` was created for `production`, not `staging`, so nothing was applied. " + replan,
+			},
+			{
+				name: "missing routing",
+				err:  &api.PlanRoutingMetadataError{PlanID: "rbplan-1", Field: "deployment"},
+				want: "Plan `rbplan-1` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. " + replan,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				msg := rollbackExecutionErrorMessage("staging", fmt.Errorf("execute apply: %w", tt.err))
+				assert.Equal(t, tt.want, msg)
+				assert.NotContains(t, msg, tt.err.Error())
+				assert.NotContains(t, msg, "execute apply")
+			})
+		}
 	})
 
 	t.Run("internal errors use fixed guidance without a retry promise", func(t *testing.T) {

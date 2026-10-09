@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -76,6 +77,17 @@ func PreviewAggregateCheckStopped() string {
 // the author to split the PR so SchemaBot can see the full changed-file list.
 func PreviewAggregateCheckFileCapBlocked() string {
 	return "Plan failed\n\n" + prFileCapExceededBlock.message
+}
+
+// PreviewRollbackConfirmPlanWithoutRouting renders the refusal of a
+// rollback-confirm whose pinned rollback plan was stored without the
+// deployment it routes to, through the renderer rollback-confirm uses.
+func PreviewRollbackConfirmPlanWithoutRouting() string {
+	return templates.RenderGenericError(templates.SchemaErrorData{
+		RequestedBy: "jackjackbits", Timestamp: "2026-01-15 14:30:00",
+		Environment: "staging", CommandName: action.RollbackConfirm,
+		ErrorDetail: rollbackExecutionErrorMessage("staging", &api.PlanRoutingMetadataError{PlanID: "plan_8f2c41", Field: "deployment"}),
+	})
 }
 
 // PreviewConfirmationPrimaryTargetChanged renders the refusal when the primary

@@ -2,8 +2,10 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -281,22 +283,125 @@ func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 	})
 }
 
+// A plan the apply names that does not exist is refused with a typed error
+// carrying the plan identifier, whether the store reports the miss as a nil
+// plan or as the sentinel, so a PR comment can name the plan without
+// presenting the error text.
+func TestExecuteApplyMissingPlanIsTyped(t *testing.T) {
+	for name, plans := range map[string]*mockPlanLookupStore{
+		"nil plan": {},
+		"sentinel": {err: storage.ErrPlanNotFound},
+	} {
+		t.Run(name, func(t *testing.T) {
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithPlanLookup{plans: plans}, testServerConfig(), nil, logger)
+
+			_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-gone", Environment: "staging"})
+
+			require.ErrorIs(t, err, storage.ErrPlanNotFound)
+			missing, ok := errors.AsType[*PlanNotFoundError](err)
+			require.True(t, ok, "a missing plan must be a *PlanNotFoundError, got %T", err)
+			assert.Equal(t, "plan-gone", missing.PlanID)
+			assert.Equal(t, "plan not found: plan-gone", err.Error())
+		})
+	}
+}
+
+// failingLockStore fails every lock read with err.
+type failingLockStore struct {
+	storage.LockStore
+	err error
+}
+
+func (s *failingLockStore) Get(context.Context, string, string) (*storage.Lock, error) {
+	return nil, s.err
+}
+
+// errDriverStorage reads like a SQL driver failure: it names the storage
+// host and the statement, neither of which belongs in an API response.
+var errDriverStorage = errors.New("Error 1205 (HY000): Lock wait timeout exceeded; try restarting transaction: dial tcp 10.0.0.5:3306")
+
 // A storage failure while queueing an apply is the server's fault, not the
-// caller's: it stays a 500 with no refusal code and is counted and traced as an
-// apply error, so a client keeps treating it as a server error rather than as
-// a request it has to change.
+// caller's: it stays a 500 with the storage_error code and is counted and
+// traced as an apply error, so a client keeps treating it as a server error
+// rather than as a request it has to change. The response is a fixed line
+// naming the plan; the SQL driver's text stays in the server log.
 func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
-	plan := executeApplyTestPlan()
-	applies := &capturingApplyStore{err: errors.New("storage unavailable")}
-	svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, applies)
-	outcomes := recordApplyOutcomes(t)
+	const wantMessage = "apply failed: storage error while queueing plan plan-1; see server logs, then retry"
 
-	status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+	t.Run("storing the apply fails", func(t *testing.T) {
+		applies := &capturingApplyStore{err: errDriverStorage}
+		svc, tasks := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
+		outcomes := recordApplyOutcomes(t)
 
-	assert.Equal(t, http.StatusInternalServerError, status)
-	assert.NotEqual(t, apitypes.ErrCodeUnsafeOptInRequired, resp.ErrorCode)
-	assert.NotEqual(t, apitypes.ErrCodePlanBlocked, resp.ErrorCode)
-	assert.Equal(t, "apply failed: store apply and tasks: storage unavailable", resp.Error)
-	assert.Equal(t, map[string]int64{"error": 1}, outcomes.statuses(t))
-	assert.Equal(t, []codes.Code{codes.Error}, outcomes.spanStatuses())
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		assert.Equal(t, http.StatusInternalServerError, status)
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Equal(t, wantMessage, resp.Error)
+		assert.NotContains(t, resp.Error, "10.0.0.5")
+		assert.NotContains(t, resp.Error, "Lock wait timeout")
+		assert.Nil(t, applies.apply)
+		assert.Empty(t, tasks.tasks)
+		assert.Equal(t, map[string]int64{"error": 1}, outcomes.statuses(t))
+		assert.Equal(t, []codes.Code{codes.Error}, outcomes.spanStatuses())
+	})
+
+	t.Run("reading the lock fails", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, _ := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
+		svc.storage.(*mockStorageWithApplyStores).locks = &failingLockStore{err: errDriverStorage}
+
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		assert.Equal(t, http.StatusInternalServerError, status)
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Equal(t, wantMessage, resp.Error)
+		assert.NotContains(t, resp.Error, "10.0.0.5")
+		assert.Nil(t, applies.apply)
+	})
+
+	// Storage refusing the apply on the merits is not a storage failure: an
+	// active apply on the target keeps its conflict answer and its message.
+	t.Run("an active apply on the target stays a conflict", func(t *testing.T) {
+		applies := &capturingApplyStore{err: fmt.Errorf("apply apply-7 (state running) holds its targets: %w", storage.ErrActiveApplyExists)}
+		svc, _ := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
+
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		assert.Equal(t, http.StatusConflict, status)
+		assert.Equal(t, apitypes.ErrCodeActiveApplyExists, resp.ErrorCode)
+		assert.Equal(t, "apply blocked by active apply: store apply and tasks: apply apply-7 (state running) holds its targets: active apply already exists", resp.Error)
+
+		_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+		_, isStorageFailure := errors.AsType[*applyStorageError](err)
+		assert.False(t, isStorageFailure, "a conflict storage decided on the merits is not a storage failure")
+	})
+
+	// A request the plan's validation refuses keeps its own message.
+	t.Run("a validation refusal keeps its message", func(t *testing.T) {
+		plan := executeApplyTestPlan()
+		plan.DatabaseType = storage.DatabaseTypePostgres
+		svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, &capturingApplyStore{})
+
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging","options":{"defer_cutover":"true"}}`)
+
+		assert.Equal(t, http.StatusBadRequest, status)
+		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+		assert.Equal(t, `apply rejected: database "testdb": deferred cutover is not supported for database_type: postgres`, resp.Error)
+	})
+
+	// An engine routing failure is not a storage failure and keeps its message.
+	t.Run("an engine routing failure keeps its message", func(t *testing.T) {
+		plan := executeApplyTestPlan()
+		plan.Deployment = "unrouted"
+		svc, _ := newQueueApplyTestService(plan, &mockTernClient{}, &capturingApplyStore{})
+
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		assert.Equal(t, http.StatusInternalServerError, status)
+		assert.NotEqual(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Equal(t, `apply failed: database "testdb" (staging): unknown deployment "unrouted": tern deployment not configured`, resp.Error)
+	})
 }

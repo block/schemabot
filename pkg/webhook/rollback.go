@@ -752,7 +752,9 @@ func rollbackExecutionErrorMessage(environment string, err error) string {
 		environment:       environment,
 		lockIntentChanged: msgRollbackLockIntentChanged,
 		afterRefusal:      "The pending rollback stays pinned for it.",
-		internal:          "Failed to execute rollback. See SchemaBot server logs for details.",
+		replan: fmt.Sprintf("Run `schemabot %s` again for the same apply to create a new rollback plan, then confirm it with `schemabot %s -e %s`.",
+			action.Rollback, action.RollbackConfirm, environment),
+		internal: "Failed to execute rollback. See SchemaBot server logs for details.",
 	})
 }
 

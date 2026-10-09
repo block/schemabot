@@ -787,6 +787,7 @@ func applyExecutionErrorMessage(command, environment string, err error) string {
 		environment: environment,
 		lockIntentChanged: "The pending schema change changed while this command was running. " +
 			"The apply was rejected; review the latest plan and run the command again.",
+		replan:   fmt.Sprintf("Run `schemabot %s -e %s` to create a new plan.", action.Apply, environment),
 		internal: "Failed to execute apply. See SchemaBot server logs for details.",
 	})
 }
@@ -804,6 +805,10 @@ type dispatchMessages struct {
 	// afterRefusal, when set, follows the remedy for a refused feature and
 	// says what the refusal left in place for the re-issued command to use.
 	afterRefusal string
+	// replan follows a refusal of the stored plan itself (missing, created
+	// for another environment, or stored without routing) and names the
+	// command that creates a plan the dispatch can run.
+	replan string
 	// internal is the fixed line for every failure whose text belongs in
 	// server logs.
 	internal string
@@ -815,7 +820,10 @@ type dispatchMessages struct {
 // expected race whose answer is lockIntentChanged, and an unsupported feature
 // is rejected before anything is stored and would be refused the same way on
 // retry, so the operator sees the feature error followed by the command to
-// re-issue without the option that asked for it. A rollout member's refused
+// re-issue without the option that asked for it. A stored plan the dispatch
+// cannot run as it stands (missing, created for another environment, or
+// stored without routing) is named by its identifier, followed by the command
+// that creates a new one. A rollout member's refused
 // plan is named by target and table from fields SchemaBot controls. Everything
 // else is an internal error whose text stays in server logs behind the fixed
 // line.
@@ -833,6 +841,15 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 			}
 		}
 		return strings.Join(parts, " ")
+	}
+	if missing, ok := errors.AsType[*api.PlanNotFoundError](err); ok {
+		return templates.PlanNotFoundDetail(missing.PlanID, msgs.replan)
+	}
+	if mismatch, ok := errors.AsType[*api.PlanEnvironmentMismatchError](err); ok {
+		return templates.PlanEnvironmentMismatchDetail(mismatch.PlanID, mismatch.PlanEnvironment, mismatch.RequestedEnvironment, msgs.replan)
+	}
+	if unrouted, ok := errors.AsType[*api.PlanRoutingMetadataError](err); ok {
+		return templates.PlanRoutingMetadataDetail(unrouted.PlanID, unrouted.Field, msgs.replan)
 	}
 	if refused, ok := errors.AsType[*api.MemberPlanRefusedError](err); ok {
 		switch refused.Refusal {

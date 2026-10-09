@@ -390,6 +390,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"SUMMARY: MULTI-NAMESPACE COMPLETED", func() { fmt.Print(webhooktemplates.PreviewCommentSummaryMultiNamespaceCompleted()) }},
 		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
 		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
+		{"ROLLBACK-CONFIRM REFUSED: ROLLBACK PLAN STORED WITHOUT ROUTING", func() { fmt.Print(webhook.PreviewRollbackConfirmPlanWithoutRouting()) }},
 	}
 	printSections(sections)
 }

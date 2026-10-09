@@ -6653,6 +6653,23 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 ```
 
 </details>
+
+</details>
+
+<details>
+<summary><a name="rollbackconfirm-refused-rollback-plan-stored-without-routing"></a><strong>Rollback-confirm Refused: Rollback Plan Stored Without Routing</strong></summary>
+
+
+## ❌ Rollback-confirm Failed
+
+**Environment**: `staging`
+
+*Requested by @jackjackbits at 2026-01-15 14:30:00 UTC*
+
+### Error
+
+> Plan `plan_8f2c41` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. Run `schemabot rollback` again for the same apply to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`.
+<!-- schemabot:offer-support-channel -->
 </details>
 
 ### CLI Output
