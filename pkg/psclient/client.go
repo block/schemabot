@@ -105,6 +105,9 @@ type psClientWrapper struct {
 	baseURL    string       // the SDK client's base URL, reused for endpoints not in the SDK
 	tokenName  string
 	tokenValue string
+	// keyspaceListingTimeout bounds a whole ListKeyspaces call, every page
+	// included. The constructors set it to defaultKeyspaceListingTimeout.
+	keyspaceListingTimeout time.Duration
 }
 
 // APIError is a non-2xx response from a PlanetScale endpoint this package calls
@@ -198,6 +201,8 @@ func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string, opts ...ps.Cl
 		baseURL:    baseURL,
 		tokenName:  tokenName,
 		tokenValue: tokenValue,
+
+		keyspaceListingTimeout: defaultKeyspaceListingTimeout,
 	}, nil
 }
 
@@ -243,6 +248,15 @@ const keyspacesPerPage = 100
 // page, and the listing fails rather than loop or return a partial view.
 const maxKeyspacePages = 100
 
+// defaultKeyspaceListingTimeout bounds a keyspace listing as a whole. The page
+// bound alone does not: each page request may run for the full per-request
+// timeout, so a caller with no deadline of its own could otherwise wait for the
+// page bound times that timeout. Two per-request timeouts lets one slow page use
+// its whole budget and still leaves the rest of the listing room to finish, while
+// a branch whose API answers every page just inside the per-request timeout ends
+// after a couple of pages rather than after all of them.
+const defaultKeyspaceListingTimeout = 2 * planetScaleHTTPTimeout
+
 // ListKeyspaces returns every keyspace on the branch, reading each page the API
 // reports.
 //
@@ -261,8 +275,15 @@ const maxKeyspacePages = 100
 // the next listing heals one that did not.
 //
 // The HTTP client's timeout applies to each page request. The listing as a whole
-// is bounded by maxKeyspacePages and by ctx.
+// reads at most maxKeyspacePages pages and ends by the wrapper's
+// keyspaceListingTimeout whatever ctx carries; a ctx deadline that comes sooner
+// ends it sooner. When the overall bound fires, the error says the listing as a
+// whole timed out and how many pages it had read, which tells it apart from a
+// single page timing out and from ctx itself ending.
 func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
+	listCtx, cancel := context.WithTimeout(ctx, w.keyspaceListingTimeout)
+	defer cancel()
+
 	// Each name is its own path segment, so a character that URL syntax gives
 	// meaning to cannot retarget the request or swallow the page query.
 	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/keyspaces",
@@ -277,8 +298,12 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 		query := url.Values{}
 		query.Set("page", strconv.Itoa(page))
 		query.Set("per_page", strconv.Itoa(keyspacesPerPage))
-		respBody, err := w.doRawJSON(ctx, http.MethodGet, basePath+"?"+query.Encode(), nil)
+		respBody, err := w.doRawJSON(listCtx, http.MethodGet, basePath+"?"+query.Encode(), nil)
 		if err != nil {
+			if listingBoundEnded(ctx, listCtx) {
+				return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: listing as a whole timed out after %s (pages read: %d, waiting on page %d): %w",
+					req.Organization, req.Database, req.Branch, w.keyspaceListingTimeout, fetched-1, page, err)
+			}
 			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
 		}
 		var payload struct {
@@ -306,6 +331,13 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 		}
 		page = *payload.NextPage
 	}
+}
+
+// listingBoundEnded reports whether the listing's own overall bound ended
+// listCtx while the caller's ctx is still live. When ctx has ended too, the
+// caller's deadline or cancellation is the cause, and it is reported as such.
+func listingBoundEnded(ctx, listCtx context.Context) bool {
+	return listCtx.Err() != nil && ctx.Err() == nil
 }
 
 func (w *psClientWrapper) GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
