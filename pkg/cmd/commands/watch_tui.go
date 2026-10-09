@@ -51,6 +51,9 @@ type WatchModel struct {
 	startedAt          time.Time
 	initialized        bool
 	consecutiveErrors  int // Consecutive fetch failures (drives backoff)
+	// requestedRetryDelay is the delay the last failed fetch asked for, which
+	// stretches the backoff before the next poll.
+	requestedRetryDelay time.Duration
 }
 
 var activityLabelFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -67,6 +70,7 @@ type progressMsg struct {
 	errorMsg     string            // Human-readable error message
 	failed       bool              // true when the API call didn't return usable progress data
 	retryable    bool              // when failed, whether the TUI should keep polling
+	retryAfter   time.Duration     // when failed, the delay the response asked for before the next poll
 	applyID      string            // Populated from progress responses
 	database     string            // Populated from apply-id progress responses
 	environment  string            // Populated from apply-id progress responses
@@ -159,6 +163,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// until the same bound the non-interactive watches give up at.
 			m.consecutiveErrors++
 			m.errorMsg = msg.errorMsg
+			m.requestedRetryDelay = msg.retryAfter
 			if m.consecutiveErrors >= maxConsecutiveProgressFailures {
 				m.errorMsg = progressGiveUpMessage(m.applyID, m.consecutiveErrors) + ": " + msg.errorMsg
 				m.initialized = true
@@ -175,6 +180,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		m.consecutiveErrors = 0
 		m.errorMsg = ""
+		m.requestedRetryDelay = 0
 		m.state = msg.state
 		if !state.IsState(m.state, state.Apply.Pending) {
 			m.pastPending = true

@@ -478,6 +478,26 @@ func TestProgressPoller_ProxyUnavailableWithoutRetryAfterUsesBackoff(t *testing.
 	assert.Equal(t, []time.Duration{fetchErrorBackoff(1)}, *waits)
 }
 
+// A Retry-After header asking for longer than the CLI's bound, whether in
+// seconds or as a far-future date, is waited out only up to that bound, so a
+// misconfigured proxy cannot park a watch for a day.
+func TestProgressPoller_BoundsProxyRetryAfterHeader(t *testing.T) {
+	for _, header := range []string{"86400", "Fri, 31 Dec 9999 23:59:59 GMT"} {
+		t.Run(header, func(t *testing.T) {
+			poller, waits := proxiedProgressPoller(t,
+				proxyResponse{status: http.StatusServiceUnavailable, retryAfter: header, body: proxyUnavailable},
+				proxyResponse{status: http.StatusOK, body: runningProgressBody()},
+			)
+
+			result, err := poller.next(func(progressRetry) {})
+
+			require.NoError(t, err)
+			assert.Equal(t, state.Apply.Running, result.State)
+			assert.Equal(t, []time.Duration{5 * time.Minute}, *waits)
+		})
+	}
+}
+
 // When the body and the Retry-After header both name a delay, the watch waits
 // for the larger, so it never polls sooner than either asked.
 func TestProgressRetryWait_LargerOfBodyAndHeaderDelayWins(t *testing.T) {

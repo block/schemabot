@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -478,10 +477,20 @@ func parseAPIError(resp *http.Response, body []byte) *APIError {
 	return apiErr
 }
 
+// maxRetryAfterHeader bounds the delay a Retry-After header can ask for. The
+// header can come from any proxy or maintenance page in front of the server,
+// which commonly asks for an hour, and a watch that honoured that would sit far
+// past the few minutes of failed polls after which it is documented to give
+// up. The server's own delay arrives in the response body and is not bounded
+// here.
+const maxRetryAfterHeader = 5 * time.Minute
+
 // parseRetryAfterHeader reads a Retry-After header value in either form RFC
-// 9110 allows: a count of seconds, or an HTTP date measured from now. An
-// absent, malformed, or negative value, or a date already past, yields zero,
-// so a header nobody can act on never delays a retry.
+// 9110 allows: a count of seconds, or an HTTP date measured from now, bounded
+// by maxRetryAfterHeader. An absent, malformed, or negative value, or a date
+// already past, yields zero, so a header nobody can act on never delays a
+// retry. A count of seconds too large to read is still a request to wait long,
+// so it yields the bound.
 func parseRetryAfterHeader(value string, now time.Time) time.Duration {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -489,8 +498,8 @@ func parseRetryAfterHeader(value string, now time.Time) time.Duration {
 	}
 	if isDigits(value) {
 		seconds, err := strconv.ParseInt(value, 10, 64)
-		if err != nil || seconds > int64(math.MaxInt64/time.Second) {
-			return 0
+		if err != nil || seconds > int64(maxRetryAfterHeader/time.Second) {
+			return maxRetryAfterHeader
 		}
 		return time.Duration(seconds) * time.Second
 	}
@@ -498,7 +507,7 @@ func parseRetryAfterHeader(value string, now time.Time) time.Duration {
 	if err != nil {
 		return 0
 	}
-	return max(at.Sub(now), 0)
+	return min(max(at.Sub(now), 0), maxRetryAfterHeader)
 }
 
 func isDigits(s string) bool {

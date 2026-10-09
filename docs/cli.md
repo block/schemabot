@@ -1055,8 +1055,9 @@ schedule. Giving up does not affect the apply. The error tells the operator to
 rerun the original watch command, preserving its output format and connection
 flags, or to run `progress` with the apply ID to see its current state. When a
 refused poll carries a `Retry-After` header, as a proxy or rate limiter in
-front of SchemaBot may send, a log or JSON watcher waits at least that long
-before polling again.
+front of SchemaBot may send, a watcher waits at least that long before polling
+again, up to 5 minutes per poll, so a watcher held off this way takes longer
+to give up.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

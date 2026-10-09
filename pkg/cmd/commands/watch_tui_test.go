@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
@@ -115,6 +116,40 @@ func TestWatchModel_GivesUpAfterConsecutiveRetryableFailures(t *testing.T) {
 	assert.Equal(t, progressGiveUpMessage(scriptedApplyID, maxConsecutiveProgressFailures)+": "+failure.errorMsg, model.errorMsg)
 	assert.Contains(t, model.errorMsg, "fetch progress for apply "+scriptedApplyID+": 10 consecutive attempts failed; this watch does not affect the apply")
 	assert.Equal(t, state.Apply.Running, model.state, "the last known state is kept on screen")
+}
+
+// The interactive watch follows the same rule as the log and JSON watches: a
+// refused poll whose response names a delay is retried no sooner than that
+// delay, a refusal without one uses the fetch-error backoff, and a successful
+// poll returns to the base interval.
+func TestWatchModel_HonorsRetryAfterHeader(t *testing.T) {
+	retryAfter := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if retryAfter != "" {
+			w.Header().Set("Retry-After", retryAfter)
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(proxyRateLimitPage))
+	}))
+	t.Cleanup(srv.Close)
+
+	m := NewWatchModel(srv.URL, "", "staging", false)
+	m.applyID = scriptedApplyID
+	require.Equal(t, pollInterval, m.nextPollDelay())
+
+	retryAfter = "45"
+	updated, _ := m.Update(m.fetchProgress()())
+	model := updated.(WatchModel)
+	assert.Equal(t, 45*time.Second, model.nextPollDelay())
+
+	updated, _ = model.Update(progressMsg{state: state.Apply.Running})
+	model = updated.(WatchModel)
+	assert.Equal(t, pollInterval, model.nextPollDelay())
+
+	retryAfter = ""
+	updated, _ = model.Update(model.fetchProgress()())
+	model = updated.(WatchModel)
+	assert.Equal(t, fetchErrorBackoff(1), model.nextPollDelay())
 }
 
 func TestWatchModel_CompletedViewShowsCompactSummary(t *testing.T) {

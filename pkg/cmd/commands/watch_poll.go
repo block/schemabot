@@ -131,15 +131,22 @@ func isRetryableStatusWithoutCode(status int) bool {
 // code. When both are present the larger wins, so a rate-limited watch never
 // polls sooner than either asked.
 func progressRetryWait(err error, consecutiveErrors int) time.Duration {
-	wait := fetchErrorBackoff(consecutiveErrors)
+	return max(fetchErrorBackoff(consecutiveErrors), requestedRetryDelay(err))
+}
+
+// requestedRetryDelay is the delay a failed fetch's response asked for: the
+// longer of the body's and the Retry-After header's when the error code is
+// retryable, and the header alone for a response with no SchemaBot error code,
+// as a proxy in front of the server sends. Zero when nothing was asked for.
+func requestedRetryDelay(err error) time.Duration {
 	var apiErr *client.APIError
 	if !errors.As(err, &apiErr) {
-		return wait
+		return 0
 	}
 	if retry, after := apiErr.RetryAfter(); retry {
-		wait = max(wait, after)
+		return after
 	}
-	return max(wait, apiErr.RetryAfterHeader)
+	return apiErr.RetryAfterHeader
 }
 
 // printProgressRetry reports a transient progress failure on stderr, keeping

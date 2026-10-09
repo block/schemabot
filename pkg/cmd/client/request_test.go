@@ -193,7 +193,10 @@ func TestParseRetryAfterHeader(t *testing.T) {
 		{name: "negative seconds", value: "-5", want: 0},
 		{name: "signed seconds", value: "+5", want: 0},
 		{name: "fractional seconds", value: "1.5", want: 0},
-		{name: "seconds too large to represent", value: "99999999999999999999", want: 0},
+		{name: "seconds at the bound", value: "300", want: 5 * time.Minute},
+		{name: "seconds past the bound", value: "86400", want: maxRetryAfterHeader},
+		{name: "seconds too large to represent", value: "99999999999999999999", want: maxRetryAfterHeader},
+		{name: "HTTP date past the bound", value: "Fri, 31 Dec 9999 23:59:59 GMT", want: maxRetryAfterHeader},
 		{name: "malformed", value: "soon", want: 0},
 	}
 	for _, tc := range tests {
