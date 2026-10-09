@@ -150,3 +150,25 @@ func TestBuildApplyOperationGroups_SingleTargetDeploymentsKeepMemberOperations(t
 
 	assert.Equal(t, []stepRow{{"", 0, []string{"stations", "docks"}}}, stepLayout(groups))
 }
+
+// A rollout that pairs a multi-target deployment with a deployment of one
+// target has a member with no target to run a step beside, so the rollout
+// keeps every member's change in one operation rather than step some members
+// and not others. Apply creation refuses this shape first; the builder holds
+// to it on its own.
+func TestBuildApplyOperationGroups_MixedDeploymentShapesKeepMemberOperations(t *testing.T) {
+	applyPlan := stepPlan(10, "bikeshare-001", "stations", "docks")
+	other := stepPlan(11, "bikeshare-002", "stations", "docks")
+	single := stepPlan(12, "", "stations", "docks")
+	groups := buildSteps(t, applyPlan,
+		stepMember("bikeshare-001", applyPlan),
+		stepMember("bikeshare-002", other),
+		applyMember{Target: routing.ExecutionTarget{Deployment: "us"}, Plan: single},
+	)
+
+	assert.Equal(t, []stepRow{
+		{"bikeshare-001", 0, []string{"stations", "docks"}},
+		{"bikeshare-002", 0, []string{"stations", "docks"}},
+		{"", 0, []string{"stations", "docks"}},
+	}, stepLayout(groups))
+}

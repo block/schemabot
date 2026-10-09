@@ -9,10 +9,29 @@ import (
 )
 
 // runsTableByTable reports whether an apply of the per-member shape rolls out
-// table by table: some deployment addresses more than one target, and no
-// member's plan changes a VSchema (see memberPlanChangesVSchema).
+// table by table: every member sits in a deployment that addresses more than
+// one target, and no member's plan changes a VSchema (see
+// memberPlanChangesVSchema).
 func runsTableByTable(keys memberOperationKeys, members []applyMember) bool {
-	return len(keys.multiTargetDeployments) > 0 && !memberPlanChangesVSchema(members)
+	return everyMemberIsMultiTarget(keys, members) && !memberPlanChangesVSchema(members)
+}
+
+// everyMemberIsMultiTarget reports whether every member is addressed as one of
+// several targets in its deployment. A step is dispatched beside its member's
+// target, so a member of a single-target deployment has no target to name its
+// step beside and keeps its whole change in one operation. Apply creation
+// refuses a multi-target rollout across deployments, so a rollout that mixes
+// the two never gets this far; the builder holds to it on its own regardless.
+func everyMemberIsMultiTarget(keys memberOperationKeys, members []applyMember) bool {
+	if len(members) == 0 {
+		return false
+	}
+	for _, member := range members {
+		if !keys.multiTargetDeployments[member.Target.Deployment] {
+			return false
+		}
+	}
+	return true
 }
 
 // memberPlanChangesVSchema reports whether any member's plan changes a
@@ -150,6 +169,8 @@ func logRolloutShape(logger *slog.Logger, plan *storage.Plan, environment string
 		logger.Info("createStoredApply: queueing a multi-target rollout table by table", append(attrs, "table_steps", steps)...)
 	case shardedFanout:
 		logger.Info("createStoredApply: queueing a multi-target rollout member by member: its plans fan out per shard", attrs...)
+	case !everyMemberIsMultiTarget(newMemberOperationKeys(members), members):
+		logger.Info("createStoredApply: queueing a multi-target rollout member by member: some members are the only target in their deployment", attrs...)
 	case memberPlanChangesVSchema(members):
 		logger.Info("createStoredApply: queueing a multi-target rollout member by member: a member's plan changes a VSchema, which applies with its member's tables", attrs...)
 	default:
