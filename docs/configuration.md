@@ -20,6 +20,7 @@
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
 - [Target TLS Posture](#target-tls-posture)
+- [PlanetScale Service Token](#planetscale-service-token)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -1284,6 +1285,26 @@ it: a pinned CA bundle under a non-verifying `sslmode` is refused at CA
 resolution, as described under
 [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets), rather than
 silently never consulted.
+
+## PlanetScale Service Token
+
+The Vitess engine drives PlanetScale through a service token whose database
+access permissions cover every API call an apply makes. The grant list in
+`deploy/aws-multi-env/scripts/bootstrap-planetscale.sh` is the reference set.
+
+One of them is easy to miss because only a failure path uses it:
+`delete_branch`. An apply prepares its schema change on a branch it creates,
+and the deploy request deletes that branch once it exists. When the apply
+fails for good before it creates the deploy request, SchemaBot deletes the
+branch itself so it does not hold branch quota. That covers both an apply's
+first drive and a drive that resumed it. A branch an operator supplied is
+never deleted.
+
+Without `delete_branch` the delete is refused. The apply still fails with its
+own error, and SchemaBot logs the refused delete at error level with the
+organization, database, and branch to delete by hand. Grant only
+`delete_branch`, not `delete_production_branch`: SchemaBot deletes only the
+development branches it creates.
 
 ## PlanetScale mTLS
 

@@ -230,6 +230,7 @@ cmd_create() {
         create_branch \
         create_comment \
         create_deploy_request \
+        delete_branch \
         delete_branch_password \
         read_branch \
         read_comment \
@@ -238,7 +239,7 @@ cmd_create() {
         write_branch_vschema \
         --database "$PS_DATABASE" \
         $ORG_FLAG
-    success "Permissions granted (11 access types)"
+    success "Permissions granted (12 access types)"
 
     # Step 6: Create vtgate password for progress polling (SHOW VITESS_MIGRATIONS)
     local vtgate_name="schemabot-${PS_DATABASE}-vtgate"
