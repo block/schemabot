@@ -932,14 +932,21 @@ fails, it also publishes a failing aggregate check.
 
 A plan narrowed to one target with `--target` posts its comment and writes no
 record: it speaks for one target, so it cannot move the environment's check in
-either direction. An apply narrowed the same way stores `narrowed_apply` on the
+either direction. That holds when it fails too, including for a target the
+environment does not have: the failure is answered on the comment. The one
+exception is a namespace placement refusal, which is a fault in the
+environment's configuration rather than the target's, so it blocks the
+environment's check the same way a plan of every target does.
+
+An apply narrowed the same way stores `narrowed_apply` on the
 environment's record before it dispatches and keeps it there when it completes,
 so the check blocks until an apply or plan of the whole environment records
 its own result (MG-12). A record already blocked for reconciliation, review-time
-drift, or namespace placement keeps that block. A narrowed apply is not refused
-on drift, since applying one target at a time is how diverged targets are
-brought back in line; the drift block stays until a rollup of the whole
-environment finds them converged.
+drift, or namespace placement keeps that block, with its own reason, from
+dispatch through completion. A narrowed apply is not refused on drift or
+placement, since applying one target at a time is how diverged targets are
+brought back in line; the block stays until a rollup of the whole environment
+finds them converged.
 
 ### Apply requested
 

@@ -852,9 +852,13 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		check.Status = checkStatusCompleted
 		check.Conclusion = checkConclusionActionRequired
 		check.HasChanges = true
-		check.BlockingReason = narrowedApplyBlock.blockingReason
-		check.ErrorMessage = narrowedApplyBlock.message
-		check.ChangeSummary = narrowedApplyCheckSummary
+		// A block the narrowed apply kept when it started stays with its own
+		// reason and summary; only a rollup of the whole environment lifts it.
+		if !narrowedApplyKeepsBlock(check.BlockingReason) {
+			check.BlockingReason = narrowedApplyBlock.blockingReason
+			check.ErrorMessage = narrowedApplyBlock.message
+			check.ChangeSummary = narrowedApplyCheckSummary
+		}
 		// MarkActionRequiredForApply releases check ownership, so the plan of
 		// the whole environment that lifts this block can write its result.
 		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)

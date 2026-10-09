@@ -353,3 +353,29 @@ func TestE2EUnstoredNamespacePlacementRefusalHoldsAggregate(t *testing.T) {
 		})
 	}
 }
+
+// A pull request's production check passed on an earlier plan of every
+// production target. An operator then plans one target and mistypes its name.
+// The narrowed plan speaks for that one target only, so its failure answers on
+// the comment alone: production's stored check state stays as the plan of
+// every target recorded it, and no failing aggregate Check Run is posted.
+func TestE2ENarrowedPlanFailureLeavesEnvironmentCheck(t *testing.T) {
+	p := newNamespacePlacementHarness(t, []api.TargetEntry{
+		{Target: "orders-001", Namespaces: []string{"ns_0"}},
+		{Target: "orders-002", Namespaces: []string{"ns_1"}},
+	})
+	require.NoError(t, p.store.Checks().Upsert(t.Context(), &storage.Check{
+		Repository: "octocat/hello-world", PullRequest: 1, HeadSHA: "abc123",
+		Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: p.dbName,
+		CheckRunID: 1, Status: checkStatusCompleted, Conclusion: checkConclusionSuccess,
+	}))
+
+	assert.Contains(t, p.comment(t, "schemabot plan -e production --target orders-009"), `is not a rollout member`)
+
+	byEnv := p.checksByEnv(t)
+	require.Contains(t, byEnv, "production")
+	assert.Equal(t, checkConclusionSuccess, byEnv["production"].Conclusion, "a narrowed plan's failure does not move the environment's check")
+	assert.Empty(t, byEnv["production"].BlockingReason)
+	assert.Empty(t, byEnv["production"].ErrorMessage)
+	assert.Nil(t, p.lastAggregate(), "a narrowed plan's failure posts no aggregate Check Run")
+}

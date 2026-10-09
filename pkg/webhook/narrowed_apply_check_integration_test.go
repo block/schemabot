@@ -120,6 +120,38 @@ func (f *narrowedApplyCheckFixture) storeNarrowedApply(t *testing.T) {
 	assert.Equal(t, f.headSHA, gotSHA)
 }
 
+// runNarrowedApply starts an apply narrowed to payments-002, claims the
+// check for it, then completes it. It returns the stored check state as the
+// apply start and the terminal refresh each left it.
+func (f *narrowedApplyCheckFixture) runNarrowedApply(t *testing.T, identifier string) (started, completed *storage.Check, applyID int64) {
+	t.Helper()
+	ctx := t.Context()
+	apply := &storage.Apply{
+		ApplyIdentifier: identifier,
+		Database:        f.schema.Database,
+		DatabaseType:    "mysql",
+		Repository:      f.repo,
+		PullRequest:     f.pr,
+		Environment:     f.env,
+		Engine:          storage.EngineSpirit,
+		InstallationID:  4242,
+		State:           state.Apply.Running,
+		Options:         storage.MarshalApplyOptions(storage.ApplyOptions{NarrowedTo: "prod/payments-002"}),
+	}
+	applyID, err := f.st.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	require.NoError(t, f.h.updateCheckRecordForApplyStart(ctx, f.client, f.repo, f.pr, f.schema, f.env, apply),
+		"a narrowed apply is not refused by a block it keeps")
+	started = f.check(t)
+
+	apply.State = state.Apply.Completed
+	require.NoError(t, f.st.Applies().Update(ctx, apply))
+	f.h.refreshChecksForTerminalApply(ctx, apply, "test narrowed apply terminal")
+	return started, f.check(t), applyID
+}
+
 // An operator lands a change on payments-002 alone with
 // `schemabot apply -e production --target payments-002` while the PR's check
 // for production reads success from an earlier plan. The apply changes one of
@@ -215,8 +247,9 @@ func TestWholeEnvironmentApplyReplacesNarrowedApplyBlock(t *testing.T) {
 // A commit removed the schema change after an earlier apply on production
 // had started, so the check is blocked for reconciliation: the target may
 // carry work the PR no longer describes (MG-6). An operator then lands a
-// narrowed apply. The check keeps the reconciliation block rather than taking
-// narrowed_apply, which an ordinary plan of the whole environment would lift.
+// narrowed apply. The check keeps the reconciliation block from dispatch
+// through completion rather than taking narrowed_apply, which an ordinary plan
+// of the whole environment would lift.
 func TestNarrowedApplyKeepsReconciliationBlock(t *testing.T) {
 	ctx := t.Context()
 	f := newNarrowedApplyCheckFixture(t, "octocat/narrowed-apply-reconcile", 10, "narrowed_apply_reconcile_db")
@@ -252,13 +285,22 @@ func TestNarrowedApplyKeepsReconciliationBlock(t *testing.T) {
 	assert.Equal(t, schemaRemovedAfterApplyBlock.message, kept.ErrorMessage)
 	assert.Equal(t, earlierID, kept.ApplyID, "the started apply still owns the row")
 	assert.Equal(t, f.headSHA, kept.HeadSHA, "the row moves to the current head so the aggregate reads it")
+
+	started, completed, _ := f.runNarrowedApply(t, "apply-narrowed-after-removal")
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, started.BlockingReason, "starting the narrowed apply keeps the reconciliation block")
+	assert.Equal(t, schemaRemovedAfterApplyBlock.message, started.ErrorMessage)
+	assert.Equal(t, checkStatusInProgress, started.Status)
+	assert.Equal(t, schemaRemovedAfterApplyBlock.blockingReason, completed.BlockingReason, "completing the narrowed apply keeps the reconciliation block")
+	assert.Equal(t, checkStatusCompleted, completed.Status)
+	assert.NotEqual(t, checkConclusionSuccess, completed.Conclusion)
 }
 
 // A plan of production found its targets diverged (or a namespace placed on
 // the wrong target) and blocked the check on live deployment state. An
-// operator then lands a narrowed apply, which runs no rollup. The check keeps
-// the stored block, which only a fresh rollup of the whole environment may
-// clear, rather than taking narrowed_apply and reading as the next step of an
+// operator then lands a narrowed apply, which runs no rollup. The apply is
+// not refused, and the check keeps the stored block from dispatch through
+// completion, since only a fresh rollup of the whole environment may clear it,
+// rather than taking narrowed_apply and reading as the next step of an
 // ordinary rollout.
 func TestNarrowedApplyKeepsRollupBlock(t *testing.T) {
 	for i, block := range []checkBlockReason{reviewTimeDeploymentDriftBlock, namespacePlacementRefusedBlock} {
@@ -281,6 +323,18 @@ func TestNarrowedApplyKeepsRollupBlock(t *testing.T) {
 			assert.Equal(t, block.message, kept.ErrorMessage)
 			assert.Equal(t, "targets diverged at review time", kept.ChangeSummary)
 			assert.Equal(t, f.headSHA, kept.HeadSHA, "the row moves to the current head so the aggregate reads it")
+
+			started, completed, applyID := f.runNarrowedApply(t, "apply-narrowed-"+block.blockingReason)
+			assert.Equal(t, block.blockingReason, started.BlockingReason, "starting the narrowed apply keeps the block")
+			assert.Equal(t, block.message, started.ErrorMessage)
+			assert.Equal(t, checkStatusInProgress, started.Status)
+			assert.Equal(t, applyID, started.ApplyID, "the narrowed apply owns the row while it runs")
+
+			assert.Equal(t, block.blockingReason, completed.BlockingReason, "completing the narrowed apply keeps the block")
+			assert.Equal(t, block.message, completed.ErrorMessage)
+			assert.Equal(t, "targets diverged at review time", completed.ChangeSummary)
+			assert.Equal(t, checkStatusCompleted, completed.Status)
+			assert.Equal(t, checkConclusionActionRequired, completed.Conclusion)
 		})
 	}
 }
