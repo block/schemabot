@@ -30,18 +30,17 @@ func writeMultiDeploymentProgress(data ProgressData) {
 	fmt.Println()
 
 	// A deployment that addresses several targets renders as one rollup
-	// section; any other member keeps a section of its own. Group members
-	// index model.Deployments, which Derive returns index-parallel to
-	// data.Operations, so each section renders its own operation's
-	// identifiers — a keyed apply has many operations on the same deployment
+	// section; any other member keeps a section of its own. Each member names
+	// the row it reads its identifiers from, so each section renders its own
+	// operation's: a keyed apply has many operations on the same deployment
 	// name, so a name-based lookup cannot tell the sections apart.
 	for _, g := range groups {
 		if len(g.Members) > 1 {
 			fmt.Print(FormatTargetRollup(view, g))
 			continue
 		}
-		i := g.Members[0]
-		writeDeploymentProgressSection(model.Deployments[i], data.Operations[i], data)
+		d := model.Deployments[g.Members[0]]
+		writeDeploymentProgressSection(d, data.Operations[d.Row], data)
 	}
 	fmt.Print(FormatThrottleReference(data.Tables))
 	fmt.Print(FormatRolloutFooter(view))

@@ -151,6 +151,49 @@ func TestBuildMultiApplyData_RoutesTasksByOperation(t *testing.T) {
 	assert.Equal(t, "orders", data.Details[1].Tables[0].TableName)
 }
 
+// A rollout run table by table has one row per target and table. Each target's
+// section covers every one of its rows: its tables in row order, under the
+// state the target reads as, so orders-001, done with `bikes` and queued for
+// `docks`, shows both tables, and the model counts two targets, not four rows.
+func TestBuildMultiApplyData_FoldsATargetsTableRows(t *testing.T) {
+	row := func(id int64, target, key, st string) *storage.ApplyOperation {
+		return &storage.ApplyOperation{ID: id, Deployment: "eu", Target: target, OperationKey: key, OperationKind: storage.ApplyOperationKindWork, State: st}
+	}
+	ops := []*storage.ApplyOperation{
+		row(1, "orders-001", "orders-001/bikes", state.ApplyOperation.Completed),
+		row(2, "orders-002", "orders-002/bikes", state.ApplyOperation.Running),
+		row(3, "orders-001", "orders-001/docks", state.ApplyOperation.Pending),
+		row(4, "orders-002", "orders-002/docks", state.ApplyOperation.Pending),
+	}
+	tasks := []*storage.Task{
+		{ApplyOperationID: new(int64(1)), TableName: "bikes", State: state.Task.Completed},
+		{ApplyOperationID: new(int64(2)), TableName: "bikes", State: state.Task.Running},
+		{ApplyOperationID: new(int64(3)), TableName: "docks", State: state.Task.Pending},
+		{ApplyOperationID: new(int64(4)), TableName: "docks", State: state.Task.Pending},
+	}
+	data := buildMultiApplyData(runningApply(), ops, false, tasks, nil, nil, "", "")
+
+	require.Len(t, data.Model.Deployments, 2)
+	require.Len(t, data.Details, 2)
+	for i, want := range []struct {
+		target string
+		state  string
+		tables []string
+	}{
+		{"orders-001", state.ApplyOperation.Pending, []string{"bikes", "docks"}},
+		{"orders-002", state.ApplyOperation.Running, []string{"bikes", "docks"}},
+	} {
+		assert.Equal(t, want.target, data.Model.Deployments[i].Target)
+		assert.Equal(t, want.state, data.Details[i].State, want.target)
+		var tables []string
+		for _, table := range data.Details[i].Tables {
+			tables = append(tables, table.TableName)
+		}
+		assert.Equal(t, want.tables, tables, want.target)
+	}
+	require.Len(t, data.Model.Groups(), 1, "the deployment's two targets are one section")
+}
+
 // Per-shard rows are scoped to their owning deployment: when two deployments
 // share a namespace and table name, each section shows only its own shards
 // rather than a merged list across deployments.

@@ -211,6 +211,13 @@ type Deployment struct {
 	// AlreadyConverged is whether the member's operation was recorded as a
 	// target that already held the change when the apply was created.
 	AlreadyConverged bool
+
+	// Rows are the indexes, into the operations Derive was given, of the rows
+	// this member's work spans, in input order. Row is the one that speaks for
+	// the member, most in need of an operator first: a surface that renders a
+	// member's own identifiers reads them from that row.
+	Rows []int
+	Row  int
 }
 
 // NextActionKind is the semantic operator action the aggregate suggests. The
@@ -384,10 +391,12 @@ func (a Apply) MultiDeployment() bool {
 
 // Derive projects the ordered operations of one apply into its rollup. The input
 // must be in resolved deployment order (as returned by ListByApply); earlier
-// siblings are those before a given index. The returned Deployments slice is
-// index-parallel to ops — one entry per operation, in the same order, each
-// carrying its operation's Deployment name — and callers rely on that
-// correspondence to key results back to their inputs.
+// siblings are those before a given index. The returned Deployments are one per
+// rollout member, in the order each member's first row appears: one per row,
+// except that a target of a deployment addressing several targets is one
+// member however many rows its work spans (see memberRows). Each carries the
+// rows it covers (Rows, Row), which callers use to key results back to their
+// inputs. The aggregate state reads every row, as the stored apply state does.
 func Derive(ops []Operation) Apply {
 	rolloutOps := make([]state.RolloutOperation, len(ops))
 	for i, op := range ops {
@@ -404,10 +413,17 @@ func Derive(ops []Operation) Apply {
 	}
 	children := state.RolloutChildren(rolloutOps)
 
-	names := memberNames(ops)
-	deployments := make([]Deployment, len(ops))
-	for i := range ops {
-		deployments[i] = deriveDeployment(ops, names, i)
+	rows := memberRows(ops)
+	members := make([]Operation, len(rows))
+	for j, memberRows := range rows {
+		members[j] = foldMember(ops, memberRows)
+	}
+	names := memberNames(members)
+	deployments := make([]Deployment, len(members))
+	for j := range members {
+		deployments[j] = deriveDeployment(members, names, j)
+		deployments[j].Rows = rows[j]
+		deployments[j].Row = leadRow(ops, rows[j])
 	}
 
 	aggState := state.DeriveRolloutApplyState(children)
