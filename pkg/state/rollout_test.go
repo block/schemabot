@@ -231,8 +231,10 @@ func rolloutStep(target string, step int, opState string) RolloutOperation {
 
 // TestRolloutChildren_StepOrphanedByAnEarlierFailedStep verifies which table
 // steps every rollout projection treats as dead. payments-002's second step is
-// orphaned once any target's first step has failed, whether it is pending or a
-// stop caught it before it started. It is not orphaned while an earlier step
+// orphaned once any target's first step has failed, been cancelled or been
+// reverted, whether it is pending or a stop caught it before it started: the
+// claim starts it only once every earlier step completed, so each of those
+// holds it for good. It is not orphaned while an earlier step
 // is only retrying, when the failed row is in its own step, or when the failure
 // is in another deployment, and a row that runs its member's whole change is
 // never a step orphan.
@@ -253,6 +255,18 @@ func TestRolloutChildren_StepOrphanedByAnEarlierFailedStep(t *testing.T) {
 			name:      "stopped step behind its own target's failed step",
 			candidate: rolloutStep("payments-002", 2, ApplyOperation.Stopped),
 			siblings:  []RolloutOperation{rolloutStep("payments-002", 1, ApplyOperation.Failed)},
+			want:      true,
+		},
+		{
+			name:      "pending step behind a cancelled step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Cancelled), rolloutStep("payments-002", 1, ApplyOperation.Completed)},
+			want:      true,
+		},
+		{
+			name:      "pending step behind a reverted step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Reverted), rolloutStep("payments-002", 1, ApplyOperation.Completed)},
 			want:      true,
 		},
 		{
@@ -294,11 +308,13 @@ func TestRolloutChildren_StepOrphanedByAnEarlierFailedStep(t *testing.T) {
 // `docks` step is pending behind the failure. Under continue the step boundary
 // still holds, so nothing will start `docks` and the rollout settles failed
 // rather than waiting on rows that never move. While payments-002 is still
-// running `stations`, the rollout stays open for it.
+// running `stations`, the rollout stays open for it. A `stations` row that was
+// cancelled or reverted holds `docks` the same way, so the rollout settles in
+// that state.
 func TestDeriveRolloutApplyState_FailedStepEndsTheRollout(t *testing.T) {
-	ops := func(secondFirstStep string) []RolloutOperation {
+	ops := func(firstFirstStep, secondFirstStep string) []RolloutOperation {
 		rows := []RolloutOperation{
-			rolloutStep("payments-001", 1, ApplyOperation.Failed),
+			rolloutStep("payments-001", 1, firstFirstStep),
 			rolloutStep("payments-002", 1, secondFirstStep),
 			rolloutStep("payments-001", 2, ApplyOperation.Pending),
 			rolloutStep("payments-002", 2, ApplyOperation.Pending),
@@ -309,6 +325,8 @@ func TestDeriveRolloutApplyState_FailedStepEndsTheRollout(t *testing.T) {
 		return rows
 	}
 
-	assert.Equal(t, Apply.Failed, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Completed))))
-	assert.Equal(t, Apply.RunningDegraded, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Running))))
+	assert.Equal(t, Apply.Failed, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Failed, ApplyOperation.Completed))))
+	assert.Equal(t, Apply.RunningDegraded, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Failed, ApplyOperation.Running))))
+	assert.Equal(t, Apply.Cancelled, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Cancelled, ApplyOperation.Completed))))
+	assert.Equal(t, Apply.Reverted, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Reverted, ApplyOperation.Completed))))
 }

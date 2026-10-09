@@ -44,7 +44,9 @@ func memberRows(ops []Operation) [][]int {
 // after it: orders-001 waiting on `docks` is held by orders-002's failure on
 // `bikes`, though orders-001 is the first member. That holds for a target with
 // one table too, when its table is a later step. Settled and active members
-// read as their folded state already says.
+// read as their folded state already says. A row with no step is a member of
+// its own (memberRows), sharded fan-out rows included, so its place among the
+// members is its place among the rows and the member keeps its own label.
 func orderFoldedMembersByRow(ops, members []Operation, names []string, memberOf []int, deployments []Deployment) {
 	rowNames := make([]string, len(ops))
 	for i := range ops {

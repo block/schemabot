@@ -146,8 +146,11 @@ func buildTableStepOperationGroups(
 }
 
 // logRolloutShape records how a multi-target rollout was laid out: table by
-// table, with how many steps, or member by member and why. An operator reading a rollout that runs every table of a
-// target at once can tell from this which case it was.
+// table, with how many steps, or member by member and why. An operator reading
+// a rollout that runs every table of a target at once can tell from this which
+// case it was. A step counts once a member runs a table in it, so a rollout
+// whose every member already holds the change, laid out as one settled step,
+// logs that its plans change no table.
 func logRolloutShape(logger *slog.Logger, plan *storage.Plan, environment string, members []applyMember, groups []*storage.ApplyOperationWithTasks, shardedFanout bool) {
 	if len(newMemberOperationKeys(members).multiTargetDeployments) == 0 {
 		return
@@ -162,6 +165,10 @@ func logRolloutShape(logger *slog.Logger, plan *storage.Plan, environment string
 	}
 	steps := 0
 	for _, group := range groups {
+		if len(group.Tasks) == 0 {
+			// A converged member's placeholder runs no table.
+			continue
+		}
 		steps = max(steps, group.Operation.RolloutStep)
 	}
 	switch {

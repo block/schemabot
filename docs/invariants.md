@@ -825,7 +825,7 @@ later member's work waits on every earlier member's, until it completes under `r
 the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Where a
 rollout is laid out table by table, work on a table starts on any target only once every earlier
 table has completed on every target, under every cutover policy and every on_failure value, and
-work held behind an earlier table that failed can never start, so it holds no target. Cutover
+work held behind an earlier table that settled without completing can never start, so it holds no target. Cutover
 under `barrier` and `parallel` is ordered across every operation, not per member: operations cut
 over strictly one at a time in the order the rollout created them, so two shards of one member cut
 over one after the other. A member's finalizer publishes its change without parking at the
@@ -868,7 +868,7 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
 `pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`, whose
-`stepOrphanedByFailedStep` marks work held behind a failed table), through which every
+`stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
 `completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`).

@@ -600,7 +600,7 @@ func earlierStepHolder(ops []Operation, i int) int {
 		if earlier.State == state.ApplyOperation.Completed {
 			continue
 		}
-		if stepCanNeverPass(earlier.State) {
+		if state.StepRowCanNeverPass(earlier.State) {
 			return j
 		}
 		if holder < 0 {
@@ -610,19 +610,13 @@ func earlierStepHolder(ops []Operation, i int) int {
 	return holder
 }
 
-// stepCanNeverPass reports whether an earlier-step row in s holds every later
-// step for good: it settled without completing.
-func stepCanNeverPass(s string) bool {
-	return s == state.ApplyOperation.Failed || s == state.ApplyOperation.Cancelled || s == state.ApplyOperation.Reverted
-}
-
 // setHeldByEarlierStep labels a pending table step held by an earlier step's
 // row. A row that settled without completing halts the step for good, whatever
 // on_failure says: the policy decides whether the rest of a step runs, never
 // whether the next table starts on a fleet missing the last one, so there is
 // nothing to release. Otherwise the step waits for that row.
 func setHeldByEarlierStep(d *Deployment, holder Operation, holderName string) {
-	if stepCanNeverPass(holder.State) {
+	if state.StepRowCanNeverPass(holder.State) {
 		d.set(StateHalted, fmt.Sprintf("halted — %s %s", holderName, haltedReason(holder.State)), "⏸️", true)
 		return
 	}

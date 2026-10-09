@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -171,4 +173,39 @@ func TestBuildApplyOperationGroups_MixedDeploymentShapesKeepMemberOperations(t *
 		{"bikeshare-002", 0, []string{"stations", "docks"}},
 		{"", 0, []string{"stations", "docks"}},
 	}, stepLayout(groups))
+}
+
+// The log of a rollout's layout says which case it was. A rollout of two
+// tables logs its two steps. A rollout whose every target already holds the
+// change is laid out as one settled step and runs no table, so it logs that its
+// plans change no table rather than claim a table-by-table rollout.
+func TestLogRolloutShape_NamesTheLayoutTheRolloutRuns(t *testing.T) {
+	for name, tc := range map[string]struct {
+		applyPlan *storage.Plan
+		members   func(*storage.Plan) []applyMember
+		want      string
+	}{
+		"table by table": {
+			applyPlan: stepPlan(10, "bikeshare-001", "stations", "docks"),
+			members: func(applyPlan *storage.Plan) []applyMember {
+				return []applyMember{stepMember("bikeshare-001", applyPlan), stepMember("bikeshare-002", stepPlan(11, "bikeshare-002", "stations", "docks"))}
+			},
+			want: `msg="createStoredApply: queueing a multi-target rollout table by table"`,
+		},
+		"every target converged": {
+			applyPlan: &storage.Plan{ID: 10, Deployment: "eu", Target: "bikeshare-001"},
+			members: func(applyPlan *storage.Plan) []applyMember {
+				return []applyMember{stepMember("bikeshare-001", applyPlan), stepMember("bikeshare-002", &storage.Plan{ID: 11, Deployment: "eu", Target: "bikeshare-002"})}
+			},
+			want: `msg="createStoredApply: queueing a multi-target rollout member by member: its plans change no table to step through"`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			members := tc.members(tc.applyPlan)
+			groups := buildSteps(t, tc.applyPlan, members...)
+			var out bytes.Buffer
+			logRolloutShape(slog.New(slog.NewTextHandler(&out, nil)), tc.applyPlan, "production", members, groups, false)
+			assert.Contains(t, out.String(), tc.want)
+		})
+	}
 }

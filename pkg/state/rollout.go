@@ -74,7 +74,7 @@ func RolloutChildren(ops []RolloutOperation) []RolloutChild {
 			State:             op.State,
 			ContinueOnFailure: op.ContinueOnFailure,
 			PauseOnFailure:    op.PauseOnFailure,
-			Orphaned:          finalizerOrphanedByFailedWork(op, ops) || stepOrphanedByFailedStep(op, ops),
+			Orphaned:          finalizerOrphanedByFailedWork(op, ops) || stepOrphanedByEarlierStep(op, ops),
 			NeverStarted:      op.NeverStarted && IsState(op.State, ApplyOperation.Pending, ApplyOperation.Stopped),
 		}
 	}
@@ -105,14 +105,14 @@ func finalizerOrphanedByFailedWork(op RolloutOperation, ops []RolloutOperation) 
 	return false
 }
 
-// stepOrphanedByFailedStep reports whether op is a table step that nothing will
-// ever start: it has not started (pending, or stopped before it started) and
-// work of an earlier step in its deployment has terminally failed. A step
-// starts only once every earlier step has completed, and a failed operation
-// never runs again, so the row is dead rather than queued. A failure the
-// policy lets the rollout continue past still ends the rollout at its step:
-// the remaining targets of that step run, and no later step does.
-func stepOrphanedByFailedStep(op RolloutOperation, ops []RolloutOperation) bool {
+// stepOrphanedByEarlierStep reports whether op is a table step that nothing
+// will ever start: it has not started (pending, or stopped before it started)
+// and work of an earlier step in its deployment settled without completing
+// (StepRowCanNeverPass). A step starts only once every earlier step has
+// completed, so the row is dead rather than queued. A failure the policy lets
+// the rollout continue past still ends the rollout at its step: the remaining
+// targets of that step run, and no later step does.
+func stepOrphanedByEarlierStep(op RolloutOperation, ops []RolloutOperation) bool {
 	if op.RolloutStep <= 0 {
 		return false
 	}
@@ -123,11 +123,21 @@ func stepOrphanedByFailedStep(op RolloutOperation, ops []RolloutOperation) bool 
 		if !earlier.Work || earlier.Deployment != op.Deployment {
 			continue
 		}
-		if earlier.RolloutStep > 0 && earlier.RolloutStep < op.RolloutStep && IsState(earlier.State, ApplyOperation.Failed) {
+		if earlier.RolloutStep > 0 && earlier.RolloutStep < op.RolloutStep && StepRowCanNeverPass(earlier.State) {
 			return true
 		}
 	}
 	return false
+}
+
+// StepRowCanNeverPass reports whether a table step's row in s holds every
+// later step of its deployment for good: it settled without completing, by
+// failing, being cancelled or being reverted. The claim starts a later step
+// only once every earlier step's row has completed, so a row in one of these
+// states is one that step can never get past. The state projection and the
+// operator surfaces both read the boundary through it.
+func StepRowCanNeverPass(s string) bool {
+	return IsState(s, ApplyOperation.Failed, ApplyOperation.Cancelled, ApplyOperation.Reverted)
 }
 
 // FinalizerFinalizesWork reports whether the group_finalizer keyed
