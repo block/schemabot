@@ -120,8 +120,8 @@ type ErrorResponse struct {
 
 	// RetryAfterSeconds is how long the client should wait before retrying,
 	// set only on responses that carry a Retry-After header. It repeats the
-	// header in the body because the CLI's HTTP client reads error bodies and
-	// not response headers.
+	// header in the body so a client that reads only the error body, such as
+	// an older CLI, still sees the wait.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 

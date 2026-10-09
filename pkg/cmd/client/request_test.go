@@ -129,6 +129,83 @@ func TestDoPostIntoCarriesTheServersRetryDelay(t *testing.T) {
 	assert.Equal(t, 4*time.Second, after)
 }
 
+// A proxy in front of the server can refuse a request with a Retry-After
+// header and a body that is not SchemaBot's JSON. The header's delay still
+// reaches the caller, alongside a status it can classify.
+func TestDoGetIntoCarriesTheRetryAfterHeader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`<html><body><h1>429 Too Many Requests</h1></body></html>`))
+	}))
+	t.Cleanup(srv.Close)
+
+	var result struct{}
+	err := doGetInto(srv.URL, "/api/progress/apply/apply-abc", &result)
+
+	var apiErr *APIError
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusTooManyRequests, apiErr.Status)
+	assert.Empty(t, apiErr.ErrorCode)
+	assert.Equal(t, 30*time.Second, apiErr.RetryAfterHeader)
+}
+
+// RetryAfter decides whether to retry from the error code alone, and when it
+// says retry, waits the longer of the body's and the header's delay.
+func TestAPIErrorRetryAfterTakesTheLongerDelay(t *testing.T) {
+	retryable := apitypes.ErrCodeRateLimited
+	for _, tc := range []struct {
+		name      string
+		code      string
+		body      int
+		header    time.Duration
+		wantRetry bool
+		want      time.Duration
+	}{
+		{name: "header longer than body", code: retryable, body: 10, header: 45 * time.Second, wantRetry: true, want: 45 * time.Second},
+		{name: "body longer than header", code: retryable, body: 45, header: 10 * time.Second, wantRetry: true, want: 45 * time.Second},
+		{name: "header only", code: retryable, header: 20 * time.Second, wantRetry: true, want: 20 * time.Second},
+		{name: "code not retryable", code: apitypes.ErrCodeInvalidRequest, header: 45 * time.Second, wantRetry: false, want: 0},
+		{name: "no code", header: 45 * time.Second, wantRetry: false, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			retry, after := (&APIError{ErrorCode: tc.code, RetryAfterSeconds: tc.body, RetryAfterHeader: tc.header}).RetryAfter()
+			assert.Equal(t, tc.wantRetry, retry)
+			assert.Equal(t, tc.want, after)
+		})
+	}
+}
+
+func TestParseRetryAfterHeader(t *testing.T) {
+	now := time.Date(2026, time.March, 4, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "absent", value: "", want: 0},
+		{name: "delta seconds", value: "45", want: 45 * time.Second},
+		{name: "delta seconds with surrounding space", value: " 45 ", want: 45 * time.Second},
+		{name: "zero seconds", value: "0", want: 0},
+		{name: "HTTP date in the future", value: now.Add(90 * time.Second).Format(http.TimeFormat), want: 90 * time.Second},
+		{name: "HTTP date in the past", value: now.Add(-time.Minute).Format(http.TimeFormat), want: 0},
+		{name: "negative seconds", value: "-5", want: 0},
+		{name: "signed seconds", value: "+5", want: 0},
+		{name: "fractional seconds", value: "1.5", want: 0},
+		{name: "seconds at the bound", value: "300", want: 5 * time.Minute},
+		{name: "seconds past the bound", value: "86400", want: maxRetryAfterHeader},
+		{name: "seconds too large to represent", value: "99999999999999999999", want: maxRetryAfterHeader},
+		{name: "HTTP date past the bound", value: "Fri, 31 Dec 9999 23:59:59 GMT", want: maxRetryAfterHeader},
+		{name: "malformed", value: "soon", want: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, parseRetryAfterHeader(tc.value, now))
+		})
+	}
+}
+
 // A permanent refusal reports no retry, so a client reading only RetryAfter
 // never schedules one against an error that will never succeed.
 func TestDoPostIntoReportsNoRetryForPermanentErrors(t *testing.T) {

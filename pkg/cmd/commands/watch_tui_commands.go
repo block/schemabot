@@ -32,13 +32,20 @@ func fetchErrorBackoff(consecutiveErrors int) time.Duration {
 }
 
 func (m WatchModel) tick() tea.Cmd {
-	d := pollInterval
-	if m.consecutiveErrors > 0 {
-		d = fetchErrorBackoff(m.consecutiveErrors)
-	}
-	return tea.Tick(d, func(t time.Time) tea.Msg {
+	return tea.Tick(m.nextPollDelay(), func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+// nextPollDelay is the wait before the next progress poll: the base interval
+// while polls succeed, and after a failure the fetch-error backoff stretched to
+// any delay the failed response asked for, the same rule the log and JSON
+// watches follow.
+func (m WatchModel) nextPollDelay() time.Duration {
+	if m.consecutiveErrors == 0 {
+		return pollInterval
+	}
+	return max(fetchErrorBackoff(m.consecutiveErrors), m.requestedRetryDelay)
 }
 
 func (m WatchModel) fetchProgress() tea.Cmd {
@@ -46,9 +53,10 @@ func (m WatchModel) fetchProgress() tea.Cmd {
 		result, err := client.GetProgress(m.endpoint, m.applyID)
 		if err != nil {
 			return progressMsg{
-				errorMsg:  err.Error(),
-				failed:    true,
-				retryable: isRetryableFetchError(err),
+				errorMsg:   err.Error(),
+				failed:     true,
+				retryable:  isRetryableFetchError(err),
+				retryAfter: requestedRetryDelay(err),
 			}
 		}
 
