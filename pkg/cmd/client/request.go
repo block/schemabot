@@ -261,9 +261,15 @@ func (e *APIError) Error() string {
 
 // RetryAfter reports whether this request should be retried and how long to
 // wait first, so a caller automating against the API gets both facts from one
-// call instead of retrying on the code and ignoring the delay.
+// call instead of retrying on the code and ignoring the delay. Whether to retry
+// comes from the error code alone; the delay is the longer of the body's and
+// the Retry-After header's, so no caller retries sooner than either asked.
 func (e *APIError) RetryAfter() (retry bool, after time.Duration) {
-	return apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
+	retry, after = apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
+	if !retry {
+		return false, 0
+	}
+	return true, max(after, e.RetryAfterHeader)
 }
 
 // IsNotFound reports whether the error is a 404 from the API.

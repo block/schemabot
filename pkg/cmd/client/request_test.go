@@ -151,6 +151,32 @@ func TestDoGetIntoCarriesTheRetryAfterHeader(t *testing.T) {
 	assert.Equal(t, 30*time.Second, apiErr.RetryAfterHeader)
 }
 
+// RetryAfter decides whether to retry from the error code alone, and when it
+// says retry, waits the longer of the body's and the header's delay.
+func TestAPIErrorRetryAfterTakesTheLongerDelay(t *testing.T) {
+	retryable := apitypes.ErrCodeRateLimited
+	for _, tc := range []struct {
+		name      string
+		code      string
+		body      int
+		header    time.Duration
+		wantRetry bool
+		want      time.Duration
+	}{
+		{name: "header longer than body", code: retryable, body: 10, header: 45 * time.Second, wantRetry: true, want: 45 * time.Second},
+		{name: "body longer than header", code: retryable, body: 45, header: 10 * time.Second, wantRetry: true, want: 45 * time.Second},
+		{name: "header only", code: retryable, header: 20 * time.Second, wantRetry: true, want: 20 * time.Second},
+		{name: "code not retryable", code: apitypes.ErrCodeInvalidRequest, header: 45 * time.Second, wantRetry: false, want: 0},
+		{name: "no code", header: 45 * time.Second, wantRetry: false, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			retry, after := (&APIError{ErrorCode: tc.code, RetryAfterSeconds: tc.body, RetryAfterHeader: tc.header}).RetryAfter()
+			assert.Equal(t, tc.wantRetry, retry)
+			assert.Equal(t, tc.want, after)
+		})
+	}
+}
+
 func TestParseRetryAfterHeader(t *testing.T) {
 	now := time.Date(2026, time.March, 4, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
