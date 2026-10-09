@@ -123,9 +123,17 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	_, err = buildCredentialResolver(t.Context(), ownAccount, nil)
 	require.NoError(t, err)
 
+	// region_attribute stands in for a fixed region.
+	regionAttr := base
+	regionAttr.Region = ""
+	regionAttr.RegionAttribute = "aws_region"
+	_, err = buildCredentialResolver(t.Context(), regionAttr, nil)
+	require.NoError(t, err)
+
 	cases := map[string]func(*EtreCredentialsConfig){
-		"region":      func(c *EtreCredentialsConfig) { c.Region = "" },
-		"secret_name": func(c *EtreCredentialsConfig) { c.SecretName = "" },
+		"region or region_attribute is required": func(c *EtreCredentialsConfig) { c.Region = "" },
+		"mutually exclusive":                     func(c *EtreCredentialsConfig) { c.RegionAttribute = "aws_region" },
+		"secret_name":                            func(c *EtreCredentialsConfig) { c.SecretName = "" },
 	}
 	for field, mutate := range cases {
 		cfg := base
@@ -174,6 +182,20 @@ func TestCredentialAttributeFields(t *testing.T) {
 		Credentials: EtreCredentialsConfig{Type: "awssm", SecretName: "{cluster}_schemabot_password"},
 	}
 	assert.Equal(t, []string{"cluster"}, resolverAttributeFields(templated))
+
+	// A per-target secret region is surfaced alongside the account attribute.
+	regionAttr := EtreConfig{
+		AttributeFields: []string{"name"},
+		Credentials:     EtreCredentialsConfig{Type: "awssm", RoleARN: "arn:aws:iam::{account}:role/ddl", RegionAttribute: "aws_region", SecretName: "secret"},
+	}
+	assert.Equal(t, []string{"name", "aws_account_id", "aws_region"}, resolverAttributeFields(regionAttr))
+
+	// Own-account mode needs the region attribute too, with no account attribute.
+	ownAccountRegionAttr := EtreConfig{
+		AttributeFields: []string{"name"},
+		Credentials:     EtreCredentialsConfig{Type: "awssm", RegionAttribute: "aws_region", SecretName: "secret"},
+	}
+	assert.Equal(t, []string{"name", "aws_region"}, resolverAttributeFields(ownAccountRegionAttr))
 
 	secretRef := EtreConfig{
 		AttributeFields: []string{"region"},
