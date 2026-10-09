@@ -2063,6 +2063,7 @@ func TestTableStepsStatus(t *testing.T) {
 		{"settled with a target still going", presentation.TableSteps{Steps: 3, Done: 1}, presentation.TargetProgress{Total: 4, Unsettled: 1}, true, false, "Rolling out: 1 of 3 tables done on 4 targets"},
 		{"every table done", presentation.TableSteps{Steps: 3, Done: 3}, presentation.TargetProgress{Total: 4, Done: 4}, true, false, "Rolled out 3 tables to 4 targets"},
 		{"settled short", presentation.TableSteps{Steps: 3, Done: 1}, failed, true, false, "Rolled out 1 of 3 tables to 3 targets, 1 failed"},
+		{"a target already had the change", presentation.TableSteps{Steps: 2, Done: 2}, presentation.TargetProgress{Total: 2, Done: 1, AlreadyHad: 1}, true, false, "Rolled out 2 tables to 1 target"},
 		{"rolling back", presentation.TableSteps{Steps: 2, Done: 0}, presentation.TargetProgress{Total: 2, Unsettled: 2}, false, true, "Rolling back: 0 of 2 tables done on 2 targets"},
 		{"rolled back", presentation.TableSteps{Steps: 2, Done: 2}, presentation.TargetProgress{Total: 2, Done: 2}, true, true, "Rolled back 2 tables on 2 targets"},
 	}

@@ -742,12 +742,14 @@ Response excerpt for `orders` then `refunds` on two targets, with `orders` done
 on both:
 
 ```json
-"operations": [
-  {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
-  {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
-  {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "rolling", "rollout_step": 2},
-  {"deployment": "commerce-a", "target": "shop-002", "state": "pending", "cutover_policy": "rolling", "rollout_step": 2}
-]
+{
+  "operations": [
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "rolling", "rollout_step": 2},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "pending", "cutover_policy": "rolling", "rollout_step": 2}
+  ]
+}
 ```
 
 The CLI and the PR comment count such a rollout in tables, `Tables: 1 of 2

@@ -253,14 +253,15 @@ func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) 
 // 3 tables to 4 targets" with the targets' outcomes when it settled short. A
 // table finishes on every target before the next starts, so while it runs the
 // targets are counted only as the rollout's size: most of them are between
-// tables, which a count of target states would read as queued. A rollback says
+// tables, which a count of target states would read as queued. A target that
+// already had the change ran no table, so it is not counted. A rollback says
 // "Rolling back" and "Rolled back ... on" instead.
 func tableStepsStatus(steps presentation.TableSteps, p presentation.TargetProgress, settled, rollback bool) string {
 	ongoing, finished, onto := "Rolling out:", "Rolled out", "to"
 	if rollback {
 		ongoing, finished, onto = "Rolling back:", "Rolled back", "on"
 	}
-	targets := targetCount(p.Total)
+	targets := targetCount(p.Total - p.AlreadyHad)
 	if !settled || p.Unsettled > 0 {
 		return fmt.Sprintf("%s %d of %d tables done on %s", ongoing, steps.Done, steps.Steps, targets)
 	}
