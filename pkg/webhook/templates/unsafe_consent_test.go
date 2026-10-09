@@ -53,7 +53,7 @@ func TestRenderPlanComment_UnsafeConsentLeadsIntoPlainCommand(t *testing.T) {
 	for _, block := range fencedCommands(t, out) {
 		assert.NotContains(t, block, "--allow-unsafe", "the pasteable command never carries the consent flag")
 	}
-	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e staging\n```")
 	assert.NotContains(t, out, glyph.Attention+" This plan", "the footer adds no second warning glyph")
 }
 
@@ -67,16 +67,17 @@ func TestRenderPlanComment_UnsafeConsentNamesEachTableOnce(t *testing.T) {
 		{Table: "ledger", Reason: "DROP TABLE removes all data"},
 	}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "to confirm 4 unsafe changes (`transfer_events`, `refunds`, `ledger`):")
+	assert.Contains(t, out, "to confirm 4 unsafe changes on `transfer_events`, `refunds` and `ledger`:")
 
 	data.UnsafeChanges = data.UnsafeChanges[:1]
 	out = RenderPlanComment(*data)
-	assert.Contains(t, out, "to confirm 1 unsafe change (`transfer_events`):")
+	assert.Contains(t, out, "to confirm 1 unsafe change on `transfer_events`:")
 }
 
-// A sharded change that only some shards carry is named with its shards, and a
-// VSchema change by its namespace, matching the labels in the unsafe findings.
-func TestRenderPlanComment_UnsafeConsentNamesShardsAndVSchema(t *testing.T) {
+// A sharded change is named by its table alone, and a VSchema change by its
+// namespace. Which shards carry the change is the unsafe findings' to say, so
+// the consent stays one short clause.
+func TestRenderPlanComment_UnsafeConsentNamesTablesAndVSchema(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.UnsafeChanges = []UnsafeChangeData{
 		{Table: "mutes", Reason: "DROP COLUMN removes data and is irreversible", Shards: []string{"40-80"}, TotalShards: 4},
@@ -84,7 +85,7 @@ func TestRenderPlanComment_UnsafeConsentNamesShardsAndVSchema(t *testing.T) {
 		{Table: "commerce_sharded/vschema.json", VSchemaNamespace: "commerce_sharded", Reason: "table `customers` no longer uses vindex `customers_email_lookup`"},
 	}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "to confirm 3 unsafe changes (`mutes` on shard `40-80`, `commerce_sharded` VSchema):")
+	assert.Contains(t, out, "to confirm 3 unsafe changes on `mutes` and `commerce_sharded` VSchema:")
 }
 
 // When the plan undoes a change another open pull request applied, the
@@ -103,7 +104,7 @@ func TestRenderPlanComment_AttributionRidesOnTheUnsafeFinding(t *testing.T) {
 	assert.NotContains(t, out, "Check before applying", "the attribution is not repeated in a section of its own")
 	_, footer, found := strings.Cut(out, "▶️ **To apply**")
 	require.True(t, found, "the comment offers an apply")
-	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```\n", footer)
+	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e staging\n```\n", footer)
 }
 
 // An owner in another repository is named with its repository, and a table
@@ -197,20 +198,20 @@ func TestRenderMultiEnvPlanComment_UnsafeConsentPerEnvironment(t *testing.T) {
 
 	out := render(clean, unsafeConsentPlan("production"))
 	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment:\n```\nschemabot apply -e staging\n```")
-	assert.Contains(t, out, "After verifying staging, apply to production. Add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e production\n```")
+	assert.Contains(t, out, "After verifying staging, apply to production. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e production\n```")
 	for _, block := range fencedCommands(t, out) {
 		assert.NotContains(t, block, "--allow-unsafe")
 	}
 
 	out = render(unsafeConsentPlan("staging"), unsafeConsentPlan("production"))
-	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment. Add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply** these changes, start with the first environment. Add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e staging\n```")
 
 	out = RenderMultiEnvPlanComment(MultiEnvPlanCommentData{
 		Database: "payments", IsMySQL: true, DatabaseType: "mysql",
 		Environments: []string{"staging", "production"},
 		Plans:        map[string]*PlanCommentData{"staging": unsafeConsentPlan("staging"), "production": nil},
 	})
-	assert.Contains(t, out, "▶️ **To apply** these changes, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply** these changes, add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e staging\n```")
 }
 
 func refusedChangePlan(env string) *PlanCommentData {
@@ -250,7 +251,7 @@ func TestRenderMultiEnvPlanComment_RefusedChangeOffersReplanNotApply(t *testing.
 	}
 
 	out := render(unsafeConsentPlan("staging"), refusedChangePlan("production"))
-	assert.Contains(t, out, "▶️ **To apply** these changes, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):\n```\nschemabot apply -e staging\n```")
+	assert.Contains(t, out, "▶️ **To apply** these changes, add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:\n```\nschemabot apply -e staging\n```")
 	assert.Contains(t, out, "The engine refuses a change in the **production** plan (see **Cannot apply** above), so its apply fails whatever its flags. After fixing it, re-plan:\n```\nschemabot plan -e production\n```")
 	assert.NotContains(t, fencedCommands(t, out), "schemabot apply -e production")
 
@@ -264,9 +265,10 @@ func TestRenderMultiEnvPlanComment_RefusedChangeOffersReplanNotApply(t *testing.
 	}
 }
 
-// The consent names at most a handful of tables and counts the rest, so a plan
-// that drops many tables keeps its instruction to one readable line. The
-// finding count still covers every change.
+// The consent names two tables and counts the rest, so a plan that drops many
+// tables keeps its instruction to one short line. A third table left over is
+// named, since naming it is as short as counting it. The finding count still
+// covers every change.
 func TestRenderPlanComment_UnsafeConsentBoundsTheTableList(t *testing.T) {
 	data := unsafeConsentPlan("staging")
 	data.UnsafeChanges = nil
@@ -274,11 +276,15 @@ func TestRenderPlanComment_UnsafeConsentBoundsTheTableList(t *testing.T) {
 		data.UnsafeChanges = append(data.UnsafeChanges, UnsafeChangeData{Table: table, Reason: "DROP TABLE removes all data"})
 	}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 7 unsafe changes (`t1`, `t2`, `t3`, `t4`, `t5` and 2 more):\n```")
+	assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 7 unsafe changes on `t1`, `t2` and 5 more:\n```")
 
-	data.UnsafeChanges = data.UnsafeChanges[:5]
+	data.UnsafeChanges = data.UnsafeChanges[:4]
 	out = RenderPlanComment(*data)
-	assert.Contains(t, out, "to confirm 5 unsafe changes (`t1`, `t2`, `t3`, `t4`, `t5`):")
+	assert.Contains(t, out, "to confirm 4 unsafe changes on `t1`, `t2` and 2 more:")
+
+	data.UnsafeChanges = data.UnsafeChanges[:3]
+	out = RenderPlanComment(*data)
+	assert.Contains(t, out, "to confirm 3 unsafe changes on `t1`, `t2` and `t3`:")
 }
 
 // When the rollup is blocked or could not be computed, the comment has no plan
@@ -295,19 +301,21 @@ func TestRenderPlanComment_UnsafeConsentCoversOtherTargetsWithoutTargetPlans(t *
 			data := unsafeConsentPlan("staging")
 			data.DeploymentDrift = drift
 			out := RenderPlanComment(*data)
-			assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`) and any the other targets carry:\n```\nschemabot apply -e staging\n```")
+			assert.Contains(t, out, "▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`, and any the other targets carry:\n```\nschemabot apply -e staging\n```")
 		})
 	}
 
 	data := unsafeConsentPlan("staging")
 	data.DeploymentDrift = &DeploymentDriftData{Computed: true, Clean: true, Deployments: previewRolloutMembers()}
 	out := RenderPlanComment(*data)
-	assert.Contains(t, out, "to confirm 2 unsafe changes (`transfer_events`, `refund_backfill`):", "a clean mirrored rollup runs the primary plan everywhere, so its count covers every target")
+	assert.Contains(t, out, "to confirm 2 unsafe changes on `transfer_events` and `refund_backfill`:", "a clean mirrored rollup runs the primary plan everywhere, so its count covers every target")
 }
 
 // --allow-unsafe consents to every target's disclosed unsafe changes, so the
 // instruction counts and names another target's changes too, and asks for the
-// flag even when the reviewed plan carries none of its own.
+// flag even when the reviewed plan carries none of its own. It names each table
+// once, without the targets that carry it: the unsafe findings list them, and
+// a wide rollout would repeat every target name for every table.
 func TestRenderPlanComment_UnsafeConsentCoversOtherTargets(t *testing.T) {
 	data := convergedPrimaryPlanData()
 	data.DeploymentDrift.Plans[1].UnsafeChanges = []UnsafeChangeData{
@@ -317,5 +325,5 @@ func TestRenderPlanComment_UnsafeConsentCoversOtherTargets(t *testing.T) {
 	out := RenderPlanComment(data)
 	_, footer, found := strings.Cut(out, "▶️ **To apply**")
 	require.True(t, found, "the comment offers an apply")
-	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes (`users` on targets `primary/testapp_2`, `primary/testapp_3`; `legacy` on target `primary/testapp_3`):\n```\nschemabot apply -e production\n```\n", footer)
+	assert.Equal(t, ", add `--allow-unsafe` to confirm 2 unsafe changes on `users` and `legacy`:\n```\nschemabot apply -e production\n```\n", footer)
 }

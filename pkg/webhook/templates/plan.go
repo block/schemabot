@@ -813,61 +813,46 @@ func (c unsafeConsent) instruction() string {
 		noun = "unsafe changes"
 	}
 	if c.primaryOnly {
-		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s) and any the other targets carry", c.findings, noun, c.tables)
+		return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on %s, and any the other targets carry", c.findings, noun, c.tables)
 	}
-	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s (%s)", c.findings, noun, c.tables)
+	return fmt.Sprintf("add `--allow-unsafe` to confirm %d %s on %s", c.findings, noun, c.tables)
 }
 
 // unsafeConsentTablesShown caps how many names the consent sentence lists.
 // The unsafe findings above list every one, so the rest are only counted.
-const unsafeConsentTablesShown = 5
+const unsafeConsentTablesShown = 2
 
 // unsafeChangeTables names what the unsafe changes touch, each once in
-// first-appearance order, comma-separated: a table by its code span, with the
-// shards it applies to when only some carry it, and a VSchema by its
-// namespace. The names match the ones the unsafe findings list above uses, so
-// the reader can match one to the other. Past unsafeConsentTablesShown the
-// rest are counted.
+// first-appearance order, comma-separated: a table by its code span and a
+// VSchema by its namespace. The names match the ones the unsafe findings list
+// above uses, so the reader can match one to the other. Which targets and
+// shards each change runs on is the findings list's to say, so the consent
+// sentence stays one short clause however wide the rollout. Past
+// unsafeConsentTablesShown the rest are counted, unless naming the one left
+// over is as short as counting it.
 func unsafeChangeTables(changes []UnsafeChangeData) string {
 	seen := make(map[string]bool, len(changes))
-	var targets []string
+	var names []string
 	for _, c := range changes {
-		target := unsafeConsentTarget(c)
-		if seen[target] {
+		name := unsafeConsentName(c)
+		if seen[name] {
 			continue
 		}
-		seen[target] = true
-		targets = append(targets, target)
+		seen[name] = true
+		names = append(names, name)
 	}
-	shown := targets[:min(len(targets), unsafeConsentTablesShown)]
-	// A label that lists several targets carries commas of its own, so the
-	// labels are then set apart with semicolons.
-	sep := ", "
-	for _, target := range shown {
-		if strings.Contains(target, ", ") {
-			sep = "; "
-			break
-		}
+	if len(names) > unsafeConsentTablesShown+1 {
+		hidden := len(names) - unsafeConsentTablesShown
+		names = append(names[:unsafeConsentTablesShown:unsafeConsentTablesShown], fmt.Sprintf("%d more", hidden))
 	}
-	list := strings.Join(shown, sep)
-	if hidden := len(targets) - len(shown); hidden > 0 {
-		list += fmt.Sprintf(" and %d more", hidden)
-	}
-	return list
+	return joinWithAnd(names)
 }
 
-func unsafeConsentTarget(c UnsafeChangeData) string {
+func unsafeConsentName(c UnsafeChangeData) string {
 	if c.VSchemaNamespace != "" {
 		return inlineCode(c.VSchemaNamespace) + " VSchema"
 	}
-	label := inlineCode(c.Table)
-	if len(c.Shards) > 0 {
-		label += " on " + planShardList(c.Shards, c.TotalShards)
-	}
-	if len(c.Targets) > 0 {
-		label += " on " + planGroupList(targetNoun, c.Targets, c.TotalTargets)
-	}
-	return label
+	return inlineCode(c.Table)
 }
 
 // attributionStillActionable reports whether the attributed-changes
