@@ -1350,9 +1350,14 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 			c.logger.Error("failed to update apply state", append(apply.LogAttrs(), "error", err)...)
 			return fmt.Errorf("mark grouped resume apply %s %s after final schema check: %w", apply.ApplyIdentifier, terminalState, err)
 		}
+		// The outcome is stored from here, so a start that cannot be answered
+		// is reconciliation left undone, not a failure of the schema change:
+		// the stored outcome still owes its gauge release, settlement, and
+		// summary, and the caller must not record a failure over it.
+		var reconcileErr error
 		if startRequested {
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
-				return err
+				reconcileErr = &postTerminalReconcileError{storedState: terminalState, err: err}
 			}
 		}
 		if !state.IsTerminalApplyState(oldApplyState) {
@@ -1365,7 +1370,7 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		// pending. Settle them before the summary posts.
 		c.settleRequestsForStoredOutcome(ctx, c.logger.With(apply.IdentityLogAttrs()...), apply)
 		c.notifyTerminalObserver(apply, allTasks)
-		return nil
+		return reconcileErr
 	}
 
 	resumeState, err := c.groupedResumeState(ctx, apply, tasks)
@@ -2846,8 +2851,19 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 // error would read as a transient drive failure that leaves the operation
 // claimable, re-leasing already-settled work instead of letting the claim loop
 // persist the operation row from its now-failed tasks immediately.
+//
+// A resume that already stored the apply's terminal outcome and then failed
+// to reconcile after it is not a refusal at all: the outcome stands as stored,
+// its side effects ran where it was stored, so nothing is paused or failed
+// over it and the error is returned for the drive to report.
 func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error) error {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	var reconcileErr *postTerminalReconcileError
+	if errors.As(err, &reconcileErr) {
+		logger.Warn("grouped resume stored the apply's terminal outcome but could not reconcile after it; the stored outcome stands, no failure is recorded over it, and the current apply owner will exit with the error",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
 	// A cancelled drive is why the resume returned, so the error describes the
 	// driver rather than the schema change it was reattaching to.
 	if c.driveCancelled(ctx, apply, "while resuming the apply") {
