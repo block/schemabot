@@ -20,6 +20,7 @@
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
 - [Target TLS Posture](#target-tls-posture)
+- [PlanetScale Service Token](#planetscale-service-token)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -1297,6 +1298,12 @@ it: a pinned CA bundle under a non-verifying `sslmode` is refused at CA
 resolution, as described under
 [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets), rather than
 silently never consulted.
+
+## PlanetScale Service Token
+
+The Vitess engine calls the PlanetScale API with a service token. The
+permissions it needs, and the ones it does not, are listed in
+[Vitess on PlanetScale](vitess.md#service-token-permissions).
 
 ## PlanetScale mTLS
 

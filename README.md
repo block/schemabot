@@ -98,6 +98,7 @@ Guides and reference:
 - [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
 - [Engines](./docs/engines.md): See how changes run on your database engine
 - [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
+- [Vitess on PlanetScale](./docs/vitess.md): Grant the service token the permissions SchemaBot needs
 - [Configuration](./docs/configuration.md): Set things up for your environment
 - [Storage schema](./docs/storage-schema.md): Keep SchemaBot’s own bookkeeping database converged across deploys
 - [Authentication](./docs/auth.md): Choose who can read and change your databases
