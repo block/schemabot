@@ -181,6 +181,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	// A rollout shape apply creation refuses is refused here first, before a
+	// plan is run or the lock is taken, so the command holds nothing.
+	if refused := h.unsupportedRolloutShape(database, environment, result); refused != nil {
+		h.logger.Info("apply rejected: the multi-target rollout does not run what the command asked for",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"targets", refused.Targets, "deployments", refused.Deployments, "defer_cutover", result.DeferCutover)
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+			rolloutShapeRefusalMessage(refused, action.Apply, environment))
+		return false, nil
+	}
+
 	// Check for existing lock
 	existingLock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
 	if err != nil {

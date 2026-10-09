@@ -134,6 +134,13 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one listed above, then apply again", len(rollout.Attention), rollout.Members)
 	}
 
+	// Each target of a multi-target rollout cuts over as its table finishes,
+	// so the server refuses --defer-cutover there; refusing it before the
+	// prompt saves confirming an apply that will not start.
+	if rollout := planResult.WholeRollout(); cmd.DeferCutover && rollout != nil && rollout.MultiTarget {
+		return fmt.Errorf("--defer-cutover is not supported on an apply to more than one target; apply again without --defer-cutover, or apply one target with --target")
+	}
+
 	// Check if there are any changes (DDL or VSchema) on any rollout member
 	if !planResult.RolloutHasChanges() {
 		fmt.Println("No changes. Your schema is up-to-date.")

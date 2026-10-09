@@ -850,6 +850,9 @@ type PlanRolloutResponse struct {
 	// schema, so members are expected to differ. False means every member is
 	// expected to run the primary's plan.
 	Independent bool `json:"independent,omitempty"`
+	// MultiTarget is true when some deployment of the rollout addresses more
+	// than one target. An apply of such a rollout refuses --defer-cutover.
+	MultiTarget bool `json:"multi_target,omitempty"`
 	// Groups holds one entry per distinct plan, naming the members that run
 	// it, with the primary's group first.
 	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`

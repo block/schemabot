@@ -620,3 +620,28 @@ func TestNewlyDirectCauseNamesEachTable(t *testing.T) {
 		"`orders` (shard `80-`) now runs as direct execution",
 	}, cause.Entries)
 }
+
+// A multi-target rollout shape refused at apply creation is named in the PR
+// comment with the command that runs instead. A refused --defer-cutover is
+// re-issued without the flag, and a rollback keeps its pin for that. A refused
+// multi-deployment shape is refused however the command is re-issued, so the
+// remedy is a fresh apply of one target, and a rollback, which cannot be
+// narrowed to a target, is told to revert in a new PR instead.
+func TestRolloutShapeRefusalMessage(t *testing.T) {
+	deferred := &api.RolloutShapeRefusedError{Database: "orders", Environment: "production", Refusal: api.RolloutDeferCutoverRefused, Targets: 2, Deployments: 1, FirstTarget: "orders-001"}
+	spanning := &api.RolloutShapeRefusedError{Database: "orders", Environment: "production", Refusal: api.RolloutMultiTargetDeploymentsRefused, Targets: 3, Deployments: 2, FirstTarget: "orders-001"}
+	wrapped := func(err error) error { return fmt.Errorf("create apply: %w", err) }
+
+	assert.Equal(t,
+		"`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
+		applyExecutionErrorMessage(action.ApplyConfirm, "production", wrapped(deferred)))
+	assert.Equal(t,
+		"`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `schemabot rollback-confirm -e production` again without `--defer-cutover`. The pending rollback stays pinned for it.",
+		rollbackExecutionErrorMessage("production", wrapped(deferred)))
+	assert.Equal(t,
+		"An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with `schemabot apply -e production --target orders-001`.",
+		applyExecutionErrorMessage(action.ApplyConfirm, "production", wrapped(spanning)))
+	assert.Equal(t,
+		"A rollback to more than one deployment is not supported yet when a deployment has several targets. Revert the schema files in a new PR and apply it one target at a time, starting with `schemabot apply -e production --target orders-001`.",
+		rollbackExecutionErrorMessage("production", wrapped(spanning)))
+}

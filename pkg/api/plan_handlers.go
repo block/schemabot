@@ -1495,6 +1495,11 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
 			return
 		}
+		if _, ok := errors.AsType[*RolloutShapeRefusedError](err); ok {
+			s.logger.Warn("apply rejected: the multi-target rollout does not run what the apply asked for", "plan_id", req.PlanID, "environment", req.Environment, "error", err)
+			s.writeErrorCode(w, http.StatusBadRequest, apitypes.ErrCodeInvalidRequest, "apply rejected: "+err.Error())
+			return
+		}
 		s.logger.Error("apply failed", "plan_id", req.PlanID, "error", err)
 		s.writeError(w, http.StatusInternalServerError, "apply failed: "+err.Error())
 		return
@@ -1515,6 +1520,10 @@ func applyMetricStatusForError(err error) string {
 		return "conflict"
 	}
 	if isPlanAdmissionRefusal(err) {
+		return applyMetricStatusRejected
+	}
+	// A rollout shape the apply cannot run is the request's to change.
+	if _, ok := errors.AsType[*RolloutShapeRefusedError](err); ok {
 		return applyMetricStatusRejected
 	}
 	return "error"
@@ -1923,6 +1932,9 @@ func (s *Service) createStoredApply(
 		return nil, 0, err
 	}
 	if err := refuseApplyRolloutUnrenderedByCaller(plan, req, targets, narrowedTo); err != nil {
+		return nil, 0, err
+	}
+	if err := RefuseUnsupportedRolloutShape(plan.Database, req.Environment, targets, applyOpts.DeferCutover); err != nil {
 		return nil, 0, err
 	}
 	// A narrowed apply records the member it ran on, so a later rollback can

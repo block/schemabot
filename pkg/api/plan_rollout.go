@@ -136,7 +136,7 @@ func primaryErroredRollout(planning MemberPlanning, targets []routing.ExecutionT
 		members[i] = routing.ExecutionTarget{Deployment: t.Deployment, Target: t.Target}
 	}
 	names := routing.DisplayNames(members)
-	resp := &apitypes.PlanRolloutResponse{Members: len(targets), Independent: planning == PlanIndependent}
+	resp := &apitypes.PlanRolloutResponse{Members: len(targets), Independent: planning == PlanIndependent, MultiTarget: IsMultiTargetRollout(members)}
 	for _, name := range names[1:] {
 		resp.Attention = append(resp.Attention, &apitypes.PlanMemberAttentionResponse{
 			Member: name, Reason: apitypes.PlanMemberUnplanned, Detail: notPlannedBesideErroredPrimaryDetail,
@@ -181,6 +181,7 @@ func planRolloutResponse(rollup PlanRollup, logAttrs ...any) *apitypes.PlanRollo
 	resp := &apitypes.PlanRolloutResponse{
 		Members:     len(rollup.Entries),
 		Independent: rollup.Planning == PlanIndependent,
+		MultiTarget: IsMultiTargetRollout(members),
 	}
 	byPlan := make(map[string]*apitypes.PlanMemberGroupResponse, len(rollup.Entries))
 	for i, e := range rollup.Entries {

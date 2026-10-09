@@ -380,6 +380,36 @@ func TestE2EDeferCutoverRefusedWhenOnlyAnotherTargetRunsDirectChanges(t *testing
 	assert.NotEmpty(t, lock.PendingPlanID)
 }
 
+// One deployment rolls out to two targets, and each cuts over as its table
+// finishes, so --defer-cutover has no meaning there. The apply command refuses
+// it before it plans or takes the lock, and names the command to run instead.
+// An apply to more than one deployment where one of them has two targets is
+// refused the same way, whatever options it carries.
+func TestE2EMultiTargetApplyRefusesUnsupportedShapes(t *testing.T) {
+	dbName := "webhook_rollout_shape"
+	svc := setupE2ERolloutService(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersBaseSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent)
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+
+	twoTargets := rolloutServiceWithTargets(t, svc, dbName, []string{"eu"}, map[string][]string{"eu": {"orders-001", "orders-002"}})
+	deferred := runRolloutCommand(t, twoTargets, dbName, "schemabot apply -e "+driftEnv+" --defer-cutover")
+	body := awaitCommentContaining(t, deferred, "is not supported on an apply to more than one target")
+	assert.Contains(t, body, "Run `schemabot apply -e "+driftEnv+"` again without `--defer-cutover`.")
+	requireNoApplies(t, twoTargets, dbName)
+	requireNoApplyLock(t, twoTargets, dbName)
+
+	twoDeployments := rolloutServiceWithTargets(t, svc, dbName, []string{"eu", "us"}, map[string][]string{"eu": {"orders-001", "orders-002"}, "us": {"orders-003"}})
+	spanning := runRolloutCommand(t, twoDeployments, dbName, "schemabot apply -e "+driftEnv)
+	body = awaitCommentContaining(t, spanning, "An apply to more than one deployment is not supported yet")
+	assert.Contains(t, body, "Apply one target at a time, starting with `schemabot apply -e "+driftEnv+" --target orders-001`.")
+	requireNoApplies(t, twoDeployments, dbName)
+	requireNoApplyLock(t, twoDeployments, dbName)
+}
+
 // usersWithTenantIndexSchema reshapes the primary key of `users`, as
 // pkSwapSchema does, and also indexes tenant_id.
 const usersWithTenantIndexSchema = "CREATE TABLE `users` (\n" +
@@ -1026,10 +1056,23 @@ func TestE2EApplyConfirmConvergedPrimaryMovedNamesTheMovedPrimary(t *testing.T) 
 // databases, the stored plans and the lock are left as svc's commands left them.
 func rolloutServiceOver(t *testing.T, svc *api.Service, dbName string, names ...string) *api.Service {
 	t.Helper()
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	deployments := make(map[string]api.DeploymentTarget, len(names))
-	ternClients := make(map[string]tern.Client, len(names))
+	targets := make(map[string][]string, len(names))
 	for _, name := range names {
+		targets[name] = []string{dbName + "-" + name + "-target"}
+	}
+	return rolloutServiceWithTargets(t, svc, dbName, names, targets)
+}
+
+// rolloutServiceWithTargets builds a service over svc's storage whose
+// environment routes dbName through the deployments in order, each addressing
+// its listed targets. Every target of a deployment is served by that
+// deployment's database from svc's setup.
+func rolloutServiceWithTargets(t *testing.T, svc *api.Service, dbName string, order []string, targetsByDeployment map[string][]string) *api.Service {
+	t.Helper()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	deployments := make(map[string]api.DeploymentTarget, len(order))
+	ternClients := make(map[string]tern.Client, len(order))
+	for _, name := range order {
 		client, err := tern.NewLocalClient(tern.LocalConfig{
 			Database:  dbName,
 			Type:      "mysql",
@@ -1037,7 +1080,11 @@ func rolloutServiceOver(t *testing.T, svc *api.Service, dbName string, names ...
 		}, svc.Storage(), logger)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = client.Close() })
-		deployments[name] = api.DeploymentTarget{Targets: []api.TargetEntry{{Target: dbName + "-" + name + "-target"}}}
+		entries := make([]api.TargetEntry, 0, len(targetsByDeployment[name]))
+		for _, target := range targetsByDeployment[name] {
+			entries = append(entries, api.TargetEntry{Target: target})
+		}
+		deployments[name] = api.DeploymentTarget{Targets: entries}
 		ternClients[name+"/"+driftEnv] = client
 	}
 	serverConfig := &api.ServerConfig{
@@ -1045,15 +1092,15 @@ func rolloutServiceOver(t *testing.T, svc *api.Service, dbName string, names ...
 			dbName: {
 				Type: "mysql",
 				Environments: map[string]api.EnvironmentConfig{
-					driftEnv: {Deployments: deployments, DeploymentOrder: names},
+					driftEnv: {Deployments: deployments, DeploymentOrder: order},
 				},
 			},
 		},
 		Repos: map[string]api.RepoConfig{"octocat/hello-world": {}},
 	}
-	shrunk := api.New(svc.Storage(), serverConfig, ternClients, logger)
-	t.Cleanup(func() { _ = shrunk.Close() })
-	return shrunk
+	reshaped := api.New(svc.Storage(), serverConfig, ternClients, logger)
+	t.Cleanup(func() { _ = reshaped.Close() })
+	return reshaped
 }
 
 // The operator confirmed a round where eu (the primary target) and us both
