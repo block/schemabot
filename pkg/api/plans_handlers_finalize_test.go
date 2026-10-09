@@ -14,7 +14,7 @@ import (
 // back with the request under the key it was planned with, so the stored plan
 // still reads as having changes.
 func TestPlanContentFromStorageReportsFinalizeRequest(t *testing.T) {
-	resp := planContentFromStorage(&storage.Plan{
+	resp := PlanContentFromStorage(&storage.Plan{
 		PlanIdentifier: "plan-finalize-only",
 		Database:       "payments",
 		DatabaseType:   storage.DatabaseTypeStrata,
@@ -100,7 +100,7 @@ func TestStoredPlanShowsGeneratedVSchemaChangeAsItsDDL(t *testing.T) {
 	assert.Zero(t, summary.FinalizeCount)
 	assert.Zero(t, summary.VSchemaChangeCount)
 
-	resp := planContentFromStorage(plan)
+	resp := PlanContentFromStorage(plan)
 	require.Len(t, resp.Changes, 1)
 	assert.True(t, resp.Changes[0].HasVSchemaChange())
 	assert.False(t, resp.Changes[0].ShowsVSchemaChange())
@@ -128,7 +128,7 @@ func TestStoredPlanShowsGeneratedVSchemaChangeWithDeletion(t *testing.T) {
 	}
 
 	assert.Equal(t, 1, planSummaryFromStorage(plan).VSchemaChangeCount)
-	resp := planContentFromStorage(plan)
+	resp := PlanContentFromStorage(plan)
 	require.Len(t, resp.Changes, 1)
 	assert.True(t, resp.Changes[0].ShowsVSchemaChange())
 }

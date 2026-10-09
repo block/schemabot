@@ -1576,13 +1576,14 @@ whatever the flags, a caller that was not shown a member's plan any unsafe chang
 the primary plan's disclosure never named (`rejectMemberUndisclosedUnsafe`); the CLI's `apply` and `rollback`, which send `allow_unsafe` only
 when `--allow-unsafe` is passed, judged against every unsafe change the plan carries, a divergent
 shard's included (`pkg/cmd/commands/apply.go`, `pkg/cmd/commands/rollback.go`, over
-`PlanResponse.UnsafeChanges` in `pkg/apitypes/apitypes.go`). On the PR-comment rollback path the
-consent is the `rollback-confirm` comment itself: it is accepted only from an authorized
-admin/operator, after the rollback plan comment has warned that the rollback may include
-destructive changes, and it is pinned to that plan by rollback confirmation's transactional
-lock-intent check (`rollbackConfirmCommandCore` in `pkg/webhook/rollback.go`, enforced by
-`verifyExpectedLockIntent` in `pkg/storage/internal/sqlstore/applies.go`); the apply it submits
-carries `allow_unsafe` on that basis rather than from a flag.
+`PlanResponse.UnsafeChanges` in `pkg/apitypes/apitypes.go`); and the PR-comment
+`rollback-confirm`, which blocks without `--allow-unsafe` on every unsafe change the lock-pinned
+rollback plan carries, a divergent shard's included, and sends `allow_unsafe` only when the flag
+is passed (`blockRollbackUnsafeWithoutOptIn` and `rollbackPlanUnsafeChanges` in
+`pkg/webhook/rollback.go`). The rollback pin lasts only as long as the plan comment that names
+those changes: when that comment cannot be posted, `rollback` withdraws its pin before returning
+(`withdrawUndisclosedRollbackPin` in `pkg/webhook/rollback.go`, over the conditional
+`LockStore.ClearPendingPlanID`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 
@@ -1598,7 +1599,10 @@ planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; f
 privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
 in `pkg/engine/postgres/row_security_apply.go` that abort plan creation); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
-path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
+path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
+refusing the namespace and shard verdicts of the plan they submit (a rollout's primary plan)
+before prompting or locking (`blockedPlanError` over `PlanResponse.FirstBlockedChange`, in
+`pkg/cmd/commands/apply.go`, called there and from `pkg/cmd/commands/rollback.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`), task rows copying
 that admitting deployment's verdict at creation (`pkg/tern/local_client.go`,
 `pkg/tern/local_plan_drift.go`), and fresh and resumed

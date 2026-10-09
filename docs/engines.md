@@ -409,6 +409,7 @@ place to keep data.
   guarantees deliberately do not cover.
 - [postgresql.md](postgresql.md) for the full PostgreSQL support envelope: which plans are
   blocked, which statements are admitted, and how each refusal is reported.
+- [vitess.md](vitess.md) for the PlanetScale service token permissions the Vitess engine needs.
 - [throttle.md](throttle.md) for what each throttle signal means when you see one.
 - [pending-drops.md](pending-drops.md) for the quarantine lifecycle.
 - [direct-execution.md](direct-execution.md) for when a change runs directly instead of through a

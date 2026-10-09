@@ -1100,6 +1100,12 @@ operator-facing controls for emergencies and direct maintenance.
 `schemabot rollback-confirm -e <environment>` submits the rollback apply and
 marks the check `in_progress` with the rollback apply's `apply_id`.
 
+A rollback that carries unsafe changes, such as dropping a table the PR added,
+needs `--allow-unsafe` exactly as `apply` does. Without it, rollback-confirm
+lists the unsafe changes and the command to re-issue, nothing runs, the check
+is left unchanged, and the lock keeps the rollback plan pinned for
+`schemabot rollback-confirm -e <environment> --allow-unsafe`.
+
 Like normal applies, accepted rollbacks must have a stored apply ID before
 SchemaBot can safely watch progress or update the required check state.
 

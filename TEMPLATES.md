@@ -6599,6 +6599,89 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 </details>
 
 <details>
+<summary><a name="rollback-plan-unsafe-change"></a><strong>Rollback Plan (Unsafe Change)</strong></summary>
+
+
+## Schema Rollback Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+```sql
+DROP TABLE `audit_log`;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `audit_log`: DROP TABLE removes all data
+
+<details>
+<summary>Destructive drop guidance</summary>
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
+
+</details>
+
+📋 **Plan**: **1** table to drop
+
+---
+
+To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
+```
+schemabot rollback-confirm -e staging
+```
+
+To cancel, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="rollback-confirm-blocked-unsafe-change"></a><strong>Rollback Confirm Blocked (Unsafe Change)</strong></summary>
+
+
+## Schema Rollback Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+```sql
+DROP TABLE `audit_log`;
+```
+
+📋 **Plan**: **1** table to drop
+
+---
+
+**⛔ Rollback rejected**: 1 unsafe change detected
+1. `audit_log`: DROP TABLE removes all data
+
+<details>
+<summary>Destructive drop guidance</summary>
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
+
+</details>
+
+**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+```
+schemabot rollback-confirm -e staging --allow-unsafe
+```
+
+The lock still pins this rollback plan, so the command above confirms it.
+
+To cancel, comment:
+```
+schemabot unlock
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="rollback-status-running"></a><strong>Rollback Status: Running</strong></summary>
 
 

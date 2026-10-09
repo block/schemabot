@@ -1268,12 +1268,20 @@ func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange
 // blocked change guarantees the apply fails, so gates use this to reject the
 // apply before it starts.
 func (r *PlanResponse) HasBlockedChanges() bool {
+	return r.FirstBlockedChange() != nil
+}
+
+// FirstBlockedChange returns the first planned change carrying the blocked
+// execution-mode verdict, namespace-level changes before per-shard ones, or
+// nil when there is none. A refusal names this change and its engine's reason,
+// which says what has to change before an apply can run it.
+func (r *PlanResponse) FirstBlockedChange() *TableChangeResponse {
 	if r == nil {
-		return false
+		return nil
 	}
 	for _, t := range r.FlatTables() {
 		if t.EngineBlocked() {
-			return true
+			return t
 		}
 	}
 	for _, sp := range r.Shards {
@@ -1282,11 +1290,11 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 		}
 		for _, t := range sp.Changes {
 			if t.EngineBlocked() {
-				return true
+				return t
 			}
 		}
 	}
-	return false
+	return nil
 }
 
 // DiscardedCopies returns the unfinished copies on the target that applying

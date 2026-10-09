@@ -544,6 +544,12 @@ targets are now each planned against their own schema.
 Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
 Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
+`apply` and `rollback` refuse a blocked plan before they check or take a lock
+or ask for confirmation, for a single target, the whole rollout, or `--target`
+alike. The refusal follows the plan and names the plan, the first blocked
+table, and the engine's reason, one line per cause. Fix what the reason names:
+the statement, a grant on the target, or the server's policy. `--yield` has no
+lock to release on this refusal.
 
 An apply of the whole rollout runs each target's own plan, but holds every
 target to what the first target's plan discloses, since that is the plan you

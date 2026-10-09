@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/block/spirit/pkg/table"
@@ -70,24 +71,137 @@ func TestPlanetScaleResumeFromBranchRunsOnlyTheRemainingPlannedChanges(t *testin
 // was touched; creating, altering, or dropping it would apply a schema change
 // nobody reviewed. The refusal is permanent, names the table, and runs none of
 // the plan's DDL on the branch.
+//
+// The refusal ends the apply before any deploy request exists to tear the
+// branch down, so a branch SchemaBot created is deleted rather than stranded
+// against quota, and a delete that fails does not replace the refusal. An
+// operator-supplied branch is the operator's and is left in place.
 func TestPlanetScaleResumeFromBranchRefusesChangesOutsideThePlan(t *testing.T) {
-	cleanupActiveDeployRequests(t, t.Context())
-	deferCleanupActiveDeployRequests(t)
-	ctx := t.Context()
-	const keyspace = "testapp"
+	tests := []struct {
+		name       string
+		operator   bool
+		deleteErr  error
+		wantDelete bool
+	}{
+		{name: "a branch SchemaBot created is deleted even when the delete fails", deleteErr: errors.New("branch delete refused"), wantDelete: true},
+		{name: "an operator-supplied branch is left in place", operator: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cleanupActiveDeployRequests(t, t.Context())
+			deferCleanupActiveDeployRequests(t)
+			ctx := t.Context()
+			const keyspace = "testapp"
 
-	desired := desiredSchemaWith(t, ctx, keyspace, resumeLandedTable, resumeMissingTable)
-	branch := createBranchWithDDL(t, ctx, "resume-stray", map[string][]string{keyspace: {resumeLandedTable, resumeStrayTable}}, nil)
+			desired := desiredSchemaWith(t, ctx, keyspace, resumeLandedTable, resumeMissingTable)
+			branch := createBranchWithDDL(t, ctx, "resume-stray", map[string][]string{keyspace: {resumeLandedTable, resumeStrayTable}}, nil)
+			req := resumeFromBranchRequest(t, ctx, branch, desired, keyspace)
+			if tt.operator {
+				req.Options["branch"] = branch
+			}
+			client := &branchDeleteRecorder{PSClient: testClient, deleteErr: tt.deleteErr}
 
-	result, err := resumeTestEngineWith(testClient).Apply(ctx, resumeFromBranchRequest(t, ctx, branch, desired, keyspace))
-	require.Error(t, err)
-	assert.Nil(t, result)
-	var permanent *engine.PermanentError
-	assert.True(t, errors.As(err, &permanent), "a branch that differs outside the plan cannot be fixed by retrying: %v", err)
-	assert.Contains(t, err.Error(), keyspace+".resume_stray")
+			result, err := resumeTestEngineWith(client).Apply(ctx, req)
+			require.Error(t, err)
+			assert.Nil(t, result)
+			var permanent *engine.PermanentError
+			assert.True(t, errors.As(err, &permanent), "a branch that differs outside the plan cannot be fixed by retrying: %v", err)
+			assert.Contains(t, err.Error(), keyspace+".resume_stray")
+			assert.NotContains(t, err.Error(), "branch delete refused", "a failed delete must not replace the refusal")
 
-	tables := branchTableNames(t, ctx, branch, keyspace)
-	assert.NotContains(t, tables, "resume_missing", "a refused resume must run none of the plan's DDL")
+			tables := branchTableNames(t, ctx, branch, keyspace)
+			assert.NotContains(t, tables, "resume_missing", "a refused resume must run none of the plan's DDL")
+			if tt.wantDelete {
+				assert.Equal(t, []string{branch}, client.deletedBranches())
+			} else {
+				assert.Empty(t, client.deletedBranches())
+			}
+		})
+	}
+}
+
+// A resumed branch whose remaining planned change is refused for good ends the
+// apply before any deploy request exists. A branch SchemaBot created is
+// deleted rather than stranded against quota; an operator-supplied branch is
+// the operator's and is left in place.
+func TestPlanetScaleResumeFromBranchReclaimsTheBranchWhenTheRemainingChangeIsRefused(t *testing.T) {
+	tests := []struct {
+		name       string
+		operator   bool
+		wantDelete bool
+	}{
+		{name: "a branch SchemaBot created is deleted", wantDelete: true},
+		{name: "an operator-supplied branch is left in place", operator: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cleanupActiveDeployRequests(t, t.Context())
+			deferCleanupActiveDeployRequests(t)
+			ctx := t.Context()
+			const keyspace = "testapp"
+
+			desired := desiredSchemaWith(t, ctx, keyspace)
+			desired[keyspace].Files["vschema.json"] = `{"tables": {}}`
+			branch := createBranch(t, ctx, "resume-vschema")
+			req := resumeFromBranchRequest(t, ctx, branch, desired, keyspace)
+			req.Changes = []engine.SchemaChange{{
+				Namespace: keyspace,
+				Metadata:  map[string]string{"vschema_changed": "true"},
+			}}
+			if tt.operator {
+				req.Options["branch"] = branch
+			}
+			client := &branchDeleteRecorder{PSClient: &vschemaRejectingClient{PSClient: testClient}}
+
+			result, err := resumeTestEngineWith(client).Apply(ctx, req)
+			require.Error(t, err)
+			assert.Nil(t, result)
+			var permanent *engine.PermanentError
+			assert.True(t, errors.As(err, &permanent), "a rejected VSchema cannot be fixed by retrying: %v", err)
+			assert.Contains(t, err.Error(), "apply remaining changes on resume")
+
+			if tt.wantDelete {
+				assert.Equal(t, []string{branch}, client.deletedBranches())
+			} else {
+				assert.Empty(t, client.deletedBranches())
+			}
+		})
+	}
+}
+
+// branchDeleteRecorder records each branch the engine deletes and serves
+// everything else from the wrapped client. LocalScale serves no branch
+// deletion, so the record is what shows the engine's teardown decision;
+// deleteErr, when set, fails each delete after recording it.
+type branchDeleteRecorder struct {
+	psclient.PSClient
+	deleteErr error
+
+	mu      sync.Mutex
+	deleted []string
+}
+
+func (c *branchDeleteRecorder) DeleteBranch(_ context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deleted = append(c.deleted, req.Branch)
+	return c.deleteErr
+}
+
+func (c *branchDeleteRecorder) deletedBranches() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.deleted...)
+}
+
+// vschemaRejectingClient refuses every VSchema write the way PlanetScale
+// refuses an invalid one, a rejection no retry can clear.
+type vschemaRejectingClient struct {
+	psclient.PSClient
+}
+
+func (c *vschemaRejectingClient) UpdateKeyspaceVSchema(context.Context, *ps.UpdateKeyspaceVSchemaRequest) (*ps.VSchema, error) {
+	return nil, &ps.Error{Code: ps.ErrInvalid}
 }
 
 // laggingSchemaAPIClient answers the branch schema API the way PlanetScale can

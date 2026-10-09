@@ -3343,6 +3343,42 @@ func PreviewCommentRollbackSummaryCompleted() string {
 	return RenderApplySummaryComment(data)
 }
 
+// sampleRollbackPlanUnsafeData is a rollback plan for a PR whose apply added
+// the audit_log table, so rolling it back drops the table again.
+func sampleRollbackPlanUnsafeData() PlanCommentData {
+	return PlanCommentData{
+		Database:     "testapp",
+		Environment:  "staging",
+		RequestedBy:  previewRequestedBy,
+		IsMySQL:      true,
+		DatabaseType: "mysql",
+		ApplyID:      "apply_8c2f4e1a",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"DROP TABLE `audit_log`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "audit_log", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `audit_log`", ChangeType: "drop"},
+		},
+	}
+}
+
+// PreviewCommentRollbackPlanUnsafe renders a rollback plan comment whose
+// rollback drops a table, naming the unsafe change and the --allow-unsafe
+// consent its confirmation takes.
+func PreviewCommentRollbackPlanUnsafe() string {
+	return RenderRollbackPlanComment(sampleRollbackPlanUnsafeData())
+}
+
+// PreviewCommentRollbackUnsafeBlocked renders the refusal posted when
+// rollback-confirm is given without --allow-unsafe on that rollback plan.
+func PreviewCommentRollbackUnsafeBlocked() string {
+	data := sampleRollbackPlanUnsafeData()
+	data.ApplyID = ""
+	return RenderRollbackUnsafeChangesBlocked(data)
+}
+
 // PreviewCommentSummaryCompletedVitessDDLWithVSchema renders a completed Vitess
 // summary where the schema change included both table work and VSchema updates.
 func PreviewCommentSummaryCompletedVitessDDLWithVSchema() string {

@@ -1,12 +1,15 @@
 package psclient
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,22 +84,6 @@ func TestCreateDeployRequestSendsAutoDeleteBranchTrue(t *testing.T) {
 
 	assert.Equal(t, true, captured["auto_delete_branch"])
 	assert.Equal(t, false, captured["auto_cutover"])
-}
-
-// Without a base URL the cutover setting cannot be expressed at all, and a
-// deploy request created anyway would leave the backend free to cut over. The
-// client refuses to create one rather than create a request it cannot govern.
-func TestCreateDeployRequestRefusesWithoutBaseURL(t *testing.T) {
-	client, err := NewPSClientWithBaseURL("token-name", "token-value", "")
-	require.NoError(t, err)
-
-	_, err = client.CreateDeployRequest(t.Context(), &ps.CreateDeployRequestRequest{
-		Organization: "block",
-		Database:     "orders",
-		Branch:       "schemabot-orders-02846775",
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "auto_cutover")
 }
 
 // A rejected create carries the API's own response text, so an operator reading
@@ -267,17 +254,6 @@ func TestRawRequestFailureRendersOnlyTheAPIsOwnRefusal(t *testing.T) {
 			assert.Equal(t, tc.body, apiErr.Body, "the whole response stays on the error for the server log")
 		})
 	}
-}
-
-func TestDeployRequestAutoCutoverRefusesWithoutBaseURL(t *testing.T) {
-	client, err := NewPSClient("token-name", "token-value")
-	require.NoError(t, err)
-	client.(*psClientWrapper).baseURL = ""
-
-	_, err = client.DeployRequestAutoCutover(t.Context(), "block", "orders", 132)
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no PlanetScale API base URL")
 }
 
 // keyspacesServer serves the keyspace list endpoint for branch main of
@@ -490,21 +466,103 @@ func TestListKeyspacesFailsWhenNextPageDoesNotAdvance(t *testing.T) {
 	assert.Equal(t, []string{"1", "2"}, requested)
 }
 
-// Without a base URL the pages cannot be requested, and the listing refuses
-// rather than return only what the SDK's first page would hold.
-func TestListKeyspacesRefusesWithoutBaseURL(t *testing.T) {
-	client, err := NewPSClient("token-name", "token-value")
+// requestedURL makes one SDK call and one raw-HTTP call on a cancelled context,
+// so neither leaves the process, and returns the URL each was addressed to.
+func requestedURL(t *testing.T, client PSClient) (sdkURL, rawURL string) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{Organization: "block", Database: "orders", Branch: "main"})
+	var sdkErr *url.Error
+	require.ErrorAs(t, err, &sdkErr)
+
+	_, err = client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+	var rawErr *url.Error
+	require.ErrorAs(t, err, &rawErr)
+
+	return sdkErr.URL, rawErr.URL
+}
+
+// A database configured without an API base URL is a real PlanetScale one, so
+// both the SDK calls and the raw-HTTP calls address the public API.
+func TestEmptyBaseURLAddressesThePublicAPI(t *testing.T) {
+	fromDefault, err := NewPSClient("token-name", "token-value")
 	require.NoError(t, err)
-	client.(*psClientWrapper).baseURL = ""
+	fromEmpty, err := NewPSClientWithBaseURL("token-name", "token-value", "")
+	require.NoError(t, err)
 
-	_, err = client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{
-		Organization: "block",
-		Database:     "orders",
-		Branch:       "main",
-	})
+	for name, client := range map[string]PSClient{"NewPSClient": fromDefault, "NewPSClientWithBaseURL": fromEmpty} {
+		sdkURL, rawURL := requestedURL(t, client)
+		assert.Equal(t, "https://api.planetscale.com/v1/organizations/block/databases/orders/branches/main", sdkURL, name)
+		assert.Equal(t, "https://api.planetscale.com/v1/organizations/block/databases/orders/branches/main/keyspaces?page=1&per_page=100", rawURL, name)
+	}
+}
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main: no PlanetScale API base URL")
+// A base URL written with a trailing slash, or with a path prefix, still
+// addresses one server and one path root for SDK and raw-HTTP calls alike, so
+// a deploy request created over raw HTTP is the one the SDK later reads.
+func TestBaseURLSpellingDoesNotSplitSDKAndRawCalls(t *testing.T) {
+	for _, suffix := range []string{"/", "/api", "/api/", "//"} {
+		t.Run(suffix, func(t *testing.T) {
+			var paths []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/keyspaces") {
+					_, _ = w.Write([]byte(`{"data":[{"name":"orders","shards":1}]}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"name":"main"}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL+suffix)
+			require.NoError(t, err)
+			_, err = client.GetBranch(t.Context(), &ps.GetDatabaseBranchRequest{Organization: "block", Database: "orders", Branch: "main"})
+			require.NoError(t, err)
+			_, err = client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+			require.NoError(t, err)
+
+			wantRoot := strings.TrimRight(suffix, "/")
+			require.Len(t, paths, 2)
+			assert.Equal(t, wantRoot+"/v1/organizations/block/databases/orders/branches/main", paths[0])
+			assert.Equal(t, paths[0]+"/keyspaces", paths[1], "SDK and raw calls must share one path root")
+		})
+	}
+}
+
+// A configured base URL is where every call goes: the raw-HTTP calls for
+// endpoints the SDK does not cover reach the same server as the SDK calls, and
+// a base URL passed among the SDK options cannot split them.
+func TestConfiguredBaseURLCarriesSDKAndRawCalls(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/keyspaces") {
+			_, _ = w.Write([]byte(`{"data":[{"name":"orders","shards":1}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"name":"main"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL, ps.WithBaseURL("https://ps.example.invalid"))
+	require.NoError(t, err)
+
+	branch, err := client.GetBranch(t.Context(), &ps.GetDatabaseBranchRequest{Organization: "block", Database: "orders", Branch: "main"})
+	require.NoError(t, err)
+	assert.Equal(t, "main", branch.Name)
+
+	keyspaces, err := client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"orders"}, keyspaceNames(keyspaces))
+
+	assert.Equal(t, []string{
+		"/v1/organizations/block/databases/orders/branches/main",
+		"/v1/organizations/block/databases/orders/branches/main/keyspaces",
+	}, paths)
 }
 
 // recordingTransport counts the requests routed through it, so a test can show
@@ -551,8 +609,7 @@ func TestCallerHTTPClientCannotDisplaceTheBoundOrTheToken(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	callerTransport := &recordingTransport{}
-	client, err := NewPSClient("token-name", "token-value",
-		ps.WithBaseURL(srv.URL),
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL,
 		ps.WithHTTPClient(&http.Client{Transport: callerTransport}),
 	)
 	require.NoError(t, err)

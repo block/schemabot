@@ -555,6 +555,51 @@ func TestLocks(t *testing.T, h Harness) {
 		assert.Nil(t, stored)
 	})
 
+	t.Run("ClearPendingPlanID", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := &storage.Lock{
+			DatabaseName:         "plan_clear_db",
+			DatabaseType:         storage.DatabaseTypeMySQL,
+			Repository:           "org/repo",
+			PullRequest:          123,
+			Owner:                "owner-a",
+			PendingPlanID:        "rollback:plan-1",
+			DisclosedCopyDiscard: true,
+		}
+		require.NoError(t, store.Locks().Acquire(ctx, lock))
+
+		// A stale observed plan, another owner, or an empty plan never clears:
+		// a newer intent pinned since stays intact.
+		for _, tc := range []struct{ owner, plan string }{
+			{"owner-a", "rollback:plan-stale"},
+			{"intruder", "rollback:plan-1"},
+			{"owner-a", ""},
+		} {
+			cleared, err := store.Locks().ClearPendingPlanID(ctx, "plan_clear_db", storage.DatabaseTypeMySQL, tc.owner, tc.plan)
+			require.NoError(t, err)
+			assert.False(t, cleared, "owner %q plan %q", tc.owner, tc.plan)
+		}
+		stored, err := store.Locks().Get(ctx, "plan_clear_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "rollback:plan-1", stored.PendingPlanID)
+		assert.True(t, stored.DisclosedCopyDiscard)
+
+		// Owner and pending plan both match: the plan and its disclosure
+		// record are withdrawn, and the owner keeps the lock.
+		cleared, err := store.Locks().ClearPendingPlanID(ctx, "plan_clear_db", storage.DatabaseTypeMySQL, "owner-a", "rollback:plan-1")
+		require.NoError(t, err)
+		assert.True(t, cleared)
+		stored, err = store.Locks().Get(ctx, "plan_clear_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "owner-a", stored.Owner)
+		assert.Empty(t, stored.PendingPlanID)
+		assert.False(t, stored.DisclosedCopyDiscard)
+	})
+
 	t.Run("AcquireIfPendingPlanID", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -806,6 +851,12 @@ func TestLocks(t *testing.T, h Harness) {
 	t.Run("ReleaseIfPendingPlanID_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.Locks().ReleaseIfPendingPlanID(t.Context(), "err_db", storage.DatabaseTypeMySQL, "owner-a", "plan-1")
+		require.Error(t, err)
+	})
+
+	t.Run("ClearPendingPlanID_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Locks().ClearPendingPlanID(t.Context(), "err_db", storage.DatabaseTypeMySQL, "owner-a", "plan-1")
 		require.Error(t, err)
 	})
 
