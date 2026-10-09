@@ -67,6 +67,14 @@ func ListsParts(status string) bool {
 	}
 }
 
+// ListsTargets reports whether a table across a rollout's targets in status
+// lists them one per line under it: while the change is in flight on them
+// (ListsParts), and once it stopped, since each target resumes from where it
+// stopped and the listing is what says where that is.
+func ListsTargets(status string) bool {
+	return ListsParts(status) || state.IsState(status, state.Task.Stopped)
+}
+
 // TargetCoverage is the " · 40 complete, 4 copying, 19 queued, 1 failed,
 // 1 retrying" suffix of a table's line across a rollout's targets, naming only
 // the states some target is in, or "" when there are none. Queued targets are

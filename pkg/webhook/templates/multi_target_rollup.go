@@ -340,7 +340,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 				line += " · ETA: " + floor + ui.FormatETA(eta)
 			}
 			sb.WriteString(line + "\n")
-			writeMemberList(sb, presentation.TargetNoun, state.Task.Running, strip, pendingWord, budget)
+			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 			return
 		}
 	}
@@ -373,13 +373,15 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
 	writeDDL()
-	writeMemberList(sb, presentation.TargetNoun, status, strip, pendingWord, budget)
+	if listsTargets(status, strip) {
+		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+	}
 }
 
 // listsTargets reports whether a table line in status lists its targets one
-// per line under it (writeMemberList).
+// per line under it (writeMemberList, presentation.ListsTargets).
 func listsTargets(status string, strip []ShardProgressData) bool {
-	return len(strip) > 1 && presentation.ListsParts(status)
+	return len(strip) > 1 && presentation.ListsTargets(status)
 }
 
 // partlyCompleted reports whether a rolled-up table has completed on some of

@@ -10045,8 +10045,13 @@ To cut over prod/payments-001:
 
 ⏹️ prod — 1 completed · 2 stopped (3 targets)
 
-     ~ orders: ⏹️ Stopped · 1 complete
+     ~ orders: ⏹️ Stopped
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+       • Targets: 3 (2 stopped, 1 complete)
+           ○ payments-002: stopped at 40.00% · 32,000 / 80,000 rows
+           ○ payments-003: stopped at 25.00% · 20,000 / 80,000 rows
+           ✓ payments-001: 80,000 rows
 
 To resume from where it stopped:
   schemabot start apply-multi-a1b2c3d4 -e production

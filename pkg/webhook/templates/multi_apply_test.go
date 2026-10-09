@@ -2046,6 +2046,29 @@ func TestRenderMultiDeploymentApplyComment_TableByTableRolloutCountsTables(t *te
 	assert.NotContains(t, out, "0 of 2 targets done")
 }
 
+// An operator stopped a rollout with testapp-001 done and testapp-002 part-way
+// through `orders`. The table reads as stopped and lists its targets, the
+// stopped one saying where it stopped, since that is where it resumes: the
+// lines the CLI's progress view prints for the same rollout.
+func TestRenderMultiDeploymentApplyComment_StoppedTableListsWhereEachTargetStopped(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Completed),
+		parallelTarget("primary", "testapp-002", so.Stopped),
+	})
+	orders := func(database, status string, copied int64) *ApplyStatusCommentData {
+		d := tablesDetail(database, TableProgressData{TableName: "orders", Status: status, RowsCopied: copied, PercentComplete: int(copied * 100 / 1000)})
+		d.State = state.Apply.Stopped
+		return d
+	}
+	out := renderTargets(model,
+		orders("testapp_001", state.Task.Completed, 1000),
+		orders("testapp_002", state.Task.Stopped, 400),
+	)
+
+	assert.Contains(t, out, "**`orders`**: ⏸ Stopped\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 complete)\n  - ○ `testapp-002`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
+}
+
 // A rollout of `stations` then `refunds` table by table settled failed when
 // testapp-002 failed `stations`, so no target starts `refunds`. The headline
 // counts the tables done and then the targets by how they ended, and each
