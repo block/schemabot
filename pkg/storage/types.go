@@ -413,6 +413,15 @@ func TargetOperationKey(target, scopedKey string) string {
 	return target + OperationKeyDelimiter + scopedKey
 }
 
+// RolloutStepOperationKey is the key within a target for its work on one table
+// step of a rollout run table by table ("step-2"). Behind TargetOperationKey it
+// names one target's rows of one step ("orders-002/step-2"). It carries the
+// step's number rather than its tables, so the key stays one component however
+// many statements the step runs and no reader mistakes it for a shard key.
+func RolloutStepOperationKey(step int) string {
+	return fmt.Sprintf("step-%d", step)
+}
+
 // KeyedByTarget reports whether the operation is whole-target work keyed by
 // its target alone (TargetOperationKey(target, "")), the key each target of a
 // deployment addressing several attaches its own work under. Within one apply,
