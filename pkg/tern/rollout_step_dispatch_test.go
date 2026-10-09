@@ -53,7 +53,8 @@ func TestDeriveDispatchScope_RolloutStepRunsOnlyItsTables(t *testing.T) {
 // A step dispatch that cannot be run as exactly the step the control plane
 // recorded is refused before it is admitted: a step that is not a positive
 // number, one with no member target or with target shards, one naming a table
-// the target's plan does not change, and one naming no table at all.
+// the target's plan does not change, one naming two tables, and one naming no
+// table at all.
 func TestDeriveDispatchScope_RefusesAStepItCannotRunAsRecorded(t *testing.T) {
 	noTarget := stepDispatch("1", "orders")
 	delete(noTarget.Options, dispatchMemberTargetOption)
@@ -68,7 +69,8 @@ func TestDeriveDispatchScope_RefusesAStepItCannotRunAsRecorded(t *testing.T) {
 		"step not a number": {stepDispatch("two", "orders"), `dispatch rollout step "two" is not a positive number`},
 		"no member target":  {noTarget, "names rollout step 1 but no member target"},
 		"target shards":     {sharded, "names rollout step 1 and target shards [-80]"},
-		"unplanned table":   {stepDispatch("2", "refunds", "payouts"), `plan plan-payments-001 has no change to table "payouts" in namespace "payments"`},
+		"unplanned table":   {stepDispatch("2", "payouts"), `plan plan-payments-001 has no change to table "payouts" in namespace "payments"`},
+		"two tables":        {stepDispatch("1", "orders", "refunds"), `the dispatch names tables "orders" and "refunds"`},
 		"no table":          {stepDispatch("1"), "the dispatch names no table"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -76,6 +78,27 @@ func TestDeriveDispatchScope_RefusesAStepItCannotRunAsRecorded(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.want)
 		})
+	}
+}
+
+// A target holding the step's table in two of its namespaces runs both as
+// tasks of the one step: a step is a table, wherever the target holds it.
+func TestDeriveDispatchScope_RolloutStepRunsItsTableInEveryNamespace(t *testing.T) {
+	plan := rolloutStepPlan()
+	plan.Namespaces["payments_archive"] = &storage.NamespacePlanData{Tables: []storage.TableChange{
+		{Table: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)", Operation: "alter"},
+	}}
+	req := stepDispatch("1", "orders")
+	req.DdlChanges = append(req.DdlChanges, &ternv1.TableChange{Namespace: "payments_archive", TableName: "orders", Ddl: "dispatched text", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER})
+
+	scope, err := deriveDispatchScope(plan, req)
+	require.NoError(t, err)
+
+	require.Len(t, scope.ddlChanges, 2)
+	namespaces := []string{scope.ddlChanges[0].Namespace, scope.ddlChanges[1].Namespace}
+	assert.ElementsMatch(t, []string{"payments", "payments_archive"}, namespaces)
+	for _, change := range scope.ddlChanges {
+		assert.Equal(t, "orders", change.Table)
 	}
 }
 

@@ -207,6 +207,7 @@ func buildSchemaWithAllTables(t *testing.T, dsn string, testTableSchemas map[str
 	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for schema building")
 	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()), "failed to reach database for schema building")
 
 	tables, err := table.LoadSchemaFromDB(t.Context(), db)
 	require.NoError(t, err, "failed to load schema from database")

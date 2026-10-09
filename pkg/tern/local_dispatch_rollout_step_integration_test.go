@@ -51,6 +51,7 @@ func TestLocalClient_Apply_RolloutStepsAttachOneOperationPerStep(t *testing.T) {
 	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(ctx))
 	for _, ddl := range []string{"CREATE TABLE users (id INT PRIMARY KEY)", "CREATE TABLE accounts (id INT PRIMARY KEY)"} {
 		_, err = db.ExecContext(ctx, ddl)
 		require.NoError(t, err)

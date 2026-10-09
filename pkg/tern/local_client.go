@@ -2715,10 +2715,14 @@ func dispatchRolloutStep(req *ternv1.ApplyRequest, memberTarget string) (int, er
 // A dispatched table the plan does not change is refused: the step would
 // otherwise run less than the control plane recorded, and report the missing
 // table as done. A step that names no table is refused too, since it would
-// leave an operation with nothing to drive.
+// leave an operation with nothing to drive. A step is one table, so a dispatch
+// naming two tables is refused: it would run both under one step's key, and the
+// other table's own step would run it again. The step's table may sit in more
+// than one of the target's namespaces, and each runs as a task of the step.
 func rolloutStepDDLChanges(plan *storage.Plan, dispatched []*ternv1.TableChange) ([]storage.TableChange, error) {
 	type tableKey struct{ namespace, table string }
 	step := make(map[tableKey]bool, len(dispatched))
+	stepTable := ""
 	for i, ch := range dispatched {
 		if ch == nil {
 			return nil, fmt.Errorf("ddl_change %d is nil", i)
@@ -2727,6 +2731,10 @@ func rolloutStepDDLChanges(plan *storage.Plan, dispatched []*ternv1.TableChange)
 		if table == "" {
 			return nil, fmt.Errorf("ddl_change %d has no table", i)
 		}
+		if stepTable != "" && table != stepTable {
+			return nil, fmt.Errorf("the dispatch names tables %q and %q; a table step runs one table, so refusing to run two under one step", stepTable, table)
+		}
+		stepTable = table
 		step[tableKey{strings.TrimSpace(ch.Namespace), table}] = true
 	}
 	if len(step) == 0 {
