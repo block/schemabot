@@ -2046,6 +2046,51 @@ func TestRenderMultiDeploymentApplyComment_TableByTableRolloutCountsTables(t *te
 	assert.NotContains(t, out, "Rolling out: 0 of 2 targets done")
 }
 
+// A rollout of `orders` then `refunds` table by table settled failed when
+// testapp-002 failed `orders`, so no target starts `refunds`. A table still
+// pending on a target of a settled rollout never starts there, so its line
+// says not started rather than queued, both where no target ran it and where
+// some targets finished it first.
+func TestRenderMultiDeploymentApplyComment_SettledRolloutTableReadsNotStarted(t *testing.T) {
+	detail := func(database, ordersStatus, refundsStatus string) *ApplyStatusCommentData {
+		d := tablesDetail(database,
+			TableProgressData{TableName: "orders", Status: ordersStatus, RowsCopied: 1000},
+			TableProgressData{TableName: "refunds", Status: refundsStatus},
+		)
+		d.State = state.Apply.Failed
+		return d
+	}
+	t.Run("no target ran it", func(t *testing.T) {
+		model := presentation.Derive([]presentation.Operation{
+			steppedTarget("testapp-001", so.Completed, 1),
+			steppedTarget("testapp-002", so.Failed, 1),
+			steppedTarget("testapp-001", so.Pending, 2),
+			steppedTarget("testapp-002", so.Pending, 2),
+		})
+		require.Equal(t, state.Apply.Failed, model.State)
+		out := renderTargets(model,
+			detail("testapp_001", state.Task.Completed, state.Task.Pending),
+			detail("testapp_002", state.Task.Failed, state.Task.Pending),
+		)
+		assert.Contains(t, out, "**`refunds`**: ⊘ Not started\n")
+		assert.Contains(t, out, "**`orders`**: ❌ Failed · 1 complete, 1 failed\n")
+		assert.NotContains(t, out, "queued")
+	})
+	t.Run("some targets finished it", func(t *testing.T) {
+		model := presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Failed),
+		})
+		require.Equal(t, state.Apply.Failed, model.State)
+		out := renderTargets(model,
+			detail("testapp_001", state.Task.Completed, state.Task.Completed),
+			detail("testapp_002", state.Task.Failed, state.Task.Pending),
+		)
+		assert.Contains(t, out, "**`refunds`**: ✅ Complete on 1 of 2 targets · 1 not started\n")
+		assert.NotContains(t, out, "queued")
+	})
+}
+
 // The table-by-table headline settles the way the target headline does: every
 // table done reads rolled out, a rollout that settled short counts the tables
 // it finished, the targets that finished and the targets' outcomes, and a

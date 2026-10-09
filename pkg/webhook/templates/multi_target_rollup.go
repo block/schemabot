@@ -49,6 +49,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		lineSilent, lineWaiting = 0, 0
 	}
 	changing := changingMembers(data.Model, g)
+	settled := rolloutSettled(data.Model, g)
 	rankTargetTableLines(lines, lineSilent)
 	for _, line := range lines {
 		first := memberDetail(data.Details, line.members[0])
@@ -61,7 +62,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		restoreScope := planScopeForLine(budget, line.targets, subset, silent)
 		restorePlan := budget.pointAt(first.storedPlan())
 		strip := targetStrip(data, g, line.cells, line.targets, lineSilent > 0)
-		writeTargetTableLine(sb, line.table.TableName, line.cells, strip, lineSilent, lineWaiting, budget, func() {
+		writeTargetTableLine(sb, line.table.TableName, line.cells, strip, lineSilent, lineWaiting, settled, budget, func() {
 			writeTargetLineDDL(sb, dialect, line, subset, changing, budget)
 		})
 		sb.WriteString("\n")
@@ -69,6 +70,13 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		restoreScope()
 	}
 	writeFailedTargets(sb, data.Model, g)
+}
+
+// rolloutSettled reports whether a deployment's rollout has settled with no
+// target left to run: the apply is in a settled state and every target in g
+// is too. A table still pending on some target then never starts there.
+func rolloutSettled(model presentation.Apply, g presentation.Group) bool {
+	return state.IsState(model.State, state.SettledApplyStates...) && model.TargetProgress(g).Unsettled == 0
 }
 
 // writeTargetLineDDL writes a table line's DDL under its headline, headed by
@@ -263,7 +271,9 @@ func rankTargetTableLines(lines []targetTableLine, silent int) {
 // headline, and while the table is in flight strip lists each target's state
 // under the rows, the way the sharded comment lays out a table and its shards.
 // waiting is the silent targets still to run, which the line counts as queued.
-func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, silent, waiting int, budget *ddlBlockBudget, writeDDL func()) {
+// Once the rollout has settled, a target still pending on the table never
+// starts it, so the line says not started rather than queued.
+func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, silent, waiting int, settled bool, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying, reporting, unreported int
 	var copied, total, eta int64
 	var running int
@@ -303,7 +313,11 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	// A target still to run that has reported no progress has not started the
 	// table, so the line counts it as queued.
 	pending := queued + waiting
-	coverage := targetCoverage(done, running, pending, failed, retrying)
+	pendingWord := "queued"
+	if settled {
+		pendingWord = "not started"
+	}
+	coverage := targetCoverage(done, running, pending, failed, retrying, pendingWord)
 	if running > 0 && total > 0 {
 		percent := int(copied * 100 / total)
 		if unreported+silent > 0 {
@@ -344,7 +358,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	if partlyCompleted(status, done, pending) {
 		// Complete on some targets and queued on the rest: the change is live
 		// where it completed, so the line leads with that, not with Queued.
-		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, targetCoverage(0, 0, pending, 0, 0))
+		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, targetCoverage(0, 0, pending, 0, 0, pendingWord))
 		writeDDL()
 		return
 	}
@@ -354,6 +368,10 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		return
 	}
 	phrase := shardedTableStatusPhrase(status)
+	if status == state.Task.Pending && settled {
+		// No target ran the table, so there is nothing to count.
+		phrase, coverage = "⊘ Not started", ""
+	}
 	if status == state.Task.Cancelled && done > 0 {
 		// The pure-cancelled parenthetical ("not started") would be false:
 		// the change is live on the completed targets.
@@ -438,8 +456,8 @@ func targetsTableBytes(cells []TableProgressData, silent int) *int64 {
 // targetCoverage is the " · 40 complete, 4 copying, 19 queued, 1 failed,
 // 1 retrying" suffix of a table's line, naming only the states some target is
 // in. Queued targets are waiting on the apply's driver cap or on their turn in
-// order.
-func targetCoverage(done, running, queued, failed, retrying int) string {
+// order; pendingWord names them, "not started" once the rollout has settled.
+func targetCoverage(done, running, queued, failed, retrying int, pendingWord string) string {
 	var parts []string
 	if done > 0 {
 		parts = append(parts, fmt.Sprintf("%d complete", done))
@@ -448,7 +466,7 @@ func targetCoverage(done, running, queued, failed, retrying int) string {
 		parts = append(parts, fmt.Sprintf("%d copying", running))
 	}
 	if queued > 0 {
-		parts = append(parts, fmt.Sprintf("%d queued", queued))
+		parts = append(parts, fmt.Sprintf("%d %s", queued, pendingWord))
 	}
 	if failed > 0 {
 		parts = append(parts, fmt.Sprintf("%d failed", failed))
