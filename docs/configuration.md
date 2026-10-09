@@ -265,7 +265,8 @@ elsewhere:
 - `region_attribute` names the entity attribute that holds the region of each
   target's cluster, for example `aws_region`.
 - `reachable_regions` lists the regions, besides `region`, whose Secrets
-  Manager the data plane can call. It requires `region_attribute`.
+  Manager the data plane can call. It requires `region_attribute`, and every
+  listed region must be in the same AWS partition as `region`.
 
 For each target:
 
@@ -307,7 +308,11 @@ credentials:
 in.** List those regions in `reachable_regions`, and each secret is read beside
 its cluster with no replica needed. Roles are still assumed through STS in
 `region`, because credentials from a regional STS endpoint are valid in every
-region, so only Secrets Manager has to be reachable in the listed regions.
+region of the same AWS partition, so only Secrets Manager has to be reachable
+in the listed regions. For the same reason, every listed region must be in the
+partition of `region`: credentials from the commercial partition cannot read a
+secret in GovCloud, China, or an isolated partition, so the resolver refuses
+to start with such a region listed.
 
 ```yaml
 credentials:

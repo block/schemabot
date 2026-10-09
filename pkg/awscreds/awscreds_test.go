@@ -375,6 +375,34 @@ func TestIsRegionName(t *testing.T) {
 	}
 }
 
+// Each region belongs to one AWS partition, decided by its name's prefix.
+func TestPartitionOf(t *testing.T) {
+	for region, partition := range map[string]string{
+		"us-east-1":       "aws",
+		"eu-central-1":    "aws",
+		"us-gov-west-1":   "aws-us-gov",
+		"cn-north-1":      "aws-cn",
+		"us-iso-east-1":   "aws-iso",
+		"us-isob-east-1":  "aws-iso-b",
+		"us-isof-south-1": "aws-iso-f",
+		"eu-isoe-west-1":  "aws-iso-e",
+		"eusc-de-east-1":  "aws-eusc",
+	} {
+		assert.Equal(t, partition, partitionOf(region), region)
+	}
+}
+
+// Reachable regions in the home region's partition are accepted outside the
+// commercial partition too.
+func TestNewAcceptsReachableRegionsInHomePartition(t *testing.T) {
+	_, err := New(Config{Region: "us-gov-west-1", RegionAttribute: "aws_region", ReachableRegions: []string{"us-gov-east-1"}, RoleARN: "arn:aws-us-gov:iam::{account}:role/role", SecretName: "secret"})
+	require.NoError(t, err)
+
+	_, err = New(Config{Region: "us-gov-west-1", RegionAttribute: "aws_region", ReachableRegions: []string{"us-east-1"}, RoleARN: "arn:aws-us-gov:iam::{account}:role/role", SecretName: "secret"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `reachable region "us-east-1" is in partition aws, not the home region us-gov-west-1's partition aws-us-gov`)
+}
+
 // Without a region attribute every secret is read in the home region, whatever
 // region the target's entity reports.
 func TestResolverHomeRegionIgnoresEntityRegion(t *testing.T) {
@@ -499,6 +527,10 @@ func TestNewValidatesConfig(t *testing.T) {
 		"reachable regions require a region attribute":    func(c *Config) { c.ReachableRegions = []string{"us-east-1"} },
 		`reachable region "us-east" is not an AWS region`: func(c *Config) { c.RegionAttribute = "aws_region"; c.ReachableRegions = []string{"us-east"} },
 		`reachable region "us-west-2" is the home region`: func(c *Config) { c.RegionAttribute = "aws_region"; c.ReachableRegions = []string{"us-west-2"} },
+		`reachable region "cn-north-1" is in partition aws-cn, not the home region us-west-2's partition aws`: func(c *Config) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-east-1", "cn-north-1"}
+		},
 		`reachable region "us-east-1" is listed more than once`: func(c *Config) {
 			c.RegionAttribute = "aws_region"
 			c.ReachableRegions = []string{"us-east-1", "us-east-1"}

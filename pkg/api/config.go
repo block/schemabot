@@ -1160,9 +1160,10 @@ type EtreCredentialsConfig struct {
 	// holding the region of each target's cluster (e.g. "aws_region"); a target
 	// whose entity has no value for it, or one that is not a region name, fails
 	// resolution. ReachableRegions lists the other regions whose Secrets Manager
-	// this data plane can call, and requires RegionAttribute: a target whose
-	// cluster is in one of them has its secret read there, and every other
-	// target's secret is read in Region, so it must be replicated there.
+	// this data plane can call, all in Region's AWS partition, and requires
+	// RegionAttribute: a target whose cluster is in one of them has its secret
+	// read there, and every other target's secret is read in Region, so it must
+	// be replicated there.
 	Region           string   `yaml:"region,omitempty"`
 	RegionAttribute  string   `yaml:"region_attribute,omitempty"`
 	ReachableRegions []string `yaml:"reachable_regions,omitempty"`

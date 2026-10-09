@@ -69,7 +69,7 @@ type Config struct {
 	// that is not a region name, fails resolution.
 	RegionAttribute string
 	// ReachableRegions lists the regions, besides Region, whose Secrets Manager
-	// this data plane can call. A target whose cluster is in one of them has its
+	// this data plane can call. They must be in Region's AWS partition. A target whose cluster is in one of them has its
 	// secret read there; a target whose cluster is in any other region has its
 	// secret read in Region, so the secret must be replicated there. Requires
 	// RegionAttribute.
@@ -205,15 +205,44 @@ func isRegionName(s string) bool {
 	return regionNameRe.MatchString(s)
 }
 
+// partitionPrefixes maps the region-name prefixes of the AWS partitions other
+// than the commercial one to their partition. A region matching none of them is
+// in the commercial "aws" partition. Longer prefixes come first so "us-isob-"
+// is not taken for "us-iso-".
+var partitionPrefixes = []struct{ prefix, partition string }{
+	{"us-gov-", "aws-us-gov"},
+	{"cn-", "aws-cn"},
+	{"us-isob-", "aws-iso-b"},
+	{"us-isof-", "aws-iso-f"},
+	{"us-iso-", "aws-iso"},
+	{"eu-isoe-", "aws-iso-e"},
+	{"eusc-", "aws-eusc"},
+}
+
+// partitionOf returns the AWS partition a region belongs to.
+func partitionOf(region string) string {
+	for _, p := range partitionPrefixes {
+		if strings.HasPrefix(region, p.prefix) {
+			return p.partition
+		}
+	}
+	return "aws"
+}
+
 // reachableRegions returns the set of regions a secret may be read in: the home
-// region and every listed one. Each listed region must be a region name, other
-// than the home region, and listed once.
+// region and every listed one. Each listed region must be a region name in the
+// home region's partition, other than the home region, and listed once. Roles
+// are assumed in the home region, and credentials from one partition cannot
+// authenticate in another, so a region in another partition could never be read.
 func reachableRegions(home string, listed []string) (map[string]bool, error) {
 	reachable := map[string]bool{home: true}
+	homePartition := partitionOf(home)
 	for _, region := range listed {
 		switch {
 		case !isRegionName(region):
 			return nil, fmt.Errorf("reachable region %q is not an AWS region name", region)
+		case partitionOf(region) != homePartition:
+			return nil, fmt.Errorf("reachable region %q is in partition %s, not the home region %s's partition %s; credentials from one partition cannot read secrets in another", region, partitionOf(region), home, homePartition)
 		case region == home:
 			return nil, fmt.Errorf("reachable region %q is the home region; list only the other regions this data plane can call", region)
 		case reachable[region]:
@@ -465,9 +494,10 @@ type accountRegion struct {
 // client per account and region.
 type assumeRoleFetcher struct {
 	// awsCfg carries the home region, where every role is assumed. Credentials
-	// from a regional STS endpoint are valid in every region, so reading a
-	// secret in another region needs that region's Secrets Manager but not its
-	// STS.
+	// from a regional STS endpoint are valid in every region of the same
+	// partition, and reachable regions are confined to the home region's
+	// partition, so reading a secret in another region needs that region's
+	// Secrets Manager but not its STS.
 	awsCfg     aws.Config
 	roleARN    string
 	externalID string
