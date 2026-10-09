@@ -883,3 +883,37 @@ func tableStepProgress(applyState string, rows []tableStepRow) ProgressData {
 	}
 	return data
 }
+
+// Once a rollout settles, a table still pending on a target never starts
+// there, so the CLI reads it as not started rather than queued, the way the PR
+// comment does: on the table line, in the targets heading and on each
+// target's line.
+func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
+	heldBack := rolloutTarget{opState: state.ApplyOperation.Failed, status: state.Task.Pending}
+	t.Run("some targets finished it", func(t *testing.T) {
+		data := targetRolloutData([]rolloutTarget{completedTarget(), completedTarget(), heldBack})
+		data.State = state.Apply.Failed
+		out := renderRollout(t, data)
+		assert.Contains(t, out, "orders: ✓ Complete on 2 of 3 targets · 1 not started\n", out)
+		assert.Contains(t, out, "Targets: 3 (1 not started, 2 complete)", out)
+		assert.Contains(t, out, "payments-003: not started", out)
+		assert.NotContains(t, out, "queued", out)
+	})
+	t.Run("no target ran it", func(t *testing.T) {
+		cancelled := rolloutTarget{opState: state.ApplyOperation.Cancelled, status: state.Task.Pending}
+		data := targetRolloutData([]rolloutTarget{cancelled, cancelled, cancelled})
+		data.State = state.Apply.Cancelled
+		out := renderRollout(t, data)
+		assert.Contains(t, out, "orders: ⊘ Not started\n", out)
+		assert.Contains(t, out, "Targets: 3 (3 not started)", out)
+		assert.NotContains(t, out, "Queued", out)
+		assert.NotContains(t, out, "queued", out)
+	})
+	t.Run("a running rollout keeps queued", func(t *testing.T) {
+		pending := rolloutTarget{opState: state.ApplyOperation.Pending, status: state.Task.Pending}
+		out := renderRollout(t, targetRolloutData([]rolloutTarget{completedTarget(), pending}))
+		assert.Contains(t, out, "orders: ✓ Complete on 1 of 2 targets · 1 queued\n", out)
+		assert.Contains(t, out, "payments-002: queued", out)
+		assert.NotContains(t, out, "not started", out)
+	})
+}

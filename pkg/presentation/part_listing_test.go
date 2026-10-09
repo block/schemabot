@@ -59,9 +59,11 @@ func TestPartDetail(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.want, func(t *testing.T) {
-			assert.Equal(t, tt.want, PartDetail(tt.part))
+			assert.Equal(t, tt.want, PartDetail(tt.part, PendingQueued))
 		})
 	}
+	// A part a settled rollout will never run reads as not started.
+	assert.Equal(t, "not started", PartDetail(Part{Status: task.Pending}, PendingWord(true)))
 }
 
 // A listing puts where the change is at the top and settled parts last, in

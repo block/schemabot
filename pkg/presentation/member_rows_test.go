@@ -283,3 +283,23 @@ func TestDerive_SingleTableTargetWaitsForTheStepBefore(t *testing.T) {
 	assert.Equal(t, StateWaiting, model.Deployments[1].Presentation)
 	assert.Equal(t, "waiting for primary/orders-001", model.Deployments[1].Label)
 }
+
+// A rollout has settled only when its apply has and every target has too. An
+// apply settles failed the moment one target fails, so a sibling still copying
+// keeps the rollout unsettled and its tables still to run read as queued; a
+// stopped apply can resume, so it never settles a rollout either.
+func TestRolloutSettled(t *testing.T) {
+	derive := func(applyState string, ops ...Operation) (Apply, Group) {
+		model := Derive(ops)
+		model.State = applyState
+		groups := model.Groups()
+		require.Len(t, groups, 1)
+		return model, groups[0]
+	}
+	model, g := derive(so.Failed, tableRow("orders-001", so.Failed, 1), tableRow("orders-002", so.Running, 1))
+	assert.False(t, model.RolloutSettled(g), "a target still copying")
+	model, g = derive(so.Failed, tableRow("orders-001", so.Failed, 1), tableRow("orders-002", so.Completed, 1))
+	assert.True(t, model.RolloutSettled(g), "every target final")
+	model, g = derive(so.Stopped, tableRow("orders-001", so.Stopped, 1), tableRow("orders-002", so.Completed, 1))
+	assert.False(t, model.RolloutSettled(g), "a stopped apply can resume")
+}
