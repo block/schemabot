@@ -692,6 +692,13 @@ const (
 	// pinDuringPlanning pins the rollback while the apply plans, before it
 	// acquires the lock for its own plan.
 	pinDuringPlanning
+	// pinDuringConfirmRepin pins the rollback after a stopped apply-confirm
+	// read the lock and before it moves the pending confirmation onto the plan
+	// it just disclosed, whichever acquire it moves it with.
+	pinDuringConfirmRepin
+	// pinNotArmed pins nothing until the test arms another moment, so the
+	// apply's own lock handling can pass before the rollback races a later step.
+	pinNotArmed
 )
 
 // concurrentRollbackStorage wraps the service's storage so a test can slip a
@@ -716,8 +723,15 @@ type concurrentRollbackLocks struct {
 
 func (l *concurrentRollbackLocks) pinRollback(ctx context.Context) {
 	l.once.Do(func() {
-		l.pinErr = l.Acquire(ctx, l.pin)
+		l.pinErr = l.LockStore.Acquire(ctx, l.pin)
 	})
+}
+
+func (l *concurrentRollbackLocks) Acquire(ctx context.Context, lock *storage.Lock) error {
+	if l.moment == pinDuringConfirmRepin {
+		l.pinRollback(ctx)
+	}
+	return l.LockStore.Acquire(ctx, lock)
 }
 
 func (l *concurrentRollbackLocks) ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error) {
@@ -728,7 +742,7 @@ func (l *concurrentRollbackLocks) ReleaseIfPendingPlanID(ctx context.Context, da
 }
 
 func (l *concurrentRollbackLocks) AcquireIfPendingPlanID(ctx context.Context, lock *storage.Lock, observedPendingPlanID string) error {
-	if l.moment == pinDuringPlanning {
+	if l.moment == pinDuringPlanning || l.moment == pinDuringConfirmRepin {
 		l.pinRollback(ctx)
 	}
 	return l.LockStore.AcquireIfPendingPlanID(ctx, lock, observedPendingPlanID)

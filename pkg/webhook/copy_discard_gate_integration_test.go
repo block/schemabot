@@ -176,8 +176,16 @@ func (f discardGateFixture) requireLockEventually(t *testing.T, check func(*stor
 
 func setupDiscardGate(t *testing.T, dbName string) discardGateFixture {
 	t.Helper()
+	return setupDiscardGateWithStorage(t, dbName, nil)
+}
 
-	svc := setupE2EService(t, dbName)
+// setupDiscardGateWithStorage is setupDiscardGate with the service's storage
+// wrapped by wrapStorage, so a test can interleave another command's storage
+// writes with the stop.
+func setupDiscardGateWithStorage(t *testing.T, dbName string, wrapStorage func(storage.Storage) storage.Storage) discardGateFixture {
+	t.Helper()
+
+	svc := setupE2EServiceWithStorage(t, dbName, wrapStorage)
 	seedAbandonedCopy(t, dbName)
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
@@ -659,8 +667,9 @@ func TestRepinPendingConfirmationPreservesANewerIntent(t *testing.T) {
 	// The rollback the operator issued while the gate ran holds the pending
 	// confirmation, so the stop leaves it alone.
 	acquire(t, "rollback:the-operator-just-asked-for-this")
-	require.NoError(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
-		"plan-the-apply-observed", "plan-disclosing-the-copy", true))
+	err := f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+		"plan-the-apply-observed", "plan-disclosing-the-copy", true)
+	require.ErrorIs(t, err, storage.ErrLockIntentChanged)
 
 	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
@@ -681,6 +690,152 @@ func TestRepinPendingConfirmationPreservesANewerIntent(t *testing.T) {
 	require.NotNil(t, lock)
 	assert.Equal(t, "plan-disclosing-the-copy", lock.PendingPlanID)
 	assert.True(t, lock.DisclosedCopyDiscard)
+}
+
+// releasingRepinStorage wraps the service's storage so a test can release the
+// lock inside the stop's conditional re-pin, just before its write lands, the
+// interleaving a `schemabot unlock` racing the stop produces.
+type releasingRepinStorage struct {
+	storage.Storage
+	locks *releasingRepinLocks
+}
+
+func (s *releasingRepinStorage) Locks() storage.LockStore { return s.locks }
+
+type releasingRepinLocks struct {
+	storage.LockStore
+	armed      bool
+	releaseErr error
+}
+
+func (l *releasingRepinLocks) AcquireIfPendingPlanID(ctx context.Context, lock *storage.Lock, observedPendingPlanID string) error {
+	if l.armed {
+		l.armed = false
+		l.releaseErr = l.ForceRelease(ctx, lock.DatabaseName, lock.DatabaseType)
+	}
+	return l.LockStore.AcquireIfPendingPlanID(ctx, lock, observedPendingPlanID)
+}
+
+// An operator sends `schemabot unlock` while an apply-confirm is stopping to
+// disclose a copy. Whether the lock is already gone when the stop moves the
+// pending confirmation, or goes while that write is in flight, the stop leaves
+// the lock released rather than re-creating it, and the operator gets the same
+// reply: the lock changed under the apply, so retry it.
+func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
+	const dbName = "webhook_copy_discard_repin_gone"
+	const repo = "octocat/hello-world"
+	const pr = 1
+	locks := &releasingRepinLocks{}
+	f := setupDiscardGateWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
+		locks.LockStore = st.Locks()
+		return &releasingRepinStorage{Storage: st, locks: locks}
+	})
+
+	tests := []struct {
+		name string
+		// releasedDuringWrite releases the lock inside the conditional write
+		// instead of before the stop reaches it.
+		releasedDuringWrite bool
+	}{
+		{name: "lock gone before the re-pin"},
+		{name: "lock released during the re-pin's write", releasedDuringWrite: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.releasedDuringWrite {
+				require.NoError(t, locks.Acquire(t.Context(), &storage.Lock{
+					DatabaseName:  dbName,
+					DatabaseType:  "mysql",
+					Repository:    repo,
+					PullRequest:   pr,
+					Owner:         fmt.Sprintf("%s#%d", repo, pr),
+					PendingPlanID: "plan-the-apply-observed",
+				}))
+				locks.armed = true
+			}
+
+			repinErr := f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+				"plan-the-apply-observed", "plan-disclosing-the-copy", true)
+			require.ErrorIs(t, repinErr, storage.ErrLockIntentChanged)
+			if tt.releasedDuringWrite {
+				require.NoError(t, locks.releaseErr)
+				require.False(t, locks.armed, "the release must have run inside the re-pin")
+			}
+
+			lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+			require.NoError(t, err)
+			assert.Nil(t, lock, "the stop must not re-create a released lock")
+
+			require.True(t, f.handler.reportRepinRefused(repinErr, repo, pr, 1, action.ApplyConfirm, dbName, "staging", "testuser"),
+				"a gone lock is answered as a lock that changed under the apply")
+			reply := awaitCommentContaining(t, f.result, "changed the lock on")
+			assert.Contains(t, reply, applyLockIntentChangedRefusal(dbName))
+		})
+	}
+
+	// A stop that observed no pending confirmation has nothing to move, so it
+	// must not take the free lock either.
+	require.Error(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+		"", "plan-disclosing-the-copy", true))
+	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	assert.Nil(t, lock, "a re-pin with no observed intent must not create a lock")
+}
+
+// An operator sends `schemabot apply-confirm -e staging`, the re-plan finds a
+// copy the confirmed comment never disclosed, and the apply stops to ask again.
+// Between the stop reading the lock and moving the pending confirmation onto
+// the disclosing plan, the operator's `schemabot rollback` on the same PR pins
+// its plan on the lock. The rollback's pin survives, so rollback-confirm still
+// has it to execute, no apply starts, and the operator is told the lock changed
+// under the apply and that a retry names the command holding it.
+func TestE2EApplyConfirmStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
+	const dbName = "webhook_copy_discard_rb_race"
+	locks := &concurrentRollbackLocks{
+		moment: pinDuringConfirmRepin,
+		pin: &storage.Lock{
+			DatabaseName: dbName, DatabaseType: "mysql", Owner: "octocat/hello-world#1",
+			Repository: "octocat/hello-world", PullRequest: 1,
+			PendingPlanID: rollbackPendingPlanPrefix + "plan_concurrent",
+		},
+	}
+	f := setupDiscardGateWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
+		locks.LockStore = st.Locks()
+		return &concurrentRollbackStorage{Storage: st, locks: locks}
+	})
+
+	// The operator is confirming a staging plan that told them nothing about
+	// a copy. The lock is taken on the wrapped store's inner store so the
+	// rollback's pin is held back for the stop.
+	noCopyPlanID := "plan-disclosing-no-copy-" + dbName
+	require.NoError(t, locks.LockStore.Acquire(t.Context(), &storage.Lock{
+		DatabaseName:  dbName,
+		DatabaseType:  "mysql",
+		Repository:    "octocat/hello-world",
+		PullRequest:   1,
+		Owner:         "octocat/hello-world#1",
+		PendingPlanID: noCopyPlanID,
+	}))
+	seedConfirmationPlan(t, f.svc, dbName, noCopyPlanID, "staging")
+
+	rr := httptest.NewRecorder()
+	f.handler.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging",
+		isPR:    true,
+	}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	refusal := awaitCommentContaining(t, f.result, "changed the lock on")
+	assert.Contains(t, refusal, "`"+dbName+"`")
+	assert.Contains(t, refusal, "Retry the apply")
+	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
+
+	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the stopped apply must not release the rollback's lock")
+	assert.Equal(t, locks.pin.PendingPlanID, lock.PendingPlanID, "the concurrent rollback's pin must survive the stop")
+	assert.False(t, lock.DisclosedCopyDiscard, "no consent is recorded on the rollback's pin")
+	requireNoApplies(t, f.svc, dbName)
 }
 
 // The consent record's whole claim is that the operator was shown the copy, so

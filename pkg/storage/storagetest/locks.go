@@ -608,6 +608,28 @@ func TestLocks(t *testing.T, h Harness) {
 		require.ErrorIs(t, store.Locks().AcquireIfPendingPlanID(ctx, other, "plan-2"), storage.ErrLockHeld)
 		require.ErrorIs(t, store.Locks().AcquireIfPendingPlanID(ctx, other, ""), storage.ErrLockHeld)
 		assert.Equal(t, "plan-2", storedPin())
+
+		// A re-pin onto a plan whose comment disclosed a discarded copy moves
+		// the disclosure record with the pin it describes.
+		disclosing := lockPinned("plan-3")
+		disclosing.DisclosedCopyDiscard = true
+		require.NoError(t, store.Locks().AcquireIfPendingPlanID(ctx, disclosing, "plan-2"))
+		stored, err = store.Locks().Get(ctx, "plan_acquire_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "plan-3", stored.PendingPlanID)
+		assert.True(t, stored.DisclosedCopyDiscard)
+
+		// A rollback pinned the lock after the caller read plan-3: the re-pin
+		// is refused and the rollback's pin keeps its own disclosure record.
+		require.NoError(t, store.Locks().Acquire(ctx, lockPinned("rollback:plan-rb")))
+		err = store.Locks().AcquireIfPendingPlanID(ctx, disclosing, "plan-3")
+		require.ErrorIs(t, err, storage.ErrLockIntentChanged)
+		stored, err = store.Locks().Get(ctx, "plan_acquire_db", storage.DatabaseTypeMySQL)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "rollback:plan-rb", stored.PendingPlanID, "a refused re-pin must leave the rollback's pin in place")
+		assert.False(t, stored.DisclosedCopyDiscard, "a refused re-pin must not record a disclosure on the rollback's pin")
 	})
 
 	t.Run("ForceRelease", func(t *testing.T) {
