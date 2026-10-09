@@ -265,6 +265,10 @@ func (e *Engine) executeAlterPhase(ctx context.Context, host, username, password
 	defer target.close()
 
 	logger := e.changeLogger()
+	alters, ok := e.skipRecordedDirectStatements(ctx, database, alters)
+	if !ok {
+		return false
+	}
 	routing, err := e.routeAlterStatements(ctx, target, database, alters, policy)
 	if err != nil {
 		logger.Error("ALTER routing failed", "database", database, "error", err)

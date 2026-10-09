@@ -1396,8 +1396,9 @@ const pkReshapeDDL = "ALTER TABLE `direct_resume` DROP PRIMARY KEY, ADD PRIMARY 
 // newStoppedDirectResume returns an engine tracking a stopped schema change
 // that carries pkReshapeDDL, with the direct statement's lifecycle from the
 // earlier run set to priorState ("" for a run that never reached it), and the
-// table it targets with its original single-column primary key.
-func newStoppedDirectResume(t *testing.T, priorState string) (*Engine, string) {
+// table it targets with its original single-column primary key, resumed
+// under policy.
+func newStoppedDirectResume(t *testing.T, priorState string, policy directPolicy) (*Engine, string) {
 	t.Helper()
 	dsn, db := setupTestMySQL(t)
 	directReshapeTable(t, db, "direct_resume")
@@ -1415,7 +1416,7 @@ func newStoppedDirectResume(t *testing.T, priorState string) (*Engine, string) {
 		username:     username,
 		password:     password,
 		originalDDLs: []string{pkReshapeDDL},
-		directPolicy: directPolicy{Enabled: true, MaxTableRows: 100000},
+		directPolicy: policy,
 	}
 	if priorState != "" {
 		rm.directStatements = []*directStatementProgress{{
@@ -1426,10 +1427,22 @@ func newStoppedDirectResume(t *testing.T, priorState string) (*Engine, string) {
 	return eng, database
 }
 
+// resumePolicy is an enabled direct execution policy whose bound the resume
+// tests' table is well within.
+var resumePolicy = directPolicy{Enabled: true, MaxTableRows: 100000}
+
 // resumeAndWait resumes the stopped schema change through Start and returns
 // its final state, error message, and tracked direct statements once the
 // resumed run ends.
 func resumeAndWait(t *testing.T, eng *Engine) (engine.State, string, []directStatementProgress) {
+	t.Helper()
+	finalState, errMsg, statements, _ := resumeAndWaitPermanence(t, eng)
+	return finalState, errMsg, statements
+}
+
+// resumeAndWaitPermanence is resumeAndWait that also reports whether a failure
+// was recorded as permanent.
+func resumeAndWaitPermanence(t *testing.T, eng *Engine) (engine.State, string, []directStatementProgress, bool) {
 	t.Helper()
 	_, err := eng.Start(t.Context(), &engine.ControlRequest{})
 	require.NoError(t, err, "Start resumes the stopped schema change")
@@ -1444,7 +1457,7 @@ func resumeAndWait(t *testing.T, eng *Engine) (engine.State, string, []directSta
 	for _, p := range rm.directStatements {
 		statements = append(statements, *p)
 	}
-	return rm.state, rm.errorMessage, statements
+	return rm.state, rm.errorMessage, statements, rm.permanentFailure
 }
 
 // A resume never runs a direct statement that already completed. The earlier
@@ -1453,7 +1466,7 @@ func resumeAndWait(t *testing.T, eng *Engine) (engine.State, string, []directSta
 // composite key on: the key staying on `id` alone proves the statement was
 // skipped, not merely that it succeeded a second time.
 func TestEngine_Resume_SkipsCompletedDirectStatement(t *testing.T) {
-	eng, database := newStoppedDirectResume(t, directStateCompleted)
+	eng, database := newStoppedDirectResume(t, directStateCompleted, resumePolicy)
 
 	finalState, errMsg, statements := resumeAndWait(t, eng)
 
@@ -1471,11 +1484,12 @@ func TestEngine_Resume_SkipsCompletedDirectStatement(t *testing.T) {
 func TestEngine_Resume_FailsClosedOnUnknownDirectOutcome(t *testing.T) {
 	for _, prior := range []string{directStateStopped, directStateRunning} {
 		t.Run(prior, func(t *testing.T) {
-			eng, database := newStoppedDirectResume(t, prior)
+			eng, database := newStoppedDirectResume(t, prior, resumePolicy)
 
-			finalState, errMsg, statements := resumeAndWait(t, eng)
+			finalState, errMsg, statements, permanent := resumeAndWaitPermanence(t, eng)
 
 			require.Equal(t, engine.StateFailed, finalState)
+			assert.True(t, permanent, "retrying the same apply cannot learn whether the DDL landed, so the failure is permanent")
 			assert.Contains(t, errMsg, `native MySQL DDL on table "direct_resume"`)
 			assert.Contains(t, errMsg, "will not run it a second time")
 			assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_resume"),
@@ -1494,7 +1508,7 @@ func TestEngine_Resume_RerunsFailedDirectStatement(t *testing.T) {
 			name = "never_reached"
 		}
 		t.Run(name, func(t *testing.T) {
-			eng, database := newStoppedDirectResume(t, prior)
+			eng, database := newStoppedDirectResume(t, prior, resumePolicy)
 
 			finalState, errMsg, statements := resumeAndWait(t, eng)
 
@@ -1506,4 +1520,20 @@ func TestEngine_Resume_RerunsFailedDirectStatement(t *testing.T) {
 			assert.NotNil(t, statements[0].completedAt)
 		})
 	}
+}
+
+// A completed direct statement is skipped before routing judges it again, so
+// nothing that has changed since the earlier run can block or reroute it. Here
+// the size bound now sits below the table's row count: routing the statement
+// would block it, failing a schema change with no work left to do.
+func TestEngine_Resume_SkipsCompletedDirectStatementBeforeRouting(t *testing.T) {
+	eng, database := newStoppedDirectResume(t, directStateCompleted, directPolicy{Enabled: true, MaxTableRows: 1})
+
+	finalState, errMsg, statements := resumeAndWait(t, eng)
+
+	require.Equal(t, engine.StateCompleted, finalState, "resume completes; error: %s", errMsg)
+	assert.Equal(t, []string{"id"}, pkColumns(t, database, "direct_resume"),
+		"the completed statement did not execute again")
+	require.Len(t, statements, 1)
+	assert.Equal(t, directStateCompleted, statements[0].state)
 }

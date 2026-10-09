@@ -805,8 +805,8 @@ completeness test over it (`pkg/state/metadata.go`).
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
 *Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
 starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
-direct executor's per-statement claim when a stopped change resumes in place
-(`pkg/engine/spirit/direct.go`), and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
+skip of direct statements an earlier run recorded, ahead of routing, when a stopped change
+resumes in place (`pkg/engine/spirit/direct.go`), and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
