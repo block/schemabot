@@ -2042,8 +2042,43 @@ func TestRenderMultiDeploymentApplyComment_TableByTableRolloutCountsTables(t *te
 		targetDetail("testapp_002", state.Task.Pending, addNote, 0),
 	)
 
-	assert.Contains(t, out, "Rolling out: 1 of 2 tables done on 2 targets")
-	assert.NotContains(t, out, "Rolling out: 0 of 2 targets done")
+	assert.Contains(t, out, "\n🔄 1 of 2 tables done on 2 targets\n", "%s", out)
+	assert.NotContains(t, out, "0 of 2 targets done")
+}
+
+// A rollout of `stations` then `refunds` table by table settled failed when
+// testapp-002 failed `stations`, so no target starts `refunds`. The headline
+// counts the tables done and then the targets by how they ended, and each
+// table counts its targets on its own line rather than listing them: the
+// lines the CLI's progress view prints for the same rollout.
+func TestRenderMultiDeploymentApplyComment_SettledTableByTableRolloutReadsLikeTheCLI(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		steppedTarget("testapp-001", so.Completed, 1),
+		steppedTarget("testapp-002", so.Failed, 1),
+		steppedTarget("testapp-003", so.Completed, 1),
+		steppedTarget("testapp-001", so.Pending, 2),
+		steppedTarget("testapp-002", so.Pending, 2),
+		steppedTarget("testapp-003", so.Pending, 2),
+	})
+	require.Equal(t, state.Apply.Failed, model.State)
+	detail := func(database, stationsStatus string) *ApplyStatusCommentData {
+		d := tablesDetail(database,
+			TableProgressData{TableName: "stations", Status: stationsStatus, RowsCopied: 1000},
+			TableProgressData{TableName: "refunds", Status: state.Task.Pending},
+		)
+		d.State = state.Apply.Failed
+		return d
+	}
+	out := renderTargets(model,
+		detail("testapp_001", state.Task.Completed),
+		detail("testapp_002", state.Task.Failed),
+		detail("testapp_003", state.Task.Completed),
+	)
+
+	assert.Contains(t, out, "\n❌ 0 of 2 tables done on 3 targets · 1 target failed, 2 halted\n", "%s", out)
+	assert.Contains(t, out, "**`stations`**: ❌ Failed · 2 complete, 1 failed\n", "%s", out)
+	assert.Contains(t, out, "**`refunds`**: ⊘ Not started\n", "%s", out)
+	assert.NotContains(t, out, "- Targets:", "a table no target is copying lists no targets:\n%s", out)
 }
 
 // A rollout of `orders` then `refunds` table by table settled failed when
@@ -2137,36 +2172,4 @@ func TestRenderMultiDeploymentApplyComment_SettledRolloutTableReadsNotStarted(t 
 		assert.NotContains(t, out, "not started")
 		assert.NotContains(t, out, "Not started")
 	})
-}
-
-// The table-by-table headline settles the way the target headline does: every
-// table done reads rolled out, a rollout that settled short counts the tables
-// it finished, the targets that finished and the targets' outcomes, and a
-// rollback says so. A target that failed while others still run is named
-// before the rollout settles.
-func TestTableStepsStatus(t *testing.T) {
-	failed := presentation.TargetProgress{Total: 3, Done: 2, Others: []presentation.StateCount{{Label: "failed", Count: 1}}}
-	tests := []struct {
-		name     string
-		steps    presentation.TableSteps
-		progress presentation.TargetProgress
-		settled  bool
-		rollback bool
-		want     string
-	}{
-		{"running", presentation.TableSteps{Steps: 3, Done: 1}, presentation.TargetProgress{Total: 4, Unsettled: 4}, false, false, "Rolling out: 1 of 3 tables done on 4 targets"},
-		{"settled with a target still going", presentation.TableSteps{Steps: 3, Done: 1}, presentation.TargetProgress{Total: 4, Unsettled: 1}, true, false, "Rolling out: 1 of 3 tables done on 4 targets"},
-		{"every table done", presentation.TableSteps{Steps: 3, Done: 3}, presentation.TargetProgress{Total: 4, Done: 4}, true, false, "Rolled out 3 tables to 4 targets"},
-		{"failing while others run", presentation.TableSteps{Steps: 3, Done: 1}, presentation.TargetProgress{Total: 4, Unsettled: 1, Others: []presentation.StateCount{{Label: "running", Count: 1}, {Label: "failed", Count: 3}}}, false, false, "Rolling out: 1 of 3 tables done on 4 targets, 3 failed"},
-		{"settled short on the last table", presentation.TableSteps{Steps: 3, Done: 2}, failed, true, false, "Rolled out 2 of 3 tables to 3 targets, 2 completed, 1 failed"},
-		{"settled short, the rest halted", presentation.TableSteps{Steps: 3, Done: 1}, presentation.TargetProgress{Total: 3, Others: []presentation.StateCount{{Label: "halted", Count: 2}, {Label: "failed", Count: 1}}}, true, false, "Rolled out 1 of 3 tables to 3 targets, 2 halted, 1 failed"},
-		{"a target already had the change", presentation.TableSteps{Steps: 2, Done: 2}, presentation.TargetProgress{Total: 2, Done: 1, AlreadyHad: 1}, true, false, "Rolled out 2 tables to 1 target"},
-		{"rolling back", presentation.TableSteps{Steps: 2, Done: 0}, presentation.TargetProgress{Total: 2, Unsettled: 2}, false, true, "Rolling back: 0 of 2 tables done on 2 targets"},
-		{"rolled back", presentation.TableSteps{Steps: 2, Done: 2}, presentation.TargetProgress{Total: 2, Done: 2}, true, true, "Rolled back 2 tables on 2 targets"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, tableStepsStatus(tt.steps, tt.progress, tt.settled, tt.rollback))
-		})
-	}
 }

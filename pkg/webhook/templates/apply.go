@@ -1072,17 +1072,6 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
-// shardSummaryBreakdownState reports whether a table's aggregate status is
-// in-flight work whose line carries the compact per-shard breakdown.
-func shardSummaryBreakdownState(status string) bool {
-	switch state.NormalizeTaskStatus(status) {
-	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
-		return true
-	default:
-		return false
-	}
-}
-
 // renderShardSummary lists a sharded table's shards while it is in flight.
 func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
 	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards, presentation.PendingQueued, budget)
@@ -1102,7 +1091,7 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string,
 	if len(members) <= 1 {
 		return
 	}
-	if !shardSummaryBreakdownState(status) {
+	if !presentation.ListsParts(status) {
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
 	part := func(i int) presentation.Part {

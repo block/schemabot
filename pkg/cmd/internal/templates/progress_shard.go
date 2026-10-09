@@ -23,8 +23,14 @@ func FormatShardProgress(shards []ShardProgress) string {
 
 // formatTableParts renders a table's per-part progress: its shards, or its
 // targets when the table stands for one change across a rollout's targets.
+// Its targets are listed only while the change is in flight on them, as the
+// PR comment lists them (presentation.ListsParts): otherwise the table's line
+// counts them.
 func formatTableParts(t TableProgress) string {
 	if t.AcrossTargets {
+		if !presentation.ListsParts(t.Status) {
+			return ""
+		}
 		return formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t))
 	}
 	return formatPartProgress(t.Shards, presentation.ShardNoun, presentation.PendingQueued)

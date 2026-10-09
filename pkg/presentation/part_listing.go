@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -52,6 +53,47 @@ const (
 	maxFailedParts  = 5
 	maxCopyingParts = 3
 )
+
+// ListsParts reports whether a table in status lists its parts one per line
+// under it: only while the change is in flight on it. A table that has not
+// started, or has settled, says where it stands on its own line, so the PR
+// comment and the CLI both leave the listing out then.
+func ListsParts(status string) bool {
+	switch state.NormalizeTaskStatus(status) {
+	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
+		return true
+	default:
+		return false
+	}
+}
+
+// TargetCoverage is the " · 40 complete, 4 copying, 19 queued, 1 failed,
+// 1 retrying" suffix of a table's line across a rollout's targets, naming only
+// the states some target is in, or "" when there are none. Queued targets are
+// waiting on the apply's driver cap or on their turn in order; pendingWord
+// names them, "not started" once the rollout has settled (PendingWord).
+func TargetCoverage(done, running, queued, failed, retrying int, pendingWord string) string {
+	var parts []string
+	if done > 0 {
+		parts = append(parts, fmt.Sprintf("%d complete", done))
+	}
+	if running > 0 {
+		parts = append(parts, fmt.Sprintf("%d copying", running))
+	}
+	if queued > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", queued, pendingWord))
+	}
+	if failed > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", failed))
+	}
+	if retrying > 0 {
+		parts = append(parts, fmt.Sprintf("%d retrying", retrying))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " · " + strings.Join(parts, ", ")
+}
 
 // PartListLine is one line of a table's part listing: the part at index Part,
 // or, when Summary is set, a count of parts the listing does not name.

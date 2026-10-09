@@ -94,3 +94,35 @@ func TestTargetProgress_TableStepOutcomes(t *testing.T) {
 
 	assert.Empty(t, TargetProgress{Total: 2, Done: 2}.TableStepOutcomes(TableSteps{Steps: 2, Done: 2}, true))
 }
+
+// A rollout run table by table reads the same headline on the PR comment and
+// in the CLI: the tables done and the targets they ran on, the tables alone
+// once every one is done, and the targets an operator acts on after them, the
+// failures first and the first count named as targets. A target that already
+// had the change is not counted, and a rollback says so.
+func TestTableStepsHeadline(t *testing.T) {
+	failed := TargetProgress{Total: 3, Done: 2, Others: []StateCount{{Label: "failed", Count: 1}}}
+	tests := []struct {
+		name     string
+		steps    TableSteps
+		progress TargetProgress
+		settled  bool
+		rollback bool
+		want     string
+	}{
+		{"running", TableSteps{Steps: 3, Done: 1}, TargetProgress{Total: 4, Unsettled: 4}, false, false, "1 of 3 tables done on 4 targets"},
+		{"settled with a target still going", TableSteps{Steps: 3, Done: 3}, TargetProgress{Total: 4, Done: 3, Unsettled: 1}, true, false, "3 of 3 tables done on 4 targets"},
+		{"every table done", TableSteps{Steps: 3, Done: 3}, TargetProgress{Total: 4, Done: 4}, true, false, "3 tables done on 4 targets"},
+		{"failing while others run", TableSteps{Steps: 3, Done: 1}, TargetProgress{Total: 4, Unsettled: 1, Others: []StateCount{{Label: "running", Count: 1}, {Label: "failed", Count: 3}}}, false, false, "1 of 3 tables done on 4 targets · 3 targets failed"},
+		{"settled short on the last table", TableSteps{Steps: 3, Done: 2}, failed, true, false, "2 of 3 tables done on 3 targets · 2 targets completed, 1 failed"},
+		{"settled short, the rest halted", TableSteps{Steps: 2, Done: 0}, TargetProgress{Total: 3, Others: []StateCount{{Label: "halted", Count: 2}, {Label: "failed", Count: 1}}}, true, false, "0 of 2 tables done on 3 targets · 1 target failed, 2 halted"},
+		{"a target already had the change", TableSteps{Steps: 2, Done: 2}, TargetProgress{Total: 2, Done: 1, AlreadyHad: 1}, true, false, "2 tables done on 1 target"},
+		{"rolling back", TableSteps{Steps: 2, Done: 0}, TargetProgress{Total: 2, Unsettled: 2}, false, true, "0 of 2 tables rolled back on 2 targets"},
+		{"rolled back", TableSteps{Steps: 2, Done: 2}, TargetProgress{Total: 2, Done: 2}, true, true, "2 tables rolled back on 2 targets"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, TableStepsHeadline(tt.steps, tt.progress, tt.settled, tt.rollback))
+		})
+	}
+}

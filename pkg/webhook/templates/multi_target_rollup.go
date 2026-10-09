@@ -307,7 +307,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	// table, so the line counts it as queued.
 	pending := queued + waiting
 	pendingWord := presentation.PendingWord(settled)
-	coverage := targetCoverage(done, running, pending, failed, retrying, pendingWord)
+	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, pendingWord)
 	if running > 0 && total > 0 {
 		percent := int(copied * 100 / total)
 		if unreported+silent > 0 {
@@ -348,7 +348,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	if partlyCompleted(status, done, pending) {
 		// Complete on some targets and queued on the rest: the change is live
 		// where it completed, so the line leads with that, not with Queued.
-		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, targetCoverage(0, 0, pending, 0, 0, pendingWord))
+		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, presentation.TargetCoverage(0, 0, pending, 0, 0, pendingWord))
 		writeDDL()
 		return
 	}
@@ -379,7 +379,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 // listsTargets reports whether a table line in status lists its targets one
 // per line under it (writeMemberList).
 func listsTargets(status string, strip []ShardProgressData) bool {
-	return len(strip) > 1 && shardSummaryBreakdownState(status)
+	return len(strip) > 1 && presentation.ListsParts(status)
 }
 
 // partlyCompleted reports whether a rolled-up table has completed on some of
@@ -441,33 +441,6 @@ func targetsTableBytes(cells []TableProgressData, silent int) *int64 {
 		total += *c.EstimatedBytes
 	}
 	return &total
-}
-
-// targetCoverage is the " · 40 complete, 4 copying, 19 queued, 1 failed,
-// 1 retrying" suffix of a table's line, naming only the states some target is
-// in. Queued targets are waiting on the apply's driver cap or on their turn in
-// order; pendingWord names them, "not started" once the rollout has settled.
-func targetCoverage(done, running, queued, failed, retrying int, pendingWord string) string {
-	var parts []string
-	if done > 0 {
-		parts = append(parts, fmt.Sprintf("%d complete", done))
-	}
-	if running > 0 {
-		parts = append(parts, fmt.Sprintf("%d copying", running))
-	}
-	if queued > 0 {
-		parts = append(parts, fmt.Sprintf("%d %s", queued, pendingWord))
-	}
-	if failed > 0 {
-		parts = append(parts, fmt.Sprintf("%d failed", failed))
-	}
-	if retrying > 0 {
-		parts = append(parts, fmt.Sprintf("%d retrying", retrying))
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return " · " + strings.Join(parts, ", ")
 }
 
 // rollupTaskStatus is a table's status across targets: a failure or halt
