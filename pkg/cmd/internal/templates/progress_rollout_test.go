@@ -796,29 +796,12 @@ func TestWriteProgress_TableByTableRolloutCountsTargets(t *testing.T) {
 // would read payments-002, done with one table and waiting on the next, as
 // queued.
 func TestWriteProgress_TableByTableRolloutCountsTableSteps(t *testing.T) {
-	data := ProgressData{ApplyID: "apply-7f3c", Database: "orders", Environment: "production", Engine: "Spirit", State: state.Apply.Running}
-	for _, r := range []struct {
-		target, table string
-		step          int
-		opState       string
-		status        string
-		copied        int64
-	}{
-		{"payments-001", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000},
-		{"payments-002", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000},
-		{"payments-001", "docks", 2, state.ApplyOperation.Running, state.Task.Running, 400},
-		{"payments-002", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0},
-	} {
-		data.Operations = append(data.Operations, ProgressOperation{
-			Deployment: "prod", Target: r.target, OperationKey: r.target + "/" + r.table, OperationKind: storage.ApplyOperationKindWork,
-			State: r.opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue, RolloutStep: r.step,
-		})
-		data.Tables = append(data.Tables, TableProgress{
-			Deployment: "prod", Target: r.target, Namespace: "orders", TableName: r.table, ChangeType: "alter",
-			DDL: "ALTER TABLE `" + r.table + "` ADD COLUMN `region` varchar(32)", Status: r.status,
-			RowsCopied: r.copied, RowsTotal: 1000, PercentComplete: int(r.copied * 100 / 1000),
-		})
-	}
+	data := tableStepProgress(state.Apply.Running, []tableStepRow{
+		{"payments-001", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-002", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-001", "docks", 2, state.ApplyOperation.Running, state.Task.Running, 400, false},
+		{"payments-002", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+	})
 
 	out := renderRollout(t, data)
 
@@ -827,4 +810,76 @@ func TestWriteProgress_TableByTableRolloutCountsTableSteps(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 1 of 2 tables done (2 targets)"), "one section for the deployment")
 	assert.Contains(t, out, "• Targets: 2 (2 complete)")
 	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 queued)")
+}
+
+// A rollout under on_failure continue finished `bikes` on all three targets,
+// and `docks` failed on payments-001 and payments-002 while payments-003 still
+// copies it. The table count says how far the rollout got, so the header and
+// the deployment line also name the two failed targets, as the PR comment's
+// headline does.
+func TestWriteProgress_TableByTableRolloutNamesFailedTargets(t *testing.T) {
+	data := tableStepProgress(state.Apply.Running, []tableStepRow{
+		{"payments-001", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-002", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-003", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-001", "docks", 2, state.ApplyOperation.Failed, state.Task.Failed, 200, false},
+		{"payments-002", "docks", 2, state.ApplyOperation.Failed, state.Task.Failed, 300, false},
+		{"payments-003", "docks", 2, state.ApplyOperation.Running, state.Task.Running, 400, false},
+	})
+
+	out := renderRollout(t, data)
+
+	assert.Contains(t, out, "Tables:       1 of 2 done on 3 targets · 2 failed")
+	assert.Contains(t, out, "prod — 1 of 2 tables done · 2 failed (3 targets)")
+}
+
+// payments-000 already held the change, so the rollout gave it one settled row
+// in the first step and it ran no table. The header counts the two targets
+// that run the tables, as the PR comment's headline does.
+func TestWriteProgress_TableByTableRolloutLeavesOutConvergedTargets(t *testing.T) {
+	data := tableStepProgress(state.Apply.Running, []tableStepRow{
+		{"payments-000", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 0, true},
+		{"payments-001", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-002", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-001", "docks", 2, state.ApplyOperation.Running, state.Task.Running, 400, false},
+		{"payments-002", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+	})
+
+	out := renderRollout(t, data)
+
+	assert.Contains(t, out, "Tables:       1 of 2 done on 2 targets")
+	assert.Contains(t, out, "prod — 1 of 2 tables done (3 targets)")
+}
+
+// tableStepRow is one target's row for one table of a rollout run table by
+// table, with that table's progress.
+type tableStepRow struct {
+	target, table    string
+	step             int
+	opState          string
+	status           string
+	copied           int64
+	alreadyConverged bool
+}
+
+// tableStepProgress is the progress of an apply in applyState over rows, one
+// deployment run table by table under parallel and on_failure continue.
+func tableStepProgress(applyState string, rows []tableStepRow) ProgressData {
+	data := ProgressData{ApplyID: "apply-7f3c", Database: "orders", Environment: "production", Engine: "Spirit", State: applyState}
+	for _, r := range rows {
+		data.Operations = append(data.Operations, ProgressOperation{
+			Deployment: "prod", Target: r.target, OperationKey: r.target + "/" + r.table, OperationKind: storage.ApplyOperationKindWork,
+			State: r.opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue, RolloutStep: r.step,
+			AlreadyConverged: r.alreadyConverged,
+		})
+		if r.alreadyConverged {
+			continue
+		}
+		data.Tables = append(data.Tables, TableProgress{
+			Deployment: "prod", Target: r.target, Namespace: "orders", TableName: r.table, ChangeType: "alter",
+			DDL: "ALTER TABLE `" + r.table + "` ADD COLUMN `region` varchar(32)", Status: r.status,
+			RowsCopied: r.copied, RowsTotal: 1000, PercentComplete: int(r.copied * 100 / 1000),
+		})
+	}
+	return data
 }

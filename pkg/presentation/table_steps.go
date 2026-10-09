@@ -1,6 +1,10 @@
 package presentation
 
-import "github.com/block/schemabot/pkg/state"
+import (
+	"slices"
+
+	"github.com/block/schemabot/pkg/state"
+)
 
 // TableSteps is a deployment's progress through the table steps of a rollout
 // run table by table: how many steps it has, and how many of them have
@@ -19,6 +23,11 @@ type TableSteps struct {
 // with. It reports false when g does not run in several table steps: a row
 // carries no step, which is a rollout that does not run table by table, or
 // every row runs the same one, where the targets' own progress says it all.
+//
+// It reads g's rows as the whole rollout. Apply creation stores a row for
+// every target and table step it runs before any of them starts, so a step
+// with no row for a target is one that target's plan does not touch, not one
+// it has yet to reach, and a step is done once every row it has completed.
 func (a Apply) TableSteps(g Group) (TableSteps, bool) {
 	unfinished := make(map[int]bool)
 	for _, i := range g.Members {
@@ -40,4 +49,47 @@ func (a Apply) TableSteps(g Group) (TableSteps, bool) {
 		}
 	}
 	return steps, true
+}
+
+// tableStepOutcomeStates are the target statuses a table-step headline names
+// beside its table count: outcomes an operator acts on. A target copying,
+// queued, waiting between tables, at cutover or in its revert window is where
+// the table count already places it.
+var tableStepOutcomeStates = []PresentationState{
+	StateHalted, StatePaused, StateFailed, StateRetrying, StateStopped, StateCancelled, StateReverted, StateUnknown,
+}
+
+// TableStepOutcomes is the target counts a table-step headline carries beside
+// its table count, which says how far the rollout got but not how its targets
+// stand: the targets in an outcome an operator acts on, such as failed or
+// stopped, and, once the rollout settled short of its last table, the targets
+// that ran the whole change ahead of them. The PR comment and the CLI both
+// read their headline's counts from it.
+func (p TargetProgress) TableStepOutcomes(steps TableSteps, settled bool) []StateCount {
+	var outcomes []StateCount
+	if settled && p.Unsettled == 0 && steps.Done < steps.Steps && p.Done > 0 {
+		outcomes = append(outcomes, StateCount{Label: "completed", Count: p.Done})
+	}
+	for _, count := range p.Others {
+		if isTableStepOutcome(count.Label) {
+			outcomes = append(outcomes, count)
+		}
+	}
+	return outcomes
+}
+
+// isTableStepOutcome reports whether the summary category labelled label
+// counts a status in tableStepOutcomeStates.
+func isTableStepOutcome(label string) bool {
+	for _, category := range summaryCategoryOrder {
+		if category.label != label {
+			continue
+		}
+		for _, s := range category.states {
+			if slices.Contains(tableStepOutcomeStates, s) {
+				return true
+			}
+		}
+	}
+	return false
 }

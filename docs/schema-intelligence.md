@@ -753,7 +753,10 @@ on both:
 ```
 
 The CLI and the PR comment count such a rollout in tables, `Tables: 1 of 2
-done on 2 targets`, rather than in target states.
+done on 2 targets`, rather than in target states. A target that already had
+the change ran no table and is not counted. Targets in an outcome an operator
+acts on are named beside the count, so a failed `docks` on `shop-002` reads
+`Tables: 1 of 2 done on 2 targets · 1 failed`.
 
 </details>
 
