@@ -67,7 +67,8 @@ type Operation struct {
 
 	// RolloutStep is the table step the row runs when the rollout runs table
 	// by table, numbered from 1, and 0 for a row that runs its member's whole
-	// change. A target's stepped rows read as one member.
+	// change. A target's stepped rows read as one member, and TableSteps
+	// counts a deployment's steps.
 	RolloutStep int
 
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
@@ -297,6 +298,10 @@ type Apply struct {
 	// Deployments are the per-deployment presentations in resolved deployment
 	// order (the order the caller supplies, which mirrors the rollout order).
 	Deployments []Deployment
+
+	// rows are the operations the model was derived from, which
+	// Deployment.Rows index.
+	rows []Operation
 }
 
 // Group is one deployment's members of a rollout, so a surface can show a
@@ -450,6 +455,7 @@ func Derive(ops []Operation) Apply {
 		NextAction:   nextAction(aggState, deployments, hasFailClosedFailure(ops)),
 		FirstFailure: firstFailure(ops, deployments, memberOf),
 		Deployments:  deployments,
+		rows:         ops,
 	}
 }
 

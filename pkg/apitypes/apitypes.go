@@ -1780,9 +1780,13 @@ type ProgressOperationResponse struct {
 	// AlreadyConverged is true for an operation recorded completed when the
 	// apply was created, because its target already held the change and
 	// nothing ran there.
-	AlreadyConverged bool   `json:"already_converged,omitempty"`
-	StartedAt        string `json:"started_at,omitempty"`
-	CompletedAt      string `json:"completed_at,omitempty"`
+	AlreadyConverged bool `json:"already_converged,omitempty"`
+	// RolloutStep is the table step this operation runs, numbered from 1, when
+	// the rollout runs table by table: one operation per target and table.
+	// Omitted for an operation that runs its member's whole change.
+	RolloutStep int    `json:"rollout_step,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.

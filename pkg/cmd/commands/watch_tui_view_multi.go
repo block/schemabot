@@ -56,8 +56,8 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 	} else {
 		b.WriteString(model.Label + "\n")
 	}
-	if counts := templates.FormatStateCounts(model.Counts); counts != "" {
-		fmt.Fprintf(b, "%s: %s\n", templates.RolloutCountsUnit(groups), counts)
+	if label, counts := templates.RolloutCounts(model, groups); counts != "" {
+		fmt.Fprintf(b, "%s: %s\n", label, counts)
 	}
 	if model.FirstFailure != nil {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))

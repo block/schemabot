@@ -49,6 +49,45 @@ func RolloutCountsUnit(groups []presentation.Group) string {
 	return "Deployments"
 }
 
+// RolloutCounts is the rollout's status counts as a label and its text, for
+// the progress header and the watch view. A rollout of one deployment run
+// table by table counts its table steps, "Tables: 1 of 3 done on 4 targets",
+// since between tables most targets are done with one and waiting on the
+// next, which a count of target states reads as queued. It counts the targets
+// that ran a table, not the ones that already had the change, and adds the
+// targets the PR comment's headline adds (TableStepOutcomes): "1 of 3 done on
+// 4 targets · 3 failed". Any other rollout counts its members' states. The
+// text is empty when there is nothing to count.
+func RolloutCounts(model presentation.Apply, groups []presentation.Group) (label, text string) {
+	if len(groups) == 1 && len(groups[0].Members) > 1 {
+		steps, ok := model.TableSteps(groups[0])
+		progress := model.TargetProgress(groups[0])
+		if ok && progress.Total > progress.AlreadyHad {
+			text := fmt.Sprintf("%d of %d done on %s", steps.Done, steps.Steps, targetCount(progress.Total-progress.AlreadyHad))
+			return "Tables", withTableStepOutcomes(text, model, steps, progress)
+		}
+	}
+	return RolloutCountsUnit(groups), FormatStateCounts(model.Counts)
+}
+
+// withTableStepOutcomes appends to a table-step count the target counts that
+// TableStepOutcomes says it carries.
+func withTableStepOutcomes(text string, model presentation.Apply, steps presentation.TableSteps, progress presentation.TargetProgress) string {
+	settled := state.IsState(model.State, state.SettledApplyStates...)
+	if outcomes := progress.TableStepOutcomes(steps, settled); len(outcomes) > 0 {
+		text += " · " + FormatStateCounts(outcomes)
+	}
+	return text
+}
+
+// targetCount is "1 target" or "3 targets".
+func targetCount(n int) string {
+	if n == 1 {
+		return "1 target"
+	}
+	return fmt.Sprintf("%d targets", n)
+}
+
 // FormatStateCounts joins a status histogram into "40 completed · 3 running".
 func FormatStateCounts(counts []presentation.StateCount) string {
 	parts := make([]string, 0, len(counts))
@@ -65,7 +104,11 @@ func FormatStateCounts(counts []presentation.StateCount) string {
 // the number of targets.
 func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, FormatStateCounts(g.Counts), len(g.Members))
+	status := FormatStateCounts(g.Counts)
+	if steps, ok := v.Model.TableSteps(g); ok {
+		status = withTableStepOutcomes(fmt.Sprintf("%d of %d tables done", steps.Done, steps.Steps), v.Model, steps, v.Model.TargetProgress(g))
+	}
+	fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, status, len(g.Members))
 	if !v.SetupPhase {
 		writeTargetTables(&b, v, g)
 	}

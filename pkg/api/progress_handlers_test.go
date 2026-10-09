@@ -237,6 +237,27 @@ func TestProgressOperationsCarryAlreadyConverged(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(string(encoded), `"already_converged":true`), string(encoded))
 }
 
+// A row of a rollout run table by table keeps its table step in the progress
+// response and its JSON encoding, which is what folds a target's rows into one
+// member and counts the rollout in tables. A row of a member's whole change
+// omits the field.
+func TestProgressOperationsCarryRolloutStep(t *testing.T) {
+	ops := []*storage.ApplyOperation{
+		{ID: 1, Deployment: "primary", Target: "testapp-001", State: state.ApplyOperation.Running, RolloutStep: 2},
+		{ID: 2, Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Pending},
+	}
+
+	responses, _ := progressOperationsFromRows(ops)
+	require.Len(t, responses, 2)
+	assert.Equal(t, 2, responses[0].RolloutStep)
+	assert.Equal(t, 0, responses[1].RolloutStep)
+
+	encoded, err := json.Marshal(responses)
+	require.NoError(t, err)
+	assert.Equal(t, 1, strings.Count(string(encoded), `"rollout_step":2`), string(encoded))
+	assert.Equal(t, 1, strings.Count(string(encoded), `"rollout_step"`), "a row of a member's whole change omits the step: %s", encoded)
+}
+
 // The operation-id map that attributes tasks to rollout members carries the
 // whole routing pair. One deployment can address several targets, each copying
 // the same tables against its own schema, so a task attributed to the deployment

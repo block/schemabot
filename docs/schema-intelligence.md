@@ -734,6 +734,30 @@ has no table rows and no `started_at`. A missing `started_at` alone does not
 mean that: an operation can also be settled to its apply's outcome without ever
 starting, and its target may not have the change.
 
+`rollout_step` is set when the rollout runs table by table: the apply then has
+one operation per target and table, and `rollout_step` is the table's place in
+the rollout, numbered from 1. Every target finishes one step before any target
+starts the next. Operations that each run their member's whole change omit it.
+Response excerpt for `orders` then `refunds` on two targets, with `orders` done
+on both:
+
+```json
+{
+  "operations": [
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "rolling", "rollout_step": 2},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "pending", "cutover_policy": "rolling", "rollout_step": 2}
+  ]
+}
+```
+
+The CLI and the PR comment count such a rollout in tables, `Tables: 1 of 2
+done on 2 targets`, rather than in target states. A target that already had
+the change ran no table and is not counted. Targets in an outcome an operator
+acts on are named beside the count, so a failed `docks` on `shop-002` reads
+`Tables: 1 of 2 done on 2 targets · 1 failed`.
+
 </details>
 
 For event-based output while applying a rollout, use log mode:
