@@ -179,8 +179,8 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			return
 		}
 		if ctx.Err() != nil && recordedBranch == ownedBranch {
-			e.logger.Info("drive ended before the deploy request was created; keeping the branch for the driver that resumes the apply",
-				"organization", org, "database", req.Database, "branch", ownedBranch, "apply_error", retErr)
+			e.applyLogger(req).Info("drive ended before the deploy request was created; keeping the branch for the driver that resumes the apply",
+				"organization", org, "planetscale_database", req.Database, "branch", ownedBranch, "apply_error", retErr)
 			return
 		}
 		// A branch the stored state names stays resumable until the delete
@@ -928,7 +928,7 @@ func rowCopyDeclineEvent(unsafe bool, unsafeReason string) engine.ApplyEvent {
 // Handles two crash scenarios:
 //   - Branch exists, no deploy request: diff branch against desired schema, apply remaining DDL, then create and deploy the deploy request
 //   - Branch exists, deploy request exists: reattach, deploy it when it was created but never started, and rediscover the Vitess migration_context for progress
-func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest) (_ *engine.ApplyResult, retErr error) {
 	meta, err := decodePSMetadata(req.ResumeState.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("decode resume state: %w", err)
@@ -965,6 +965,25 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("wait for branch %s on resume: %w", meta.BranchName, err)
 	}
 
+	// The branch exists and is ready, and until the deploy request is created
+	// nothing else owns its teardown, so every exit from here to that point
+	// reclaims it. Once the deploy request exists it owns the teardown
+	// (auto_delete_branch) and the reclaim is disarmed. A create response lost
+	// to a timeout leaves the reclaim armed; deleting the branch is still safe
+	// there, for the reasons the fresh drive's cleanup in Apply gives.
+	handedToDeployRequest := false
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if handedToDeployRequest {
+			e.applyLogger(req).Info("resumed apply failed after its deploy request was created; the deploy request owns the branch's teardown",
+				"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, retErr)
+	}()
+
 	resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer resumePwCancel()
 	password, err := client.CreateBranchPassword(resumePwCtx, &ps.DatabaseBranchPasswordRequest{
@@ -995,20 +1014,16 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}
 	remainingChanges, err := remainingPlannedChanges(req.Changes, branchDiff, req.SchemaFiles)
 	if err != nil {
-		err = fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
-		e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, err)
-		return nil, err
+		return nil, fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
 	}
 
 	if len(remainingChanges) > 0 {
-		e.logger.Info("applying remaining planned changes on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
+		e.applyLogger(req).Info("applying remaining planned changes on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
 		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
-			err = fmt.Errorf("apply remaining changes on resume: %w", err)
-			e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, err)
-			return nil, err
+			return nil, fmt.Errorf("apply remaining changes on resume: %w", err)
 		}
 	} else {
-		e.logger.Info("all planned changes already applied on branch", "branch", meta.BranchName)
+		e.applyLogger(req).Info("all planned changes already applied on branch", "branch", meta.BranchName)
 	}
 
 	// The resumed branch must match the declared schema before a deploy request
@@ -1039,6 +1054,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
+	handedToDeployRequest = true
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("wait for deploy request on resume: %w", err)

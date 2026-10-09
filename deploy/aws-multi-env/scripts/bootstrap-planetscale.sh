@@ -225,21 +225,16 @@ cmd_create() {
     # Step 5: Grant permissions
     log "Step 5/7: Granting database permissions..."
     pscale service-token add-access "$token_id" \
-        approve_deploy_request \
         connect_branch \
         create_branch \
-        create_comment \
         create_deploy_request \
         delete_branch \
-        delete_branch_password \
         read_branch \
-        read_comment \
-        read_database \
         read_deploy_request \
         write_branch_vschema \
         --database "$PS_DATABASE" \
         $ORG_FLAG
-    success "Permissions granted (12 access types)"
+    success "Permissions granted (7 access types)"
 
     # Step 6: Create vtgate password for progress polling (SHOW VITESS_MIGRATIONS)
     local vtgate_name="schemabot-${PS_DATABASE}-vtgate"

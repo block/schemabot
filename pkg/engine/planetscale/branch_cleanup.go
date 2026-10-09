@@ -40,7 +40,7 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 		Branch:       branch,
 	})
 	if err != nil && ctx.Err() != nil {
-		logger.Warn("drive ended while deleting the branch; abandoned the delete and left the branch for the driver that resumes the apply",
+		logger.Warn("drive ended while deleting the branch; abandoned the delete request, which may already have landed; a resuming driver starts fresh if the branch is gone",
 			"organization", org, "planetscale_database", database, "branch", branch,
 			"apply_error", cause, "error", err)
 		return
@@ -56,17 +56,20 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 }
 
 // reclaimBranchAfterFailedResume deletes the branch a resumed drive was
-// preparing when that drive fails for good before it creates the deploy
-// request. Until a deploy request exists nothing else owns the branch's
-// teardown, and the fresh drive's own cleanup does not cover a resumed drive,
-// so a terminal failure here would otherwise strand the branch against quota.
+// preparing when that drive fails before it creates the deploy request. Until
+// a deploy request exists nothing else owns the branch's teardown, and the
+// fresh drive's own cleanup does not cover a resumed drive, so a failure here
+// would otherwise strand the branch against quota.
 //
-// The branch is kept whenever another drive may still need it, or when it is
-// not SchemaBot's to delete: an operator-supplied branch belongs to the
-// operator; a drive whose context ended is handing the apply to the driver
-// that resumes it from this branch; and a retryable failure leaves the branch
-// as the starting point for the retry. Each kept branch is logged with the
-// reason, so a branch left behind is explained rather than silent.
+// Any error the drive returns fails the apply: the Vitess drive does not
+// retry engine errors, classified or not, and recovery from a failed apply is
+// a fresh plan and apply on a new branch (ST-2). So the failure's
+// classification does not decide the branch's fate. The branch is kept only
+// when another drive may still need it, or when it is not SchemaBot's to
+// delete: an operator-supplied branch belongs to the operator, and a drive
+// whose context ended is handing the apply to the driver that resumes it from
+// this branch. Each kept branch is logged with the reason, so a branch left
+// behind is explained rather than silent.
 //
 // The stored state names the resumed branch, so the delete stays under the
 // drive's context for the whole request: a lease lost after the checks below,
@@ -83,9 +86,6 @@ func (e *Engine) reclaimBranchAfterFailedResume(ctx context.Context, client pscl
 			"organization", org, "planetscale_database", req.Database, "branch", branch, "apply_error", cause)
 	case ctx.Err() != nil:
 		logger.Info("resumed drive ended before its deploy request; keeping the branch for the driver that resumes the apply",
-			"organization", org, "planetscale_database", req.Database, "branch", branch, "apply_error", cause)
-	case engine.IsRetryable(cause):
-		logger.Info("resumed apply failed with a retryable error before its deploy request; keeping the branch for the retry to resume on",
 			"organization", org, "planetscale_database", req.Database, "branch", branch, "apply_error", cause)
 	default:
 		e.deleteOwnedBranch(ctx, logger, client, org, req.Database, branch, cause)

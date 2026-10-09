@@ -24,9 +24,9 @@ these database access permissions on every database SchemaBot manages:
 
 | Permission | What SchemaBot uses it for |
 |---|---|
-| `read_branch` | Wait for a branch to be ready, read its schema, list its keyspaces, and read each keyspace's VSchema |
+| `read_branch` | Wait for a branch to be ready, read its schema, list its keyspaces, and read each keyspace's VSchema. Also read the production branch: its schema during plan, its schema, keyspaces, and VSchema during pull, and its keyspaces during progress polling |
 | `create_branch` | Create the branch each apply prepares its schema change on |
-| `delete_branch` | Delete that branch when the apply fails for good before its deploy request exists (see [Branch cleanup](#branch-cleanup)) |
+| `delete_branch` | Delete that branch when the apply fails before its deploy request exists (see [Branch cleanup](#branch-cleanup)) |
 | `connect_branch` | Create the branch password used to run DDL on the branch |
 | `write_branch_vschema` | Apply VSchema changes to the branch |
 | `create_deploy_request` | Create the deploy request and drive it: deploy, cutover, cancel, close, revert, and skip revert |
@@ -40,11 +40,7 @@ requests or read or write their comments, so it needs neither
 `approve_deploy_request` nor the comment permissions.
 
 The bootstrap script `deploy/aws-multi-env/scripts/bootstrap-planetscale.sh`
-grants the permissions above, and also `approve_deploy_request`,
-`create_comment`, `read_comment`, `read_database`, and
-`delete_branch_password`. SchemaBot calls none of these five. Branch passwords
-are created with an expiry rather than deleted, and no call reads the
-database itself.
+grants exactly the permissions in the table above.
 
 When an apply runs on an operator-supplied branch, SchemaBot also refreshes
 that branch's schema from the production branch first. PlanetScale's API
@@ -52,22 +48,28 @@ reference does not list a permission for that call, so the table above may
 not be enough for that path.
 
 Progress polling uses both the service token and the database's vtgate
-credentials. The service token reads the deploy request's status
-(`read_deploy_request`) and lists the branch's keyspaces (`read_branch`). The
-vtgate credentials read per-shard progress with `SHOW VITESS_MIGRATIONS` on
-the production branch; the bootstrap script creates a read-only branch
-password for them. Without vtgate credentials, progress falls back to the
-deploy request's state and shows no per-shard row counts.
+credentials. On every poll the service token reads the deploy request's
+status (`read_deploy_request`). When vtgate credentials are set, the token
+also lists the production branch's keyspaces (`read_branch`), and the vtgate
+credentials then read each keyspace's per-shard progress with
+`SHOW VITESS_MIGRATIONS`; the bootstrap script creates a read-only branch
+password for them. Without vtgate credentials, the token only reads the
+deploy request, and progress shows its state with no per-shard row counts.
 
 ## Branch cleanup
 
 `delete_branch` is the permission most likely to be missing, because only a
 failure path uses it. An apply prepares its schema change on a branch it
 creates, and the deploy request deletes that branch once it exists. When the
-apply fails for good before it creates the deploy request, SchemaBot deletes
-the branch itself so it does not hold branch quota. That covers both an
-apply's first drive and a drive that resumed it. A branch an operator
-supplied is never deleted.
+apply fails after the branch exists and before the deploy request is
+created, SchemaBot deletes the branch itself so it does not hold branch
+quota. That covers any failure in that window, on an apply's first drive and
+on a drive that resumed it. Two cases keep the branch. A branch an operator
+supplied is never deleted. A drive that ends before it finishes, because its
+lease was lost, it stalled, or its instance shut down, keeps a branch the
+apply's stored state names, for the driver that resumes the apply from it; a
+branch the stored state does not name cannot be resumed, so it is still
+deleted.
 
 Without `delete_branch` the delete is refused. The apply still fails with its
 own error, and SchemaBot logs the refused delete at error level with the
