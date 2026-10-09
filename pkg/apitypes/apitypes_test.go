@@ -346,6 +346,29 @@ func TestPlanResponse_HasBlockedChanges(t *testing.T) {
 	}
 }
 
+// FirstBlockedChange returns the change a refusal names: the first blocked
+// namespace-level change, else the first blocked per-shard change, so a
+// verdict only a divergent shard carries is still named with its reason.
+func TestPlanResponse_FirstBlockedChange(t *testing.T) {
+	shardBlocked := &TableChangeResponse{TableName: "mutes", ExecutionMode: "blocked", ModeReason: "exact row count unavailable"}
+	nsBlocked := &TableChangeResponse{TableName: "users", ExecutionMode: "blocked", ModeReason: "direct execution is disabled"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace:    "testdb",
+			TableChanges: []*TableChangeResponse{{TableName: "orders", ExecutionMode: "direct"}, nsBlocked},
+		}},
+		Shards: []*ShardPlanResponse{{Shard: "-40", Changes: []*TableChangeResponse{shardBlocked}}},
+	}
+	assert.Same(t, nsBlocked, resp.FirstBlockedChange())
+
+	resp.Changes = nil
+	assert.Same(t, shardBlocked, resp.FirstBlockedChange())
+
+	resp.Shards = nil
+	assert.Nil(t, resp.FirstBlockedChange())
+	assert.Nil(t, (*PlanResponse)(nil).FirstBlockedChange())
+}
+
 // DirectChanges collects direct-execution verdicts across namespace-level and
 // per-shard changes, and only those.
 func TestPlanResponse_DirectChanges(t *testing.T) {

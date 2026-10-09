@@ -133,7 +133,12 @@ func TestApplyCmd_BlockedPrimaryRefusesBeforeLockOrPrompt(t *testing.T) {
 						plan := planWithTablesAndEngine("mysql", blocked)
 						plan.PlanID = "plan-blocked"
 						if work == "shard-only" {
-							plan.Changes = nil
+							// The namespace-level change is the collapsed view
+							// and carries no verdict; only the divergent shard's
+							// row is blocked.
+							collapsed := *blocked
+							collapsed.ExecutionMode, collapsed.ModeReason = "", ""
+							plan.Changes = []*apitypes.SchemaChangeResponse{{Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{&collapsed}}}
 							plan.Shards = []*apitypes.ShardPlanResponse{{Namespace: "orders", Shard: "-80", Changes: []*apitypes.TableChangeResponse{blocked}}}
 						}
 						var target string
@@ -161,7 +166,12 @@ func TestApplyCmd_BlockedPrimaryRefusesBeforeLockOrPrompt(t *testing.T) {
 						var runErr error
 						out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) }))
 
-						assert.EqualError(t, runErr, "apply blocked: the plan contains changes its target's engine refuses; change the schema files so the engine accepts them")
+						assert.EqualError(t, runErr, `apply blocked: plan plan-blocked contains a blocked change for table "users": direct execution is disabled`)
+						if output == OutputFormatJSON {
+							assert.NotContains(t, out, "DROP PRIMARY KEY", "JSON output renders no plan; the error carries the refusal")
+						} else {
+							assert.Contains(t, out, "DROP PRIMARY KEY", "the refused statement is shown before the refusal")
+						}
 						assert.NotContains(t, out, "Do you want to apply these changes?")
 						assert.NotContains(t, out, "--allow-unsafe", "unsafe consent cannot permit a blocked change")
 						recorded.mu.Lock()
@@ -194,4 +204,97 @@ func TestApplyCmd_ExecutablePrimaryStillPromptsAndApplies(t *testing.T) {
 	assert.Equal(t, []string{"/api/plan", "/api/status", "/api/locks/testdb/mysql", "/api/locks/acquire", "/api/apply"}, recorded.paths)
 	assert.Equal(t, "plan-narrowed", recorded.applyReq.PlanID)
 	assert.Equal(t, "prod/payments-002", recorded.applyReq.Target)
+}
+
+// The refusal names the blocked table and the engine's reason, which carries
+// the remedy: here a grant to provision, not a schema file to change.
+func TestApplyCmd_BlockedPrimaryRefusalNamesTableAndReason(t *testing.T) {
+	reason := "direct execution is enabled but the database user lacks a grant it needs to end sessions blocking the statement: grant it PROCESS and CONNECTION_ADMIN, then plan again"
+	plan := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		TableName: "users", DDL: "ALTER TABLE `users` DROP PRIMARY KEY", ChangeType: "alter",
+		ExecutionMode: engine.ExecutionModeBlocked, ModeReason: reason,
+	})
+	recorded, endpoint := newNarrowedPlanServer(t, plan)
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Output: OutputFormatJSON}
+	var runErr error
+	captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) })
+
+	require.Error(t, runErr)
+	assert.Contains(t, runErr.Error(), `"users"`)
+	assert.Contains(t, runErr.Error(), reason)
+	assert.NotContains(t, runErr.Error(), "change the schema files")
+	recorded.mu.Lock()
+	defer recorded.mu.Unlock()
+	assert.Equal(t, []string{"/api/status", "/api/plan"}, recorded.paths)
+}
+
+// A change blocked for several independent reasons lists each on its own
+// line, so an operator fixing the first is not surprised by the second on the
+// next attempt. Interactive output shows the refused statement first; JSON
+// output renders no plan and carries the whole refusal in the error.
+func TestApplyCmd_BlockedPrimaryRefusalListsEachCause(t *testing.T) {
+	reason := engine.JoinBlockedCauses([]string{
+		"direct execution is enabled but the table is above the configured limit of 1,000,000 rows",
+		"the target denies a grant the kill needs: grant it PROCESS, then plan again",
+	})
+	want := "apply blocked: plan plan-blocked contains a blocked change for table \"users\":\n" +
+		"- direct execution is enabled but the table is above the configured limit of 1,000,000 rows\n" +
+		"- the target denies a grant the kill needs: grant it PROCESS, then plan again"
+	for _, output := range []OutputFormat{OutputFormatInteractive, OutputFormatJSON} {
+		t.Run(string(output), func(t *testing.T) {
+			plan := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+				TableName: "users", DDL: "ALTER TABLE `users` DROP PRIMARY KEY", ChangeType: "alter",
+				ExecutionMode: engine.ExecutionModeBlocked, ModeReason: reason,
+			})
+			plan.PlanID = "plan-blocked"
+			recorded, endpoint := newNarrowedPlanServer(t, plan)
+			cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Output: output}
+			var runErr error
+			out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) }))
+
+			assert.EqualError(t, runErr, want)
+			if output == OutputFormatJSON {
+				assert.Empty(t, out)
+			} else {
+				assert.Contains(t, out, "ALTER TABLE `users` DROP PRIMARY KEY")
+			}
+			recorded.mu.Lock()
+			defer recorded.mu.Unlock()
+			assert.Equal(t, []string{"/api/status", "/api/plan"}, recorded.paths)
+		})
+	}
+}
+
+// A blocked primary is refused before the rollout's member refusals: their
+// remedy is to apply the refused members on their own and then the rollout
+// again, which the primary's verdict would refuse after those members had
+// changed, leaving the rollout split.
+func TestApplyCmd_BlockedPrimaryRefusesBeforeMemberReruns(t *testing.T) {
+	blocked := &apitypes.TableChangeResponse{
+		TableName: "users", DDL: "ALTER TABLE `users` DROP PRIMARY KEY", ChangeType: "alter",
+		ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "direct execution is enabled but the table is above the configured limit of 1,000,000 rows",
+	}
+	plan := planWithTablesAndEngine("mysql", blocked)
+	plan.PlanID = "plan-blocked"
+	plan.Rollout = &apitypes.PlanRolloutResponse{
+		Members: 2, Independent: true,
+		Groups: []*apitypes.PlanMemberGroupResponse{
+			{Members: []string{"prod/payments-001"}, Primary: true, Changes: plan.Changes},
+			{Members: []string{"prod/payments-002"}, Changes: plan.Changes},
+		},
+		Refused: []*apitypes.PlanMemberRefusalResponse{{
+			Member: "prod/payments-002", Target: "payments-002", Reason: apitypes.PlanMemberNeedsTarget,
+			Detail: `runs table "users" as direct-execution DDL, which a rollout-wide apply runs only from the pull request comment that discloses it under this target`,
+		}},
+	}
+	recorded, endpoint := newNarrowedPlanServer(t, plan)
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AllowUnsafe: true, AutoApprove: true, Yield: true, Output: OutputFormatInteractive}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) }))
+
+	assert.EqualError(t, runErr, `apply blocked: plan plan-blocked contains a blocked change for table "users": direct execution is enabled but the table is above the configured limit of 1,000,000 rows`)
+	assert.NotContains(t, out, "then apply the rollout again for the rest")
+	recorded.mu.Lock()
+	defer recorded.mu.Unlock()
+	assert.Equal(t, []string{"/api/status", "/api/plan"}, recorded.paths)
 }

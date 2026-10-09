@@ -1024,18 +1024,38 @@ Error: plan plan-example-42 was made for environment "staging", not "production"
 
 A blocked execution verdict is a refusal, not a request for unsafe consent.
 For example, when the fresh plan contains a blocked key alteration on `users`,
-`apply` stops before prompting or locking, even with `--allow-unsafe --yield`:
+`apply` shows the plan and stops before prompting or locking, even with
+`--allow-unsafe --yield`. The refusal names the plan, the table, and the
+engine's reason, which says what has to change; here it is a grant on the
+target, not the schema files:
 
 ```sh
 schemabot apply -s ./schema -e staging --allow-unsafe --yield
 ```
 
 ```text
-Error: apply blocked: the plan contains changes its target's engine refuses; change the schema files so the engine accepts them
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Apply                  │
+│                                             │
+│  Database: testdb                           │
+│  Schema name: schema                        │
+╰─────────────────────────────────────────────╯
+
+Staging
+     ~ users
+       ALTER TABLE `users` DROP PRIMARY KEY;
+
+📋 Plan: 1 table to alter
+
+Error: apply blocked: plan plan-example-43 contains a blocked change for table "users": dropping primary key is not supported; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and CONNECTION_ADMIN (or SUPER), then plan again
 ```
 
-This also applies to a whole rollout and an apply narrowed with `--target`.
-No apply is submitted and no lock is acquired or released.
+A reason with several independent causes lists each on its own line. With
+`-o json` the plan is not rendered and the error alone carries the refusal.
+This also applies to a whole rollout, where it is reported before any member
+the rollout refuses, to an apply narrowed with `--target`, and to `rollback`,
+whose refusal starts `rollback blocked:`. No apply is submitted and no lock is
+acquired or released.
 
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,

@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -157,6 +158,21 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		}
 	}
 
+	// The primary is not listed among rollout member refusals. Its engine's
+	// blocked verdict also refuses single-target and narrowed applies, and no
+	// unsafe opt-in makes it executable. It is checked before the member
+	// refusals, whose remedy is a rerun of the rollout that this verdict would
+	// refuse after those members had already changed.
+	if err := blockedPlanError("apply", planResult); err != nil {
+		if cmd.Output != OutputFormatJSON {
+			// The refused statement is shown before the refusal, since the
+			// remedy, whichever the reason names, starts with reading it.
+			OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
+			writeNarrowedTo(planResult)
+		}
+		return err
+	}
+
 	// The server lists the members whose own plans apply creation refuses in
 	// an apply of the whole rollout from the API, whatever the flags: an
 	// unsafe change the primary's plan does not carry, a direct-execution
@@ -171,13 +187,6 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 			return fmt.Errorf("an apply of the whole rollout cannot run the plan of %d of %d rollout members: %s", len(rollout.Refused), rollout.Members, rolloutRefusalSummary(rollout.Refused, cmd.Environment, cfg.SchemaDir))
 		}
 		return blockRolloutApplyRefused(planResult, rollout, cfg.Database, cmd.Environment, cfg.SchemaDir)
-	}
-
-	// The primary is not listed among rollout member refusals. Its engine's
-	// blocked verdict also refuses single-target and narrowed applies, and no
-	// unsafe opt-in makes it executable.
-	if planResult.HasBlockedChanges() {
-		return fmt.Errorf("apply blocked: the plan contains changes its target's engine refuses; change the schema files so the engine accepts them")
 	}
 
 	// Check for unsafe changes
@@ -596,6 +605,27 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 	// Then show the unsafe changes warning
 	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry)
 	return ErrSilent
+}
+
+// blockedPlanError returns the refusal for a plan carrying a blocked
+// execution verdict, or nil when it carries none. It names the plan, the
+// first blocked table, and the engine's reason, which says what has to change:
+// the statement, the target's provisioning, or the server's policy. A reason
+// with several independent causes lists each on its own line, so an operator
+// fixing the first is not surprised by the second on the next attempt.
+func blockedPlanError(command string, plan *apitypes.PlanResponse) error {
+	change := plan.FirstBlockedChange()
+	if change == nil {
+		return nil
+	}
+	reason := change.ModeReason
+	if strings.TrimSpace(reason) == "" {
+		reason = "the engine refuses this statement"
+	}
+	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
+		return fmt.Errorf("%s blocked: plan %s contains a blocked change for table %q:\n- %s", command, plan.PlanID, change.TableName, strings.Join(causes, "\n- "))
+	}
+	return fmt.Errorf("%s blocked: plan %s contains a blocked change for table %q: %s", command, plan.PlanID, change.TableName, reason)
 }
 
 // rolloutAttentionSummary names each rollout member that needs attention with
