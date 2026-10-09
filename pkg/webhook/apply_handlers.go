@@ -1083,13 +1083,14 @@ func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) st
 		"Use `%s` to execute the rollback, or `schemabot unlock` to cancel it, then retry the apply.", database, confirm)
 }
 
-// applyLockIntentChangedRefusal tells the operator that another command on the
-// same PR pinned the lock while this apply was checking or planning against it.
-// The apply leaves that pin in place; a retry finds it and reports which
-// command holds the lock and how to settle it.
+// applyLockIntentChangedRefusal tells the operator that another command pinned
+// or released the lock while this apply was checking or planning against it.
+// The apply leaves the lock as that command set it; a retry finds it and
+// reports which command holds the lock and how to settle it, or plans afresh
+// when the lock is free.
 func applyLockIntentChangedRefusal(database string) string {
-	return fmt.Sprintf("Another SchemaBot command on this PR changed the lock on `%s` while this apply was running, "+
-		"so the apply was rejected to keep that command's lock in place. Retry the apply; "+
+	return fmt.Sprintf("Another SchemaBot command changed the lock on `%s` while this apply was running, "+
+		"so the apply was rejected to leave the lock as that command set it. Retry the apply; "+
 		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database)
 }
 

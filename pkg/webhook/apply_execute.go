@@ -892,28 +892,19 @@ func (h *Handler) postAutoConfirmDowngrade(
 // longer carries the pending intent this apply observed — a rollback the
 // operator issued while the gate ran owns the lock now, and overwriting its pin
 // would answer "no pending rollback" to the rollback-confirm they are about to
-// send. The write itself is conditional on that intent, so a pin set after the
-// read below is kept too. Declining leaves the copy gate armed, so the next
-// apply-confirm stops and discloses again rather than proceeding on consent
-// that was never recorded.
+// send — or when the lock is gone, so a lock someone released stays released.
+// The write itself is conditional on that intent, so the answer does not
+// depend on when the lock changed. Declining leaves the copy gate armed, so
+// the next apply-confirm stops and discloses again rather than proceeding on
+// consent that was never recorded.
 func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, expectedPendingPlanID, planID string, disclosedCopyDiscard bool) error {
-	lock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
-	if err != nil {
-		return fmt.Errorf("load apply lock for %s (%s) to re-pin the pending confirmation: %w", database, dbType, err)
+	// An empty observed intent asks the conditional acquire for a free lock,
+	// which would re-create a released one, so there is nothing safe to move.
+	if expectedPendingPlanID == "" {
+		return fmt.Errorf("re-pin pending confirmation for %s (%s) onto plan %s: the apply observed no pending confirmation to move",
+			database, dbType, planID)
 	}
-	if lock == nil {
-		return fmt.Errorf("apply lock for %s (%s) is gone, so the pending confirmation cannot be re-pinned", database, dbType)
-	}
-	if lock.PendingPlanID != expectedPendingPlanID {
-		h.logger.Warn("preserved a newer pending intent instead of re-pinning the confirmation onto the disclosing plan",
-			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"expected_pending_plan_id", expectedPendingPlanID, "observed_pending_plan_id", lock.PendingPlanID,
-			"plan_id", planID)
-		return fmt.Errorf("re-pin pending confirmation for %s (%s) onto plan %s: lock pins %s, not %s: %w",
-			database, dbType, planID, lock.PendingPlanID, expectedPendingPlanID, storage.ErrLockIntentChanged)
-	}
-
-	err = h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, &storage.Lock{
+	err := h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, &storage.Lock{
 		DatabaseName:         database,
 		DatabaseType:         dbType,
 		Owner:                fmt.Sprintf("%s#%d", repo, pr),
@@ -923,9 +914,7 @@ func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr 
 		DisclosedCopyDiscard: disclosedCopyDiscard,
 	}, expectedPendingPlanID)
 	if errors.Is(err, storage.ErrLockIntentChanged) {
-		h.logger.Warn("preserved a pending intent pinned after the lock was read instead of re-pinning the confirmation onto the disclosing plan",
-			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
-			"expected_pending_plan_id", expectedPendingPlanID, "plan_id", planID)
+		h.logPreservedLockIntent(ctx, repo, pr, database, dbType, expectedPendingPlanID, planID)
 	}
 	if err != nil {
 		return fmt.Errorf("re-pin pending confirmation for %s (%s) onto plan %s from %s: %w",
@@ -934,17 +923,37 @@ func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr 
 	return nil
 }
 
+// logPreservedLockIntent records that a re-pin left the lock as another
+// command set it, with the lock's state after the refusal so the log says
+// whether a newer intent holds it or it was released.
+func (h *Handler) logPreservedLockIntent(ctx context.Context, repo string, pr int, database, dbType, expectedPendingPlanID, planID string) {
+	attrs := []any{
+		"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+		"expected_pending_plan_id", expectedPendingPlanID, "plan_id", planID,
+	}
+	current, err := h.service.Storage().Locks().Get(ctx, database, dbType)
+	switch {
+	case err != nil:
+		attrs = append(attrs, "lock_read_error", err)
+	case current == nil:
+		attrs = append(attrs, "lock_present", false)
+	default:
+		attrs = append(attrs, "lock_present", true, "observed_pending_plan_id", current.PendingPlanID, "lock_owner", current.Owner)
+	}
+	h.logger.Warn("preserved the lock's current intent instead of re-pinning the confirmation onto the disclosing plan", attrs...)
+}
+
 // reportRepinRefused answers an apply whose pending confirmation could not be
-// re-pinned because another command on this PR pinned the lock meanwhile. The
+// re-pinned because another command pinned or released the lock meanwhile. The
 // stop comment just posted coaches a confirmation the lock no longer carries,
 // so the operator is told the lock changed and that a retry names the command
-// holding it. It reports whether err was that refusal; any other error is left
-// for the caller to report.
+// holding it, if any. It reports whether err was that refusal; any other error
+// is left for the caller to report.
 func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, actionName, database, environment, requestedBy string) bool {
 	if !errors.Is(err, storage.ErrLockIntentChanged) {
 		return false
 	}
-	h.logger.Info("apply stopped: the pending confirmation stays with the intent another command pinned on this PR's lock",
+	h.logger.Info("apply stopped: another command pinned or released the lock, so the pending confirmation was not re-pinned",
 		"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName, "error", err)
 	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyLockIntentChangedRefusal(database))
 	return true

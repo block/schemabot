@@ -696,6 +696,9 @@ const (
 	// read the lock and before it moves the pending confirmation onto the plan
 	// it just disclosed, whichever acquire it moves it with.
 	pinDuringConfirmRepin
+	// pinNotArmed pins nothing until the test arms another moment, so the
+	// apply's own lock handling can pass before the rollback races a later step.
+	pinNotArmed
 )
 
 // concurrentRollbackStorage wraps the service's storage so a test can slip a

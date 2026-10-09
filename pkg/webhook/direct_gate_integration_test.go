@@ -195,7 +195,15 @@ type newlyDirectFixture struct {
 
 func setupNewlyDirectFixture(t *testing.T, dbName string) *newlyDirectFixture {
 	t.Helper()
-	svc := setupE2EServiceOpts(t, dbName, e2eServiceOpts{engineMetadata: directPolicyMetadata})
+	return setupNewlyDirectFixtureWithStorage(t, dbName, nil)
+}
+
+// setupNewlyDirectFixtureWithStorage is setupNewlyDirectFixture with the
+// service's storage wrapped by wrapStorage, so a test can interleave another
+// command's storage writes with the stop.
+func setupNewlyDirectFixtureWithStorage(t *testing.T, dbName string, wrapStorage func(storage.Storage) storage.Storage) *newlyDirectFixture {
+	t.Helper()
+	svc := setupE2EServiceOpts(t, dbName, e2eServiceOpts{engineMetadata: directPolicyMetadata, wrapStorage: wrapStorage})
 	seedPKSwapTargetTable(t, dbName)
 	t.Cleanup(func() {
 		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
@@ -370,6 +378,48 @@ func TestE2EApplyConfirmStopsWhenAChangeNewlyRunsDirect(t *testing.T) {
 		return slices.Equal([]string{"id", "tenant_id"}, appPrimaryKeyColumns(t, f.dbName, "users"))
 	}, webhookIntegrationPollDeadline, 200*time.Millisecond,
 		"confirming the comment that discloses the direct change applies it")
+}
+
+// An operator confirms a plan whose comment ran every statement through the
+// engine, but the re-plan now routes the primary-key swap to direct execution,
+// so the apply stops to disclose it. Between the stop reading the lock and
+// moving the pending confirmation onto the disclosing plan, the operator's
+// rollback on the same PR pins its plan. The rollback's pin survives, no apply
+// starts, and the operator is told the lock changed under the apply.
+func TestE2EApplyConfirmNewlyDirectStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
+	const dbName = "webhook_direct_rb_race"
+	locks := &concurrentRollbackLocks{
+		moment: pinDuringConfirmRepin,
+		pin: &storage.Lock{
+			DatabaseName: dbName, DatabaseType: "mysql", Owner: "octocat/hello-world#1",
+			Repository: "octocat/hello-world", PullRequest: 1,
+			PendingPlanID: rollbackPendingPlanPrefix + "plan_concurrent",
+		},
+	}
+	f := setupNewlyDirectFixtureWithStorage(t, dbName, func(st storage.Storage) storage.Storage {
+		locks.LockStore = st.Locks()
+		return &concurrentRollbackStorage{Storage: st, locks: locks}
+	})
+	shown := f.storeEngineRoutedPlan(t)
+	// The lock is taken on the wrapped store's inner store so the rollback's
+	// pin is held back for the stop.
+	require.NoError(t, locks.LockStore.Acquire(t.Context(), &storage.Lock{
+		DatabaseName: dbName, DatabaseType: "mysql", Owner: "octocat/hello-world#1",
+		Repository: "octocat/hello-world", PullRequest: 1,
+		PendingPlanID: shown.PlanIdentifier,
+	}))
+
+	f.comment(t, "schemabot apply-confirm -e staging --allow-unsafe")
+	requireNewlyDirectDisclosure(t, f.awaitComment(t, "Changes run differently"))
+	refusal := f.awaitComment(t, "changed the lock on")
+	assert.Contains(t, refusal, "`"+dbName+"`")
+	assert.Contains(t, refusal, "Retry the apply")
+	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
+
+	assert.Equal(t, locks.pin.PendingPlanID, f.pendingPlanID(t), "the concurrent rollback's pin must survive the stop")
+	requireNoApplies(t, f.svc, dbName)
+	assert.Equal(t, []string{"id"}, appPrimaryKeyColumns(t, dbName, "users"),
+		"the stopped confirm left the primary key unchanged")
 }
 
 // --defer-cutover has nothing to act on when every change runs as native DDL.

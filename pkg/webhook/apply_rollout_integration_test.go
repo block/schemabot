@@ -1501,6 +1501,59 @@ func TestE2EApplyNamesThePrimarysDriftWhenItStopsARolloutWhileStarting(t *testin
 	requireNoApplies(t, svc, dbName)
 }
 
+// The primary target (eu) already has the column and us does not, so the
+// apply command posts us's `ADD COLUMN` and runs it in the same step. us gains
+// a narrower `email` column before the re-plan, so the apply stops to show
+// us's plan as it is now. Between that stop and its move of the pending
+// confirmation onto the plan it just showed, the operator's rollback on the
+// same PR pins its plan. The rollback's pin survives, nothing runs, and the
+// operator is told the lock changed under the apply.
+func TestE2EApplyRolloutStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
+	dbName := "webhook_rollout_rb_race"
+	locks := &concurrentRollbackLocks{
+		moment: pinNotArmed,
+		pin: &storage.Lock{
+			DatabaseName: dbName, DatabaseType: "mysql", Owner: "octocat/hello-world#1",
+			Repository: "octocat/hello-world", PullRequest: 1,
+			PendingPlanID: rollbackPendingPlanPrefix + "plan_concurrent",
+		},
+	}
+	var hooked *afterLockStorage
+	svc := setupE2ERolloutServiceWithStorage(t, dbName, []deploymentSpec{
+		{name: "eu", liveSchema: usersWithEmailSchema},
+		{name: "us", liveSchema: usersBaseSchema},
+	}, api.PlanIndependent, func(st storage.Storage) storage.Storage {
+		locks.LockStore = st.Locks()
+		hooked = &afterLockStorage{Storage: &concurrentRollbackStorage{Storage: st, locks: locks}}
+		return hooked
+	})
+	t.Cleanup(func() {
+		_ = svc.Storage().Locks().ForceRelease(context.WithoutCancel(t.Context()), dbName, "mysql")
+	})
+	us := openDriftDB(t, driftDSN(t, dbName+"_us"))
+	// The apply takes the lock for the plan it posts; only the stop's re-pin
+	// after it races the rollback.
+	hooked.onAcquire = func(*storage.Lock) {
+		_, err := us.ExecContext(t.Context(), "ALTER TABLE `users` ADD COLUMN `email` varchar(16) DEFAULT NULL")
+		require.NoError(t, err)
+		locks.moment = pinDuringConfirmRepin
+	}
+
+	apply := runRolloutCommand(t, svc, dbName, "schemabot apply -e "+driftEnv)
+	awaitCommentContaining(t, apply, "The plan for target `us` changed before this apply could start")
+	refusal := awaitCommentContaining(t, apply, "changed the lock on")
+	assert.Contains(t, refusal, "`"+dbName+"`")
+	assert.Contains(t, refusal, "Retry the apply")
+	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
+
+	lock, err := svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
+	require.NoError(t, err)
+	require.NotNil(t, lock, "the stopped apply must not release the rollback's lock")
+	assert.Equal(t, locks.pin.PendingPlanID, lock.PendingPlanID, "the concurrent rollback's pin must survive the stop")
+	assert.False(t, lock.DisclosedCopyDiscard, "no consent is recorded on the rollback's pin")
+	requireNoApplies(t, svc, dbName)
+}
+
 // awaitApplyLockReleased waits for a command that posts before it releases its
 // lock to finish releasing it.
 func awaitApplyLockReleased(t *testing.T, svc *api.Service, dbName, msg string) {
