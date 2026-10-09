@@ -103,13 +103,21 @@ func buildMultiApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, re
 	tasksByOp := groupTasksByOperation(tasks)
 
 	model := deriveApplyPresentation(ops, released)
-	// Derive returns one presentation per operation in input order, so the
-	// details are built in that same order and consumed positionally. A
-	// deployment can own several operations, which a name-keyed map could not
-	// tell apart.
-	details := make([]*templates.ApplyStatusCommentData, 0, len(ops))
-	for _, op := range ops {
-		detail := buildDeploymentDetail(apply, op, tasksByOp[op.ID], displayByOp[op.ID], shardsByTable, tenant, cliName)
+	// Derive returns one presentation per rollout member, so the details are
+	// built member by member and consumed positionally. A deployment can own
+	// several members, which a name-keyed map could not tell apart. A
+	// member whose work spans several rows, a target run table by table,
+	// shows every row's tables in row order, under its lead row's state,
+	// error and engine detail.
+	details := make([]*templates.ApplyStatusCommentData, 0, len(model.Deployments))
+	for _, d := range model.Deployments {
+		lead := ops[d.Row]
+		var memberTasks []*storage.Task
+		for _, i := range d.Rows {
+			memberTasks = append(memberTasks, tasksByOp[ops[i].ID]...)
+		}
+		detail := buildDeploymentDetail(apply, lead, memberTasks, displayByOp[lead.ID], shardsByTable, tenant, cliName)
+		detail.State = d.State
 		details = append(details, &detail)
 	}
 

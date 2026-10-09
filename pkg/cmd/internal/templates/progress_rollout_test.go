@@ -742,3 +742,48 @@ func TestWriteProgress_TargetRollupRanksUnreportedTargetsAsQueued(t *testing.T) 
 	assert.Contains(t, out, "2 of 3 targets have not reported progress yet.")
 	assertLess(t, out, "ALTER TABLE `orders`", "ALTER TABLE `invoices`")
 }
+
+// A rollout run table by table has a row per target and table: payments-001
+// finished `bikes` and is queued for `docks`, while payments-002 still copies
+// `bikes`. The header and the deployment count the two targets, not the four
+// rows, and the deployment is one section listing both tables.
+func TestWriteProgress_TableByTableRolloutCountsTargets(t *testing.T) {
+	step := map[string]int{"bikes": 1, "docks": 2}
+	row := func(target, table, opState, status string, copied int64) (ProgressOperation, TableProgress) {
+		percent := int(copied * 100 / 1000)
+		return ProgressOperation{
+				Deployment: "prod", Target: target, OperationKey: target + "/" + table, OperationKind: storage.ApplyOperationKindWork,
+				State: opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue, RolloutStep: step[table],
+			}, TableProgress{
+				Deployment: "prod", Target: target, Namespace: "orders", TableName: table, ChangeType: "alter",
+				DDL: "ALTER TABLE `" + table + "` ADD COLUMN `region` varchar(32)", Status: status,
+				RowsCopied: copied, RowsTotal: 1000, PercentComplete: percent,
+			}
+	}
+	data := ProgressData{ApplyID: "apply-7f3c", Database: "orders", Environment: "production", Engine: "Spirit", State: state.Apply.Running}
+	for _, r := range [][2]any{
+		{"payments-001", "bikes"}, {"payments-002", "bikes"}, {"payments-001", "docks"}, {"payments-002", "docks"},
+	} {
+		target, table := r[0].(string), r[1].(string)
+		opState, status, copied := state.ApplyOperation.Pending, state.Task.Pending, int64(0)
+		switch {
+		case target == "payments-001" && table == "bikes":
+			opState, status, copied = state.ApplyOperation.Completed, state.Task.Completed, 1000
+		case target == "payments-002" && table == "bikes":
+			opState, status, copied = state.ApplyOperation.Running, state.Task.Running, 400
+		}
+		op, tp := row(target, table, opState, status, copied)
+		data.Operations = append(data.Operations, op)
+		data.Tables = append(data.Tables, tp)
+	}
+
+	out := renderRollout(t, data)
+
+	assert.Contains(t, out, "Targets:      1 running · 1 queued")
+	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 1 running · 1 queued (2 targets)"), "one section for the deployment")
+	assert.Equal(t, 1, strings.Count(out, "~ bikes:"))
+	assert.Equal(t, 1, strings.Count(out, "~ docks:"))
+	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 complete)")
+	assert.Contains(t, out, "• Targets: 2 (2 queued)")
+	assert.NotContains(t, out, "4 targets")
+}

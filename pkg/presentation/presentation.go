@@ -12,6 +12,11 @@
 // from the same gate FindNextApplyOperation evaluates, so the presentation never
 // contradicts what the operator will actually claim next.
 //
+// Apply.Deployments has one entry per rollout member, not per operation: a
+// target whose rollout runs table by table folds its rows into one member. A
+// caller reaches a member's operations through Deployment.Rows and
+// Deployment.Row, never by the member's index.
+//
 // Vocabulary is deployment-facing only — the model never exposes the internal
 // "apply_operation" term.
 package presentation
@@ -59,6 +64,11 @@ type Operation struct {
 	// AlreadyConverged carries the stored row's mark that its target already
 	// held the change when the apply was created, so nothing ran there.
 	AlreadyConverged bool
+
+	// RolloutStep is the table step the row runs when the rollout runs table
+	// by table, numbered from 1, and 0 for a row that runs its member's whole
+	// change. A target's stepped rows read as one member.
+	RolloutStep int
 
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
 	// by the caller from storage.CutoverPolicyBarrier). Under barrier an earlier
@@ -211,6 +221,13 @@ type Deployment struct {
 	// AlreadyConverged is whether the member's operation was recorded as a
 	// target that already held the change when the apply was created.
 	AlreadyConverged bool
+
+	// Rows are the indexes, into the operations Derive was given, of the rows
+	// this member's work spans, in input order. Row is the one that speaks for
+	// the member, most in need of an operator first: a surface that renders a
+	// member's own identifiers reads them from that row.
+	Rows []int
+	Row  int
 }
 
 // NextActionKind is the semantic operator action the aggregate suggests. The
@@ -384,10 +401,12 @@ func (a Apply) MultiDeployment() bool {
 
 // Derive projects the ordered operations of one apply into its rollup. The input
 // must be in resolved deployment order (as returned by ListByApply); earlier
-// siblings are those before a given index. The returned Deployments slice is
-// index-parallel to ops — one entry per operation, in the same order, each
-// carrying its operation's Deployment name — and callers rely on that
-// correspondence to key results back to their inputs.
+// siblings are those before a given index. The returned Deployments are one per
+// rollout member, in the order each member's first row appears: one per row,
+// except that a target's rows of a rollout run table by table are one member
+// however many tables they run (see memberRows). Each carries the rows it
+// covers (Rows, Row), which callers use to key results back to their inputs.
+// The aggregate state reads every row, as the stored apply state does.
 func Derive(ops []Operation) Apply {
 	rolloutOps := make([]state.RolloutOperation, len(ops))
 	for i, op := range ops {
@@ -404,11 +423,24 @@ func Derive(ops []Operation) Apply {
 	}
 	children := state.RolloutChildren(rolloutOps)
 
-	names := memberNames(ops)
-	deployments := make([]Deployment, len(ops))
-	for i := range ops {
-		deployments[i] = deriveDeployment(ops, names, i)
+	rows := memberRows(ops)
+	members := make([]Operation, len(rows))
+	memberOf := make([]int, len(ops))
+	leads := make([]int, len(rows))
+	for j, memberRows := range rows {
+		members[j], leads[j] = foldMember(ops, memberRows)
+		for _, i := range memberRows {
+			memberOf[i] = j
+		}
 	}
+	names := memberNames(members)
+	deployments := make([]Deployment, len(members))
+	for j := range members {
+		deployments[j] = deriveDeployment(members, names, j)
+		deployments[j].Rows = rows[j]
+		deployments[j].Row = leads[j]
+	}
+	orderFoldedMembersByRow(ops, members, names, memberOf, deployments)
 
 	aggState := state.DeriveRolloutApplyState(children)
 	return Apply{
@@ -416,21 +448,26 @@ func Derive(ops []Operation) Apply {
 		Label:        aggregateLabel(aggState),
 		Counts:       summaryCounts(deployments),
 		NextAction:   nextAction(aggState, deployments, hasFailClosedFailure(ops)),
-		FirstFailure: firstFailure(deployments),
+		FirstFailure: firstFailure(ops, deployments, memberOf),
 		Deployments:  deployments,
 	}
 }
 
-// firstFailure returns the first deployment, in resolved order, whose raw
-// operation state is terminally failed, or nil when none failed. failed_retryable
+// firstFailure returns the deployment of the first row, in resolved order,
+// whose raw operation state is terminally failed, or nil when none failed. A
+// folded member's failure is placed by its failed row, so a target that
+// failed a later table comes after one that failed an earlier one. memberOf
+// maps each row to its deployment. failed_retryable
 // is excluded: a retrying deployment is still in progress and surfaces no
 // operator-facing failure. The result is a copy, not an alias into Deployments,
 // so a caller that later re-slices or sorts Deployments cannot turn it into a
 // stale pointer.
-func firstFailure(deps []Deployment) *Deployment {
-	for i := range deps {
-		if deps[i].State == state.ApplyOperation.Failed {
-			failed := deps[i]
+func firstFailure(ops []Operation, deps []Deployment, memberOf []int) *Deployment {
+	for i, op := range ops {
+		if op.State != state.ApplyOperation.Failed {
+			continue
+		}
+		if failed := deps[memberOf[i]]; failed.State == state.ApplyOperation.Failed {
 			return &failed
 		}
 	}
