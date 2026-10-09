@@ -148,6 +148,22 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return nil
 	}
 
+	// An apply that spans several deployments, one of them with several
+	// targets, is refused by apply creation whatever its flags; refusing it
+	// here, before the prompt and the lock, leaves nothing held. A rollout
+	// already up to date has nothing to apply, so it says so above instead,
+	// and an apply that confirms convergence stays a no-op.
+	if rollout := planResult.WholeRollout(); rollout != nil && rollout.ShapeRefusal != "" {
+		return errors.New(rollout.ShapeRefusal)
+	}
+
+	// Each target of a multi-target rollout cuts over as its table finishes,
+	// so the server refuses --defer-cutover there; refusing it before the
+	// prompt saves confirming an apply that will not start.
+	if rollout := planResult.WholeRollout(); cmd.DeferCutover && rollout != nil && rollout.MultiTarget {
+		return fmt.Errorf("--defer-cutover is not supported on an apply to more than one target; apply again without --defer-cutover, or apply one target with --target")
+	}
+
 	// A targeted apply's preflight: the plan has resolved its member, and has
 	// work that would conflict with a schema change on that deployment.
 	if cmd.Target != "" {

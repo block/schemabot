@@ -70,7 +70,9 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 		}
 		s.logger.Info("rollout members not planned: the primary plan reported errors; the plan lists every other member as needing attention",
 			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId(), "members", len(targets))
-		return primaryErroredRollout(planning, targets), nil
+		rollout := primaryErroredRollout(planning, targets)
+		rollout.ShapeRefusal = rolloutShapeRefusal(req.Database, req.Environment, targets)
+		return rollout, nil
 	}
 	// The primary is held to the namespace selection it was planned under, so
 	// the rollup can tell a placement change since the plan from the plan
@@ -85,6 +87,7 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 		return nil, err
 	}
 	rollout := planRolloutResponse(rollup, "database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
+	rollout.ShapeRefusal = rolloutShapeRefusal(req.Database, req.Environment, targets)
 	if len(rollout.Attention) == 0 {
 		refused, err := s.rolloutApplyRefusals(ctx, req.Environment, primaryPlan.GetPlanId(), targets)
 		if err != nil {
@@ -136,7 +139,7 @@ func primaryErroredRollout(planning MemberPlanning, targets []routing.ExecutionT
 		members[i] = routing.ExecutionTarget{Deployment: t.Deployment, Target: t.Target}
 	}
 	names := routing.DisplayNames(members)
-	resp := &apitypes.PlanRolloutResponse{Members: len(targets), Independent: planning == PlanIndependent}
+	resp := &apitypes.PlanRolloutResponse{Members: len(targets), Independent: planning == PlanIndependent, MultiTarget: IsMultiTargetRollout(members)}
 	for _, name := range names[1:] {
 		resp.Attention = append(resp.Attention, &apitypes.PlanMemberAttentionResponse{
 			Member: name, Reason: apitypes.PlanMemberUnplanned, Detail: notPlannedBesideErroredPrimaryDetail,
@@ -181,6 +184,7 @@ func planRolloutResponse(rollup PlanRollup, logAttrs ...any) *apitypes.PlanRollo
 	resp := &apitypes.PlanRolloutResponse{
 		Members:     len(rollup.Entries),
 		Independent: rollup.Planning == PlanIndependent,
+		MultiTarget: IsMultiTargetRollout(members),
 	}
 	byPlan := make(map[string]*apitypes.PlanMemberGroupResponse, len(rollup.Entries))
 	for i, e := range rollup.Entries {

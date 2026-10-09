@@ -837,6 +837,15 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 		}
 		return strings.Join(parts, " ")
 	}
+	if refused, ok := errors.AsType[*api.RolloutShapeRefusedError](err); ok {
+		parts := []string{rolloutShapeRefusalMessage(refused, msgs.command, msgs.environment)}
+		// Only a refused option leaves the pending plan usable: a refused
+		// deployment shape is refused again however the command is re-issued.
+		if refused.Refusal == api.RolloutDeferCutoverRefused && msgs.afterRefusal != "" {
+			parts = append(parts, msgs.afterRefusal)
+		}
+		return strings.Join(parts, " ")
+	}
 	if refused, ok := errors.AsType[*api.MemberPlanRefusedError](err); ok {
 		switch refused.Refusal {
 		case api.MemberPlanBlocked:
@@ -860,6 +869,31 @@ func unsupportedFeatureRemedy(feature schema.Feature, command, environment strin
 		return ""
 	}
 	return fmt.Sprintf("Run `schemabot %s -e %s` again without `--defer-cutover`.", command, environment)
+}
+
+// rolloutShapeRefusalMessage is the PR comment line for an apply a multi-target
+// rollout does not run, with the command that runs instead. It reads only the
+// refusal's kind and the configured target to start with, so no error text
+// reaches the comment.
+//
+// A refused --defer-cutover is fixed by re-issuing the same command without the
+// flag. A refused multi-deployment shape is not: the pending plan covers every
+// deployment, so the remedy is a fresh apply narrowed to one target, and a
+// rollback, which cannot be narrowed, is reverted in the schema files instead.
+func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, environment string) string {
+	switch refused.Refusal {
+	case api.RolloutDeferCutoverRefused:
+		return fmt.Sprintf("`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `schemabot %s -e %s` again without `--defer-cutover`.", command, environment)
+	case api.RolloutMultiTargetDeploymentsRefused:
+		narrowed := fmt.Sprintf("`schemabot %s -e %s --target %s`", action.Apply, environment, refused.FirstTarget)
+		if command == action.RollbackConfirm {
+			// The refused rollback still holds this PR's lock, which would
+			// block the apply the remedy names, so the remedy releases it first.
+			return fmt.Sprintf("A rollback to more than one deployment is not supported yet when a deployment has several targets. Release this PR's lock with `schemabot %s`, then revert the schema files in a new PR and apply it one target at a time, starting with %s.", action.Unlock, narrowed)
+		}
+		return "An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with " + narrowed + "."
+	}
+	return "This rollout shape is not supported. See SchemaBot server logs for details."
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an

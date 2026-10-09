@@ -448,6 +448,19 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	// A rollout shape apply creation refuses is refused here, before the lock
+	// is taken, so the command holds nothing. It follows the no-change branch
+	// above: a rollout already up to date records its passing check and says
+	// so, and an apply that confirms convergence stays a no-op.
+	if refused := h.unsupportedRolloutShape(database, environment, result); refused != nil {
+		h.logger.Info("apply rejected: the multi-target rollout does not run what the command asked for",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "targets", refused.Targets, "deployments", refused.Deployments, "defer_cutover", result.DeferCutover)
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+			rolloutShapeRefusalMessage(refused, action.Apply, environment))
+		return false, nil
+	}
+
 	// Engine-blocked changes reject the apply before the unsafe gate: no flag
 	// lets a refused statement through, so the user must never be coached
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
