@@ -61,7 +61,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		restoreScope := planScopeForLine(budget, line.targets, subset, silent)
 		restorePlan := budget.pointAt(first.storedPlan())
 		strip := targetStrip(data, g, line.cells, line.targets, lineSilent > 0)
-		writeTargetTableLine(sb, line.table.TableName, line.cells, strip, lineSilent, lineWaiting, func() {
+		writeTargetTableLine(sb, line.table.TableName, line.cells, strip, lineSilent, lineWaiting, budget, func() {
 			writeTargetLineDDL(sb, dialect, line, subset, changing, budget)
 		})
 		sb.WriteString("\n")
@@ -263,7 +263,7 @@ func rankTargetTableLines(lines []targetTableLine, silent int) {
 // headline, and while the table is in flight strip lists each target's state
 // under the rows, the way the sharded comment lays out a table and its shards.
 // waiting is the silent targets still to run, which the line counts as queued.
-func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, silent, waiting int, writeDDL func()) {
+func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, silent, waiting int, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying, reporting, unreported int
 	var copied, total, eta int64
 	var running int
@@ -336,7 +336,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 				line += " · ETA: " + floor + ui.FormatETA(eta)
 			}
 			sb.WriteString(line + "\n")
-			writeMemberList(sb, presentation.TargetNoun, state.Task.Running, strip)
+			writeMemberList(sb, presentation.TargetNoun, state.Task.Running, strip, budget)
 			return
 		}
 	}
@@ -365,7 +365,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
 	writeDDL()
-	writeMemberList(sb, presentation.TargetNoun, status, strip)
+	writeMemberList(sb, presentation.TargetNoun, status, strip, budget)
 }
 
 // listsTargets reports whether a table line in status lists its targets one

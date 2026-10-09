@@ -8555,6 +8555,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_040`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
   - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
+  - … 1 more copying targets
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 
@@ -8587,6 +8588,7 @@ ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
   - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
   - ◉ `orders_002`: 12.48% · 183,029 / 1,466,232 rows
+  - … 1 more copying targets
 
 
 </dd></dl>
