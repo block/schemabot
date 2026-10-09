@@ -717,7 +717,7 @@ func shardedTableStatusPhrase(status string) string {
 	case state.Task.FailedRetryable:
 		return "🔄 Interrupted — retrying automatically"
 	case state.Task.Stopped:
-		return "⏸ Stopped"
+		return "⏹️ Stopped"
 	case state.Task.Cancelled:
 		return "⊘ Cancelled (not started)"
 	case state.Task.RevertWindow:

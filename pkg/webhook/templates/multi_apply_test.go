@@ -2065,7 +2065,7 @@ func TestRenderMultiDeploymentApplyComment_StoppedTableListsWhereEachTargetStopp
 		orders("testapp_002", state.Task.Stopped, 400),
 	)
 
-	assert.Contains(t, out, "**`orders`**: ⏸ Stopped\n", "%s", out)
+	assert.Contains(t, out, "**`orders`**: ⏹️ Stopped\n", "%s", out)
 	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 complete)\n  - ○ `testapp-002`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
 }
 

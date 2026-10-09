@@ -976,6 +976,12 @@ func TestShardedTableStatusPhrase_TerminalStatesNamed(t *testing.T) {
 	assert.Equal(t, "🟡 Waiting for deploy", shardedTableStatusPhrase(state.Task.WaitingForDeploy))
 }
 
+// A stopped table reads with the stop glyph the comment's title and the CLI's
+// table line use, so a stop looks the same wherever an operator reads it.
+func TestShardedTableStatusPhrase_StoppedUsesTheStopGlyph(t *testing.T) {
+	assert.Equal(t, "⏹️ Stopped", shardedTableStatusPhrase(state.Task.Stopped))
+}
+
 // An apply cancelled after part of the fleet landed must not read as if
 // nothing happened: the table line states the landed coverage, and the
 // divergent outcome promotes the per-shard status table so the summary names
