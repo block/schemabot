@@ -346,7 +346,7 @@ func (c *LocalClient) recheckTargetAfterHeldWait(ctx context.Context, logger *sl
 	if err != nil {
 		return taskAbort, err
 	}
-	verdict, replanKey := replanVerdictForTask(replanDDL, task)
+	verdict, replanKey := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
 	switch verdict {
 	case replanCannotAttribute:
 		logger.Warn("the re-plan describes the table's namespace as a unit and does not mention this shard; the task starts again with its reviewed statement and the engine decides its outcome",
@@ -1413,7 +1413,7 @@ func (c *LocalClient) settleLostEngineWork(ctx context.Context, apply *storage.A
 	if err != nil {
 		return taskContinue, fmt.Errorf("verify target schema for task %s table %s: %w", task.TaskIdentifier, task.TableName, err)
 	}
-	verdict, _ := replanVerdictForTask(replanDDL, task)
+	verdict, _ := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
 	if err := c.settleLostVerifiedTask(ctx, apply, task, verdict, engineState); err != nil {
 		return taskAbort, err
 	}
