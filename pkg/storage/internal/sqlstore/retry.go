@@ -16,9 +16,16 @@ const lockRetryMaxAttempts = 5
 // full jitter on each subsequent attempt.
 const lockRetryBaseBackoff = 5 * time.Millisecond
 
+// lockRetryMaxBackoff caps the delay before any one retry, so raising
+// lockRetryMaxAttempts adds attempts without letting the exponential backoff
+// grow into seconds.
+const lockRetryMaxBackoff = 100 * time.Millisecond
+
 // withLockRetry runs fn, retrying conflicts selected by the backend classifier
 // with bounded attempts and jittered backoff. It returns promptly if the context
-// is cancelled between attempts.
+// is cancelled between attempts, wrapping the context error with the operation
+// and the lock conflict it was retrying so a caller can tell lock starvation
+// from any other cancellation.
 //
 // fn must be idempotent and either run one autocommit statement or own its entire
 // transaction. It must not run inside a caller-owned transaction: PostgreSQL
@@ -29,7 +36,7 @@ func withLockRetry(ctx context.Context, classifier ErrorClassifier, op string, f
 	for attempt := range lockRetryMaxAttempts {
 		if attempt > 0 {
 			if err := sleepBackoff(ctx, attempt); err != nil {
-				return err
+				return fmt.Errorf("%s: stopped retrying after %d attempts (last lock conflict: %s): %w", op, attempt, lastErr.Error(), err)
 			}
 		}
 		err := fn()
@@ -45,15 +52,15 @@ func withLockRetry(ctx context.Context, classifier ErrorClassifier, op string, f
 }
 
 // sleepBackoff waits before the next retry using exponential backoff with full
-// jitter, returning early if the context is cancelled. Cancellation is checked
-// before waiting because full jitter can pick a near-zero delay, and a select
-// between an already-cancelled context and an already-fired timer picks either.
+// jitter, capped at lockRetryMaxBackoff, returning early if the context is
+// cancelled. Cancellation is checked before waiting because full jitter can
+// pick a near-zero delay, and a select between an already-cancelled context
+// and an already-fired timer picks either.
 func sleepBackoff(ctx context.Context, attempt int) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	maxDelay := lockRetryBaseBackoff << (attempt - 1)
-	delay := time.Duration(rand.Int64N(int64(maxDelay) + 1))
+	delay := time.Duration(rand.Int64N(int64(lockRetryBackoffCeiling(attempt)) + 1))
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
@@ -62,4 +69,17 @@ func sleepBackoff(ctx context.Context, attempt int) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// lockRetryBackoffCeiling is the longest delay before the given retry attempt:
+// the base backoff doubled per attempt, capped at lockRetryMaxBackoff.
+func lockRetryBackoffCeiling(attempt int) time.Duration {
+	ceiling := lockRetryBaseBackoff
+	for range attempt - 1 {
+		if ceiling >= lockRetryMaxBackoff {
+			break
+		}
+		ceiling *= 2
+	}
+	return min(ceiling, lockRetryMaxBackoff)
 }
