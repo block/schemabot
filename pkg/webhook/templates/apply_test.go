@@ -827,9 +827,9 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 	assert.Contains(t, inline, "- Shards: 5 (1 failed, 2 copying, 1 waiting for cutover, 1 complete)\n"+
 		"  - ✗ `c0-e0`: failed\n"+
 		// A shard that has not reported progress reads as copying, not 0%,
-		// and ranks behind one that has.
-		"  - ◉ `40-80`: copying\n"+
+		// and is listed after the ones that have, which set the pace.
 		"  - ◉ `80-c0`: 45%\n"+
+		"  - ◉ `40-80`: copying\n"+
 		"  - ● `e0-`: waiting for cutover\n"+
 		"  - ✓ `-40`: complete\n")
 

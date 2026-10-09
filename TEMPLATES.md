@@ -4987,6 +4987,7 @@ ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
   - ◉ `f7-`: 12%
   - ◉ `c8-`: 55%
   - ◉ `dc-`: 55%
+  - … 49 more copying shards
 
 
 ---
@@ -7560,6 +7561,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ fe-ff: 10.00% · 100,800 / 1,008,000 rows · ETA: 4m 40s
            ◉ ff-: 10.00% · 101,000 / 1,010,000 rows · ETA: 4m 40s
            ◉ fc-fd: 11.00% · 110,440 / 1,004,000 rows · ETA: 4m 38s
+           ... 223 more copying shards
 
 ```
 </details>
@@ -7589,6 +7591,7 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
            ◉ f8-: 23.00% · 347,300 / 1,510,000 rows · ETA: 2m 37s
            ◉ f0-f8: 26.00% · 390,000 / 1,500,000 rows · ETA: 2m 34s
            ◉ e8-f0: 29.00% · 432,100 / 1,490,000 rows · ETA: 2m 31s
+           ... 17 more copying shards
 
   ── commerce_001 ──
 
@@ -9882,6 +9885,7 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
            ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
            ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
            ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
+           ... 16 more copying targets
 
   4 of 64 targets have not reported progress yet.
 

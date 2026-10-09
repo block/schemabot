@@ -2,6 +2,7 @@ package presentation
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -114,6 +115,37 @@ func TestListParts(t *testing.T) {
 		want = append(want, PartListLine{Part: -1, Summary: "7 more failed targets"})
 		// The slowest copying targets, furthest behind first.
 		want = append(want, PartListLine{Part: 22}, PartListLine{Part: 21}, PartListLine{Part: 20})
+		want = append(want, PartListLine{Part: -1, Summary: "4 more copying targets"})
 		assert.Equal(t, want, got)
+	})
+	t.Run("copiers that have not reported follow the ones that have", func(t *testing.T) {
+		var parts []Part
+		for i := range 6 {
+			parts = append(parts, Part{Name: fmt.Sprintf("quiet%d", i), Status: task.Running})
+		}
+		for i := range 4 {
+			parts = append(parts, Part{Name: fmt.Sprintf("measured%d", i), Status: task.Running, RowsCopied: int64(100 * (i + 1)), RowsTotal: 1000})
+		}
+		var names []string
+		for _, line := range ListParts(len(parts), func(i int) Part { return parts[i] }, ShardNoun) {
+			if line.Summary != "" {
+				names = append(names, line.Summary)
+				continue
+			}
+			names = append(names, parts[line.Part].Name)
+		}
+		assert.Equal(t, []string{"measured0", "measured1", "measured2", "7 more copying shards"}, names,
+			"the slowest measured copiers set the pace; ones with nothing reported are not named ahead of them")
+	})
+	t.Run("lines follow the heading's order", func(t *testing.T) {
+		// A phase outside otherPartStatusOrder, as a new task state would be
+		// until it is added there, sits after the listed phases and before
+		// cancelled in both the heading and the lines.
+		const unlisted = "zz_new_phase"
+		c := PartCounts{Other: map[string]int{state.Task.Stopped: 1, unlisted: 1}, Cancelled: 1}
+		assert.Equal(t, []string{"1 stopped", "1 " + unlisted, "1 cancelled"}, c.Phrases())
+		statuses := []string{task.Cancelled, unlisted, task.Stopped}
+		slices.SortStableFunc(statuses, comparePartStatuses)
+		assert.Equal(t, []string{task.Stopped, unlisted, task.Cancelled}, statuses)
 	})
 }

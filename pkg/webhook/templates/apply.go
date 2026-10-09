@@ -1067,7 +1067,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		renderRunningTable(sb, dialect, table, budget)
 	}
 
-	renderShardSummary(sb, table)
+	renderShardSummary(sb, table, budget)
 
 	sb.WriteString("\n")
 }
@@ -1084,8 +1084,8 @@ func shardSummaryBreakdownState(status string) bool {
 }
 
 // renderShardSummary lists a sharded table's shards while it is in flight.
-func renderShardSummary(sb *strings.Builder, table TableProgressData) {
-	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards)
+func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
+	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards, budget)
 }
 
 // writeMemberList lists a table's members, the shards of a sharded table or
@@ -1094,8 +1094,10 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData) {
 // words. It is the listing the CLI shows (presentation.ListParts), so a wide
 // table names only its failures and slowest members, leaving the rest to the
 // counts, rather than growing a line per member. A settled table's line
-// already says where it ended, so the listing stays out of the way then.
-func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string, members []ShardProgressData) {
+// already says where it ended, so the listing stays out of the way then. A
+// comment that would not fit otherwise keeps only the line counting them
+// (ddlBlockBudget.listsMembers).
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string, members []ShardProgressData, budget *ddlBlockBudget) {
 	if len(members) <= 1 {
 		return
 	}
@@ -1108,6 +1110,9 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string,
 	}
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
 	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
+	if !budget.listsMembers() {
+		return
+	}
 	for _, line := range presentation.ListParts(len(members), part, noun) {
 		if line.Summary != "" {
 			fmt.Fprintf(sb, "  - … %s\n", line.Summary)

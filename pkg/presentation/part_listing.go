@@ -1,6 +1,7 @@
 package presentation
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"sort"
@@ -47,8 +48,9 @@ type PartListLine struct {
 // then copying parts furthest behind first, then the other phases, then queued
 // parts in order, so the next to run leads them, and complete parts last. Up
 // to the inline limit every part is named. Past it, only the failed parts and
-// the slowest copying parts are named; the heading already counts every
-// state, so the listing does not repeat the rest.
+// the slowest copying parts are named, each followed by a count of the ones of
+// its kind left unnamed; the heading already counts every other state, so the
+// listing does not repeat the rest.
 func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 	if n <= partListInlineLimit {
 		return listEveryPart(n, part)
@@ -71,6 +73,9 @@ func ListParts(n int, part func(int) Part, noun Noun) []PartListLine {
 	for _, i := range copying[:min(len(copying), maxCopyingParts)] {
 		lines = append(lines, PartListLine{Part: i})
 	}
+	if more := len(copying) - maxCopyingParts; more > 0 {
+		lines = append(lines, PartListLine{Part: -1, Summary: fmt.Sprintf("%d more copying %s", more, noun.Plural)})
+	}
 	return lines
 }
 
@@ -92,7 +97,7 @@ func listEveryPart(n int, part func(int) Part) []PartListLine {
 	}
 	// The other phases follow the order the heading counts them in.
 	sort.SliceStable(phases, func(a, b int) bool {
-		return partStatusRank(part(phases[a]).Status) < partStatusRank(part(phases[b]).Status)
+		return comparePartStatuses(state.NormalizeTaskStatus(part(phases[a]).Status), state.NormalizeTaskStatus(part(phases[b]).Status)) < 0
 	})
 	lines := make([]PartListLine, 0, n)
 	for _, group := range [][]int{failed, copyingFurthestBehindFirst(n, part), phases, queued, complete} {
@@ -104,7 +109,10 @@ func listEveryPart(n int, part func(int) Part) []PartListLine {
 }
 
 // copyingFurthestBehindFirst is the copying parts among n, the one furthest
-// behind first, since that is the one a reader watches.
+// behind first, since that is the one a reader watches. A part that has not
+// reported progress yet is not known to be behind, so the parts that have
+// reported come first and the rest follow in order: a wide listing names the
+// parts that set the pace rather than parts with nothing to show.
 func copyingFurthestBehindFirst(n int, part func(int) Part) []int {
 	var copying []int
 	for i := range n {
@@ -114,9 +122,17 @@ func copyingFurthestBehindFirst(n int, part func(int) Part) []int {
 	}
 	sort.SliceStable(copying, func(a, b int) bool {
 		pa, pb := part(copying[a]), part(copying[b])
+		if ra, rb := partReported(pa), partReported(pb); ra != rb {
+			return ra
+		}
 		return ui.RowCopyFraction(pa.PercentComplete, pa.RowsCopied, pa.RowsTotal) < ui.RowCopyFraction(pb.PercentComplete, pb.RowsCopied, pb.RowsTotal)
 	})
 	return copying
+}
+
+// partReported reports whether a copying part has reported any progress yet.
+func partReported(p Part) bool {
+	return p.PercentComplete != 0 || p.RowsCopied != 0
 }
 
 // PartGlyph is the mark a part's line leads with: ✓ complete, ◉ copying,
@@ -151,7 +167,7 @@ func PartDetail(p Part) string {
 	case state.Task.Running:
 		// A part that has not reported progress yet reads as copying rather
 		// than a misleading 0%.
-		if p.PercentComplete == 0 && p.RowsCopied == 0 {
+		if !partReported(p) {
 			return "copying"
 		}
 		return partProgress(p)
@@ -257,7 +273,8 @@ func (c PartCounts) Phrases() []string {
 }
 
 // otherPartStatusOrder is the order the counts list the statuses PartCounts
-// has no field of its own for. A status outside it still counts, after these.
+// has no field of its own for. A status outside it still counts, after these
+// and before cancelled.
 var otherPartStatusOrder = []string{
 	state.Task.WaitingForCutover,
 	state.Task.CuttingOver,
@@ -271,13 +288,27 @@ var otherPartStatusOrder = []string{
 	state.Task.Reverting,
 	state.Task.RevertWindow,
 	state.Task.Reverted,
-	state.Task.Cancelled,
 }
 
-// partStatusRank is where a status falls in otherPartStatusOrder, with any
-// status outside it after every status in it.
+// comparePartStatuses orders two statuses the way Phrases counts them, so a
+// listing's lines follow its heading: otherPartStatusOrder, then any status
+// outside it alphabetically, then cancelled, which PartCounts counts on its
+// own after the rest. Both statuses are normalized.
+func comparePartStatuses(a, b string) int {
+	if c := cmp.Compare(partStatusRank(a), partStatusRank(b)); c != 0 {
+		return c
+	}
+	return cmp.Compare(a, b)
+}
+
+// partStatusRank is where a status falls in the heading's order: its index in
+// otherPartStatusOrder, one past it for any status outside it, and last for
+// cancelled.
 func partStatusRank(status string) int {
-	if i := slices.Index(otherPartStatusOrder, state.NormalizeTaskStatus(status)); i >= 0 {
+	if status == state.Task.Cancelled {
+		return len(otherPartStatusOrder) + 1
+	}
+	if i := slices.Index(otherPartStatusOrder, status); i >= 0 {
 		return i
 	}
 	return len(otherPartStatusOrder)
