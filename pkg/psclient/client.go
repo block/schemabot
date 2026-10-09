@@ -164,9 +164,11 @@ func (e *APIError) summary() string {
 // is configured.
 const DefaultBaseURL = "https://api.planetscale.com"
 
-// NewPSClient creates a new PSClient for the public PlanetScale API.
-func NewPSClient(tokenName, tokenValue string, opts ...ps.ClientOption) (PSClient, error) {
-	return NewPSClientWithBaseURL(tokenName, tokenValue, "", opts...)
+// NewPSClient creates a new PSClient for the public PlanetScale API. It takes
+// no SDK options: a client for another endpoint, or with options of its own,
+// is built with NewPSClientWithBaseURL, which names the endpoint explicitly.
+func NewPSClient(tokenName, tokenValue string) (PSClient, error) {
+	return NewPSClientWithBaseURL(tokenName, tokenValue, "")
 }
 
 // NewPSClientWithBaseURL creates a new PSClient that addresses the PlanetScale
@@ -175,12 +177,17 @@ func NewPSClient(tokenName, tokenValue string, opts ...ps.ClientOption) (PSClien
 // SDK calls and the raw-HTTP calls for endpoints the SDK does not cover go to
 // the same base URL. It is installed after the caller's options, so a
 // ps.WithBaseURL among them cannot send SDK calls somewhere the raw calls do
-// not go.
+// not go. The two resolve paths differently: the SDK resolves its relative
+// endpoints against the URL, and the raw calls append an absolute path to it.
+// So trailing slashes are trimmed once, the raw calls get the trimmed URL, and
+// the SDK gets it with exactly one trailing slash. That way a base URL with a
+// trailing slash or a path prefix reaches the same path root on both.
 func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string, opts ...ps.ClientOption) (PSClient, error) {
+	baseURL = strings.TrimRight(baseURL, "/")
 	if baseURL == "" {
 		baseURL = DefaultBaseURL
 	}
-	allOpts := boundedClientOptions(tokenName, tokenValue, append(append([]ps.ClientOption{}, opts...), ps.WithBaseURL(baseURL)))
+	allOpts := boundedClientOptions(tokenName, tokenValue, append(append([]ps.ClientOption{}, opts...), ps.WithBaseURL(baseURL+"/")))
 	client, err := ps.NewClient(allOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create PlanetScale client for %s: %w", baseURL, err)

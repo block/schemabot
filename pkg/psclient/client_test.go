@@ -499,6 +499,39 @@ func TestEmptyBaseURLAddressesThePublicAPI(t *testing.T) {
 	}
 }
 
+// A base URL written with a trailing slash, or with a path prefix, still
+// addresses one server and one path root for SDK and raw-HTTP calls alike, so
+// a deploy request created over raw HTTP is the one the SDK later reads.
+func TestBaseURLSpellingDoesNotSplitSDKAndRawCalls(t *testing.T) {
+	for _, suffix := range []string{"/", "/api", "/api/", "//"} {
+		t.Run(suffix, func(t *testing.T) {
+			var paths []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/keyspaces") {
+					_, _ = w.Write([]byte(`{"data":[{"name":"orders","shards":1}]}`))
+					return
+				}
+				_, _ = w.Write([]byte(`{"name":"main"}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL+suffix)
+			require.NoError(t, err)
+			_, err = client.GetBranch(t.Context(), &ps.GetDatabaseBranchRequest{Organization: "block", Database: "orders", Branch: "main"})
+			require.NoError(t, err)
+			_, err = client.ListKeyspaces(t.Context(), &ps.ListKeyspacesRequest{Organization: "block", Database: "orders", Branch: "main"})
+			require.NoError(t, err)
+
+			wantRoot := strings.TrimRight(suffix, "/")
+			require.Len(t, paths, 2)
+			assert.Equal(t, wantRoot+"/v1/organizations/block/databases/orders/branches/main", paths[0])
+			assert.Equal(t, paths[0]+"/keyspaces", paths[1], "SDK and raw calls must share one path root")
+		})
+	}
+}
+
 // A configured base URL is where every call goes: the raw-HTTP calls for
 // endpoints the SDK does not cover reach the same server as the SDK calls, and
 // a base URL passed among the SDK options cannot split them.
