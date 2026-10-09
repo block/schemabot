@@ -64,19 +64,20 @@ func waitsItsTurn(rowState, memberState string) bool {
 	return state.IsState(rowState, state.ApplyOperation.Pending, state.ApplyOperation.WaitingForCutover)
 }
 
-// foldMember is the one Operation a member's rows read as. The lead row, the
-// one most in need of an operator, speaks for the member's error and
-// identifiers. Its state is the apply state over its rows: a target runs its
-// tables one after another, so the rule that reads a single apply's tasks
-// reads a target's tables, and a failure, retry or stop on any table is the
-// target's. The rollout's on_failure policy governs other targets, never the
-// failed target's own later tables, so it plays no part here.
-func foldMember(ops []Operation, rows []int) Operation {
-	lead := ops[leadRow(ops, rows)]
+// foldMember is the one Operation a member's rows read as, and the index of
+// its lead row. The lead row, the one most in need of an operator, speaks for
+// the member's error and identifiers, and Deployment.Row points at it. Its
+// state is the apply state over its rows: a target runs its tables one after
+// another, so the rule that reads a single apply's tasks reads a target's
+// tables, and a failure, retry or stop on any table is the target's. The
+// rollout's on_failure policy governs other targets, never the failed
+// target's own later tables, so it plays no part here.
+func foldMember(ops []Operation, rows []int) (Operation, int) {
+	lead := leadRow(ops, rows)
 	if len(rows) == 1 {
-		return lead
+		return ops[lead], lead
 	}
-	member := lead
+	member := ops[lead]
 	states := make([]string, len(rows))
 	member.NeverStarted = true
 	member.AlreadyConverged = true
@@ -86,7 +87,26 @@ func foldMember(ops []Operation, rows []int) Operation {
 		member.AlreadyConverged = member.AlreadyConverged && ops[i].AlreadyConverged
 	}
 	member.State = state.DeriveApplyState(states)
-	return member
+	if member.State == state.ApplyOperation.Pending && parkedAtEarliestUnfinishedTable(ops, rows) {
+		member.State = state.ApplyOperation.WaitingForCutover
+	}
+	return member, lead
+}
+
+// parkedAtEarliestUnfinishedTable reports whether the earliest of a member's
+// rows that has not completed is parked for cutover. The apply rule reads a
+// parked table beside queued ones as queued, since one apply's tables copy
+// together. A target reaches its tables one after another, so its queued
+// later tables are work it has not reached, and the parked table is where it
+// stands: its cutover is what lets the target go on.
+func parkedAtEarliestUnfinishedTable(ops []Operation, rows []int) bool {
+	for _, i := range rows {
+		if state.IsState(ops[i].State, state.ApplyOperation.Completed) {
+			continue
+		}
+		return state.IsState(ops[i].State, state.ApplyOperation.WaitingForCutover)
+	}
+	return false
 }
 
 // leadRow is the row among rows most in need of an operator: a failure, then

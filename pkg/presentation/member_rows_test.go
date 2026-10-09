@@ -172,3 +172,48 @@ func TestDerive_FirstFailureIsTheEarliestFailedRow(t *testing.T) {
 	require.NotNil(t, model.FirstFailure)
 	assert.Equal(t, "primary/orders-002", model.FirstFailure.Name)
 }
+
+// orders-001 copied `bikes` and parked it for cutover, with `docks` still
+// queued behind it. The target stands at that cutover, so it reads as ready
+// for cutover and the next action offers it, rather than reading as queued
+// with nothing for the operator to do. orders-002 waits on it.
+func TestDerive_FoldedTargetParkedForCutoverOffersTheCutover(t *testing.T) {
+	model := Derive([]Operation{
+		tableRow("orders-001", so.WaitingForCutover, 1),
+		tableRow("orders-002", so.Pending, 1),
+		tableRow("orders-001", so.Pending, 2),
+		tableRow("orders-002", so.Pending, 2),
+	})
+
+	require.Len(t, model.Deployments, 2)
+	first := model.Deployments[0]
+	assert.Equal(t, so.WaitingForCutover, first.State)
+	assert.Equal(t, StateReadyForCutoverNext, first.Presentation)
+	assert.Equal(t, "ready for cutover — next in order", first.Label)
+	assert.Equal(t, 0, first.Row)
+	assert.Equal(t, "waiting for primary/orders-001", model.Deployments[1].Label)
+	assert.Equal(t, NextActionCutover, model.NextAction.Kind)
+	assert.Equal(t, "orders-001", model.NextAction.Target)
+}
+
+// Under a parallel copy, orders-001 copied and parked `docks` while `bikes`,
+// its earlier table, is still queued. Cutovers run in order, so `docks` cannot
+// cut over before `bikes` has run: the target reads as queued and no cutover
+// is offered.
+func TestDerive_FoldedTargetWithAnEarlierTableQueuedIsNotReadyForCutover(t *testing.T) {
+	row := func(st string, step int) Operation {
+		op := tableRow("orders-001", st, step)
+		op.Parallel = true
+		return op
+	}
+	model := Derive([]Operation{
+		row(so.Pending, 1),
+		row(so.WaitingForCutover, 2),
+	})
+
+	require.Len(t, model.Deployments, 1)
+	only := model.Deployments[0]
+	assert.Equal(t, so.Pending, only.State)
+	assert.Equal(t, StateQueuedNext, only.Presentation)
+	assert.Equal(t, NextActionNone, model.NextAction.Kind)
+}

@@ -12,6 +12,11 @@
 // from the same gate FindNextApplyOperation evaluates, so the presentation never
 // contradicts what the operator will actually claim next.
 //
+// Apply.Deployments has one entry per rollout member, not per operation: a
+// target whose rollout runs table by table folds its rows into one member. A
+// caller reaches a member's operations through Deployment.Rows and
+// Deployment.Row, never by the member's index.
+//
 // Vocabulary is deployment-facing only — the model never exposes the internal
 // "apply_operation" term.
 package presentation
@@ -421,8 +426,9 @@ func Derive(ops []Operation) Apply {
 	rows := memberRows(ops)
 	members := make([]Operation, len(rows))
 	memberOf := make([]int, len(ops))
+	leads := make([]int, len(rows))
 	for j, memberRows := range rows {
-		members[j] = foldMember(ops, memberRows)
+		members[j], leads[j] = foldMember(ops, memberRows)
 		for _, i := range memberRows {
 			memberOf[i] = j
 		}
@@ -432,7 +438,7 @@ func Derive(ops []Operation) Apply {
 	for j := range members {
 		deployments[j] = deriveDeployment(members, names, j)
 		deployments[j].Rows = rows[j]
-		deployments[j].Row = leadRow(ops, rows[j])
+		deployments[j].Row = leads[j]
 	}
 	orderFoldedMembersByRow(ops, members, names, memberOf, deployments)
 
