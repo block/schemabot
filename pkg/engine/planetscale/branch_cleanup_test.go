@@ -1,8 +1,11 @@
 package planetscale
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 
@@ -235,4 +238,109 @@ func TestApplyHandsOnlyItsOwnBranchToTheDeployRequest(t *testing.T) {
 		assert.Equal(t, "operator-branch", client.lastCreate.Branch)
 		assert.False(t, client.lastCreate.AutoDeleteBranch)
 	})
+}
+
+// resumeReclaimClient serves a resumed branch that is ready and issues its
+// credentials, so a resume runs on to its diff. Deletions are recorded, and
+// deleteErr, when set, fails each one after recording it.
+type resumeReclaimClient struct {
+	branchLifecycleClient
+	deleteErr error
+}
+
+func (c *resumeReclaimClient) CreateBranchPassword(context.Context, *ps.DatabaseBranchPasswordRequest) (*ps.DatabaseBranchPassword, error) {
+	return &ps.DatabaseBranchPassword{}, nil
+}
+
+func (c *resumeReclaimClient) DeleteBranch(ctx context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+	if err := c.branchLifecycleClient.DeleteBranch(ctx, req); err != nil {
+		return err
+	}
+	return c.deleteErr
+}
+
+// A resumed drive that fails for good before it creates the deploy request
+// leaves nothing else to tear the branch down, so it deletes a branch SchemaBot
+// created rather than strand it against quota. It keeps the branch whenever
+// the branch is not SchemaBot's to delete or another drive may still need it:
+// an operator-supplied branch belongs to the operator, a retryable failure
+// leaves the branch for the retry, and a drive whose context ended is handing
+// the apply to the driver that resumes it from that branch.
+func TestReclaimBranchAfterFailedResume(t *testing.T) {
+	const ownedBranch = "schemabot-commerce-1a2b"
+	permanent := engine.NewPermanentError("branch differs from the declared schema on tables the plan does not change (commerce.legacy_audit)")
+	retryable := errors.New("fetch branch schemabot-commerce-1a2b schema via MySQL on resume: connection refused")
+	tests := []struct {
+		name        string
+		branch      string
+		options     map[string]string
+		cause       error
+		driveEnded  bool
+		wantDeleted []string
+	}{
+		{name: "a terminal failure deletes the branch SchemaBot created", branch: ownedBranch, cause: permanent, wantDeleted: []string{ownedBranch}},
+		{name: "an operator-supplied branch is never deleted", branch: "my-dev-branch", options: map[string]string{"branch": "my-dev-branch"}, cause: permanent},
+		{name: "a retryable failure keeps the branch for the retry", branch: ownedBranch, cause: retryable},
+		{name: "a drive that ended keeps the branch for the driver that resumes it", branch: ownedBranch, cause: permanent, driveEnded: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if tt.driveEnded {
+				cancel()
+			}
+			client := &resumeReclaimClient{}
+			req := resumeRequest(t, &psMetadata{BranchName: tt.branch}, "apply-1a2b3c4d5e6f7890")
+			req.Options = tt.options
+
+			conformanceEngine(client).reclaimBranchAfterFailedResume(ctx, client, "org", req, tt.branch, tt.cause)
+
+			_, deleted := client.snapshot()
+			assert.Equal(t, tt.wantDeleted, deleted)
+		})
+	}
+}
+
+// A branch the reclaim could not delete is still against quota, so the failure
+// is logged at error level with everything an operator needs to find the apply
+// and delete the branch by hand: the apply, the organization, the PlanetScale
+// database, the branch, and the failure that ended the drive.
+func TestReclaimBranchAfterFailedResume_LogsAFailedDeleteForTriage(t *testing.T) {
+	var logs bytes.Buffer
+	client := &resumeReclaimClient{deleteErr: errors.New("branch delete refused")}
+	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-commerce-1a2b"}, "apply-1a2b3c4d5e6f7890")
+	req.Logger = slog.New(slog.NewJSONHandler(&logs, nil)).With("apply_id", "apply-1a2b3c4d5e6f7890")
+	cause := engine.NewPermanentError("apply keyspace commerce: vschema rejected")
+
+	conformanceEngine(client).reclaimBranchAfterFailedResume(t.Context(), client, "org", req, "schemabot-commerce-1a2b", cause)
+
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(logs.Bytes(), &record), "exactly one log line: %s", logs.String())
+	assert.Equal(t, "ERROR", record["level"])
+	assert.Equal(t, "apply-1a2b3c4d5e6f7890", record["apply_id"])
+	assert.Equal(t, "org", record["organization"])
+	assert.Equal(t, "testdb", record["planetscale_database"])
+	assert.Equal(t, "schemabot-commerce-1a2b", record["branch"])
+	assert.Equal(t, "apply keyspace commerce: vschema rejected", record["apply_error"])
+	assert.Equal(t, "branch delete refused", record["error"])
+}
+
+// A resume whose diff fails with a retryable error has not ended the apply for
+// good, so it keeps the branch it resumed on and returns the diff's own error.
+func TestResumeApply_RetryableFailureBeforeTheDeployRequestKeepsTheBranch(t *testing.T) {
+	client := &resumeReclaimClient{}
+	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-testdb-1a2b"}, "apply-1a2b3c4d5e6f7890")
+	req.Changes = []engine.SchemaChange{{
+		Namespace:    "commerce",
+		TableChanges: []engine.TableChange{{DDL: "this is not a statement"}},
+	}}
+
+	_, err := conformanceEngine(client).resumeApply(t.Context(), client, "org", req)
+
+	require.Error(t, err)
+	assert.True(t, engine.IsRetryable(err), "the diff failure must stay retryable: %v", err)
+	assert.Contains(t, err.Error(), "resume branch schemabot-testdb-1a2b")
+	_, deleted := client.snapshot()
+	assert.Empty(t, deleted, "a retryable failure must leave the branch for the retry")
 }

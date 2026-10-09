@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"strings"
@@ -182,7 +183,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 				"organization", org, "database", req.Database, "branch", ownedBranch, "apply_error", retErr)
 			return
 		}
-		e.deleteOwnedBranch(ctx, client, org, req.Database, ownedBranch, retErr)
+		e.deleteOwnedBranch(ctx, e.applyLogger(req), client, org, req.Database, ownedBranch, retErr)
 	}()
 
 	if existingBranch != "" {
@@ -875,6 +876,16 @@ func plannedTableName(keyspace string, tc engine.TableChange) (string, error) {
 	return name, nil
 }
 
+// applyLogger returns the logger scoped to this schema change when the caller
+// supplied one, so a line about the apply carries the caller's triage identity
+// (apply id, repo, PR, environment), and the engine logger otherwise.
+func (e *Engine) applyLogger(req *engine.ApplyRequest) *slog.Logger {
+	if req.Logger != nil {
+		return req.Logger
+	}
+	return e.logger
+}
+
 // eventEmitter returns a closure that logs a lifecycle event and sends it to
 // the caller for apply_logs recording.
 func (e *Engine) eventEmitter(req *engine.ApplyRequest) func(engine.ApplyEvent) {
@@ -977,13 +988,17 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}
 	remainingChanges, err := remainingPlannedChanges(req.Changes, branchDiff, req.SchemaFiles)
 	if err != nil {
-		return nil, fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
+		err = fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
+		e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, err)
+		return nil, err
 	}
 
 	if len(remainingChanges) > 0 {
 		e.logger.Info("applying remaining planned changes on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
 		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
-			return nil, fmt.Errorf("apply remaining changes on resume: %w", err)
+			err = fmt.Errorf("apply remaining changes on resume: %w", err)
+			e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, err)
+			return nil, err
 		}
 	} else {
 		e.logger.Info("all planned changes already applied on branch", "branch", meta.BranchName)
