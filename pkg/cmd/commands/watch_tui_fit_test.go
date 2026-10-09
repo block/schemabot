@@ -57,8 +57,9 @@ func TestWatchViewFitsTheWindow(t *testing.T) {
 
 	_, footer := m.multiDeploymentProgressSections()
 	assert.True(t, strings.HasSuffix(fitted, footer), "the footer stays whole")
-	hidden := frameRows(full) - frameRows(fitted) + 1
-	assert.Contains(t, plain, fmt.Sprintf("⋯ %d more lines. Enlarge the window, or run: %s status apply-abc123 -e staging\n", hidden, cliname.Name()))
+	// The note takes two rows: the count, then the status command.
+	hidden := frameRows(full) - frameRows(fitted) + 2
+	assert.Contains(t, plain, fmt.Sprintf("⋯ %d more lines. Enlarge the window, or run:\n  %s status apply-abc123 -e staging\n", hidden, cliname.Name()))
 }
 
 // A view that fits, or one drawn before the terminal reports its size, is
@@ -81,8 +82,11 @@ func TestWatchViewUntrimmedWhenTheFooterFillsTheWindow(t *testing.T) {
 	full := m.View()
 	_, footer := m.multiDeploymentProgressSections()
 
-	m.windowHeight = frameRows(footer) + 1
+	m.windowHeight = frameRows(footer) + m.hiddenLinesNoteRows()
 	assert.Equal(t, full, m.View())
+
+	m.windowHeight++
+	assert.Equal(t, m.windowHeight, frameRows(m.View()), "one more row leaves room for a line of body")
 }
 
 // The note names one hidden line in the singular and leaves out the status
