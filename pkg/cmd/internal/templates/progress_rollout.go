@@ -115,9 +115,6 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 		if !seen {
 			wi = len(work)
 			bySignature[signature] = wi
-			// Sorted as a copy: the index is read again for every table below.
-			tables = slices.Clone(tables)
-			sortActiveTables(tables)
 			work = append(work, targetWork{tables: tables})
 		}
 		work[wi].members = append(work[wi].members, i)
@@ -130,6 +127,7 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 		for _, t := range w.tables {
 			rolled = append(rolled, tableAcrossTargets(v, byMember, w.members, t))
 		}
+		sortRolledTables(rolled)
 		// Tables are grouped under their namespace whenever they carry one,
 		// so the same table changed in two schemas reads as two changes.
 		namespaced := hasTableNamespaces(rolled)
@@ -153,6 +151,26 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	if silent > 0 {
 		fmt.Fprintf(b, "  %s%d of %d targets have not reported progress yet.%s\n", ANSIDim, silent, len(g.Members), ANSIReset)
 	}
+}
+
+// sortRolledTables orders tables rolled up across targets by
+// presentation.TableRolloutRank, the order the PR comment lists them in, so a
+// table finished on some targets stays above one no target has started. Tables
+// of equal rank keep plan order.
+func sortRolledTables(tables []TableProgress) {
+	slices.SortStableFunc(tables, func(a, b TableProgress) int {
+		return rolledTableRank(a) - rolledTableRank(b)
+	})
+}
+
+// rolledTableRank is a rolled-up table's presentation.TableRolloutRank, from
+// its status on each target.
+func rolledTableRank(t TableProgress) int {
+	statuses := make([]string, len(t.Shards))
+	for i, target := range t.Shards {
+		statuses[i] = target.Status
+	}
+	return presentation.TableRolloutRank(statuses)
 }
 
 // acrossTargetsCounts is the target counts that close a rolled-up table's

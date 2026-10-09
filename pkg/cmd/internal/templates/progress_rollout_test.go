@@ -631,3 +631,33 @@ func TestFormatTargetRollup_FailedTargetNamesItsOwnIdentifiers(t *testing.T) {
 	assert.NotContains(t, attention, "spirit-001", "%s", out)
 	assert.NotContains(t, attention, "spirit-003", "%s", out)
 }
+
+// A rolling rollout four targets wide, with the first target part-way through
+// its three tables, lists the rolled-up tables the way the PR comment does: the
+// table a target is copying, then the one finished on that target and queued on
+// the rest, then the one no target has started.
+func TestWriteProgress_TargetRollupListsTablesWhereTheRolloutIs(t *testing.T) {
+	data := targetRolloutData([]rolloutTarget{copyingTarget(970), queuedTarget(), queuedTarget(), queuedTarget()})
+	data.Tables = nil
+	for i, op := range data.Operations {
+		for _, name := range []string{"invoices", "orders", "refunds"} {
+			table := TableProgress{
+				Deployment: "prod", Target: op.Target, Namespace: "orders", TableName: name, ChangeType: "alter",
+				DDL: "ALTER TABLE `" + name + "` ADD COLUMN `note` text", Status: state.Task.Pending,
+			}
+			if i == 0 {
+				switch name {
+				case "orders":
+					table.Status, table.RowsCopied, table.RowsTotal, table.PercentComplete = state.Task.Completed, 1000, 1000, 100
+				case "refunds":
+					table.Status, table.RowsCopied, table.RowsTotal, table.PercentComplete, table.ETASeconds = state.Task.Running, 970, 1000, 97, 30
+				}
+			}
+			data.Tables = append(data.Tables, table)
+		}
+	}
+
+	out := renderRollout(t, data)
+	assertLess(t, out, "ALTER TABLE `refunds`", "ALTER TABLE `orders`")
+	assertLess(t, out, "ALTER TABLE `orders`", "ALTER TABLE `invoices`")
+}

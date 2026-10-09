@@ -8547,7 +8547,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 </details>
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 96% · 40 complete, 4 running, 12 queued
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 75% · 40 complete, 4 running, 12 queued
 - Rows: 62,308,108 / 64,514,208 across 44 of 56 targets · ETA: ≥ 3m 15s
 - Running: `orders_040`, `orders_041`, `orders_042`, `orders_043`
 
@@ -8579,7 +8579,7 @@ ALTER TABLE `orders`
 <summary>🔄 eu — 4 running, 60 queued (64 targets)</summary>
 <dl><dd>
 
-**`orders`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 12% · 4 running, 60 queued
+**`orders`**: 🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 1% · 4 running, 60 queued
 - Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
 - Running: `orders_000`, `orders_001`, `orders_002`, `orders_003`
 
@@ -8614,7 +8614,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 🔄 Rolling out: 1 of 3 targets done, 1 running, 1 queued
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 81% · 1 complete, 1 running
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 54% · 1 complete, 1 running
 - Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
 - Running: `orders_001`
 

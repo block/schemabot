@@ -55,10 +55,9 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		// target's stored plan and says which other targets run the same.
 		restoreGroup := planScopeForWork(budget, targetNames(data.Model, w.members), len(work), silent)
 		restorePlan := budget.pointAt(first.storedPlan())
-		for _, t := range w.tables {
-			cells, targets := tableAcrossTargets(data, w.members, t)
-			writeTargetTableLine(sb, t.TableName, cells, targets, lineSilent)
-			writeDDLLine(sb, dialect, t.DDL, budget)
+		for _, line := range rankedTargetTableLines(data, w) {
+			writeTargetTableLine(sb, line.table.TableName, line.cells, line.targets, lineSilent)
+			writeDDLLine(sb, dialect, line.table.DDL, budget)
 			sb.WriteString("\n")
 		}
 		restorePlan()
@@ -129,6 +128,34 @@ func tableChangeSignature(tables []TableProgressData) string {
 	return strings.Join(parts, "\x01")
 }
 
+// targetTableLine is one table's line in a target rollup: the table as its
+// group's first target plans it, its progress on each target that runs it, and
+// those targets.
+type targetTableLine struct {
+	table   TableProgressData
+	cells   []TableProgressData
+	targets []string
+	rank    int
+}
+
+// rankedTargetTableLines is a work group's table lines in the order the rollup
+// lists them: by presentation.TableRolloutRank across the group's targets, so
+// the table being copied leads and one no target has started sits below one
+// already finished on some. Lines of equal rank keep plan order.
+func rankedTargetTableLines(data MultiDeploymentApplyData, w targetWork) []targetTableLine {
+	lines := make([]targetTableLine, 0, len(w.tables))
+	for _, t := range w.tables {
+		cells, targets := tableAcrossTargets(data, w.members, t)
+		statuses := make([]string, len(cells))
+		for i, c := range cells {
+			statuses[i] = c.Status
+		}
+		lines = append(lines, targetTableLine{table: t, cells: cells, targets: targets, rank: presentation.TableRolloutRank(statuses)})
+	}
+	slices.SortStableFunc(lines, func(a, b targetTableLine) int { return a.rank - b.rank })
+	return lines
+}
+
 // tableAcrossTargets returns table's progress on each of members, and the
 // target each cell belongs to. A cell matches on its DDL as well as its table,
 // so a table changed by two statements gets a line per statement.
@@ -150,8 +177,9 @@ func tableAcrossTargets(data MultiDeploymentApplyData, members []int, table Tabl
 // writeTargetTableLine writes one table's line across the targets that run it.
 // While any target copies, the bar sums the rows of targets copying or done,
 // and the rows line names its coverage only when a target is left out of the
-// sum; until every target still to copy reports, the ETA (the slowest
-// target's) is a floor. Failed targets are counted rather than summed, since
+// sum. Until every target still to copy reports, the ETA (the slowest
+// target's) is a floor, and the bar is the table's share across all of its
+// targets (targetSharePercent) rather than the rows of the ones that reported. Failed targets are counted rather than summed, since
 // their rows are not progressing, and so are retrying targets. A completed
 // target has reported even when it had no rows to copy. The running targets
 // are named unless every target is running. With nothing copying, the line
@@ -196,7 +224,11 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	name := inlineCode(table)
 	coverage := targetCoverage(done, len(running), queued, failed, retrying)
 	if len(running) > 0 && total > 0 {
-		if pct := ui.RowCopyDisplayPercent(int(copied*100/total), copied); pct > 0 {
+		percent := int(copied * 100 / total)
+		if unreported+silent > 0 {
+			percent = targetSharePercent(cells, silent)
+		}
+		if pct := ui.RowCopyDisplayPercent(percent, copied); pct > 0 {
 			fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", name, ui.ProgressBarRowCopy(pct), pct, coverage)
 			line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
 			partial := reporting < len(cells)+silent
@@ -229,6 +261,12 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		fmt.Fprintf(sb, "**%s**: %s (%d targets)\n", name, shardedTableStatusPhrase(status), len(cells))
 		return
 	}
+	if status == state.Task.Pending && done > 0 {
+		// Complete on some targets and queued on the rest: the change is live
+		// where it completed, so the line leads with that, not with Queued.
+		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, targetCoverage(0, 0, queued, 0, 0))
+		return
+	}
 	phrase := shardedTableStatusPhrase(status)
 	if status == state.Task.Cancelled && done > 0 {
 		// The pure-cancelled parenthetical ("not started") would be false:
@@ -236,6 +274,33 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		phrase = "⊘ Cancelled"
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
+}
+
+// targetSharePercent is how much of a table is done across every target that
+// runs it, for a line where some of those targets have not reported rows: a
+// completed target counts in full, a target copying or verifying counts by the
+// rows its engine reports, and every other target counts as nothing yet. It
+// only combines what the engines report, so it is not an estimate. silent is
+// the targets with no progress at all that the line speaks for.
+func targetSharePercent(cells []TableProgressData, silent int) int {
+	targets := len(cells) + silent
+	if targets == 0 {
+		return 0
+	}
+	var share float64
+	for _, c := range cells {
+		switch state.NormalizeTaskStatus(c.Status) {
+		case state.Task.Completed:
+			share++
+		case state.Task.Pending, state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled:
+			// Not copying: queued, halted, or waiting on a retry.
+		default:
+			if c.RowsTotal > 0 {
+				share += float64(ui.ClampRows(c.RowsCopied, c.RowsTotal)) / float64(c.RowsTotal)
+			}
+		}
+	}
+	return int(share * 100 / float64(targets))
 }
 
 // targetsTableBytes totals a table's planned size across the targets that run

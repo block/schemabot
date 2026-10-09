@@ -1793,3 +1793,82 @@ func TestTargetRolloutStatus(t *testing.T) {
 		})
 	}
 }
+
+// rollingTargets is a rolling rollout of the primary deployment's targets
+// testapp-001 onward: the first is running and the rest wait their turn.
+func rollingTargets(n int) []presentation.Operation {
+	ops := make([]presentation.Operation, n)
+	for i := range ops {
+		st := so.Pending
+		if i == 0 {
+			st = so.Running
+		}
+		ops[i] = presentation.Operation{Deployment: "primary", Target: fmt.Sprintf("testapp-%03d", i+1), State: st}
+	}
+	return ops
+}
+
+// tablesDetail is one target's comment data, running the given tables, each a
+// change of 1,000 rows that a queued table has yet to report.
+func tablesDetail(database string, tables ...TableProgressData) *ApplyStatusCommentData {
+	for i := range tables {
+		tables[i].DDL = "ALTER TABLE `" + tables[i].TableName + "` ADD COLUMN `note` text"
+		if tables[i].Status != state.Task.Pending {
+			tables[i].RowsTotal = 1000
+		}
+	}
+	return &ApplyStatusCommentData{
+		Database: database, State: state.Apply.Running, ApplyID: "apply-123", Environment: "production", Engine: storage.EngineSpirit,
+		Tables: tables,
+	}
+}
+
+// A rolling rollout four targets wide, with the first target part-way through
+// its three tables, lists its tables by where the rollout is rather than in
+// schema order: the table a target is copying first, then the one finished on
+// that target and queued on the other three, then the one no target has
+// started. The table finished on one target says so rather than reading as
+// queued, and the copying table's bar is its share of all four targets, not
+// the one target that has reported rows.
+func TestRenderMultiDeploymentApplyComment_RolledUpTablesListWhereTheRolloutIs(t *testing.T) {
+	queuedTarget := func(database string) *ApplyStatusCommentData {
+		return tablesDetail(database,
+			TableProgressData{TableName: "invoices", Status: state.Task.Pending},
+			TableProgressData{TableName: "orders", Status: state.Task.Pending},
+			TableProgressData{TableName: "refunds", Status: state.Task.Pending},
+		)
+	}
+	out := renderTargets(presentation.Derive(rollingTargets(4)),
+		tablesDetail("testapp_001",
+			TableProgressData{TableName: "invoices", Status: state.Task.Pending},
+			TableProgressData{TableName: "orders", Status: state.Task.Completed, RowsCopied: 1000},
+			TableProgressData{TableName: "refunds", Status: state.Task.Running, RowsCopied: 970, ETASeconds: 30},
+		),
+		queuedTarget("testapp_002"), queuedTarget("testapp_003"), queuedTarget("testapp_004"),
+	)
+
+	refunds := strings.Index(out, "**`refunds`**")
+	orders := strings.Index(out, "**`orders`**")
+	invoices := strings.Index(out, "**`invoices`**")
+	require.NotEqual(t, -1, refunds)
+	require.NotEqual(t, -1, orders)
+	require.NotEqual(t, -1, invoices)
+	assert.Less(t, refunds, orders, "the copying table leads")
+	assert.Less(t, orders, invoices, "the table finished on one target leads the one no target has started")
+
+	assert.Contains(t, out, "**`orders`**: ✅ Complete on 1 of 4 targets · 3 queued\n")
+	assert.Contains(t, out, "**`refunds`**: "+ui.ProgressBarRowCopy(24)+" 24% · 1 running, 3 queued\n- Rows: 970 / 1,000 across 1 of 4 targets")
+}
+
+// Once every target has reported its rows, the copying table's bar is the rows
+// copied over the rows planned across them, as before any target is queued.
+func TestRenderMultiDeploymentApplyComment_RolledUpBarWeighsRowsOnceEveryTargetReports(t *testing.T) {
+	out := renderTargets(presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Running),
+		parallelTarget("primary", "testapp-002", so.Running),
+	}),
+		targetDetail("testapp_001", state.Task.Running, addNote, 900),
+		targetDetail("testapp_002", state.Task.Running, addNote, 100),
+	)
+	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%")
+}
