@@ -51,9 +51,13 @@ that branch's schema from the production branch first. PlanetScale's API
 reference does not list a permission for that call, so the table above may
 not be enough for that path.
 
-Progress polling reads the production branch through the database's vtgate
-credentials, not the service token. The bootstrap script creates a read-only
-branch password for it.
+Progress polling uses both the service token and the database's vtgate
+credentials. The service token reads the deploy request's status
+(`read_deploy_request`) and lists the branch's keyspaces (`read_branch`). The
+vtgate credentials read per-shard progress with `SHOW VITESS_MIGRATIONS` on
+the production branch; the bootstrap script creates a read-only branch
+password for them. Without vtgate credentials, progress falls back to the
+deploy request's state and shows no per-shard row counts.
 
 ## Branch cleanup
 
