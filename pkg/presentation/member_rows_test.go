@@ -217,3 +217,69 @@ func TestDerive_FoldedTargetWithAnEarlierTableQueuedIsNotReadyForCutover(t *test
 	assert.Equal(t, StateQueuedNext, only.Presentation)
 	assert.Equal(t, NextActionNone, model.NextAction.Kind)
 }
+
+// A table step waits for every target to finish the step before it, under
+// every cutover policy and on_failure. orders-002 failed `bikes`: under
+// continue and under an unreleased pause, orders-001's `docks` reads halted,
+// not queued or paused for a release, since no release starts the next table
+// on a fleet missing the last one, and the rollout settles failed. While
+// orders-002 is still copying `bikes` under parallel, orders-001 waits for it
+// rather than reading next in order.
+func TestDerive_TableStepWaitsForTheStepBefore(t *testing.T) {
+	policies := map[string]func(*Operation){
+		"continue": func(*Operation) {},
+		"pause":    func(op *Operation) { op.ContinueOnFailure = false; op.PauseOnFailure = true },
+	}
+	for name, policy := range policies {
+		t.Run(name, func(t *testing.T) {
+			rows := []Operation{
+				tableRow("orders-001", so.Completed, 1),
+				tableRow("orders-002", so.Failed, 1),
+				tableRow("orders-001", so.Pending, 2),
+				tableRow("orders-002", so.Pending, 2),
+			}
+			for i := range rows {
+				rows[i].Parallel = true
+				policy(&rows[i])
+			}
+			model := Derive(rows)
+
+			require.Len(t, model.Deployments, 2)
+			assert.Equal(t, StateHalted, model.Deployments[0].Presentation)
+			assert.Equal(t, "halted — primary/orders-002 failed", model.Deployments[0].Label)
+			assert.Equal(t, state.Apply.Failed, model.State)
+		})
+	}
+
+	t.Run("still copying", func(t *testing.T) {
+		rows := []Operation{
+			tableRow("orders-001", so.Completed, 1),
+			tableRow("orders-002", so.Running, 1),
+			tableRow("orders-001", so.Pending, 2),
+			tableRow("orders-002", so.Pending, 2),
+		}
+		for i := range rows {
+			rows[i].Parallel = true
+		}
+		model := Derive(rows)
+
+		require.Len(t, model.Deployments, 2)
+		assert.Equal(t, StateWaiting, model.Deployments[0].Presentation)
+		assert.Equal(t, "waiting for primary/orders-002", model.Deployments[0].Label)
+	})
+}
+
+// A target whose only change is a later table is one row, and it still waits
+// for the step before: orders-003 changes only `docks`, so it waits while
+// orders-001 copies `bikes`.
+func TestDerive_SingleTableTargetWaitsForTheStepBefore(t *testing.T) {
+	model := Derive([]Operation{
+		tableRow("orders-001", so.Running, 1),
+		tableRow("orders-001", so.Pending, 2),
+		tableRow("orders-003", so.Pending, 2),
+	})
+
+	require.Len(t, model.Deployments, 2)
+	assert.Equal(t, StateWaiting, model.Deployments[1].Presentation)
+	assert.Equal(t, "waiting for primary/orders-001", model.Deployments[1].Label)
+}

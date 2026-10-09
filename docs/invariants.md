@@ -822,7 +822,10 @@ pair taken in `deployment_order` and then in each deployment's `targets` order, 
 earlier member blocks later ones unless the config says otherwise. Copy start is ordered per
 member, not per operation: one member's work never waits on its own member's work to start, and a
 later member's work waits on every earlier member's, until it completes under `rolling` or reaches
-the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Cutover
+the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Where a
+rollout is laid out table by table, work on a table starts on any target only once every earlier
+table has completed on every target, under every cutover policy and every on_failure value, and
+work held behind an earlier table that settled without completing can never start, so it holds no target. Cutover
 under `barrier` and `parallel` is ordered across every operation, not per member: operations cut
 over strictly one at a time in the order the rollout created them, so two shards of one member cut
 over one after the other. A member's finalizer publishes its change without parking at the
@@ -851,7 +854,8 @@ has reached every operation: the pending request is what `start` consults, so ho
 without completing the request would refuse the start the hold exists to preserve (CO-2).
 *Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
-started, to the same gate, with the failure exemption shared by every gate, and `FindNextApplyOperationCutover`
+started, to the same gate, with the failure exemption shared by every gate and the table-step
+boundary `rolloutStepGateSQL` in the work gate, and `FindNextApplyOperationCutover`
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
 dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
@@ -863,7 +867,8 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
-`pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`), through which every
+`pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`, whose
+`stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
 `completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`).

@@ -69,8 +69,8 @@ func TestOperationWriteGuardUpdateStatement(t *testing.T) {
 }
 
 // First-start admission binds the earlier member's failure state ahead of the
-// cutover policy arms, with the release exemption bound last, on both
-// dialects. The gate's behavior on each dialect is covered by the storage
+// cutover policy arms, with the release exemption and then the table-step
+// boundary bound last, on both dialects. The gate's behavior on each dialect is covered by the storage
 // parity suite; this pins only the placeholder-to-argument alignment, which
 // no behavioral test can catch when a binding shifts into a neighbor's slot
 // of the same type.
@@ -110,6 +110,7 @@ func TestWorkStartGateFailureAdmission(t *testing.T) {
 				storage.ControlOperationRelease,
 				storage.ControlRequestPending,
 				storage.ControlRequestCompleted,
+				state.ApplyOperation.Completed,
 			}, args)
 		})
 	}

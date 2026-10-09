@@ -420,6 +420,7 @@ func Derive(ops []Operation) Apply {
 			OperationKey:      op.OperationKey,
 			Work:              op.Work,
 			Finalizer:         op.Finalizer,
+			RolloutStep:       op.RolloutStep,
 			State:             op.State,
 			NeverStarted:      op.NeverStarted,
 			ContinueOnFailure: op.continuesPastFailure(),
@@ -544,6 +545,10 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 // label agrees with what the operator will claim next.
 func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 	op := ops[i]
+	if h := earlierStepHolder(ops, i); h >= 0 {
+		setHeldByEarlierStep(d, ops[h], names[h])
+		return
+	}
 	// Under parallel the copy phase has no earlier-sibling ordering, so a
 	// pending operation never waits for an earlier sibling and a cancelled or
 	// reverted one does not hold it. Failure admission still applies: a
@@ -573,6 +578,49 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		}
 	}
 	d.set(StateQueuedNext, "queued — next in order", "⏳", false)
+}
+
+// earlierStepHolder returns the index of the row that holds a pending table
+// step behind an earlier one, or -1 when none does: a row of its deployment in
+// an earlier step that has not completed. A row the step can never pass, one
+// that failed, was cancelled or was reverted, is named ahead of one that is
+// still running, since it is what the operator has to act on. It mirrors the
+// claim's rolloutStepGateSQL, which holds a step under every cutover_policy and
+// on_failure.
+func earlierStepHolder(ops []Operation, i int) int {
+	op := ops[i]
+	if op.RolloutStep <= 0 {
+		return -1
+	}
+	holder := -1
+	for j, earlier := range ops {
+		if earlier.Deployment != op.Deployment || earlier.RolloutStep <= 0 || earlier.RolloutStep >= op.RolloutStep {
+			continue
+		}
+		if earlier.State == state.ApplyOperation.Completed {
+			continue
+		}
+		if state.StepRowCanNeverPass(earlier.State) {
+			return j
+		}
+		if holder < 0 {
+			holder = j
+		}
+	}
+	return holder
+}
+
+// setHeldByEarlierStep labels a pending table step held by an earlier step's
+// row. A row that settled without completing halts the step for good, whatever
+// on_failure says: the policy decides whether the rest of a step runs, never
+// whether the next table starts on a fleet missing the last one, so there is
+// nothing to release. Otherwise the step waits for that row.
+func setHeldByEarlierStep(d *Deployment, holder Operation, holderName string) {
+	if state.StepRowCanNeverPass(holder.State) {
+		d.set(StateHalted, fmt.Sprintf("halted — %s %s", holderName, haltedReason(holder.State)), "⏸️", true)
+		return
+	}
+	d.set(StateWaiting, fmt.Sprintf("waiting for %s", holderName), "⏳", false)
 }
 
 // deriveWaitingForCutover splits a copied-and-parked operation into ready-now or
