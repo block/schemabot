@@ -299,8 +299,7 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 	raw, err := r.fetch.FetchSecret(ctx, accountID, region, secretName)
 	if err != nil {
 		if missingReplica(err, clusterRegion, region) {
-			return nil, fmt.Errorf("fetch secret %q for %s: %w; the target's cluster is in %s, which is not a reachable region, so its secret is read in %s: replicate the secret to %s, or list %s as a reachable region if this data plane can call Secrets Manager there",
-				secretName, where, err, clusterRegion, region, region, clusterRegion)
+			return nil, fmt.Errorf("fetch secret %q for %s: %w; %s", secretName, where, err, missingReplicaFix(clusterRegion, region))
 		}
 		return nil, fmt.Errorf("fetch secret %q for %s: %w", secretName, where, err)
 	}
@@ -374,6 +373,22 @@ func missingReplica(err error, clusterRegion, readRegion string) bool {
 	}
 	var notFound *smtypes.ResourceNotFoundException
 	return errors.As(err, &notFound)
+}
+
+// missingReplicaFix explains a secret missing from the home region for a
+// cluster in an unreachable region, and names the fix that can work. In the home
+// region's partition the secret can be replicated there or the cluster's region
+// made reachable. A cluster in another partition admits neither, since secrets
+// do not replicate across partitions and startup refuses a reachable region in
+// one, so it has to be served by a data plane in its own partition.
+func missingReplicaFix(clusterRegion, homeRegion string) string {
+	clusterPartition := partitionOf(clusterRegion)
+	if clusterPartition != partitionOf(homeRegion) {
+		return fmt.Sprintf("the target's cluster is in %s, in partition %s, whose secrets this data plane's credentials cannot read: serve the target from a data plane in partition %s",
+			clusterRegion, clusterPartition, clusterPartition)
+	}
+	return fmt.Sprintf("the target's cluster is in %s, which is not a reachable region, so its secret is read in %s: replicate the secret to %s, or list %s as a reachable region if this data plane can call Secrets Manager there",
+		clusterRegion, homeRegion, homeRegion, clusterRegion)
 }
 
 // targetContext describes the target for error messages, including its AWS

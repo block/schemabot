@@ -364,6 +364,10 @@ its secret is read in us-west-2: replicate the secret to us-west-2, or list us-e
 reachable region if this data plane can call Secrets Manager there
 ```
 
+For a cluster in another AWS partition, where neither fix can work, the error
+says instead that the target has to be served by a data plane in that
+partition.
+
 #### Changing the region settings
 
 A change to these settings moves the reads of every target the resolver serves

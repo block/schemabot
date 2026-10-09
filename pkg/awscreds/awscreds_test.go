@@ -437,6 +437,20 @@ func TestResolverSecretMissingFromHomeRegionNamesTheFix(t *testing.T) {
 	assert.ErrorAs(t, err, &notFound)
 }
 
+// A cluster in another AWS partition can neither have its secret replicated
+// into the home region nor be listed as reachable, so the error names the fix
+// that can work: a data plane in the cluster's partition.
+func TestResolverSecretMissingForClusterInOtherPartitionNamesTheFix(t *testing.T) {
+	fetch := &fakeFetcher{err: secretNotFound()}
+	_, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
+		inventory.Request{Target: "inventory-dsid"}, accountInRegion("222222222222", "us-gov-west-1"))
+	require.Error(t, err)
+	assert.Equal(t, "us-west-2", fetch.gotRegion)
+	assert.Contains(t, err.Error(), "the target's cluster is in us-gov-west-1, in partition aws-us-gov, whose secrets this data plane's credentials cannot read: serve the target from a data plane in partition aws-us-gov")
+	assert.NotContains(t, err.Error(), "reachable region")
+	assert.NotContains(t, err.Error(), "replicate")
+}
+
 // The replication fix is offered only where it applies: not when the secret
 // was read in the cluster's own region, and not for a failure other than a
 // missing secret.
