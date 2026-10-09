@@ -339,6 +339,12 @@ Every routing outcome increments
 statements; `blocked_policy_disabled`, `blocked_size_limit`,
 `blocked_size_unknown`, `blocked_force_kill_unavailable`, or
 `blocked_force_kill_unknown` for statements the policy did not route.
+A resumed schema change adds two more: `skipped_completed` for a statement that
+already completed on an earlier run and is not executed again, and
+`blocked_outcome_unknown` for a statement an earlier run stopped mid-statement.
+MySQL may finish such a statement after the connection closes, so the resume
+fails rather than run non-revertible DDL a second time; a fresh plan shows
+whether it landed.
 `blocked_size_limit` covers either bound; the server log line for the verdict
 says which bound blocked and carries the measured estimate. Direct executions
 are rare, policy-approved events — a spike in

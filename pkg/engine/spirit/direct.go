@@ -775,7 +775,30 @@ func (e *Engine) executeDirectStatements(ctx context.Context, target *lazyTarget
 	defer utils.CloseAndLog(db)
 	forceExecConfig := directForceExecConfig(lockWaitSeconds)
 	for _, ds := range stmts {
-		progress := e.trackDirectStatement(ds.table, ds.stmt)
+		progress, claim := e.claimDirectStatement(ds.table, ds.stmt)
+		switch claim {
+		case directClaimSkipCompleted:
+			// A resume re-enters this loop from the top, and native DDL is not
+			// revertible, so a statement that completed on an earlier run of
+			// this schema change never executes again.
+			metrics.RecordDirectExecution(ctx, database, "skipped_completed")
+			logger.Info("direct statement already completed on an earlier run of this schema change; skipping",
+				"database", database, "table", ds.table)
+			e.emitTableLog(ds.table, "statement already completed as native MySQL DDL on an earlier run; skipping")
+			continue
+		case directClaimOutcomeUnknown:
+			// An earlier run stopped mid-statement: the connection closed, but
+			// MySQL may have finished the DDL server-side. Running it again
+			// could silently duplicate it (an unnamed FOREIGN KEY succeeds a
+			// second time as a second constraint), so the resume fails closed.
+			metrics.RecordDirectExecution(ctx, database, "blocked_outcome_unknown")
+			logger.Error("direct execution failed: an earlier run stopped mid-statement, so whether the statement took effect is unknown",
+				"database", database, "table", ds.table)
+			e.setSchemaChangeFailed(engine.OperatorErrorf(nil,
+				"A stop interrupted the native MySQL DDL on table %q, and MySQL may have finished it anyway. SchemaBot will not run it a second time. Plan again: the new plan shows whether the change landed.",
+				ds.table))
+			return false
+		}
 		logger.Info("executing statement directly as native MySQL DDL",
 			"database", database, "table", ds.table, "reason", ds.reason, "estimated_rows", ds.rows, "estimated_bytes", ds.bytes,
 			"lock_wait_timeout_seconds", lockWaitSeconds, "max_attempts", forceExecConfig.MaxRetries)
@@ -837,16 +860,54 @@ func (e *Engine) emitTableLog(table, msg string) {
 	}
 }
 
-// trackDirectStatement registers a direct-routed statement on the running
-// schema change so progress polls report its lifecycle.
-func (e *Engine) trackDirectStatement(table, ddlStmt string) *directStatementProgress {
-	p := &directStatementProgress{table: table, ddl: ddlStmt, state: directStateRunning, startedAt: time.Now()}
+// directClaim is how the executor handles a direct-routed statement, given
+// the lifecycle an earlier run of the same schema change recorded for it.
+type directClaim int
+
+const (
+	// directClaimRun executes the statement: it has no recorded lifecycle, or
+	// it failed earlier. A failed MySQL DDL statement is atomic and left no
+	// effect, so running it again is safe.
+	directClaimRun directClaim = iota
+	// directClaimSkipCompleted skips the statement: it completed on an earlier
+	// run, and native DDL must never execute twice.
+	directClaimSkipCompleted
+	// directClaimOutcomeUnknown fails the schema change: an earlier run
+	// stopped mid-statement, so whether the DDL took effect is unknown.
+	directClaimOutcomeUnknown
+)
+
+// claimDirectStatement resolves how the executor handles a direct-routed
+// statement and returns the progress entry that tracks it. A statement keeps
+// one entry across resumes of the same schema change, so a progress poll
+// never lists it twice.
+func (e *Engine) claimDirectStatement(table, ddlStmt string) (*directStatementProgress, directClaim) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.runningSchemaChange != nil {
-		e.runningSchemaChange.directStatements = append(e.runningSchemaChange.directStatements, p)
+	if e.runningSchemaChange == nil {
+		return &directStatementProgress{table: table, ddl: ddlStmt, state: directStateRunning, startedAt: time.Now()}, directClaimRun
 	}
-	return p
+	for _, p := range e.runningSchemaChange.directStatements {
+		if p.table != table || p.ddl != ddlStmt {
+			continue
+		}
+		switch p.state {
+		case directStateCompleted:
+			return p, directClaimSkipCompleted
+		case directStateFailed:
+			p.state = directStateRunning
+			p.startedAt = time.Now()
+			p.completedAt = nil
+			return p, directClaimRun
+		default:
+			// Stopped, or still running with no recorded result: the earlier
+			// run ended before the statement's outcome was known.
+			return p, directClaimOutcomeUnknown
+		}
+	}
+	p := &directStatementProgress{table: table, ddl: ddlStmt, state: directStateRunning, startedAt: time.Now()}
+	e.runningSchemaChange.directStatements = append(e.runningSchemaChange.directStatements, p)
+	return p, directClaimRun
 }
 
 // setDirectStatementState records a direct statement's transition. Completed

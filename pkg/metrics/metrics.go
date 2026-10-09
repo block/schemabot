@@ -2343,16 +2343,20 @@ func RecordDropTableAlreadyAbsent(ctx context.Context, database string) {
 // knownDirectExecutionOutcomes limits metric cardinality to the outcomes the
 // direct execution path can produce. Executed statements terminate as
 // completed, failed, or stopped; refused statements the policy does not route
-// directly are blocked with the reason encoded in the outcome.
+// directly are blocked with the reason encoded in the outcome. A resumed schema
+// change skips a statement that already completed (skipped_completed) and fails
+// closed on one an earlier run stopped mid-statement (blocked_outcome_unknown).
 var knownDirectExecutionOutcomes = map[string]bool{
 	"completed":                      true,
 	"failed":                         true,
 	"stopped":                        true,
+	"skipped_completed":              true,
 	"blocked_policy_disabled":        true,
 	"blocked_size_limit":             true,
 	"blocked_size_unknown":           true,
 	"blocked_force_kill_unavailable": true,
 	"blocked_force_kill_unknown":     true,
+	"blocked_outcome_unknown":        true,
 }
 
 // RecordDirectExecution increments the counter for a statement the
@@ -2366,7 +2370,8 @@ var knownDirectExecutionOutcomes = map[string]bool{
 // user lacks a grant the kill needs (grant SELECT on performance_schema.*,
 // PROCESS, and CONNECTION_ADMIN or SUPER, or on RDS EXECUTE on mysql.rds_kill);
 // blocked_force_kill_unknown means checking those grants failed (check target
-// connectivity).
+// connectivity). blocked_outcome_unknown means a resume refused to re-run a
+// statement a stop interrupted (re-plan the database to see whether it landed).
 func RecordDirectExecution(ctx context.Context, database, outcome string) {
 	if !knownDirectExecutionOutcomes[outcome] {
 		outcome = "unknown"
