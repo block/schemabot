@@ -642,6 +642,6 @@ func TestRolloutShapeRefusalMessage(t *testing.T) {
 		"An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with `schemabot apply -e production --target orders-001`.",
 		applyExecutionErrorMessage(action.ApplyConfirm, "production", wrapped(spanning)))
 	assert.Equal(t,
-		"A rollback to more than one deployment is not supported yet when a deployment has several targets. Revert the schema files in a new PR and apply it one target at a time, starting with `schemabot apply -e production --target orders-001`.",
+		"A rollback to more than one deployment is not supported yet when a deployment has several targets. Release this PR's lock with `schemabot unlock`, then revert the schema files in a new PR and apply it one target at a time, starting with `schemabot apply -e production --target orders-001`.",
 		rollbackExecutionErrorMessage("production", wrapped(spanning)))
 }

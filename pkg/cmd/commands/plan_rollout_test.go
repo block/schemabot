@@ -1015,3 +1015,23 @@ func TestApplyCmd_RefusesAnUnsupportedMultiTargetShapeBeforeLocking(t *testing.T
 		})
 	}
 }
+
+// A rollout of a shape apply creation refuses that is already up to date has
+// nothing to apply, so the CLI says so and succeeds: an operator who applied
+// each target in turn can confirm the whole rollout converged with one apply.
+func TestApplyCmd_ConvergedUnsupportedMultiTargetShapeIsANoOp(t *testing.T) {
+	const spansDeployments = "orders/production rolls out to 3 targets across 2 deployments, and an apply to more than one deployment is not supported yet when a deployment has several targets; apply one target at a time, starting with --target payments-001"
+	rollout := &apitypes.PlanRolloutResponse{
+		Members: 3, MultiTarget: true, ShapeRefusal: spansDeployments,
+		Groups: []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, 3), Primary: true, Changes: []*apitypes.SchemaChangeResponse{}}},
+	}
+	server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{PlanID: "plan-orders-1", Engine: "mysql", Rollout: rollout})
+
+	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true}
+	var runErr error
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+	require.NoError(t, runErr)
+	assert.Contains(t, out, "No changes. Your schema is up-to-date.")
+	assert.Equal(t, []string{"/api/status", "/api/plan"}, *paths, "nothing is locked or applied:\n%s", out)
+}

@@ -382,7 +382,7 @@ func TestE2EDeferCutoverRefusedWhenOnlyAnotherTargetRunsDirectChanges(t *testing
 
 // One deployment rolls out to two targets, and each cuts over as its table
 // finishes, so --defer-cutover has no meaning there. The apply command refuses
-// it before it plans or takes the lock, and names the command to run instead.
+// it before it takes the lock, and names the command to run instead.
 // An apply to more than one deployment where one of them has two targets is
 // refused the same way, whatever options it carries.
 func TestE2EMultiTargetApplyRefusesUnsupportedShapes(t *testing.T) {

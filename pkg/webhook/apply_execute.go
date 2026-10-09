@@ -887,7 +887,9 @@ func rolloutShapeRefusalMessage(refused *api.RolloutShapeRefusedError, command, 
 	case api.RolloutMultiTargetDeploymentsRefused:
 		narrowed := fmt.Sprintf("`schemabot %s -e %s --target %s`", action.Apply, environment, refused.FirstTarget)
 		if command == action.RollbackConfirm {
-			return "A rollback to more than one deployment is not supported yet when a deployment has several targets. Revert the schema files in a new PR and apply it one target at a time, starting with " + narrowed + "."
+			// The refused rollback still holds this PR's lock, which would
+			// block the apply the remedy names, so the remedy releases it first.
+			return fmt.Sprintf("A rollback to more than one deployment is not supported yet when a deployment has several targets. Release this PR's lock with `schemabot %s`, then revert the schema files in a new PR and apply it one target at a time, starting with %s.", action.Unlock, narrowed)
 		}
 		return "An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with " + narrowed + "."
 	}

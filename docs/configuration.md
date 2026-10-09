@@ -347,7 +347,7 @@ Being primary decides which plan is stored, not which deployment is reviewed. A 
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
 
-Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
+Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. A deployment with a `targets` list is the exception: each of its targets cuts over as its table finishes, so an apply to it refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
 
 ## Multi-Target Environment (preview)
 
@@ -381,6 +381,8 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
           payments-b:
             target: payments-003
 ```
+
+An apply that spans several deployments, one of them with a `targets` list, is not supported yet and is refused before it takes the lock. Apply one target at a time instead, in rollout order: `schemabot apply -e production --target payments-001`, then the next target. The refusal names the first one. A rollout already up to date applies nothing, so an apply that confirms it converged still succeeds.
 
 ### Selecting namespaces per target
 

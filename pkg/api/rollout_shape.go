@@ -32,9 +32,9 @@ type RolloutShapeRefusedError struct {
 	Targets int
 	// Deployments is how many deployments those targets route through.
 	Deployments int
-	// FirstTarget is the --target selector of the first target, in rollout
-	// order, of a deployment with several targets: the one to apply first
-	// when applying one target at a time.
+	// FirstTarget is the --target selector of the rollout's first target, in
+	// deployment order: the one to apply first when applying one target at a
+	// time, so the targets still roll out in the order the config sets.
 	FirstTarget string
 }
 
@@ -80,21 +80,16 @@ func RefuseUnsupportedRolloutShape(database, environment string, targets []routi
 	}
 	deployments := make(map[string]struct{}, len(targets))
 	members := make(map[string]struct{}, len(targets))
-	selectors := rolloutMemberSelectors(targets)
-	firstTarget := ""
-	for i, t := range targets {
+	for _, t := range targets {
 		deployments[t.Deployment] = struct{}{}
 		members[t.MemberID()] = struct{}{}
-		if firstTarget == "" && multiTarget[t.Deployment] {
-			firstTarget = selectors[i]
-		}
 	}
 	refused := &RolloutShapeRefusedError{
 		Database:    database,
 		Environment: environment,
 		Targets:     len(members),
 		Deployments: len(deployments),
-		FirstTarget: firstTarget,
+		FirstTarget: rolloutMemberSelectors(targets)[0],
 	}
 	// The deployment shape is refused first: it refuses the apply whatever
 	// options it carries, so dropping --defer-cutover would not admit it.

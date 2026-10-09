@@ -146,6 +146,11 @@ func TestRolloutShapeRefusal(t *testing.T) {
 		return routing.ExecutionTarget{DatabaseType: storage.DatabaseTypeMySQL, Deployment: deployment, Target: name}
 	}
 	assert.Empty(t, rolloutShapeRefusal("testapp", "production", []routing.ExecutionTarget{target("eu", "orders-001"), target("eu", "orders-002")}))
+	// A single-target deployment first in the rollout's order is where the
+	// one-target-at-a-time apply starts, so the order the config sets holds.
+	assert.Equal(t,
+		"testapp/production rolls out to 3 targets across 2 deployments, and an apply to more than one deployment is not supported yet when a deployment has several targets; apply one target at a time, starting with --target orders-003",
+		rolloutShapeRefusal("testapp", "production", []routing.ExecutionTarget{target("us", "orders-003"), target("eu", "orders-001"), target("eu", "orders-002")}))
 	assert.Equal(t,
 		"testapp/production rolls out to 3 targets across 2 deployments, and an apply to more than one deployment is not supported yet when a deployment has several targets; apply one target at a time, starting with --target orders-001",
 		rolloutShapeRefusal("testapp", "production", []routing.ExecutionTarget{target("eu", "orders-001"), target("eu", "orders-002"), target("us", "orders-003")}))
