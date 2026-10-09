@@ -12,6 +12,11 @@ import (
 // row is a member of its own: a row that runs its member's whole change
 // carries no step, and that includes several members dividing one target's
 // work and the sharded fan-out, which renders its rows as shards.
+//
+// Input order is the resolved order the claim's ordering gates read, so a
+// member's rows are listed in the order its work is claimed. A table step
+// marks where one table ends and the next begins; it is not a second order to
+// sort a member's rows by.
 func memberRows(ops []Operation) [][]int {
 	var members [][]int
 	memberOf := make(map[string]int, len(ops))

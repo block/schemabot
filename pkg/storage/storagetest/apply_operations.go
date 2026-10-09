@@ -70,6 +70,42 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.ErrorContains(t, err, "an already converged operation must be completed and never started")
 	})
 
+	// Insert_RolloutStepRoundTrips verifies that a row inserted with a table
+	// step reads that step back, that a row of a member's whole change reads
+	// step 0, and that a negative step is refused rather than stored as a
+	// step that sorts before every other.
+	t.Run("Insert_RolloutStepRoundTrips", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_step_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_step", 932)
+
+		steppedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "primary", Target: "orders-002", OperationKey: "orders-002/docks", RolloutStep: 2,
+		})
+		require.NoError(t, err)
+		wholeID := createOperation(t, store, apply.ID, "region-b", "")
+
+		stepped, err := store.ApplyOperations().Get(ctx, steppedID)
+		require.NoError(t, err)
+		require.NotNil(t, stepped)
+		assert.Equal(t, 2, stepped.RolloutStep)
+
+		listed, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+		require.NoError(t, err)
+		require.Len(t, listed, 2)
+		steps := map[int64]int{}
+		for _, op := range listed {
+			steps[op.ID] = op.RolloutStep
+		}
+		assert.Equal(t, map[int64]int{steppedID: 2, wholeID: 0}, steps)
+
+		_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "primary", Target: "orders-001", OperationKey: "orders-001/docks", RolloutStep: -1,
+		})
+		require.ErrorContains(t, err, "rollout step -1 is negative")
+	})
+
 	// FindNextApplyOperation_ClaimsInDeploymentOrder verifies the operation
 	// ladder: a pending operation is claimed into running with a fresh lease,
 	// and a later deployment remains blocked until its earlier sibling

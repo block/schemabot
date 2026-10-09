@@ -1389,6 +1389,12 @@ type ApplyOperation struct {
 	// what says the target already had the change.
 	AlreadyConverged bool
 
+	// RolloutStep is the table step of a rollout that runs table by table:
+	// each of a target's tables is a step, numbered from 1 in rollout order,
+	// and one operation runs one target's step. Zero is an operation that runs
+	// a member's whole change.
+	RolloutStep int
+
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
 
