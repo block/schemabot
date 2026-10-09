@@ -97,8 +97,8 @@ func writeMultiDeploymentHeader(data ProgressData, model presentation.Apply, gro
 	if dur := formatApplyDuration(data.StartedAt, data.CompletedAt); dur != "-" {
 		rows = append(rows, BoxRow{"Duration", dur})
 	}
-	if counts := FormatStateCounts(model.Counts); counts != "" {
-		rows = append(rows, BoxRow{RolloutCountsUnit(groups), counts})
+	if label, counts := RolloutCounts(model, groups); counts != "" {
+		rows = append(rows, BoxRow{label, counts})
 	}
 	WriteBox(rows, "State", stateColorFunc(model.State))
 }

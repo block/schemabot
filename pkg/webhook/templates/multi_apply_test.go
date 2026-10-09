@@ -2015,3 +2015,60 @@ func TestTargetSharePercentCountsTheRevertWindowAsDone(t *testing.T) {
 	}
 	assert.Equal(t, 50, targetSharePercent(cells, 1))
 }
+
+// steppedTarget is a target's row for one table of a rollout run table by
+// table, the step being the table's place in the rollout.
+func steppedTarget(target, st string, step int) presentation.Operation {
+	op := parallelTarget("primary", target, st)
+	op.Work = true
+	op.RolloutStep = step
+	return op
+}
+
+// A rollout runs `orders` then `refunds` table by table on testapp-001 and
+// testapp-002. Both finished `orders`; testapp-001 is copying `refunds` and
+// testapp-002 waits for it. The headline counts tables done across the
+// targets, since a count of target states would read testapp-002, done with
+// one table and waiting on the next, as queued.
+func TestRenderMultiDeploymentApplyComment_TableByTableRolloutCountsTables(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		steppedTarget("testapp-001", so.Completed, 1),
+		steppedTarget("testapp-002", so.Completed, 1),
+		steppedTarget("testapp-001", so.Running, 2),
+		steppedTarget("testapp-002", so.Pending, 2),
+	})
+	out := renderTargets(model,
+		targetDetail("testapp_001", state.Task.Running, addNote, 400),
+		targetDetail("testapp_002", state.Task.Pending, addNote, 0),
+	)
+
+	assert.Contains(t, out, "Rolling out: 1 of 2 tables done on 2 targets")
+	assert.NotContains(t, out, "Rolling out: 0 of 2 targets done")
+}
+
+// The table-by-table headline settles the way the target headline does: every
+// table done reads rolled out, a rollout that settled short counts the tables
+// it finished and the targets' outcomes, and a rollback says so.
+func TestTableStepsStatus(t *testing.T) {
+	failed := presentation.TargetProgress{Total: 3, Done: 2, Others: []presentation.StateCount{{Label: "failed", Count: 1}}}
+	tests := []struct {
+		name     string
+		steps    presentation.TableSteps
+		progress presentation.TargetProgress
+		settled  bool
+		rollback bool
+		want     string
+	}{
+		{"running", presentation.TableSteps{Steps: 3, Done: 1}, presentation.TargetProgress{Total: 4, Unsettled: 4}, false, false, "Rolling out: 1 of 3 tables done on 4 targets"},
+		{"settled with a target still going", presentation.TableSteps{Steps: 3, Done: 1}, presentation.TargetProgress{Total: 4, Unsettled: 1}, true, false, "Rolling out: 1 of 3 tables done on 4 targets"},
+		{"every table done", presentation.TableSteps{Steps: 3, Done: 3}, presentation.TargetProgress{Total: 4, Done: 4}, true, false, "Rolled out 3 tables to 4 targets"},
+		{"settled short", presentation.TableSteps{Steps: 3, Done: 1}, failed, true, false, "Rolled out 1 of 3 tables to 3 targets, 1 failed"},
+		{"rolling back", presentation.TableSteps{Steps: 2, Done: 0}, presentation.TargetProgress{Total: 2, Unsettled: 2}, false, true, "Rolling back: 0 of 2 tables done on 2 targets"},
+		{"rolled back", presentation.TableSteps{Steps: 2, Done: 2}, presentation.TargetProgress{Total: 2, Done: 2}, true, true, "Rolled back 2 tables on 2 targets"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tableStepsStatus(tt.steps, tt.progress, tt.settled, tt.rollback))
+		})
+	}
+}

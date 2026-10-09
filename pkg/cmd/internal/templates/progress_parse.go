@@ -163,6 +163,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ErrorMessage:        op.ErrorMessage,
 			ErrorCode:           op.ErrorCode,
 			AlreadyConverged:    op.AlreadyConverged,
+			RolloutStep:         op.RolloutStep,
 			StartedAt:           op.StartedAt,
 			CompletedAt:         op.CompletedAt,
 		})

@@ -745,8 +745,9 @@ func TestWriteProgress_TargetRollupRanksUnreportedTargetsAsQueued(t *testing.T) 
 
 // A rollout run table by table has a row per target and table: payments-001
 // finished `bikes` and is queued for `docks`, while payments-002 still copies
-// `bikes`. The header and the deployment count the two targets, not the four
-// rows, and the deployment is one section listing both tables.
+// `bikes`. The deployment is one section listing both tables, each table
+// counting the two targets, not the four rows, and the header and the
+// deployment line count the tables done.
 func TestWriteProgress_TableByTableRolloutCountsTargets(t *testing.T) {
 	step := map[string]int{"bikes": 1, "docks": 2}
 	row := func(target, table, opState, status string, copied int64) (ProgressOperation, TableProgress) {
@@ -779,11 +780,51 @@ func TestWriteProgress_TableByTableRolloutCountsTargets(t *testing.T) {
 
 	out := renderRollout(t, data)
 
-	assert.Contains(t, out, "Targets:      1 running · 1 queued")
-	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 1 running · 1 queued (2 targets)"), "one section for the deployment")
+	assert.Contains(t, out, "Tables:       0 of 2 done on 2 targets")
+	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 0 of 2 tables done (2 targets)"), "one section for the deployment")
 	assert.Equal(t, 1, strings.Count(out, "~ bikes:"))
 	assert.Equal(t, 1, strings.Count(out, "~ docks:"))
 	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 complete)")
 	assert.Contains(t, out, "• Targets: 2 (2 queued)")
 	assert.NotContains(t, out, "4 targets")
+}
+
+// A rollout runs `bikes` then `docks` table by table on payments-001 and
+// payments-002, and every target has finished `bikes`: payments-001 is copying
+// `docks` and payments-002 waits for it. The header and the deployment line
+// count the tables done across the targets, since a count of target states
+// would read payments-002, done with one table and waiting on the next, as
+// queued.
+func TestWriteProgress_TableByTableRolloutCountsTableSteps(t *testing.T) {
+	data := ProgressData{ApplyID: "apply-7f3c", Database: "orders", Environment: "production", Engine: "Spirit", State: state.Apply.Running}
+	for _, r := range []struct {
+		target, table string
+		step          int
+		opState       string
+		status        string
+		copied        int64
+	}{
+		{"payments-001", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000},
+		{"payments-002", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000},
+		{"payments-001", "docks", 2, state.ApplyOperation.Running, state.Task.Running, 400},
+		{"payments-002", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0},
+	} {
+		data.Operations = append(data.Operations, ProgressOperation{
+			Deployment: "prod", Target: r.target, OperationKey: r.target + "/" + r.table, OperationKind: storage.ApplyOperationKindWork,
+			State: r.opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue, RolloutStep: r.step,
+		})
+		data.Tables = append(data.Tables, TableProgress{
+			Deployment: "prod", Target: r.target, Namespace: "orders", TableName: r.table, ChangeType: "alter",
+			DDL: "ALTER TABLE `" + r.table + "` ADD COLUMN `region` varchar(32)", Status: r.status,
+			RowsCopied: r.copied, RowsTotal: 1000, PercentComplete: int(r.copied * 100 / 1000),
+		})
+	}
+
+	out := renderRollout(t, data)
+
+	assert.Contains(t, out, "Tables:       1 of 2 done on 2 targets")
+	assert.NotContains(t, out, "Targets:      ")
+	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 1 of 2 tables done (2 targets)"), "one section for the deployment")
+	assert.Contains(t, out, "• Targets: 2 (2 complete)")
+	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 queued)")
 }

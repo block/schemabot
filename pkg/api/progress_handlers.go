@@ -223,6 +223,7 @@ func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.
 		ErrorCode:           deriveErrorCode(op.State, op.ErrorMessage),
 		ErrorMessage:        op.ErrorMessage,
 		AlreadyConverged:    op.AlreadyConverged,
+		RolloutStep:         op.RolloutStep,
 	}
 	if op.StartedAt != nil {
 		resp.StartedAt = op.StartedAt.Format(time.RFC3339)

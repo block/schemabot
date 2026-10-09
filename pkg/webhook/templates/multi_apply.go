@@ -197,6 +197,9 @@ func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, 
 		progress.AlreadyHad += leftOut
 	}
 	status := targetRolloutStatus(progress, settled, data.Rollback)
+	if steps, ok := data.Model.TableSteps(g); ok && progress.Total > progress.AlreadyHad {
+		status = tableStepsStatus(steps, progress, settled, data.Rollback)
+	}
 	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
 	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
 	sb.WriteString("\n")
@@ -238,6 +241,33 @@ func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) 
 	default:
 		line = fmt.Sprintf("%s %d of %s", finished, p.Done, targetCount(changing))
 	}
+	if len(p.Others) > 0 {
+		line += ", " + countsPhrase(p.Others)
+	}
+	return line
+}
+
+// tableStepsStatus states the progress of a multi-target rollout run table by
+// table in one line: "Rolling out: 1 of 3 tables done on 4 targets" until the
+// apply settles, then "Rolled out 3 tables to 4 targets", or "Rolled out 1 of
+// 3 tables to 4 targets" with the targets' outcomes when it settled short. A
+// table finishes on every target before the next starts, so while it runs the
+// targets are counted only as the rollout's size: most of them are between
+// tables, which a count of target states would read as queued. A rollback says
+// "Rolling back" and "Rolled back ... on" instead.
+func tableStepsStatus(steps presentation.TableSteps, p presentation.TargetProgress, settled, rollback bool) string {
+	ongoing, finished, onto := "Rolling out:", "Rolled out", "to"
+	if rollback {
+		ongoing, finished, onto = "Rolling back:", "Rolled back", "on"
+	}
+	targets := targetCount(p.Total)
+	if !settled || p.Unsettled > 0 {
+		return fmt.Sprintf("%s %d of %d tables done on %s", ongoing, steps.Done, steps.Steps, targets)
+	}
+	if steps.Done == steps.Steps {
+		return fmt.Sprintf("%s %d tables %s %s", finished, steps.Steps, onto, targets)
+	}
+	line := fmt.Sprintf("%s %d of %d tables %s %s", finished, steps.Done, steps.Steps, onto, targets)
 	if len(p.Others) > 0 {
 		line += ", " + countsPhrase(p.Others)
 	}
