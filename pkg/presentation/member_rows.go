@@ -6,33 +6,21 @@ import (
 )
 
 // memberRows partitions ops into rollout members, each a list of the rows of
-// its work in input order. A target of a deployment that addresses several
-// targets is one member however many rows its work spans, one per table when
-// the rollout runs table by table, so the rollup counts and labels targets
-// rather than rows. Every other row is a member of its own: a deployment that
-// addresses one target, or several members dividing one target's work, keeps
-// one member per row.
-//
-// The sharded fan-out is left row by row. It keys each row by shard and
-// table, and its group finalizers publish per namespace, so its rows are
-// rendered as shards rather than folded into targets.
+// its work in input order. A target's rows of a rollout run table by table,
+// each stamped with its table step, are one member however many tables they
+// run, so the rollup counts and labels targets rather than rows. Every other
+// row is a member of its own: a row that runs its member's whole change
+// carries no step, and that includes several members dividing one target's
+// work and the sharded fan-out, which renders its rows as shards.
 func memberRows(ops []Operation) [][]int {
-	if !foldsTargetRows(ops) {
-		return eachRow(len(ops))
-	}
-	targets := make([]routing.ExecutionTarget, len(ops))
-	for i, op := range ops {
-		targets[i] = routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}
-	}
-	multiTarget := routing.MultiTargetDeployments(targets)
 	var members [][]int
 	memberOf := make(map[string]int, len(ops))
 	for i, op := range ops {
-		if !multiTarget[op.Deployment] || op.Target == "" {
+		if op.RolloutStep == 0 || op.Target == "" {
 			members = append(members, []int{i})
 			continue
 		}
-		id := targets[i].MemberID()
+		id := routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}.MemberID()
 		j, seen := memberOf[id]
 		if !seen {
 			j = len(members)
@@ -44,23 +32,36 @@ func memberRows(ops []Operation) [][]int {
 	return members
 }
 
-// foldsTargetRows reports whether ops fold by target: no row is a group
-// finalizer, which only the sharded fan-out creates.
-func foldsTargetRows(ops []Operation) bool {
-	for _, op := range ops {
-		if op.Finalizer {
-			return false
-		}
+// orderFoldedMembersByRow labels each folded member that waits its turn by its
+// lead row's place among every row, rather than its own place among the
+// members. A target runs its next table only once the earlier rows allow it,
+// and those can belong to targets the member order puts after it: orders-001
+// waiting on `docks` is held by orders-002's failure on `bikes`, though
+// orders-001 is the first member. Settled and active members read as their
+// folded state already says.
+func orderFoldedMembersByRow(ops, members []Operation, names []string, memberOf []int, deployments []Deployment) {
+	rowNames := make([]string, len(ops))
+	for i := range ops {
+		rowNames[i] = names[memberOf[i]]
 	}
-	return true
+	for j := range deployments {
+		d := &deployments[j]
+		if len(d.Rows) < 2 || !waitsItsTurn(ops[d.Row].State, members[j].State) {
+			continue
+		}
+		row := deriveDeployment(ops, rowNames, d.Row)
+		d.set(row.Presentation, row.Label, row.Emoji, row.Open)
+	}
 }
 
-func eachRow(n int) [][]int {
-	members := make([][]int, n)
-	for i := range n {
-		members[i] = []int{i}
+// waitsItsTurn reports whether a folded member whose lead row is in rowState
+// and whose rows fold to memberState is waiting on earlier rows: pending, or
+// copied and parked for cutover, with the member reading the same.
+func waitsItsTurn(rowState, memberState string) bool {
+	if rowState != memberState {
+		return false
 	}
-	return members
+	return state.IsState(rowState, state.ApplyOperation.Pending, state.ApplyOperation.WaitingForCutover)
 }
 
 // foldMember is the one Operation a member's rows read as. The lead row, the

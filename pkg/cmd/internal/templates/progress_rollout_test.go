@@ -748,11 +748,12 @@ func TestWriteProgress_TargetRollupRanksUnreportedTargetsAsQueued(t *testing.T) 
 // `bikes`. The header and the deployment count the two targets, not the four
 // rows, and the deployment is one section listing both tables.
 func TestWriteProgress_TableByTableRolloutCountsTargets(t *testing.T) {
+	step := map[string]int{"bikes": 1, "docks": 2}
 	row := func(target, table, opState, status string, copied int64) (ProgressOperation, TableProgress) {
 		percent := int(copied * 100 / 1000)
 		return ProgressOperation{
 				Deployment: "prod", Target: target, OperationKey: target + "/" + table, OperationKind: storage.ApplyOperationKindWork,
-				State: opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue,
+				State: opState, CutoverPolicy: storage.CutoverPolicyParallel, OnFailure: storage.OnFailureContinue, RolloutStep: step[table],
 			}, TableProgress{
 				Deployment: "prod", Target: target, Namespace: "orders", TableName: table, ChangeType: "alter",
 				DDL: "ALTER TABLE `" + table + "` ADD COLUMN `region` varchar(32)", Status: status,

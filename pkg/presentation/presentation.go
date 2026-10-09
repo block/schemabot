@@ -60,6 +60,11 @@ type Operation struct {
 	// held the change when the apply was created, so nothing ran there.
 	AlreadyConverged bool
 
+	// RolloutStep is the table step the row runs when the rollout runs table
+	// by table, numbered from 1, and 0 for a row that runs its member's whole
+	// change. A target's stepped rows read as one member.
+	RolloutStep int
+
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
 	// by the caller from storage.CutoverPolicyBarrier). Under barrier an earlier
 	// sibling stops blocking a later copy once it reaches the cutover barrier or
@@ -393,10 +398,10 @@ func (a Apply) MultiDeployment() bool {
 // must be in resolved deployment order (as returned by ListByApply); earlier
 // siblings are those before a given index. The returned Deployments are one per
 // rollout member, in the order each member's first row appears: one per row,
-// except that a target of a deployment addressing several targets is one
-// member however many rows its work spans (see memberRows). Each carries the
-// rows it covers (Rows, Row), which callers use to key results back to their
-// inputs. The aggregate state reads every row, as the stored apply state does.
+// except that a target's rows of a rollout run table by table are one member
+// however many tables they run (see memberRows). Each carries the rows it
+// covers (Rows, Row), which callers use to key results back to their inputs.
+// The aggregate state reads every row, as the stored apply state does.
 func Derive(ops []Operation) Apply {
 	rolloutOps := make([]state.RolloutOperation, len(ops))
 	for i, op := range ops {
@@ -415,8 +420,12 @@ func Derive(ops []Operation) Apply {
 
 	rows := memberRows(ops)
 	members := make([]Operation, len(rows))
+	memberOf := make([]int, len(ops))
 	for j, memberRows := range rows {
 		members[j] = foldMember(ops, memberRows)
+		for _, i := range memberRows {
+			memberOf[i] = j
+		}
 	}
 	names := memberNames(members)
 	deployments := make([]Deployment, len(members))
@@ -425,6 +434,7 @@ func Derive(ops []Operation) Apply {
 		deployments[j].Rows = rows[j]
 		deployments[j].Row = leadRow(ops, rows[j])
 	}
+	orderFoldedMembersByRow(ops, members, names, memberOf, deployments)
 
 	aggState := state.DeriveRolloutApplyState(children)
 	return Apply{
@@ -432,21 +442,26 @@ func Derive(ops []Operation) Apply {
 		Label:        aggregateLabel(aggState),
 		Counts:       summaryCounts(deployments),
 		NextAction:   nextAction(aggState, deployments, hasFailClosedFailure(ops)),
-		FirstFailure: firstFailure(deployments),
+		FirstFailure: firstFailure(ops, deployments, memberOf),
 		Deployments:  deployments,
 	}
 }
 
-// firstFailure returns the first deployment, in resolved order, whose raw
-// operation state is terminally failed, or nil when none failed. failed_retryable
+// firstFailure returns the deployment of the first row, in resolved order,
+// whose raw operation state is terminally failed, or nil when none failed. A
+// folded member's failure is placed by its failed row, so a target that
+// failed a later table comes after one that failed an earlier one. memberOf
+// maps each row to its deployment. failed_retryable
 // is excluded: a retrying deployment is still in progress and surfaces no
 // operator-facing failure. The result is a copy, not an alias into Deployments,
 // so a caller that later re-slices or sorts Deployments cannot turn it into a
 // stale pointer.
-func firstFailure(deps []Deployment) *Deployment {
-	for i := range deps {
-		if deps[i].State == state.ApplyOperation.Failed {
-			failed := deps[i]
+func firstFailure(ops []Operation, deps []Deployment, memberOf []int) *Deployment {
+	for i, op := range ops {
+		if op.State != state.ApplyOperation.Failed {
+			continue
+		}
+		if failed := deps[memberOf[i]]; failed.State == state.ApplyOperation.Failed {
 			return &failed
 		}
 	}

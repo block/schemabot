@@ -50,8 +50,11 @@ type ProgressOperation struct {
 	ErrorMessage        string
 	ErrorCode           string
 	AlreadyConverged    bool
-	StartedAt           string
-	CompletedAt         string
+	// RolloutStep is the table step the operation runs when the rollout runs
+	// table by table, and 0 otherwise.
+	RolloutStep int
+	StartedAt   string
+	CompletedAt string
 }
 
 // TableProgress represents progress for a single table schema change.

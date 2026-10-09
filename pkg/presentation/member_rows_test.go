@@ -9,23 +9,24 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-// tableRow is one target's work on one table of a rollout run table by table.
-func tableRow(target, st string) Operation {
-	return Operation{Deployment: "primary", Target: target, Work: true, State: st, ContinueOnFailure: true, ExternalOperationID: "op-" + target + "-" + st}
+// tableRow is one target's work on the table at step of a rollout run table
+// by table.
+func tableRow(target, st string, step int) Operation {
+	return Operation{Deployment: "primary", Target: target, Work: true, State: st, RolloutStep: step, ContinueOnFailure: true, ExternalOperationID: "op-" + target + "-" + st}
 }
 
 // A rollout runs `bikes` then `docks` on orders-001 and orders-002, one row per
 // target and table, created table by table. Each target reads as one member
 // over its two rows: orders-001 finished `bikes` and waits for `docks`, and
-// orders-002 is still copying `bikes`. The deployment is one group of two
-// targets, the counts are targets rather than rows, and the header reads the
-// rows as the stored apply state does.
+// orders-002 is still copying `bikes`, which orders-001 waits on. The
+// deployment is one group of two targets, the counts are targets rather than
+// rows, and the header reads the rows as the stored apply state does.
 func TestDerive_FoldsATargetsTableRowsIntoOneMember(t *testing.T) {
 	model := Derive([]Operation{
-		tableRow("orders-001", so.Completed),
-		tableRow("orders-002", so.Running),
-		tableRow("orders-001", so.Pending),
-		tableRow("orders-002", so.Pending),
+		tableRow("orders-001", so.Completed, 1),
+		tableRow("orders-002", so.Running, 1),
+		tableRow("orders-001", so.Pending, 2),
+		tableRow("orders-002", so.Pending, 2),
 	})
 
 	require.Len(t, model.Deployments, 2)
@@ -44,20 +45,21 @@ func TestDerive_FoldsATargetsTableRowsIntoOneMember(t *testing.T) {
 	require.Len(t, groups, 1)
 	assert.Equal(t, []int{0, 1}, groups[0].Members)
 	assert.Equal(t, state.Apply.Running, model.State)
-	assert.Equal(t, []StateCount{{"running", 1}, {"queued", 1}}, model.Counts)
+	assert.Equal(t, []StateCount{{"running", 1}, {"waiting", 1}}, model.Counts)
+	assert.Equal(t, "waiting for primary/orders-002", first.Label, "the queued table waits on the other target's copy of `bikes`")
 }
 
 // A failure on any table is its target's: orders-002 failed `bikes`, so it
 // reads failed with that table's error and identifiers, and it is the
 // rollout's first failure, though its `docks` row is still queued.
 func TestDerive_FoldedTargetFailsOnAnyTable(t *testing.T) {
-	failed := tableRow("orders-002", so.Failed)
+	failed := tableRow("orders-002", so.Failed, 1)
 	failed.Error = "Error 1062: Duplicate entry"
 	model := Derive([]Operation{
-		tableRow("orders-001", so.Completed),
+		tableRow("orders-001", so.Completed, 1),
 		failed,
-		tableRow("orders-001", so.Running),
-		tableRow("orders-002", so.Pending),
+		tableRow("orders-001", so.Running, 2),
+		tableRow("orders-002", so.Pending, 2),
 	})
 
 	require.Len(t, model.Deployments, 2)
@@ -75,19 +77,19 @@ func TestDerive_FoldedTargetFailsOnAnyTable(t *testing.T) {
 // table already held the change reads already applied. A target that had only
 // some of its tables already is one that ran the rest, so it reads completed.
 func TestDerive_FoldedTargetSettlesOnceEveryTableHas(t *testing.T) {
-	converged := func(target string) Operation {
-		op := tableRow(target, so.Completed)
+	converged := func(target string, step int) Operation {
+		op := tableRow(target, so.Completed, step)
 		op.NeverStarted = true
 		op.AlreadyConverged = true
 		return op
 	}
 	model := Derive([]Operation{
-		tableRow("orders-001", so.Completed),
-		converged("orders-002"),
-		converged("orders-003"),
-		tableRow("orders-001", so.Completed),
-		tableRow("orders-002", so.Completed),
-		converged("orders-003"),
+		tableRow("orders-001", so.Completed, 1),
+		converged("orders-002", 1),
+		converged("orders-003", 1),
+		tableRow("orders-001", so.Completed, 2),
+		tableRow("orders-002", so.Completed, 2),
+		converged("orders-003", 2),
 	})
 
 	require.Len(t, model.Deployments, 3)
@@ -98,14 +100,21 @@ func TestDerive_FoldedTargetSettlesOnceEveryTableHas(t *testing.T) {
 	assert.Equal(t, state.Apply.Completed, model.State)
 }
 
-// Rows fold only by a target of a deployment that addresses several targets.
-// Several rows dividing one target's work keep a member each, and so does the
-// sharded fan-out, whose rows are shards under a namespace finalizer.
-func TestDerive_FoldsOnlyTheTargetsOfAMultiTargetDeployment(t *testing.T) {
+// Only rows stamped with a table step fold. Rows that each run their member's
+// whole change keep a member each, whether several of them divide one
+// target's work, several targets each run several keyed members, or they are
+// the sharded fan-out, whose rows are shards under a namespace finalizer.
+func TestDerive_FoldsOnlyRowsOfATableByTableRollout(t *testing.T) {
 	for name, ops := range map[string][]Operation{
 		"one target's keyed work": {
 			{Deployment: "primary", Target: "orders-001", OperationKey: "ns_0", Work: true, State: so.Running},
 			{Deployment: "primary", Target: "orders-001", OperationKey: "ns_1", Work: true, State: so.Pending},
+		},
+		"several targets' keyed work": {
+			{Deployment: "primary", Target: "orders-001", OperationKey: "orders-001/ns_0", Work: true, State: so.Completed},
+			{Deployment: "primary", Target: "orders-002", OperationKey: "orders-002/ns_0", Work: true, State: so.Running},
+			{Deployment: "primary", Target: "orders-001", OperationKey: "orders-001/ns_1", Work: true, State: so.Pending},
+			{Deployment: "primary", Target: "orders-002", OperationKey: "orders-002/ns_1", Work: true, State: so.Pending},
 		},
 		"sharded fan-out": {
 			{Deployment: "primary", Target: "orders-001", OperationKey: "orders-001/ns_0/-80/t", Work: true, State: so.Running},
@@ -123,4 +132,43 @@ func TestDerive_FoldsOnlyTheTargetsOfAMultiTargetDeployment(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A target waiting on its next table is held by whatever holds that table's
+// row, which can be a failure on a target the member order puts after it.
+// Under halt, orders-002 failed `bikes`, so orders-001, done with `bikes` and
+// queued for `docks`, reads halted by orders-002's failure rather than queued.
+func TestDerive_FoldedTargetWaitsOnEarlierRowsOfOtherTargets(t *testing.T) {
+	row := func(target, st string, step int) Operation {
+		op := tableRow(target, st, step)
+		op.ContinueOnFailure = false
+		return op
+	}
+	model := Derive([]Operation{
+		row("orders-001", so.Completed, 1),
+		row("orders-002", so.Failed, 1),
+		row("orders-001", so.Pending, 2),
+		row("orders-002", so.Pending, 2),
+	})
+
+	require.Len(t, model.Deployments, 2)
+	first := model.Deployments[0]
+	assert.Equal(t, StateHalted, first.Presentation)
+	assert.Equal(t, "halted — primary/orders-002 failed", first.Label)
+	assert.Equal(t, StateFailed, model.Deployments[1].Presentation)
+}
+
+// The first failure is the first failed row, so a target that failed an
+// earlier table is reported before one the member order puts first that
+// failed a later table.
+func TestDerive_FirstFailureIsTheEarliestFailedRow(t *testing.T) {
+	model := Derive([]Operation{
+		tableRow("orders-001", so.Completed, 1),
+		tableRow("orders-002", so.Failed, 1),
+		tableRow("orders-001", so.Failed, 2),
+		tableRow("orders-002", so.Pending, 2),
+	})
+
+	require.NotNil(t, model.FirstFailure)
+	assert.Equal(t, "primary/orders-002", model.FirstFailure.Name)
 }
