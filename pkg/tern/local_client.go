@@ -2174,6 +2174,15 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 	if !applyRequestCarriesPlanPayload(req) {
 		return nil, nil
 	}
+	// A table step's dispatch carries one table of its target's plan, so a plan
+	// built from it would hold that table alone and the next step's table
+	// would have nothing to run against. Apply creation refuses a multi-target
+	// rollout across deployments, so a step's target was planned on this
+	// deployment and its plan is stored here; a step that arrives without one
+	// is refused rather than materialized short.
+	if step, ok := req.GetOptions()[dispatchRolloutStepOption]; ok {
+		return nil, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment; a step carries one table of its target's plan, so refusing to build the plan from it", step, req.PlanId)
+	}
 	return c.materializeApplyRequestPlan(ctx, req)
 }
 
@@ -2575,16 +2584,28 @@ func (c *LocalClient) existingIdempotentApply(ctx context.Context, req *ternv1.A
 // absent for every other dispatch.
 const dispatchMemberTargetOption = "member_target"
 
+// dispatchRolloutStepOption is the dispatch option naming the table step a
+// member dispatch runs, in a rollout run table by table. Each of a target's
+// steps is its own operation, so the data plane runs only the step's tables and
+// keys the operation by its step behind the target, the key the planner stored.
+// It is set only alongside dispatchMemberTargetOption.
+//
+// A data plane that does not read it derives the whole-target key instead,
+// which the dispatch's generation manifest does not name, so the dispatch is
+// refused before anything runs rather than run every table of the target.
+const dispatchRolloutStepOption = "rollout_step"
+
 // dispatchScope is the execution shape derived from a dispatch request: the
 // DDL changes this dispatch drives, the single target shard of a shard-scoped
-// dispatch, whether the dispatch is a task-less VSchema finalizer, and the
-// rollout member target its operation key is qualified with.
+// dispatch, whether the dispatch is a task-less VSchema finalizer, the rollout
+// member target its operation key is qualified with, and the table step it runs.
 type dispatchScope struct {
 	ddlChanges         []storage.TableChange
 	shard              string
 	finalizer          bool
 	finalizerNamespace string
 	memberTarget       string
+	rolloutStep        int
 }
 
 // deriveDispatchScope determines a dispatch request's scope. A sharded
@@ -2626,6 +2647,19 @@ func deriveDispatchScope(plan *storage.Plan, req *ternv1.ApplyRequest) (dispatch
 		return dispatchScope{}, fmt.Errorf("dispatch for rollout member target %q runs plan %s, which was produced for target %q; refusing to run one target's plan on another target's database", memberTarget, plan.PlanIdentifier, plan.Target)
 	}
 	scope := dispatchScope{ddlChanges: plan.FlatDDLChanges(), memberTarget: memberTarget}
+	rolloutStep, err := dispatchRolloutStep(req, memberTarget)
+	if err != nil {
+		return dispatchScope{}, err
+	}
+	if rolloutStep > 0 {
+		changes, err := rolloutStepDDLChanges(plan, req.DdlChanges)
+		if err != nil {
+			return dispatchScope{}, fmt.Errorf("dispatch for step %d of rollout member target %q: %w", rolloutStep, memberTarget, err)
+		}
+		scope.rolloutStep = rolloutStep
+		scope.ddlChanges = changes
+		return scope, nil
+	}
 	if len(req.TargetShards) > 0 {
 		shard, err := dispatchTargetShard(req.TargetShards)
 		if err != nil {
@@ -2662,6 +2696,88 @@ func dispatchMemberTarget(req *ternv1.ApplyRequest) (string, error) {
 	return target, nil
 }
 
+// dispatchRolloutStep reads the table step a dispatch names, or 0 when it names
+// none. A step belongs to one target's rows, so a dispatch naming a step without
+// a member target, or a step that is not a positive number, is refused rather
+// than run as some other shape. A step runs on a whole target, while a sharded
+// target's work is dispatched one shard at a time, so a dispatch naming both a
+// step and target shards is malformed and refused.
+func dispatchRolloutStep(req *ternv1.ApplyRequest, memberTarget string) (int, error) {
+	raw, ok := req.GetOptions()[dispatchRolloutStepOption]
+	if !ok {
+		return 0, nil
+	}
+	step, err := strconv.Atoi(raw)
+	if err != nil || step < 1 {
+		return 0, fmt.Errorf("dispatch rollout step %q is not a positive number; refusing a dispatch whose table step cannot be read", raw)
+	}
+	if memberTarget == "" {
+		return 0, fmt.Errorf("dispatch names rollout step %d but no member target; a table step is one target's work, so refusing to run it as the whole deployment's", step)
+	}
+	if len(req.TargetShards) > 0 {
+		return 0, fmt.Errorf("dispatch names rollout step %d and target shards %v; a table step runs on a whole target, so refusing a dispatch that names both", step, req.TargetShards)
+	}
+	return step, nil
+}
+
+// rolloutStepDDLChanges narrows the plan's changes to the tables a table step's
+// dispatch names. The plan is this target's own, so its statements are the ones
+// this target runs; the dispatch says only which of its tables the step covers.
+// A dispatched table the plan does not change is refused: the step would
+// otherwise run less than the control plane recorded, and report the missing
+// table as done. A step that names no table is refused too, since it would
+// leave an operation with nothing to drive. A step is one table, so a dispatch
+// naming two tables is refused: it would run both under one step's key, and the
+// other table's own step would run it again. The step's table may sit in more
+// than one of the target's namespaces, and each runs as a task of the step.
+//
+// The dispatch is checked against the target's plan, not against the step: the
+// data plane holds no map from step to table, so which table runs under which
+// step is the control plane's to get right and is not verified here.
+func rolloutStepDDLChanges(plan *storage.Plan, dispatched []*ternv1.TableChange) ([]storage.TableChange, error) {
+	type tableKey struct{ namespace, table string }
+	step := make(map[tableKey]bool, len(dispatched))
+	stepTable := ""
+	for i, ch := range dispatched {
+		if ch == nil {
+			return nil, fmt.Errorf("ddl_change %d is nil", i)
+		}
+		table := strings.TrimSpace(ch.TableName)
+		if table == "" {
+			return nil, fmt.Errorf("ddl_change %d has no table", i)
+		}
+		if stepTable != "" && table != stepTable {
+			return nil, fmt.Errorf("the dispatch names tables %q and %q; a table step runs one table, so refusing to run two under one step", stepTable, table)
+		}
+		stepTable = table
+		step[tableKey{strings.TrimSpace(ch.Namespace), table}] = true
+	}
+	if len(step) == 0 {
+		return nil, fmt.Errorf("the dispatch names no table")
+	}
+	var changes []storage.TableChange
+	covered := make(map[tableKey]bool, len(step))
+	for _, change := range plan.FlatDDLChanges() {
+		key := tableKey{change.Namespace, change.Table}
+		if !step[key] {
+			continue
+		}
+		covered[key] = true
+		changes = append(changes, change)
+	}
+	var uncovered []string
+	for key := range step {
+		if !covered[key] {
+			uncovered = append(uncovered, key.namespace)
+		}
+	}
+	if len(uncovered) > 0 {
+		slices.Sort(uncovered)
+		return nil, fmt.Errorf("plan %s has no change to table %q in namespace %q, which the step names", plan.PlanIdentifier, stepTable, uncovered[0])
+	}
+	return changes, nil
+}
+
 // operationIdentityForDispatch returns the operation key and kind the dispatch
 // scope stores on its apply_operations row.
 //
@@ -2695,6 +2811,9 @@ func operationIdentityForDispatch(scope dispatchScope) (operationKey, operationK
 		}
 		if scope.finalizer {
 			return storage.TargetOperationKey(scope.memberTarget, finalizerKeyForScope(scope)), storage.ApplyOperationKindGroupFinalizer, nil
+		}
+		if scope.rolloutStep > 0 {
+			return storage.TargetOperationKey(scope.memberTarget, storage.RolloutStepOperationKey(scope.rolloutStep)), "", nil
 		}
 		return storage.TargetOperationKey(scope.memberTarget, ""), "", nil
 	}
@@ -2959,6 +3078,7 @@ func (c *LocalClient) attachDispatchOperation(ctx context.Context, req *ternv1.A
 		OperationKind: operationKind,
 		Target:        plan.Target,
 		State:         state.ApplyOperation.Pending,
+		RolloutStep:   scope.rolloutStep,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
@@ -3274,6 +3394,7 @@ func (c *LocalClient) Apply(ctx context.Context, req *ternv1.ApplyRequest) (*ter
 		OperationKind: operationKind,
 		Target:        plan.Target,
 		State:         state.ApplyOperation.Pending,
+		RolloutStep:   scope.rolloutStep,
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}}
