@@ -8538,29 +8538,28 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
 <dl><dd>
 
-#### 56 of 64 targets
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 75%
 
 <details>
-<summary>Target names</summary>
+<summary><b>56 of 64 targets</b></summary>
 
 `orders_000`, `orders_001`, `orders_002`, `orders_003`, `orders_004`, `orders_005`, `orders_006`, `orders_007`, `orders_008`, `orders_009`, `orders_010`, `orders_011`, `orders_012`, `orders_013`, `orders_014`, `orders_015`, `orders_016`, `orders_017`, `orders_018`, `orders_019`, `orders_020`, `orders_021`, `orders_022`, `orders_023`, `orders_024`, `orders_025`, `orders_026`, `orders_027`, `orders_028`, `orders_029`, `orders_030`, `orders_031`, `orders_032`, `orders_033`, `orders_034`, `orders_035`, `orders_036`, `orders_037`, `orders_038`, `orders_039`, `orders_040`, `orders_041`, `orders_042`, `orders_043`, `orders_044`, `orders_045`, `orders_046`, `orders_047`, `orders_048`, `orders_049`, `orders_050`, `orders_051`, `orders_052`, `orders_053`, `orders_054`, `orders_055`
 
 </details>
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 96% · 40 complete, 4 running, 12 queued
-- Rows: 62,308,108 / 64,514,208 across 44 of 56 targets · ETA: ≥ 3m 15s
-- Running: `orders_040`, `orders_041`, `orders_042`, `orders_043`
-
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
-
-#### 8 of 64 targets
-
-`orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`
+- Rows: 62,308,108 / 64,514,208 across 44 of 56 targets · ETA: ≥ 3m 15s
+- Targets: 56 (4 copying, 12 queued, 40 complete)
+  - ◉ `orders_040`: 62.38% · 914,707 / 1,466,232 rows
+  - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
+  - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
+  - … 1 more copying targets
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 
+**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
 ```sql
 ALTER TABLE `orders`
     ADD INDEX `idx_user_id`(`user_id`),
@@ -8579,13 +8578,17 @@ ALTER TABLE `orders`
 <summary>🔄 eu — 4 running, 60 queued (64 targets)</summary>
 <dl><dd>
 
-**`orders`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 12% · 4 running, 60 queued
-- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
-- Running: `orders_000`, `orders_001`, `orders_002`, `orders_003`
+**`orders`**: 🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 1%
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
+- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
+- Targets: 64 (4 copying, 60 queued)
+  - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
+  - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
+  - ◉ `orders_002`: 12.48% · 183,029 / 1,466,232 rows
+  - … 1 more copying targets
 
 
 </dd></dl>
@@ -8614,13 +8617,16 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 🔄 Rolling out: 1 of 3 targets done, 1 running, 1 queued
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 81% · 1 complete, 1 running
-- Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
-- Running: `orders_001`
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 54%
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
+- Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
+- Targets: 3 (1 copying, 1 queued, 1 complete)
+  - ◉ `orders_001`: 62.38% · 914,707 / 1,466,232 rows
+  - ○ `orders_002`: queued
+  - ✓ `orders_000`: 1,466,232 rows
 
 
 ---
@@ -9960,7 +9966,7 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
 ❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72% · 40 of 60 targets complete · 1 failed
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 4,093,000 / 4,720,000 · ETA: 10m 0s
        • Targets: 60 (1 failed, 19 copying, 40 complete)
@@ -10000,18 +10006,16 @@ To stop this schema change:
 
 🟢 prod — 3 ready for cutover (3 targets)
 
-▸ targets payments-001, payments-002
-
-     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover · 0 of 2 targets complete
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+       targets payments-001, payments-002
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
        • Targets: 2 (2 waiting for cutover)
            ● payments-001: waiting for cutover
            ● payments-002: waiting for cutover
 
-▸ target payments-003
-
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+       target payments-003
        ALTER TABLE `orders` MODIFY COLUMN `source` varchar(32) DEFAULT NULL;
 
        • Targets: 1 (1 waiting for cutover)
@@ -10041,7 +10045,7 @@ To cut over prod/payments-001:
 
 ⏹️ prod — 1 completed · 2 stopped (3 targets)
 
-     ~ orders: ⏹️ Stopped · 1 of 3 targets complete
+     ~ orders: ⏹️ Stopped
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
        • Targets: 3 (2 stopped, 1 complete)

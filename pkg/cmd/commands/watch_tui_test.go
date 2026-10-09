@@ -855,7 +855,7 @@ func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {
 
 // Two targets of one deployment each copy their own tables against their own
 // schema. The watch view rolls the deployment up the way the progress output
-// does, listing each table once under the targets that copied it, so a
+// does, listing each table once and naming the targets that copied it, so a
 // deployment addressing several targets does not show every copy twice.
 func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "testapp", "production", false)
@@ -867,8 +867,8 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 		{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 	}
 	m.tables = []templates.TableProgress{
-		{Deployment: "primary", Target: "testapp-001", TableName: "users_001", ChangeType: "alter", Status: state.Task.Completed},
-		{Deployment: "primary", Target: "testapp-002", TableName: "users_002", ChangeType: "alter", Status: state.Task.Running},
+		{Deployment: "primary", Target: "testapp-001", TableName: "users_001", ChangeType: "alter", DDL: "ALTER TABLE `users_001` ADD COLUMN `region` varchar(20)", Status: state.Task.Completed},
+		{Deployment: "primary", Target: "testapp-002", TableName: "users_002", ChangeType: "alter", DDL: "ALTER TABLE `users_002` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
 	}
 
 	view := m.View()
@@ -876,14 +876,14 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	assertContainsInOrder(t, view,
 		"Targets: 1 completed · 1 running",
 		"primary — 1 completed · 1 running (2 targets)",
-		"target testapp-001",
-		"users_001",
-		"target testapp-002",
 		"users_002",
+		"target testapp-002",
+		"users_001",
+		"target testapp-001",
 		"To stop this schema change:",
 		"schemabot stop apply-multi-target -e production",
 		"ESC to detach",
 	)
-	assert.Equal(t, 1, strings.Count(view, "users_001"))
-	assert.Equal(t, 1, strings.Count(view, "users_002"))
+	assert.Equal(t, 1, strings.Count(view, "users_001:"))
+	assert.Equal(t, 1, strings.Count(view, "users_002:"))
 }

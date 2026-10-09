@@ -202,6 +202,20 @@ func (b *ddlBlockBudget) forTargetGroup(members []string) (restore func()) {
 	return b.scopePlan(targetGroupPlanScope(members))
 }
 
+// forNamedTargets marks the DDL rendered from here on as one table's DDL on the
+// targets named above it, naming the first one's stored plan, until the
+// returned restore runs.
+func (b *ddlBlockBudget) forNamedTargets(members []string) (restore func()) {
+	// The targets are named above the DDL, so the note says so rather than
+	// listing them again.
+	scope, groupNote := targetGroupPlanScope(members)
+	note := ""
+	if groupNote != "" {
+		note = "every target named above runs the same DDL"
+	}
+	return b.scopePlan(scope, note)
+}
+
 // forSoleTargetGroup marks the DDL rendered from here on as the plan of the
 // only group of targets a deployment's reporting targets form, rendered with
 // no heading naming its members, until the returned restore runs. unreported

@@ -82,13 +82,15 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 // countDeploymentTablesWithDDL counts the DDL blocks the per-deployment detail
 // sections render between them, so one comment's DDL budget is shared across
 // every deployment rather than granted to each. A rolled-up deployment renders
-// each distinct change once, however many targets run it.
+// each table's DDL once, however many targets run it.
 func countDeploymentTablesWithDDL(data MultiDeploymentApplyData) int {
 	count := 0
 	for _, g := range data.Model.Groups() {
 		if len(g.Members) > 1 {
-			for _, work := range targetWorkGroups(data, g) {
-				count += countTablesWithDDL(work.tables)
+			for _, line := range targetTableLines(data, g) {
+				if line.table.DDL != "" {
+					count++
+				}
 			}
 			continue
 		}
