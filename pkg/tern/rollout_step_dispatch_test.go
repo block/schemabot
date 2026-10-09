@@ -60,6 +60,8 @@ func TestDeriveDispatchScope_RefusesAStepItCannotRunAsRecorded(t *testing.T) {
 	delete(noTarget.Options, dispatchMemberTargetOption)
 	sharded := stepDispatch("1", "orders")
 	sharded.TargetShards = []string{"-80"}
+	unplannedTwice := stepDispatch("2", "payouts")
+	unplannedTwice.DdlChanges = append(unplannedTwice.DdlChanges, &ternv1.TableChange{Namespace: "billing", TableName: "payouts", Ddl: "dispatched text", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER})
 
 	for name, tc := range map[string]struct {
 		req  *ternv1.ApplyRequest
@@ -70,8 +72,11 @@ func TestDeriveDispatchScope_RefusesAStepItCannotRunAsRecorded(t *testing.T) {
 		"no member target":  {noTarget, "names rollout step 1 but no member target"},
 		"target shards":     {sharded, "names rollout step 1 and target shards [-80]"},
 		"unplanned table":   {stepDispatch("2", "payouts"), `plan plan-payments-001 has no change to table "payouts" in namespace "payments"`},
-		"two tables":        {stepDispatch("1", "orders", "refunds"), `the dispatch names tables "orders" and "refunds"`},
-		"no table":          {stepDispatch("1"), "the dispatch names no table"},
+		// Named in two namespaces, the refusal names the first in order, so a
+		// rerun reports the same one.
+		"unplanned table in two namespaces": {unplannedTwice, `plan plan-payments-001 has no change to table "payouts" in namespace "billing"`},
+		"two tables":                        {stepDispatch("1", "orders", "refunds"), `the dispatch names tables "orders" and "refunds"`},
+		"no table":                          {stepDispatch("1"), "the dispatch names no table"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := deriveDispatchScope(rolloutStepPlan(), tc.req)
@@ -100,6 +105,24 @@ func TestDeriveDispatchScope_RolloutStepRunsItsTableInEveryNamespace(t *testing.
 	for _, change := range scope.ddlChanges {
 		assert.Equal(t, "orders", change.Table)
 	}
+}
+
+// A table step's dispatch carries one table of its target's plan, so a step
+// that reaches a deployment with no stored plan is refused rather than
+// materialized into a plan of that one table, and no plan row is written.
+func TestPlanForApplyRequest_RefusesToMaterializeAPlanFromOneStep(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClient(store)
+	req := stepDispatch("1", "orders")
+	req.PlanId = "plan-payments-001"
+	req.SchemaFiles = map[string]*ternv1.SchemaFiles{"payments": {Files: map[string]string{"orders.sql": "CREATE TABLE `orders` ..."}}}
+
+	got, err := c.planForApplyRequest(t.Context(), req)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dispatch for rollout step 1 has no plan plan-payments-001 stored on this deployment")
+	assert.Nil(t, got)
+	assert.Nil(t, store.created, "nothing is materialized from one step's table")
 }
 
 // The control plane names a stepped operation's table step on its dispatch,

@@ -2174,6 +2174,15 @@ func (c *LocalClient) planForApplyRequest(ctx context.Context, req *ternv1.Apply
 	if !applyRequestCarriesPlanPayload(req) {
 		return nil, nil
 	}
+	// A table step's dispatch carries one table of its target's plan, so a plan
+	// built from it would hold that table alone and the next step's table
+	// would have nothing to run against. Apply creation refuses a multi-target
+	// rollout across deployments, so a step's target was planned on this
+	// deployment and its plan is stored here; a step that arrives without one
+	// is refused rather than materialized short.
+	if step, ok := req.GetOptions()[dispatchRolloutStepOption]; ok {
+		return nil, fmt.Errorf("dispatch for rollout step %s has no plan %s stored on this deployment; a step carries one table of its target's plan, so refusing to build the plan from it", step, req.PlanId)
+	}
 	return c.materializeApplyRequestPlan(ctx, req)
 }
 
@@ -2690,7 +2699,9 @@ func dispatchMemberTarget(req *ternv1.ApplyRequest) (string, error) {
 // dispatchRolloutStep reads the table step a dispatch names, or 0 when it names
 // none. A step belongs to one target's rows, so a dispatch naming a step without
 // a member target, or a step that is not a positive number, is refused rather
-// than run as some other shape.
+// than run as some other shape. A step runs on a whole target, while a sharded
+// target's work is dispatched one shard at a time, so a dispatch naming both a
+// step and target shards is malformed and refused.
 func dispatchRolloutStep(req *ternv1.ApplyRequest, memberTarget string) (int, error) {
 	raw, ok := req.GetOptions()[dispatchRolloutStepOption]
 	if !ok {
@@ -2719,6 +2730,10 @@ func dispatchRolloutStep(req *ternv1.ApplyRequest, memberTarget string) (int, er
 // naming two tables is refused: it would run both under one step's key, and the
 // other table's own step would run it again. The step's table may sit in more
 // than one of the target's namespaces, and each runs as a task of the step.
+//
+// The dispatch is checked against the target's plan, not against the step: the
+// data plane holds no map from step to table, so which table runs under which
+// step is the control plane's to get right and is not verified here.
 func rolloutStepDDLChanges(plan *storage.Plan, dispatched []*ternv1.TableChange) ([]storage.TableChange, error) {
 	type tableKey struct{ namespace, table string }
 	step := make(map[tableKey]bool, len(dispatched))
@@ -2750,10 +2765,15 @@ func rolloutStepDDLChanges(plan *storage.Plan, dispatched []*ternv1.TableChange)
 		covered[key] = true
 		changes = append(changes, change)
 	}
+	var uncovered []string
 	for key := range step {
 		if !covered[key] {
-			return nil, fmt.Errorf("plan %s has no change to table %q in namespace %q, which the step names", plan.PlanIdentifier, key.table, key.namespace)
+			uncovered = append(uncovered, key.namespace)
 		}
+	}
+	if len(uncovered) > 0 {
+		slices.Sort(uncovered)
+		return nil, fmt.Errorf("plan %s has no change to table %q in namespace %q, which the step names", plan.PlanIdentifier, stepTable, uncovered[0])
 	}
 	return changes, nil
 }
