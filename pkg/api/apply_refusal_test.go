@@ -288,13 +288,23 @@ func TestApplyHandler_MemberPlanRefusalsAreClientErrors(t *testing.T) {
 // plan or as the sentinel, so a PR comment can name the plan without
 // presenting the error text.
 func TestExecuteApplyMissingPlanIsTyped(t *testing.T) {
-	for name, plans := range map[string]*mockPlanLookupStore{
-		"nil plan": {},
-		"sentinel": {err: storage.ErrPlanNotFound},
-	} {
+	tests := map[string]struct {
+		plans    *mockPlanLookupStore
+		wantText string
+	}{
+		"nil plan": {plans: &mockPlanLookupStore{}, wantText: "plan not found: plan-gone"},
+		"sentinel": {plans: &mockPlanLookupStore{err: storage.ErrPlanNotFound}, wantText: "plan not found: plan-gone"},
+		// A store that attaches a reason to the sentinel keeps it on the error
+		// for the log line.
+		"sentinel with reason": {
+			plans:    &mockPlanLookupStore{err: fmt.Errorf("read plan from replica: %w", storage.ErrPlanNotFound)},
+			wantText: "read plan from replica: plan not found: plan-gone",
+		},
+	}
+	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
 			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-			svc := New(&mockStorageWithPlanLookup{plans: plans}, testServerConfig(), nil, logger)
+			svc := New(&mockStorageWithPlanLookup{plans: tt.plans}, testServerConfig(), nil, logger)
 
 			_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-gone", Environment: "staging"})
 
@@ -302,7 +312,7 @@ func TestExecuteApplyMissingPlanIsTyped(t *testing.T) {
 			missing, ok := errors.AsType[*PlanNotFoundError](err)
 			require.True(t, ok, "a missing plan must be a *PlanNotFoundError, got %T", err)
 			assert.Equal(t, "plan-gone", missing.PlanID)
-			assert.Equal(t, "plan not found: plan-gone", err.Error())
+			assert.Equal(t, tt.wantText, err.Error())
 		})
 	}
 }
@@ -327,14 +337,22 @@ var errDriverStorage = errors.New("Error 1205 (HY000): Lock wait timeout exceede
 // rather than as a request it has to change. The response is a fixed line
 // naming the plan; the SQL driver's text stays in the server log.
 func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
-	const wantMessage = "apply failed: storage error while queueing plan plan-1; see server logs, then retry"
+	const wantMessage = "apply failed: storage error while queueing plan plan-1; see server logs and check for a stored apply before retrying"
 
+	// The server log carries what the response withholds: the SQL driver's
+	// text, and the identifiers that tie the failed attempt to its plan, its
+	// routing, its PR and its caller.
 	t.Run("storing the apply fails", func(t *testing.T) {
 		applies := &capturingApplyStore{err: errDriverStorage}
-		svc, tasks := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
+		plan := executeApplyTestPlan()
+		plan.Repository = "acme/schemas"
+		plan.PullRequest = 42
+		svc, tasks := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+		var logs bytes.Buffer
+		svc.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelError}))
 		outcomes := recordApplyOutcomes(t)
 
-		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-1","environment":"staging","caller":"github:octocat"}`)
 
 		assert.Equal(t, http.StatusInternalServerError, status)
 		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
@@ -345,6 +363,15 @@ func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
 		assert.Empty(t, tasks.tasks)
 		assert.Equal(t, map[string]int64{"error": 1}, outcomes.statuses(t))
 		assert.Equal(t, []codes.Code{codes.Error}, outcomes.spanStatuses())
+
+		for _, attr := range []string{
+			"plan_id=plan-1", "database=testdb", "database_type=mysql", "deployment=" + DefaultDeployment,
+			"environment=staging", "repo=acme/schemas", "pr=42", "caller=github:octocat",
+			`operation="store apply and tasks"`, "10.0.0.5",
+		} {
+			assert.Contains(t, logs.String(), attr)
+		}
+		assert.Regexp(t, `apply_id=apply-[0-9a-f]+`, logs.String(), "the log names the apply that was being queued")
 	})
 
 	t.Run("reading the lock fails", func(t *testing.T) {
@@ -373,7 +400,7 @@ func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
 		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
 		assert.Equal(t, http.StatusInternalServerError, status)
 		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
-		assert.Equal(t, "apply failed: storage error while queueing plan plan-primary; see server logs, then retry", resp.Error)
+		assert.Equal(t, "apply failed: storage error while queueing plan plan-primary; see server logs and check for a stored apply before retrying", resp.Error)
 		assert.Nil(t, applies.apply)
 
 		_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-primary", Environment: "production", RendersRollout: true})

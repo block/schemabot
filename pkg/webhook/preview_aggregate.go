@@ -86,7 +86,7 @@ func PreviewRollbackConfirmPlanWithoutRouting() string {
 	return templates.RenderGenericError(templates.SchemaErrorData{
 		RequestedBy: "jackjackbits", Timestamp: "2026-01-15 14:30:00",
 		Environment: "staging", CommandName: action.RollbackConfirm,
-		ErrorDetail: rollbackExecutionErrorMessage("staging", &api.PlanRoutingMetadataError{PlanID: "plan_8f2c41", Field: "deployment"}),
+		ErrorDetail: rollbackExecutionErrorMessage("staging", "", &api.PlanRoutingMetadataError{PlanID: "plan_8f2c41", Field: "deployment"}),
 	})
 }
 

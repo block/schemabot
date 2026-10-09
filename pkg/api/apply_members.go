@@ -152,7 +152,7 @@ func (s *Service) MemberPlansForReviewRound(ctx context.Context, plan *storage.P
 	if err != nil {
 		return nil, &applyStorageError{
 			Operation: fmt.Sprintf("list member plans for %s/%s round %s", plan.Database, environment, plan.PlanIdentifier),
-			Database:  plan.Database,
+			Plan:      plan,
 			Err:       err,
 		}
 	}

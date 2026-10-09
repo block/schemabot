@@ -3587,7 +3587,12 @@ func writeEnvApplyLeadIn(sb *strings.Builder, sentence string, plan *PlanComment
 	sb.WriteString(sentence + ":\n")
 }
 
-func tenantCommand(baseCommand, environment, tenant string) string {
+// TenantCommand renders a pasteable PR command for one environment, carrying
+// the deployment's tenant when it has one so the pasted command addresses this
+// deployment. baseCommand starts with the bot's trigger word, "schemabot": a PR
+// comment is read by the bot, not run as the CLI, so the command word never
+// varies with cli_name.
+func TenantCommand(baseCommand, environment, tenant string) string {
 	return scopedCommand(baseCommand, environment, "", tenant)
 }
 

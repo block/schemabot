@@ -547,7 +547,7 @@ func (h *Handler) executeApply(
 	if err != nil {
 		h.service.ClearPendingObserver(pendingObserver)
 		h.logger.Error("apply execution failed", "repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment, "error", err)
-		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, err))
+		h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyExecutionErrorMessage(actionName, environment, h.deploymentTenant(), err))
 		return
 	}
 
@@ -781,13 +781,17 @@ func unverifiedMemberWorkMessage(unverified, environment string, automatic bool)
 	return fmt.Sprintf("SchemaBot could not verify %s, so nothing was applied. %s", unverified, recovery)
 }
 
-func applyExecutionErrorMessage(command, environment string, err error) string {
+// applyExecutionErrorMessage renders the PR-facing detail for a failed apply
+// dispatch. tenant is the deployment's own tenant, carried by every command the
+// detail coaches so pasting one addresses this deployment.
+func applyExecutionErrorMessage(command, environment, tenant string, err error) string {
 	return dispatchErrorMessage(err, dispatchMessages{
 		command:     command,
 		environment: environment,
+		tenant:      tenant,
 		lockIntentChanged: "The pending schema change changed while this command was running. " +
 			"The apply was rejected; review the latest plan and run the command again.",
-		replan:   fmt.Sprintf("Run `schemabot %s -e %s` to create a new plan.", action.Apply, environment),
+		replan:   fmt.Sprintf("Run `%s` to create a new plan.", templates.TenantCommand("schemabot "+action.Apply, environment, tenant)),
 		internal: "Failed to execute apply. See SchemaBot server logs for details.",
 	})
 }
@@ -795,10 +799,11 @@ func applyExecutionErrorMessage(command, environment string, err error) string {
 // dispatchMessages carries the command-specific words dispatchErrorMessage
 // renders around the shared classification of a failed dispatch.
 type dispatchMessages struct {
-	// command and environment name the PR command to re-issue in a remedy,
-	// for example `schemabot rollback-confirm -e staging`.
+	// command, environment and tenant name the PR command to re-issue in a
+	// remedy, for example `schemabot rollback-confirm -e staging --tenant acme`.
 	command     string
 	environment string
+	tenant      string
 	// lockIntentChanged is the whole message for a lock intent change; its
 	// recovery differs between apply and rollback.
 	lockIntentChanged string
@@ -834,7 +839,7 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 	var featureErr *api.UnsupportedFeatureError
 	if errors.As(err, &featureErr) {
 		parts := []string{featureErr.Error() + "."}
-		if remedy := unsupportedFeatureRemedy(featureErr.Feature, msgs.command, msgs.environment); remedy != "" {
+		if remedy := unsupportedFeatureRemedy(featureErr.Feature, msgs); remedy != "" {
 			parts = append(parts, remedy)
 			if msgs.afterRefusal != "" {
 				parts = append(parts, msgs.afterRefusal)
@@ -869,11 +874,11 @@ func dispatchErrorMessage(err error, msgs dispatchMessages) string {
 // unsupportedFeatureRemedy names the command to re-issue without the option
 // that asked for a feature the database type refused. Features no PR command
 // option requests have no remedy: the operator cannot change the request.
-func unsupportedFeatureRemedy(feature schema.Feature, command, environment string) string {
+func unsupportedFeatureRemedy(feature schema.Feature, msgs dispatchMessages) string {
 	if feature != schema.FeatureDeferredCutover {
 		return ""
 	}
-	return fmt.Sprintf("Run `schemabot %s -e %s` again without `--defer-cutover`.", command, environment)
+	return fmt.Sprintf("Run `%s` again without `--defer-cutover`.", templates.TenantCommand("schemabot "+msgs.command, msgs.environment, msgs.tenant))
 }
 
 // postAutoConfirmDowngrade posts the locked plan comment that pauses an

@@ -679,7 +679,7 @@ func (h *Handler) rollbackConfirmCommandCore(parent context.Context, repo string
 			h.logger.Error("rollback apply failed", "repo", repo, "pr", pr, "database", database,
 				"database_type", dbType, "environment", environment, "plan_id", rollbackPlan.PlanIdentifier, "error", err)
 		}
-		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, rollbackExecutionErrorMessage(environment, err))
+		h.postCommandError(repo, pr, installationID, action.RollbackConfirm, environment, requestedBy, rollbackExecutionErrorMessage(environment, h.deploymentTenant(), err))
 		return false, nil
 	}
 
@@ -746,14 +746,26 @@ const msgRollbackLockIntentChanged = "The pending rollback changed while this co
 // tells the operator why and which command to re-issue instead of coaching a
 // retry that would fail the same way; the pin survives that refusal, so the
 // remedy says so. A lock intent change gets the rollback-specific recovery.
-func rollbackExecutionErrorMessage(environment string, err error) string {
+// tenant is the deployment's own tenant, carried by every command the detail
+// coaches so pasting one addresses this deployment.
+//
+// The re-plan names the rollback command without the apply it reverses: the
+// stored rollback plan does not record that apply, and the rollback plan
+// comment on the PR does, so the detail says where to read it. The command
+// renders without a placeholder because this detail is HTML-escaped on its way
+// into the comment, which would show a `<apply-id>` placeholder as its entity
+// text; pasted as it stands, the command is answered with the rollback usage
+// rather than ignored.
+func rollbackExecutionErrorMessage(environment, tenant string, err error) string {
 	return dispatchErrorMessage(err, dispatchMessages{
 		command:           action.RollbackConfirm,
 		environment:       environment,
+		tenant:            tenant,
 		lockIntentChanged: msgRollbackLockIntentChanged,
 		afterRefusal:      "The pending rollback stays pinned for it.",
-		replan: fmt.Sprintf("Run `schemabot %s APPLY_ID -e %s` again, with APPLY_ID the apply you rolled back, to create a new rollback plan, then confirm it with `schemabot %s -e %s`.",
-			action.Rollback, environment, action.RollbackConfirm, environment),
+		replan: fmt.Sprintf("Run `%s` followed by the apply ID from the rollback plan comment to create a new rollback plan, then confirm it with `%s`.",
+			templates.TenantCommand("schemabot "+action.Rollback, environment, tenant),
+			templates.TenantCommand("schemabot "+action.RollbackConfirm, environment, tenant)),
 		internal: "Failed to execute rollback. See SchemaBot server logs for details.",
 	})
 }

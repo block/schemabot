@@ -58,7 +58,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// Footer
 	sb.WriteString("---\n\n")
 	sb.WriteString("To confirm this rollback, comment:\n")
-	fmt.Fprintf(&sb, "```\n%s\n```\n\n", tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
+	fmt.Fprintf(&sb, "```\n%s\n```\n\n", TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
 	sb.WriteString("To cancel, comment:\n")
 	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock", data.Tenant))
 
@@ -69,7 +69,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 // without a held lock. Tenant is the deployment's own tenant; when set, the
 // suggested command carries it so pasting the hint addresses this deployment.
 func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
-	rollbackCmd := tenantCommand("schemabot rollback <apply-id>", environment, tenant)
+	rollbackCmd := TenantCommand("schemabot rollback <apply-id>", environment, tenant)
 	if database == "" {
 		return fmt.Sprintf("## 🔒 No Lock Found\n\n"+
 			"**Environment**: `%s`\n\n"+
@@ -92,8 +92,8 @@ func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
 // through its endpoint or profile, which cliName's wrapper selects.
 func RenderRollbackMissingApplyID(cliName, environment, tenant string) string {
 	return offerSupportChannel("## Missing Apply ID\n\n" +
-		fmt.Sprintf("Usage: `%s`\n\n", tenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
-		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", tenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
+		fmt.Sprintf("Usage: `%s`\n\n", TenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
+		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", TenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
 		"You can find the apply ID in the summary comment of a completed apply, " +
 		fmt.Sprintf("or by running `%s`.", cliCommand(cliName, "status "+environmentFlag(environment))))
 }

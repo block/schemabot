@@ -6668,7 +6668,7 @@ ALTER TABLE `users` DROP INDEX `idx_email`;
 
 ### Error
 
-> Plan `plan_8f2c41` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. Run `schemabot rollback APPLY_ID -e staging` again, with APPLY_ID the apply you rolled back, to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`.
+> Plan `plan_8f2c41` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. Run `schemabot rollback -e staging` followed by the apply ID from the rollback plan comment to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`.
 <!-- schemabot:offer-support-channel -->
 </details>
 
