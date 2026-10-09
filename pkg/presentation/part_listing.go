@@ -22,6 +22,23 @@ type Part struct {
 	RowsTotal       int64
 }
 
+// PendingQueued and PendingNotStarted name a part still to run: queued while
+// its rollout can still run it, not started once the rollout has settled and
+// never will.
+const (
+	PendingQueued     = "queued"
+	PendingNotStarted = "not started"
+)
+
+// PendingWord names the parts still to run of a rollout that has or has not
+// settled.
+func PendingWord(settled bool) string {
+	if settled {
+		return PendingNotStarted
+	}
+	return PendingQueued
+}
+
 // partListInlineLimit is the most parts a listing names one per line. Past it,
 // the listing names only the parts that need attention or set the pace, and
 // the heading's counts cover the rest.
@@ -153,10 +170,11 @@ func PartGlyph(status string) string {
 }
 
 // PartDetail is a part's state in words, for the text after its name: the
-// rows a complete part copied, how far a copying part is, how far a stopped or
-// cancelled part got, or its phase. Progress reads the way a table's own does,
-// the percent and then its rows: "62.00% · 620 / 1,000 rows".
-func PartDetail(p Part) string {
+// rows a complete part copied, how far a copying part is, pendingWord for a
+// part still to run, how far a stopped or cancelled part got, or its phase.
+// Progress reads the way a table's own does, the percent and then its rows:
+// "62.00% · 620 / 1,000 rows".
+func PartDetail(p Part, pendingWord string) string {
 	status := state.NormalizeTaskStatus(p.Status)
 	switch status {
 	case state.Task.Completed:
@@ -172,7 +190,7 @@ func PartDetail(p Part) string {
 		}
 		return partProgress(p)
 	case state.Task.Pending:
-		return "queued"
+		return pendingWord
 	case state.Task.Stopped, state.Task.Cancelled:
 		// A part that had copied rows says how far it got before it halted.
 		if p.RowsCopied > 0 && p.RowsTotal > 0 {
@@ -204,9 +222,8 @@ type PartCounts struct {
 	Queued            int
 	Failed            int
 	Cancelled         int
-	// PendingLabel is the word Phrases counts Queued parts by, "queued" when
-	// empty. A rollout that has settled names them "not started", since they
-	// never will.
+	// PendingLabel is the word Phrases counts Queued parts by, PendingQueued
+	// when empty (PendingWord).
 	PendingLabel string
 	// Other counts every status the fields above do not name, keyed by
 	// status, so a part in any phase stays in the summary.
@@ -267,7 +284,7 @@ func (c PartCounts) Phrases() []string {
 	if c.Queued > 0 {
 		label := c.PendingLabel
 		if label == "" {
-			label = "queued"
+			label = PendingQueued
 		}
 		parts = append(parts, fmt.Sprintf("%d %s", c.Queued, label))
 	}

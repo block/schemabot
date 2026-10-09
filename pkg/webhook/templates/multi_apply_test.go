@@ -2089,6 +2089,54 @@ func TestRenderMultiDeploymentApplyComment_SettledRolloutTableReadsNotStarted(t 
 		assert.Contains(t, out, "**`refunds`**: ✅ Complete on 1 of 2 targets · 1 not started\n")
 		assert.NotContains(t, out, "queued")
 	})
+	t.Run("a target's last snapshot still reads copying", func(t *testing.T) {
+		// The apply was cancelled with testapp-002 part-way through `orders`;
+		// its last snapshot still reads copying, so the table lists its targets,
+		// and the count and the line for testapp-003 both say not started.
+		model := presentation.Derive([]presentation.Operation{
+			parallelTarget("primary", "testapp-001", so.Completed),
+			parallelTarget("primary", "testapp-002", so.Cancelled),
+			parallelTarget("primary", "testapp-003", so.Cancelled),
+		})
+		require.Equal(t, state.Apply.Cancelled, model.State)
+		orders := func(database, status string, copied int64) *ApplyStatusCommentData {
+			d := tablesDetail(database, TableProgressData{TableName: "orders", Status: status, RowsCopied: copied, RowsTotal: 1000})
+			d.State = state.Apply.Cancelled
+			return d
+		}
+		out := renderTargets(model,
+			orders("testapp_001", state.Task.Completed, 1000),
+			orders("testapp_002", state.Task.Running, 400),
+			orders("testapp_003", state.Task.Pending, 0),
+		)
+		assert.Contains(t, out, "- Targets: 3 (1 copying, 1 not started, 1 complete)\n")
+		assert.Contains(t, out, "`testapp-003`: not started\n")
+		assert.NotContains(t, out, "queued")
+	})
+	t.Run("a running rollout keeps queued", func(t *testing.T) {
+		model := presentation.Derive([]presentation.Operation{
+			steppedTarget("testapp-001", so.Completed, 1),
+			steppedTarget("testapp-002", so.Running, 1),
+			steppedTarget("testapp-001", so.Pending, 2),
+			steppedTarget("testapp-002", so.Pending, 2),
+		})
+		require.Equal(t, state.Apply.Running, model.State)
+		running := func(database, ordersStatus string) *ApplyStatusCommentData {
+			d := tablesDetail(database,
+				TableProgressData{TableName: "orders", Status: ordersStatus, RowsCopied: 1000},
+				TableProgressData{TableName: "refunds", Status: state.Task.Pending},
+			)
+			d.State = state.Apply.Running
+			return d
+		}
+		out := renderTargets(model,
+			running("testapp_001", state.Task.Completed),
+			running("testapp_002", state.Task.Running),
+		)
+		assert.Contains(t, out, "**`refunds`**: ⏳ Queued")
+		assert.NotContains(t, out, "not started")
+		assert.NotContains(t, out, "Not started")
+	})
 }
 
 // The table-by-table headline settles the way the target headline does: every

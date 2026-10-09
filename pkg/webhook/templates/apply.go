@@ -1085,7 +1085,7 @@ func shardSummaryBreakdownState(status string) bool {
 
 // renderShardSummary lists a sharded table's shards while it is in flight.
 func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
-	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards, budget)
+	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards, presentation.PendingQueued, budget)
 }
 
 // writeMemberList lists a table's members, the shards of a sharded table or
@@ -1096,8 +1096,9 @@ func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *dd
 // counts, rather than growing a line per member. A settled table's line
 // already says where it ended, so the listing stays out of the way then. A
 // comment that would not fit otherwise keeps only the line counting them
-// (ddlBlockBudget.listsMembers).
-func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string, members []ShardProgressData, budget *ddlBlockBudget) {
+// (ddlBlockBudget.listsMembers). pendingWord names the members still to run
+// (presentation.PendingWord), in the count and on their lines alike.
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
 	if len(members) <= 1 {
 		return
 	}
@@ -1109,6 +1110,7 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string,
 		return presentation.Part{Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal}
 	}
 	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
+	c.PendingLabel = pendingWord
 	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
 	if !budget.listsMembers() {
 		return
@@ -1119,7 +1121,7 @@ func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string,
 			continue
 		}
 		p := part(line.Part)
-		fmt.Fprintf(sb, "  - %s %s: %s\n", presentation.PartGlyph(p.Status), inlineCode(p.Name), presentation.PartDetail(p))
+		fmt.Fprintf(sb, "  - %s %s: %s\n", presentation.PartGlyph(p.Status), inlineCode(p.Name), presentation.PartDetail(p, pendingWord))
 	}
 }
 

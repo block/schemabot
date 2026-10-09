@@ -18,7 +18,7 @@ var (
 
 // FormatShardProgress returns per-shard progress for a Vitess table as a string.
 func FormatShardProgress(shards []ShardProgress) string {
-	return formatPartProgress(shards, presentation.ShardNoun, "queued")
+	return formatPartProgress(shards, presentation.ShardNoun, presentation.PendingQueued)
 }
 
 // formatTableParts renders a table's per-part progress: its shards, or its
@@ -27,14 +27,14 @@ func formatTableParts(t TableProgress) string {
 	if t.AcrossTargets {
 		return formatPartProgress(t.Shards, presentation.TargetNoun, pendingTargetsWord(t))
 	}
-	return formatPartProgress(t.Shards, presentation.ShardNoun, "queued")
+	return formatPartProgress(t.Shards, presentation.ShardNoun, presentation.PendingQueued)
 }
 
 // formatPartProgress renders the parts one table's change runs across — the
 // shards of a keyspace or the targets of a rollout — named by noun: a heading
 // counting them by state, then the lines presentation.ListParts picks, the
 // listing the PR comment shows too. pendingWord names the parts still
-// pending: "queued", or "not started" once a settled rollout will not run them.
+// pending (presentation.PendingWord).
 func formatPartProgress(shards []ShardProgress, noun presentation.Noun, pendingWord string) string {
 	if len(shards) == 0 {
 		return ""
@@ -63,10 +63,7 @@ func shardPart(s ShardProgress) presentation.Part {
 // its state, then its state in words, with a copying part's ETA. pendingWord
 // names a part still pending.
 func formatShardLine(s ShardProgress, pendingWord string) string {
-	detail := presentation.PartDetail(shardPart(s))
-	if s.Status == state.Task.Pending {
-		detail = pendingWord
-	}
+	detail := presentation.PartDetail(shardPart(s), pendingWord)
 	glyph := presentation.PartGlyph(s.Status)
 	switch s.Status {
 	case state.Task.Completed:

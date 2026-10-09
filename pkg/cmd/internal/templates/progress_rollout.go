@@ -439,10 +439,7 @@ func formatNotStartedAcrossTargets(t TableProgress) string {
 // pendingTargetsWord is how a rolled-up table names the targets still pending
 // on it: queued while the rollout runs, not started once it has settled.
 func pendingTargetsWord(t TableProgress) string {
-	if t.RolloutSettled {
-		return "not started"
-	}
-	return "queued"
+	return presentation.PendingWord(t.RolloutSettled)
 }
 
 // formatHaltedAcrossTargets renders a halted table across targets the way the

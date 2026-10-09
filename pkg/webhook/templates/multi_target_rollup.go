@@ -306,10 +306,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	// A target still to run that has reported no progress has not started the
 	// table, so the line counts it as queued.
 	pending := queued + waiting
-	pendingWord := "queued"
-	if settled {
-		pendingWord = "not started"
-	}
+	pendingWord := presentation.PendingWord(settled)
 	coverage := targetCoverage(done, running, pending, failed, retrying, pendingWord)
 	if running > 0 && total > 0 {
 		percent := int(copied * 100 / total)
@@ -343,7 +340,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 				line += " · ETA: " + floor + ui.FormatETA(eta)
 			}
 			sb.WriteString(line + "\n")
-			writeMemberList(sb, presentation.TargetNoun, state.Task.Running, strip, budget)
+			writeMemberList(sb, presentation.TargetNoun, state.Task.Running, strip, pendingWord, budget)
 			return
 		}
 	}
@@ -376,7 +373,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
 	writeDDL()
-	writeMemberList(sb, presentation.TargetNoun, status, strip, budget)
+	writeMemberList(sb, presentation.TargetNoun, status, strip, pendingWord, budget)
 }
 
 // listsTargets reports whether a table line in status lists its targets one
