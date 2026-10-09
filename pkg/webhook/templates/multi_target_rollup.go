@@ -49,7 +49,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		lineSilent, lineWaiting = 0, 0
 	}
 	changing := changingMembers(data.Model, g)
-	settled := rolloutSettled(data.Model, g)
+	settled := data.Model.RolloutSettled(g)
 	rankTargetTableLines(lines, lineSilent)
 	for _, line := range lines {
 		first := memberDetail(data.Details, line.members[0])
@@ -70,13 +70,6 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		restoreScope()
 	}
 	writeFailedTargets(sb, data.Model, g)
-}
-
-// rolloutSettled reports whether a deployment's rollout has settled with no
-// target left to run: the apply is in a settled state and every target in g
-// is too. A table still pending on some target then never starts there.
-func rolloutSettled(model presentation.Apply, g presentation.Group) bool {
-	return state.IsState(model.State, state.SettledApplyStates...) && model.TargetProgress(g).Unsettled == 0
 }
 
 // writeTargetLineDDL writes a table line's DDL under its headline, headed by

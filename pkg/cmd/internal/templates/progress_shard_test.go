@@ -37,7 +37,7 @@ func TestFormatShardLineShowsSubPercentFraction(t *testing.T) {
 		RowsCopied:      3_000,
 		RowsTotal:       1_604_159,
 		PercentComplete: 0,
-	})
+	}, "queued")
 
 	assert.Contains(t, line, "0.19% · 3,000 / 1,604,159 rows")
 	assert.NotContains(t, line, " 0%")

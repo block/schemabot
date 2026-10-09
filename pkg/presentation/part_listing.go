@@ -204,6 +204,10 @@ type PartCounts struct {
 	Queued            int
 	Failed            int
 	Cancelled         int
+	// PendingLabel is the word Phrases counts Queued parts by, "queued" when
+	// empty. A rollout that has settled names them "not started", since they
+	// never will.
+	PendingLabel string
 	// Other counts every status the fields above do not name, keyed by
 	// status, so a part in any phase stays in the summary.
 	Other map[string]int
@@ -261,7 +265,11 @@ func (c PartCounts) Phrases() []string {
 		parts = append(parts, fmt.Sprintf("%d cancelled", c.Cancelled))
 	}
 	if c.Queued > 0 {
-		parts = append(parts, fmt.Sprintf("%d queued", c.Queued))
+		label := c.PendingLabel
+		if label == "" {
+			label = "queued"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", c.Queued, label))
 	}
 	if c.Complete > 0 {
 		parts = append(parts, fmt.Sprintf("%d complete", c.Complete))

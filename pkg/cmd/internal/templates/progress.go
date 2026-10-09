@@ -480,6 +480,9 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 	if isPartlyCompletedAcrossTargets(t) {
 		return formatPartlyCompletedAcrossTargets(t)
 	}
+	if isNotStartedAcrossTargets(t) {
+		return formatNotStartedAcrossTargets(t)
+	}
 
 	var b strings.Builder
 

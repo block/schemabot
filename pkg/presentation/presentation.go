@@ -966,6 +966,14 @@ type TargetProgress struct {
 	Unsettled int
 }
 
+// RolloutSettled reports whether g's rollout has settled with no target left
+// to run: the apply is in a settled state and every target in g is too. A
+// table still pending on some target then never starts there, so it reads as
+// not started rather than queued.
+func (a Apply) RolloutSettled(g Group) bool {
+	return state.IsState(a.State, state.SettledApplyStates...) && a.TargetProgress(g).Unsettled == 0
+}
+
 // TargetProgress counts g's targets for its status line. Done and AlreadyHad
 // are counted apart from the rest, so Done + AlreadyHad plus the Others counts
 // is always Total.

@@ -101,6 +101,10 @@ type TableProgress struct {
 	// are still to run and have reported no progress yet, so have not started
 	// it. A settled target is not among them.
 	UnreportedTargets int
+	// RolloutSettled marks a rolled-up table whose rollout has settled with no
+	// target left to run, so a target still pending on it never starts it and
+	// reads as not started rather than queued.
+	RolloutSettled bool
 }
 
 // ShardProgress contains per-shard progress for template rendering.

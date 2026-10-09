@@ -166,8 +166,10 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 		lineSilent, lineSettled = 0, 0
 	}
 	rolled := rolledTargetTables(v, byMember, reporting)
+	settled := v.Model.RolloutSettled(g)
 	for i := range rolled {
 		rolled[i].UnreportedTargets = lineSilent
+		rolled[i].RolloutSettled = settled
 		if covered := len(rolled[i].Shards) + lineSilent + lineSettled; covered < len(g.Members)-converged {
 			rolled[i].OnTargets = targetSubsetLabel(rolled[i].Shards, len(g.Members)-converged)
 		}
@@ -399,18 +401,48 @@ func partlyCompletedCounts(targets []ShardProgress) (completed, queued int) {
 }
 
 // formatPartlyCompletedAcrossTargets renders a table completed on some targets
-// and queued on the rest: how many completed, then how many are queued, with
-// each target's line beneath.
+// and queued on the rest: how many completed, then how many are queued, or not
+// started once the rollout has settled, with each target's line beneath.
 func formatPartlyCompletedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
 	completed, queued := partlyCompletedCounts(t.Shards)
-	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ✓ Complete on %d of %d targets · %d queued\n", t.TableName, completed, len(t.Shards)+t.UnreportedTargets, queued+t.UnreportedTargets)
+	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ✓ Complete on %d of %d targets · %d %s\n", t.TableName, completed, len(t.Shards)+t.UnreportedTargets, queued+t.UnreportedTargets, pendingTargetsWord(t))
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
 	b.WriteString("\n")
 	b.WriteString(formatTableParts(t))
 	return b.String()
+}
+
+// isNotStartedAcrossTargets reports whether a table rolled up across targets
+// is pending on every target of a rollout that has settled: no target ran it,
+// and none will.
+func isNotStartedAcrossTargets(t TableProgress) bool {
+	return t.AcrossTargets && t.RolloutSettled && state.IsState(t.Status, state.Task.Pending)
+}
+
+// formatNotStartedAcrossTargets renders a table no target of a settled rollout
+// ran the way the PR comment's table line does, with each target's line
+// beneath.
+func formatNotStartedAcrossTargets(t TableProgress) string {
+	var b strings.Builder
+	writeTableLine(&b, t, "⊘ Not started")
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	b.WriteString("\n")
+	b.WriteString(formatTableParts(t))
+	return b.String()
+}
+
+// pendingTargetsWord is how a rolled-up table names the targets still pending
+// on it: queued while the rollout runs, not started once it has settled.
+func pendingTargetsWord(t TableProgress) string {
+	if t.RolloutSettled {
+		return "not started"
+	}
+	return "queued"
 }
 
 // formatHaltedAcrossTargets renders a halted table across targets the way the
