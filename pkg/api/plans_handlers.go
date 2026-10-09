@@ -241,10 +241,14 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 		}
 		change := &apitypes.SchemaChangeResponse{Namespace: namespace}
 		if nsData.ChangesVSchema() {
-			// The stored artifact is the desired VSchema document, not a
-			// rendered diff, so the namespace is flagged as carrying VSchema
-			// work without one.
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
+			// The diff recorded at plan time is the one the plan was reviewed
+			// with, so a stored plan shows it rather than only flagging the
+			// namespace. A plan recorded without one still reads as carrying
+			// VSchema work.
+			if diff := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; diff != "" {
+				change.Metadata[apitypes.VSchemaDiffMetadataKey] = diff
+			}
 			if !nsData.ShowsVSchemaChange() {
 				// Carried so the stored plan renders the namespace the way
 				// the live plan did: by its DDL and finalize, with no VSchema
