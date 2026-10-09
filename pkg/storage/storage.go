@@ -641,7 +641,9 @@ type ApplyStore interface {
 	// operation keyed by its target is refused with
 	// ErrApplyOperationKeyingMismatch when the deployment's existing work
 	// operations of the apply are not keyed that way, and the reverse, so one
-	// target's work can never attach under two keys. On success the operation's ID and every
+	// target's work can never attach under two keys. An attach to an apply
+	// whose work a newer generation took over (Apply.SupersededBy) fails with
+	// ErrApplyTakenOver. On success the operation's ID and every
 	// task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
@@ -861,6 +863,13 @@ type ApplyStore interface {
 	// dispatch — the marked apply's hold on the database was already released
 	// when the marker was earned.
 	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
+
+	// GetSupersededBy returns the apply's superseded_by marker, the identifier
+	// of the apply that took over its work, or "" when nothing has. It reads
+	// the one column, so a driver checking the marker on every projection pass
+	// does not reload the whole row. It returns ErrApplyNotFound when the apply
+	// does not exist.
+	GetSupersededBy(ctx context.Context, applyID int64) (string, error)
 
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.

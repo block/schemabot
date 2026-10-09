@@ -437,6 +437,14 @@ func TestPlanCommentDeleteFailureRetriesOnNextSupersede(t *testing.T) {
 // that posting through the handler would run.
 func insertPlanCommentRow(t *testing.T, st storage.Storage, repo string, pr int, database, scope, headSHA string, commentID int64, nodeID string) {
 	t.Helper()
+	insertPlanCommentRowWithOutcome(t, st, repo, pr, database, scope, headSHA, commentID, nodeID, false)
+}
+
+// insertPlanCommentRowWithOutcome is insertPlanCommentRow for a comment whose
+// recorded outcome matters to the test: upToDate marks a comment that showed
+// nothing to act on.
+func insertPlanCommentRowWithOutcome(t *testing.T, st storage.Storage, repo string, pr int, database, scope, headSHA string, commentID int64, nodeID string, upToDate bool) {
+	t.Helper()
 	require.NoError(t, st.PlanComments().Insert(t.Context(), &storage.PlanComment{
 		Repository:       repo,
 		PullRequest:      pr,
@@ -446,95 +454,8 @@ func insertPlanCommentRow(t *testing.T, st storage.Storage, repo string, pr int,
 		HeadSHA:          headSHA,
 		GitHubCommentID:  commentID,
 		GitHubNodeID:     nodeID,
+		UpToDate:         upToDate,
 	}))
-}
-
-// TestStalePlanCommentsDeletedWithoutNewComment exercises the up-to-date-PR
-// UX: when the current head's plan outcome supersedes prior comments without
-// posting a new comment — an auto-plan that resolves to no changes — plan
-// comments rendered at older heads with no apply are deleted, since the
-// pending DDL and apply prompt they advertise no longer match the branch and
-// nothing ever ran them. A comment already rendered at the current head stays
-// expanded (it may be the only visible plan for its environment scope), other
-// databases' slots are untouched, and the sweep never posts a comment of its
-// own.
-func TestStalePlanCommentsDeletedWithoutNewComment(t *testing.T) {
-	const repo = "org/plan-retire-stale-sweep"
-	h, st, fake := setupPlanCommentHandler(t, repo, true)
-
-	insertPlanCommentRow(t, st, repo, 42, "orders", "production,staging", "shaA", 9001, "IC_stale_shaA")
-	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaB", 9002, "IC_current_shaB")
-	insertPlanCommentRow(t, st, repo, 42, "billing", "production,staging", "shaA", 9003, "IC_billing_shaA")
-	fake.setCurrentHead("shaB")
-
-	client, err := h.clientForRepo(repo, 12345)
-	require.NoError(t, err)
-	h.retireStalePlanComments(t.Context(), client, repo, 42, "orders", "mysql", "shaB")
-
-	assert.Equal(t, []int64{9001}, fake.deletedCommentIDs(),
-		"only the prior-head orders comment is deleted")
-	assert.Empty(t, fake.minimizedNodes())
-	assert.Equal(t, []string{"shaB"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"),
-		"the current-head comment stays expanded and the stale row is recorded deleted")
-	assert.Equal(t, []string{"shaA"}, unretiredHeads(t, st, repo, 42, "billing", "mysql"),
-		"another database's slot is untouched")
-	assert.Equal(t, 0, fake.createCount(), "the sweep posts no comment")
-}
-
-// TestStalePlanCommentSweepSkipsWhenHeadMoved covers the concurrent-push
-// safety of the no-new-comment sweep: a plan outcome computed for an older
-// head must never retire the current head's live plan comment, because
-// nothing would replace it and a deleted comment cannot be restored. When the
-// PR head has moved past the sweep's head, the sweep leaves every comment
-// expanded — the current head's own plan outcome supersedes the slot.
-func TestStalePlanCommentSweepSkipsWhenHeadMoved(t *testing.T) {
-	const repo = "org/plan-retire-stale-head-moved"
-	h, st, fake := setupPlanCommentHandler(t, repo, true)
-
-	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaA", 9001, "IC_old_shaA")
-	insertPlanCommentRow(t, st, repo, 42, "orders", "staging", "shaC", 9002, "IC_live_shaC")
-	fake.setCurrentHead("shaC")
-
-	client, err := h.clientForRepo(repo, 12345)
-	require.NoError(t, err)
-	h.retireStalePlanComments(t.Context(), client, repo, 42, "orders", "mysql", "shaB")
-
-	assert.Empty(t, fake.deletedCommentIDs(),
-		"a sweep for a superseded head must not touch the slot")
-	assert.Empty(t, fake.minimizedNodes())
-	assert.ElementsMatch(t, []string{"shaA", "shaC"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"),
-		"every comment stays expanded until the current head's own sweep")
-}
-
-// TestStalePlanCommentSweepMinimizesApplyOwnedHead covers the safety hold on
-// the no-new-comment sweep: once an apply exists for the head a plan comment
-// was rendered at, that comment is the operational record of what ran. A
-// later head resolving to no changes — for example after the applied change
-// lands and the schema converges — minimizes it, keeping the record
-// expandable, while a stale comment with no apply is deleted outright.
-func TestStalePlanCommentSweepMinimizesApplyOwnedHead(t *testing.T) {
-	const repo = "org/plan-retire-stale-apply-owned"
-	h, st, fake := setupPlanCommentHandler(t, repo, true)
-
-	insertPlanCommentRow(t, st, repo, 42, "inventory", "staging", "shaA", 9001, "IC_owned_shaA")
-	// A second stale comment with no apply proves the two retirement paths
-	// run side by side in one sweep: shaZ is deleted while shaA is minimized.
-	insertPlanCommentRow(t, st, repo, 42, "inventory", "staging", "shaZ", 9002, "IC_unowned_shaZ")
-	fake.setCurrentHead("shaB")
-
-	// The shaA plan becomes an apply before the next push.
-	createRunningApplyForHead(t, st, repo, 42, "inventory", "staging", "shaA")
-
-	client, err := h.clientForRepo(repo, 12345)
-	require.NoError(t, err)
-	h.retireStalePlanComments(t.Context(), client, repo, 42, "inventory", "mysql", "shaB")
-
-	assert.Equal(t, []string{"IC_owned_shaA"}, fake.minimizedNodes(),
-		"the apply-owned shaA comment is minimized, never deleted")
-	assert.Equal(t, []int64{9002}, fake.deletedCommentIDs(),
-		"the unowned stale comment is deleted in the same sweep")
-	assert.Empty(t, unretiredHeads(t, st, repo, 42, "inventory", "mysql"),
-		"both comments are recorded retired")
 }
 
 // TestPRWideStalePlanCommentSweep covers the PR whose new head resolves no
@@ -734,4 +655,154 @@ func TestPlanCommentSweepSkipsRowsPostedAfterAnchor(t *testing.T) {
 	assert.Empty(t, fake.deletedCommentIDs(), "the concurrently posted newer comment must not be retired")
 	assert.Empty(t, fake.minimizedNodes())
 	assert.ElementsMatch(t, []string{"sha2", "sha3"}, unretiredHeads(t, st, repo, 42, "orders", "mysql"))
+}
+
+// replacementDecision asks the handler whether an auto-plan that would
+// otherwise post nothing must post a plan comment for slot to replace the
+// slot's visible answer.
+func replacementDecision(t *testing.T, h *Handler, repo string, slot planCommentSlot, keepMatchingOutcome bool) bool {
+	t.Helper()
+	client, err := h.clientForRepo(repo, 12345)
+	require.NoError(t, err)
+	return h.priorHeadPlanCommentNeedsReplacing(t.Context(), client, repo, 42, slot, keepMatchingOutcome)
+}
+
+// Two pushes land close together. The newer head's plan shows DDL and posts
+// first; the older head's slow auto-plan then finishes and resolves to no
+// changes. Its comment would be stale on arrival and would sit below the
+// current answer contradicting it, so it does not post — on a schema-neutral
+// push or a schema-changing one.
+func TestPlanCommentReplacementSkipsAHeadThePRMovedPast(t *testing.T) {
+	const repo = "org/plan-replace-stale-head"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaB", 9001, "IC_current_ddl", false)
+	fake.setCurrentHead("shaB")
+
+	stale := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging"}, HeadSHA: "shaA", UpToDate: true}
+	assert.False(t, replacementDecision(t, h, repo, stale, false), "a plan for a head the PR moved past must not post")
+	assert.False(t, replacementDecision(t, h, repo, stale, true), "a plan for a head the PR moved past must not post")
+
+	current := stale
+	current.HeadSHA = "shaB"
+	assert.True(t, replacementDecision(t, h, repo, current, true),
+		"the same outcome on the current head does replace the comment showing DDL")
+}
+
+// Every environment's schema request failed, so the plan resolved no head.
+// Its error-only comment cannot be told apart from the visible answer by
+// head, and posting it untracked would repeat on every push for as long as
+// the failure lasts; the failing check run reports the failure instead.
+func TestPlanCommentReplacementSkipsAPlanWithNoResolvedHead(t *testing.T) {
+	const repo = "org/plan-replace-no-head"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaA", 9001, "IC_no_changes", true)
+	fake.setCurrentHead("shaB")
+
+	assert.False(t, replacementDecision(t, h, repo, planCommentSlot{DatabaseType: "mysql"}, true))
+}
+
+// Under the minimize-based policy, an apply ran the DDL from shaA's plan
+// comment, so that comment stays expanded as the record of what ran. shaB's
+// auto-plan resolves to no changes and posts its no-changes comment, which is
+// now the PR's answer. Later schema-neutral pushes keep resolving to no
+// changes; the answer still matches, so none of them posts again, even though
+// shaA's apply-owned comment showing DDL stays visible.
+func TestPlanCommentReplacementIgnoresApplyOwnedHistoryUnderMinimizePolicy(t *testing.T) {
+	const repo = "org/plan-replace-minimize-history"
+	h, st, fake := setupPlanCommentHandler(t, repo, false)
+
+	slot := planCommentSlot{Database: "ledger", DatabaseType: "mysql", Environments: []string{"staging"}, HeadSHA: "shaA"}
+	fake.setCurrentHead("shaA")
+	h.postTrackedPlanComment(repo, 42, 12345, slot, "plan at shaA with DDL")
+	createRunningApplyForHead(t, st, repo, 42, "ledger", "staging", "shaA")
+
+	slot.HeadSHA, slot.UpToDate = "shaB", true
+	fake.setCurrentHead("shaB")
+	require.True(t, replacementDecision(t, h, repo, slot, false), "the no-changes plan replaces shaA's answer")
+	h.postTrackedPlanComment(repo, 42, 12345, slot, "no changes at shaB")
+	require.ElementsMatch(t, []string{"shaA", "shaB"}, unretiredHeads(t, st, repo, 42, "ledger", "mysql"),
+		"the apply-owned shaA comment stays expanded under the minimize policy")
+
+	for _, head := range []string{"shaC", "shaD"} {
+		slot.HeadSHA = head
+		fake.setCurrentHead(head)
+		assert.False(t, replacementDecision(t, h, repo, slot, true),
+			"schema-neutral push to %s keeps shaB's matching answer", head)
+	}
+	assert.Equal(t, 2, fake.createCount(), "no comment beyond shaA's and shaB's")
+}
+
+// After an apply settles, the plan re-runs for the head it last answered
+// (shaB): its visible comment still shows DDL, but the DDL has now run and
+// the plan resolves to no changes. The comment no longer matches its own
+// head's plan, so the no-changes comment replaces it; a same-head comment
+// whose outcome still matches stays.
+func TestPlanCommentReplacementComparesTheOutcomeOnTheSameHead(t *testing.T) {
+	const repo = "org/plan-replace-same-head"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaB", 9001, "IC_shows_ddl", false)
+	fake.setCurrentHead("shaB")
+
+	slot := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging"}, HeadSHA: "shaB", UpToDate: true}
+	assert.True(t, replacementDecision(t, h, repo, slot, true))
+	assert.True(t, replacementDecision(t, h, repo, slot, false))
+
+	slot.UpToDate = false
+	assert.False(t, replacementDecision(t, h, repo, slot, true))
+	assert.False(t, replacementDecision(t, h, repo, slot, false))
+}
+
+// At shaA the plan for every environment showed DDL. The change was then
+// applied outside the PR, and a staging-only plan command posted a newer
+// no-changes reply. A schema-neutral push to shaB plans every environment
+// and finds no changes. The staging-only reply says nothing about
+// production, so it must not stand in for the answer: the comment covering
+// every environment still offers the DDL, and this head's plan replaces it.
+func TestPlanCommentReplacementReadsTheAnswerForItsOwnEnvironments(t *testing.T) {
+	const repo = "org/plan-replace-mixed-scope"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "production,staging", "shaA", 9001, "IC_every_env_ddl", false)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaA", 9002, "IC_staging_no_changes", true)
+	fake.setCurrentHead("shaB")
+
+	slot := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging", "production"}, HeadSHA: "shaB", UpToDate: true}
+	assert.True(t, replacementDecision(t, h, repo, slot, true),
+		"the outdated comment for every environment is replaced despite the newer staging-only reply")
+}
+
+// The only visible comment is a staging-only plan reply rendered at shaA. A
+// push to shaB plans every environment and finds no changes. No comment
+// covers those environments, and the reply renders a prior head, so this
+// head's plan posts and supersedes it. Once that comment is the answer for
+// every environment, later schema-neutral pushes keep it even while the
+// staging-only reply stays visible, as an apply-owned comment does under the
+// minimize-based policy.
+func TestPlanCommentReplacementSupersedesANarrowerReplyFromAPriorHead(t *testing.T) {
+	const repo = "org/plan-replace-narrower-reply"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaA", 9001, "IC_staging_reply", true)
+	fake.setCurrentHead("shaB")
+
+	slot := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging", "production"}, HeadSHA: "shaB", UpToDate: true}
+	assert.True(t, replacementDecision(t, h, repo, slot, true))
+	assert.True(t, replacementDecision(t, h, repo, slot, false))
+
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "production,staging", "shaB", 9002, "IC_every_env_no_changes", true)
+	slot.HeadSHA = "shaC"
+	fake.setCurrentHead("shaC")
+	assert.False(t, replacementDecision(t, h, repo, slot, true),
+		"the answer for every environment still matches, so the visible staging-only reply forces no post")
+}
+
+// A staging-only plan reply rendered at the current head is the only visible
+// comment. Planning every environment at that head adds nothing to replace:
+// the reply is not from a prior head, so no comment posts.
+func TestPlanCommentReplacementLeavesANarrowerReplyFromThisHead(t *testing.T) {
+	const repo = "org/plan-replace-narrower-same-head"
+	h, st, fake := setupPlanCommentHandler(t, repo, true)
+	insertPlanCommentRowWithOutcome(t, st, repo, 42, "orders", "staging", "shaB", 9001, "IC_staging_reply", true)
+	fake.setCurrentHead("shaB")
+
+	slot := planCommentSlot{Database: "orders", DatabaseType: "mysql", Environments: []string{"staging", "production"}, HeadSHA: "shaB", UpToDate: true}
+	assert.False(t, replacementDecision(t, h, repo, slot, false))
 }

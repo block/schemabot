@@ -29,9 +29,17 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
+// mustIgnoredTables indexes ignore_tables entries the test knows are valid.
+func mustIgnoredTables(t *testing.T, entries []string) engine.IgnoredTables {
+	t.Helper()
+	ignored, err := engine.NewIgnoredTables(entries)
+	require.NoError(t, err)
+	return ignored
+}
+
 func TestBaselinePolicyTableMembership(t *testing.T) {
 	declared := map[string]bool{"users": true, "audit_log_archive_2019": true}
-	ignored := engine.NewIgnoredTables([]string{"flyway_schema_history", "audit_log_archive_2018"})
+	ignored := mustIgnoredTables(t, []string{"flyway_schema_history", "audit_log_archive_2018"})
 	tests := []struct {
 		table              string
 		wantRollbackReason string
@@ -50,7 +58,7 @@ func TestBaselinePolicyTableMembership(t *testing.T) {
 			assert.Empty(t, pulledBaseline.exclusionReason(tt.table), "pull exports every enumerated table")
 		})
 	}
-	assert.Equal(t, engine.ExemptReasonIgnoreTables, rollbackBaseline(declared, engine.NewIgnoredTables([]string{"audit_log_archive_2019"})).exclusionReason("audit_log_archive_2019"),
+	assert.Equal(t, engine.ExemptReasonIgnoreTables, rollbackBaseline(declared, mustIgnoredTables(t, []string{"audit_log_archive_2019"})).exclusionReason("audit_log_archive_2019"),
 		"the exact ignore policy withholds a named table before introspection; the plan separately refuses declared contradictions")
 }
 

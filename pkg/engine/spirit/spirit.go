@@ -635,7 +635,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	)
 
 	// Fetch current schema from database (use database from DSN, not req.Database)
-	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", database, err)
+	}
 	currentSchema, withheld, err := e.fetchCurrentSchema(ctx, req.Credentials.DSN, database, ignored)
 	if err != nil {
 		return nil, fmt.Errorf("fetch current schema: %w", err)
@@ -1256,7 +1259,9 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 // The test is on the entry's shape, not on whether it names a live table, so
 // one archive-shaped entry takes the exclusion off the whole read even when it
 // matches nothing — and the convention it matches is the one that partition
-// rotation produces, where the affected set can be large. The loader decides
+// rotation produces, where the affected set can be large. A pattern entry
+// takes it off as well, since which names a pattern reaches is only known once
+// the catalog is read. The loader decides
 // before it has a name list to compare against, so shape is all this side can
 // test; an exclusion that kept the cheap path for every archive table the
 // config does not name would have to come from the loader, which already holds
@@ -1267,7 +1272,7 @@ func progressState(rm *runningSchemaChange, spiritState status.State) engine.Sta
 // withheld from here whatever the ordering.
 func liveSchemaFilterOptions(ignored engine.IgnoredTables) []table.FilterOption {
 	opts := []table.FilterOption{table.WithoutUnderscoreTables, table.WithStrippedAutoIncrement}
-	if !ignored.NamesAny(table.IsArchiveTable) {
+	if !ignored.MayWithhold(table.IsArchiveTable) {
 		opts = append(opts, table.WithoutArchiveTables)
 	}
 	return opts

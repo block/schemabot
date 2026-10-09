@@ -196,6 +196,50 @@ The PostgreSQL shape differs from MySQL in three ways:
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
 
+### PostgreSQL Etre targets
+
+An `etre` resolver with `database_type: postgres` discovers PostgreSQL targets
+the same way it discovers MySQL ones: it looks the opaque target up by a label,
+reads the host from an entity field, and fetches credentials from the
+configured backend. It reads its own `postgres` block.
+
+```yaml
+target_resolver:
+  etre:
+    - addr: "https://etre.example.com"
+      database_type: postgres
+      entity_type: db_cluster
+      target_label: target_id
+      env_label: env
+      attribute_fields: [cluster_name]
+      postgres:
+        host_field: writer_endpoint
+        table_owner: "app_owner"           # optional; see table_owner above
+        ca_ref: "embedded:rds-global"      # optional for RDS endpoints
+      credentials:
+        type: awssm
+        region: us-east-1
+        secret_name: "db/{cluster_name}/schemabot"
+```
+
+A PostgreSQL connection is made to one database, so the resolver needs its
+name. It comes from the credential secret, which is read as JSON in the format
+AWS uses for RDS database secrets; any `engine`, `host`, or `port` fields are
+ignored, because the entity decides where to connect:
+
+```json
+{"username": "schemabot", "password": "...", "dbname": "orders"}
+```
+
+Because the secret names the user, leave `credentials.username` unset. A
+resolver whose engine decodes its secret (`postgres` or `vitess`) refuses to
+start when a username is configured, on both the `secret_ref` and `awssm`
+backends, rather than ignoring it.
+
+`table_owner` and `ca_ref` mean the same as on a `dsn_from` target. They apply
+to every target the resolver serves, so a resolver serves clusters that share
+one owner role.
+
 ## gRPC Mode
 
 SchemaBot delegates to remote services that implement the Tern proto. This is useful for distributed deployments where schema changes need to run in separate isolated environments.
@@ -1960,10 +2004,22 @@ for the same set of environments. A same-commit comment covering different
 environments is kept expanded — it may be the only visible plan for those
 environments.
 
-A plan outcome can also supersede without posting: when an auto-plan resolves
-to no changes, no new comment appears (the check run alone reports the green
-state), but plan comments from prior commits are still retired — the pending
-DDL and apply prompt they show no longer match the branch.
+Once a PR shows a plan comment, it keeps showing a current one. When an
+auto-plan resolves to no changes and a plan comment from a prior commit is
+still visible, the auto-plan posts its no-changes plan comment, which
+supersedes the prior one like any other plan comment. A PR that has never shown
+a plan comment gets no comment for a no-changes auto-plan; the check run alone
+reports the green state. A push that changes no schema input files leaves the
+newest visible plan comment for the same environments in place while it
+still matches the plan: a comment that shows changes stays while there are
+still changes, and one that shows none stays while there are still none. When the live database moved
+without the schema files changing and the plan flipped between those two
+outcomes, for example after the PR's change was applied outside the PR, the
+auto-plan posts a new plan comment that supersedes the outdated one. The
+comparison is changes against no changes, not the DDL itself: a comment whose
+DDL was partly applied elsewhere stays until the next plan comment replaces
+it. A plan for a commit the PR has already moved past never posts a
+replacement; the current commit's own plan answers instead.
 
 By default, a superseded plan comment no apply ever acted on is deleted from
 the PR timeline outright — its DDL never ran and is reproducible from the

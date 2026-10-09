@@ -80,24 +80,24 @@ func SetAuthToken(token string) {
 type bearerTransport struct {
 	base  http.RoundTripper
 	token string
-	// origin, when set, is the one origin (as requestOrigin renders it) the
+	// origin, when set, is the one origin (as RequestOrigin renders it) the
 	// private local-runtime credential may be sent to; every other request
 	// is refused outright.
 	origin string
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.origin != "" && requestOrigin(req.URL) != t.origin {
+	if t.origin != "" && RequestOrigin(req.URL) != t.origin {
 		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
 	}
 	chain, complete := redirectChain(req)
 	if !complete {
-		warnUnauthenticatedRedirect("its origin cannot be established", "", requestOrigin(req.URL))
+		WarnUnauthenticatedRedirect("its origin cannot be established", "", RequestOrigin(req.URL))
 		return t.base.RoundTrip(withoutAuthorization(req))
 	}
 	first := chain[0]
-	if !stayedOnFirstOrigin(chain) {
-		warnUnauthenticatedRedirect("it is on another origin", requestOrigin(first.URL), requestOrigin(req.URL))
+	if !StayedOnFirstOrigin(chain) {
+		WarnUnauthenticatedRedirect("it is on another origin", RequestOrigin(first.URL), RequestOrigin(req.URL))
 		return t.base.RoundTrip(withoutAuthorization(req))
 	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
@@ -111,23 +111,29 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(req)
 }
 
-// warnWriter receives the CLI's warning lines. It is the process's stderr, the
-// same stream the commands use for their own warnings, so an operator sees why
-// a later 401 happened next to the command output rather than in a log format
-// they filter out.
-var warnWriter io.Writer = os.Stderr
+// warnWriter receives the CLI's warning lines. Nil means the process's stderr
+// as it is when the warning is written, the same stream the commands use for
+// their own warnings, so an operator sees why a later 401 happened next to the
+// command output rather than in a log format they filter out. It is resolved at
+// write time rather than bound at package init, so a caller that redirects
+// os.Stderr sees the warning too.
+var warnWriter io.Writer
 
-// warnUnauthenticatedRedirect tells the operator that a redirect is being
+// WarnUnauthenticatedRedirect tells the operator that a redirect is being
 // followed without the token and why, naming the origin the token belongs to
 // (when known) and the origin the redirect points at.
-func warnUnauthenticatedRedirect(reason, tokenOrigin, redirectOrigin string) {
+func WarnUnauthenticatedRedirect(reason, tokenOrigin, redirectOrigin string) {
 	subject := "the auth token"
 	if tokenOrigin != "" {
 		subject += " for " + tokenOrigin
 	}
 	// The warning is advisory. A stderr that refuses writes leaves nowhere to
 	// report that, and the request itself is unaffected.
-	_, _ = fmt.Fprintf(warnWriter, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
+	out := warnWriter
+	if out == nil {
+		out = os.Stderr
+	}
+	_, _ = fmt.Fprintf(out, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
 		subject, redirectOrigin, reason)
 }
 
@@ -163,22 +169,29 @@ func redirectChain(req *http.Request) (chain []*http.Request, complete bool) {
 	return chain, true
 }
 
-// stayedOnFirstOrigin reports whether every hop in a redirect chain targets the
-// origin of the request the command sent.
-func stayedOnFirstOrigin(chain []*http.Request) bool {
-	origin := requestOrigin(chain[0].URL)
+// StayedOnFirstOrigin reports whether every hop in a redirect chain targets the
+// origin of the request the command sent. The chain is oldest first, so an
+// http.Client CheckRedirect policy passes its via requests with the pending
+// request appended. Any CLI client that sends a credential across redirects
+// holds it to this rule, so the token stays with the origin it was sent to.
+// An empty chain has sent nothing, so it has left no origin.
+func StayedOnFirstOrigin(chain []*http.Request) bool {
+	if len(chain) == 0 {
+		return true
+	}
+	origin := RequestOrigin(chain[0].URL)
 	for _, hop := range chain[1:] {
-		if requestOrigin(hop.URL) != origin {
+		if RequestOrigin(hop.URL) != origin {
 			return false
 		}
 	}
 	return true
 }
 
-// requestOrigin renders a URL's origin as scheme://host:port, with the scheme
+// RequestOrigin renders a URL's origin as scheme://host:port, with the scheme
 // and host lowercased and the scheme's default port made explicit, so the same
 // server compares equal however a redirect spells it.
-func requestOrigin(u *url.URL) string {
+func RequestOrigin(u *url.URL) string {
 	scheme := strings.ToLower(u.Scheme)
 	port := u.Port()
 	if port == "" {
@@ -523,6 +536,6 @@ func SetLocalAuth(token, endpoint string) {
 	SetAuthToken(token)
 	authTransport.origin = endpoint
 	if u, err := url.Parse(endpoint); err == nil {
-		authTransport.origin = requestOrigin(u)
+		authTransport.origin = RequestOrigin(u)
 	}
 }
