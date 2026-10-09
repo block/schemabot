@@ -68,9 +68,12 @@ type Operation struct {
 
 	// Parallel is true when the operation's cutover_policy is "parallel" (resolved
 	// by the caller from storage.CutoverPolicyParallel). Under parallel the copy
-	// phase has no earlier-sibling gate at all — every deployment copies
-	// concurrently from the start — so a pending operation is never shown waiting
-	// for or halted by an earlier sibling. Cutover ordering is unchanged (it is
+	// phase has no earlier-sibling ordering — every deployment copies
+	// concurrently from the start — so a pending operation is never shown
+	// waiting for an earlier sibling, and a cancelled or reverted one does not
+	// hold it. Failure admission still applies: a terminal-failed earlier
+	// sibling holds it (halted, or paused under on_failure=pause) unless the
+	// policy continues past the failure. Cutover ordering is unchanged (it is
 	// strict-complete and policy-independent), so a parked parallel operation
 	// still waits for earlier cutovers exactly like barrier. Barrier and Parallel
 	// are mutually exclusive: the caller derives each from the same stored policy.
@@ -498,17 +501,23 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 // label agrees with what the operator will claim next.
 func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 	op := ops[i]
-	// Under parallel the copy phase has no earlier-sibling gate, so a pending
-	// operation is immediately claimable regardless of any earlier sibling — it
-	// is never halted by or waiting for one. Mirror FindNextApplyOperation, whose
-	// copy-start gate matches no arm for parallel.
+	// Under parallel the copy phase has no earlier-sibling ordering, so a
+	// pending operation never waits for an earlier sibling and a cancelled or
+	// reverted one does not hold it. Failure admission still applies: a
+	// terminal-failed earlier sibling holds it unless the policy continues past
+	// the failure. Mirror FindNextApplyOperation, whose copy-start gate matches
+	// only the failure arm for parallel.
 	if op.Parallel {
+		if h := failedSibling(ops, i); h >= 0 {
+			setHeldByFailure(d, op, names[h])
+			return
+		}
 		d.set(StateQueuedNext, "queued — next in order", "⏳", false)
 		return
 	}
-	if h, paused := blockingSibling(ops, i); h >= 0 {
-		if paused {
-			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", names[h]), "⏸️", true)
+	if h := blockingSibling(ops, i); h >= 0 {
+		if ops[h].State == state.ApplyOperation.Failed {
+			setHeldByFailure(d, op, names[h])
 			return
 		}
 		d.set(StateHalted, fmt.Sprintf("halted — %s %s", names[h], haltedReason(ops[h].State)), "⏸️", true)
@@ -538,15 +547,13 @@ func deriveWaitingForCutover(d *Deployment, ops []Operation, names []string, i i
 }
 
 // blockingSibling returns the index of the earliest earlier sibling that holds
-// the rollout for a pending operation, or -1 when none does, and whether the
-// hold is a human-gated pause rather than a halt. A terminal-failed sibling
-// holds unless the policy continues past it (continue, or a released pause);
-// when it does hold under on_failure=pause the hold is a pause (paused=true). A
-// cancelled/reverted sibling always halts, matching the predicate's lack of an
-// exemption for them. The index, rather than the operation, is what the caller
-// needs: the label names the blocker by its resolved member name, which is only
-// addressable by position.
-func blockingSibling(ops []Operation, i int) (blocker int, paused bool) {
+// the rollout for a pending operation under an ordered cutover policy, or -1
+// when none does. A terminal-failed sibling holds unless the policy continues
+// past it (continue, or a released pause). A cancelled/reverted sibling always
+// holds, matching the predicate's lack of an exemption for them. The index,
+// rather than the operation, is what the caller needs: the label names the
+// blocker by its resolved member name, which is only addressable by position.
+func blockingSibling(ops []Operation, i int) int {
 	op := ops[i]
 	for j := range i {
 		switch ops[j].State {
@@ -554,12 +561,41 @@ func blockingSibling(ops []Operation, i int) (blocker int, paused bool) {
 			if op.continuesPastFailure() {
 				continue
 			}
-			return j, op.pausesOnFailure()
+			return j
 		case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
-			return j, false
+			return j
 		}
 	}
-	return -1, false
+	return -1
+}
+
+// failedSibling returns the index of the earliest terminal-failed earlier
+// sibling that holds a pending operation, or -1 when none does or the policy
+// continues past failure (continue, or a released pause). It is the failure
+// admission arm of the copy-start gate alone, which is all that holds a
+// pending operation under parallel: a cancelled or reverted sibling does not.
+func failedSibling(ops []Operation, i int) int {
+	op := ops[i]
+	if op.continuesPastFailure() {
+		return -1
+	}
+	for j := range i {
+		if ops[j].State == state.ApplyOperation.Failed {
+			return j
+		}
+	}
+	return -1
+}
+
+// setHeldByFailure labels a pending operation held by an earlier sibling's
+// terminal failure: paused for a human under on_failure=pause, halted
+// otherwise. blocker is the failed sibling's resolved member name.
+func setHeldByFailure(d *Deployment, op Operation, blocker string) {
+	if op.pausesOnFailure() {
+		d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", blocker), "⏸️", true)
+		return
+	}
+	d.set(StateHalted, fmt.Sprintf("halted — %s failed", blocker), "⏸️", true)
 }
 
 // blocksPending reports whether an earlier sibling in earlierState blocks a

@@ -24,8 +24,9 @@ func barrier(dep, st string) Operation {
 }
 
 // parallel builds a parallel, halt-on-failure operation. Under parallel the copy
-// phase has no earlier-sibling gate, so a pending parallel operation is never
-// shown waiting for or halted by an earlier sibling.
+// phase has no earlier-sibling ordering, so a pending parallel operation is
+// never shown waiting for an earlier sibling; a terminal-failed earlier sibling
+// still holds it under halt.
 func parallel(dep, st string) Operation {
 	return Operation{Deployment: dep, State: st, Parallel: true}
 }
@@ -158,10 +159,10 @@ func TestDerivePending_Ordering(t *testing.T) {
 			label: "queued — next in order",
 		},
 		{
-			name:  "parallel: earlier failed does not halt copy start",
+			name:  "parallel: earlier failed halts copy start",
 			ops:   []Operation{parallel("eu", so.Failed), parallel("us", so.Pending)},
-			want:  StateQueuedNext,
-			label: "queued — next in order",
+			want:  StateHalted,
+			label: "halted — eu failed",
 		},
 		{
 			name:  "parallel: earlier cancelled does not halt copy start",
@@ -506,6 +507,56 @@ func TestDerive_PauseFailureWithPendingSiblingHoldsPaused(t *testing.T) {
 	assert.Equal(t, "paused — eu failed; release or stop", got.Deployments[1].Label)
 	require.NotNil(t, got.FirstFailure)
 	assert.Equal(t, "eu", got.FirstFailure.Deployment)
+}
+
+// TestDerivePending_ParallelHeldByFailedEarlierMember: under parallel a pending
+// operation is still held by a terminal-failed earlier sibling, even while
+// another sibling is mid-copy, because the copy-start gate's failure arm applies
+// to every cutover policy. The hold renders halted by default, paused for a
+// human under on_failure=pause, and is lifted under on_failure=continue, so the
+// label agrees with what the driver will claim next.
+func TestDerivePending_ParallelHeldByFailedEarlierMember(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func(dep, st string) Operation
+		want  PresentationState
+		label string
+	}{
+		{
+			name:  "halt",
+			build: parallel,
+			want:  StateHalted,
+			label: "halted — eu failed",
+		},
+		{
+			name: "pause",
+			build: func(dep, st string) Operation {
+				return Operation{Deployment: dep, State: st, Parallel: true, PauseOnFailure: true}
+			},
+			want:  StatePaused,
+			label: "paused — eu failed; release or stop",
+		},
+		{
+			name: "continue",
+			build: func(dep, st string) Operation {
+				return Operation{Deployment: dep, State: st, Parallel: true, ContinueOnFailure: true}
+			},
+			want:  StateQueuedNext,
+			label: "queued — next in order",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Derive([]Operation{
+				tc.build("eu", so.Failed),
+				tc.build("ap", so.Running),
+				tc.build("us", so.Pending),
+			})
+			require.Len(t, got.Deployments, 3)
+			assert.Equal(t, tc.want, got.Deployments[2].Presentation)
+			assert.Equal(t, tc.label, got.Deployments[2].Label)
+		})
+	}
 }
 
 // TestDerive_ReleasedPauseRunsDegradedLikeContinue: once an apply is released a

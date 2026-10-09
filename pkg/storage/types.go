@@ -58,11 +58,11 @@ const (
 	// earlier siblings reach the cutover barrier, while cutover stays ordered.
 	CutoverPolicyBarrier = "barrier"
 
-	// CutoverPolicyParallel drops copy-phase ordering entirely: every deployment
-	// copies concurrently from the start, with no earlier-sibling gate on copy
-	// start. Only the cutover phase stays deployment-ordered, exactly like
-	// barrier. This collapses copy wall-clock toward "longest copy" for rollouts
-	// whose hours-long copy dominates, while preserving the ordered, one-at-a-time
+	// CutoverPolicyParallel drops copy-phase ordering: deployments copy
+	// concurrently, bounded by the driver cap and on_failure admission. Only
+	// the cutover phase stays deployment-ordered, exactly like barrier. This
+	// collapses copy wall-clock toward "longest copy" for rollouts whose
+	// hours-long copy dominates, while preserving the ordered, one-at-a-time
 	// cutover swaps.
 	CutoverPolicyParallel = "parallel"
 )
