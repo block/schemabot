@@ -6626,7 +6626,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change (`audit_log`):
+To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
 ```
 schemabot rollback-confirm -e staging
 ```

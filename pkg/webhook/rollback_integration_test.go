@@ -345,7 +345,7 @@ func TestE2ERollbackConfirmExecutesAndPostsComments(t *testing.T) {
 		assert.Contains(t, body, "Rollback Plan")
 		assert.Contains(t, body, "1 unsafe change detected")
 		assert.Contains(t, body, "`idx_name`")
-		assert.Contains(t, body, "To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change (`users`)")
+		assert.Contains(t, body, "To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change on `users`")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for rollback plan comment")
 	}
