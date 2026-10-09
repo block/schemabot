@@ -2,9 +2,12 @@ package planetscale
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
@@ -111,6 +114,95 @@ func TestPlan_ReportsLintViolationsOfEveryStatement(t *testing.T) {
 	}
 	// Spirit does not fix the order of findings within a statement.
 	assert.ElementsMatch(t, []string{"orders", "refunds", "invoices"}, tables)
+}
+
+// gatedVSchemaClient serves an empty main branch whose VSchema reads are
+// scripted per keyspace, so a test can force the order in which keyspaces
+// finish. The `commerce` read fails at once and then opens the gate; the
+// `billing` read waits at the gate, then waits for its context to be cancelled
+// or for billingHold to pass, and answers with billingErr (nil means success).
+// A plan that cancels sibling keyspaces when one fails therefore sees billing
+// end with the cancellation, after commerce has already failed.
+type gatedVSchemaClient struct {
+	emptyMainBranchClient
+	commerceFailed chan struct{}
+	billingErr     error
+}
+
+// billingHold bounds how long billing waits for a cancellation that a correct
+// plan never sends. It only sets how long the test takes; the outcome a correct
+// plan reports does not depend on it.
+const billingHold = 200 * time.Millisecond
+
+func newGatedVSchemaClient(billingErr error) *gatedVSchemaClient {
+	return &gatedVSchemaClient{commerceFailed: make(chan struct{}), billingErr: billingErr}
+}
+
+func (c *gatedVSchemaClient) GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
+	switch req.Keyspace {
+	case "commerce":
+		close(c.commerceFailed)
+		return nil, errors.New("commerce unavailable")
+	case "billing":
+		select {
+		case <-c.commerceFailed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(billingHold):
+		}
+		if c.billingErr != nil {
+			return nil, c.billingErr
+		}
+		return &ps.VSchema{Raw: "{}"}, nil
+	default:
+		return nil, fmt.Errorf("unexpected keyspace %q", req.Keyspace)
+	}
+}
+
+// gatedPlanRequest plans keyspaces `billing` and `commerce`, each with a
+// VSchema so that each reads it through the gated client.
+func gatedPlanRequest() *engine.PlanRequest {
+	return &engine.PlanRequest{
+		Database: "shop",
+		SchemaFiles: schema.SchemaFiles{
+			"billing":  &schema.Namespace{Files: map[string]string{"vschema.json": "{}"}},
+			"commerce": &schema.Namespace{Files: map[string]string{"vschema.json": "{}"}},
+		},
+		Credentials: &engine.Credentials{Metadata: map[string]string{"organization": "org", "token_name": "tn", "token_value": "tv"}},
+	}
+}
+
+// Keyspaces `billing` and `commerce` both fail, and `commerce` is forced to
+// fail first: billing's VSchema read does not answer until commerce's has
+// failed. The plan still reports billing, the first keyspace in sorted order,
+// so the refusal an operator sees does not depend on which keyspace finished
+// first.
+func TestPlan_RefusalAcrossKeyspacesIsDeterministic(t *testing.T) {
+	client := newGatedVSchemaClient(errors.New("billing unavailable"))
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+	result, err := e.Plan(t.Context(), gatedPlanRequest())
+	require.EqualError(t, err, "fetch VSchema for keyspace billing: billing unavailable")
+	assert.Nil(t, result)
+}
+
+// Keyspace `commerce` fails first; keyspace `billing` is valid and is still
+// reading its VSchema when commerce fails. The failure does not cut billing
+// short, so the plan reports commerce's failure, the one real problem, rather
+// than an aborted read in billing.
+func TestPlan_FailingKeyspaceDoesNotAbortOthers(t *testing.T) {
+	client := newGatedVSchemaClient(nil)
+	e := NewWithClient(slog.New(slog.NewTextHandler(os.Stdout, nil)),
+		func(_, _ string) (psclient.PSClient, error) { return client, nil })
+
+	result, err := e.Plan(t.Context(), gatedPlanRequest())
+	require.EqualError(t, err, "fetch VSchema for keyspace commerce: commerce unavailable")
+	assert.Nil(t, result)
 }
 
 // A desired schema the plan cannot read fails the plan with the reason,
