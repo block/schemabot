@@ -630,12 +630,10 @@ func New(logger *slog.Logger) *Engine {
 		logger = slog.Default()
 	}
 	return &Engine{
-		clientFunc: func(tokenName, tokenValue string) (psclient.PSClient, error) {
-			return psclient.NewPSClient(tokenName, tokenValue)
-		},
-		linter:    lint.New(),
-		logger:    logger,
-		vtgateDBs: make(map[string]*sql.DB),
+		clientFunc: psclient.NewPSClient,
+		linter:     lint.New(),
+		logger:     logger,
+		vtgateDBs:  make(map[string]*sql.DB),
 	}
 }
 
