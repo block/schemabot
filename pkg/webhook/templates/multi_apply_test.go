@@ -1872,3 +1872,42 @@ func TestRenderMultiDeploymentApplyComment_RolledUpBarWeighsRowsOnceEveryTargetR
 	)
 	assert.Contains(t, out, "**`orders`**: "+ui.ProgressBarRowCopy(50)+" 50%")
 }
+
+// A rolling rollout three targets wide, where only the first target has
+// reported its tables, ranks the targets still waiting their turn as queued on
+// every table: the table finished on the first target leads the one it has not
+// started, since the rollout is part-way through it.
+func TestRenderMultiDeploymentApplyComment_UnreportedTargetsRankAsQueued(t *testing.T) {
+	out := renderTargets(presentation.Derive(rollingTargets(3)),
+		tablesDetail("testapp_001",
+			TableProgressData{TableName: "invoices", Status: state.Task.Pending},
+			TableProgressData{TableName: "orders", Status: state.Task.Completed, RowsCopied: 1000},
+		),
+		nil, nil,
+	)
+
+	orders := strings.Index(out, "**`orders`**")
+	invoices := strings.Index(out, "**`invoices`**")
+	require.NotEqual(t, -1, orders, out)
+	require.NotEqual(t, -1, invoices, out)
+	assert.Less(t, orders, invoices, "the table finished on one target leads the one no target has started")
+}
+
+// A table in its revert window on one target and queued on the other has
+// completed where it ran, so its line counts that target as complete, the way
+// the CLI does. Once every target is in its revert window, the line keeps the
+// revert window's wording.
+func TestRenderMultiDeploymentApplyComment_RevertWindowTargetCountsAsComplete(t *testing.T) {
+	partial := renderTargets(presentation.Derive(rollingTargets(2)),
+		tablesDetail("testapp_001", TableProgressData{TableName: "orders", Status: state.Task.RevertWindow, RowsCopied: 1000}),
+		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.Pending}),
+	)
+	assert.Contains(t, partial, "**`orders`**: ✅ Complete on 1 of 2 targets · 1 queued\n")
+
+	everywhere := renderTargets(presentation.Derive(rollingTargets(2)),
+		tablesDetail("testapp_001", TableProgressData{TableName: "orders", Status: state.Task.RevertWindow, RowsCopied: 1000}),
+		tablesDetail("testapp_002", TableProgressData{TableName: "orders", Status: state.Task.RevertWindow, RowsCopied: 1000}),
+	)
+	assert.Contains(t, everywhere, "**`orders`**: "+shardedTableStatusPhrase(state.Task.RevertWindow))
+	assert.NotContains(t, everywhere, "Complete on")
+}

@@ -55,7 +55,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		// target's stored plan and says which other targets run the same.
 		restoreGroup := planScopeForWork(budget, targetNames(data.Model, w.members), len(work), silent)
 		restorePlan := budget.pointAt(first.storedPlan())
-		for _, line := range rankedTargetTableLines(data, w) {
+		for _, line := range rankedTargetTableLines(data, w, lineSilent) {
 			writeTargetTableLine(sb, line.table.TableName, line.cells, line.targets, lineSilent)
 			writeDDLLine(sb, dialect, line.table.DDL, budget)
 			sb.WriteString("\n")
@@ -141,14 +141,19 @@ type targetTableLine struct {
 // rankedTargetTableLines is a work group's table lines in the order the rollup
 // lists them: by presentation.TableRolloutRank across the group's targets, so
 // the table being copied leads and one no target has started sits below one
-// already finished on some. Lines of equal rank keep plan order.
-func rankedTargetTableLines(data MultiDeploymentApplyData, w targetWork) []targetTableLine {
+// already finished on some. silent is the targets with no progress reported
+// that the lines speak for; they have not started any table, so they rank as
+// queued. Lines of equal rank keep plan order.
+func rankedTargetTableLines(data MultiDeploymentApplyData, w targetWork, silent int) []targetTableLine {
 	lines := make([]targetTableLine, 0, len(w.tables))
 	for _, t := range w.tables {
 		cells, targets := tableAcrossTargets(data, w.members, t)
-		statuses := make([]string, len(cells))
+		statuses := make([]string, len(cells), len(cells)+silent)
 		for i, c := range cells {
 			statuses[i] = c.Status
+		}
+		for range silent {
+			statuses = append(statuses, state.Task.Pending)
 		}
 		lines = append(lines, targetTableLine{table: t, cells: cells, targets: targets, rank: presentation.TableRolloutRank(statuses)})
 	}
@@ -193,7 +198,8 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 	for i, c := range cells {
 		status := state.NormalizeTaskStatus(c.Status)
 		switch status {
-		case state.Task.Completed:
+		case state.Task.Completed, state.Task.RevertWindow:
+			// A target in its revert window has completed the change.
 			done++
 			if c.RowsTotal == 0 {
 				reporting++
@@ -261,7 +267,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		fmt.Fprintf(sb, "**%s**: %s (%d targets)\n", name, shardedTableStatusPhrase(status), len(cells))
 		return
 	}
-	if status == state.Task.Pending && done > 0 {
+	if partlyCompleted(status, done, queued) {
 		// Complete on some targets and queued on the rest: the change is live
 		// where it completed, so the line leads with that, not with Queued.
 		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, targetCoverage(0, 0, queued, 0, 0))
@@ -274,6 +280,18 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		phrase = "⊘ Cancelled"
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
+}
+
+// partlyCompleted reports whether a rolled-up table has completed on some of
+// its targets and is queued on the rest, with nothing else in between. A target
+// in its revert window has completed, so a table in its revert window on some
+// targets and queued on the rest is partly completed too; once every target
+// is in its revert window, the line keeps the revert window's wording.
+func partlyCompleted(status string, done, queued int) bool {
+	if done == 0 || queued == 0 {
+		return false
+	}
+	return status == state.Task.Pending || status == state.Task.RevertWindow
 }
 
 // targetSharePercent is how much of a table is done across every target that

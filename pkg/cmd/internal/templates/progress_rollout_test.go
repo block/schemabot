@@ -661,3 +661,26 @@ func TestWriteProgress_TargetRollupListsTablesWhereTheRolloutIs(t *testing.T) {
 	assertLess(t, out, "ALTER TABLE `refunds`", "ALTER TABLE `orders`")
 	assertLess(t, out, "ALTER TABLE `orders`", "ALTER TABLE `invoices`")
 }
+
+// A rolling rollout three targets wide, where only the first target has
+// reported its tables, ranks the targets still waiting their turn as queued on
+// every table: the table finished on the first target leads the one it has not
+// started, the order the PR comment lists them in.
+func TestWriteProgress_TargetRollupRanksUnreportedTargetsAsQueued(t *testing.T) {
+	data := targetRolloutData([]rolloutTarget{copyingTarget(970), queuedTarget(), queuedTarget()})
+	data.Tables = nil
+	for _, name := range []string{"invoices", "orders"} {
+		table := TableProgress{
+			Deployment: "prod", Target: data.Operations[0].Target, Namespace: "orders", TableName: name, ChangeType: "alter",
+			DDL: "ALTER TABLE `" + name + "` ADD COLUMN `note` text", Status: state.Task.Pending,
+		}
+		if name == "orders" {
+			table.Status, table.RowsCopied, table.RowsTotal, table.PercentComplete = state.Task.Completed, 1000, 1000, 100
+		}
+		data.Tables = append(data.Tables, table)
+	}
+
+	out := renderRollout(t, data)
+	assert.Contains(t, out, "2 of 3 targets have not reported progress yet.")
+	assertLess(t, out, "ALTER TABLE `orders`", "ALTER TABLE `invoices`")
+}

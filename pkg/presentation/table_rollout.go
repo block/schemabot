@@ -2,7 +2,8 @@ package presentation
 
 import "github.com/block/schemabot/pkg/state"
 
-// Ranks TableRolloutRank returns, in the order a rollout's tables are listed.
+// The ranks TableRolloutRank returns, in the order a rollout's tables are
+// listed.
 const (
 	tableRankWorking = iota
 	tableRankWaiting
@@ -33,7 +34,8 @@ func TableRolloutRank(statuses []string) int {
 		case state.Task.Completed, state.Task.RevertWindow:
 			done = true
 		default:
-			// Pending, and any state this build does not know, has not started.
+			// Pending: not started. NormalizeTaskStatus maps a state this build
+			// does not know to Running, so unknown work ranks as working.
 			queued = true
 		}
 	}

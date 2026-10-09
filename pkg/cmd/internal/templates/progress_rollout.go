@@ -122,12 +122,19 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	if len(work) > 1 {
 		b.WriteString("\n")
 	}
+	// A target that has not reported has started no table, so it ranks every
+	// table as queued. When the groups diverge it is not known to run any one
+	// group's change, and ranks none of them.
+	rankSilent := silent
+	if len(work) > 1 {
+		rankSilent = 0
+	}
 	for _, w := range work {
 		rolled := make([]TableProgress, 0, len(w.tables))
 		for _, t := range w.tables {
 			rolled = append(rolled, tableAcrossTargets(v, byMember, w.members, t))
 		}
-		sortRolledTables(rolled)
+		sortRolledTables(rolled, rankSilent)
 		// Tables are grouped under their namespace whenever they carry one,
 		// so the same table changed in two schemas reads as two changes.
 		namespaced := hasTableNamespaces(rolled)
@@ -156,19 +163,23 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 // sortRolledTables orders tables rolled up across targets by
 // presentation.TableRolloutRank, the order the PR comment lists them in, so a
 // table finished on some targets stays above one no target has started. Tables
-// of equal rank keep plan order.
-func sortRolledTables(tables []TableProgress) {
+// of equal rank keep plan order. silent is the targets with no progress
+// reported that rank as queued on every table.
+func sortRolledTables(tables []TableProgress, silent int) {
 	slices.SortStableFunc(tables, func(a, b TableProgress) int {
-		return rolledTableRank(a) - rolledTableRank(b)
+		return rolledTableRank(a, silent) - rolledTableRank(b, silent)
 	})
 }
 
 // rolledTableRank is a rolled-up table's presentation.TableRolloutRank, from
-// its status on each target.
-func rolledTableRank(t TableProgress) int {
-	statuses := make([]string, len(t.Shards))
+// its status on each target and silent targets queued.
+func rolledTableRank(t TableProgress, silent int) int {
+	statuses := make([]string, len(t.Shards), len(t.Shards)+silent)
 	for i, target := range t.Shards {
 		statuses[i] = target.Status
+	}
+	for range silent {
+		statuses = append(statuses, state.Task.Pending)
 	}
 	return presentation.TableRolloutRank(statuses)
 }
