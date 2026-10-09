@@ -43,6 +43,9 @@ type WatchModel struct {
 	metadata         map[string]string // Full metadata from progress response
 
 	// UI state
+	// windowHeight is the terminal's height in rows, zero until the first
+	// window size message arrives.
+	windowHeight       int
 	pastPending        bool
 	detached           bool
 	quitting           bool
@@ -122,6 +125,10 @@ func (m WatchModel) Init() tea.Cmd {
 // Update implements tea.Model.
 func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.windowHeight = msg.Height
+		return m, nil
+
 	case tea.KeyMsg:
 		// During cutover, ignore all keyboard input except q to force quit
 		isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
