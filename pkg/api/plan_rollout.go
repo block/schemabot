@@ -70,7 +70,9 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 		}
 		s.logger.Info("rollout members not planned: the primary plan reported errors; the plan lists every other member as needing attention",
 			"database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId(), "members", len(targets))
-		return primaryErroredRollout(planning, targets), nil
+		rollout := primaryErroredRollout(planning, targets)
+		rollout.ShapeRefusal = rolloutShapeRefusal(req.Database, req.Environment, targets)
+		return rollout, nil
 	}
 	// The primary is held to the namespace selection it was planned under, so
 	// the rollup can tell a placement change since the plan from the plan
@@ -85,6 +87,7 @@ func (s *Service) planRollout(ctx context.Context, req PlanRequest, primaryPlan 
 		return nil, err
 	}
 	rollout := planRolloutResponse(rollup, "database", req.Database, "environment", req.Environment, "plan_id", primaryPlan.GetPlanId())
+	rollout.ShapeRefusal = rolloutShapeRefusal(req.Database, req.Environment, targets)
 	if len(rollout.Attention) == 0 {
 		refused, err := s.rolloutApplyRefusals(ctx, req.Environment, primaryPlan.GetPlanId(), targets)
 		if err != nil {

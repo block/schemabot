@@ -135,3 +135,18 @@ func TestCreateStoredApply_MultiTargetDeploymentsAreRefused(t *testing.T) {
 	assert.Equal(t, 2, refused.Deployments)
 	assert.Equal(t, "testapp-001", refused.FirstTarget)
 }
+
+// A plan carries the refusal of the rollout's shape that holds whatever the
+// apply's options, so the CLI refuses it before it prompts or locks. An apply
+// across deployments, one of them with several targets, carries it; a
+// deployment with several targets alone does not, since only --defer-cutover
+// would refuse its apply.
+func TestRolloutShapeRefusal(t *testing.T) {
+	target := func(deployment, name string) routing.ExecutionTarget {
+		return routing.ExecutionTarget{DatabaseType: storage.DatabaseTypeMySQL, Deployment: deployment, Target: name}
+	}
+	assert.Empty(t, rolloutShapeRefusal("testapp", "production", []routing.ExecutionTarget{target("eu", "orders-001"), target("eu", "orders-002")}))
+	assert.Equal(t,
+		"testapp/production rolls out to 3 targets across 2 deployments, and an apply to more than one deployment is not supported yet when a deployment has several targets; apply one target at a time, starting with --target orders-001",
+		rolloutShapeRefusal("testapp", "production", []routing.ExecutionTarget{target("eu", "orders-001"), target("eu", "orders-002"), target("us", "orders-003")}))
+}

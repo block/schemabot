@@ -134,6 +134,13 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return fmt.Errorf("%d of %d rollout members cannot be applied as planned; resolve each one listed above, then apply again", len(rollout.Attention), rollout.Members)
 	}
 
+	// An apply that spans several deployments, one of them with several
+	// targets, is refused by apply creation whatever its flags; refusing it
+	// here, before the prompt and the lock, leaves nothing held.
+	if rollout := planResult.WholeRollout(); rollout != nil && rollout.ShapeRefusal != "" {
+		return errors.New(rollout.ShapeRefusal)
+	}
+
 	// Each target of a multi-target rollout cuts over as its table finishes,
 	// so the server refuses --defer-cutover there; refusing it before the
 	// prompt saves confirming an apply that will not start.

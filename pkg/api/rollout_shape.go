@@ -58,6 +58,16 @@ func IsMultiTargetRollout(targets []routing.ExecutionTarget) bool {
 	return len(routing.MultiTargetDeployments(targets)) > 0
 }
 
+// rolloutShapeRefusal is the refusal apply creation returns for an apply of
+// targets whatever options it carries, or "" when their shape admits one. A
+// plan carries it so the CLI refuses before it prompts or takes the lock.
+func rolloutShapeRefusal(database, environment string, targets []routing.ExecutionTarget) string {
+	if err := RefuseUnsupportedRolloutShape(database, environment, targets, false); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // RefuseUnsupportedRolloutShape refuses an apply to targets that a multi-target
 // rollout does not run: --defer-cutover, or more than one deployment. An apply
 // that is not multi-target is admitted unchanged, whatever it asks for. Apply

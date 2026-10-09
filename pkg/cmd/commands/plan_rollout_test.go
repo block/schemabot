@@ -974,3 +974,44 @@ func TestApplyCmd_SuggestedCommandsQuoteTheirArguments(t *testing.T) {
 		assert.Contains(t, out, "apply -s '"+schemaDir+"' -e production --allow-unsafe", "%s", out)
 	})
 }
+
+// Apply creation refuses an apply of a multi-target rollout that spans
+// several deployments, and --defer-cutover on one that does not. The CLI
+// refuses both from the plan, before it checks or takes the lock and before
+// it asks the server to apply, so a refused apply holds nothing.
+func TestApplyCmd_RefusesAnUnsupportedMultiTargetShapeBeforeLocking(t *testing.T) {
+	const spansDeployments = "orders/production rolls out to 3 targets across 2 deployments, and an apply to more than one deployment is not supported yet when a deployment has several targets; apply one target at a time, starting with --target payments-001"
+	for name, tt := range map[string]struct {
+		rollout      *apitypes.PlanRolloutResponse
+		deferCutover bool
+		want         string
+	}{
+		"several deployments": {
+			rollout: &apitypes.PlanRolloutResponse{Members: 3, MultiTarget: true, ShapeRefusal: spansDeployments},
+			want:    spansDeployments,
+		},
+		"several deployments with --defer-cutover": {
+			rollout:      &apitypes.PlanRolloutResponse{Members: 3, MultiTarget: true, ShapeRefusal: spansDeployments},
+			deferCutover: true,
+			want:         spansDeployments,
+		},
+		"--defer-cutover on several targets": {
+			rollout:      &apitypes.PlanRolloutResponse{Members: 2, MultiTarget: true},
+			deferCutover: true,
+			want:         "--defer-cutover is not supported on an apply to more than one target; apply again without --defer-cutover, or apply one target with --target",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tt.rollout.Groups = []*apitypes.PlanMemberGroupResponse{{Members: paymentsTargets(1, tt.rollout.Members), Primary: true, Changes: addColumnTo("region")}}
+			server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{PlanID: "plan-orders-1", Engine: "mysql", Changes: addColumnTo("region"), Rollout: tt.rollout})
+
+			cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, DeferCutover: tt.deferCutover}
+			var runErr error
+			out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+
+			require.Error(t, runErr)
+			assert.Equal(t, tt.want, runErr.Error())
+			assert.Equal(t, []string{"/api/status", "/api/plan"}, *paths, "no lock is checked or taken and no apply is requested:\n%s", out)
+		})
+	}
+}

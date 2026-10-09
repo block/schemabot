@@ -853,6 +853,10 @@ type PlanRolloutResponse struct {
 	// MultiTarget is true when some deployment of the rollout addresses more
 	// than one target. An apply of such a rollout refuses --defer-cutover.
 	MultiTarget bool `json:"multi_target,omitempty"`
+	// ShapeRefusal is why apply creation refuses an apply of the whole rollout
+	// whatever options it carries, naming the apply to run instead. It is
+	// empty when the rollout's shape admits one.
+	ShapeRefusal string `json:"shape_refusal,omitempty"`
 	// Groups holds one entry per distinct plan, naming the members that run
 	// it, with the primary's group first.
 	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
