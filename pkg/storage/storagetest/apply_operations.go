@@ -70,10 +70,10 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.ErrorContains(t, err, "an already converged operation must be completed and never started")
 	})
 
-	// Insert_RolloutStepRoundTrips verifies that the table step a row of a
-	// rollout run table by table is stamped with reads back, that a row of a
-	// member's whole change reads step 0, and that a negative step is refused
-	// rather than stored where the step gate would order it first.
+	// Insert_RolloutStepRoundTrips verifies that a row inserted with a table
+	// step reads that step back, that a row of a member's whole change reads
+	// step 0, and that a negative step is refused rather than stored as a
+	// step that sorts before every other.
 	t.Run("Insert_RolloutStepRoundTrips", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
