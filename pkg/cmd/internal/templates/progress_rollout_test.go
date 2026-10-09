@@ -248,8 +248,8 @@ func TestWriteProgress_TargetRollupWithNothingCopyingReadsAsFailed(t *testing.T)
 	assert.NotContains(t, out, "schemabot stop", "a failed apply refuses stop")
 }
 
-// Targets that hold different schemas run different changes, so the rollup
-// splits them by what applies where. Once every target of an apply that
+// Targets that hold different schemas run different DDL on a table, so the
+// rollup shows a block per DDL, each naming the targets it runs on. Once every target of an apply that
 // defers cutover waits for it, the cutover is the one command and stop is not
 // offered beside it.
 func TestWriteProgress_DivergedTargetsWaitingForCutover(t *testing.T) {
@@ -265,9 +265,10 @@ func TestWriteProgress_DivergedTargetsWaitingForCutover(t *testing.T) {
 	}
 
 	out := renderRollout(t, data)
-	assertLess(t, out, "▸ targets payments-001, payments-002", "ADD COLUMN `region`")
-	assertLess(t, out, "ADD COLUMN `region`", "▸ target payments-003")
-	assertLess(t, out, "▸ target payments-003", "ADD COLUMN `zone`")
+	assertLess(t, out, "       targets payments-001, payments-002\n", "ADD COLUMN `region`")
+	assertLess(t, out, "ADD COLUMN `region`", "       target payments-003\n")
+	assertLess(t, out, "       target payments-003\n", "ADD COLUMN `zone`")
+	assert.NotContains(t, out, "▸", "each DDL names its targets rather than heading a group")
 	assert.True(t, strings.HasSuffix(out, "To cut over prod/payments-001:\n  schemabot cutover apply-7f3c -e production\n"),
 		"the cutover closes the output:\n%s", out)
 	assert.NotContains(t, out, "schemabot stop", "targets only waiting for cutover keep the cutover as the one command")
@@ -439,27 +440,27 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 	}{
 		"two targets stopped part-way": {
 			targets:  []rolloutTarget{stoppedAt(400), stoppedAt(400)},
-			headline: "~ orders: ⏹️ Stopped · 0 of 2 targets complete\n",
+			headline: "~ orders: ⏹️ Stopped\n",
 			lines:    []string{"○ payments-001: stopped at 40.00% · 400 / 1,000 rows", "○ payments-002: stopped at 40.00% · 400 / 1,000 rows"},
 		},
 		"one target done and one stopped part-way": {
 			targets:  []rolloutTarget{completedTarget(), stoppedAt(400)},
-			headline: "~ orders: ⏹️ Stopped · 1 of 2 targets complete\n",
+			headline: "~ orders: ⏹️ Stopped\n",
 			lines:    []string{"○ payments-002: stopped at 40.00% · 400 / 1,000 rows", "✓ payments-001: 1,000 rows"},
 		},
 		"one target done and one failed part-way": {
 			targets:  []rolloutTarget{completedTarget(), failedAt(300)},
-			headline: "~ orders: ❌ Failed · 1 of 2 targets complete · 1 failed\n",
+			headline: "~ orders: ❌ Failed\n",
 			lines:    []string{"✗ payments-002: failed", "✓ payments-001: 1,000 rows"},
 		},
 		"one target done and one cancelled before copying": {
 			targets:  []rolloutTarget{completedTarget(), cancelledBeforeCopying},
-			headline: "~ orders: 🚫 Cancelled · 1 of 2 targets complete\n",
+			headline: "~ orders: 🚫 Cancelled\n",
 			lines:    []string{"○ payments-002: cancelled", "✓ payments-001: 1,000 rows"},
 		},
 		"every target cancelled before copying": {
 			targets:  []rolloutTarget{cancelledBeforeCopying, cancelledBeforeCopying},
-			headline: "~ orders: 🚫 Cancelled (not started) · 0 of 2 targets complete\n",
+			headline: "~ orders: 🚫 Cancelled (not started)\n",
 			lines:    []string{"○ payments-001: cancelled", "○ payments-002: cancelled"},
 		},
 	} {
@@ -561,14 +562,14 @@ func TestFormatTargetRollup_AllocationDoesNotScaleWithTargetsTimesTables(t *test
 	assert.Less(t, allocated, 20*tablesBytes, "a render allocates in proportion to the tables, not to targets times tables")
 }
 
-// A rolled-up table's line carries its target counts, so the bar, which sums
-// only the targets that have started, never reads as the rollout's progress:
-// one target half copied out of 64 reads as 0 of 64 complete beside its 50%,
-// a table still copying on one target while 63 failed says so on the line,
-// and a table every started target finished but one still queued reads as
-// queued with 63 of 64 complete. A table every target finished carries no
-// count.
-func TestFormatTargetRollup_TableLineCarriesTargetCounts(t *testing.T) {
+// A rolled-up table's target counts head the list under it, so the bar, which
+// sums only the targets that have started, never reads as the rollout's
+// progress: one target half copied out of 64 is counted beside the 63 queued,
+// a table still copying on one target while 63 failed counts the failures
+// first, and a table finished on 63 targets and queued on the last reads as
+// complete on 63 of 64, as it does in its revert window. A table every target
+// finished carries no count.
+func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 	queuedWithRow := rolloutTarget{opState: state.ApplyOperation.Pending, status: state.Task.Pending, rowsTotal: 1000}
 	failed := rolloutTarget{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: 300, rowsTotal: 1000, err: "Error 1062: Duplicate entry"}
 	repeat := func(target rolloutTarget, n int) []rolloutTarget {
@@ -581,23 +582,33 @@ func TestFormatTargetRollup_TableLineCarriesTargetCounts(t *testing.T) {
 	for name, tc := range map[string]struct {
 		targets []rolloutTarget
 		line    string
+		counts  string
 	}{
 		"one of 64 started": {
 			targets: append([]rolloutTarget{copyingTarget(500)}, repeat(queuedWithRow, 63)...),
-			line:    "~ orders: " + ui.ProgressBarRowCopy(50) + " 50.00% · 0 of 64 targets complete\n",
+			line:    "~ orders: " + ui.ProgressBarRowCopy(50) + " 50.00%\n",
+			counts:  "• Targets: 64 (1 copying, 63 queued)\n",
 		},
 		"one copying beside 63 failed": {
 			targets: append([]rolloutTarget{copyingTarget(500)}, repeat(failed, 63)...),
-			line:    "~ orders: " + ui.ProgressBarRowCopy(50) + " 50.00% · 0 of 64 targets complete · 63 failed\n",
+			line:    "~ orders: " + ui.ProgressBarRowCopy(50) + " 50.00%\n",
+			counts:  "• Targets: 64 (63 failed, 1 copying)\n",
 		},
 		"63 complete and one queued": {
 			targets: append(repeat(completedTarget(), 63), queuedWithRow),
-			line:    "~ orders: ⏳ Queued · 63 of 64 targets complete\n",
+			line:    "~ orders: ✓ Complete on 63 of 64 targets · 1 queued\n",
+			counts:  "• Targets: 64 (1 queued, 63 complete)\n",
+		},
+		"one in its revert window and one queued": {
+			targets: []rolloutTarget{{opState: state.ApplyOperation.RevertWindow, status: state.Task.RevertWindow, rowsCopied: 1000, rowsTotal: 1000}, queuedWithRow},
+			line:    "~ orders: ✓ Complete on 1 of 2 targets · 1 queued\n",
+			counts:  "• Targets: 2 (1 revert window open, 1 queued)\n",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := renderRollout(t, targetRolloutData(tc.targets))
 			assert.Contains(t, out, tc.line, "%s", out)
+			assertLess(t, out, tc.line, tc.counts)
 		})
 	}
 
@@ -606,7 +617,7 @@ func TestFormatTargetRollup_TableLineCarriesTargetCounts(t *testing.T) {
 		data.State = state.Apply.Completed
 		out := renderRollout(t, data)
 		assert.Contains(t, out, "~ orders: "+ui.ProgressBarComplete()+" ✓ Complete\n", "%s", out)
-		assert.NotContains(t, out, "targets complete", "%s", out)
+		assert.NotContains(t, out, "of 3 targets", "%s", out)
 	})
 }
 

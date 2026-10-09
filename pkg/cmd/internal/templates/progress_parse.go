@@ -90,6 +90,10 @@ type TableProgress struct {
 	// AcrossTargets marks a table that stands for one change across a
 	// rollout's targets, rolled up the way a sharded table rolls up its shards.
 	AcrossTargets bool
+	// OnTargets names the targets a rolled-up table's DDL runs on when they
+	// are only some of the deployment's, shown above the DDL. Empty when the
+	// DDL runs on every target.
+	OnTargets string
 }
 
 // ShardProgress contains per-shard progress for template rendering.
