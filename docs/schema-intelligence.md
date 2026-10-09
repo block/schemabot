@@ -1157,7 +1157,10 @@ finalizer to run once its DDL lands (for Strata, registering tables and
 seeding sequences), independently of any VSchema change. The finalizer runs
 as its own `group_finalizer` operation of the apply, so a namespace can carry
 the marker with no table changes at all, and such a plan still has work to
-apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
+apply. `vschema`, beside `vschema_changed`, is the VSchema diff the plan was
+reviewed with, so a stored plan shows the same VSchema change the plan did; a
+plan recorded without a diff carries `vschema_changed` alone.
+`vschema_generated_only: "true"`, beside `vschema_changed`, means the
 engine generates the namespace's whole VSchema change from the plan's DDL, so
 there is no VSchema diff to review; plans show such a namespace by its DDL
 alone.
