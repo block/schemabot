@@ -221,6 +221,14 @@ type CheckStore interface {
 	// is holding.
 	UpsertPlanResult(ctx context.Context, check *Check, drift PlanDriftState) (stored bool, err error)
 
+	// UpsertGuardBlock records a guard block over plan-derived check state. Like
+	// UpsertPlanResult it refuses (stored=false) while an in-progress apply owns
+	// the row. A row whose stored blocking reason is in preserve keeps that block:
+	// the write refreshes only its head SHA and check run id, so a weaker block
+	// never replaces a stronger one. The stored reason is read under the same row
+	// lock as the write.
+	UpsertGuardBlock(ctx context.Context, check *Check, preserve []string) (stored bool, err error)
+
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
 	RecoverApplyOwnedCheckWithNoOpPlan(ctx context.Context, check *Check) (bool, error)

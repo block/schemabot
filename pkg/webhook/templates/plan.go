@@ -140,8 +140,16 @@ type PlanCommentData struct {
 	// comment is about.
 	ScopedDatabase string
 
-	SchemaName   string // Schema directory name (e.g. filepath.Base of schema dir)
-	Environment  string
+	SchemaName  string // Schema directory name (e.g. filepath.Base of schema dir)
+	Environment string
+
+	// Target is the --target selector a plan or apply was narrowed to: one
+	// rollout member of Environment, named by its target or as
+	// deployment/target. Empty means the comment covers every target. The
+	// metadata line names it, and the copy-paste apply carries it, because
+	// an apply of a narrowed plan has to name the same target.
+	Target string
+
 	Tenant       string
 	HeadSHA      string
 	Repository   string
@@ -704,9 +712,9 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	case data.MemberApplyRefusal != "":
 		writeMemberApplyRefusal(&sb, data.MemberApplyRefusalTarget, data.MemberApplyRefusal)
 	case data.applyFailsOnRefusedChange():
-		writeRefusedChangeReplan(&sb, "this plan", scopedCommand("schemabot plan", data.Environment, data.ScopedDatabase, data.Tenant))
+		writeRefusedChangeReplan(&sb, "this plan", appendTenantFlag(appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot plan -e %s", data.Environment), data.ScopedDatabase), data.Target), data.Tenant))
 	default:
-		applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
+		applyCmd := appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase), data.Target)
 		if data.Tenant != "" {
 			applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
 		}
@@ -915,6 +923,15 @@ func writeAttributedChanges(sb *strings.Builder, changes []AttributedChangeData)
 	sb.WriteString("\nA plan diffs this PR's schema files against the live database, so what another PR applied before merging reads here as something to remove. If that is not what you intend, merge that PR, or bring this PR's schema files up to date with it, then re-plan.\n\n")
 }
 
+// appendTargetFlag appends the --target flag to a pasteable command hint when
+// the comment was narrowed to one rollout member.
+func appendTargetFlag(command, target string) string {
+	if target == "" {
+		return command
+	}
+	return fmt.Sprintf("%s --target %s", command, target)
+}
+
 // writePlanMetadata writes the metadata line for plan comments.
 // Schema name (the schema directory) is shown for MySQL. Vitess uses keyspace headers instead.
 func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
@@ -922,6 +939,9 @@ func writePlanMetadata(sb *strings.Builder, data PlanCommentData) {
 	parts = append(parts, fmt.Sprintf("**Type**: `%s`", schemaChangePlanDatabaseTypeLabel(data.DatabaseType, data.IsMySQL)))
 	if data.IsMySQL && data.SchemaName != "" {
 		parts = append(parts, fmt.Sprintf("**Schema Name**: %s", inlineCode(data.SchemaName)))
+	}
+	if data.Target != "" {
+		parts = append(parts, fmt.Sprintf("**Target**: %s", inlineCode(data.Target)))
 	}
 	if data.Tenant != "" {
 		parts = append(parts, fmt.Sprintf("**Tenant**: `%s`", data.Tenant))

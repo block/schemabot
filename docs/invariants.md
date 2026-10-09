@@ -585,7 +585,10 @@ and `settleChecksReplacedByNewType` in `pkg/webhook/pull_request.go`, the latter
 `handlePlanCommand` and `handleMultiEnvPlan` in `pkg/webhook/plan.go`, and `checkHasStartedApply` in
 `pkg/webhook/check_aggregate.go`), and the storage write that marks a stale plan successful only
 while no apply owns the row (`MarkStalePlanSuccessful` in `pkg/storage/internal/sqlstore/checks.go`);
-close and reopen handlers release nothing they cannot read (`pkg/webhook/pull_request.go`).
+close and reopen handlers release nothing they cannot read (`pkg/webhook/pull_request.go`); and the
+guard block a narrowed apply writes, which keeps a reconciliation block in place instead of replacing
+it (`storeNarrowedApplyCheck` in `pkg/webhook/apply_check_records.go`, `UpsertGuardBlock` in
+`pkg/storage/internal/sqlstore/checks.go`).
 
 ### MG-7: A completed rollback never shows green
 
@@ -665,7 +668,10 @@ refusing member work the apply's operation shape cannot carry, rather than settl
 done (`rejectMemberWorkOutsideShape` in `pkg/api/plan_handlers.go`); the failing
 aggregate published from that round when the stored check state cannot be written
 (`failClosedOnUnstoredRollout` in `pkg/webhook/apply_member_work.go`, and `pkg/webhook/plan.go`);
-the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`); an environment whose
+the refusal to record a plan narrowed to one member (`upsertPlanCheckRecord`); an apply narrowed to
+one member blocking the check before it dispatches (`storeNarrowedApplyCheck` in
+`pkg/webhook/apply_check_records.go`) and when it completes (`completedNarrowedApply` in
+`updateCheckRecordForApplyResult`, `pkg/webhook/check_records.go`); an environment whose
 namespace placement refuses its plan stored as a failing check on every plan command
 (`storeNamespacePlacementCheck` in `pkg/webhook/check_records.go`, called by the single- and
 multi-environment plans in `pkg/webhook/plan.go` on each refusal `planRefusedByNamespacePlacement`

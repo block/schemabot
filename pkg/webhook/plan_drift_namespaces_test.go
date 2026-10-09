@@ -78,7 +78,7 @@ func TestReviewTimeDrift_SelectingPrimaryMatchesItsOwnPlan(t *testing.T) {
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(t.Context(), planReq, "octocat/orders", 7)
 	require.NoError(t, err)
-	outcome, _ := h.reviewTimeDrift(t.Context(), planReq, planProto, plannedPrimaryMember(planResp), "octocat/orders", 7)
+	outcome, _ := h.reviewTimeDrift(t.Context(), planReq, planProto, planResp, "octocat/orders", 7)
 
 	assert.Equal(t, driftClean, outcome.state, "the primary's recorded selection matches the placement the rollup resolves")
 	assert.Equal(t, []string{"ns_0"}, client.planNamespaces)

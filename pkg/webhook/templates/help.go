@@ -17,7 +17,7 @@ func commandReference() string {
 | ` + "`schemabot rollback <apply-id> -e <env> [-t <tenant>]`" + ` | Generate a rollback plan |
 | ` + "`schemabot rollback-confirm -e <env> [-t <tenant>]`" + ` | Execute a rollback |
 
-**Options**: ` + "`-e <env>`" + ` environment, ` + "`-d <db>`" + ` database, ` + "`-t, --tenant <name>`" + ` deployment routing, ` + "`--defer-cutover`" + `, ` + "`--allow-unsafe`" + `, ` + "`--skip-revert`" + ` (Vitess)
+**Options**: ` + "`-e <env>`" + ` environment, ` + "`-d <db>`" + ` database, ` + "`-t, --tenant <name>`" + ` deployment routing, ` + "`--defer-cutover`" + `, ` + "`--allow-unsafe`" + `, ` + "`--skip-revert`" + ` (Vitess), ` + "`--target <target>`" + ` one target of the rollout (plan and apply)
 
 **Quick start**: ` + "`plan`" + ` → ` + "`apply`" + `
 `

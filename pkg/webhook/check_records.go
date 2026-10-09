@@ -52,6 +52,10 @@ type reviewDriftOutcome struct {
 	// apply it refuses names the right fix. Unset is review-time deployment
 	// drift, which is what the rollup reports.
 	block checkBlockReason
+	// preserve lists stored blocking reasons a blocked outcome must not
+	// replace: a row already carrying one keeps it, because it is the stronger
+	// block. Empty for outcomes the rollup reports, which rewrite any block.
+	preserve []string
 }
 
 // blockingReason is the stored reason for a blocked outcome.
@@ -391,7 +395,12 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		BlockingReason: blockingReason,
 		ChangeSummary:  changeSummary,
 	}
-	stored, err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	var stored bool
+	if driftBlocked && len(drift.preserve) > 0 {
+		stored, err = h.service.Storage().Checks().UpsertGuardBlock(ctx, check, drift.preserve)
+	} else {
+		stored, err = h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	}
 	if errors.Is(err, storage.ErrCheckNotFound) {
 		// The PR closed and its check state was cleaned up while this plan ran.
 		// There is no gate left for the result to land on, so the plan itself is
@@ -672,6 +681,21 @@ func isCompletedRollback(a *storage.Apply) bool {
 	return a.IsRollback() && state.IsState(a.State, state.Apply.Completed)
 }
 
+// completedNarrowedApply reports whether a forward apply narrowed to one
+// rollout member completed. It changed one target, so its success cannot pass
+// the environment's check (MG-12). A check already blocked because the PR
+// removed the schema change keeps that reason, which names the reconciliation
+// the operator owes.
+func completedNarrowedApply(a *storage.Apply, check *storage.Check) bool {
+	if !state.IsState(a.State, state.Apply.Completed) || a.IsRollback() {
+		return false
+	}
+	if storage.ParseApplyOptions(a.Options).NarrowedTo == "" {
+		return false
+	}
+	return !checkBlockedByRemovedSchemaAfterApply(check)
+}
+
 // completedForwardTaskBeforeCancellation returns durable evidence that the
 // cancelled apply or an earlier forward apply changed the same target. Apply
 // rows cannot provide this proof because an apply may be cancelled or failed
@@ -828,6 +852,25 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 					append(apply.LogAttrs(), "check_status", check.Status, "check_conclusion", check.Conclusion)...)
 			}
 		}
+	case completedNarrowedApply(apply, check):
+		check.Status = checkStatusCompleted
+		check.Conclusion = checkConclusionActionRequired
+		check.HasChanges = true
+		// A block the narrowed apply kept when it started stays with its own
+		// reason and summary; only a rollup of the whole environment lifts it.
+		if !narrowedApplyKeepsBlock(check.BlockingReason) {
+			check.BlockingReason = narrowedApplyBlock.blockingReason
+			check.ErrorMessage = narrowedApplyBlock.message
+			check.ChangeSummary = narrowedApplyCheckSummary
+		}
+		// MarkActionRequiredForApply releases check ownership, so the plan of
+		// the whole environment that lifts this block can write its result.
+		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("mark stored check state action_required after apply narrowed to one target repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
 	default:
 		var conclusion string
 		switch {
@@ -862,10 +905,13 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		// The action-required writes yield only to a newer apply, while ordinary
 		// completion requires the row to still be owned by this apply.
 		msg := "skipping check state update because stored state no longer belongs to apply"
-		if isCompletedRollback(apply) {
+		switch {
+		case isCompletedRollback(apply):
 			msg = "skipping rollback action_required update because a newer apply supersedes the rollback"
-		} else if cancelledForwardApply {
+		case cancelledForwardApply:
 			msg = "skipping cancelled apply action_required update because a newer apply supersedes the cancellation"
+		case completedNarrowedApply(apply, check):
+			msg = "skipping narrowed apply action_required update because a newer apply supersedes it"
 		}
 		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,

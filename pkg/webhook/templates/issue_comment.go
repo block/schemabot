@@ -46,6 +46,22 @@ func RenderUnsupportedDatabaseFlag(action string) string {
 	return fmt.Sprintf("The `-d` flag is not supported for `%s`.", action)
 }
 
+// RenderUnsupportedTargetFlag renders the message posted when `--target` is
+// supplied to a command that cannot be narrowed to one rollout member.
+func RenderUnsupportedTargetFlag(action string) string {
+	return fmt.Sprintf("The `--target` flag is not supported for `%s`. Only `plan` and `apply` take it.", action)
+}
+
+// RenderTargetMissingEnv renders the message posted when `--target` is given
+// without `-e`. A target is a member of one environment's rollout, so the
+// usage line keeps the target the caller typed and asks only for the
+// environment. The target is unvalidated text from the comment, so the usage
+// line is a code span it cannot break out of.
+func RenderTargetMissingEnv(action, target string) string {
+	return "`--target` picks a target inside one environment, so it needs `-e` too.\n\n" +
+		"**Usage**: " + inlineCode(fmt.Sprintf("schemabot %s -e <environment> --target %s", action, target))
+}
+
 // StopCommandAcceptedData contains data for a PR comment stop acknowledgement.
 type StopCommandAcceptedData struct {
 	ApplyID      string

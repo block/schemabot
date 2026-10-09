@@ -14,6 +14,8 @@
 package checkstate
 
 import (
+	"slices"
+
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -78,6 +80,7 @@ const (
 	BlockManagedDirMissingConfig          = "managed_dir_missing_config"
 	BlockNoAllowedConfiguredEnvironments  = "no_allowed_configured_environments"
 	BlockParticipantUnresolved            = "participant_unresolved"
+	BlockNarrowedApply                    = "narrowed_apply"
 	BlockReviewTimeDeploymentDrift        = storage.ReviewTimeDeploymentDriftBlockingReason
 	BlockNamespacePlacementRefused        = storage.NamespacePlacementRefusedBlockingReason
 )
@@ -106,6 +109,10 @@ const (
 // that re-evaluates the rollup lifts the block once they match. Reading it as
 // a reconciliation would deny the action that actually clears it.
 //
+// A narrowed apply is a guard for the same reason: it changed one target of
+// the rollout, and a plan of the whole environment lifts the block once every
+// target has the change.
+//
 // An unlisted reason is read as blockGuard: the column is a plain string, so a
 // value this table does not know about is one whose remedy cannot be asserted,
 // and the honest reading of an unknown block is that someone has to look at it.
@@ -124,6 +131,7 @@ var blockClasses = map[string]blockClass{
 	BlockPRFileCapExceeded:                blockGuard,
 	BlockManagedDirMissingConfig:          blockGuard,
 	BlockNoAllowedConfiguredEnvironments:  blockGuard,
+	BlockNarrowedApply:                    blockGuard,
 	BlockParticipantUnresolved:            blockAwaitingReport,
 }
 
@@ -132,6 +140,31 @@ var blockClasses = map[string]blockClass{
 func BlockingReasonIsClassified(reason string) bool {
 	_, ok := blockClasses[reason]
 	return ok
+}
+
+// ReconciliationBlockingReasons returns every durable blocking reason that
+// says work may have reached the target, sorted. A guard block written over a
+// row carrying one of them would trade "reconcile the target" for "re-plan",
+// so writers that must not weaken a block keep these rows as they are.
+func ReconciliationBlockingReasons() []string {
+	var reasons []string
+	for reason, class := range blockClasses {
+		if class == blockReconciliation {
+			reasons = append(reasons, reason)
+		}
+	}
+	slices.Sort(reasons)
+	return reasons
+}
+
+// RollupBlockingReasons returns the durable blocking reasons that only a
+// fresh review-time rollup may clear, sorted. They depend on live deployment
+// state rather than PR content, so a writer that did not run the rollup keeps
+// rows carrying them as they are.
+func RollupBlockingReasons() []string {
+	reasons := []string{BlockReviewTimeDeploymentDrift, BlockNamespacePlacementRefused}
+	slices.Sort(reasons)
+	return reasons
 }
 
 // Reason codes for why a stored check row reads the way it does on a given

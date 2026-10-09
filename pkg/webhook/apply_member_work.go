@@ -310,6 +310,7 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 	}
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
+	commentData.Target = narrowedTarget(planResp, result.Target)
 	commentData.UnsafeChanges = append(commentData.UnsafeChanges, memberUnsafe...)
 	commentData.HasUnsafeChanges = true
 	if runsMemberWork {
@@ -323,6 +324,16 @@ func (h *Handler) blockUnsafeWithoutOptIn(ctx context.Context, client *ghclient.
 		"plan_id", planResp.PlanID, "primary_unsafe", len(planResp.UnsafeChanges()), "other_targets_unsafe", len(memberUnsafe))
 	h.postComment(repo, pr, installationID, templates.RenderUnsafeChangesBlocked(commentData))
 	return true
+}
+
+// narrowedTarget returns the --target selector a comment about this plan names,
+// or empty when the plan covers the whole rollout. A selector on an environment
+// with one target narrows nothing, so its comment reads as any other.
+func narrowedTarget(planResp *apitypes.PlanResponse, target string) string {
+	if planResp.NarrowedTo == "" {
+		return ""
+	}
+	return target
 }
 
 // memberWorkRefusalMessage tells the operator why the other targets' work was
