@@ -140,7 +140,7 @@ func TestRollbackExecutionErrorMessage(t *testing.T) {
 	// stored with it, followed by the commands that replace it; the refusal's
 	// text, written for an API caller, never reaches the comment.
 	t.Run("plan refusals name the plan and the rollback to re-plan", func(t *testing.T) {
-		const replan = "Run `schemabot rollback` again for the same apply to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`."
+		const replan = "Run `schemabot rollback APPLY_ID -e staging` again, with APPLY_ID the apply you rolled back, to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`."
 		tests := []struct {
 			name string
 			err  error

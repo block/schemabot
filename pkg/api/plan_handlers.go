@@ -1572,7 +1572,7 @@ func storedPlanNotFoundMessage(operation, planID string) string {
 
 // applyStorageError marks a storage read or write that failed while queueing
 // an apply for a plan that was already loaded and validated. The request was
-// valid; the server could not record it. The error text carries the storage
+// valid; the server could not record it. The error text carries the SQL
 // driver's message, so it belongs in server logs: callers that present the
 // failure answer with applyStorageFailedMessage instead. Refusals storage
 // reports as sentinels (an active apply on the target, a changed lock intent)
@@ -2034,6 +2034,12 @@ func (s *Service) createStoredApply(
 	onFailure := s.config.OnFailure(plan.Database, req.Environment)
 	members, err := s.resolveApplyMembers(ctx, plan, req.Environment, targets)
 	if err != nil {
+		// The member-plan lookup reports its storage failure without the apply
+		// it was queueing; name it here, where the identifier is known, so the
+		// failure log can be matched to the attempt.
+		if storageErr, ok := errors.AsType[*applyStorageError](err); ok && storageErr.ApplyIdentifier == "" {
+			storageErr.ApplyIdentifier = applyIdentifier
+		}
 		return nil, 0, err
 	}
 	// Admission is per member, because the plan a member runs is the plan it was

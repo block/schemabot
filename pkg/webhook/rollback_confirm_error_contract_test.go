@@ -489,7 +489,7 @@ func TestRollbackConfirmLegacyPlanWithoutRoutingNamesTheReplan(t *testing.T) {
 	assert.False(t, retry, "an attempted dispatch must never be re-driven")
 	body := requireComment(t, comments, "legacy rollback plan refusal comment")
 	assert.Contains(t, body, "Plan `rbplan-1` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. "+
-		"Run `schemabot rollback` again for the same apply to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`.")
+		"Run `schemabot rollback APPLY_ID -e staging` again, with APPLY_ID the apply you rolled back, to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`.")
 	assert.NotContains(t, body, "server-side routing metadata")
 	assert.NotContains(t, body, "retry apply")
 	assert.NotContains(t, body, "Failed to execute rollback")

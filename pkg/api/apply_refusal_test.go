@@ -361,6 +361,27 @@ func TestApplyHandler_StorageFailureStaysServerError(t *testing.T) {
 		assert.Nil(t, applies.apply)
 	})
 
+	// Listing a rollout's member plans fails while the apply is being queued.
+	// The failure names the apply being queued, so the error log can be
+	// matched to the attempt, and the caller still gets the fixed line.
+	t.Run("listing the member plans fails", func(t *testing.T) {
+		primary := primaryPlanRow("testapp-001")
+		primary.Environment = "production"
+		svc, applies, _ := multiTargetApplyHTTPService(primary, nil)
+		svc.storage.(*mockStorageWithApplyStores).plans.(*listingPlanStore).listErr = errDriverStorage
+
+		status, resp := postApplyForRefusal(t, svc, `{"plan_id":"plan-primary","environment":"production","renders_rollout":true}`)
+		assert.Equal(t, http.StatusInternalServerError, status)
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Equal(t, "apply failed: storage error while queueing plan plan-primary; see server logs, then retry", resp.Error)
+		assert.Nil(t, applies.apply)
+
+		_, _, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-primary", Environment: "production", RendersRollout: true})
+		storageErr, ok := errors.AsType[*applyStorageError](err)
+		require.True(t, ok, "a member-plan listing failure is a storage failure: %v", err)
+		assert.True(t, strings.HasPrefix(storageErr.ApplyIdentifier, "apply-"), "the failure names the apply being queued, got %q", storageErr.ApplyIdentifier)
+	})
+
 	// Storage refusing the apply on the merits is not a storage failure: an
 	// active apply on the target keeps its conflict answer and its message.
 	t.Run("an active apply on the target stays a conflict", func(t *testing.T) {
