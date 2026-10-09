@@ -1153,7 +1153,15 @@ type EtreCredentialsConfig struct {
 	// AWS account id (defaults to aws_account_id); when empty, secrets are read from
 	// the caller's own account. ExternalID is an optional STS external id used only
 	// with RoleARN.
+	//
+	// Region is the one region every target's secret is read from.
+	// RegionAttribute instead names the entity attribute holding each target's
+	// region (e.g. "aws_region"), for secrets provisioned beside their cluster in
+	// whichever region it runs. Exactly one of the two is required; a target with
+	// no value for RegionAttribute fails resolution rather than falling back to
+	// another region.
 	Region           string `yaml:"region,omitempty"`
+	RegionAttribute  string `yaml:"region_attribute,omitempty"`
 	RoleARN          string `yaml:"role_arn,omitempty"`
 	ExternalID       string `yaml:"external_id,omitempty"`
 	SecretName       string `yaml:"secret_name,omitempty"`

@@ -256,8 +256,10 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 		// after (potentially slow) credential-chain resolution. role_arn is
 		// optional: without it the backend reads from the caller's own account.
 		switch {
-		case cfg.Region == "":
-			return nil, fmt.Errorf("target_resolver.etre.credentials.region is required for the awssm backend")
+		case cfg.Region == "" && cfg.RegionAttribute == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.region or region_attribute is required for the awssm backend")
+		case cfg.Region != "" && cfg.RegionAttribute != "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.region and region_attribute are mutually exclusive; set region for one fixed region or region_attribute for each target's own")
 		case cfg.SecretName == "":
 			return nil, fmt.Errorf("target_resolver.etre.credentials.secret_name is required for the awssm backend")
 		case cfg.Username != "" && decode != nil:
@@ -270,6 +272,7 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 		resolver, err := awscreds.New(awscreds.Config{
 			AWSConfig:        awsCfg,
 			Region:           cfg.Region,
+			RegionAttribute:  cfg.RegionAttribute,
 			RoleARN:          cfg.RoleARN,
 			ExternalID:       cfg.ExternalID,
 			SecretName:       cfg.SecretName,
@@ -316,6 +319,10 @@ func resolverAttributeFields(cfg EtreConfig) []string {
 				accountAttr = "aws_account_id"
 			}
 			fields = ensureField(fields, accountAttr)
+		}
+		// A per-target secret region comes from an attribute.
+		if cfg.Credentials.RegionAttribute != "" {
+			fields = ensureField(fields, cfg.Credentials.RegionAttribute)
 		}
 		// The secret name and username may template over resolved attributes;
 		// surface those so the resolver fetches them for the credential backend.

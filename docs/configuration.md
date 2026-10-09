@@ -236,6 +236,13 @@ resolver whose engine decodes its secret (`postgres` or `vitess`) refuses to
 start when a username is configured, on both the `secret_ref` and `awssm`
 backends, rather than ignoring it.
 
+The `awssm` backend reads every target's secret from the one `region` it is
+given. When each cluster's secret is provisioned in the region that cluster
+runs in, set `region_attribute` instead, naming the entity attribute that holds
+it (for example `region_attribute: aws_region`). Set exactly one of the two. A
+target whose entity has no value for the attribute fails resolution rather than
+being read from another region.
+
 `table_owner` and `ca_ref` mean the same as on a `dsn_from` target. They apply
 to every target the resolver serves, so a resolver serves clusters that share
 one owner role.

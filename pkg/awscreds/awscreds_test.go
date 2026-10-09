@@ -14,30 +14,34 @@ import (
 // fakeFetcher records the account and secret name it was asked for and returns
 // a configured payload, so the resolver logic can be tested without AWS.
 type fakeFetcher struct {
+	calls      int
 	gotAccount string
+	gotRegion  string
 	gotSecret  string
 	payload    string
 	err        error
 }
 
-func (f *fakeFetcher) FetchSecret(_ context.Context, accountID, secretName string) (string, error) {
+func (f *fakeFetcher) FetchSecret(_ context.Context, accountID, region, secretName string) (string, error) {
+	f.calls++
 	f.gotAccount = accountID
+	f.gotRegion = region
 	f.gotSecret = secretName
 	return f.payload, f.err
 }
 
 func TestResolverReadsJSONSecretForTargetAccount(t *testing.T) {
-	fetch := &fakeFetcher{payload: `{"username":"spirit","password":"s3cret"}`}
-	r := newResolver("aws_account_id", "ods-rds-spirit-password", "", fetch, nil, true)
+	fetch := &fakeFetcher{payload: `{"username":"ddl","password":"s3cret"}`}
+	r := newResolver("aws_account_id", "ddl-password", "", fetch, nil, true)
 
 	creds, err := r.ResolveCredentials(t.Context(),
 		inventory.Request{Target: "orders-dsid"},
-		map[string]string{"aws_account_id": "497546275604"})
+		map[string]string{"aws_account_id": "111111111111"})
 	require.NoError(t, err)
 
-	assert.Equal(t, "497546275604", fetch.gotAccount)
-	assert.Equal(t, "ods-rds-spirit-password", fetch.gotSecret)
-	assert.Equal(t, "spirit", creds.Username)
+	assert.Equal(t, "111111111111", fetch.gotAccount)
+	assert.Equal(t, "ddl-password", fetch.gotSecret)
+	assert.Equal(t, "ddl", creds.Username)
 	assert.Equal(t, "s3cret", creds.Password)
 }
 
@@ -82,7 +86,7 @@ func TestResolverFailsOnNonJSONSecret(t *testing.T) {
 }
 
 func TestResolverFailsOnIncompleteSecret(t *testing.T) {
-	r := newResolver("aws_account_id", "secret", "", &fakeFetcher{payload: `{"username":"spirit"}`}, nil, true)
+	r := newResolver("aws_account_id", "secret", "", &fakeFetcher{payload: `{"username":"ddl"}`}, nil, true)
 
 	_, err := r.ResolveCredentials(t.Context(),
 		inventory.Request{Target: "orders-dsid"},
@@ -277,6 +281,97 @@ func TestResolverFetchErrorIncludesAccountInAssumeRoleMode(t *testing.T) {
 	assert.NotContains(t, err.Error(), "in account")
 }
 
+// A cluster's credential secret is provisioned in the region the cluster runs
+// in. With a region attribute, a us-east-1 cluster's secret is read from
+// us-east-1 even though other targets of the same resolver live in us-west-2.
+func TestResolverReadsSecretInEntityRegion(t *testing.T) {
+	fetch := &fakeFetcher{payload: `{"username":"ddl","password":"s3cret"}`}
+	r := newResolver("aws_account_id", "ddl-password", "", fetch, nil, true)
+	r.regionAttr = "aws_region"
+
+	creds, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "inventory-dsid"},
+		map[string]string{"aws_account_id": "222222222222", "aws_region": "us-east-1"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "222222222222", fetch.gotAccount)
+	assert.Equal(t, "us-east-1", fetch.gotRegion)
+	assert.Equal(t, "ddl-password", fetch.gotSecret)
+	assert.Equal(t, "ddl", creds.Username)
+}
+
+// A target whose entity does not name a region fails before any fetch: reading
+// the secret from some other region would be a guess.
+func TestResolverFailsWhenRegionAttributeMissing(t *testing.T) {
+	fetch := &fakeFetcher{payload: `{"username":"u","password":"p"}`}
+	r := newResolver("aws_account_id", "secret", "", fetch, nil, true)
+	r.regionAttr = "aws_region"
+
+	_, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"},
+		map[string]string{"aws_account_id": "111111111111"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target "orders-dsid" has no "aws_region" attribute`)
+	assert.Equal(t, 0, fetch.calls)
+}
+
+// A fixed region is used for every target, whatever region its entity reports.
+func TestResolverFixedRegionIgnoresEntityRegion(t *testing.T) {
+	fetch := &fakeFetcher{payload: `{"username":"u","password":"p"}`}
+	r := newResolver("aws_account_id", "secret", "", fetch, nil, true)
+	r.region = "us-west-2"
+
+	_, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"},
+		map[string]string{"aws_account_id": "111111111111", "aws_region": "us-east-1"})
+	require.NoError(t, err)
+	assert.Equal(t, "us-west-2", fetch.gotRegion)
+}
+
+// A fetch failure names the account and region it read from, so a secret that
+// exists in one region but not another is diagnosable from the error alone.
+func TestResolverFetchErrorIncludesRegion(t *testing.T) {
+	r := newResolver("aws_account_id", "ddl-password", "", &fakeFetcher{err: fmt.Errorf("ResourceNotFoundException")}, nil, true)
+	r.regionAttr = "aws_region"
+
+	_, err := r.ResolveCredentials(t.Context(),
+		inventory.Request{Target: "inventory-dsid"},
+		map[string]string{"aws_account_id": "222222222222", "aws_region": "us-east-1"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target "inventory-dsid" in account 222222222222, region us-east-1`)
+}
+
+// Assumed-role clients are cached per account and region: a client built for
+// one region is never reused to read another region's secret.
+func TestAssumeRoleFetcherCachesClientPerAccountAndRegion(t *testing.T) {
+	r, err := New(Config{RegionAttribute: "aws_region", RoleARN: "arn:aws:iam::{account}:role/role", SecretName: "secret"})
+	require.NoError(t, err)
+	f, ok := r.fetch.(*assumeRoleFetcher)
+	require.True(t, ok)
+
+	west := f.clientFor("111111111111", "us-west-2")
+	east := f.clientFor("111111111111", "us-east-1")
+	assert.NotSame(t, west, east)
+	assert.Same(t, west, f.clientFor("111111111111", "us-west-2"))
+	assert.Equal(t, "us-west-2", west.Options().Region)
+	assert.Equal(t, "us-east-1", east.Options().Region)
+	assert.NotSame(t, west, f.clientFor("222222222222", "us-west-2"))
+}
+
+// Own-account clients are cached per region the same way.
+func TestOwnAccountFetcherCachesClientPerRegion(t *testing.T) {
+	r, err := New(Config{RegionAttribute: "aws_region", SecretName: "secret"})
+	require.NoError(t, err)
+	f, ok := r.fetch.(*ownAccountFetcher)
+	require.True(t, ok)
+
+	west := f.clientForRegion("us-west-2")
+	east := f.clientForRegion("us-east-1")
+	assert.NotSame(t, west, east)
+	assert.Same(t, west, f.clientForRegion("us-west-2"))
+	assert.Equal(t, "us-east-1", east.Options().Region)
+}
+
 func TestNewValidatesConfig(t *testing.T) {
 	base := Config{Region: "us-west-2", RoleARN: "arn:aws:iam::{account}:role/tern-assumed", SecretName: "secret"}
 
@@ -287,7 +382,19 @@ func TestNewValidatesConfig(t *testing.T) {
 	noRegion.Region = ""
 	_, err = New(noRegion)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "region")
+	assert.Contains(t, err.Error(), "region or region attribute is required")
+
+	// A region attribute stands in for the fixed region.
+	regionAttr := noRegion
+	regionAttr.RegionAttribute = "aws_region"
+	_, err = New(regionAttr)
+	require.NoError(t, err)
+
+	bothRegions := base
+	bothRegions.RegionAttribute = "aws_region"
+	_, err = New(bothRegions)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mutually exclusive")
 
 	// RoleARN is optional: without it, secrets are read from the caller's own
 	// account, so New succeeds.
