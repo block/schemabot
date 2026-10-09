@@ -682,7 +682,9 @@ const (
 // as covering the namespace's shards.
 //
 // A namespace-unit re-plan that still lists the table is read as needing the
-// change on the task's shard too, and an unattributable task runs its reviewed
+// change on the task's shard too, whether or not the engine declares that it
+// plans each shard: the declaration settles a task the plan is silent about,
+// never one the plan still asks for. An unattributable task runs its reviewed
 // statement again. Either can be wrong for a shard that already has the
 // change, but it is wrong in the direction that runs the statement rather than
 // the direction that reports a change as made. Running it is not free. Most
@@ -705,12 +707,14 @@ func replanVerdictForTask(replanDDL map[shardTableKey][]string, plansEachShard b
 	if _, needsChange := replanDDL[key]; needsChange {
 		return replanNeedsChange, key
 	}
-	if task.Shard != "" && !plansEachShard && !replanCoversShards(replanDDL, task.Namespace) {
+	if task.Shard != "" {
 		unitKey := shardTableKey{namespace: task.Namespace, table: task.TableName}
 		if _, needsChange := replanDDL[unitKey]; needsChange {
 			return replanNeedsChange, unitKey
 		}
-		return replanCannotAttribute, key
+		if !plansEachShard && !replanCoversShards(replanDDL, task.Namespace) {
+			return replanCannotAttribute, key
+		}
 	}
 	return replanChangeLanded, key
 }

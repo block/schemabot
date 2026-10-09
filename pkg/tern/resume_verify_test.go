@@ -278,6 +278,11 @@ func TestReplanVerdictForTask_ShardTaskUnderAShardKeyedReplan(t *testing.T) {
 	otherNamespace := shardTableKey{namespace: "appdb_other", shard: "-40", table: "orders"}
 	verdict, _ = replanVerdictForTask(map[shardTableKey][]string{otherNamespace: {resumeTaskDDL}}, true, task)
 	assert.Equal(t, replanChangeLanded, verdict, "another namespace still owing the table says nothing against this one")
+
+	unitKey := shardTableKey{namespace: "appdb_sharded", table: "orders"}
+	verdict, key = replanVerdictForTask(map[shardTableKey][]string{unitKey: {resumeTaskDDL}}, true, task)
+	assert.Equal(t, replanNeedsChange, verdict, "a plan still asking for the change on the namespace is never read as the shard having it")
+	assert.Equal(t, unitKey, key)
 }
 
 // A resume of a shard task whose change already landed, on an engine that
