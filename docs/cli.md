@@ -682,11 +682,11 @@ $ schemabot progress apply-example-84
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.50%
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
-       • Shards: 4 (1 complete, 3 copying)
+       • Shards: 4 (3 copying, 1 complete)
+           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
+           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
            ✓ -40: 1,000,000 rows
-           ◉ 40-80: 80.00% (800,000/1,000,000 rows) ETA 1m 0s
-           ◉ 80-c0: 65.00% (650,000/1,000,000 rows) ETA 1m 45s
-           ◉ c0-: 45.00% (450,000/1,000,000 rows) ETA 2m 45s
 
 
 ESC detach • c cancel

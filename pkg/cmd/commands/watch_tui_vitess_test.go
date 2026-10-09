@@ -57,7 +57,7 @@ func TestTUIShardRendering(t *testing.T) {
 			},
 			// The ETA pins the shard-field plumbing end to end: unlike the
 			// percent, formatShardLine cannot re-derive it from row counts.
-			contains: []string{"Shards:", "2 copying", "ETA 2m 30s"},
+			contains: []string{"Shards:", "2 copying", "ETA: 2m 30s"},
 		},
 		{
 			name: "uppercase and prefixed statuses normalized for rendering",

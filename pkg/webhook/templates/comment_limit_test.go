@@ -797,3 +797,50 @@ func TestPlanCommentCutSoleTargetPlanNamesWhosePlanItPointsAt(t *testing.T) {
 		assert.NotContains(t, body, "for this target")
 	})
 }
+
+// inFlightShardedTables is n tables each copying across sixteen shards, so
+// every table renders its shard listing.
+func inFlightShardedTables(n int) []TableProgressData {
+	tables := greenfieldTables("events", n, state.Task.Running)
+	for i := range tables {
+		tables[i].RowsCopied, tables[i].RowsTotal = 400*16, 1000*16
+		for s := range 16 {
+			tables[i].Shards = append(tables[i].Shards, ShardProgressData{
+				Shard: fmt.Sprintf("%x0-%x0", s, s+1), Status: state.Task.Running,
+				PercentComplete: 40, RowsCopied: 400 + int64(s), RowsTotal: 1000,
+			})
+		}
+	}
+	return tables
+}
+
+// A sharded apply copying many tables at once lists each table's shards, and
+// those lines share the comment with the DDL. The DDL yields room to them
+// first. When the comment would not fit even with the DDL cut to nothing, each
+// table keeps the line counting its shards by state and drops the line per
+// shard, so the comment stays under the limit and the DDL keeps its room.
+func TestApplyCommentShardListingsFitWithinTheLimit(t *testing.T) {
+	limit := commentBodyLimit - applyCommentAppendReserve
+	render := func(n int) string {
+		return RenderApplyStatusComment(ApplyStatusCommentData{
+			Database: "ledger", Environment: "production", Engine: "PlanetScale",
+			State: state.Apply.Running, Tables: inFlightShardedTables(n),
+		})
+	}
+
+	t.Run("the DDL yields to the listings", func(t *testing.T) {
+		body := render(60)
+		assert.LessOrEqual(t, len(body), limit)
+		assert.Contains(t, body, ddlTruncatedMarker)
+		assert.Equal(t, 60, strings.Count(body, "- Shards: 16 (16 copying)\n"))
+		assert.Equal(t, 60*3, strings.Count(body, "  - ◉ `"), "each table names its three slowest shards")
+	})
+
+	t.Run("the listings keep only their counts", func(t *testing.T) {
+		body := render(140)
+		assert.LessOrEqual(t, len(body), limit)
+		assert.Equal(t, 140, strings.Count(body, "- Shards: 16 (16 copying)\n"), "every table still counts its shards")
+		assert.NotContains(t, body, "  - ◉ `", "no table names its shards one per line")
+		assert.Contains(t, body, "CREATE TABLE `events_000`", "the DDL keeps the room the shard lines gave up")
+	})
+}

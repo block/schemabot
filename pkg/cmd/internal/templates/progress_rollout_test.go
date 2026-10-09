@@ -141,9 +141,9 @@ func TestWriteProgress_ThreeTargetRolloutIsOneSection(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `region`"), "the shared change's DDL is shown once:\n%s", out)
 	assert.Contains(t, out, "70.00%", "the bar sums the rows of the targets copying or done")
 	assert.Contains(t, out, "Rows: 1,400 / 2,000 · ETA: 2m 0s")
-	assert.Contains(t, out, "• Targets: 2 (1 complete, 1 copying)")
+	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 complete)")
 	assert.Contains(t, out, "✓ payments-001: 1,000 rows")
-	assert.Contains(t, out, "◉ payments-002: 40.00% (400/1,000 rows) ETA 2m 0s")
+	assert.Contains(t, out, "◉ payments-002: 40.00% · 400 / 1,000 rows · ETA: 2m 0s")
 	assert.Contains(t, out, "1 of 3 targets have not reported progress yet.")
 	assert.NotContains(t, out, "prod/payments-001 —", "a rolled-up target has no section of its own")
 	assert.True(t, strings.HasSuffix(out, "To stop this schema change:\n  schemabot stop apply-7f3c -e production\n"),
@@ -201,10 +201,12 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 	assert.Contains(t, out, "❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)")
 	assert.Equal(t, 1, strings.Count(out, "ADD COLUMN `region`"))
 	assert.NotContains(t, out, "❌ Failed", "a table still copying on 19 targets does not read as failed")
-	assert.Contains(t, out, "• Targets: 60 (40 complete, 19 copying, 1 failed)")
-	assert.Contains(t, out, "✗ payments-041: failed")
-	assert.Contains(t, out, "... 14 more copying targets")
-	assert.Contains(t, out, "... 40 complete")
+	assert.Contains(t, out, "• Targets: 60 (1 failed, 19 copying, 40 complete)\n"+
+		"           ✗ payments-041: failed\n"+
+		"           ◉ payments-042: 51.00% · 510 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ◉ payments-043: 52.00% · 520 / 1,000 rows · ETA: 2m 0s\n"+
+		"           ◉ payments-044: 53.00% · 530 / 1,000 rows · ETA: 2m 0s\n",
+		"the failure and the three slowest copiers are named; the heading counts the rest")
 	assert.Contains(t, out, "4 of 64 targets have not reported progress yet.")
 	assertLess(t, out, "Targets needing attention:", "❌ payments-041 — failed: Error 1062: Duplicate entry 'x' for key 'orders.idx'")
 	assertLess(t, out, "payments-041 — failed", "External operation ID: spirit-op-041")
@@ -213,7 +215,7 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 }
 
 // A change that failed on all 64 targets still stays short: the table names
-// the first failed targets and counts the rest, and the attention list caps
+// the first five failed targets and counts the rest, and the attention list caps
 // its own entries, so the output does not grow by a line per target.
 func TestWriteProgress_AllTargetsFailedStaysBounded(t *testing.T) {
 	var targets []rolloutTarget
@@ -228,9 +230,8 @@ func TestWriteProgress_AllTargetsFailedStaysBounded(t *testing.T) {
 
 	out := renderRollout(t, data)
 	assert.Contains(t, out, "• Targets: 64 (64 failed)")
-	assert.Contains(t, out, "✗ payments-010: failed")
-	assert.NotContains(t, out, "✗ payments-011: failed", "failed targets past the cap are counted, not listed:\n%s", out)
-	assert.Contains(t, out, "... 54 more failed targets")
+	assert.Contains(t, out, "✗ payments-005: failed\n           ... 59 more failed targets\n",
+		"failed targets past the cap are counted, not listed:\n%s", out)
 	assert.Contains(t, out, "…and 44 more")
 	assert.Less(t, strings.Count(out, "\n"), 60, "the output does not grow by a line per failed target:\n%s", out)
 }
@@ -330,13 +331,12 @@ func TestWriteProgress_TargetRollupSumsTargetsPastRowCopy(t *testing.T) {
 	out := renderRollout(t, targetRolloutData([]rolloutTarget{waiting, copyingTarget(200)}))
 	assert.Contains(t, out, "60.00%", "the bar sums every target past the start of its copy:\n%s", out)
 	assert.Contains(t, out, "Rows: 1,200 / 2,000")
-	assert.Contains(t, out, "• Targets: 2 (1 waiting for cutover, 1 copying)")
+	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 waiting for cutover)")
 }
 
-// A wide rollout past its row copy names the phase each target is in: the
-// summary counts catching up and checksumming targets, and the lines sample
-// each phase with the rest counted, rather than reading "(none)" with no
-// target named.
+// A wide rollout past its row copy counts the phase each target is in, so
+// the summary names catching up and checksumming rather than reading
+// "(none)". With nothing failed or copying, no target needs a line of its own.
 func TestWriteProgress_WideTargetRollupNamesEveryPhase(t *testing.T) {
 	var targets []rolloutTarget
 	for i := range 12 {
@@ -348,17 +348,8 @@ func TestWriteProgress_WideTargetRollupNamesEveryPhase(t *testing.T) {
 	}
 
 	out := renderRollout(t, targetRolloutData(targets))
-	assert.Contains(t, out, "• Targets: 12 (3 catching up, 9 checksumming)", "%s", out)
+	assert.Contains(t, out, "• Targets: 12 (3 catching up, 9 checksumming)\n\n", "%s", out)
 	assert.NotContains(t, out, "(none)")
-	for _, name := range []string{"payments-001", "payments-002", "payments-003"} {
-		assert.Contains(t, out, "○ "+name+": catching up")
-	}
-	for _, name := range []string{"payments-004", "payments-005", "payments-006"} {
-		assert.Contains(t, out, "○ "+name+": checksumming")
-	}
-	assert.NotContains(t, out, "payments-007:", "past the sample, a phase's targets are counted")
-	assert.Contains(t, out, "... 6 more checksumming")
-	assert.NotContains(t, out, "more catching up", "every catching-up target is already named")
 }
 
 // An apply that does not defer cutover is cut over by SchemaBot as each
@@ -449,22 +440,22 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 		"two targets stopped part-way": {
 			targets:  []rolloutTarget{stoppedAt(400), stoppedAt(400)},
 			headline: "~ orders: ⏹️ Stopped · 0 of 2 targets complete\n",
-			lines:    []string{"○ payments-001: stopped at 40.00% (400/1,000 rows)", "○ payments-002: stopped at 40.00% (400/1,000 rows)"},
+			lines:    []string{"○ payments-001: stopped at 40.00% · 400 / 1,000 rows", "○ payments-002: stopped at 40.00% · 400 / 1,000 rows"},
 		},
 		"one target done and one stopped part-way": {
 			targets:  []rolloutTarget{completedTarget(), stoppedAt(400)},
 			headline: "~ orders: ⏹️ Stopped · 1 of 2 targets complete\n",
-			lines:    []string{"✓ payments-001: 1,000 rows", "○ payments-002: stopped at 40.00% (400/1,000 rows)"},
+			lines:    []string{"○ payments-002: stopped at 40.00% · 400 / 1,000 rows", "✓ payments-001: 1,000 rows"},
 		},
 		"one target done and one failed part-way": {
 			targets:  []rolloutTarget{completedTarget(), failedAt(300)},
 			headline: "~ orders: ❌ Failed · 1 of 2 targets complete · 1 failed\n",
-			lines:    []string{"✓ payments-001: 1,000 rows", "✗ payments-002: failed"},
+			lines:    []string{"✗ payments-002: failed", "✓ payments-001: 1,000 rows"},
 		},
 		"one target done and one cancelled before copying": {
 			targets:  []rolloutTarget{completedTarget(), cancelledBeforeCopying},
 			headline: "~ orders: 🚫 Cancelled · 1 of 2 targets complete\n",
-			lines:    []string{"✓ payments-001: 1,000 rows", "○ payments-002: cancelled"},
+			lines:    []string{"○ payments-002: cancelled", "✓ payments-001: 1,000 rows"},
 		},
 		"every target cancelled before copying": {
 			targets:  []rolloutTarget{cancelledBeforeCopying, cancelledBeforeCopying},

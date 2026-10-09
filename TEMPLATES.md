@@ -4945,7 +4945,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 - Rows: 914,707 / 1,466,232 · ETA: 3m 15s
-  └ shards: ✓ -40 · ● 40-80 ready · ◐ 80-c0 31% · ⏳ c0-
+- Shards: 4 (1 copying, 1 waiting for cutover, 1 queued, 1 complete)
+  - ◉ `80-c0`: 31%
+  - ● `40-80`: waiting for cutover
+  - ○ `c0-`: queued
+  - ✓ `-40`: complete
 
 
 ---
@@ -4979,7 +4983,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
 ```
 - Rows: 4,200,000,000 / 6,000,000,000 · ETA: 1h 30m
-  └ 256 shards: 200 ✓ · 52 ◐ copying · 4 ⏳ · slowest f7- 12%
+- Shards: 256 (52 copying, 4 queued, 200 complete)
+  - ◉ `f7-`: 12%
+  - ◉ `c8-`: 55%
+  - ◉ `dc-`: 55%
+  - … 49 more copying shards
 
 
 ---
@@ -7381,8 +7389,8 @@ Use 'schemabot start' to resume from checkpoint.
        ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
        • Rows: 0 / 124,760,460
        • Shards: 2 (2 copying)
-           ◉ -80: 0% (0/60,483,380 rows)
-           ◉ 80-: 0% (0/64,277,080 rows)
+           ◉ -80: copying
+           ◉ 80-: copying
 
 ```
 </details>
@@ -7605,8 +7613,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
        • Shards: 2 (2 cancelled)
-           ○ -80: cancelled at 38.10% (800,000/2,100,000 rows)
-           ○ 80-: cancelled at 21.05% (400,000/1,900,000 rows)
+           ○ -80: cancelled at 38.10% · 800,000 / 2,100,000 rows
+           ○ 80-: cancelled at 21.05% · 400,000 / 1,900,000 rows
 
 ```
 </details>
@@ -7632,17 +7640,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
      ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57.21%
        ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
        • Rows: 110,573,340 / 193,280,000 · ETA: 4m 40s
-       • Shards: 256 (30 waiting for cutover, 226 copying)
-           ● -01: waiting for cutover
-           ● 01-02: waiting for cutover
-           ● 02-03: waiting for cutover
-           ... 27 more waiting for cutover
-           ◉ ff-: 10.00% (101,000/1,010,000 rows) ETA 4m 40s
-           ◉ fe-ff: 10.00% (100,800/1,008,000 rows) ETA 4m 40s
-           ◉ fd-fe: 11.00% (110,660/1,006,000 rows) ETA 4m 38s
-           ◉ fc-fd: 11.00% (110,440/1,004,000 rows) ETA 4m 38s
-           ◉ fb-fc: 12.00% (120,240/1,002,000 rows) ETA 4m 36s
-           ... 221 more copying shards
+       • Shards: 256 (226 copying, 30 waiting for cutover)
+           ◉ fe-ff: 10.00% · 100,800 / 1,008,000 rows · ETA: 4m 40s
+           ◉ ff-: 10.00% · 101,000 / 1,010,000 rows · ETA: 4m 40s
+           ◉ fc-fd: 11.00% · 110,440 / 1,004,000 rows · ETA: 4m 38s
+           ... 223 more copying shards
 
 ```
 </details>
@@ -7668,17 +7670,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
      ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67.89%
        ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
        • Rows: 29,435,000 / 43,360,000 · ETA: 2m 37s
-       • Shards: 32 (12 waiting for cutover, 20 copying)
-           ● -08: waiting for cutover
-           ● 08-10: waiting for cutover
-           ● 10-18: waiting for cutover
-           ... 9 more waiting for cutover
-           ◉ f8-: 23.00% (347,300/1,510,000 rows) ETA 2m 37s
-           ◉ f0-f8: 26.00% (390,000/1,500,000 rows) ETA 2m 34s
-           ◉ e8-f0: 29.00% (432,100/1,490,000 rows) ETA 2m 31s
-           ◉ e0-e8: 32.00% (473,600/1,480,000 rows) ETA 2m 28s
-           ◉ d8-e0: 35.00% (514,500/1,470,000 rows) ETA 2m 25s
-           ... 15 more copying shards
+       • Shards: 32 (20 copying, 12 waiting for cutover)
+           ◉ f8-: 23.00% · 347,300 / 1,510,000 rows · ETA: 2m 37s
+           ◉ f0-f8: 26.00% · 390,000 / 1,500,000 rows · ETA: 2m 34s
+           ◉ e8-f0: 29.00% · 432,100 / 1,490,000 rows · ETA: 2m 31s
+           ... 17 more copying shards
 
   ── commerce_001 ──
 
@@ -7847,8 +7843,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
        • Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
        • Shards: 2 (2 copying)
-           ◉ -80: 95.24% (2,000,000/2,100,000 rows) ETA 10s
-           ◉ 80-: 42.11% (800,000/1,900,000 rows) ETA 2m 0s
+           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m 0s
+           ◉ -80: 95.24% · 2,000,000 / 2,100,000 rows · ETA: 10s
 
 ```
 </details>
@@ -9475,7 +9471,11 @@ schemabot apply -e production
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 - Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
-  └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
+- Shards: 4 (1 copying, 3 queued)
+  - ◉ `-40`: 62%
+  - ○ `40-80`: queued
+  - ○ `80-c0`: queued
+  - ○ `c0-`: queued
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -9550,7 +9550,10 @@ ALTER TABLE `mutes`
     ADD INDEX `created_at`(`created_at`),
     ADD COLUMN `reason` varchar(255);
 ```
-  └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0
+- Shards: 3 (1 copying, 2 queued)
+  - ◉ `-40`: 62%
+  - ○ `40-80`: queued
+  - ○ `80-c0`: queued
 
 Shards diverge — grouped by change:
 
@@ -9960,15 +9963,12 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72% · 40 of 60 targets complete · 1 failed
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 4,093,000 / 4,720,000 · ETA: 10m 0s
-       • Targets: 60 (40 complete, 19 copying, 1 failed)
+       • Targets: 60 (1 failed, 19 copying, 40 complete)
            ✗ payments-041: failed
-           ◉ payments-042: 25.00% (20,000/80,000 rows) ETA 10m 0s
-           ◉ payments-043: 28.75% (23,000/80,000 rows) ETA 9m 35s
-           ◉ payments-044: 32.50% (26,000/80,000 rows) ETA 9m 10s
-           ◉ payments-045: 36.25% (29,000/80,000 rows) ETA 8m 45s
-           ◉ payments-046: 40.00% (32,000/80,000 rows) ETA 8m 20s
-           ... 14 more copying targets
-           ... 40 complete
+           ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
+           ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
+           ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
+           ... 16 more copying targets
 
   4 of 64 targets have not reported progress yet.
 
@@ -10044,10 +10044,10 @@ To cut over prod/payments-001:
      ~ orders: ⏹️ Stopped · 1 of 3 targets complete
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
-       • Targets: 3 (1 complete, 2 stopped)
+       • Targets: 3 (2 stopped, 1 complete)
+           ○ payments-002: stopped at 40.00% · 32,000 / 80,000 rows
+           ○ payments-003: stopped at 25.00% · 20,000 / 80,000 rows
            ✓ payments-001: 80,000 rows
-           ○ payments-002: stopped at 40.00% (32,000/80,000 rows)
-           ○ payments-003: stopped at 25.00% (20,000/80,000 rows)
 
 To resume from where it stopped:
   schemabot start apply-multi-a1b2c3d4 -e production
