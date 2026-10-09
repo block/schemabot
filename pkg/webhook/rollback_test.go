@@ -451,6 +451,54 @@ func TestRollbackPlanCommentData_ListsUnsafeChanges(t *testing.T) {
 	assert.NotContains(t, templates.RenderRollbackPlanComment(safe), "unsafe")
 }
 
+// A rollback that drops a column on every shard carries the drop both on the
+// namespace-level view and on each shard row. The comment lists it once, from
+// the shard rows, rather than counting the collapsed duplicate as a second
+// unsafe change.
+func TestPlanUnsafeChangesListsAUniformShardDropOnce(t *testing.T) {
+	dropLegacy := &apitypes.TableChangeResponse{TableName: "orders", Namespace: "orders", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy`", ChangeType: "alter",
+		IsUnsafe: true, UnsafeReason: `Column "legacy" is dropped`}
+	planResp := &apitypes.PlanResponse{
+		PlanID:  "plan_rb_uniform",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{dropLegacy}}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "orders", Shard: "-80", Changes: []*apitypes.TableChangeResponse{dropLegacy}},
+			{Namespace: "orders", Shard: "80-", Changes: []*apitypes.TableChangeResponse{dropLegacy}},
+		},
+	}
+
+	unsafe := planUnsafeChanges(planResp)
+	require.Len(t, unsafe, 1)
+	assert.Equal(t, "orders", unsafe[0].Table)
+	assert.Equal(t, []string{"-80", "80-"}, unsafe[0].Shards)
+}
+
+// A rollback whose stored plan removes a vindex is refused without
+// --allow-unsafe: the refusal names the VSchema change the stored plan's own
+// unsafe gate reports, once, under its namespace.
+func TestRollbackPlanUnsafeChangesNamesVSchemaRemoval(t *testing.T) {
+	plan := &storage.Plan{
+		PlanIdentifier: "rollback-plan-vschema",
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+				Metadata: map[string]string{
+					storage.PlanMetadataVSchemaChanged:   "true",
+					storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+				},
+			},
+		},
+	}
+
+	unsafe := rollbackPlanUnsafeChanges(plan)
+	require.Len(t, unsafe, 1)
+	assert.Equal(t, "payments/vschema.json", unsafe[0].Table)
+	assert.Equal(t, "payments", unsafe[0].VSchemaNamespace)
+	assert.Equal(t, "removing vindex email_idx changes query routing", unsafe[0].Reason)
+}
+
 // prOwnedRollbackLock returns a lock held by the PR that issues the
 // rollback-confirm command in these tests.
 func prOwnedRollbackLock() *storage.Lock {

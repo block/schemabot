@@ -1580,7 +1580,10 @@ shard's included (`pkg/cmd/commands/apply.go`, `pkg/cmd/commands/rollback.go`, o
 `rollback-confirm`, which blocks without `--allow-unsafe` on every unsafe change the lock-pinned
 rollback plan carries, a divergent shard's included, and sends `allow_unsafe` only when the flag
 is passed (`blockRollbackUnsafeWithoutOptIn` and `rollbackPlanUnsafeChanges` in
-`pkg/webhook/rollback.go`).
+`pkg/webhook/rollback.go`). The rollback pin lasts only as long as the plan comment that names
+those changes: when that comment cannot be posted, `rollback` withdraws its pin before returning
+(`withdrawUndisclosedRollbackPin` in `pkg/webhook/rollback.go`, over the conditional
+`LockStore.ClearPendingPlanID`).
 
 ### RV-4: Engine refusals are known at plan time and gate the apply
 

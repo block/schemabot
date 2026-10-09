@@ -830,22 +830,13 @@ func (h *Handler) blockRollbackUnsafeWithoutOptIn(repo string, pr int, installat
 // rollbackPlanUnsafeChanges lists the unsafe changes a stored rollback plan
 // carries: the table changes as a plan comment lists them, with the shards a
 // change confined to some shards applies to, and the VSchema changes the
-// stored plan's own unsafe gate reports. Apply creation refuses the same plan
-// without allow_unsafe on the stored plan's verdicts, so when those name a
-// table change the comment view does not, the stored change is listed rather
-// than letting the refusal claim nothing is unsafe.
+// stored plan's own unsafe gate reports. The table changes use the same
+// predicate over the same stored rows as the server's stored-plan gate, which
+// still refuses the apply without allow_unsafe if the two ever drift apart.
+// The VSchema changes come from the stored plan directly, because the plan
+// response carries no VSchema deletion detail.
 func rollbackPlanUnsafeChanges(plan *storage.Plan) []templates.UnsafeChangeData {
 	unsafe := planUnsafeChanges(api.PlanContentFromStorage(plan))
-	if len(unsafe) == 0 {
-		for _, tc := range plan.UnsafeDDLChanges() {
-			unsafe = append(unsafe, templates.UnsafeChangeData{
-				Table:      tc.Table,
-				Reason:     tc.UnsafeOptInReason(),
-				DDL:        tc.DDL,
-				ChangeType: tc.Operation,
-			})
-		}
-	}
 	for _, vc := range plan.UnsafeVSchemaChanges() {
 		unsafe = append(unsafe, templates.UnsafeChangeData{
 			Table:            vc.Namespace + "/vschema.json",
