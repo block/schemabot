@@ -44,9 +44,9 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 	// A target that has not reported is not known to run any one change, so
 	// when the reporting targets diverge each line counts only its own
 	// targets and the silent ones are counted once, for the deployment.
-	lineSilent := silent
+	lineSilent, lineWaiting := silent, waitingTargets(data, g)
 	if targetsDiverge(data, g) {
-		lineSilent = 0
+		lineSilent, lineWaiting = 0, 0
 	}
 	changing := changingMembers(data.Model, g)
 	rankTargetTableLines(lines, lineSilent)
@@ -61,7 +61,7 @@ func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g pre
 		restoreScope := planScopeForLine(budget, line.targets, subset, silent)
 		restorePlan := budget.pointAt(first.storedPlan())
 		strip := targetStrip(data, g, line.cells, line.targets, lineSilent > 0)
-		writeTargetTableLine(sb, line.table.TableName, line.cells, strip, lineSilent, func() {
+		writeTargetTableLine(sb, line.table.TableName, line.cells, strip, lineSilent, lineWaiting, func() {
 			writeTargetLineDDL(sb, dialect, line, subset, changing, budget)
 		})
 		sb.WriteString("\n")
@@ -81,7 +81,14 @@ func writeTargetLineDDL(sb *strings.Builder, dialect schema.Dialect, line target
 		writeDDLLine(sb, dialect, line.table.DDL, budget)
 		return
 	}
-	fmt.Fprintf(sb, "\n**%s**\n", planGroupList(targetNoun, line.targets, changing))
+	if len(line.targets) <= shardNamesInlineLimit {
+		fmt.Fprintf(sb, "\n**%s**\n", planGroupList(targetNoun, line.targets, changing))
+	} else {
+		// A wide subset's names collapse under its count rather than drop, so
+		// the heading still says which targets run this DDL.
+		fmt.Fprintf(sb, "\n<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
+			presentation.CoveragePhrase(targetNoun, len(line.targets), changing), strings.Join(inlineCodeList(line.targets), ", "))
+	}
 	writeSQLFencedBlock(sb, ddl.FormatDDLForDialect(dialect, line.table.DDL), budget)
 }
 
@@ -103,6 +110,18 @@ func unreportedTargets(data MultiDeploymentApplyData, g presentation.Group) int 
 	n := 0
 	for _, i := range g.Members {
 		if targetUnreported(data, i) {
+			n++
+		}
+	}
+	return n
+}
+
+// waitingTargets counts the unreported targets still to run: a settled target
+// with no table progress has its outcome and is not queued for any table.
+func waitingTargets(data MultiDeploymentApplyData, g presentation.Group) int {
+	n := 0
+	for _, i := range g.Members {
+		if targetUnreported(data, i) && !state.IsState(data.Model.Deployments[i].State, state.SettledApplyStates...) {
 			n++
 		}
 	}
@@ -243,7 +262,8 @@ func rankTargetTableLines(lines []targetTableLine, silent int) {
 // and make the ETA a floor. writeDDL writes the table's DDL directly under the
 // headline, and while the table is in flight strip lists each target's state
 // under the rows, the way the sharded comment lays out a table and its shards.
-func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, silent int, writeDDL func()) {
+// waiting is the silent targets still to run, which the line counts as queued.
+func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, silent, waiting int, writeDDL func()) {
 	var done, queued, failed, retrying, reporting, unreported int
 	var copied, total, eta int64
 	var running int
@@ -280,7 +300,10 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		total += c.RowsTotal
 	}
 	name := inlineCode(table)
-	coverage := targetCoverage(done, running, queued, failed, retrying)
+	// A target still to run that has reported no progress has not started the
+	// table, so the line counts it as queued.
+	pending := queued + waiting
+	coverage := targetCoverage(done, running, pending, failed, retrying)
 	if running > 0 && total > 0 {
 		percent := int(copied * 100 / total)
 		if unreported+silent > 0 {
@@ -318,15 +341,15 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		}
 	}
 	status := rollupTaskStatus(cells)
-	if status == state.Task.Completed {
-		fmt.Fprintf(sb, "**%s**: %s (%d targets)\n", name, shardedTableStatusPhrase(status), len(cells))
+	if partlyCompleted(status, done, pending) {
+		// Complete on some targets and queued on the rest: the change is live
+		// where it completed, so the line leads with that, not with Queued.
+		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, targetCoverage(0, 0, pending, 0, 0))
 		writeDDL()
 		return
 	}
-	if partlyCompleted(status, done, queued) {
-		// Complete on some targets and queued on the rest: the change is live
-		// where it completed, so the line leads with that, not with Queued.
-		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, targetCoverage(0, 0, queued, 0, 0))
+	if status == state.Task.Completed {
+		fmt.Fprintf(sb, "**%s**: %s (%d targets)\n", name, shardedTableStatusPhrase(status), len(cells))
 		writeDDL()
 		return
 	}
@@ -355,12 +378,14 @@ func listsTargets(status string, strip []ShardProgressData) bool {
 // its targets and is queued on the rest, with nothing else in between. A target
 // in its revert window has completed, so a table in its revert window on some
 // targets and queued on the rest is partly completed too; once every target
-// is in its revert window, the line keeps the revert window's wording.
+// is in its revert window, the line keeps the revert window's wording. queued
+// counts the targets with no progress reported, so a table complete on every
+// target that reported is partly completed while others have not.
 func partlyCompleted(status string, done, queued int) bool {
 	if done == 0 || queued == 0 {
 		return false
 	}
-	return status == state.Task.Pending || status == state.Task.RevertWindow
+	return status == state.Task.Pending || status == state.Task.RevertWindow || status == state.Task.Completed
 }
 
 // targetSharePercent is how much of a table is done across every target that

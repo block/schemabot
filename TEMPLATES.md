@@ -8540,7 +8540,13 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 **`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 75%
 
-**56 of 64 targets**
+<details>
+<summary><b>56 of 64 targets</b></summary>
+
+`orders_000`, `orders_001`, `orders_002`, `orders_003`, `orders_004`, `orders_005`, `orders_006`, `orders_007`, `orders_008`, `orders_009`, `orders_010`, `orders_011`, `orders_012`, `orders_013`, `orders_014`, `orders_015`, `orders_016`, `orders_017`, `orders_018`, `orders_019`, `orders_020`, `orders_021`, `orders_022`, `orders_023`, `orders_024`, `orders_025`, `orders_026`, `orders_027`, `orders_028`, `orders_029`, `orders_030`, `orders_031`, `orders_032`, `orders_033`, `orders_034`, `orders_035`, `orders_036`, `orders_037`, `orders_038`, `orders_039`, `orders_040`, `orders_041`, `orders_042`, `orders_043`, `orders_044`, `orders_045`, `orders_046`, `orders_047`, `orders_048`, `orders_049`, `orders_050`, `orders_051`, `orders_052`, `orders_053`, `orders_054`, `orders_055`
+
+</details>
+
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```

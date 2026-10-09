@@ -190,6 +190,53 @@ func TestWriteProgress_TargetRollupCountsSettledTargetsApart(t *testing.T) {
 	assert.Contains(t, out, "1 of 3 targets have not reported progress yet.", "a stopped target reports once the apply resumes:\n%s", out)
 }
 
+// A table finished on payments-001 while payments-002 and payments-003 have
+// not reported reads as complete on one of the three, with the other two
+// queued, since a target still to run that has reported nothing has not
+// started it. A target that settled without reporting tables is no such
+// target: a reaped target is complete, so a finished rollout still reads
+// complete, and a target that failed before reporting gives the shared DDL no
+// subset of targets to name.
+func TestWriteProgress_TargetRollupCountsUnreportedTargetsOnTheTable(t *testing.T) {
+	ran := completedTarget()
+	out := renderRollout(t, targetRolloutData([]rolloutTarget{ran, queuedTarget(), queuedTarget()}))
+	assert.Contains(t, out, "✓ Complete on 1 of 3 targets · 2 queued", "the unreported targets are queued on the table:\n%s", out)
+
+	reaped := rolloutTarget{opState: state.ApplyOperation.Completed}
+	settled := targetRolloutData([]rolloutTarget{ran, ran, reaped})
+	settled.State = state.Apply.Completed
+	out = renderRollout(t, settled)
+	assert.NotContains(t, out, "Complete on", "a reaped target is not queued on the table:\n%s", out)
+
+	failedEarly := rolloutTarget{opState: state.ApplyOperation.Failed, startedAt: "2026-09-30T12:00:00Z", err: "connection refused"}
+	failed := targetRolloutData([]rolloutTarget{ran, ran, failedEarly})
+	failed.State = state.Apply.Failed
+	out = renderRollout(t, failed)
+	assert.NotContains(t, out, "targets payments-001, payments-002", "missing detail is no evidence of a different change:\n%s", out)
+	assert.NotContains(t, out, "queued", "a failed target is not queued on the table:\n%s", out)
+}
+
+// Ten targets run two different statements on one table: nine add a column
+// and payments-010 adds an index. The nine are too many to name inline, so
+// the label above their DDL counts them and then names every one, since the
+// list under the table is bounded and the label is the only place that says
+// which targets run that DDL.
+func TestWriteProgress_WideTargetSubsetNamesEveryTarget(t *testing.T) {
+	targets := make([]rolloutTarget, 10)
+	for i := range targets {
+		targets[i] = copyingTarget(400)
+	}
+	targets[9].ddl = "ALTER TABLE `orders` ADD INDEX `idx_region` (`region`)"
+	out := renderRollout(t, targetRolloutData(targets))
+
+	names := make([]string, 9)
+	for i := range names {
+		names[i] = fmt.Sprintf("payments-%03d", i+1)
+	}
+	assert.Contains(t, out, "9 of 10 targets: "+strings.Join(names, ", "), "every target of the wide subset is named:\n%s", out)
+	assert.Contains(t, out, "target payments-010")
+}
+
 // Sixty-four targets stay one screen: copying targets are sampled with the
 // rest counted, the failed target is always named with its error and the
 // data-plane apply to look at, and the table keeps showing the rows still

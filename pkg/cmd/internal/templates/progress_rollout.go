@@ -88,6 +88,10 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	silent, converged := 0, 0
 	byMember := tablesByMember(v.Tables)
 	signatures := make(map[string]bool)
+	// settledUnreported counts the settled targets that reported no tables.
+	// They are not waiting to report, so the footer leaves them out, but no
+	// table detail is no evidence of a different change either.
+	settledUnreported := 0
 	for _, i := range g.Members {
 		d := v.Model.Deployments[i]
 		tables := byMember[rolloutMemberKey{d.Deployment, d.Target}]
@@ -99,6 +103,8 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 			// reported tables. A stopped one reports once the apply resumes.
 			case !state.IsState(d.State, state.SettledApplyStates...):
 				silent++
+			default:
+				settledUnreported++
 			}
 			continue
 		}
@@ -108,18 +114,22 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	// A target that has not reported has started no table, so it ranks every
 	// table as queued and a block that runs on every reporting target speaks
 	// for it. When the reporting targets diverge it is not known to run any
-	// one change, and no block speaks for it.
-	lineSilent := silent
+	// one change, and no block speaks for it. A settled target with no tables
+	// is not queued, but it is no evidence of a different change either, so a
+	// block that runs on every reporting target speaks for it too, the way the
+	// PR comment's does.
+	lineSilent, lineSettled := silent, settledUnreported
 	if len(signatures) > 1 {
-		lineSilent = 0
+		lineSilent, lineSettled = 0, 0
 	}
 	rolled := rolledTargetTables(v, byMember, reporting)
 	for i := range rolled {
-		if covered := len(rolled[i].Shards) + lineSilent; covered < len(g.Members)-converged {
+		rolled[i].UnreportedTargets = lineSilent
+		if covered := len(rolled[i].Shards) + lineSilent + lineSettled; covered < len(g.Members)-converged {
 			rolled[i].OnTargets = targetSubsetLabel(rolled[i].Shards, len(g.Members)-converged)
 		}
 	}
-	sortRolledTables(rolled, lineSilent)
+	sortRolledTables(rolled)
 	// Tables are grouped under their namespace whenever they carry one, so
 	// the same table changed in two schemas reads as two changes.
 	if hasTableNamespaces(rolled) {
@@ -160,15 +170,17 @@ func rolledTargetTables(v RolloutView, byMember map[rolloutMemberKey][]TableProg
 }
 
 // targetSubsetLabel names the targets a table's DDL runs on when they are only
-// some of the deployment's: by name when few, otherwise by how many of the
-// deployment's targets they are.
+// some of the deployment's. Few read by name; more lead with how many of the
+// deployment's targets they are, then name every one, since the list under
+// the table is bounded and this label is the only place that says which
+// targets run this DDL.
 func targetSubsetLabel(targets []ShardProgress, total int) string {
-	if len(targets) > memberNamesInlineLimit {
-		return presentation.CoveragePhrase(presentation.TargetNoun, len(targets), total)
-	}
 	names := make([]string, len(targets))
 	for i, t := range targets {
 		names[i] = t.Shard
+	}
+	if len(targets) > memberNamesInlineLimit {
+		return presentation.CoveragePhrase(presentation.TargetNoun, len(targets), total) + ": " + strings.Join(names, ", ")
 	}
 	if len(names) == 1 {
 		return presentation.TargetNoun.Singular + " " + names[0]
@@ -179,22 +191,31 @@ func targetSubsetLabel(targets []ShardProgress, total int) string {
 // sortRolledTables orders tables rolled up across targets by
 // presentation.TableRolloutRank, the order the PR comment lists them in, so a
 // table finished on some targets stays above one no target has started. Tables
-// of equal rank keep plan order. silent is the targets with no progress
-// reported that rank as queued on every table.
-func sortRolledTables(tables []TableProgress, silent int) {
-	slices.SortStableFunc(tables, func(a, b TableProgress) int {
-		return rolledTableRank(a, silent) - rolledTableRank(b, silent)
-	})
+// of equal rank keep plan order. Each table's rank is computed once, so a
+// watch frame does not rebuild it on every comparison.
+func sortRolledTables(tables []TableProgress) {
+	type ranked struct {
+		table TableProgress
+		rank  int
+	}
+	byRank := make([]ranked, len(tables))
+	for i, t := range tables {
+		byRank[i] = ranked{t, rolledTableRank(t)}
+	}
+	slices.SortStableFunc(byRank, func(a, b ranked) int { return a.rank - b.rank })
+	for i, r := range byRank {
+		tables[i] = r.table
+	}
 }
 
 // rolledTableRank is a rolled-up table's presentation.TableRolloutRank, from
-// its status on each target and silent targets queued.
-func rolledTableRank(t TableProgress, silent int) int {
-	statuses := make([]string, len(t.Shards), len(t.Shards)+silent)
+// its status on each target and its unreported targets queued.
+func rolledTableRank(t TableProgress) int {
+	statuses := make([]string, len(t.Shards), len(t.Shards)+t.UnreportedTargets)
 	for i, target := range t.Shards {
 		statuses[i] = target.Status
 	}
-	for range silent {
+	for range t.UnreportedTargets {
 		statuses = append(statuses, state.Task.Pending)
 	}
 	return presentation.TableRolloutRank(statuses)
@@ -307,15 +328,17 @@ func isHaltedAcrossTargets(t TableProgress) bool {
 
 // isPartlyCompletedAcrossTargets reports whether a table rolled up across
 // targets has completed on some of them and is queued on the rest, with
-// nothing in between. A target in its revert window has completed the change.
-// Its rolled-up status is queued or the revert window, but the change is live
-// where it completed, so its line leads with that, as the PR comment's does.
+// nothing in between. A target in its revert window has completed the change,
+// and a target that has reported no progress has not started it. Its
+// rolled-up status is queued, the revert window or complete, but the change is
+// live only where it completed, so its line leads with that, as the PR
+// comment's does.
 func isPartlyCompletedAcrossTargets(t TableProgress) bool {
-	if !t.AcrossTargets || !state.IsState(t.Status, state.Task.Pending, state.Task.RevertWindow) {
+	if !t.AcrossTargets || !state.IsState(t.Status, state.Task.Pending, state.Task.RevertWindow, state.Task.Completed) {
 		return false
 	}
 	completed, queued := partlyCompletedCounts(t.Shards)
-	return completed > 0 && queued > 0 && completed+queued == len(t.Shards)
+	return completed > 0 && queued+t.UnreportedTargets > 0 && completed+queued == len(t.Shards)
 }
 
 // partlyCompletedCounts counts the targets that have completed a change and
@@ -338,7 +361,7 @@ func partlyCompletedCounts(targets []ShardProgress) (completed, queued int) {
 func formatPartlyCompletedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
 	completed, queued := partlyCompletedCounts(t.Shards)
-	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ✓ Complete on %d of %d targets · %d queued\n", t.TableName, completed, len(t.Shards), queued)
+	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ✓ Complete on %d of %d targets · %d queued\n", t.TableName, completed, len(t.Shards)+t.UnreportedTargets, queued+t.UnreportedTargets)
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}

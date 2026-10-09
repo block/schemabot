@@ -722,6 +722,31 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetsDivergeByChange(t *tes
 	assert.NotContains(t, out, "testapp-004`**", "a target without detail is not a change of its own")
 }
 
+// Ten targets run two different statements on one table: nine add a column
+// and testapp-010 adds an index. The nine are too many to name inline, so the
+// heading above their DDL counts them and collapses their names beneath, so
+// the comment still says which targets run that DDL.
+func TestRenderMultiDeploymentApplyComment_WideTargetSubsetKeepsItsNames(t *testing.T) {
+	ops := make([]presentation.Operation, 10)
+	details := make([]*ApplyStatusCommentData, 10)
+	names := make([]string, 9)
+	for i := range ops {
+		target := fmt.Sprintf("testapp-%03d", i+1)
+		ops[i] = parallelTarget("primary", target, so.Running)
+		ddl := addNote
+		if i == 9 {
+			ddl = "ALTER TABLE `orders` ADD INDEX `idx_note`(`note`)"
+		} else {
+			names[i] = "`" + target + "`"
+		}
+		details[i] = targetDetail(fmt.Sprintf("testapp_%03d", i+1), state.Task.Running, ddl, 500)
+	}
+	out := renderTargets(presentation.Derive(ops), details...)
+
+	assert.Contains(t, out, "<details>\n<summary><b>9 of 10 targets</b></summary>\n\n"+strings.Join(names, ", ")+"\n\n</details>\n\n```sql\nALTER TABLE `orders` ADD COLUMN `note` text;\n```\n")
+	assert.Contains(t, out, "**target `testapp-010`**\n```sql\nALTER TABLE `orders` ADD INDEX `idx_note`(`note`);\n```\n")
+}
+
 // Rolled-up targets that run different DDL each point a cut block at the
 // stored plan of the first target its line names, and a line naming several
 // says the other targets named run the same DDL.
@@ -1927,6 +1952,32 @@ func TestRenderMultiDeploymentApplyComment_RevertWindowTargetCountsAsComplete(t 
 // the sharded comment lists a table's shards: the copying target with its
 // progress, and a target that has not reported yet as queued. Past the inline
 // limit the list names only the failed and the slowest copying targets, and
+
+// A rolling rollout of `refunds` across four targets where testapp-001 has
+// finished it, and the other targets have not reported progress or report it
+// queued. A target with no progress reported has not started the table, so the
+// line counts it among the queued rather than reading complete on every target
+// that reported.
+func TestRenderMultiDeploymentApplyComment_RolledUpTableCountsUnreportedTargetsAsQueued(t *testing.T) {
+	refunds := func(st string, copied int64) TableProgressData {
+		return TableProgressData{TableName: "refunds", Status: st, RowsCopied: copied}
+	}
+	ops := rollingTargets(4)
+	ops[0].State, ops[1].State = so.Completed, so.Running
+	t.Run("one target queued", func(t *testing.T) {
+		out := renderTargets(presentation.Derive(ops),
+			tablesDetail("testapp_001", refunds(state.Task.Completed, 1000)),
+			tablesDetail("testapp_002", refunds(state.Task.Pending, 0)),
+		)
+		assert.Contains(t, out, "**`refunds`**: ✅ Complete on 1 of 4 targets · 3 queued\n")
+	})
+	t.Run("only the finished target reported", func(t *testing.T) {
+		out := renderTargets(presentation.Derive(ops), tablesDetail("testapp_001", refunds(state.Task.Completed, 1000)))
+		assert.Contains(t, out, "**`refunds`**: ✅ Complete on 1 of 4 targets · 3 queued\n")
+		assert.NotContains(t, out, "Complete (1 targets)")
+	})
+}
+
 // its heading counts the rest, so a wide rollout stays a few lines per table.
 func TestRenderMultiDeploymentApplyComment_RolledUpTargetListNamesEveryTarget(t *testing.T) {
 	refunds := func(st string, copied int64) TableProgressData {

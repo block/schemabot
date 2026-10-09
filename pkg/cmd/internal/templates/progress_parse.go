@@ -94,6 +94,10 @@ type TableProgress struct {
 	// are only some of the deployment's, shown above the DDL. Empty when the
 	// DDL runs on every target.
 	OnTargets string
+	// UnreportedTargets counts the targets a rolled-up table speaks for that
+	// are still to run and have reported no progress yet, so have not started
+	// it. A settled target is not among them.
+	UnreportedTargets int
 }
 
 // ShardProgress contains per-shard progress for template rendering.
