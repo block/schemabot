@@ -103,21 +103,6 @@ type ShardProgress struct {
 	CutoverAttempts int
 }
 
-// ShardCounts holds aggregated shard status counts.
-type ShardCounts struct {
-	Total             int
-	Complete          int
-	Running           int
-	WaitingForCutover int
-	CuttingOver       int
-	Queued            int
-	Failed            int
-	Cancelled         int
-	// Other counts every status the fields above do not name, keyed by
-	// status, so a part in any phase stays in the summary.
-	Other map[string]int
-}
-
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
 // but are used for per-table rendering in sequential mode.
 const (
