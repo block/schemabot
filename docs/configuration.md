@@ -1288,12 +1288,41 @@ silently never consulted.
 
 ## PlanetScale Service Token
 
-The Vitess engine drives PlanetScale through a service token whose database
-access permissions cover every API call an apply makes. The grant list in
-`deploy/aws-multi-env/scripts/bootstrap-planetscale.sh` is the reference set.
+The Vitess engine drives PlanetScale through a service token. Grant the token
+these database access permissions on every database SchemaBot manages:
 
-One of them is easy to miss because only a failure path uses it:
-`delete_branch`. An apply prepares its schema change on a branch it creates,
+| Permission | What SchemaBot uses it for |
+|---|---|
+| `read_branch` | Wait for a branch to be ready, read its schema, list its keyspaces, and read each keyspace's VSchema |
+| `create_branch` | Create the branch each apply prepares its schema change on |
+| `delete_branch` | Delete that branch when the apply fails for good before its deploy request exists (see below) |
+| `connect_branch` | Create the branch password used to run DDL on the branch |
+| `write_branch_vschema` | Apply VSchema changes to the branch |
+| `create_deploy_request` | Create the deploy request and drive it: deploy, cutover, cancel, close, revert, and skip revert |
+| `read_deploy_request` | Track a deploy request's progress and read back its cutover setting |
+
+None of the production variants (`delete_production_branch`,
+`connect_production_branch`, `write_production_branch_vschema`) is needed:
+SchemaBot changes only the development branches it works on, and production
+changes only through a deploy request. SchemaBot also does not approve deploy
+requests or read or write their comments, so it needs neither
+`approve_deploy_request` nor the comment permissions. The bootstrap script
+`deploy/aws-multi-env/scripts/bootstrap-planetscale.sh` grants the
+permissions above, and also `approve_deploy_request`, `create_comment`,
+`read_comment`, `read_database`, and `delete_branch_password`, which
+SchemaBot does not call.
+
+When an apply runs on an operator-supplied branch, SchemaBot also refreshes
+that branch's schema from the production branch first. PlanetScale's API
+reference does not list a permission for that call, so the table above may
+not be enough for that path.
+
+Progress polling reads the production branch through the database's vtgate
+credentials, not the service token. The bootstrap script creates a read-only
+branch password for it.
+
+`delete_branch` is the permission most likely to be missing, because only a
+failure path uses it. An apply prepares its schema change on a branch it creates,
 and the deploy request deletes that branch once it exists. When the apply
 fails for good before it creates the deploy request, SchemaBot deletes the
 branch itself so it does not hold branch quota. That covers both an apply's
