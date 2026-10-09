@@ -1154,19 +1154,22 @@ type EtreCredentialsConfig struct {
 	// the caller's own account. ExternalID is an optional STS external id used only
 	// with RoleARN.
 	//
-	// Region is the one region every target's secret is read from.
-	// RegionAttribute instead names the entity attribute holding each target's
-	// region (e.g. "aws_region"), for secrets provisioned beside their cluster in
-	// whichever region it runs. Exactly one of the two is required, and either
-	// must be an AWS region name. A target whose entity has no value for
-	// RegionAttribute, or one that is not a region name, fails resolution rather
-	// than falling back to another region.
-	Region           string `yaml:"region,omitempty"`
-	RegionAttribute  string `yaml:"region_attribute,omitempty"`
-	RoleARN          string `yaml:"role_arn,omitempty"`
-	ExternalID       string `yaml:"external_id,omitempty"`
-	SecretName       string `yaml:"secret_name,omitempty"`
-	AccountAttribute string `yaml:"account_attribute,omitempty"`
+	// Region is the data plane's home region, and is required: roles are assumed
+	// through STS there, and a target's secret is read there unless its cluster
+	// is in one of ReachableRegions. RegionAttribute names the entity attribute
+	// holding the region of each target's cluster (e.g. "aws_region"); a target
+	// whose entity has no value for it, or one that is not a region name, fails
+	// resolution. ReachableRegions lists the other regions whose Secrets Manager
+	// this data plane can call, and requires RegionAttribute: a target whose
+	// cluster is in one of them has its secret read there, and every other
+	// target's secret is read in Region, so it must be replicated there.
+	Region           string   `yaml:"region,omitempty"`
+	RegionAttribute  string   `yaml:"region_attribute,omitempty"`
+	ReachableRegions []string `yaml:"reachable_regions,omitempty"`
+	RoleARN          string   `yaml:"role_arn,omitempty"`
+	ExternalID       string   `yaml:"external_id,omitempty"`
+	SecretName       string   `yaml:"secret_name,omitempty"`
+	AccountAttribute string   `yaml:"account_attribute,omitempty"`
 }
 
 // DatabaseConfig holds configuration for a registered database.
