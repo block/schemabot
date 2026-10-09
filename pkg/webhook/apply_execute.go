@@ -967,14 +967,13 @@ func (h *Handler) logPreservedLockIntent(ctx context.Context, repo string, pr in
 // stop comment just posted coaches a confirmation the lock no longer carries,
 // so the operator is told the lock changed and that a retry names the command
 // holding it, if any. It reports whether err was that refusal; any other error
-// is left for the caller to report.
+// is left for the caller to report. repinPendingConfirmation has already
+// logged the refusal with the lock's state, so it is not logged again here.
 func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, actionName, database, environment, requestedBy string) bool {
 	if !errors.Is(err, storage.ErrLockIntentChanged) {
 		return false
 	}
-	h.logger.Info("apply stopped: another command pinned or released the lock, so the pending confirmation was not re-pinned",
-		"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName, "error", err)
-	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyLockIntentChangedRefusal(database))
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyLockIntentChangedRefusal(database, environment))
 	return true
 }
 

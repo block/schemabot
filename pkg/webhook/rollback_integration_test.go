@@ -820,7 +820,7 @@ func TestE2EApplyKeepsConcurrentRollbackPin(t *testing.T) {
 
 			refusal := awaitCommentContaining(t, result, "changed the lock on")
 			assert.Contains(t, refusal, "`"+tt.dbName+"`")
-			assert.Contains(t, refusal, "Retry the apply")
+			assert.Contains(t, refusal, "Re-run `schemabot apply -e staging`")
 			require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 			lock, err := svc.Storage().Locks().Get(ctx, tt.dbName, "mysql")
