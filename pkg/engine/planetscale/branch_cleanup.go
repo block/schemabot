@@ -21,19 +21,30 @@ const branchDeleteTimeout = 30 * time.Second
 // outcome so the two are readable together. logger carries the caller's triage
 // identity for the schema change, so the outcome names the apply it belongs to.
 //
-// The delete runs on its own deadline, detached from the apply's context, so a
-// cancelled or timed-out apply still cleans up after itself. A branch that could
-// not be deleted is logged at error level with the identifiers needed to remove
-// it by hand — an undeletable branch must be visible, not silently retried.
+// The delete runs under ctx with its own deadline. A caller deleting a branch
+// that the apply's stored state names, and that another driver could therefore
+// resume from, passes the drive's context, so a lost lease abandons the delete
+// mid-request instead of tearing down a branch a successor may be preparing. A
+// caller deleting a branch no drive can resume passes a context detached from
+// the drive, so a cancelled apply still cleans up after itself. A branch that
+// could not be deleted is logged at error level with the identifiers needed to
+// remove it by hand — an undeletable branch must be visible, not silently
+// retried.
 func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, client psclient.PSClient, org, database, branch string, cause error) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), branchDeleteTimeout)
+	deleteCtx, cancel := context.WithTimeout(ctx, branchDeleteTimeout)
 	defer cancel()
 
-	err := client.DeleteBranch(ctx, &ps.DeleteDatabaseBranchRequest{
+	err := client.DeleteBranch(deleteCtx, &ps.DeleteDatabaseBranchRequest{
 		Organization: org,
 		Database:     database,
 		Branch:       branch,
 	})
+	if err != nil && ctx.Err() != nil {
+		logger.Warn("drive ended while deleting the branch; abandoned the delete and left the branch for the driver that resumes the apply",
+			"organization", org, "planetscale_database", database, "branch", branch,
+			"apply_error", cause, "error", err)
+		return
+	}
 	if err != nil {
 		logger.Error("failed to delete the branch left behind by a failed apply; delete it manually to reclaim branch quota",
 			"organization", org, "planetscale_database", database, "branch", branch,
@@ -56,6 +67,10 @@ func (e *Engine) deleteOwnedBranch(ctx context.Context, logger *slog.Logger, cli
 // that resumes it from this branch; and a retryable failure leaves the branch
 // as the starting point for the retry. Each kept branch is logged with the
 // reason, so a branch left behind is explained rather than silent.
+//
+// The stored state names the resumed branch, so the delete stays under the
+// drive's context for the whole request: a lease lost after the checks below,
+// even while the delete is in flight, abandons it.
 //
 // The caller returns cause unchanged whatever happens here: a failed delete is
 // logged by deleteOwnedBranch and never replaces the failure that ended the

@@ -183,7 +183,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 				"organization", org, "database", req.Database, "branch", ownedBranch, "apply_error", retErr)
 			return
 		}
-		e.deleteOwnedBranch(ctx, e.applyLogger(req), client, org, req.Database, ownedBranch, retErr)
+		// A branch the stored state names stays resumable until the delete
+		// lands, so its delete follows the drive's context; one it does not
+		// name is deleted even after the drive's context ends.
+		deleteCtx := ctx
+		if recordedBranch != ownedBranch {
+			deleteCtx = context.WithoutCancel(ctx)
+		}
+		e.deleteOwnedBranch(deleteCtx, e.applyLogger(req), client, org, req.Database, ownedBranch, retErr)
 	}()
 
 	if existingBranch != "" {

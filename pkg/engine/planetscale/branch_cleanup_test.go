@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 	"github.com/stretchr/testify/assert"
@@ -20,7 +21,8 @@ import (
 // branchLifecycleClient serves a branch that exists and is ready, and fails the
 // credential request that follows it — the shape of an apply that dies while
 // preparing its branch, before any deploy request exists. Deletions are
-// recorded so the test can assert on the cleanup.
+// recorded so the test can assert on the cleanup. A delete whose context has
+// already ended fails without being recorded, as a real API request would.
 type branchLifecycleClient struct {
 	psclient.PSClient
 
@@ -40,7 +42,10 @@ func (c *branchLifecycleClient) CreateBranch(_ context.Context, req *ps.CreateDa
 	return &ps.DatabaseBranch{Name: req.Name, Ready: true}, nil
 }
 
-func (c *branchLifecycleClient) DeleteBranch(_ context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+func (c *branchLifecycleClient) DeleteBranch(ctx context.Context, req *ps.DeleteDatabaseBranchRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deleted = append(c.deleted, req.Branch)
@@ -300,6 +305,61 @@ func TestReclaimBranchAfterFailedResume(t *testing.T) {
 			assert.Equal(t, tt.wantDeleted, deleted)
 		})
 	}
+}
+
+// inFlightDeleteClient holds each branch delete open until its context ends,
+// signalling started once the request is in flight, and records whether the
+// delete was abandoned because its context ended. A delete detached from the
+// drive's context is released only by the test's fallback, so it is recorded
+// as not abandoned.
+type inFlightDeleteClient struct {
+	resumeReclaimClient
+	started   chan struct{}
+	abandoned chan bool
+}
+
+func (c *inFlightDeleteClient) DeleteBranch(ctx context.Context, _ *ps.DeleteDatabaseBranchRequest) error {
+	close(c.started)
+	select {
+	case <-ctx.Done():
+		c.abandoned <- true
+		return ctx.Err()
+	case <-time.After(5 * time.Second):
+		c.abandoned <- false
+		return nil
+	}
+}
+
+// A resumed drive starts deleting its branch after a permanent failure, and
+// its lease is lost while the delete request is still in flight. A peer may
+// already be resuming the apply from that branch, so the old drive abandons
+// the delete the moment its context ends rather than finishing it, and logs
+// that it left the branch for the resuming driver instead of asking an
+// operator to delete it by hand.
+func TestReclaimBranchAfterFailedResume_LeaseLostDuringTheDeleteAbandonsIt(t *testing.T) {
+	var logs bytes.Buffer
+	client := &inFlightDeleteClient{started: make(chan struct{}), abandoned: make(chan bool, 1)}
+	req := resumeRequest(t, &psMetadata{BranchName: "schemabot-commerce-1a2b"}, "apply-1a2b3c4d5e6f7890")
+	req.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	ctx, loseLease := context.WithCancel(t.Context())
+	defer loseLease()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conformanceEngine(client).reclaimBranchAfterFailedResume(ctx, client, "org", req, "schemabot-commerce-1a2b",
+			engine.NewPermanentError("apply keyspace commerce: vschema rejected"))
+	}()
+	<-client.started
+	loseLease()
+	<-done
+
+	assert.True(t, <-client.abandoned, "the delete must end with the drive's context, not run on past the lost lease")
+	var record map[string]any
+	require.NoError(t, json.Unmarshal(logs.Bytes(), &record), "exactly one log line: %s", logs.String())
+	assert.Equal(t, "WARN", record["level"])
+	assert.Equal(t, "drive ended while deleting the branch; abandoned the delete and left the branch for the driver that resumes the apply", record["msg"])
+	assert.Equal(t, "schemabot-commerce-1a2b", record["branch"])
 }
 
 // A branch the reclaim could not delete is still against quota, so the failure
