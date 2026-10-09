@@ -190,6 +190,13 @@ func TestCredentialAttributeFields(t *testing.T) {
 	}
 	assert.Equal(t, []string{"name", "aws_account_id", "aws_region"}, resolverAttributeFields(regionAttr))
 
+	// Own-account mode needs the region attribute too, with no account attribute.
+	ownAccountRegionAttr := EtreConfig{
+		AttributeFields: []string{"name"},
+		Credentials:     EtreCredentialsConfig{Type: "awssm", RegionAttribute: "aws_region", SecretName: "secret"},
+	}
+	assert.Equal(t, []string{"name", "aws_region"}, resolverAttributeFields(ownAccountRegionAttr))
+
 	secretRef := EtreConfig{
 		AttributeFields: []string{"region"},
 		Credentials:     EtreCredentialsConfig{Type: "secret_ref"},
