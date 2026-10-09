@@ -1157,9 +1157,10 @@ type EtreCredentialsConfig struct {
 	// Region is the one region every target's secret is read from.
 	// RegionAttribute instead names the entity attribute holding each target's
 	// region (e.g. "aws_region"), for secrets provisioned beside their cluster in
-	// whichever region it runs. Exactly one of the two is required; a target with
-	// no value for RegionAttribute fails resolution rather than falling back to
-	// another region.
+	// whichever region it runs. Exactly one of the two is required, and either
+	// must be an AWS region name. A target whose entity has no value for
+	// RegionAttribute, or one that is not a region name, fails resolution rather
+	// than falling back to another region.
 	Region           string `yaml:"region,omitempty"`
 	RegionAttribute  string `yaml:"region_attribute,omitempty"`
 	RoleARN          string `yaml:"role_arn,omitempty"`

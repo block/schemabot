@@ -124,6 +124,28 @@ type secretFetcher interface {
 // New builds a Resolver. With a role ARN it assumes a per-account role to read
 // secrets across accounts; without one it reads from the caller's own account.
 func New(cfg Config) (*Resolver, error) {
+	// No role: read from the caller's own account, with no STS call. A role
+	// switches on per-account assume-role so one data plane can read secrets
+	// across many accounts; the target account then comes from an attribute.
+	// Building a fetcher makes no AWS call; newResolver validates cfg first.
+	var fetch secretFetcher
+	if cfg.RoleARN == "" {
+		fetch = &ownAccountFetcher{awsCfg: cfg.AWSConfig, clients: make(map[string]*secretsmanager.Client)}
+	} else {
+		fetch = &assumeRoleFetcher{
+			awsCfg:     cfg.AWSConfig,
+			roleARN:    cfg.RoleARN,
+			externalID: cfg.ExternalID,
+			clients:    make(map[accountRegion]*secretsmanager.Client),
+		}
+	}
+	return newResolver(cfg, fetch)
+}
+
+// newResolver validates cfg and constructs a Resolver over a given fetcher, so
+// tests can inject a fake that does not call AWS while building the resolver
+// exactly as New does.
+func newResolver(cfg Config, fetch secretFetcher) (*Resolver, error) {
 	switch {
 	case cfg.Region == "" && cfg.RegionAttribute == "":
 		return nil, fmt.Errorf("region or region attribute is required")
@@ -134,42 +156,34 @@ func New(cfg Config) (*Resolver, error) {
 	case cfg.Username != "" && cfg.Decode != nil:
 		return nil, fmt.Errorf("username template and decode are mutually exclusive")
 	}
+	if cfg.Region != "" && !isRegionName(cfg.Region) {
+		return nil, fmt.Errorf("region %q is not an AWS region name", cfg.Region)
+	}
 	accountAttr := cfg.AccountAttribute
 	if accountAttr == "" {
 		accountAttr = defaultAccountAttribute
 	}
-
-	// No role: read from the caller's own account, with no STS call. A role
-	// switches on per-account assume-role so one data plane can read secrets
-	// across many accounts; the target account then comes from an attribute.
-	var r *Resolver
-	if cfg.RoleARN == "" {
-		fetch := &ownAccountFetcher{awsCfg: cfg.AWSConfig, clients: make(map[string]*secretsmanager.Client)}
-		r = newResolver(accountAttr, cfg.SecretName, cfg.Username, fetch, cfg.Decode, false)
-	} else {
-		fetch := &assumeRoleFetcher{
-			awsCfg:     cfg.AWSConfig,
-			roleARN:    cfg.RoleARN,
-			externalID: cfg.ExternalID,
-			clients:    make(map[accountRegion]*secretsmanager.Client),
-		}
-		r = newResolver(accountAttr, cfg.SecretName, cfg.Username, fetch, cfg.Decode, true)
-	}
-	r.region, r.regionAttr = cfg.Region, cfg.RegionAttribute
-	return r, nil
-}
-
-// newResolver constructs a Resolver over a given fetcher, so tests can inject a
-// fake that does not call AWS.
-func newResolver(accountAttr, secretName, usernameTmpl string, fetch secretFetcher, decode inventory.SecretDecoder, requireAccount bool) *Resolver {
 	return &Resolver{
 		accountAttr:    accountAttr,
-		secretName:     secretName,
-		usernameTmpl:   usernameTmpl,
+		region:         cfg.Region,
+		regionAttr:     cfg.RegionAttribute,
+		secretName:     cfg.SecretName,
+		usernameTmpl:   cfg.Username,
 		fetch:          fetch,
-		decode:         decode,
-		requireAccount: requireAccount,
-	}
+		decode:         cfg.Decode,
+		requireAccount: cfg.RoleARN != "",
+	}, nil
+}
+
+// regionNameRe matches the shape of an AWS region name across partitions:
+// "us-east-1", "us-gov-west-1", "cn-north-1".
+var regionNameRe = regexp.MustCompile(`^[a-z]{2,}(-[a-z]+)+-[0-9]+$`)
+
+// isRegionName reports whether s has the shape of an AWS region name. A value
+// that does not would otherwise surface later as an opaque endpoint or signing
+// failure from the SDK.
+func isRegionName(s string) bool {
+	return regionNameRe.MatchString(s)
 }
 
 // TemplateAttributes returns the entity attribute names referenced by a template
@@ -200,6 +214,9 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 		region = attrs[r.regionAttr]
 		if region == "" {
 			return nil, fmt.Errorf("target %q has no %q attribute naming the region of its credential secret", req.Target, r.regionAttr)
+		}
+		if !isRegionName(region) {
+			return nil, fmt.Errorf("target %q has %q attribute %q, which is not an AWS region name", req.Target, r.regionAttr, region)
 		}
 	}
 
