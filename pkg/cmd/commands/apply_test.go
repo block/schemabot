@@ -164,7 +164,7 @@ func TestApplyCmd_BlockedPrimaryRefusesBeforeLockOrPrompt(t *testing.T) {
 							AllowUnsafe: consent.allowUnsafe, AutoApprove: consent.autoApprove, Yield: true, Output: output,
 						}
 						var runErr error
-						out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) }))
+						out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) }))
 
 						assert.EqualError(t, runErr, `apply blocked: plan plan-blocked contains a blocked change for table "users": direct execution is disabled`)
 						if output == OutputFormatJSON {
@@ -195,7 +195,7 @@ func TestApplyCmd_ExecutablePrimaryStillPromptsAndApplies(t *testing.T) {
 	cmd.NoLock = false
 	cmd.Output = OutputFormatInteractive
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) }))
 
 	require.NoError(t, runErr)
 	assertBefore(t, out, "CREATE TABLE users (id BIGINT PRIMARY KEY);", "Do you want to apply these changes?")
@@ -217,7 +217,7 @@ func TestApplyCmd_BlockedPrimaryRefusalNamesTableAndReason(t *testing.T) {
 	recorded, endpoint := newNarrowedPlanServer(t, plan)
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Output: OutputFormatJSON}
 	var runErr error
-	captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) })
+	captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) })
 
 	require.Error(t, runErr)
 	assert.Contains(t, runErr.Error(), `"users"`)
@@ -250,7 +250,7 @@ func TestApplyCmd_BlockedPrimaryRefusalListsEachCause(t *testing.T) {
 			recorded, endpoint := newNarrowedPlanServer(t, plan)
 			cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AutoApprove: true, Output: output}
 			var runErr error
-			out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) }))
+			out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) }))
 
 			assert.EqualError(t, runErr, want)
 			if output == OutputFormatJSON {
@@ -290,7 +290,7 @@ func TestApplyCmd_BlockedPrimaryRefusesBeforeMemberReruns(t *testing.T) {
 	recorded, endpoint := newNarrowedPlanServer(t, plan)
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", AllowUnsafe: true, AutoApprove: true, Yield: true, Output: OutputFormatInteractive}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: endpoint}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint}) }))
 
 	assert.EqualError(t, runErr, `apply blocked: plan plan-blocked contains a blocked change for table "users": direct execution is enabled but the table is above the configured limit of 1,000,000 rows`)
 	assert.NotContains(t, out, "then apply the rollout again for the rest")

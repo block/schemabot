@@ -651,7 +651,7 @@ func TestApplyCmd_RefusesWhileARolloutMemberNeedsAttention(t *testing.T) {
 
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true, AutoApprove: true}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.Error(t, runErr)
 	assert.Contains(t, runErr.Error(), "1 of 3 rollout members cannot be applied as planned")
@@ -678,7 +678,7 @@ func TestApplyCmd_PromptFollowsEveryTargetsPlan(t *testing.T) {
 	})
 
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true}
-	out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	assert.NotContains(t, out, "No changes. Your schema is up-to-date.", "a converged primary does not make the rollout a no-op:\n%s", out)
 	prompt := strings.Index(out, "Do you want to apply these changes?")
@@ -724,7 +724,7 @@ func TestApplyCmd_UnsafeChangeBesideAConvergedPrimaryNamesTheNarrowedApply(t *te
 	schemaDir := writeTestSchemaDir(t)
 	cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", NoLock: true, AutoApprove: true, AllowUnsafe: true}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.ErrorIs(t, runErr, ErrSilent)
 	assert.NotContains(t, *paths, "/api/apply", "no apply is requested that apply creation would refuse")
@@ -768,7 +768,7 @@ func TestApplyCmd_RefusesTargetsARolloutWideApplyCannotRunBesidePrimaryWork(t *t
 	schemaDir := writeTestSchemaDir(t)
 	cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", AutoApprove: true, AllowUnsafe: true}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.ErrorIs(t, runErr, ErrSilent)
 	assert.Equal(t, []string{"/api/status", "/api/plan"}, *paths, "no lock is checked or taken and no apply is requested:\n%s", out)
@@ -804,7 +804,7 @@ func TestApplyCmd_RefusesARolloutWhoseOnlyRefusalIsBlocked(t *testing.T) {
 
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true, AutoApprove: true}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.ErrorIs(t, runErr, ErrSilent)
 	assert.NotContains(t, *paths, "/api/apply")
@@ -859,7 +859,7 @@ func TestApplyCmd_JSONOutputNamesTheMembersThatNeedAttention(t *testing.T) {
 
 	cmd := ApplyCmd{SchemaDir: writeTestSchemaDir(t), Environment: "production", NoLock: true, AutoApprove: true, Output: OutputFormatJSON}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.Error(t, runErr)
 	assert.Equal(t, "1 of 3 rollout members cannot be applied as planned; resolve each one, then apply again: prod/payments-003 (could not be planned; see server logs for the cause, then plan again)", runErr.Error())
@@ -890,7 +890,7 @@ func TestApplyCmd_JSONOutputNamesTheRefusedTargets(t *testing.T) {
 	schemaDir := writeTestSchemaDir(t)
 	cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", NoLock: true, AutoApprove: true, Output: OutputFormatJSON}
 	var runErr error
-	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+	out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 	require.Error(t, runErr)
 	assert.Equal(t, "an apply of the whole rollout cannot run the plan of 2 of 3 rollout members: "+
@@ -923,7 +923,7 @@ func TestApplyCmd_JSONOutputNamesTheUnsafeChanges(t *testing.T) {
 			server, paths := rolloutPlanServer(t, &apitypes.PlanResponse{PlanID: "plan-orders-1", Engine: "mysql", Changes: drop, NarrowedTo: tc.narrowedTo})
 			cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", Target: tc.target, NoLock: true, AutoApprove: true, Output: OutputFormatJSON}
 			var runErr error
-			out := stripAnsi(captureStdout(func() { runErr = cmd.Run(&Globals{Endpoint: server.URL}) }))
+			out := stripAnsi(captureStdout(func() { runErr = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 
 			require.Error(t, runErr)
 			assert.NotErrorIs(t, runErr, ErrSilent, "nothing else reports the refusal in JSON mode")
@@ -963,14 +963,14 @@ func TestApplyCmd_SuggestedCommandsQuoteTheirArguments(t *testing.T) {
 			},
 		})
 		cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", NoLock: true, AutoApprove: true}
-		out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
+		out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 		assert.Contains(t, out, "apply -s '"+schemaDir+"' -e production --target 'payments 002' --allow-unsafe", "%s", out)
 	})
 
 	t.Run("unsafe retry", func(t *testing.T) {
 		server, _ := rolloutPlanServer(t, &apitypes.PlanResponse{PlanID: "plan-orders-1", Engine: "mysql", Changes: drop})
 		cmd := ApplyCmd{SchemaDir: schemaDir, Environment: "production", NoLock: true, AutoApprove: true}
-		out := stripAnsi(captureStdout(func() { _ = cmd.Run(&Globals{Endpoint: server.URL}) }))
+		out := stripAnsi(captureStdout(func() { _ = cmd.Run(t.Context(), &Globals{Endpoint: server.URL}) }))
 		assert.Contains(t, out, "apply -s '"+schemaDir+"' -e production --allow-unsafe", "%s", out)
 	})
 }

@@ -3,6 +3,7 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -476,7 +477,7 @@ func writeNarrowedTo(planResult *apitypes.PlanResponse) {
 // rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
 // decides it for its own output, so a new caller has to decide it rather than
 // inherit it.
-func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
+func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
 	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
@@ -527,7 +528,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout 
 	}
 
 	fmt.Println("Watching progress...")
-	if err := WatchApplyProgressWithFormat(ep, applyID, environment, true, format, logHeartbeat); err != nil {
+	if err := WatchApplyProgressWithFormat(ctx, ep, applyID, environment, true, format, logHeartbeat); err != nil {
 		return applyID, err
 	}
 

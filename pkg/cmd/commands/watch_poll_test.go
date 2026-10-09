@@ -41,6 +41,7 @@ func scriptedPoller(t *testing.T, steps ...pollStep) (*progressPoller, *[]time.D
 	var waits []time.Duration
 	calls := 0
 	p := &progressPoller{
+		ctx:     t.Context(),
 		applyID: scriptedApplyID,
 		fetch: func() (*apitypes.ProgressResponse, error) {
 			require.Less(t, calls, len(steps), "watch kept polling after its scripted progress ran out")
@@ -433,7 +434,7 @@ func proxiedProgressPoller(t *testing.T, responses ...proxyResponse) (*progressP
 	t.Cleanup(srv.Close)
 
 	var waits []time.Duration
-	p := newProgressPoller(srv.URL, scriptedApplyID)
+	p := newProgressPoller(t.Context(), srv.URL, scriptedApplyID)
 	p.sleep = func(d time.Duration) { waits = append(waits, d) }
 	return p, &waits
 }

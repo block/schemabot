@@ -141,7 +141,7 @@ func TestApplyCmd_TargetNarrowsPlanAndApply(t *testing.T) {
 
 	cmd := targetedApplyCmd(t)
 	out := stripAnsi(captureStdout(func() {
-		require.NoError(t, cmd.Run(&Globals{Endpoint: endpoint}))
+		require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: endpoint}))
 	}))
 
 	recorded.mu.Lock()
@@ -164,7 +164,7 @@ func TestApplyCmd_TargetDisclosedWhenMemberIsUpToDate(t *testing.T) {
 
 	cmd := targetedApplyCmd(t)
 	out := stripAnsi(captureStdout(func() {
-		require.NoError(t, cmd.Run(&Globals{Endpoint: endpoint}))
+		require.NoError(t, cmd.Run(t.Context(), &Globals{Endpoint: endpoint}))
 	}))
 
 	assert.Contains(t, out, "No changes. Your schema is up-to-date.\nTarget: prod/payments-002 (this plan covers only this rollout member)")
@@ -185,7 +185,7 @@ func TestApplyCmd_UnsafeRetryKeepsTarget(t *testing.T) {
 	cmd.Output = OutputFormatInteractive
 	var runErr error
 	out := stripAnsi(captureStdout(func() {
-		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 	}))
 
 	require.ErrorIs(t, runErr, ErrSilent)
@@ -221,7 +221,7 @@ func TestApplyCmd_TargetRefusedWhileItsDeploymentHasAnActiveSchemaChange(t *test
 			cmd.Output = OutputFormatInteractive
 			var runErr error
 			out := stripAnsi(captureStdout(func() {
-				runErr = cmd.Run(&Globals{Endpoint: endpoint})
+				runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 			}))
 
 			require.Error(t, runErr)
@@ -253,7 +253,7 @@ func TestApplyCmd_TargetRefusedWhileRolloutRunsElsewhereAfterFinishingHere(t *te
 	cmd.Output = OutputFormatInteractive
 	var runErr error
 	out := stripAnsi(captureStdout(func() {
-		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 	}))
 
 	require.Error(t, runErr)
