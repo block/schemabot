@@ -746,7 +746,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`orders`):
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
 ```
 schemabot apply -e staging
 ```
@@ -789,7 +789,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`orders`, `reconcile_state`):
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
 ```
 schemabot apply -e staging
 ```
@@ -1368,7 +1368,7 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`commerce_sharded` VSchema):
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `commerce_sharded` VSchema:
 ```
 schemabot apply -e staging
 ```
@@ -9363,7 +9363,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`mutes` on shard `40-80`):
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
 ```
 schemabot apply -e production
 ```
