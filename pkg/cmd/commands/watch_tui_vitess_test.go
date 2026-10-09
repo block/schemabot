@@ -166,7 +166,7 @@ func TestTUIBranchApplyProgress(t *testing.T) {
 				engine:      "PlanetScale",
 			}
 
-			view := m.progressView()
+			view := m.View()
 			for _, expected := range tt.contains {
 				assert.Contains(t, view, expected, "expected %q in TUI output", expected)
 			}
@@ -191,6 +191,6 @@ func TestTUIShowsDeployRequestURLWhileRunning(t *testing.T) {
 		engine:      "PlanetScale",
 	}
 
-	view := m.progressView()
+	view := m.View()
 	assert.Contains(t, view, "Deploy Request:  "+url)
 }

@@ -27,14 +27,28 @@ func (m WatchModel) fitToWindow(body, footer string) string {
 		return frame
 	}
 	bodyLines := strings.Split(strings.TrimSuffix(body, "\n"), "\n")
-	footerRows := strings.Count(footer, "\n") + 1
 	noteRows := m.hiddenLinesNoteRows()
-	keep := m.windowHeight - footerRows - noteRows
+	keep := m.windowHeight - footerRows(footer) - noteRows
 	if keep < 1 {
 		return frame
 	}
 	hidden := len(bodyLines) - keep
-	return strings.Join(bodyLines[:keep], "\n") + "\n" + m.hiddenLinesNote(hidden) + "\n" + footer
+	fitted := strings.Join(bodyLines[:keep], "\n") + "\n" + m.hiddenLinesNote(hidden)
+	if footer == "" {
+		// The note is the frame's last row, so no newline follows it: one
+		// would be a blank row the budget did not reserve.
+		return fitted
+	}
+	return fitted + "\n" + footer
+}
+
+// footerRows is how many rows a footer takes below the hidden-lines note: none
+// for a view that writes no footer, so its body keeps that row.
+func footerRows(footer string) int {
+	if footer == "" {
+		return 0
+	}
+	return strings.Count(footer, "\n") + 1
 }
 
 // hiddenLinesNoteRows is how many rows hiddenLinesNote takes: one, plus one
@@ -52,14 +66,27 @@ func (m WatchModel) hasStatusCommand() bool {
 
 // hiddenLinesNote says how many lines the window could not fit and how to see
 // them: a taller window, or the status command, which prints the whole view.
-// The command sits on a line of its own, the way the footer's commands do, so
-// a narrow window that truncates the note's first line still shows it whole.
+// Once the watch has ended its last frame stays on screen and no longer
+// redraws, so a taller window shows nothing more and only the command is
+// offered. The command sits on a line of its own, the way the footer's
+// commands do, so a narrow window that truncates the note's first line still
+// shows it whole.
 func (m WatchModel) hiddenLinesNote(hidden int) string {
 	dimStyle := lipgloss.NewStyle().Faint(true)
-	note := fmt.Sprintf("⋯ %d more %s. Enlarge the window", hidden, ui.Pluralize("line", hidden))
-	if !m.hasStatusCommand() {
-		return dimStyle.Render(note)
+	count := fmt.Sprintf("⋯ %d more %s.", hidden, ui.Pluralize("line", hidden))
+	ended := m.watchHasEnded()
+	switch {
+	case !m.hasStatusCommand() && ended:
+		return dimStyle.Render(count)
+	case !m.hasStatusCommand():
+		return dimStyle.Render(count + " Enlarge the window")
+	case ended:
+		return dimStyle.Render(count+" To see them all, run:") + "\n" + dimStyle.Render(m.statusCommand())
+	default:
+		return dimStyle.Render(count+" Enlarge the window, or run:") + "\n" + dimStyle.Render(m.statusCommand())
 	}
-	command := fmt.Sprintf("  %s status %s -e %s", cliname.Name(), m.applyID, m.environment)
-	return dimStyle.Render(note+", or run:") + "\n" + dimStyle.Render(command)
+}
+
+func (m WatchModel) statusCommand() string {
+	return fmt.Sprintf("  %s status %s -e %s", cliname.Name(), m.applyID, m.environment)
 }

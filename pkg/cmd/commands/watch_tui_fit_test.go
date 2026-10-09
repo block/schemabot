@@ -89,8 +89,56 @@ func TestWatchViewUntrimmedWhenTheFooterFillsTheWindow(t *testing.T) {
 	assert.Equal(t, m.windowHeight, frameRows(m.View()), "one more row leaves room for a line of body")
 }
 
-// The note names one hidden line in the singular and leaves out the status
+// A rollout that finished while trimmed leaves its last frame on screen after
+// the watch exits. That frame no longer redraws, so the note offers only the
+// status command, which prints the whole view, and not a taller window.
+func TestWatchViewEndedOffersOnlyTheStatusCommand(t *testing.T) {
+	m := tallRollout(12)
+	m.state = state.Apply.Completed
+	full := m.View()
+	m.windowHeight = 20
+
+	fitted := m.View()
+	plain := stripANSI(fitted)
+
+	assert.Equal(t, 20, frameRows(fitted))
+	hidden := frameRows(full) - frameRows(fitted) + 2
+	assert.Contains(t, plain, fmt.Sprintf("⋯ %d more lines. To see them all, run:\n  %s status apply-abc123 -e staging\n", hidden, cliname.Name()))
+	assert.NotContains(t, plain, "Enlarge the window")
+}
+
+// The note names the hidden lines in the singular or plural, offers a taller
+// window only while the watch still redraws, and leaves out the status
 // command when the view has no apply to name.
 func TestHiddenLinesNote(t *testing.T) {
-	assert.Equal(t, "⋯ 1 more line. Enlarge the window", stripANSI(WatchModel{}.hiddenLinesNote(1)))
+	cmd := "  " + cliname.Name() + " status apply-abc123 -e staging"
+	cases := []struct {
+		name  string
+		model WatchModel
+		want  string
+	}{
+		{name: "watching, no apply", model: WatchModel{state: state.Apply.Running}, want: "⋯ 1 more line. Enlarge the window"},
+		{name: "ended, no apply", model: WatchModel{state: state.Apply.Failed}, want: "⋯ 1 more line."},
+		{name: "watching", model: WatchModel{state: state.Apply.Running, applyID: "apply-abc123", environment: "staging"}, want: "⋯ 1 more line. Enlarge the window, or run:\n" + cmd},
+		{name: "ended", model: WatchModel{state: state.Apply.Stopped, applyID: "apply-abc123", environment: "staging"}, want: "⋯ 1 more line. To see them all, run:\n" + cmd},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, stripANSI(tc.model.hiddenLinesNote(1)))
+		})
+	}
+}
+
+// A view that writes no footer spends no row on one: the body keeps that row
+// and the note is the frame's last line, with no blank row below it.
+func TestFitToWindowWithoutAFooter(t *testing.T) {
+	m := WatchModel{state: state.Apply.Running, applyID: "apply-abc123", environment: "staging", windowHeight: 6}
+	body := strings.Repeat("line\n", 10)
+
+	fitted := m.fitToWindow(body, "")
+
+	require.Equal(t, 6, frameRows(fitted))
+	lines := strings.Split(stripANSI(fitted), "\n")
+	assert.Equal(t, []string{"line", "line", "line", "line"}, lines[:4], "the body keeps every row the note does not take")
+	assert.Equal(t, "  "+cliname.Name()+" status apply-abc123 -e staging", lines[5], "the note's command is the last row")
 }

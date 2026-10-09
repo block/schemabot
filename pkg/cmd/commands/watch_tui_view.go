@@ -49,12 +49,6 @@ func (m WatchModel) View() string {
 	return m.fitToWindow(m.progressSections())
 }
 
-// progressView renders the progress display.
-func (m WatchModel) progressView() string {
-	body, footer := m.progressSections()
-	return body + footer
-}
-
 // progressSections renders the progress display as its body (the status line
 // and tables) and its footer (the outcome or the keys the operator can press),
 // so a view too tall for the window can give up body lines and keep the footer.

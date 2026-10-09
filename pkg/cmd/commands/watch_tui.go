@@ -237,16 +237,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// Check for terminal states
-		if state.IsState(m.state, state.Apply.Completed, state.Apply.Failed) {
-			return m, tea.Quit
-		}
-		// Also quit on stopped/cancelled state
-		if state.IsState(m.state, state.Apply.Stopped, state.Apply.Cancelled) {
-			return m, tea.Quit
-		}
-		// Quit if no active schema change
-		if state.IsState(m.state, state.NoActiveChange) {
+		if m.watchHasEnded() {
 			return m, tea.Quit
 		}
 
