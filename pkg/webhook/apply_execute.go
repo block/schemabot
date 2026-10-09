@@ -58,6 +58,9 @@ func (h *Handler) executeApply(
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 			"plan_id", disclosedPlan.PlanIdentifier, "narrowed_to", disclosedPlan.NarrowedTo)
 	}
+	// The apply a refusal asks the operator to re-run: the one they sent,
+	// narrowed as its confirmed plan was, with the options they typed.
+	recoveryCommand := templates.ApplyCommand(environment, result.Database, applyCommandOptionsOf(result))
 
 	// Re-plan for drift detection
 	prNumber := int32(pr)
@@ -258,8 +261,8 @@ func (h *Handler) executeApply(
 				return
 			}
 			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy) {
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
 					return
 				}
 				h.logger.Error("failed to re-pin the pending confirmation onto the plan whose comment shows the targets' changed plans",
@@ -393,8 +396,8 @@ func (h *Handler) executeApply(
 			// The comment just posted renders this re-plan, so it discloses
 			// whatever unfinished copy the re-plan would discard.
 			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
-			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
-				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy) {
+			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
 					return
 				}
 				h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the newly-direct changes",
@@ -433,8 +436,8 @@ func (h *Handler) executeApply(
 				"environment", environment, "plan_id", planResp.PlanID, "error", err)
 			return
 		}
-		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, true); err != nil {
-			if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy) {
+		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planResp.PlanID, true); err != nil {
+			if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy, recoveryCommand) {
 				return
 			}
 			// Without the re-pin the confirm command would load the disclosure
@@ -916,7 +919,7 @@ func (h *Handler) postAutoConfirmDowngrade(
 // depend on when the lock changed. Declining leaves the copy gate armed, so
 // the next apply-confirm stops and discloses again rather than proceeding on
 // consent that was never recorded.
-func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, expectedPendingPlanID, planID string, disclosedCopyDiscard bool) error {
+func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, environment, actionName, expectedPendingPlanID, planID string, disclosedCopyDiscard bool) error {
 	// An empty observed intent asks the conditional acquire for a free lock,
 	// which would re-create a released one, so there is nothing safe to move.
 	if expectedPendingPlanID == "" {
@@ -933,7 +936,7 @@ func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr 
 		DisclosedCopyDiscard: disclosedCopyDiscard,
 	}, expectedPendingPlanID)
 	if errors.Is(err, storage.ErrLockIntentChanged) {
-		h.logPreservedLockIntent(ctx, repo, pr, database, dbType, expectedPendingPlanID, planID)
+		h.logPreservedLockIntent(ctx, repo, pr, database, dbType, environment, actionName, expectedPendingPlanID, planID)
 	}
 	if err != nil {
 		return fmt.Errorf("re-pin pending confirmation for %s (%s) onto plan %s from %s: %w",
@@ -944,10 +947,13 @@ func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr 
 
 // logPreservedLockIntent records that a re-pin left the lock as another
 // command set it, with the lock's state after the refusal so the log says
-// whether a newer intent holds it or it was released.
-func (h *Handler) logPreservedLockIntent(ctx context.Context, repo string, pr int, database, dbType, expectedPendingPlanID, planID string) {
+// whether a newer intent holds it or it was released. The lock is keyed by
+// database, so the environment and the command that was refused are named
+// here for a recurring race to be placed.
+func (h *Handler) logPreservedLockIntent(ctx context.Context, repo string, pr int, database, dbType, environment, actionName, expectedPendingPlanID, planID string) {
 	attrs := []any{
 		"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+		"environment", environment, "action", actionName,
 		"expected_pending_plan_id", expectedPendingPlanID, "plan_id", planID,
 	}
 	current, err := h.service.Storage().Locks().Get(ctx, database, dbType)
@@ -965,15 +971,16 @@ func (h *Handler) logPreservedLockIntent(ctx context.Context, repo string, pr in
 // reportRepinRefused answers an apply whose pending confirmation could not be
 // re-pinned because another command pinned or released the lock meanwhile. The
 // stop comment just posted coaches a confirmation the lock no longer carries,
-// so the operator is told the lock changed and that a retry names the command
-// holding it, if any. It reports whether err was that refusal; any other error
-// is left for the caller to report. repinPendingConfirmation has already
-// logged the refusal with the lock's state, so it is not logged again here.
-func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, actionName, database, environment, requestedBy string) bool {
+// so the operator is told the lock changed, given recoveryCommand to re-run,
+// and told that a retry names the command holding the lock, if any. It reports
+// whether err was that refusal; any other error is left for the caller to
+// report. repinPendingConfirmation has already logged the refusal with the
+// lock's state, so it is not logged again here.
+func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, actionName, database, environment, requestedBy, recoveryCommand string) bool {
 	if !errors.Is(err, storage.ErrLockIntentChanged) {
 		return false
 	}
-	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyLockIntentChangedRefusal(database, environment))
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyLockIntentChangedRefusal(database, recoveryCommand))
 	return true
 }
 

@@ -281,7 +281,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"observed_pending_plan_id", existingLock.PendingPlanID)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database, environment))
+				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
 	}
@@ -531,7 +531,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"plan_id", planResp.PlanID)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database, environment))
+				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
@@ -1103,19 +1103,22 @@ func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) st
 // or released the lock while this apply was checking or planning against it.
 // The apply leaves the lock as that command set it; a retry finds it and
 // reports which command holds the lock and how to settle it, or plans afresh
-// when the lock is free.
-func applyLockIntentChangedRefusal(database, environment string) string {
+// when the lock is free. command is the apply to re-run, scoped and optioned
+// as the operator sent it.
+func applyLockIntentChangedRefusal(database, command string) string {
 	return fmt.Sprintf("Another SchemaBot command changed the lock on `%s` while this apply was running, "+
-		"so the apply was rejected to leave the lock as that command set it. Re-run `schemabot apply -e %s`; "+
-		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database, environment)
+		"so the apply was rejected to leave the lock as that command set it. Re-run `%s`; "+
+		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database, command)
 }
 
-// applyCommandOptionsOf carries the option flags the operator typed on a
-// rejected apply-confirm into the recovery command the rejection recommends.
-// apply-confirm reads its options from the confirm comment alone, so a hint
-// that dropped them would run with defaults the operator did not choose.
+// applyCommandOptionsOf carries the target and option flags the operator typed
+// on a rejected apply or apply-confirm into the recovery command the rejection
+// recommends. Both commands read their options from the comment that carries
+// them alone, so a hint that dropped them would run with defaults the operator
+// did not choose.
 func applyCommandOptionsOf(result CommandResult) templates.ApplyCommandOptions {
 	return templates.ApplyCommandOptions{
+		Target:       result.Target,
 		Tenant:       result.Tenant,
 		AllowUnsafe:  result.AllowUnsafe,
 		DeferCutover: result.DeferCutover,
