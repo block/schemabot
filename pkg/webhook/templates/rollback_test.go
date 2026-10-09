@@ -33,11 +33,92 @@ func TestRenderRollbackPlanComment_WithChanges(t *testing.T) {
 	assert.Contains(t, rendered, "— Staging")
 	assert.Contains(t, rendered, "DROP INDEX")
 	assert.Contains(t, rendered, "DROP COLUMN")
-	assert.Contains(t, rendered, "destructive changes")
-	assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging\n```")
+	assert.Contains(t, rendered, "To confirm this rollback, comment:\n```\nschemabot rollback-confirm -e staging\n```")
 	assert.NotContains(t, rendered, "schemabot rollback-confirm -e staging -d")
 	assert.NotContains(t, rendered, "--tenant")
 	assert.Contains(t, rendered, "```\nschemabot unlock\n```")
+	assert.NotContains(t, rendered, "unsafe", "a rollback plan with no unsafe changes carries no unsafe warning")
+}
+
+// A rollback plan that drops a table, plus a column drop on only one shard of
+// a sharded keyspace, names both unsafe changes — the shard-only one with the
+// shard that carries it — and tells the operator that confirming takes
+// --allow-unsafe, while keeping the flag out of the pasteable command.
+func TestRenderRollbackPlanComment_ListsUnsafeChanges(t *testing.T) {
+	data := PlanCommentData{
+		Database:     "shop",
+		Environment:  "staging",
+		RequestedBy:  "testuser",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		ApplyID:      "apply_abc123",
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "shop",
+			Statements: []string{"DROP TABLE `audit_log`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "audit_log", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `audit_log`", ChangeType: "drop"},
+			{Table: "orders", Reason: `Column "legacy" is dropped`, DDL: "ALTER TABLE `orders` DROP COLUMN `legacy`", ChangeType: "alter", Shards: []string{"80-"}, TotalShards: 2},
+		},
+	}
+
+	rendered := RenderRollbackPlanComment(data)
+	assert.Contains(t, rendered, "**Issues**: 2 unsafe changes detected")
+	assert.Contains(t, rendered, "1. `audit_log`: DROP TABLE removes all data")
+	assert.Contains(t, rendered, "2. `orders` (shard `80-`)")
+	assert.Contains(t, rendered, "`legacy`")
+	assert.Contains(t, rendered, "To confirm this rollback, add `--allow-unsafe` to confirm 2 unsafe changes")
+	assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging\n```")
+}
+
+// rollback-confirm without --allow-unsafe on a rollback plan with unsafe
+// changes is refused with the plan, each unsafe change, the exact
+// rollback-confirm command that consents to them, and the unlock that cancels
+// the still-pinned rollback.
+func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
+	data := PlanCommentData{
+		Database:     "shop",
+		Environment:  "staging",
+		RequestedBy:  "testuser",
+		DatabaseType: "mysql",
+		IsMySQL:      true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "shop",
+			Statements: []string{"DROP TABLE `audit_log`"},
+		}},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "audit_log", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `audit_log`", ChangeType: "drop"},
+		},
+	}
+
+	t.Run("names the change and the re-issue command", func(t *testing.T) {
+		rendered := RenderRollbackUnsafeChangesBlocked(data)
+		assert.Contains(t, rendered, "## Schema Rollback Plan — Staging")
+		assert.Contains(t, rendered, "DROP TABLE `audit_log`")
+		assert.Contains(t, rendered, "**⛔ Rollback rejected**: 1 unsafe change detected")
+		assert.Contains(t, rendered, "1. `audit_log`: DROP TABLE removes all data")
+		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --allow-unsafe\n```")
+		assert.Contains(t, rendered, "The lock still pins this rollback plan")
+		assert.Contains(t, rendered, "```\nschemabot unlock\n```")
+		assert.NotContains(t, rendered, "schemabot apply")
+	})
+
+	t.Run("tenant deployment carries the tenant on both commands", func(t *testing.T) {
+		tenantData := data
+		tenantData.Tenant = "acme"
+		rendered := RenderRollbackUnsafeChangesBlocked(tenantData)
+		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --tenant acme --allow-unsafe\n```")
+		assert.Contains(t, rendered, "```\nschemabot unlock --tenant acme\n```")
+	})
+
+	t.Run("a deferred cutover stays deferred in the re-issue command", func(t *testing.T) {
+		deferredData := data
+		deferredData.DeferCutover = true
+		rendered := RenderRollbackUnsafeChangesBlocked(deferredData)
+		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --allow-unsafe --defer-cutover\n```")
+	})
 }
 
 // A rollback plan posted by a tenant deployment must render confirm/cancel

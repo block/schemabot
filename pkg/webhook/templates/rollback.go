@@ -39,8 +39,11 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// Detailed changes
 	writeKeyspaceChanges(&sb, data, budget)
 
-	// Unsafe warning — rollback typically produces DROP operations
-	sb.WriteString("> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.\n\n")
+	// The rollback's unsafe changes are named here, because confirming them
+	// takes --allow-unsafe and the operator should see what that destroys.
+	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
+		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL, true)
+	}
 
 	// Lint violations
 	if len(data.LintViolations) > 0 {
@@ -55,14 +58,63 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	// Summary (after DDL, matching CLI layout)
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
-	// Footer
+	// Footer. Like the apply instruction, the consent requirement leads into
+	// the command and the flag stays out of the pasteable command, so
+	// consenting to destroy data takes typing it.
 	sb.WriteString("---\n\n")
-	sb.WriteString("To confirm this rollback, comment:\n")
+	if consent, ok := planUnsafeConsent(data); ok {
+		fmt.Fprintf(&sb, "To confirm this rollback, %s:\n", consent.instruction())
+	} else {
+		sb.WriteString("To confirm this rollback, comment:\n")
+	}
 	fmt.Fprintf(&sb, "```\n%s\n```\n\n", tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
-	sb.WriteString("To cancel, comment:\n")
-	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock", data.Tenant))
+	writeRollbackCancel(&sb, data.Tenant)
 
 	return appendAgentHint(sb.String(), data.AgentHint)
+}
+
+func writeRollbackCancel(sb *strings.Builder, tenant string) {
+	sb.WriteString("To cancel, comment:\n")
+	fmt.Fprintf(sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock", tenant))
+}
+
+// RenderRollbackUnsafeChangesBlocked renders the refusal posted when
+// rollback-confirm is given without `--allow-unsafe` and the pinned rollback
+// plan carries unsafe changes. It mirrors the apply refusal: the rollback plan,
+// each unsafe change, and the exact rollback-confirm command that consents to
+// them. Nothing ran and the lock still pins the rollback plan, so the
+// re-issued command confirms the same plan, and unlock cancels it.
+func RenderRollbackUnsafeChangesBlocked(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderRollbackUnsafeChangesBlocked(data, budget)
+	})
+}
+
+func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, "Schema Rollback Plan", data.Environment)
+	writePlanMetadata(&sb, data)
+	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	sb.WriteString("\n")
+
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	if totalStatements+keyspaceUpdates > 0 {
+		writeKeyspaceChanges(&sb, data, budget)
+	}
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
+
+	// The retry keeps every option the rejected command carried, so following
+	// it changes only the consent, never how the rollback runs.
+	retryCommand := tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant) + " --allow-unsafe"
+	if data.DeferCutover {
+		retryCommand += " --defer-cutover"
+	}
+	writeUnsafeChangesRejection(&sb, data, "Rollback rejected", retryCommand)
+	sb.WriteString("\nThe lock still pins this rollback plan, so the command above confirms it.\n\n")
+	writeRollbackCancel(&sb, data.Tenant)
+
+	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
 }
 
 // RenderRollbackConfirmNoLock renders a message when rollback-confirm is run

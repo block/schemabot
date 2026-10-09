@@ -334,6 +334,33 @@ func (s *lockStore) ReleaseIfPendingPlanID(ctx context.Context, database, dbType
 	return rowsAffected > 0, nil
 }
 
+// ClearPendingPlanID withdraws the pending plan the caller observed while
+// keeping the owner's hold. Like ReleaseIfPendingPlanID it is conditional on
+// both owner and pending plan in one statement, so a same-owner command that
+// pinned a newer intent in between is left alone. The WHERE clause requires a
+// non-empty pending plan that differs from the cleared value, so a matched row
+// always changes and RowsAffected is unambiguous.
+func (s *lockStore) ClearPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error) {
+	if pendingPlanID == "" {
+		return false, nil
+	}
+	database = storage.CanonicalKey(database)
+	dbType = storage.CanonicalKey(dbType)
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE locks
+		SET pending_plan_id = '', disclosed_copy_discard = ?, updated_at = NOW()
+		WHERE database_name = ? AND database_type = ? AND `+s.dialect.BinaryEquals("owner")+` AND pending_plan_id = ?
+	`, false, database, dbType, owner, pendingPlanID)
+	if err != nil {
+		return false, fmt.Errorf("clear pending plan %s on lock %s/%s owner=%s: %w", pendingPlanID, database, dbType, owner, err)
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read rows affected clearing pending plan %s on lock %s/%s owner=%s: %w", pendingPlanID, database, dbType, owner, err)
+	}
+	return rowsAffected > 0, nil
+}
+
 // ForceRelease releases a lock regardless of owner (admin override).
 func (s *lockStore) ForceRelease(ctx context.Context, database, dbType string) error {
 	database = storage.CanonicalKey(database)

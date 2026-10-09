@@ -956,6 +956,71 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
+// namespacesWithUnsafeShardChanges names the namespaces whose unsafe table
+// changes shardedUnsafeChanges already lists from the per-shard view.
+func namespacesWithUnsafeShardChanges(shards []*apitypes.ShardPlanResponse) map[string]bool {
+	namespaces := make(map[string]bool)
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if _, ok := t.UnsafeChange(); ok {
+				namespaces[sp.Namespace] = true
+				break
+			}
+		}
+	}
+	return namespaces
+}
+
+// planUnsafeChanges lists a plan's unsafe changes for a comment. The view is
+// chosen per namespace. In a namespace with an unsafe per-shard change, the
+// table-level entries come from the per-shard changes, so an unsafe change
+// confined to one shard (e.g. a column drop on a single drifted shard) is still
+// flagged with the shard it applies to — the collapsed namespace-level Changes
+// can omit it. Every other namespace uses its namespace-level table view, so a
+// plan mixing an unsafe shard in one namespace with an unsafe change in another
+// lists both. VSchema removals live only on the namespace-level change, so they
+// are appended for every namespace.
+func planUnsafeChanges(planResp *apitypes.PlanResponse) []templates.UnsafeChangeData {
+	if planResp == nil {
+		return nil
+	}
+	unsafe := shardedUnsafeChanges(planResp.Shards)
+	shardViewNamespaces := namespacesWithUnsafeShardChanges(planResp.Shards)
+	for _, sc := range planResp.Changes {
+		if sc == nil || shardViewNamespaces[sc.Namespace] {
+			continue
+		}
+		for _, t := range sc.TableChanges {
+			if uc, ok := t.UnsafeChange(); ok {
+				unsafe = append(unsafe, templates.UnsafeChangeData{
+					Table:      uc.Table,
+					Reason:     uc.Reason,
+					DDL:        uc.DDL,
+					ChangeType: uc.ChangeType,
+				})
+			}
+		}
+	}
+	for _, sc := range planResp.Changes {
+		if sc == nil {
+			continue
+		}
+		for _, uc := range sc.VSchemaUnsafeChanges() {
+			unsafe = append(unsafe, templates.UnsafeChangeData{
+				Table:            uc.Table,
+				Reason:           uc.Reason,
+				DDL:              uc.DDL,
+				ChangeType:       uc.ChangeType,
+				VSchemaNamespace: sc.Namespace,
+			})
+		}
+	}
+	return unsafe
+}
+
 // plannedShardCount counts the shards the plan actually covers, so a shard
 // list rendered against it states coverage over what was planned rather than
 // over slots that carried no plan.
@@ -1307,45 +1372,7 @@ func buildPlanCommentData(schema *ghclient.SchemaRequestResult, planResp *apityp
 		data.Changes = append(data.Changes, ksData)
 	}
 
-	// Unsafe changes. For a sharded plan, derive table-level entries from the
-	// per-shard changes so an unsafe change confined to one shard (e.g. a column
-	// drop on a single drifted shard) is still flagged with the shard it applies
-	// to — the collapsed namespace-level Changes can omit it. Otherwise use the
-	// namespace-level table view. VSchema removals live only on the
-	// namespace-level change, so they are appended in both views.
-	unsafe := shardedUnsafeChanges(planResp.Shards)
-	if len(unsafe) == 0 {
-		for _, sc := range planResp.Changes {
-			if sc == nil {
-				continue
-			}
-			for _, t := range sc.TableChanges {
-				if uc, ok := t.UnsafeChange(); ok {
-					unsafe = append(unsafe, templates.UnsafeChangeData{
-						Table:      uc.Table,
-						Reason:     uc.Reason,
-						DDL:        uc.DDL,
-						ChangeType: uc.ChangeType,
-					})
-				}
-			}
-		}
-	}
-	for _, sc := range planResp.Changes {
-		if sc == nil {
-			continue
-		}
-		for _, uc := range sc.VSchemaUnsafeChanges() {
-			unsafe = append(unsafe, templates.UnsafeChangeData{
-				Table:            uc.Table,
-				Reason:           uc.Reason,
-				DDL:              uc.DDL,
-				ChangeType:       uc.ChangeType,
-				VSchemaNamespace: sc.Namespace,
-			})
-		}
-	}
-	if len(unsafe) > 0 {
+	if unsafe := planUnsafeChanges(planResp); len(unsafe) > 0 {
 		data.HasUnsafeChanges = true
 		data.UnsafeChanges = unsafe
 	}

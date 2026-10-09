@@ -70,7 +70,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.SkipRevert, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true},
-	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true},
+	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 }
 
 // CommandNames returns the command word of every registered PR comment

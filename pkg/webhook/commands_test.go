@@ -65,7 +65,7 @@ func TestCommandSpecs_FlagsRespected(t *testing.T) {
 		{name: action.SkipRevert, requiresEnv: true, hasApplyID: true},
 		{name: action.Cutover, requiresEnv: true, hasApplyID: true},
 		{name: action.Rollback, requiresEnv: true, hasApplyID: true},
-		{name: action.RollbackConfirm, requiresEnv: true, supportsDefer: true},
+		{name: action.RollbackConfirm, requiresEnv: true, supportsDefer: true, supportsAllowUnsafe: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -772,6 +772,17 @@ func TestParseCommand(t *testing.T) {
 			expected: CommandResult{
 				Action:      "rollback-confirm",
 				Environment: "production",
+				Found:       true,
+				IsMention:   true,
+			},
+		},
+		{
+			name: "rollback-confirm with allow-unsafe",
+			body: "schemabot rollback-confirm -e production --allow-unsafe",
+			expected: CommandResult{
+				Action:      "rollback-confirm",
+				Environment: "production",
+				AllowUnsafe: true,
 				Found:       true,
 				IsMention:   true,
 			},
