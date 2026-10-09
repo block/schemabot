@@ -237,22 +237,155 @@ resolver whose engine decodes its secret (`postgres` or `vitess`) refuses to
 start when a username is configured, on both the `secret_ref` and `awssm`
 backends, rather than ignoring it.
 
-The `awssm` backend reads every target's secret from the one `region` it is
-given. When each cluster's secret is provisioned in the region that cluster
-runs in, set `region_attribute` instead, naming the entity attribute that holds
-it (for example `region_attribute: aws_region`). Set exactly one of the two. A
-target whose entity has no value for the attribute, or a value that is not an
-AWS region name, fails resolution rather than being read from another region.
-
-Switching an existing resolver from `region` to `region_attribute` applies to
-every target it serves at once, and a target whose entity lacks the attribute
-fails only when something next resolves it. Before switching, query the
-inventory for the entities the resolver matches and confirm each one carries a
-region name in that attribute.
+The `awssm` backend reads the secret in the region its `region` settings
+choose; see [Etre credentials from AWS Secrets
+Manager](#etre-credentials-from-aws-secrets-manager).
 
 `table_owner` and `ca_ref` mean the same as on a `dsn_from` target. They apply
 to every target the resolver serves, so a resolver serves clusters that share
 one owner role.
+
+### Etre credentials from AWS Secrets Manager
+
+An `etre` resolver with `credentials.type: awssm` reads each target's database
+credentials from AWS Secrets Manager. Three groups of settings decide which
+secret it reads:
+
+| Settings | Decide | Default |
+|---|---|---|
+| `secret_name` | the secret, templated over `{target}` and any `{attribute}` | required |
+| `role_arn`, `account_attribute`, `external_id` | the AWS account, by assuming `role_arn` in the account `account_attribute` names | the data plane's own account |
+| `region`, `region_attribute`, `reachable_regions` | the region the secret is read in | required: `region` |
+
+#### Which region a secret is read in
+
+`region` is the data plane's home region. Roles are assumed through STS there,
+and secrets are read there unless the two optional settings place a target
+elsewhere:
+
+- `region_attribute` names the entity attribute that holds the region of each
+  target's cluster, for example `aws_region`.
+- `reachable_regions` lists the regions, besides `region`, whose Secrets
+  Manager the data plane can call. It requires `region_attribute`, and every
+  listed region must be in the same AWS partition as `region`.
+
+For each target:
+
+```
+region of the target's cluster, from region_attribute
+├─ region, or listed in reachable_regions → read the secret in the cluster's region
+└─ any other region                       → read the secret in region, as a replica
+```
+
+Without `region_attribute`, every secret is read in `region`.
+
+Each deployment shape below needs a different combination:
+
+**All clusters are in the data plane's region.** Set `region` alone.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-east-1
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+**Clusters run in several regions, and the data plane can call Secrets Manager
+only in its own.** Replicate every secret into the home region and add
+`region_attribute`. Reads stay in `region`, and when a secret is missing the
+error names the cluster's region and the replica it expected.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+**The data plane can call Secrets Manager in every region its clusters run
+in.** List those regions in `reachable_regions`, and each secret is read beside
+its cluster with no replica needed. Roles are still assumed through STS in
+`region`, because credentials from a regional STS endpoint are valid in every
+region of the same AWS partition, so only Secrets Manager has to be reachable
+in the listed regions. For the same reason, every listed region must be in the
+partition of `region`: credentials from the commercial partition cannot read a
+secret in GovCloud, China, or an isolated partition, so the resolver refuses
+to start with such a region listed.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  reachable_regions: [us-east-1]
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+Shapes can mix: a cluster in a region that is not listed still has its secret
+read in `region`, so it needs a replica there while the clusters in listed
+regions do not.
+
+#### What each target account provides
+
+In the account and region a target's secret is read in, the read needs:
+
+- The secret, named as `secret_name` renders for the target. In the home region
+  that is usually a replica of a secret whose primary is in the cluster's
+  region.
+- With `role_arn`: the role, trusting the data plane's identity and allowed to
+  call `secretsmanager:GetSecretValue` on the secret in that region.
+- Permission for the reading identity to decrypt with the KMS key that encrypts
+  the secret in that region. A replica is encrypted by a key in the replica's
+  own region, so a policy that grants decrypt by key alias needs the alias to
+  exist in that region as well.
+
+#### Errors
+
+With `reachable_regions` set, the attribute chooses where a secret is read, so
+a target whose entity has no value for `region_attribute`, or a value that is
+not an AWS region name, fails before any read rather than having its secret read
+in a region chosen for it:
+
+```
+target "orders" has no "aws_region" attribute naming the region of its cluster
+target "orders" has "aws_region" attribute "us-east", which is not an AWS region name
+```
+
+Without `reachable_regions`, every secret is read in `region` whatever the
+attribute says, so such a target is still read there. It only loses the
+cluster's region from the error below if its secret is missing, and the
+resolver logs a warning for a value that is not a region name.
+
+A secret missing from the home region, for a cluster in a region that is not
+reachable, names the fix:
+
+```
+fetch secret "orders/schemabot" for target "orders" in account 111111111111, region us-west-2:
+get secret value "orders/schemabot": ... ResourceNotFoundException: Secrets Manager can't find
+the specified secret.; the target's cluster is in us-east-1, which is not a reachable region, so
+its secret is read in us-west-2: replicate the secret to us-west-2, or list us-east-1 as a
+reachable region if this data plane can call Secrets Manager there
+```
+
+For a cluster in another AWS partition, where neither fix can work, the error
+says instead that the target has to be served by a data plane in that
+partition.
+
+#### Changing the region settings
+
+A change to these settings moves the reads of every target the resolver serves
+at once, and a target it breaks fails only when something next resolves it.
+Before listing `reachable_regions`, query the inventory for the entities the
+resolver matches and confirm each one carries a region name in
+`region_attribute`, since from then on a target without one fails. Before
+listing a region there, also confirm that the data plane can
+call Secrets Manager there and that every target in that region has its secret
+there: a listed region the data plane cannot reach turns each of those reads
+into a connection failure.
 
 ## gRPC Mode
 

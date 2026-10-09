@@ -256,14 +256,17 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 		// after (potentially slow) credential-chain resolution. role_arn is
 		// optional: without it the backend reads from the caller's own account.
 		switch {
-		case cfg.Region == "" && cfg.RegionAttribute == "":
-			return nil, fmt.Errorf("target_resolver.etre.credentials.region or region_attribute is required for the awssm backend")
-		case cfg.Region != "" && cfg.RegionAttribute != "":
-			return nil, fmt.Errorf("target_resolver.etre.credentials.region and region_attribute are mutually exclusive; set region for one fixed region or region_attribute for each target's own")
+		case cfg.Region == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.region is required for the awssm backend; it is the data plane's home region")
+		case len(cfg.ReachableRegions) > 0 && cfg.RegionAttribute == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.reachable_regions requires region_attribute, which names the region of each target's cluster")
 		case cfg.SecretName == "":
 			return nil, fmt.Errorf("target_resolver.etre.credentials.secret_name is required for the awssm backend")
 		case cfg.Username != "" && decode != nil:
 			return nil, fmt.Errorf("target_resolver.etre.credentials.username (plain-password secrets) cannot be combined with an engine that decodes the secret itself (vitess, postgres)")
+		}
+		if err := awscreds.ValidateRegions(cfg.Region, cfg.ReachableRegions); err != nil {
+			return nil, fmt.Errorf("target_resolver.etre.credentials: %w", err)
 		}
 		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 		if err != nil {
@@ -273,6 +276,7 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 			AWSConfig:        awsCfg,
 			Region:           cfg.Region,
 			RegionAttribute:  cfg.RegionAttribute,
+			ReachableRegions: cfg.ReachableRegions,
 			RoleARN:          cfg.RoleARN,
 			ExternalID:       cfg.ExternalID,
 			SecretName:       cfg.SecretName,
@@ -320,7 +324,7 @@ func resolverAttributeFields(cfg EtreConfig) []string {
 			}
 			fields = ensureField(fields, accountAttr)
 		}
-		// A per-target secret region comes from an attribute.
+		// The region of each target's cluster comes from an attribute.
 		if cfg.Credentials.RegionAttribute != "" {
 			fields = ensureField(fields, cfg.Credentials.RegionAttribute)
 		}
