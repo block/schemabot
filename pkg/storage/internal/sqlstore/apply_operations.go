@@ -981,10 +981,12 @@ func finalizerStartGateArgs() []any {
 // Parallel leaves copy start unordered, but still obeys failure admission.
 // Under rolling, and any unrecognized value, which fails closed to the serial
 // gate via NOT IN (barrier, parallel), only a completed earlier sibling stops
-// blocking. The fragment references the apply_operations alias; see
+// blocking. A table step of a rollout that runs table by table also waits on
+// rolloutStepGateSQL. The fragment references the apply_operations alias; see
 // workStartGateArgs for its placeholders.
 func workStartGateSQL(d Dialect) string {
-	return `NOT EXISTS (
+	return `(
+NOT EXISTS (
 	SELECT 1
 	FROM apply_operations AS earlier
 	WHERE earlier.apply_id = apply_operations.apply_id
@@ -1004,8 +1006,33 @@ func workStartGateSQL(d Dialect) string {
 			)
 		)
 		AND ` + releasedFailureExemptionSQL(d) + `
+)
+AND ` + rolloutStepGateSQL + `
 )`
 }
+
+// rolloutStepGateSQL is the table-step boundary of a rollout that runs table by
+// table: a work row of step N starts only once every row of an earlier step in
+// its deployment has completed, so each table lands on every target before any
+// target starts the next. It holds under every cutover_policy, since parallel
+// and barrier order only targets within a step, and under every on_failure,
+// since a failure the policy continues past lets the step's remaining targets
+// run but never starts the next table on a fleet where one target is missing
+// the last. A row of step zero runs its member's whole change and is never
+// gated here, and an earlier step-zero row never holds one. As with the member
+// gate, an apply a remote dispatch created leaves the order to its dispatcher
+// (rolloutMembersOrderedHereSQL). The fragment references the apply_operations
+// alias; its one placeholder is completed.
+const rolloutStepGateSQL = `NOT EXISTS (
+	SELECT 1
+	FROM apply_operations AS earlier_step
+	WHERE earlier_step.apply_id = apply_operations.apply_id
+		AND earlier_step.deployment = apply_operations.deployment
+		AND earlier_step.rollout_step > 0
+		AND earlier_step.rollout_step < apply_operations.rollout_step
+		AND earlier_step.state <> ?
+		AND ` + rolloutMembersOrderedHereSQL + `
+)`
 
 // workStartGateArgs returns the positional arguments for workStartGateSQL,
 // in placeholder order.
@@ -1024,7 +1051,8 @@ func workStartGateArgs() []any {
 		storage.CutoverPolicyParallel,
 		state.ApplyOperation.Completed,
 	)
-	return append(args, releasedFailureExemptionArgs()...)
+	args = append(args, releasedFailureExemptionArgs()...)
+	return append(args, state.ApplyOperation.Completed)
 }
 
 // operationStartGateSQL is the member-order gate every claim arm that starts

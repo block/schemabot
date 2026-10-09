@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -214,4 +215,100 @@ func TestFinalizerFinalizesWork(t *testing.T) {
 			assert.Equal(t, tc.want, FinalizerFinalizesWork(tc.finalizer, tc.work))
 		})
 	}
+}
+
+// rolloutStep builds payments-a's table step for target.
+func rolloutStep(target string, step int, opState string) RolloutOperation {
+	return RolloutOperation{
+		Deployment:   "payments-a",
+		OperationKey: target + OperationKeyDelimiter + "step-" + strconv.Itoa(step),
+		Work:         true,
+		RolloutStep:  step,
+		State:        opState,
+		NeverStarted: opState == ApplyOperation.Pending || opState == ApplyOperation.Stopped,
+	}
+}
+
+// TestRolloutChildren_StepOrphanedByAnEarlierFailedStep verifies which table
+// steps every rollout projection treats as dead. payments-002's second step is
+// orphaned once any target's first step has failed, whether it is pending or a
+// stop caught it before it started. It is not orphaned while an earlier step
+// is only retrying, when the failed row is in its own step, or when the failure
+// is in another deployment, and a row that runs its member's whole change is
+// never a step orphan.
+func TestRolloutChildren_StepOrphanedByAnEarlierFailedStep(t *testing.T) {
+	cases := []struct {
+		name      string
+		candidate RolloutOperation
+		siblings  []RolloutOperation
+		want      bool
+	}{
+		{
+			name:      "pending step behind another target's failed step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Failed), rolloutStep("payments-002", 1, ApplyOperation.Completed)},
+			want:      true,
+		},
+		{
+			name:      "stopped step behind its own target's failed step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Stopped),
+			siblings:  []RolloutOperation{rolloutStep("payments-002", 1, ApplyOperation.Failed)},
+			want:      true,
+		},
+		{
+			name:      "pending step behind a retrying step",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.FailedRetryable)},
+		},
+		{
+			name:      "pending step beside a failure in its own step",
+			candidate: rolloutStep("payments-002", 1, ApplyOperation.Pending),
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Failed)},
+		},
+		{
+			name:      "failed step of another deployment",
+			candidate: rolloutStep("payments-002", 2, ApplyOperation.Pending),
+			siblings: []RolloutOperation{func() RolloutOperation {
+				op := rolloutStep("payments-001", 1, ApplyOperation.Failed)
+				op.Deployment = "payments-b"
+				return op
+			}()},
+		},
+		{
+			name:      "whole-change row",
+			candidate: RolloutOperation{Deployment: "payments-a", OperationKey: "payments-002", Work: true, State: ApplyOperation.Pending},
+			siblings:  []RolloutOperation{rolloutStep("payments-001", 1, ApplyOperation.Failed)},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := append([]RolloutOperation{tc.candidate}, tc.siblings...)
+			assert.Equal(t, tc.want, RolloutChildren(ops)[0].Orphaned)
+		})
+	}
+}
+
+// TestDeriveRolloutApplyState_FailedStepEndsTheRollout verifies that a rollout
+// run table by table settles once a failed step leaves nothing that can run.
+// payments-001 failed `stations`; payments-002 finished it, and both targets'
+// `docks` step is pending behind the failure. Under continue the step boundary
+// still holds, so nothing will start `docks` and the rollout settles failed
+// rather than waiting on rows that never move. While payments-002 is still
+// running `stations`, the rollout stays open for it.
+func TestDeriveRolloutApplyState_FailedStepEndsTheRollout(t *testing.T) {
+	ops := func(secondFirstStep string) []RolloutOperation {
+		rows := []RolloutOperation{
+			rolloutStep("payments-001", 1, ApplyOperation.Failed),
+			rolloutStep("payments-002", 1, secondFirstStep),
+			rolloutStep("payments-001", 2, ApplyOperation.Pending),
+			rolloutStep("payments-002", 2, ApplyOperation.Pending),
+		}
+		for i := range rows {
+			rows[i].ContinueOnFailure = true
+		}
+		return rows
+	}
+
+	assert.Equal(t, Apply.Failed, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Completed))))
+	assert.Equal(t, Apply.RunningDegraded, DeriveRolloutApplyState(RolloutChildren(ops(ApplyOperation.Running))))
 }

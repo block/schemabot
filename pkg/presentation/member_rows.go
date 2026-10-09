@@ -37,13 +37,14 @@ func memberRows(ops []Operation) [][]int {
 	return members
 }
 
-// orderFoldedMembersByRow labels each folded member that waits its turn by its
-// lead row's place among every row, rather than its own place among the
-// members. A target runs its next table only once the earlier rows allow it,
-// and those can belong to targets the member order puts after it: orders-001
-// waiting on `docks` is held by orders-002's failure on `bikes`, though
-// orders-001 is the first member. Settled and active members read as their
-// folded state already says.
+// orderFoldedMembersByRow labels each member of a rollout run table by table
+// that waits its turn by its lead row's place among every row, rather than its
+// own place among the members. A target runs its next table only once the
+// earlier rows allow it, and those can belong to targets the member order puts
+// after it: orders-001 waiting on `docks` is held by orders-002's failure on
+// `bikes`, though orders-001 is the first member. That holds for a target with
+// one table too, when its table is a later step. Settled and active members
+// read as their folded state already says.
 func orderFoldedMembersByRow(ops, members []Operation, names []string, memberOf []int, deployments []Deployment) {
 	rowNames := make([]string, len(ops))
 	for i := range ops {
@@ -51,7 +52,7 @@ func orderFoldedMembersByRow(ops, members []Operation, names []string, memberOf 
 	}
 	for j := range deployments {
 		d := &deployments[j]
-		if len(d.Rows) < 2 || !waitsItsTurn(ops[d.Row].State, members[j].State) {
+		if ops[d.Row].RolloutStep == 0 || !waitsItsTurn(ops[d.Row].State, members[j].State) {
 			continue
 		}
 		row := deriveDeployment(ops, rowNames, d.Row)

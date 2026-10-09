@@ -230,6 +230,108 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		return ids
 	}
 
+	// insertTableSteps inserts a rollout run table by table over targets, one
+	// work row per (step, target) for steps tables, in (step, target) order as
+	// the planner creates them, and returns the ids indexed [step-1][target].
+	insertTableSteps := func(t *testing.T, store storage.Storage, applyID int64, cutoverPolicy, onFailure string, steps int, targets ...string) [][]int64 {
+		t.Helper()
+		ids := make([][]int64, steps)
+		for step := 1; step <= steps; step++ {
+			for _, target := range targets {
+				id, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+					ApplyID: applyID, Deployment: "payments-a", Target: target,
+					OperationKey:  storage.TargetOperationKey(target, storage.RolloutStepOperationKey(step)),
+					OperationKind: storage.ApplyOperationKindWork,
+					CutoverPolicy: cutoverPolicy, OnFailure: onFailure, RolloutStep: step,
+				})
+				require.NoError(t, err)
+				ids[step-1] = append(ids[step-1], id)
+			}
+		}
+		return ids
+	}
+
+	// FindNextApplyOperation_TableStepWaitsForEveryTarget verifies the table-step
+	// boundary under every cutover_policy. payments-001 has finished `stations`
+	// and payments-002 has copied it and is parked for cutover, which a barrier
+	// rollout would otherwise take as leave for later copies to start. Neither
+	// target starts `docks` until payments-002's `stations` completes, and then
+	// payments-001 starts it first.
+	t.Run("FindNextApplyOperation_TableStepWaitsForEveryTarget", func(t *testing.T) {
+		for _, policy := range []string{storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel} {
+			t.Run(policy, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_table_step_"+policy, storage.DatabaseTypeMySQL)
+				apply := CreateApply(t, store, lock, "apply_operation_table_step_"+policy, 933)
+				ids := insertTableSteps(t, store, apply.ID, policy, storage.OnFailureHalt, 2, "payments-001", "payments-002")
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0][0]))
+				require.NoError(t, store.ApplyOperations().UpdateState(ctx, ids[0][1], state.ApplyOperation.WaitingForCutover))
+
+				held, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				assert.Nil(t, held, "no target starts docks while payments-002 has not finished stations")
+
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0][1]))
+				next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, next, "docks starts once every target finished stations")
+				assert.Equal(t, ids[1][0], next.ID)
+				assert.Equal(t, 2, next.RolloutStep)
+			})
+		}
+	})
+
+	// FindNextApplyOperation_FailedTableStepEndsTheRollout verifies that the
+	// table-step boundary is strict under every on_failure. payments-001 failed
+	// `stations`. Continue and a released pause still run `stations` on
+	// payments-002, as they would run any later target, but once it completes
+	// no target starts `docks`: the rollout never starts the next table on a
+	// fleet missing the last one.
+	t.Run("FindNextApplyOperation_FailedTableStepEndsTheRollout", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			policy    string
+			onFailure string
+			release   bool
+		}{
+			{name: "rolling_continue", policy: storage.CutoverPolicyRolling, onFailure: storage.OnFailureContinue},
+			{name: "parallel_continue", policy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureContinue},
+			{name: "barrier_pause_released", policy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailurePause, release: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_table_step_fail_"+tc.name, storage.DatabaseTypeMySQL)
+				apply := CreateApply(t, store, lock, "apply_operation_table_step_fail_"+tc.name, 934)
+				ids := insertTableSteps(t, store, apply.ID, tc.policy, tc.onFailure, 2, "payments-001", "payments-002")
+
+				first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, first)
+				require.Equal(t, ids[0][0], first.ID)
+				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0][0], "duplicate key name 'idx_stations_note'"))
+				if tc.release {
+					_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+						ApplyID: apply.ID, Operation: storage.ControlOperationRelease, Status: storage.ControlRequestPending,
+						RequestedBy: "operator-a", Metadata: []byte(`{}`),
+					})
+					require.NoError(t, err)
+				}
+
+				sameStep, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+				require.NoError(t, err)
+				require.NotNil(t, sameStep, "%s runs stations on payments-002 past payments-001's failure", tc.name)
+				assert.Equal(t, ids[0][1], sameStep.ID)
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0][1]))
+
+				nextStep, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+				require.NoError(t, err)
+				assert.Nil(t, nextStep, "no target starts docks after payments-001 failed stations")
+			})
+		}
+	})
+
 	// FindNextApplyOperation_RollingOrdersTargetsOfOneDeployment verifies that
 	// the targets of one deployment are rollout members in their own right. A
 	// rolling rollout over payments-001..003 starts one target at a time, in

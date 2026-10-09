@@ -2042,6 +2042,7 @@ func (s *Service) createStoredApply(
 			"deployment_count", len(targets),
 			"operation_group_count", len(groups))
 	}
+	logRolloutShape(s.logger, plan, req.Environment, members, groups, shardedFanout)
 
 	storedApplyID, err := s.storage.Applies().CreateWithGroupedOperations(ctx, apply, groups)
 	if err != nil {
@@ -2674,6 +2675,14 @@ func buildApplyOperationGroups(
 			return nil, false, fmt.Errorf("plan %s asks to finalize namespaces %v after their DDL, but its changes carry no per-shard plan to schedule a group finalizer behind; re-plan, and report this if it repeats",
 				member.Plan.PlanIdentifier, namespaces)
 		}
+	}
+
+	if runsTableByTable(keys, members) {
+		groups, err := buildTableStepOperationGroups(plan, members, keys, environment, applyOpts, cutoverPolicy, onFailure, now)
+		if err != nil {
+			return nil, false, err
+		}
+		return groups, false, nil
 	}
 
 	groups := make([]*storage.ApplyOperationWithTasks, 0, len(members))

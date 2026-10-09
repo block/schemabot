@@ -36,6 +36,10 @@ type RolloutOperation struct {
 	Work bool
 	// Finalizer is true for a group_finalizer.
 	Finalizer bool
+	// RolloutStep is the table step the operation runs in a rollout that runs
+	// table by table, numbered from 1, or zero for an operation that runs its
+	// member's whole change.
+	RolloutStep int
 	// State is the operation's state.
 	State string
 	// NeverStarted is true when no driver has ever claimed the row: it has no
@@ -56,7 +60,10 @@ type RolloutOperation struct {
 //   - Orphaned: a finalizer that has not started while work it finalizes has
 //     terminally failed. The claim query's orphanedFinalizerSQL
 //     (pkg/storage/internal/sqlstore/apply_operations.go) is the same
-//     predicate.
+//     predicate. Also a table step that has not started while work of an
+//     earlier step in its deployment has terminally failed: the claim's step
+//     gate (rolloutStepGateSQL) holds a step until every earlier one has
+//     completed, under every on_failure policy.
 //   - NeverStarted: a stopped row no driver ever claimed. The claim query
 //     holds it to the same start gate as a pending row, so the projection
 //     counts it as a pending row too.
@@ -67,7 +74,7 @@ func RolloutChildren(ops []RolloutOperation) []RolloutChild {
 			State:             op.State,
 			ContinueOnFailure: op.ContinueOnFailure,
 			PauseOnFailure:    op.PauseOnFailure,
-			Orphaned:          finalizerOrphanedByFailedWork(op, ops),
+			Orphaned:          finalizerOrphanedByFailedWork(op, ops) || stepOrphanedByFailedStep(op, ops),
 			NeverStarted:      op.NeverStarted && IsState(op.State, ApplyOperation.Pending, ApplyOperation.Stopped),
 		}
 	}
@@ -92,6 +99,31 @@ func finalizerOrphanedByFailedWork(op RolloutOperation, ops []RolloutOperation) 
 			continue
 		}
 		if FinalizerFinalizesWork(op.OperationKey, work.OperationKey) && IsState(work.State, ApplyOperation.Failed) {
+			return true
+		}
+	}
+	return false
+}
+
+// stepOrphanedByFailedStep reports whether op is a table step that nothing will
+// ever start: it has not started (pending, or stopped before it started) and
+// work of an earlier step in its deployment has terminally failed. A step
+// starts only once every earlier step has completed, and a failed operation
+// never runs again, so the row is dead rather than queued. A failure the
+// policy lets the rollout continue past still ends the rollout at its step:
+// the remaining targets of that step run, and no later step does.
+func stepOrphanedByFailedStep(op RolloutOperation, ops []RolloutOperation) bool {
+	if op.RolloutStep <= 0 {
+		return false
+	}
+	if !IsState(op.State, ApplyOperation.Pending, ApplyOperation.Stopped) {
+		return false
+	}
+	for _, earlier := range ops {
+		if !earlier.Work || earlier.Deployment != op.Deployment {
+			continue
+		}
+		if earlier.RolloutStep > 0 && earlier.RolloutStep < op.RolloutStep && IsState(earlier.State, ApplyOperation.Failed) {
 			return true
 		}
 	}
