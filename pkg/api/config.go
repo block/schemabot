@@ -1157,9 +1157,9 @@ type EtreCredentialsConfig struct {
 	// Region is the data plane's home region, and is required: roles are assumed
 	// through STS there, and a target's secret is read there unless its cluster
 	// is in one of ReachableRegions. RegionAttribute names the entity attribute
-	// holding the region of each target's cluster (e.g. "aws_region"); a target
-	// whose entity has no value for it, or one that is not a region name, fails
-	// resolution. ReachableRegions lists the other regions whose Secrets Manager
+	// holding the region of each target's cluster (e.g. "aws_region"); with
+	// ReachableRegions set, a target whose entity has no value for it, or one
+	// that is not a region name, fails resolution. ReachableRegions lists the other regions whose Secrets Manager
 	// this data plane can call, all in Region's AWS partition, and requires
 	// RegionAttribute: a target whose cluster is in one of them has its secret
 	// read there, and every other target's secret is read in Region, so it must

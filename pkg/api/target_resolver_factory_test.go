@@ -135,7 +135,8 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 		"reachable_regions requires region_attribute": func(c *EtreCredentialsConfig) {
 			c.ReachableRegions = []string{"us-west-2"}
 		},
-		`reachable region "us-west" is not an AWS region name`: func(c *EtreCredentialsConfig) {
+		`target_resolver.etre.credentials: region "us-west" is not an AWS region name`: func(c *EtreCredentialsConfig) { c.Region = "us-west" },
+		`target_resolver.etre.credentials: reachable region "us-west" at index 0 is not an AWS region name`: func(c *EtreCredentialsConfig) {
 			c.RegionAttribute = "aws_region"
 			c.ReachableRegions = []string{"us-west"}
 		},
@@ -156,6 +157,32 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	_, err = buildCredentialResolver(t.Context(), withUsername, inventory.DecodePlanetScaleSecret)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "username")
+}
+
+// A mistyped region is reported before AWS config is loaded, so it is not
+// hidden behind, or delayed by, a credential chain that cannot load.
+func TestBuildCredentialResolverAWSSMValidatesRegionsBeforeLoadingAWSConfig(t *testing.T) {
+	t.Setenv("AWS_PROFILE", "profile-that-does-not-exist")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "aws-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "aws-credentials"))
+
+	cfg := EtreCredentialsConfig{
+		Type:             "awssm",
+		Region:           "us-east-1",
+		RegionAttribute:  "aws_region",
+		RoleARN:          "arn:aws:iam::{account}:role/tern-assumed",
+		SecretName:       "{target}_ddl_password",
+		ReachableRegions: []string{"us-west-2"},
+	}
+	_, err := buildCredentialResolver(t.Context(), cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "load AWS config", "a valid config reaches the AWS config load, which fails on the missing profile")
+
+	cfg.ReachableRegions = []string{"us-west-2", "eu-west"}
+	_, err = buildCredentialResolver(t.Context(), cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target_resolver.etre.credentials: reachable region "eu-west" at index 1 is not an AWS region name`)
+	assert.NotContains(t, err.Error(), "load AWS config")
 }
 
 // The assume-role backend's account attribute is surfaced to the resolver even

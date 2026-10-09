@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -65,8 +66,9 @@ type Config struct {
 	// target's cluster (e.g. "aws_region"). Setting it lets a target whose
 	// cluster is in one of ReachableRegions have its secret read in that region,
 	// and lets a secret missing from the home region be reported against the
-	// cluster's region. A target whose entity has no value for it, or a value
-	// that is not a region name, fails resolution.
+	// cluster's region. With ReachableRegions set, a target whose entity has no
+	// value for it, or a value that is not a region name, fails resolution;
+	// without, such a target's secret is read in Region.
 	RegionAttribute string
 	// ReachableRegions lists the regions, besides Region, whose Secrets Manager
 	// this data plane can call. They must be in Region's AWS partition. A target whose cluster is in one of them has its
@@ -170,9 +172,6 @@ func newResolver(cfg Config, fetch secretFetcher) (*Resolver, error) {
 	case len(cfg.ReachableRegions) > 0 && cfg.RegionAttribute == "":
 		return nil, fmt.Errorf("reachable regions require a region attribute naming each target's cluster region")
 	}
-	if !isRegionName(cfg.Region) {
-		return nil, fmt.Errorf("region %q is not an AWS region name", cfg.Region)
-	}
 	reachable, err := reachableRegions(cfg.Region, cfg.ReachableRegions)
 	if err != nil {
 		return nil, err
@@ -229,24 +228,37 @@ func partitionOf(region string) string {
 	return "aws"
 }
 
+// ValidateRegions checks a home region and the reachable regions listed beside
+// it, with the same rules New applies. It makes no AWS call, so a caller can
+// report a mistyped region before loading AWS config, which may wait on a slow
+// credential chain.
+func ValidateRegions(home string, reachable []string) error {
+	_, err := reachableRegions(home, reachable)
+	return err
+}
+
 // reachableRegions returns the set of regions a secret may be read in: the home
-// region and every listed one. Each listed region must be a region name in the
-// home region's partition, other than the home region, and listed once. Roles
-// are assumed in the home region, and credentials from one partition cannot
-// authenticate in another, so a region in another partition could never be read.
+// region and every listed one. The home region must be a region name, and each
+// listed region a region name in the home region's partition, other than the
+// home region, and listed once. Roles are assumed in the home region, and
+// credentials from one partition cannot authenticate in another, so a region in
+// another partition could never be read.
 func reachableRegions(home string, listed []string) (map[string]bool, error) {
+	if !isRegionName(home) {
+		return nil, fmt.Errorf("region %q is not an AWS region name", home)
+	}
 	reachable := map[string]bool{home: true}
 	homePartition := partitionOf(home)
-	for _, region := range listed {
+	for i, region := range listed {
 		switch {
 		case !isRegionName(region):
-			return nil, fmt.Errorf("reachable region %q is not an AWS region name", region)
+			return nil, fmt.Errorf("reachable region %q at index %d is not an AWS region name", region, i)
 		case partitionOf(region) != homePartition:
-			return nil, fmt.Errorf("reachable region %q is in partition %s, not the home region %s's partition %s; credentials from one partition cannot read secrets in another", region, partitionOf(region), home, homePartition)
+			return nil, fmt.Errorf("reachable region %q at index %d is in partition %s, not the home region %s's partition %s; credentials from one partition cannot read secrets in another", region, i, partitionOf(region), home, homePartition)
 		case region == home:
-			return nil, fmt.Errorf("reachable region %q is the home region; list only the other regions this data plane can call", region)
+			return nil, fmt.Errorf("reachable region %q at index %d is the home region; list only the other regions this data plane can call", region, i)
 		case reachable[region]:
-			return nil, fmt.Errorf("reachable region %q is listed more than once", region)
+			return nil, fmt.Errorf("reachable region %q at index %d is listed more than once", region, i)
 		}
 		reachable[region] = true
 	}
@@ -341,26 +353,48 @@ func (r *Resolver) ResolveCredentials(ctx context.Context, req inventory.Request
 }
 
 // readRegion returns the region to read the target's secret in, and the region
-// of the target's cluster when a region attribute is configured. The secret is
-// read in the cluster's region when that region is reachable, and in the home
-// region otherwise. A missing or malformed cluster region fails rather than
-// being read in the home region, since it means the inventory cannot say where
-// the target runs.
+// of the target's cluster when a region attribute names one. The secret is read
+// in the cluster's region when that region is reachable, and in the home region
+// otherwise.
+//
+// A missing or malformed cluster region fails when reachable regions are
+// configured, because the attribute then chooses the region and reading in the
+// home region would be a guess about where the target runs. With only the home
+// region reachable every read lands there whatever the attribute says, so such a
+// target is read in the home region and only loses the cluster region from a
+// missing-secret error.
 func (r *Resolver) readRegion(target string, attrs map[string]string) (read, cluster string, err error) {
 	if r.regionAttr == "" {
 		return r.region, "", nil
 	}
 	cluster = attrs[r.regionAttr]
 	if cluster == "" {
-		return "", "", fmt.Errorf("target %q has no %q attribute naming the region of its cluster", target, r.regionAttr)
+		if r.attributeChoosesRegion() {
+			return "", "", fmt.Errorf("target %q has no %q attribute naming the region of its cluster", target, r.regionAttr)
+		}
+		slog.Debug("target has no cluster region attribute; reading its credential secret in the home region",
+			"target", target, "region_attribute", r.regionAttr, "home_region", r.region)
+		return r.region, "", nil
 	}
 	if !isRegionName(cluster) {
-		return "", "", fmt.Errorf("target %q has %q attribute %q, which is not an AWS region name", target, r.regionAttr, cluster)
+		if r.attributeChoosesRegion() {
+			return "", "", fmt.Errorf("target %q has %q attribute %q, which is not an AWS region name", target, r.regionAttr, cluster)
+		}
+		slog.Warn("target's cluster region attribute is not an AWS region name; reading its credential secret in the home region",
+			"target", target, "region_attribute", r.regionAttr, "value", cluster, "home_region", r.region)
+		return r.region, "", nil
 	}
 	if r.reachable[cluster] {
 		return cluster, cluster, nil
 	}
 	return r.region, cluster, nil
+}
+
+// attributeChoosesRegion reports whether a target's cluster region can change
+// where its secret is read: only when a region besides the home region is
+// reachable.
+func (r *Resolver) attributeChoosesRegion() bool {
+	return len(r.reachable) > 1
 }
 
 // missingReplica reports whether a fetch failed because the secret is missing

@@ -344,14 +344,20 @@ In the account and region a target's secret is read in, the read needs:
 
 #### Errors
 
-A target whose entity has no value for `region_attribute`, or a value that is
-not an AWS region name, fails before any read, rather than having its secret
-read in a region chosen for it:
+With `reachable_regions` set, the attribute chooses where a secret is read, so
+a target whose entity has no value for `region_attribute`, or a value that is
+not an AWS region name, fails before any read rather than having its secret read
+in a region chosen for it:
 
 ```
 target "orders" has no "aws_region" attribute naming the region of its cluster
 target "orders" has "aws_region" attribute "us-east", which is not an AWS region name
 ```
+
+Without `reachable_regions`, every secret is read in `region` whatever the
+attribute says, so such a target is still read there. It only loses the
+cluster's region from the error below if its secret is missing, and the
+resolver logs a warning for a value that is not a region name.
 
 A secret missing from the home region, for a cluster in a region that is not
 reachable, names the fix:
@@ -372,9 +378,10 @@ partition.
 
 A change to these settings moves the reads of every target the resolver serves
 at once, and a target it breaks fails only when something next resolves it.
-Before adding `region_attribute`, query the inventory for the entities the
-resolver matches and confirm each one carries a region name in that attribute.
-Before listing a region in `reachable_regions`, confirm that the data plane can
+Before listing `reachable_regions`, query the inventory for the entities the
+resolver matches and confirm each one carries a region name in
+`region_attribute`, since from then on a target without one fails. Before
+listing a region there, also confirm that the data plane can
 call Secrets Manager there and that every target in that region has its secret
 there: a listed region the data plane cannot reach turns each of those reads
 into a connection failure.

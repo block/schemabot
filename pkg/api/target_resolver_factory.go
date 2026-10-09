@@ -265,6 +265,9 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 		case cfg.Username != "" && decode != nil:
 			return nil, fmt.Errorf("target_resolver.etre.credentials.username (plain-password secrets) cannot be combined with an engine that decodes the secret itself (vitess, postgres)")
 		}
+		if err := awscreds.ValidateRegions(cfg.Region, cfg.ReachableRegions); err != nil {
+			return nil, fmt.Errorf("target_resolver.etre.credentials: %w", err)
+		}
 		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("load AWS config for target_resolver.etre.credentials: %w", err)

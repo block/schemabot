@@ -342,9 +342,9 @@ func TestResolverReadsSecretInHomeRegionWhenClusterRegionUnreachable(t *testing.
 	assert.Equal(t, "us-west-2", fetch.gotRegion)
 }
 
-// A target whose entity does not name its cluster's region fails before any
-// fetch: reading the secret in the home region would be a guess about where the
-// target runs.
+// With reachable regions configured, a target whose entity does not name its
+// cluster's region fails before any fetch: reading the secret in the home region
+// would be a guess about where the target runs.
 func TestResolverFailsWhenRegionAttributeMissing(t *testing.T) {
 	fetch := &fakeFetcher{payload: `{"username":"u","password":"p"}`}
 	_, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
@@ -355,8 +355,9 @@ func TestResolverFailsWhenRegionAttributeMissing(t *testing.T) {
 	assert.Equal(t, 0, fetch.calls)
 }
 
-// A region attribute whose value is not a region name fails before any fetch,
-// naming the value, rather than as an opaque endpoint error from the SDK.
+// With reachable regions configured, a region attribute whose value is not a
+// region name fails before any fetch, naming the value, rather than as an opaque
+// endpoint error from the SDK.
 func TestResolverFailsOnMalformedEntityRegion(t *testing.T) {
 	fetch := &fakeFetcher{payload: `{"username":"u","password":"p"}`}
 	_, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
@@ -364,6 +365,33 @@ func TestResolverFailsOnMalformedEntityRegion(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `target "orders-dsid" has "aws_region" attribute "us-east", which is not an AWS region name`)
 	assert.Equal(t, 0, fetch.calls)
+}
+
+// With only the home region reachable, the attribute cannot change where a
+// secret is read, so a target with a missing or malformed cluster region is read
+// in the home region rather than failed. A missing secret is then reported
+// without a cluster region to name.
+func TestResolverHomeOnlyReadsTargetWithoutUsableClusterRegion(t *testing.T) {
+	cfg := Config{Region: "us-west-2", RegionAttribute: "aws_region", RoleARN: testRoleARN, SecretName: "ddl-password"}
+	cases := map[string]map[string]string{
+		"missing":   {"aws_account_id": "111111111111"},
+		"malformed": accountInRegion("111111111111", "us-east"),
+	}
+	for name, attrs := range cases {
+		fetch := &fakeFetcher{payload: `{"username":"ddl","password":"s3cret"}`}
+		creds, err := testResolver(t, cfg, fetch).ResolveCredentials(t.Context(),
+			inventory.Request{Target: "orders-dsid"}, attrs)
+		require.NoError(t, err, name)
+		assert.Equal(t, "us-west-2", fetch.gotRegion, name)
+		assert.Equal(t, "ddl", creds.Username, name)
+
+		fetch = &fakeFetcher{err: secretNotFound()}
+		_, err = testResolver(t, cfg, fetch).ResolveCredentials(t.Context(),
+			inventory.Request{Target: "orders-dsid"}, attrs)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), `fetch secret "ddl-password" for target "orders-dsid" in account 111111111111, region us-west-2`, name)
+		assert.NotContains(t, err.Error(), "the target's cluster is in", name)
+	}
 }
 
 func TestIsRegionName(t *testing.T) {
@@ -400,7 +428,7 @@ func TestNewAcceptsReachableRegionsInHomePartition(t *testing.T) {
 
 	_, err = New(Config{Region: "us-gov-west-1", RegionAttribute: "aws_region", ReachableRegions: []string{"us-east-1"}, RoleARN: "arn:aws-us-gov:iam::{account}:role/role", SecretName: "secret"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `reachable region "us-east-1" is in partition aws, not the home region us-gov-west-1's partition aws-us-gov`)
+	assert.Contains(t, err.Error(), `reachable region "us-east-1" at index 0 is in partition aws, not the home region us-gov-west-1's partition aws-us-gov`)
 }
 
 // Without a region attribute every secret is read in the home region, whatever
@@ -535,17 +563,23 @@ func TestNewValidatesConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	cases := map[string]func(*Config){
-		"region is required":                              func(c *Config) { c.Region = "" },
-		`region "us-west" is not an AWS region name`:      func(c *Config) { c.Region = "us-west" },
-		"secret name is required":                         func(c *Config) { c.SecretName = "" },
-		"reachable regions require a region attribute":    func(c *Config) { c.ReachableRegions = []string{"us-east-1"} },
-		`reachable region "us-east" is not an AWS region`: func(c *Config) { c.RegionAttribute = "aws_region"; c.ReachableRegions = []string{"us-east"} },
-		`reachable region "us-west-2" is the home region`: func(c *Config) { c.RegionAttribute = "aws_region"; c.ReachableRegions = []string{"us-west-2"} },
-		`reachable region "cn-north-1" is in partition aws-cn, not the home region us-west-2's partition aws`: func(c *Config) {
+		"region is required":                           func(c *Config) { c.Region = "" },
+		`region "us-west" is not an AWS region name`:   func(c *Config) { c.Region = "us-west" },
+		"secret name is required":                      func(c *Config) { c.SecretName = "" },
+		"reachable regions require a region attribute": func(c *Config) { c.ReachableRegions = []string{"us-east-1"} },
+		`reachable region "us-east" at index 0 is not an AWS region`: func(c *Config) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-east"}
+		},
+		`reachable region "us-west-2" at index 0 is the home region`: func(c *Config) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-west-2"}
+		},
+		`reachable region "cn-north-1" at index 1 is in partition aws-cn, not the home region us-west-2's partition aws`: func(c *Config) {
 			c.RegionAttribute = "aws_region"
 			c.ReachableRegions = []string{"us-east-1", "cn-north-1"}
 		},
-		`reachable region "us-east-1" is listed more than once`: func(c *Config) {
+		`reachable region "us-east-1" at index 1 is listed more than once`: func(c *Config) {
 			c.RegionAttribute = "aws_region"
 			c.ReachableRegions = []string{"us-east-1", "us-east-1"}
 		},
