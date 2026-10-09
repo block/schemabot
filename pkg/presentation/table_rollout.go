@@ -7,16 +7,18 @@ import "github.com/block/schemabot/pkg/state"
 const (
 	tableRankWorking = iota
 	tableRankWaiting
+	tableRankHalted
 	tableRankPartlyDone
 	tableRankNotStarted
-	tableRankSettled
+	tableRankFinished
 )
 
 // TableRolloutRank is where a table rolled up across the targets that run it
 // sorts in a rollout's progress, lower first, given the table's status on each
 // of those targets. A table some target is working on leads, then one a target
-// is waiting on or retrying, then one finished on some targets and queued on the
-// rest, then one no target has started, and last one that halted or finished
+// is waiting on or retrying, then one that failed or halted on a target, since
+// that is where the rollout stopped, then one finished on some targets and
+// queued on the rest, then one no target has started, and last one finished
 // everywhere it ran. The PR comment and the CLI both order their target rollups
 // by it, so the two list a rollout's tables the same way.
 func TableRolloutRank(statuses []string) int {
@@ -43,12 +45,12 @@ func TableRolloutRank(statuses []string) int {
 	case waiting:
 		return tableRankWaiting
 	case halted:
-		return tableRankSettled
+		return tableRankHalted
 	case done && queued:
 		return tableRankPartlyDone
 	case queued || len(statuses) == 0:
 		return tableRankNotStarted
 	default:
-		return tableRankSettled
+		return tableRankFinished
 	}
 }

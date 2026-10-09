@@ -2003,3 +2003,15 @@ func TestRenderMultiDeploymentApplyComment_RolledUpTargetListNamesEveryTarget(t 
 		assert.NotContains(t, out, "`testapp-003`", "past the inline limit a queued target is only counted")
 	})
 }
+
+// A table runs on three targets: orders-001 finished a direct ALTER and is in
+// its revert window with no rows copied, orders-002 has copied half its rows,
+// and orders-003 has reported nothing. The bar counts orders-001 as done, the
+// way the line's coverage does, so the table reads half done.
+func TestTargetSharePercentCountsTheRevertWindowAsDone(t *testing.T) {
+	cells := []TableProgressData{
+		{TableName: "orders", Status: state.Task.RevertWindow},
+		{TableName: "orders", Status: state.Task.Running, RowsCopied: 500, RowsTotal: 1000},
+	}
+	assert.Equal(t, 50, targetSharePercent(cells, 1))
+}

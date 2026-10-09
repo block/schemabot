@@ -206,8 +206,11 @@ func (b *ddlBlockBudget) forTargetGroup(members []string) (restore func()) {
 // targets named above it, naming the first one's stored plan, until the
 // returned restore runs.
 func (b *ddlBlockBudget) forNamedTargets(members []string) (restore func()) {
-	scope, note := targetGroupPlanScope(members)
-	if note != "" {
+	// The targets are named above the DDL, so the note says so rather than
+	// listing them again.
+	scope, groupNote := targetGroupPlanScope(members)
+	note := ""
+	if groupNote != "" {
 		note = "every target named above runs the same DDL"
 	}
 	return b.scopePlan(scope, note)

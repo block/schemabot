@@ -402,7 +402,9 @@ func targetSharePercent(cells []TableProgressData, silent int) int {
 	var share float64
 	for _, c := range cells {
 		switch state.NormalizeTaskStatus(c.Status) {
-		case state.Task.Completed:
+		case state.Task.Completed, state.Task.RevertWindow:
+			// A target in its revert window has completed the change, and may
+			// have run it without copying any rows.
 			share++
 		case state.Task.Pending, state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled:
 			// Not copying: queued, halted, or waiting on a retry.
