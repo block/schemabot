@@ -248,6 +248,9 @@ func (h *Handler) executeApply(
 			}
 			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
 			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy) {
+					return
+				}
 				h.logger.Error("failed to re-pin the pending confirmation onto the plan whose comment shows the targets' changed plans",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -375,6 +378,9 @@ func (h *Handler) executeApply(
 			// whatever unfinished copy the re-plan would discard.
 			disclosesDiscard := len(planResp.DiscardedCopies()) > 0
 			if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, disclosesDiscard); err != nil {
+				if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy) {
+					return
+				}
 				h.logger.Error("failed to re-pin pending confirmation onto the plan that discloses the newly-direct changes",
 					"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 					"environment", environment, "plan_id", planResp.PlanID, "error", err)
@@ -412,6 +418,9 @@ func (h *Handler) executeApply(
 			return
 		}
 		if err := h.repinPendingConfirmation(ctx, repo, pr, database, dbType, expectedPendingPlanID, planResp.PlanID, true); err != nil {
+			if h.reportRepinRefused(err, repo, pr, installationID, actionName, database, environment, requestedBy) {
+				return
+			}
 			// Without the re-pin the confirm command would load the disclosure
 			// that showed no discard and stop again, so say what happened rather
 			// than leaving a confirmation the operator cannot pass.
@@ -879,12 +888,14 @@ func (h *Handler) postAutoConfirmDowngrade(
 // reads the lock to learn what the operator was shown, so a lock still pointing
 // at the comment that disclosed nothing would stop the same apply again on every
 // attempt.
-// The re-pin is skipped when the lock no longer carries the pending intent this
-// apply observed — a rollback the operator issued while the gate ran owns the
-// lock now, and overwriting its pin would answer "no pending rollback" to the
-// rollback-confirm they are about to send. Declining leaves the copy gate armed,
-// so the next apply-confirm stops and discloses again rather than proceeding on
-// consent that was never recorded.
+// The re-pin is refused with storage.ErrLockIntentChanged when the lock no
+// longer carries the pending intent this apply observed — a rollback the
+// operator issued while the gate ran owns the lock now, and overwriting its pin
+// would answer "no pending rollback" to the rollback-confirm they are about to
+// send. The write itself is conditional on that intent, so a pin set after the
+// read below is kept too. Declining leaves the copy gate armed, so the next
+// apply-confirm stops and discloses again rather than proceeding on consent
+// that was never recorded.
 func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr int, database, dbType, expectedPendingPlanID, planID string, disclosedCopyDiscard bool) error {
 	lock, err := h.service.Storage().Locks().Get(ctx, database, dbType)
 	if err != nil {
@@ -898,10 +909,11 @@ func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr 
 			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
 			"expected_pending_plan_id", expectedPendingPlanID, "observed_pending_plan_id", lock.PendingPlanID,
 			"plan_id", planID)
-		return nil
+		return fmt.Errorf("re-pin pending confirmation for %s (%s) onto plan %s: lock pins %s, not %s: %w",
+			database, dbType, planID, lock.PendingPlanID, expectedPendingPlanID, storage.ErrLockIntentChanged)
 	}
 
-	return h.service.Storage().Locks().Acquire(ctx, &storage.Lock{
+	err = h.service.Storage().Locks().AcquireIfPendingPlanID(ctx, &storage.Lock{
 		DatabaseName:         database,
 		DatabaseType:         dbType,
 		Owner:                fmt.Sprintf("%s#%d", repo, pr),
@@ -909,7 +921,33 @@ func (h *Handler) repinPendingConfirmation(ctx context.Context, repo string, pr 
 		PullRequest:          pr,
 		PendingPlanID:        planID,
 		DisclosedCopyDiscard: disclosedCopyDiscard,
-	})
+	}, expectedPendingPlanID)
+	if errors.Is(err, storage.ErrLockIntentChanged) {
+		h.logger.Warn("preserved a pending intent pinned after the lock was read instead of re-pinning the confirmation onto the disclosing plan",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"expected_pending_plan_id", expectedPendingPlanID, "plan_id", planID)
+	}
+	if err != nil {
+		return fmt.Errorf("re-pin pending confirmation for %s (%s) onto plan %s from %s: %w",
+			database, dbType, planID, expectedPendingPlanID, err)
+	}
+	return nil
+}
+
+// reportRepinRefused answers an apply whose pending confirmation could not be
+// re-pinned because another command on this PR pinned the lock meanwhile. The
+// stop comment just posted coaches a confirmation the lock no longer carries,
+// so the operator is told the lock changed and that a retry names the command
+// holding it. It reports whether err was that refusal; any other error is left
+// for the caller to report.
+func (h *Handler) reportRepinRefused(err error, repo string, pr int, installationID int64, actionName, database, environment, requestedBy string) bool {
+	if !errors.Is(err, storage.ErrLockIntentChanged) {
+		return false
+	}
+	h.logger.Info("apply stopped: the pending confirmation stays with the intent another command pinned on this PR's lock",
+		"repo", repo, "pr", pr, "database", database, "environment", environment, "action", actionName, "error", err)
+	h.postCommandError(repo, pr, installationID, actionName, environment, requestedBy, applyLockIntentChangedRefusal(database))
+	return true
 }
 
 // releaseApplyLockIfIntentUnchanged releases this PR's apply lock after a
