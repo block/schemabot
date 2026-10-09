@@ -956,32 +956,51 @@ func shardedUnsafeChanges(shards []*apitypes.ShardPlanResponse) []templates.Unsa
 	return out
 }
 
-// planUnsafeChanges lists a plan's unsafe changes for a comment. For a sharded
-// plan, table-level entries are derived from the per-shard changes so an unsafe
-// change confined to one shard (e.g. a column drop on a single drifted shard)
-// is still flagged with the shard it applies to — the collapsed
-// namespace-level Changes can omit it. Otherwise the namespace-level table
-// view is used. VSchema removals live only on the namespace-level change, so
-// they are appended in both views.
+// namespacesWithUnsafeShardChanges names the namespaces whose unsafe table
+// changes shardedUnsafeChanges already lists from the per-shard view.
+func namespacesWithUnsafeShardChanges(shards []*apitypes.ShardPlanResponse) map[string]bool {
+	namespaces := make(map[string]bool)
+	for _, sp := range shards {
+		if sp == nil {
+			continue
+		}
+		for _, t := range sp.Changes {
+			if _, ok := t.UnsafeChange(); ok {
+				namespaces[sp.Namespace] = true
+				break
+			}
+		}
+	}
+	return namespaces
+}
+
+// planUnsafeChanges lists a plan's unsafe changes for a comment. The view is
+// chosen per namespace. In a namespace with an unsafe per-shard change, the
+// table-level entries come from the per-shard changes, so an unsafe change
+// confined to one shard (e.g. a column drop on a single drifted shard) is still
+// flagged with the shard it applies to — the collapsed namespace-level Changes
+// can omit it. Every other namespace uses its namespace-level table view, so a
+// plan mixing an unsafe shard in one namespace with an unsafe change in another
+// lists both. VSchema removals live only on the namespace-level change, so they
+// are appended for every namespace.
 func planUnsafeChanges(planResp *apitypes.PlanResponse) []templates.UnsafeChangeData {
 	if planResp == nil {
 		return nil
 	}
 	unsafe := shardedUnsafeChanges(planResp.Shards)
-	if len(unsafe) == 0 {
-		for _, sc := range planResp.Changes {
-			if sc == nil {
-				continue
-			}
-			for _, t := range sc.TableChanges {
-				if uc, ok := t.UnsafeChange(); ok {
-					unsafe = append(unsafe, templates.UnsafeChangeData{
-						Table:      uc.Table,
-						Reason:     uc.Reason,
-						DDL:        uc.DDL,
-						ChangeType: uc.ChangeType,
-					})
-				}
+	shardViewNamespaces := namespacesWithUnsafeShardChanges(planResp.Shards)
+	for _, sc := range planResp.Changes {
+		if sc == nil || shardViewNamespaces[sc.Namespace] {
+			continue
+		}
+		for _, t := range sc.TableChanges {
+			if uc, ok := t.UnsafeChange(); ok {
+				unsafe = append(unsafe, templates.UnsafeChangeData{
+					Table:      uc.Table,
+					Reason:     uc.Reason,
+					DDL:        uc.DDL,
+					ChangeType: uc.ChangeType,
+				})
 			}
 		}
 	}

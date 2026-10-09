@@ -168,6 +168,13 @@ type LockStore interface {
 	// rollback intent owned by the same PR remains intact.
 	ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error)
 
+	// ClearPendingPlanID withdraws a pending plan from a lock the owner keeps
+	// holding, only while both its owner and pending plan still match: the lock
+	// stays held with no pending plan and no disclosure record. It reports
+	// whether it cleared the plan; a mismatch is a no-op so a newer intent
+	// pinned since stays intact. An empty pendingPlanID never matches.
+	ClearPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error)
+
 	// ForceRelease releases a lock regardless of owner (admin override).
 	// Used by `schemabot unlock` command and --force flag.
 	ForceRelease(ctx context.Context, database, dbType string) error

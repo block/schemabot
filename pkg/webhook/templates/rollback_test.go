@@ -112,6 +112,13 @@ func TestRenderRollbackUnsafeChangesBlocked(t *testing.T) {
 		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --tenant acme --allow-unsafe\n```")
 		assert.Contains(t, rendered, "```\nschemabot unlock --tenant acme\n```")
 	})
+
+	t.Run("a deferred cutover stays deferred in the re-issue command", func(t *testing.T) {
+		deferredData := data
+		deferredData.DeferCutover = true
+		rendered := RenderRollbackUnsafeChangesBlocked(deferredData)
+		assert.Contains(t, rendered, "```\nschemabot rollback-confirm -e staging --allow-unsafe --defer-cutover\n```")
+	})
 }
 
 // A rollback plan posted by a tenant deployment must render confirm/cancel

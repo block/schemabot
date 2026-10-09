@@ -469,7 +469,7 @@ func TestE2ERollbackConfirmSafeRollbackRunsWithoutAllowUnsafe(t *testing.T) {
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		a, err := svc.Storage().Applies().Get(ctx, dropApplyID)
-		return err == nil && a != nil && a.State == "completed"
+		return err == nil && a != nil && state.IsState(a.State, state.Apply.Completed)
 	}, webhookIntegrationPollDeadline, 500*time.Millisecond, "the index drop apply should complete")
 	dropApply, err := svc.Storage().Applies().Get(ctx, dropApplyID)
 	require.NoError(t, err)
@@ -504,6 +504,72 @@ func TestE2ERollbackConfirmSafeRollbackRunsWithoutAllowUnsafe(t *testing.T) {
 	rollbackApply := requireSingleRollbackApply(t, svc, dbName)
 	assert.False(t, rollbackApply.GetOptions().AllowUnsafe, "a rollback with no unsafe changes must not send allow_unsafe")
 	assert.True(t, rollbackApply.GetOptions().Rollback)
+}
+
+// A PR's apply added an index, so rolling it back drops it: an unsafe change
+// the rollback plan comment names. When GitHub rejects that comment, the pin
+// rollback-confirm would act on does not survive. --allow-unsafe on a later
+// confirm would otherwise consent to a drop the operator was never shown. A
+// lock the rollback command acquired is released; a lock the PR already held
+// keeps its hold with no pending rollback.
+func TestE2ERollbackPinIsWithdrawnWhenThePlanCommentCannotBePosted(t *testing.T) {
+	tests := []struct {
+		name          string
+		dbName        string
+		prHeldTheLock bool
+	}{
+		{name: "a lock the rollback command acquired is released", dbName: "webhook_rb_undisclosed_new"},
+		{name: "a lock the PR already held keeps its hold without the pin", dbName: "webhook_rb_undisclosed_held", prHeldTheLock: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := setupE2EService(t, tt.dbName)
+			ctx := t.Context()
+			applyID := seedCompletedIndexApply(t, svc, tt.dbName)
+			storedApply, err := svc.Storage().Applies().Get(ctx, applyID)
+			require.NoError(t, err)
+			if tt.prHeldTheLock {
+				require.NoError(t, svc.Storage().Locks().Acquire(ctx, &storage.Lock{
+					DatabaseName: tt.dbName, DatabaseType: "mysql", Owner: "octocat/hello-world#1",
+					Repository: "octocat/hello-world", PullRequest: 1,
+				}))
+			}
+
+			mux := http.NewServeMux()
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+			client := gh.NewClient(nil)
+			client.BaseURL, _ = url.Parse(server.URL + "/")
+			result := setupFakeGitHubForPlan(t, mux, map[string]string{
+				"users.sql": rollbackTestSchemaWithIndex,
+			}, fmt.Sprintf("database: %s\ntype: mysql\n", tt.dbName), tt.dbName)
+			result.FailCommentPost.Store(true)
+			h := newE2EHandler(t, svc, client)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{
+				comment: fmt.Sprintf("schemabot rollback %s -e staging", storedApply.ApplyIdentifier),
+				isPR:    true,
+			}, nil))
+			require.Equal(t, http.StatusOK, rr.Code)
+
+			// The plan comment was attempted, naming the drop, and GitHub rejected it.
+			plan := awaitCommentContaining(t, result, "Rollback Plan")
+			assert.Contains(t, plan, "DROP INDEX")
+
+			require.Eventually(t, func() bool {
+				lock, err := svc.Storage().Locks().Get(ctx, tt.dbName, "mysql")
+				if err != nil {
+					return false
+				}
+				if !tt.prHeldTheLock {
+					return lock == nil
+				}
+				return lock != nil && lock.Owner == "octocat/hello-world#1" && lock.PendingPlanID == ""
+			}, webhookIntegrationPollDeadline, 100*time.Millisecond,
+				"a rollback pin whose plan comment never landed must not be left for rollback-confirm to act on")
+		})
+	}
 }
 
 // lockRepinningStorage wraps the service's storage so a test can change the

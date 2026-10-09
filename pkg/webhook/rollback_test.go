@@ -353,6 +353,27 @@ func TestHandleRollbackConfirmBlocksUnsafeChangesWithoutAllowUnsafe(t *testing.T
 	assertRollbackLockPinKept(t, locks)
 }
 
+// An operator who asked for a deferred cutover and is refused for unsafe
+// changes is told to re-issue a command that still defers the cutover, so
+// adding the consent does not also switch the rollback to automatic cutover.
+func TestHandleRollbackConfirmBlockKeepsDeferCutoverInTheRetry(t *testing.T) {
+	locks := &actorAuthLockStore{locks: []*storage.Lock{prOwnedRollbackLock()}}
+	h, comments := newRollbackConfirmHandler(t, locks, testLogger(), []storage.TableChange{{
+		Table:     "audit_log",
+		DDL:       "DROP TABLE `audit_log`",
+		Operation: "drop",
+	}}, nil)
+
+	retry, err := h.rollbackConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", 12345, "hubot",
+		CommandResult{Action: action.RollbackConfirm, Environment: "staging", DeferCutover: true})
+	require.NoError(t, err)
+	assert.False(t, retry)
+
+	body := requireComment(t, comments, "rollback unsafe-changes refusal")
+	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --allow-unsafe --defer-cutover\n```")
+	assertRollbackLockPinKept(t, locks)
+}
+
 // A rollback of a sharded keyspace whose shards diverge carries a column drop
 // only one shard needs. The namespace-level view shows only the safe column
 // add, so the refusal must read the per-shard changes: it names the drop with
@@ -407,6 +428,20 @@ func TestRollbackPlanCommentData_ListsUnsafeChanges(t *testing.T) {
 	assert.Contains(t, body, "**Issues**: 1 unsafe change detected")
 	assert.Contains(t, body, "1. `orders` (shard `80-`)")
 	assert.Contains(t, body, "To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change")
+
+	// A plan mixing a shard-only drop in one namespace with a drop in an
+	// unsharded namespace lists both: the shard view stands in for its own
+	// namespace only.
+	dropAudit := &apitypes.TableChangeResponse{TableName: "audit_log", Namespace: "audit", DDL: "DROP TABLE `audit_log`", ChangeType: "drop",
+		IsUnsafe: true, UnsafeReason: "DROP TABLE removes all data"}
+	mixed := *planResp
+	mixed.Changes = append([]*apitypes.SchemaChangeResponse{{Namespace: "audit", TableChanges: []*apitypes.TableChangeResponse{dropAudit}}}, planResp.Changes...)
+	mixedData := (&Handler{}).rollbackPlanCommentData(apply, &mixed, "testuser")
+	require.Len(t, mixedData.UnsafeChanges, 2)
+	assert.Equal(t, "orders", mixedData.UnsafeChanges[0].Table)
+	assert.Equal(t, []string{"80-"}, mixedData.UnsafeChanges[0].Shards)
+	assert.Equal(t, "audit_log", mixedData.UnsafeChanges[1].Table)
+	assert.Empty(t, mixedData.UnsafeChanges[1].Shards)
 
 	safe := (&Handler{}).rollbackPlanCommentData(apply, &apitypes.PlanResponse{
 		PlanID:  "plan_rb_safe",

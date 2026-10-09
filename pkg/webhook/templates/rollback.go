@@ -104,7 +104,12 @@ func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBu
 	}
 	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
+	// The retry keeps every option the rejected command carried, so following
+	// it changes only the consent, never how the rollback runs.
 	retryCommand := tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant) + " --allow-unsafe"
+	if data.DeferCutover {
+		retryCommand += " --defer-cutover"
+	}
 	writeUnsafeChangesRejection(&sb, data, "Rollback rejected", retryCommand)
 	sb.WriteString("\nThe lock still pins this rollback plan, so the command above confirms it.\n\n")
 	writeRollbackCancel(&sb, data.Tenant)

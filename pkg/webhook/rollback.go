@@ -306,9 +306,53 @@ func (h *Handler) rollbackCommandCore(parent context.Context, repo string, pr in
 			releaseErr)
 	}
 
+	// The plan comment is the disclosure rollback-confirm consents to: it names
+	// every unsafe change, so --allow-unsafe on the confirm is consent to
+	// changes the operator was shown. A pin whose comment never landed would let
+	// that consent cover changes nobody saw, so the pin does not outlive a
+	// failed post.
 	commentData := h.rollbackPlanCommentData(apply, planResp, requestedBy)
-	h.postComment(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData))
+	if err := h.postCommentReportingError(repo, pr, installationID, templates.RenderRollbackPlanComment(commentData)); err != nil {
+		h.logger.Error("failed to post the rollback plan comment the pinned rollback is confirmed against; withdrawing the pin so rollback-confirm cannot run a plan that was never shown",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType,
+			"environment", environment, "apply_id", applyID, "plan_id", planResp.PlanID, "error", err)
+		withdrawErr := h.withdrawUndisclosedRollbackPin(ctx, lock, lockAcquiredByCommand)
+		return true, errors.Join(
+			fmt.Errorf("rollback command post plan comment %s#%d database %s plan %s: %w", repo, pr, database, planResp.PlanID, err),
+			withdrawErr)
+	}
 	return false, nil
+}
+
+// withdrawUndisclosedRollbackPin takes back a rollback pin whose plan comment
+// failed to post. A lock this command acquired is released; a lock the PR
+// already held keeps its hold with the pin cleared. Both writes are
+// conditional on the lock still pinning this rollback, so a newer intent
+// pinned meanwhile is left alone.
+func (h *Handler) withdrawUndisclosedRollbackPin(ctx context.Context, pinned *storage.Lock, acquiredByCommand bool) error {
+	withdrawCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackLockReleaseTimeout)
+	defer cancel()
+	locks := h.service.Storage().Locks()
+	if acquiredByCommand {
+		released, err := locks.ReleaseIfPendingPlanID(withdrawCtx, pinned.DatabaseName, pinned.DatabaseType, pinned.Owner, pinned.PendingPlanID)
+		if err != nil {
+			return fmt.Errorf("release undisclosed rollback pin %s on database %s type %s owner %s: %w", pinned.PendingPlanID, pinned.DatabaseName, pinned.DatabaseType, pinned.Owner, err)
+		}
+		if !released {
+			h.logger.Info("kept the lock after a failed rollback plan comment because its pending intent changed",
+				"database", pinned.DatabaseName, "database_type", pinned.DatabaseType, "owner", pinned.Owner, "expected_pending_plan_id", pinned.PendingPlanID)
+		}
+		return nil
+	}
+	cleared, err := locks.ClearPendingPlanID(withdrawCtx, pinned.DatabaseName, pinned.DatabaseType, pinned.Owner, pinned.PendingPlanID)
+	if err != nil {
+		return fmt.Errorf("clear undisclosed rollback pin %s on database %s type %s owner %s: %w", pinned.PendingPlanID, pinned.DatabaseName, pinned.DatabaseType, pinned.Owner, err)
+	}
+	if !cleared {
+		h.logger.Info("kept the lock pin after a failed rollback plan comment because its pending intent changed",
+			"database", pinned.DatabaseName, "database_type", pinned.DatabaseType, "owner", pinned.Owner, "expected_pending_plan_id", pinned.PendingPlanID)
+	}
+	return nil
 }
 
 // rollbackPlanCommentData builds the rollback plan comment for the stored
@@ -775,6 +819,7 @@ func (h *Handler) blockRollbackUnsafeWithoutOptIn(repo string, pr int, installat
 	commentData := h.rollbackCommentData(plan.Database, plan.DatabaseType, environment, "", planResp, requestedBy)
 	commentData.HasUnsafeChanges = true
 	commentData.UnsafeChanges = unsafe
+	commentData.DeferCutover = result.DeferCutover
 	h.logger.Info("rollback-confirm blocked by unsafe changes without --allow-unsafe; the lock still pins the rollback plan",
 		"repo", repo, "pr", pr, "database", plan.Database, "database_type", plan.DatabaseType,
 		"environment", environment, "plan_id", plan.PlanIdentifier, "unsafe", len(unsafe))
