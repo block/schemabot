@@ -1599,7 +1599,10 @@ planning deployment's. *Enforced:* plan-time execution verdicts (`pkg/engine`; f
 privilege and size gates in `pkg/engine/postgres/postgres.go`, plus RLS admission refusals
 in `pkg/engine/postgres/row_security_apply.go` that abort plan creation); the whole-plan
 blocked verdict (`storage.Plan.BlockedApplyError`, `pkg/storage`) checked at every apply admission
-path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), with a materialized plan carrying
+path (`pkg/api/plan_handlers.go`, `pkg/tern/local_client.go`), and the CLI's `apply` and `rollback`
+refusing the namespace and shard verdicts of the plan they submit (a rollout's primary plan)
+before prompting or locking (`blockedPlanError` over `PlanResponse.FirstBlockedChange`, in
+`pkg/cmd/commands/apply.go`, called there and from `pkg/cmd/commands/rollback.go`), with a materialized plan carrying
 the applying deployment's own re-plan verdicts (`pkg/tern/local_plan_drift.go`), task rows copying
 that admitting deployment's verdict at creation (`pkg/tern/local_client.go`,
 `pkg/tern/local_plan_drift.go`), and fresh and resumed

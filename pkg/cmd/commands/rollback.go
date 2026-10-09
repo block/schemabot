@@ -80,6 +80,14 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 	templates.WriteRollbackPlan(planResult, cmd.ApplyID)
 
+	// A rollback plan gets the same execution verdicts as an apply plan, and
+	// the server refuses to submit a blocked one, so it is refused here,
+	// below the plan that shows the refused statement, before any prompt or
+	// lock.
+	if err := blockedPlanError("rollback", planResult); err != nil {
+		return err
+	}
+
 	// Unsafe changes need --allow-unsafe, exactly as for apply. Neither the
 	// confirmation prompt nor -y stands in for it: a rollback that drops a table
 	// is as destructive as an apply that does.
