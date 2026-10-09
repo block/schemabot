@@ -1133,9 +1133,10 @@ type EtreCredentialsConfig struct {
 	// Username is the database user. For secret_ref it is a literal username. For
 	// awssm it is optional: when set, it is a template (over {target} and
 	// {attribute} placeholders, e.g. "{app}_ddl") and the fetched secret is treated
-	// as the plain-text password instead of a JSON payload. For awssm it is mutually
-	// exclusive with token-decoding engines (e.g. vitess), which interpret the
-	// secret themselves.
+	// as the plain-text password instead of a JSON payload. On both backends it
+	// must be unset for engines that decode the secret themselves (vitess,
+	// postgres), because the secret names the user; setting it fails resolver
+	// construction rather than being ignored.
 	// PasswordRef (secret_ref) is a password secret reference (env:, file:,
 	// secretsmanager:, or a literal), optionally carrying a {target} placeholder.
 	Username    string `yaml:"username,omitempty"`

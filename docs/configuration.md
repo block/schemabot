@@ -231,6 +231,11 @@ ignored, because the entity decides where to connect:
 {"username": "schemabot", "password": "...", "dbname": "orders"}
 ```
 
+Because the secret names the user, leave `credentials.username` unset. A
+resolver whose engine decodes its secret (`postgres` or `vitess`) refuses to
+start when a username is configured, on both the `secret_ref` and `awssm`
+backends, rather than ignoring it.
+
 `table_owner` and `ca_ref` mean the same as on a `dsn_from` target. They apply
 to every target the resolver serves, so a resolver serves clusters that share
 one owner role.
