@@ -695,9 +695,9 @@ Response excerpt (illustrative values):
   "engine": "spirit",
   "state": "running",
   "operations": [
-    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling"},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "rolling"},
-    {"deployment": "commerce-a", "target": "shop-003", "state": "completed", "cutover_policy": "rolling", "already_converged": true}
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "parallel"},
+    {"deployment": "commerce-a", "target": "shop-003", "state": "completed", "cutover_policy": "parallel", "already_converged": true}
   ],
   "tables": [
     {
@@ -744,10 +744,10 @@ on both:
 ```json
 {
   "operations": [
-    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
-    {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "rolling", "rollout_step": 2},
-    {"deployment": "commerce-a", "target": "shop-002", "state": "pending", "cutover_policy": "rolling", "rollout_step": 2}
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "parallel", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "parallel", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "parallel", "rollout_step": 2},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "running", "cutover_policy": "parallel", "rollout_step": 2}
   ]
 }
 ```
