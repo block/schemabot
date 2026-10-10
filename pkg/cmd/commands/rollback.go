@@ -119,6 +119,13 @@ func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	}
 
 	// Step 4: Acquire lock and apply the rollback
+
+	// A Ctrl-C during planning or the prompt ends the command here, before
+	// any lock is taken on the operator's behalf.
+	if ctx.Err() != nil {
+		return stoppedBeforeSubmit(ctx, "rollback")
+	}
+
 	owner := client.GenerateCLIOwner()
 
 	var existingLock *client.LockInfo

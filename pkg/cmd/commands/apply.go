@@ -247,6 +247,12 @@ func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 
 	// Step 4: Acquire lock and apply the plan
 
+	// A Ctrl-C during planning or the prompt ends the command here, before
+	// any lock is taken or released on the operator's behalf.
+	if ctx.Err() != nil {
+		return stoppedBeforeSubmit(ctx, "apply")
+	}
+
 	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {

@@ -1064,12 +1064,19 @@ names the `start` command that resumes it. A watcher that cannot reach the
 server retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
-rerun the original watch command, preserving its output format and connection
-flags, or to run `progress` with the apply ID to see its current state. When a
-refused poll carries a `Retry-After` header, as a proxy or rate limiter in
-front of SchemaBot may send, a watcher waits at least that long before polling
-again, up to 5 minutes per poll, so a watcher held off this way takes longer
-to give up.
+run `progress` with the apply ID to watch it again. When a refused poll
+carries a `Retry-After` header, as a proxy or rate limiter in front of
+SchemaBot may send, a watcher waits at least that long before polling again,
+up to 5 minutes per poll, so a watcher held off this way takes longer to give
+up.
+
+A single Ctrl-C or SIGTERM ends only the watch. The command prints a notice to
+stderr saying the apply continues and how to watch it again with `progress`,
+and exits 130, the status a shell reports for an interrupted process, so a
+script can tell an interrupted watch from an apply that failed. The apply
+itself runs on unaffected. A Ctrl-C that lands before the apply or rollback
+has been submitted ends the command before anything is started, with a notice
+saying so, and the same exit status.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

@@ -70,11 +70,11 @@ func (p *progressPoller) pause(d time.Duration) error {
 
 // watchStopped tells the operator their Ctrl-C ended only the watch, and how
 // to pick it up again. The notice goes to stderr so a JSON stream on stdout
-// stays machine-readable, and the error is silent so the CLI exits non-zero
-// without repeating it as a raw "context canceled" line.
+// stays machine-readable, and the error is silent so the CLI exits with the
+// interrupt status without repeating it as a raw "context canceled" line.
 func (p *progressPoller) watchStopped() error {
 	fmt.Fprintln(os.Stderr, progressStoppedMessage(p.applyID))
-	return fmt.Errorf("%w: %w", ErrSilent, p.ctx.Err())
+	return interrupted(p.ctx)
 }
 
 // progressRetry describes one transient progress failure the poller is about
@@ -92,15 +92,18 @@ type progressRetry struct {
 // Watching is read-only, so giving up never affects the apply itself; the
 // returned error says how to resume watching it. A fetch or wait that the
 // operator's Ctrl-C cut short is reported as the watch stopping, never as a
-// failed fetch to retry.
+// failed fetch to retry. A fetch that answered before the Ctrl-C landed is
+// still returned: the frame may be the apply's final state, which the
+// operator pressed Ctrl-C believing they would not see, and the caller's next
+// wait reports the stop.
 func (p *progressPoller) next(onRetry func(progressRetry)) (*apitypes.ProgressResponse, error) {
 	for failures := 1; ; failures++ {
 		result, err := p.fetch()
-		if p.ctx.Err() != nil {
-			return nil, p.watchStopped()
-		}
 		if err == nil {
 			return result, nil
+		}
+		if p.ctx.Err() != nil {
+			return nil, p.watchStopped()
 		}
 		if !isRetryableFetchError(err) {
 			return nil, fmt.Errorf("fetch progress for apply %s: %w", p.applyID, err)
@@ -132,10 +135,12 @@ func progressStoppedMessage(applyID string) string {
 		applyID, resumeWatchHint(applyID))
 }
 
-// resumeWatchHint names the commands that show an apply the watch can no
-// longer follow.
+// resumeWatchHint names the command that watches an apply this watch can no
+// longer follow. It names only a read: the command the operator ran to start
+// this watch was an apply, a rollback, or a cutover, and running that again
+// would submit a second one rather than show the first.
 func resumeWatchHint(applyID string) string {
-	return fmt.Sprintf("rerun the original watch command, or '%s progress %s', to see its current state", cliname.Name(), applyID)
+	return fmt.Sprintf("watch it again with '%s progress %s'", cliname.Name(), applyID)
 }
 
 // isRetryableFetchError reports whether a failed progress fetch is worth
