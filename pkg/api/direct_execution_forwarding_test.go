@@ -198,30 +198,49 @@ func TestStoredPlanRecordsTheResolvedDirectExecutionPolicy(t *testing.T) {
 	}, plans.created.DirectExecution)
 }
 
-// A server holding no grant still records an answer on the plan row. Without
-// it, nothing on the row distinguishes a plan judged under no grant from one
-// stored before the column existed, and the second is the only case that may
-// fall back to configuration.
-func TestStoredPlanRecordsAnOptOutWhenNoGrantIsInForce(t *testing.T) {
-	plans := &capturingPlanStore{}
-	config := directExecutionServerConfig()
-	config.DirectExecution = nil
-	svc := New(&mockStorageWithPlanLookup{plans: plans}, config, map[string]tern.Client{
-		DefaultDeployment + "/staging": &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-direct"}},
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-
-	_, err := svc.ExecutePlan(t.Context(), PlanRequest{
-		Database:    "payments",
-		Environment: "staging",
-		Type:        storage.DatabaseTypeMySQL,
-		SchemaFiles: map[string]*ternv1.SchemaFiles{
-			"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+// A plan row always records the policy it was judged under, whether the
+// server states one or falls back to the default. Without it, nothing on the
+// row distinguishes a plan judged under an opt-out from one stored before the
+// column existed, and the second is the only case that may fall back to
+// configuration.
+func TestStoredPlanRecordsThePolicyInForce(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy *DirectExecutionConfig
+		want   *storage.DirectExecutionPolicy
+	}{
+		{
+			name:   "server opts out",
+			policy: &DirectExecutionConfig{Enabled: false},
+			want:   &storage.DirectExecutionPolicy{Enabled: false},
 		},
-	})
-	require.NoError(t, err)
+		{
+			name: "server states no policy",
+			want: &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plans := &capturingPlanStore{}
+			config := directExecutionServerConfig()
+			config.DirectExecution = tc.policy
+			svc := New(&mockStorageWithPlanLookup{plans: plans}, config, map[string]tern.Client{
+				DefaultDeployment + "/staging": &mockTernClient{isRemote: true, planResp: &ternv1.PlanResponse{PlanId: "plan-direct"}},
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
-	require.NotNil(t, plans.created)
-	assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, plans.created.DirectExecution)
+			_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+				Database:    "payments",
+				Environment: "staging",
+				Type:        storage.DatabaseTypeMySQL,
+				SchemaFiles: map[string]*ternv1.SchemaFiles{
+					"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint primary key)"}},
+				},
+			})
+			require.NoError(t, err)
+
+			require.NotNil(t, plans.created)
+			assert.Equal(t, tc.want, plans.created.DirectExecution)
+		})
+	}
 }
 
 // directExecutionApplyService admits an apply from plan against config.

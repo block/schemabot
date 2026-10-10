@@ -60,10 +60,14 @@ A refusal must be available during planning to qualify for this fallback.
 The [primary-key collation check](#changing-a-primary-keys-collation) runs later,
 so that check alone does not let SchemaBot offer direct execution for a collation change.
 
-### Enable it with a table-size limit
+### Set its table-size limit
 
-Direct execution is disabled by default. To allow it for small tables, add this
-at the top level of the **server configuration**:
+Direct execution is on by default for tables of at most 100MiB of data and
+indexes. That bound is the InnoDB estimate, which nothing corroborates, so a
+table that just grew can pass it (see
+[configuration](configuration.md#direct-execution)). To bound it by a row count
+the engine confirms exactly, or to change the limit, add this at the top level
+of the **server configuration**:
 
 ```yaml
 direct_execution:

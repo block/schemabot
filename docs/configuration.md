@@ -971,22 +971,42 @@ local-mode MySQL and `cleanup_enabled: true`.
 
 For MySQL databases executed by the Spirit engine, some ALTER statements are
 deterministically refused by the engine — for example dropping a primary key or
-adding a foreign key, which its online copy cannot preserve. By default those
-statements block the apply. The `direct_execution` policy lets a refused
-statement instead run verbatim as native MySQL DDL when the target table is
-small enough. See [Direct Execution](direct-execution.md) for how routing
-works and what other engines need to adopt it.
+adding a foreign key, which its online copy cannot preserve. The
+`direct_execution` policy lets a refused statement instead run verbatim as
+native MySQL DDL when the target table is small enough. With no policy
+configured, the default applies: enabled, bounded at 100MiB of data and
+indexes, which is an estimate (see `max_table_bytes` below). Set
+`enabled: false` to leave refused statements blocked, or `max_table_rows` for a
+bound the engine corroborates with an exact count. See
+[Direct Execution](direct-execution.md) for how routing works and what other
+engines need to adopt it.
 
 Set it at the top level of the server config to state one policy for every
 MySQL database the server drives:
 
 ```yaml
 direct_execution:
-  enabled: true           # default: false
+  enabled: true           # required to enable; omitted in a stated block means false
   max_table_rows: 100000  # the size bound: set exactly one of max_table_rows
                           # or max_table_bytes (e.g. max_table_bytes: 100MiB)
   lock_acquisition_timeout: 10s  # optional; whole seconds; default 10s
 ```
+
+Only omitting the block entirely selects the default policy. A stated block is
+taken as written: it does not inherit the default's size bound, so one that
+enables direct execution must name its own.
+
+State the policy, including an opt-out, on the control plane. A control plane
+forwards the policy it resolves with every plan, and the server that runs the
+statement uses it in place of its own. A control plane with no
+`direct_execution` block forwards the default, so `enabled: false` set only on
+a data plane is overridden.
+
+Upgrade order: upgrade every server that executes statements to a build that
+reads `max_table_bytes` before upgrading the control plane to a build with this
+default. An older server rejects the forwarded default as missing its row
+bound, so every MySQL plan and apply it serves fails until it is upgraded.
+Stating a `max_table_rows` policy on the control plane first avoids this.
 
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more
