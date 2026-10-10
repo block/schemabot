@@ -1490,6 +1490,23 @@ func PreviewCommentReviewRequiredStaleApproval() string {
 	})
 }
 
+// PreviewCommentReviewRequiredStaleApprovalOtherBranch renders the "review
+// required" comment for a PR targeting a branch other than the default, where
+// changes that reach that branch count as a change to the PR's schema change.
+func PreviewCommentReviewRequiredStaleApprovalOtherBranch() string {
+	return RenderReviewRequired(ReviewGateData{
+		Database:          "testapp",
+		Environment:       "staging",
+		RequestedBy:       previewRequestedBy,
+		OperatorReviewers: []string{"acme/testapp-operators"},
+		OtherReviewers:    []string{"acme/schema-reviewers", "jdoe"},
+		PRAuthor:          previewRequestedBy,
+		ChangedApprovers:  []string{"jdoe"},
+		BaseRef:           "release-1.2",
+		DefaultBranch:     "main",
+	})
+}
+
 // PreviewCommentReviewGateError renders a sample review gate error comment (fail-closed).
 func PreviewCommentReviewGateError() string {
 	return RenderGenericError(SchemaErrorData{

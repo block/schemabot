@@ -1765,10 +1765,13 @@ A PR apply requires an actor authorized for the target (configured operators, ad
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
 their own review requirement. An approval counts only for the schema change it reviewed: it was
 given on the commit being applied, or on an earlier commit at which the change's own effect on every
-schema input is provably the same, so any difference between the two came from newer base branch
-content; when that cannot be proved, the approval does not count. This relies on the base branch
-requiring review for every change that reaches it: a change pushed to it without review is
-carried past an earlier approval as base branch content. *Enforced:* the review gate and actor
+schema input is provably the same, or the change has stopped touching an input that newer default
+branch content has changed since, so any difference between the two came from newer content on the
+repository's default branch; when that cannot be proved, the approval does not count. A change
+targeting any other branch keeps an approval only where its own effect and its base content are
+both the same. This relies on the default branch requiring review for every change that reaches
+it: a change pushed to it without review is carried past an earlier approval as default branch
+content. *Enforced:* the review gate and actor
 authorization (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the
 comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`).
 
