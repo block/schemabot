@@ -275,9 +275,12 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		headChange        func(map[string]string)
 		headOnOldBase     bool
 		approvedOnNewBase bool
-		schemaPath        string
-		schemaLinkPath    string
-		configPath        string
+		// targetsOtherBranch makes the PR's base branch something other than
+		// the repository's default branch.
+		targetsOtherBranch bool
+		schemaPath         string
+		schemaLinkPath     string
+		configPath         string
 		// approvedUnknown leaves the approved commit unknown to GitHub.
 		approvedUnknown  bool
 		treesUnavailable bool
@@ -389,6 +392,27 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			},
 			headChange: addVotes,
 			want:       wantCovers,
+		},
+		{
+			name: "a rebase onto a target branch other than the default that took over a stacked table does not count",
+			prChange: addVotesAnd(func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			}),
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, `task_id` bigint, PRIMARY KEY (`id`))"
+			},
+			headChange:         addVotes,
+			targetsOtherBranch: true,
+			want:               wantChanged,
+		},
+		{
+			name:     "a rebase onto a target branch other than the default that added tables beside the PR's does not count",
+			prChange: addVotes,
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/feedback.sql"] = "CREATE TABLE `feedback` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			targetsOtherBranch: true,
+			want:               wantChanged,
 		},
 		{
 			name: "a rebase after the stacked PR below it merged unchanged counts",
@@ -625,7 +649,11 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				commits[reviewGateApproved] = derive(approvedBase, tt.prChange)
 				mergeBases[reviewGateApproved] = approvedMergeBase
 			}
-			registerReviewGateBaseBranch(t, mux, mergeBases)
+			defaultBranch := "main"
+			if tt.targetsOtherBranch {
+				defaultBranch = "trunk"
+			}
+			registerReviewGateBaseBranchWithDefault(t, mux, mergeBases, defaultBranch)
 			if tt.treesUnavailable {
 				mux.HandleFunc("GET /repos/octocat/hello-world/git/trees/{sha}", func(w http.ResponseWriter, _ *http.Request) {
 					http.Error(w, "service unavailable", http.StatusServiceUnavailable)
@@ -725,7 +753,19 @@ func (r *reviewGateBaseReads) comparedCommits() []string {
 // commit is unknown to GitHub.
 func registerReviewGateBaseBranch(t *testing.T, mux *http.ServeMux, mergeBases map[string]string) *reviewGateBaseReads {
 	t.Helper()
+	return registerReviewGateBaseBranchWithDefault(t, mux, mergeBases, "main")
+}
+
+// registerReviewGateBaseBranchWithDefault is registerReviewGateBaseBranch for
+// a repository whose default branch is defaultBranch, so a PR targeting main
+// can be made to target a branch other than the default.
+func registerReviewGateBaseBranchWithDefault(t *testing.T, mux *http.ServeMux, mergeBases map[string]string, defaultBranch string) *reviewGateBaseReads {
+	t.Helper()
 	reads := &reviewGateBaseReads{}
+	mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&gh.Repository{DefaultBranch: &defaultBranch})
+	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
 		reads.refs.Add(1)
 		w.Header().Set("Content-Type", "application/json")
@@ -1088,6 +1128,10 @@ func TestCheckReviewGate_CompareUnavailableIsEvaluationFailure(t *testing.T) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/git/ref/heads/main", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(&gh.Reference{Ref: new("refs/heads/main"), Object: &gh.GitObject{SHA: new(reviewGateBaseTip), Type: new("commit")}})
+	})
+	mux.HandleFunc("GET /repos/octocat/hello-world", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&gh.Repository{DefaultBranch: new("main")})
 	})
 	mux.HandleFunc("GET /repos/octocat/hello-world/compare/{range}", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)

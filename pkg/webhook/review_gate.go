@@ -322,6 +322,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 			"base_moved_forward", comparison.BaseMovedForward,
+			"base_is_default_branch", comparison.BaseIsDefaultBranch,
 			"input_paths", c.inputPaths, "error", err)
 		return approvalVerdict{notComparable: fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
 			c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(errApprovalNotComparable, err))}, nil
@@ -334,6 +335,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 			"base_moved_forward", comparison.BaseMovedForward,
+			"base_is_default_branch", comparison.BaseIsDefaultBranch,
 			"differing_path", comparison.DifferingPath)
 		return approvalVerdict{}, nil
 	}
@@ -344,6 +346,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 		"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 		"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 		"base_moved_forward", comparison.BaseMovedForward,
+		"base_is_default_branch", comparison.BaseIsDefaultBranch,
 		"input_paths", c.inputPaths)
 	return approvalVerdict{covers: true}, nil
 }

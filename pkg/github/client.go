@@ -1140,6 +1140,9 @@ type SchemaChangeComparison struct {
 	// BaseMovedForward is true when the head's merge base is the approved
 	// commit's merge base or a descendant of it.
 	BaseMovedForward bool
+	// BaseIsDefaultBranch is true when the pull request targets the
+	// repository's default branch.
+	BaseIsDefaultBranch bool
 }
 
 // PRSchemaChangeUnchangedSince reports whether the change a pull request
@@ -1155,7 +1158,9 @@ type SchemaChangeComparison struct {
 // unchanged when the base branch changed it since the approved commit's base:
 // what the pull request did there has been replaced by base branch content,
 // as when a stacked pull request below this one merges and this one is
-// rebased. Both rules hold only when the head's base content is
+// rebased. Both rules hold only when the pull request targets the
+// repository's default branch, the branch whose changes are expected to have
+// had their own review, and only when the head's base content is
 // newer than the approved commit's: the head's merge base must descend from
 // the approved commit's. A head rebuilt on older base content would otherwise
 // carry an older version of a path the pull request never touched, which
@@ -1178,6 +1183,11 @@ type SchemaChangeComparison struct {
 // than maxSchemaSymlinkReads.
 func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, approvedSHA, headSHA string, paths []string) (SchemaChangeComparison, error) {
 	var result SchemaChangeComparison
+	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
+	if err != nil {
+		return result, err
+	}
+	result.BaseIsDefaultBranch = baseRef == defaultBranch
 	baseTipSHA, err := ic.branchTipSHA(ctx, repo, baseRef)
 	if err != nil {
 		return result, err
@@ -1194,12 +1204,12 @@ func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, 
 	}
 
 	comparer := &schemaChangeComparer{
-		ic:               ic,
-		repo:             repo,
-		commits:          [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
-		baseMovedForward: result.BaseMovedForward,
-		levelCache:       make(map[string][]TreeEntry),
-		symlinkText:      make(map[string]string),
+		ic:                  ic,
+		repo:                repo,
+		commits:             [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
+		baseContentReviewed: result.BaseIsDefaultBranch && result.BaseMovedForward,
+		levelCache:          make(map[string][]TreeEntry),
+		symlinkText:         make(map[string]string),
 	}
 	differingPath, err := comparer.compare(ctx, paths)
 	if err != nil {
@@ -1236,11 +1246,12 @@ type schemaChangeComparer struct {
 	ic      *InstallationClient
 	repo    string
 	commits [4]string
-	// baseMovedForward is true when the head's merge base descends from the
-	// approved commit's, so a path the pull request leaves as its base has it
-	// at both commits differs only by newer base content.
-	baseMovedForward bool
-	levelCache       map[string][]TreeEntry
+	// baseContentReviewed is true when the pull request targets the default
+	// branch and the head's merge base descends from the approved commit's, so
+	// base content that differs between the two is newer default branch
+	// content that had its own review.
+	baseContentReviewed bool
+	levelCache          map[string][]TreeEntry
 	// symlinkText caches each symlink object's target text by blob SHA, so
 	// links with the same target text cost one read.
 	symlinkText map[string]string
@@ -1320,7 +1331,8 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 // content that had its own review: the pull request makes the same change on
 // the same base, it leaves the path alone at both commits, or it no longer
 // touches a path the base branch has changed since the approval. The last two
-// hold only when the base moved forward. supersededByBase never decides a
+// trust base branch content, so they hold only when that content is newer
+// default branch content (see baseContentReviewed). supersededByBase never decides a
 // directory on every side: inside it, a file the pull request dropped without
 // the base branch changing it must still count as a change, so the directory
 // is compared entry by entry instead.
@@ -1328,7 +1340,7 @@ func (c *schemaChangeComparer) pathUnchanged(s [4]gitSide) bool {
 	if sameChange(s) {
 		return true
 	}
-	if !c.baseMovedForward {
+	if !c.baseContentReviewed {
 		return false
 	}
 	return untouchedByPR(s) || (supersededByBase(s) && !onlyTrees(s))
@@ -1473,6 +1485,26 @@ func (c *schemaChangeComparer) resolveSymlinks(ctx context.Context, links []Tree
 	return targets, nil
 }
 
+// repositoryDefaultBranch returns the name of repo's default branch.
+func (ic *InstallationClient) repositoryDefaultBranch(ctx context.Context, repo string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	repository, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
+		repository, _, err := ic.client.Repositories.Get(ctx, owner, repoName)
+		if err != nil {
+			return nil, fmt.Errorf("get repository: %w", classifyGitHubAPIError(err))
+		}
+		return repository, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	defaultBranch := repository.GetDefaultBranch()
+	if defaultBranch == "" {
+		return "", fmt.Errorf("repository %s reports no default branch", repo)
+	}
+	return defaultBranch, nil
+}
+
 // branchTipSHA resolves branch to the commit it points at now.
 func (ic *InstallationClient) branchTipSHA(ctx context.Context, repo, branch string) (string, error) {
 	owner, repoName := splitRepo(repo)
@@ -1604,19 +1636,9 @@ func (ic *InstallationClient) PRFilesProposedAgainstDefaultBranch(ctx context.Co
 	}
 
 	owner, repoName := splitRepo(repo)
-	repository, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve repository default branch", []any{"repo", repo}, func(ctx context.Context) (*gh.Repository, error) {
-		repository, _, err := ic.client.Repositories.Get(ctx, owner, repoName)
-		if err != nil {
-			return nil, fmt.Errorf("get repository: %w", classifyGitHubAPIError(err))
-		}
-		return repository, nil
-	})
+	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
 	if err != nil {
 		return nil, "", err
-	}
-	defaultBranch := repository.GetDefaultBranch()
-	if defaultBranch == "" {
-		return nil, "", fmt.Errorf("repository %s reports no default branch", repo)
 	}
 
 	// Pin the tip up front so a commit landing on the default branch mid-pass
