@@ -1342,14 +1342,16 @@ type EnvironmentConfig struct {
 
 	// CutoverPolicy controls how a multi-member rollout sequences the copy and
 	// cutover phases of its members: the deployments of a Deployments map, or
-	// the targets of a Targets list, in resolved order. "rolling" (the default,
-	// also used when unset) keeps the rollout fully serial: a later member does
-	// not start until every earlier member has completed. "barrier" lets later
-	// members run their copy phase once earlier members reach the cutover
-	// barrier, while cutover itself stays ordered. "parallel" starts every
-	// member's copy without waiting on earlier members, up to the server's
-	// max_drivers_per_apply at once, and still cuts over one member at a time in
-	// order. Only meaningful alongside a Deployments map or a Targets list.
+	// the targets of a Targets list, in resolved order. "rolling" keeps the
+	// rollout fully serial: a later member does not start until every earlier
+	// member has completed. "barrier" lets later members run their copy phase
+	// once earlier members reach the cutover barrier, while cutover itself
+	// stays ordered. "parallel" starts every member's copy without waiting on
+	// earlier members, up to the server's max_drivers_per_apply at once, and
+	// still cuts over one member at a time in order. Left unset, a multi-target
+	// environment (one that spells any of its routing as a Targets list, see
+	// UsesTargetsList) uses "parallel", and any other uses "rolling". Only
+	// meaningful alongside a Deployments map or a Targets list.
 	CutoverPolicy string `yaml:"cutover_policy,omitempty"`
 
 	// OnFailure controls multi-member rollout continuation when a member
@@ -3111,15 +3113,23 @@ func (c *ServerConfig) DatabaseEnvironment(database, environment string) *Enviro
 }
 
 // CutoverPolicyFor returns the resolved cutover policy for a database+environment.
-// It defaults to CutoverPolicyRolling (today's serial behaviour) when the
-// environment is unconfigured or leaves cutover_policy unset, preserving the
-// conservative rolling rollout as the safe default.
+// An explicit cutover_policy always wins. Left unset, a multi-target
+// environment (UsesTargetsList) defaults to CutoverPolicyParallel: its targets
+// each hold their own schema, so their copies run side by side while cutover
+// stays one target at a time in list order. Every other environment, and an
+// unconfigured one, defaults to CutoverPolicyRolling, the fully serial rollout.
 func (c *ServerConfig) CutoverPolicyFor(database, environment string) string {
 	env := c.DatabaseEnvironment(database, environment)
-	if env == nil || env.CutoverPolicy == "" {
+	if env == nil {
 		return storage.CutoverPolicyRolling
 	}
-	return env.CutoverPolicy
+	if env.CutoverPolicy != "" {
+		return env.CutoverPolicy
+	}
+	if env.UsesTargetsList() {
+		return storage.CutoverPolicyParallel
+	}
+	return storage.CutoverPolicyRolling
 }
 
 // OnFailure returns the resolved rollout-continuation policy for a

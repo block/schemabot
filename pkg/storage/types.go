@@ -49,9 +49,10 @@ const MaxWebhookEventAttempts = 5
 // environment config at apply-create time and persisted on each apply_operations
 // row so the policy in force when the apply was created travels with it.
 const (
-	// CutoverPolicyRolling is the default: a later deployment does not start
-	// until every earlier sibling in deployment_order has completed, keeping the
-	// rollout fully serial.
+	// CutoverPolicyRolling keeps the rollout fully serial: a later deployment
+	// does not start until every earlier sibling in deployment_order has
+	// completed. It is the default for an environment without a targets list,
+	// and the fallback for an operation inserted without a policy.
 	CutoverPolicyRolling = "rolling"
 
 	// CutoverPolicyBarrier lets later deployments run their copy phase once
@@ -63,7 +64,8 @@ const (
 	// the cutover phase stays deployment-ordered, exactly like barrier. This
 	// collapses copy wall-clock toward "longest copy" for rollouts whose
 	// hours-long copy dominates, while preserving the ordered, one-at-a-time
-	// cutover swaps.
+	// cutover swaps. It is the default for an environment that routes through
+	// a targets list.
 	CutoverPolicyParallel = "parallel"
 )
 
@@ -1357,10 +1359,10 @@ type ApplyOperation struct {
 
 	// CutoverPolicy is the rollout sequencing policy captured for this
 	// operation's parent apply at apply-create time, drawn from the resolved
-	// environment config. "rolling" (the default) keeps the fully serial
-	// rollout — a later deployment waits for every earlier sibling to complete.
-	// "barrier" allows later deployments to run their copy phase once earlier
-	// siblings reach the cutover barrier. Persisted on each row so the policy in
+	// environment config. "rolling" keeps the fully serial rollout — a later
+	// deployment waits for every earlier sibling to complete. "barrier" allows
+	// later deployments to run their copy phase once earlier siblings reach the
+	// cutover barrier, and "parallel" starts their copies without waiting. Persisted on each row so the policy in
 	// force when the apply was created travels with the operation. Insert treats
 	// an empty value as "rolling", matching the column's NOT NULL DEFAULT.
 	CutoverPolicy string
