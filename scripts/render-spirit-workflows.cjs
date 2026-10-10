@@ -18,6 +18,8 @@ browser=await chromium.launch({headless:true,...(process.env.CHROME ? {executabl
  let pageError;
  page.on('pageerror',e=>{pageError=e});
  await page.setContent(fs.readFileSync(path.join(root,'assets/src/'+name+'.html'),'utf8'));await page.evaluate(()=>document.fonts.ready);
+ // Chrome can tear the first screenshot after a page loads; discard it.
+ await page.screenshot();
  const frames=[],fps=20,duration=illustrations[name];
  let previous;
  for(let i=0;i<fps*duration;i++){
