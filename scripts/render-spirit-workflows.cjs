@@ -2,9 +2,7 @@
 const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {execFileSync}=require('node:child_process');
 const {chromium}=require('playwright');
-const illustrations={'spirit-ddl-selection':30,'spirit-change-lifecycle':22,'spirit-checkpoint-resume':22,'spirit-write-thread-scaling':24,'spirit-throttling':20,'spirit-aurora-upsize':28};
-// Play an illustration faster than its own timeline; its duration is in timeline seconds.
-const speeds={'spirit-write-thread-scaling':1.6};
+const illustrations={'spirit-ddl-selection':30,'spirit-change-lifecycle':22,'spirit-checkpoint-resume':22,'spirit-throttling':24,'spirit-aurora-upsize':21};
 // Keep the lifecycle motion, but allow four to five seconds to read each short phase.
 function frameDelay(name,t){
  if(name!=='spirit-change-lifecycle')return 5;
@@ -22,12 +20,12 @@ browser=await chromium.launch({headless:true,...(process.env.CHROME ? {executabl
  await page.setContent(fs.readFileSync(path.join(root,'assets/src/'+name+'.html'),'utf8'));await page.evaluate(()=>document.fonts.ready);
  // Chrome can tear the first screenshot after a page loads; discard it.
  await page.screenshot();
- const frames=[],fps=20,speed=speeds[name]||1,duration=illustrations[name]/speed;
+ const frames=[],fps=20,duration=illustrations[name];
  let previous;
  for(let i=0;i<fps*duration;i++){
   const f=path.join(framesDir,String(i).padStart(4,'0')+'.png');
-  await page.evaluate(t=>renderFrame(t),i/fps*speed);const png=await page.screenshot();
-  const delay=frameDelay(name,i/fps*speed);
+  await page.evaluate(t=>renderFrame(t),i/fps);const png=await page.screenshot();
+  const delay=frameDelay(name,i/fps);
   if(previous&&png.equals(previous)){frames[frames.length-1].delay+=delay;}
   else{fs.writeFileSync(f,png);frames.push({file:f,delay});previous=png;}
   if(i%100===0)console.log('Rendered frame '+i+'/'+fps*duration);

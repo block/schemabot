@@ -1,7 +1,7 @@
 <!doctype html>
-<html lang="en"><meta charset="utf-8"><title>Spirit slows the copy when commit latency passes 100ms</title>
+<html lang="en"><meta charset="utf-8"><title>Spirit slows the copy as commit latency rises</title>
 <style>html,body{margin:0;background:#fff}svg{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}text{font-variant-numeric:tabular-nums}.mono{font-family:SFMono-Regular,Menlo,Consolas,monospace}</style>
-<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An application and Spirit's copy share an Aurora writer; as application traffic grows, average commit latency climbs past 100ms, Spirit waits before each chunk so the copy slows, and the copy resumes once latency recovers"></svg>
+<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="An application and Spirit's copy write to one Aurora writer; while commit latency is low Spirit adds write threads, above 70ms it sheds them, at 100ms it halves them and each thread waits before its next chunk, and as latency recovers Spirit adds threads back"></svg>
 <script>
 const C={ink:'#1f2328',muted:'#59636e',line:'#d1d9e0',soft:'#f6f8fa',blue:'#0969da',blueBg:'#ddf4ff',green:'#1a7f37',greenBg:'#dafbe1',amber:'#9a6700',amberBg:'#fff8c5',purple:'#8250df',purpleBg:'#fbefff',red:'#cf222e',redBg:'#ffebe9'};
 const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
@@ -9,52 +9,68 @@ const rect=(x,y,w,h,fill=C.soft,stroke='none',r=8,dash='')=>`<rect x="${x}" y="$
 const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='',anchor='start')=>`<text x="${x}" y="${y}" font-size="${size}" fill="${color}" font-weight="${weight}" class="${cls}" text-anchor="${anchor}">${esc(s)}</text>`;
 const line=(x1,y1,x2,y2,color=C.line,w=1,dash='')=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${w}" stroke-dasharray="${dash}"/>`;
 const clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x);},frac=x=>x-Math.floor(x);
-const DURATION=20,THRESHOLD=100;
+const DURATION=24,THRESHOLD=100,LOW=40,HIGH=70,MAX_THREADS=8,TICK=.5,COOLDOWN=2;
 // Application traffic grows, holds, then falls back.
-const appLoad=t=>1+1.6*ease((t-5)/4)-1.6*ease((t-14)/3);
+const appLoad=t=>1+1.6*ease((t-5)/7)-1.6*ease((t-14.5)/3.5);
 // Average commit latency in ms follows the application's load.
 function latency(t){
  const wobble=2.5*Math.sin(t*1.3);
- if(t<5.5)return 38+wobble;
- if(t<14)return 38+74*ease((t-5.5)/5)+wobble;
- return 112-74*ease((t-14)/3.5)+wobble;
+ if(t<14.5)return 38+74*ease((t-5)/7)+wobble;
+ return 112-77*ease((t-14.5)/3.5)+wobble;
 }
-const sampled=t=>latency(Math.floor(t*2)/2);
-const throttledAt=t=>sampled(t)>=THRESHOLD;
-const progress=[];{let p=.18;for(let i=0;i<=DURATION*20;i++){progress.push(p);if(!throttledAt(i/20))p+=.012/20;}}
+// Spirit's controller, one tick at a time: utilization picks the zone, and
+// every step but the panic halve waits out a shared cooldown. This copy is
+// write-limited, so the write pool is the one that moves.
+const ticks=[];{let threads=6,cool=0,breached=false,shown='hold';
+ for(let i=0;i*TICK<=DURATION;i++){const util=latency(i*TICK)/THRESHOLD;let action='hold';
+  if(util>=1){if(!breached||cool<=0){threads=Math.max(1,Math.ceil(threads/2));cool=COOLDOWN;action='halve';}breached=true;}
+  else{breached=false;
+   if(util<LOW/THRESHOLD&&threads<MAX_THREADS&&cool<=0){threads++;cool=COOLDOWN;action='add';}
+   else if(util>=HIGH/THRESHOLD&&threads>1&&cool<=0){threads--;cool=COOLDOWN;action='shed';}}
+  shown=action!=='hold'?action:cool>0?shown:'hold';ticks.push({threads,action:shown,util});cool--;}}
+const tickAt=t=>ticks[Math.min(ticks.length-1,Math.floor(t/TICK))];
+const throttledAt=t=>latency(Math.floor(t/TICK)*TICK)>=THRESHOLD;
+// Rows per second, eased the way Spirit's windowed rate eases, so a pause
+// drains the reported speed instead of dropping it to zero.
+const PER_THREAD=7000,TRICKLE=.02;
+const rates=[];{let shown=6*PER_THREAD;for(let i=0;i<=DURATION*20;i++){const t=i/20,n=tickAt(t).threads,target=n*PER_THREAD*(throttledAt(t)?TRICKLE:1);shown+=(target-shown)*.06;rates.push(shown);}}
 const PX0=56,PX1=1044,PY0=540,PY1=420,YMAX=130;
 const px=t=>PX0+(PX1-PX0)*t/DURATION,py=ms=>PY0-(PY0-PY1)*Math.min(ms,YMAX)/YMAX;
 function flow(x0,x1,y,n,speed,t,color){let r='';for(let k=0;k<n;k++){const u=frac(t*speed+k/n);r+=`<circle cx="${x0+(x1-x0)*u}" cy="${y}" r="4" fill="${color}"/>`;}return r;}
 function arrow(x0,x1,y,color){const d=Math.sign(x1-x0);return line(x0,y,x1,y,color,2)+`<path d="M${x1} ${y} L${x1-9*d} ${y-6} L${x1-9*d} ${y+6} Z" fill="${color}"/>`;}
 function renderFrame(t){
  t=Math.max(0,Math.min(t,DURATION-.05));
- const phase=Math.min(3,Math.floor(t/5)),lat=sampled(t),throttled=throttledAt(t),hot=lat>=THRESHOLD,load=appLoad(t);
- const labels=['Copy beside the app','App traffic grows','Copy waits','Copy resumes'];
- const captions=['Spirit copies the table while the application keeps writing to the same database.',
-  'More application writes slow each commit, and average commit latency climbs past 100ms.',
-  'Spirit waits before each chunk, so the copy slows and leaves the database to the application.',
-  'Commit latency falls back under 100ms, so the copy picks up speed on its own.'];
- let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Spirit slows the copy when commit latency passes 100ms.',32,C.ink,650);
+ const phase=Math.min(3,Math.floor(t/6)),lat=latency(Math.floor(t/TICK)*TICK),throttled=throttledAt(t),{threads,action}=tickAt(t),load=appLoad(t);
+ const rate=rates[Math.round(t*20)],zoneColor=lat>=THRESHOLD?C.red:lat>=HIGH?C.amber:C.ink;
+ const labels=['Add threads','Shed threads','Wait at 100ms','Grow back'];
+ const captions=['Commit latency is low, so Spirit adds write threads and the copy speeds up.',
+  'Application writes push latency up: Spirit sheds a thread above 70ms and halves them at 100ms.',
+  'Above 100ms each thread also waits before its next chunk, so only a trickle copies.',
+  'Latency recovers, so Spirit adds threads back one at a time and the copy speeds up again.'];
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Spirit slows the copy as commit latency rises.',32,C.ink,650);
  for(let i=0;i<4;i++){const x=36+i*263;s+=rect(x,130,247,3,i<phase?C.green:i===phase?C.blue:C.line)+txt(x,158,labels[i],16,i===phase?C.blue:C.muted,i===phase?650:500);}
  // The application and Spirit both write to one Aurora writer.
  s+=rect(36,190,260,150,'#fff',C.line,12)+txt(56,224,'Application',20,C.ink,650)+txt(56,262,'writes per second',13,C.muted,600)+txt(56,306,(1.2*load).toFixed(1)+'k',34,C.blue,650,'mono');
- s+=rect(380,190,340,150,'#fff',hot?C.red:C.line,12)+txt(400,224,'Aurora writer',20,C.ink,650)+txt(400,262,'average commit latency',13,C.muted,600)+txt(400,306,lat.toFixed(1)+'ms',34,hot?C.red:C.ink,650,'mono');
- s+=rect(804,190,260,150,'#fff',throttled?C.amber:C.line,12)+txt(824,224,'Spirit copy',20,C.ink,650)+txt(824,262,'rows per second',13,C.muted,600)+txt(824,306,throttled?'0':'42,000',34,throttled?C.amber:C.purple,650,'mono');
- const p=progress[Math.round(t*20)];
- s+=txt(824,328,'orders',12,C.muted,600,'mono')+rect(876,319,140,8,C.soft,'none',4)+rect(876,319,140*p,8,throttled?C.amber:C.purple,'none',4)+txt(1044,328,Math.floor(p*100)+'%',12,C.ink,600,'mono','end');
+ s+=rect(380,190,340,150,'#fff',lat>=THRESHOLD?C.red:C.line,12)+txt(400,224,'Aurora writer',20,C.ink,650)+txt(400,262,'average commit latency',13,C.muted,600)+txt(400,306,lat.toFixed(1)+'ms',34,zoneColor,650,'mono');
+ s+=rect(804,190,260,150,'#fff',throttled?C.amber:C.line,12)+txt(824,224,'Spirit copy',20,C.ink,650);
+ s+=txt(824,252,'write threads',13,C.muted,600)+txt(1044,252,String(threads),13,C.purple,650,'mono','end');
+ for(let i=0;i<MAX_THREADS;i++)s+=rect(824+i*28,262,22,14,i<threads?C.purple:C.soft,i<threads?'none':C.line,3);
+ s+=txt(824,300,'rows per second',13,C.muted,600)+txt(824,330,(rate>=1000?Math.round(rate/100)*100:Math.round(rate/10)*10).toLocaleString('en-US'),28,throttled?C.amber:C.purple,650,'mono');
  s+=arrow(300,372,265,C.blue)+flow(304,362,265,Math.round(2+2*load),.9,t,C.blue);
- s+=arrow(800,728,265,throttled?C.line:C.purple)+(throttled?'':flow(796,738,265,3,.9,t,C.purple));
- // Commit latency over time against the throttle threshold.
+ s+=arrow(800,728,265,throttled?C.line:C.purple)+(throttled?'':flow(796,738,265,Math.max(1,Math.round(threads/2)),.9,t,C.purple));
+ // Commit latency over time against Spirit's three lines.
  s+=rect(36,360,1028,196,'#fff',C.line,12)+txt(56,392,'Average commit latency',15,C.ink,650);
- s+=txt(1044,392,throttled?'(throttled) commit-latency '+lat.toFixed(1)+'ms >= '+THRESHOLD+'ms':'copying chunks',13,throttled?C.amber:C.purple,650,'mono','end');
- for(let a=0;a<t;a+=.5){const b=Math.min(t,a+.5);if(throttledAt(a))s+=rect(px(a),PY1-8,px(b)-px(a),PY0-PY1+8,C.amberBg,'none',0);}
- s+=line(PX0,PY0,PX1,PY0,C.line)+line(PX0,py(THRESHOLD),PX1,py(THRESHOLD),C.red,1.5,'6 4')+txt(PX1,py(THRESHOLD)-6,'throttle at 100ms',12,C.red,650,'','end');
+ const status=throttled?'(throttled) commit-latency '+lat.toFixed(1)+'ms >= '+THRESHOLD+'ms':action==='add'?'adding a write thread':action==='shed'?'shedding a write thread':action==='halve'?'halving the threads':'holding';
+ s+=txt(1044,392,status,13,throttled?C.amber:C.purple,650,'mono','end');
+ for(let a=0;a<t;a+=TICK){const b=Math.min(t,a+TICK);if(throttledAt(a))s+=rect(px(a),PY1-8,px(b)-px(a),PY0-PY1+8,C.amberBg,'none',0);}
+ s+=line(PX0,PY0,PX1,PY0,C.line);
+ for(const [ms,color,label] of [[LOW,C.green,'add below 40ms'],[HIGH,C.amber,'shed above 70ms'],[THRESHOLD,C.red,'pause at 100ms']])s+=line(PX0,py(ms),PX1,py(ms),color,1.2,'6 4')+txt(PX1,py(ms)-5,label,11,color,650,'','end');
  let pts=[];for(let a=0;a<=t;a+=.1)pts.push(px(a).toFixed(1)+','+py(latency(a)).toFixed(1));pts.push(px(t).toFixed(1)+','+py(latency(t)).toFixed(1));
- s+=`<polyline points="${pts.join(' ')}" fill="none" stroke="${hot?C.red:C.blue}" stroke-width="3" stroke-linejoin="round"/>`+`<circle cx="${px(t)}" cy="${py(latency(t))}" r="5" fill="${hot?C.red:C.blue}"/>`;
+ s+=`<polyline points="${pts.join(' ')}" fill="none" stroke="${zoneColor===C.ink?C.blue:zoneColor}" stroke-width="3" stroke-linejoin="round"/>`+`<circle cx="${px(t)}" cy="${py(latency(t))}" r="5" fill="${zoneColor===C.ink?C.blue:zoneColor}"/>`;
  s+=rect(36,576,1028,57,C.soft)+txt(55,612,captions[phase],17,C.ink,500);
- s+=txt(36,659,'Illustrative timing · Spirit averages commit latency over five-second samples and rechecks every second while it waits.',12,C.muted);
- s+=txt(36,678,'On Aurora, Spirit also counts threads on CPU; the MySQL guide explains each throttle signal.',12,C.muted);
- document.getElementById('art').innerHTML=s;return {phase,lat,throttled};
+ s+=txt(36,659,'Illustrative timing and a write-limited copy · Spirit samples every five seconds and moves one step per cooldown.',12,C.muted);
+ s+=txt(36,678,'A waiting thread rechecks every second and copies one chunk after a minute, so the copy always makes progress.',12,C.muted);
+ document.getElementById('art').innerHTML=s;return {phase,lat,throttled,threads,action,rate:Math.round(rate)};
 }
 window.renderFrame=renderFrame;renderFrame(0);
 </script></html>

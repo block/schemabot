@@ -303,7 +303,7 @@ For progress bar colors, phase labels, and keyboard controls, see the
 
 ## Throttling
 
-![An application and Spirit's copy write to one Aurora writer; as application traffic grows, average commit latency climbs past 100ms and Spirit waits before each chunk, slowing the copy until latency recovers](../assets/spirit-throttling.gif)
+![An application and Spirit's copy write to one Aurora writer; while commit latency is low Spirit adds write threads, above 70ms it sheds them, at 100ms it halves them and each thread waits before its next chunk, and as latency recovers Spirit adds threads back](../assets/spirit-throttling.gif)
 
 When a schema change's progress bar carries a `(throttled)` annotation, Spirit's
 throttler is deliberately pausing the copy or the checksum verify to protect
@@ -344,14 +344,27 @@ SchemaBot enables Spirit's automatic write-thread scaling by default. It adjusts
 from throttle feedback, increasing throughput when capacity permits and backing off under
 pressure. This scales the copy's work; it does not resize your database instance.
 
-![Spirit adds write threads while the database has room, holds inside a target band, sheds threads as application traffic rises, and pauses the copy at the throttle limit until the load clears](../assets/spirit-write-thread-scaling.gif)
+Two mechanisms work together. Every five seconds the autoscaler reads the throttle signal as a
+fraction of its limit, and that fraction picks a zone:
 
-This animation shows two mechanisms working together. Spirit reads the database's load every few
-seconds and compares it with the throttle limit. Well below the limit it adds a write thread,
-inside a target band it holds, above the band it sheds one, and at the limit it halves the pool.
-Separately, while a signal is over its limit the copy pauses entirely; that pause is what the
-`(throttled)` annotation reports. The thread limits scale with the instance's vCPUs, so a larger
-instance gives the copy more room alongside the application.
+| Fraction of the limit | Zone | Step |
+|---|---|---|
+| below 40% | room to grow | add one thread to the bottleneck pool |
+| 40% to 70% | target band | hold |
+| 70% to 100% | over the band | shed one thread from the pool the queue blames |
+| 100% and above | at the limit | halve both pools |
+
+The zone decides whether the copy grows or shrinks; the queue between the read and write pools
+decides which pool moves. A queue that stays near empty means the readers cannot keep up, so the
+read pool grows or sheds. A queue that stays near full means the writers are the bottleneck, so
+the write pool does. A balanced queue holds even below 40%. Every step except the halve waits out
+a shared cooldown, so the pools move one thread at a time. The animation at the top of this
+section follows a write-limited copy, so only its write pool moves.
+
+Separately, while a signal is at or over its limit, each copy thread waits before its next chunk,
+which is what the `(throttled)` annotation reports. A waiting thread rechecks every second and
+copies one chunk after a minute, so the copy keeps making progress. The pool limits scale with
+the instance's vCPUs, so a larger instance gives the copy more room alongside the application.
 
 Allow headroom for both application traffic and the schema change. If progress stays slow,
 check the reported reason alongside database CPU, I/O, and application latency. A quieter
@@ -450,8 +463,10 @@ its request latency roughly halved, and commit latency fell from 4.4ms to 1.85ms
 
 Before you upsize:
 
-- **Read the throttle reason.** A thread-count reason (`redo-aware` or `threads-running`) points at
-  CPU, which more vCPUs relieve. A sustained [`commit-latency`](#commit-latency) reason points at
+- **Read the throttle reason.** A [`redo-aware`](#redo-aware) reason points at CPU, which more
+  vCPUs relieve, because it leaves out threads waiting on the redo log. A
+  [`threads-running`](#threads-running) reason counts those waiters too, so confirm high writer
+  CPU before you resize for it. A sustained [`commit-latency`](#commit-latency) reason points at
   the write path, which a larger instance may not fix.
 - **Schedule the resize.** Changing a writer's instance class interrupts it, so plan it like any
   other instance change. See [checkpointing](#checkpointing-and-resuming-a-change) for how an

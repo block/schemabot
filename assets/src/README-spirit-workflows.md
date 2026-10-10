@@ -19,18 +19,15 @@ illustrative, not performance measurements.
   A compatible restart repeats work beyond the saved checkpoint and replays retained logs.
   This loop remains 22 seconds.
 - `spirit-throttling.html` shows an application and Spirit's copy writing to one Aurora writer.
-  Application traffic grows, average commit latency climbs past Spirit's 100ms threshold, and the
-  copy waits before each chunk until latency recovers. Traffic, latency, and timing are
-  illustrative.
-- `spirit-write-thread-scaling.html` steps Spirit's write-thread controller once per tick: below
-  the band it adds a thread, inside it holds, above it sheds one, and at the limit it halves the
-  pool while the copy pauses. Load values are illustrative; the zone order matches Spirit's
-  `pkg/autoscale`. The renderer plays it at 1.6x its 24-second timeline.
+  As application traffic pushes average commit latency up, Spirit's write-thread controller adds a
+  thread below 40ms, sheds one above 70ms, and halves the pool at 100ms, where each thread also
+  waits before its next chunk. The copy is write-limited, so only the write pool moves; traffic,
+  latency, and timing are illustrative.
 - `spirit-aurora-upsize.html` retells a staging schema change on a 107M-row table that moved from
-  `db.r6g.large` to `db.r6g.2xlarge`. The ETAs, CPU, and commit latency are the observed values;
-  the elapsed timeline before the upsize is illustrative, and the copy progress follows the ETAs;
-  the thread pools follow Spirit's sizing for each instance class (small-instance mode below
-  4 vCPUs, write threads from vCPUs minus two up to twice that).
+  `db.r6g.large` to `db.r6g.2xlarge`, as a timeline of events under the table copy's progress bar.
+  The ETAs and instance classes are the observed values; the time before the upsize is
+  illustrative, and the write threads follow Spirit's sizing for each instance class
+  (small-instance mode below 4 vCPUs, write threads from vCPUs minus two upward).
 
 From the repository root, with Node.js, Playwright, Chrome, and ImageMagick installed:
 
