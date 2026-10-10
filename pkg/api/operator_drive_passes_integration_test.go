@@ -18,12 +18,6 @@ import (
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// drivePassesDeadline bounds how long a test waits for a running operator to
-// settle a rollout whose units become claimable one after another. It is far
-// below the poll interval these tests configure, so only a driver that claims
-// the next unit as soon as the previous one settles can meet it.
-const drivePassesDeadline = 20 * time.Second
-
 // A parallel rollout of three members has copied everything and parked at the
 // cutover barrier. Its swaps run one at a time, so only the first is claimable;
 // each completed swap is what makes the next one claimable. With a single
@@ -106,7 +100,7 @@ func TestDrivePassesCarriesARollingRolloutThroughEveryMember(t *testing.T) {
 		"region-c": {taskState: state.Task.Completed},
 	}))
 
-	svc.drivePasses(ctx, 1, openClaimGate())
+	drivePassesWithin(t, svc.Service, openClaimGate())
 
 	assert.Equal(t, members, rec.resumeOrder(), "every member must be driven, in order, from a single wake")
 	assert.Equal(t, state.Apply.Completed, getApply(t, ctx, stor, seed.applyID).State)
@@ -146,7 +140,7 @@ func TestDrivePassesStopsWhenTheClaimGateClosesMidRun(t *testing.T) {
 	}
 	svc := newMatrixService(t, stor, clients)
 
-	svc.drivePasses(ctx, 1, stop)
+	drivePassesWithin(t, svc.Service, stop)
 
 	assert.Equal(t, []string{"region-a"}, rec.resumeOrder(), "no pass may claim after the claim gate closes")
 	assert.Equal(t, state.ApplyOperation.Completed, opState(t, ctx, stor, seed.opID("region-a")),
@@ -182,7 +176,7 @@ func TestDrivePassesLeavesARetryableFailureToTheNextTick(t *testing.T) {
 		"region-b": {taskState: state.Task.Completed},
 	}))
 
-	svc.drivePasses(ctx, 1, openClaimGate())
+	drivePassesWithin(t, svc.Service, openClaimGate())
 
 	assert.Equal(t, 1, rec.resumeCount(), "a retryable failure must not send the driver into another pass")
 	assert.Equal(t, state.ApplyOperation.FailedRetryable, opState(t, ctx, stor, seed.opID("region-a")))
