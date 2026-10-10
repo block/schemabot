@@ -22,7 +22,7 @@ illustrative, not performance measurements.
   As application traffic pushes average commit latency up, Spirit's write-thread controller adds a
   thread below 40ms, sheds one above 70ms, and halves the pool at 100ms, where each thread also
   waits before its next chunk. The copy is write-limited, so only the write pool moves; traffic,
-  latency, and timing are illustrative.
+  latency, and timing are illustrative. The renderer plays it at 1.3x its 24-second timeline.
 - `spirit-aurora-upsize.html` retells a staging schema change on a 107M-row table that moved from
   `db.r6g.large` to `db.r6g.2xlarge`, as a timeline of events under the table copy's progress bar.
   The ETAs and instance classes are the observed values; the time before the upsize is

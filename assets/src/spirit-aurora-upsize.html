@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><meta charset="utf-8"><title>Upsizing an Aurora writer speeds up a throttled copy</title>
 <style>html,body{margin:0;background:#fff}svg{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}text{font-variant-numeric:tabular-nums}.mono{font-family:SFMono-Regular,Menlo,Consolas,monospace}</style>
-<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A copy throttled on a 2-vCPU db.r6g.large writer has a 35-day ETA; after the instance class changes to the 8-vCPU db.r6g.2xlarge, Spirit scales its write threads up and the copy finishes about 2 hours later"></svg>
+<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A copy throttled on a 2-vCPU db.r6g.large writer has an ETA of about a month; after the instance class changes to the 8-vCPU db.r6g.2xlarge, Spirit scales its write threads up and the copy finishes about 2 hours later"></svg>
 <script>
 const C={ink:'#1f2328',muted:'#59636e',line:'#d1d9e0',soft:'#f6f8fa',blue:'#0969da',blueBg:'#ddf4ff',green:'#1a7f37',greenBg:'#dafbe1',amber:'#9a6700',amberBg:'#fff8c5',purple:'#8250df',purpleBg:'#fbefff',red:'#cf222e',redBg:'#ffebe9'};
 const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
@@ -9,32 +9,32 @@ const rect=(x,y,w,h,fill=C.soft,stroke='none',r=8)=>`<rect x="${x}" y="${y}" wid
 const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='',anchor='start')=>`<text x="${x}" y="${y}" font-size="${size}" fill="${color}" font-weight="${weight}" class="${cls}" text-anchor="${anchor}">${esc(s)}</text>`;
 const line=(x1,y1,x2,y2,color=C.line,w=1)=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${w}"/>`;
 const clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x);};
-function eta(hours){if(hours>=47.5)return Math.round(hours/24)+' days';const h=Math.max(1,Math.round(hours));return h+(h===1?' hour':' hours');}
+function eta(hours){if(hours>=24*28)return 'a month';if(hours>=47.5)return Math.round(hours/24)+' days';const h=Math.max(1,Math.round(hours));return h+(h===1?' hour':' hours');}
 function clock(h){const m=Math.round(h*60);return Math.floor(m/60)+'h '+String(m%60).padStart(2,'0')+'m';}
-const DURATION=21,ROWS=107,RESIZE_AT=7.3,BACK_AT=9.3,GROW_AT=11;
+const DURATION=18,ROWS=107,RESIZE_AT=5,BACK_AT=6.8,GROW_AT=8.3;
 // Elapsed hours per second of animation: a long crawl, a short restart, then the fast finish.
-const hoursPerSecond=t=>t<RESIZE_AT?18/RESIZE_AT:t<BACK_AT?.25/(BACK_AT-RESIZE_AT):.32;
+const hoursPerSecond=t=>t<RESIZE_AT?.5/RESIZE_AT:t<BACK_AT?.25/(BACK_AT-RESIZE_AT):.32;
 // Write threads, and the copy rate in millions of rows per hour they sustain.
 const writeAt=t=>t<BACK_AT?1:t<GROW_AT?6:Math.round(6+4*ease((t-GROW_AT)/2.5));
 const rateAt=t=>t<RESIZE_AT?ROWS/840:t<BACK_AT?0:5.6*writeAt(t);
 const model=[];{let h=0,rows=0;for(let i=0;i<=DURATION*20;i++){const t=i/20;model.push({h,rows});if(rows<ROWS){h+=hoursPerSecond(t)/20;rows=Math.min(ROWS,rows+rateAt(t)*hoursPerSecond(t)/20);}}}
 const at=t=>model[Math.min(model.length-1,Math.round(t*20))];
 const DONE_AT=model.findIndex(m=>m.rows>=ROWS)/20;
-const EVENTS=[[0,'Copy starts on db.r6g.large: one write thread, throttled, ETA 35 days'],
- [RESIZE_AT,'Instance class changed to db.r6g.2xlarge; the writer restarts'],
+const EVENTS=[[0,'Copy starts on db.r6g.large: one write thread, throttled, ETA about a month'],
+ [RESIZE_AT,'Operator sees the ETA and changes the instance class to db.r6g.2xlarge'],
  [BACK_AT,'Writer back with 8 vCPUs; Spirit resumes from its checkpoint on 6 write threads'],
  [GROW_AT,'Autoscaling grows the write threads toward 10; ETA 2 hours'],
  [DONE_AT,'Copy done: 107M rows, about 2 hours after the upsize']];
 function card(x,label,value,valueColor,sub,subColor){return rect(x,190,330,110,'#fff',C.line,12)+txt(x+20,220,label,13,C.muted,600)+txt(x+20,260,value,26,valueColor,650,'mono')+txt(x+20,286,sub,13,subColor,600);}
 function renderFrame(t){
  t=Math.max(0,Math.min(t,DURATION-.05));
- const phase=t<RESIZE_AT?0:t<14?1:2,{h:elapsed,rows}=at(t),done=rows>=ROWS,write=writeAt(t);
+ const phase=t<RESIZE_AT?0:t<11.5?1:2,{h:elapsed,rows}=at(t),done=rows>=ROWS,write=writeAt(t);
  const restarting=t>=RESIZE_AT&&t<BACK_AT,upsized=t>=RESIZE_AT,rate=rateAt(t),hours=rate>0?(ROWS-rows)/rate:840;
  const labels=['Throttled on db.r6g.large','Upsize the writer','Done in 2 hours'];
- const captions=['On a 2-vCPU writer the copy runs one write thread and stays throttled, so its ETA is 35 days.',
+ const captions=['On a 2-vCPU writer the copy runs one write thread and stays throttled, so its ETA is about a month.',
   'Changing the instance class gives the writer 8 vCPUs, and Spirit scales its write threads up.',
-  'The copy finished about 2 hours after the upsize instead of 35 days.'];
- let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Upsizing Aurora turns a 35-day copy into 2 hours.',32,C.ink,650);
+  'The copy finished about 2 hours after the upsize instead of a month.'];
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Upsizing Aurora turns a month-long copy into 2 hours.',32,C.ink,650);
  for(let i=0;i<3;i++){const x=36+i*349;s+=rect(x,130,330,3,i<phase?C.green:i===phase?C.blue:C.line)+txt(x,158,labels[i],16,i===phase?C.blue:C.muted,i===phase?650:500);}
  // The instance class setting, Spirit's write threads, and the ETA.
  s+=card(36,'instance_class',upsized?'db.r6g.2xlarge':'db.r6g.large',upsized?C.green:C.ink,restarting?'restarting':upsized?'8 vCPUs':'2 vCPUs',restarting?C.amber:C.muted);

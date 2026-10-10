@@ -440,7 +440,7 @@ backpressure semantics are the same; only the explanation is missing.
 
 ## Upsizing Aurora to speed up a change
 
-![A copy throttled on a 2-vCPU db.r6g.large writer has a 35-day ETA; after the instance class changes to the 8-vCPU db.r6g.2xlarge, Spirit's autoscaling engages and the copy finishes in about 2 hours](../assets/spirit-aurora-upsize.gif)
+![A copy throttled on a 2-vCPU db.r6g.large writer has an ETA of about a month; after the instance class changes to the 8-vCPU db.r6g.2xlarge, Spirit's autoscaling engages and the copy finishes in about 2 hours](../assets/spirit-aurora-upsize.gif)
 
 **A throttled copy on a small writer can finish in hours instead of weeks after an upsize.** A
 schema change runs long for two reasons: a large table with many writes is more work, and a busy
@@ -456,7 +456,7 @@ instance's vCPUs:
   instance and [adjusts them with the load](#capacity-and-automatic-scaling). On 8 vCPUs, write
   threads start at 6 and can grow to 12, and read threads start at 2 and can grow to 4.
 
-In one staging schema change, the copy of a 107M-row table showed an ETA of 35 days on a
+In one staging schema change, the copy of a 107M-row table showed an ETA of about a month on a
 `db.r6g.large` writer (2 vCPUs) running at 99.7% CPU. After its instance class changed to
 `db.r6g.2xlarge` (8 vCPUs), the copy finished in about 2 hours. The application gained as well:
 its request latency roughly halved, and commit latency fell from 4.4ms to 1.85ms.
