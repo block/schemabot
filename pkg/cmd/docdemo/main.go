@@ -515,7 +515,7 @@ func main() {
 		throttleFrames = append(throttleFrames, Frame{0.18, "", "Copying resumes when conditions improve", live(p, state.Apply.Running, false, "")})
 	}
 	throttleFrames = append(throttleFrames, Frame{3, "", "The change completes", live(100, state.Apply.Completed, false, "")})
-	demos = append(demos, Demo{Name: "cli-throttle", Title: "See why a change slows down.", Frames: throttleFrames})
+	demos = append(demos, Demo{Name: "cli-mysql-throttle", Title: "See why a change slows down.", Frames: throttleFrames})
 	ui.Hyperlinks = previousHyperlinks
 	stopFrames := []Frame{
 		{2, "", "The change is already copying rows", live(50, state.Apply.Running, false, "")},

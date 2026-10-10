@@ -794,7 +794,7 @@ func FormatThrottleReference(tables []TableProgress) string {
 		if !state.IsState(table.Status, state.Task.Running, state.Task.Checksumming) {
 			continue
 		}
-		return "  " + DocsLine(ui.ThrottleDocURL) + "\n\n"
+		return "  " + DocsLine(ui.MySQLThrottleDocURL) + "\n\n"
 	}
 	return ""
 }

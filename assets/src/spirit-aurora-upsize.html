@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Upsizing an Aurora writer speeds up a throttled copy</title>
+<style>html,body{margin:0;background:#fff}svg{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}text{font-variant-numeric:tabular-nums}.mono{font-family:SFMono-Regular,Menlo,Consolas,monospace}</style>
+<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="A copy throttled on a 2-vCPU db.r6g.large writer has a 35-day ETA; after the instance class changes to the 8-vCPU db.r6g.2xlarge, Spirit's autoscaling engages and the copy finishes in about 2 hours"></svg>
+<script>
+const C={ink:'#1f2328',muted:'#59636e',line:'#d1d9e0',soft:'#f6f8fa',blue:'#0969da',blueBg:'#ddf4ff',green:'#1a7f37',greenBg:'#dafbe1',amber:'#9a6700',amberBg:'#fff8c5',purple:'#8250df',purpleBg:'#fbefff',red:'#cf222e',redBg:'#ffebe9'};
+const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const rect=(x,y,w,h,fill=C.soft,stroke='none',r=8)=>`<rect x="${x}" y="${y}" width="${Math.max(0,w)}" height="${h}" rx="${r}" fill="${fill}" stroke="${stroke}"/>`;
+const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='',anchor='start')=>`<text x="${x}" y="${y}" font-size="${size}" fill="${color}" font-weight="${weight}" class="${cls}" text-anchor="${anchor}">${esc(s)}</text>`;
+const line=(x1,y1,x2,y2,color=C.line,w=1)=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${w}"/>`;
+const clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x);},mix=(a,b,k)=>a+(b-a)*k;
+function eta(hours){if(hours>=47.5)return Math.round(hours/24)+' days';const h=Math.max(1,Math.round(hours));return h+(h===1?' hour':' hours');}
+function renderFrame(t){
+ t=Math.max(0,Math.min(t,27.95));
+ const phase=Math.min(3,Math.floor(t/7));
+ // Phase 2 changes the instance class; phase 3 lets autoscaling grow the pools.
+ const resize=ease((t-8)/3),grow=ease((t-14.5)/5),after=t>=11;
+ // The new class comes up with all its vCPUs at once.
+ const vcpus=resize>=.5?8:2;
+ const write=after?Math.round(mix(6,10,grow)):1,read=after?Math.round(mix(2,4,grow)):1;
+ const cpu=after?mix(99.7,91,ease((t-11)/4)):99.7,commitMs=after?mix(4.4,1.85,ease((t-11)/5)):4.4;
+ // The writer restarts into its new class during the resize, so the copy waits.
+ const resizing=t>=8&&!after,throttled=t<8&&((t*1.3)%1)<.85;
+ const hours=after?Math.exp(mix(Math.log(840),Math.log(2),grow)):840;
+ const labels=['On a 2-vCPU writer','Change the instance class','Autoscaling engages','Days become hours'];
+ const captions=['The application already fills 2 vCPUs, so the copy is throttled almost continuously.',
+  'Raising the instance class from db.r6g.large to db.r6g.2xlarge quadruples the vCPUs.',
+  'At 8 vCPUs Spirit leaves small-instance mode and grows its write threads from 6 toward a ceiling of 12.',
+  'The copy finished in about 2 hours instead of 35 days, and the application got faster too.'];
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'A larger writer turns a 35-day copy into 2 hours.',32,C.ink,650);
+ for(let i=0;i<4;i++){const x=36+i*263;s+=rect(x,130,247,3,i<phase?C.green:i===phase?C.blue:C.line)+txt(x,158,labels[i],16,i===phase?C.blue:C.muted,i===phase?650:500);}
+ // The writer and its instance class setting.
+ s+=rect(36,190,500,366,'#fff',C.line,12)+txt(56,224,'Aurora writer',20,C.ink,650);
+ s+=rect(56,240,460,t>=7.6?76:48,C.soft,'none',8)+txt(72,262,'instance_class',12,C.muted,600,'mono');
+ if(t<7.6)s+=txt(72,282,'db.r6g.large',17,C.ink,600,'mono');
+ else s+=rect(64,268,444,20,C.redBg,'none',4)+txt(72,283,'- db.r6g.large',15,C.red,600,'mono')+rect(64,291,444,20,C.greenBg,'none',4)+txt(72,306,'+ db.r6g.2xlarge',15,C.green,600,'mono');
+ s+=txt(56,350,'vCPUs',14,C.ink,600)+txt(516,350,String(vcpus),17,C.ink,650,'mono','end');
+ for(let i=0;i<8;i++){const x=56+i*58;s+=rect(x,362,48,30,i<vcpus?C.blue:C.soft,i<vcpus?'none':C.line,5);}
+ s+=txt(56,424,'Writer CPU',14,C.ink,600)+txt(516,424,cpu.toFixed(1)+'%',15,cpu>95?C.red:C.amber,650,'mono','end')+rect(56,434,460,8,C.soft,'none',4)+rect(56,434,460*cpu/100,8,cpu>95?C.red:C.amber,'none',4);
+ s+=txt(56,470,'Thread budget',14,C.ink,600)+txt(516,470,(vcpus+1)+' active threads',14,C.ink,600,'mono','end');
+ s+=txt(56,528,'Commit latency',14,C.ink,600)+txt(516,528,commitMs.toFixed(2)+'ms',14,C.ink,600,'mono','end');
+ s+=txt(56,490,'vCPUs + 1, where the redo-aware signal pauses the copy',12,C.muted);
+ // Spirit's pools, the throttle state, and the ETA.
+ s+=rect(556,190,508,366,'#fff',throttled?C.amber:C.line,12)+txt(576,224,'Spirit copy',20,C.ink,650)+txt(1044,224,'107M rows',14,C.muted,500,'','end');
+ const pool=(y,name,n,max)=>{let r=txt(576,y,name,14,C.ink,600)+txt(1044,y,String(n),15,C.purple,650,'mono','end');for(let i=0;i<max;i++)r+=rect(576+i*36,y+10,30,20,i<n?C.purple:C.soft,i<n?'none':C.line,4);return r;};
+ s+=pool(260,'Write threads',write,12)+pool(316,'Read threads',read,4);
+ s+=txt(732,330,after?'autoscaling':'small-instance mode · fixed',12,after?C.green:C.muted,600);
+ s+=line(576,366,1044,366,C.line);
+ s+=txt(576,394,'ETA',14,C.muted,600)+txt(576,432,eta(hours),34,hours<48?C.green:C.ink,650,'mono');
+ s+=txt(1044,412,throttled?'(throttled)':resizing?'writer restarting':after?'copying':'',14,throttled?C.amber:resizing?C.muted:C.blue,650,'mono','end');
+ if(throttled)s+=txt(1044,432,'redo-aware 4 > 3',13,C.muted,500,'mono','end');
+ // The two ETAs on one scale: the after bar is a sliver of the before bar.
+ const before=444;
+ s+=txt(576,472,'db.r6g.large',12,C.muted,600,'mono')+rect(576,480,before,12,C.amber,'none',4)+txt(576+before-6,489,'35 days',11,'#fff',650,'','end');
+ if(t>=19.5)s+=txt(576,516,'db.r6g.2xlarge',12,C.muted,600,'mono')+rect(576,524,Math.max(3,before*2/840),12,C.green,'none',2)+txt(588,534,'about 2 hours',12,C.green,650);
+ s+=rect(36,576,1028,57,C.soft)+txt(55,612,captions[phase],17,C.ink,500);
+ s+=txt(36,659,'From a staging schema change on a 107M-row table · Thread counts follow Spirit’s sizing for each instance class.',12,C.muted);
+ s+=txt(36,678,'Changing the instance class restarts the writer; schedule it like any other instance change.',12,C.muted);
+ document.getElementById('art').innerHTML=s;return {phase,vcpus,write,read,hours};
+}
+window.renderFrame=renderFrame;renderFrame(0);
+</script></html>

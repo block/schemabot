@@ -1185,7 +1185,7 @@ func writeThrottleTooltip(sb *strings.Builder, table TableProgressData) {
 	// whose signal has no tip renders alone so a new engine signal degrades
 	// to raw text rather than a wrong explanation.
 	if tip := ui.ThrottleTip(table.ThrottleReason); tip != "" {
-		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.ThrottleDocURL)
+		fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s · %s ([docs](%s))_\n", escapeInlineMarkdown(table.ThrottleReason), tip, ui.MySQLThrottleDocURL)
 		return
 	}
 	fmt.Fprintf(sb, "- "+glyph.Info+" _Throttled: %s_\n", escapeInlineMarkdown(table.ThrottleReason))

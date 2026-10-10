@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>How Spirit decides to throttle on Aurora</title>
+<style>html,body{margin:0;background:#fff}svg{display:block;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}text{font-variant-numeric:tabular-nums}.mono{font-family:SFMono-Regular,Menlo,Consolas,monospace}</style>
+<svg id="art" width="1100" height="690" viewBox="0 0 1100 690" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Spirit detects Aurora, counts threads on CPU while skipping threads parked on a redo-log flush, watches average commit latency, and pauses the copy when latency crosses 100ms until it recovers"></svg>
+<script>
+const C={ink:'#1f2328',muted:'#59636e',line:'#d1d9e0',soft:'#f6f8fa',blue:'#0969da',blueBg:'#ddf4ff',green:'#1a7f37',greenBg:'#dafbe1',amber:'#9a6700',amberBg:'#fff8c5',purple:'#8250df',purpleBg:'#fbefff',red:'#cf222e',redBg:'#ffebe9'};
+const esc=s=>String(s).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+const rect=(x,y,w,h,fill=C.soft,stroke='none',r=8,dash='')=>`<rect x="${x}" y="${y}" width="${Math.max(0,w)}" height="${h}" rx="${r}" fill="${fill}" stroke="${stroke}" stroke-dasharray="${dash}"/>`;
+const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='',anchor='start')=>`<text x="${x}" y="${y}" font-size="${size}" fill="${color}" font-weight="${weight}" class="${cls}" text-anchor="${anchor}">${esc(s)}</text>`;
+const line=(x1,y1,x2,y2,color=C.line,w=1,dash='')=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${w}" stroke-dasharray="${dash}"/>`;
+const clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x);};
+const frac=x=>x-Math.floor(x),hash=(i,s)=>frac(Math.sin(i*12.9898+s*78.233)*43758.5453);
+// A 16-vCPU writer: the redo-aware budget is vCPUs + 1.
+const VCPUS=16,BUDGET=VCPUS+1,THRESHOLD=100,COPY_START=6.5;
+const COPY_TILES=new Set([2,7,11,15,18,22]);
+// Share of busy threads parked on a redo-log flush: it rises when storage slows.
+function parkedShare(t){if(t<16)return .30;if(t<24)return .30+.34*ease((t-16)/6);return .64-.34*ease((t-24)/4);}
+// Average commit latency in ms, as the change in total latency over the change in commits.
+function latency(t){
+ if(t<16)return 38+5*Math.sin(t*.9);
+ if(t<21)return 40+72.4*ease((t-16)/5);
+ if(t<25)return 112.4+1.5*Math.sin(t*2);
+ if(t<28.5)return 112.4-52.4*ease((t-25)/3.5);
+ return 60-20*ease((t-28.5)/3.5);
+}
+const sampledLatency=t=>latency(Math.floor(t));
+const throttledAt=t=>t>=COPY_START&&sampledLatency(t)>=THRESHOLD;
+function tiles(t){
+ const out=[];
+ for(let i=0;i<24;i++){
+  const copy=COPY_TILES.has(i);
+  const u=frac(hash(i,1)+.08*Math.sin(t*1.7+i*1.3)),v=frac(hash(i,2)+.06*Math.sin(t*1.1+i*.7));
+  let state='running';
+  if(u<.40||(copy&&(t<COPY_START||throttledAt(t))))state='idle';
+  else if(v<parkedShare(t))state='parked';
+  out.push({copy,state});
+ }
+ return out;
+}
+const progress=[];{let p=.24;for(let i=0;i<=640;i++){progress.push(p);const t=i/20;if(t>=COPY_START&&!throttledAt(t))p+=.0085/20;}}
+function renderFrame(t){
+ t=Math.max(0,Math.min(t,31.95));
+ const phase=Math.min(3,Math.floor(t/8)),ts=Math.floor(t*2)/2,grid=tiles(ts);
+ const running=grid.filter(g=>g.state!=='idle').length,parked=grid.filter(g=>g.state==='parked').length,counted=running-parked;
+ const lat=sampledLatency(t),throttled=throttledAt(t),ready=t>=5.6;
+ const labels=['Detect Aurora','Count threads on CPU','Watch commit latency','Pause and recheck'];
+ const captions=['Spirit reads Aurora status counters to choose its signals before the copy starts.',
+  'It counts threads on CPU and skips those parked on a redo-log flush, which use no CPU.',
+  'Storage slows: more threads park, so the count falls while commit latency climbs past 100ms.',
+  throttled?'The copy waits before its next chunk and checks the signal again every second.':'Commit latency recovers, so the copy resumes on its own.'];
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Spirit pauses the copy when Aurora is under pressure.',32,C.ink,650);
+ for(let i=0;i<4;i++){const x=36+i*263;s+=rect(x,130,247,3,i<phase?C.green:i===phase?C.blue:C.line)+txt(x,158,labels[i],16,i===phase?C.blue:C.muted,i===phase?650:500);}
+ // The writer's threads, as performance_schema reports them.
+ s+=rect(36,190,500,366,'#fff',C.line,12)+txt(56,224,'Aurora writer',20,C.ink,650)+txt(516,224,VCPUS+' vCPUs',14,C.muted,500,'','end');
+ grid.forEach((g,i)=>{const x=56+(i%6)*76,y=242+Math.floor(i/6)*52;
+  if(g.state==='idle')s+=rect(x,y,66,42,C.soft,'none',6);
+  else if(g.state==='parked')s+=rect(x,y,66,42,'#fff',C.muted,6,'4 3')+txt(x+33,y+18,'redo',11,C.muted,600,'','middle')+txt(x+33,y+32,'flush',11,C.muted,600,'','middle');
+  else s+=rect(x,y,66,42,g.copy?C.purpleBg:C.blueBg,g.copy?C.purple:C.blue,6)+txt(x+33,y+26,g.copy?'copy':'app',12,g.copy?C.purple:C.blue,650,'','middle');});
+ s+=rect(56,462,12,12,C.blueBg,C.blue,3)+txt(74,473,'Application',12,C.muted)+rect(162,462,12,12,C.purpleBg,C.purple,3)+txt(180,473,'Spirit copy',12,C.muted)+rect(266,462,12,12,'#fff',C.muted,3,'3 2')+txt(284,473,'Waiting on redo-log flush, not counted',12,C.muted);
+ s+=line(56,490,516,490,C.line)+txt(56,520,'On CPU',14,C.ink,600)+txt(56,542,running+' running − '+parked+' redo waits',13,C.muted,500,'mono')+txt(516,532,String(counted),28,ready?C.ink:C.muted,650,'mono','end');
+ // Spirit's setup and its two signals.
+ s+=rect(556,190,508,366,'#fff',throttled?C.red:C.line,12)+txt(576,224,'Spirit throttler',20,C.ink,650);
+ const checks=[[.8,'Aurora detected','AuroraDb_commits counters readable'],[2.2,VCPUS+' vCPUs','innodb_buffer_pool_instances'],[3.6,'Redo-aware count','budget '+VCPUS+' + 1 = '+BUDGET],[5,'Commit latency','throttle at '+THRESHOLD+'ms average']];
+ checks.forEach(([at,name,detail],i)=>{const y=252+i*22,on=t>=at;
+  s+=txt(576,y,on?'✓':'·',14,on?C.green:C.line,700)+txt(596,y,name,13,on?C.ink:C.line,600)+txt(746,y,detail,12,on?C.muted:C.line,500,'mono');});
+ s+=line(576,334,1044,334,C.line);
+ const chip=(y,on,label)=>rect(944,y-15,100,22,on?C.redBg:C.greenBg,'none',11)+txt(994,y,label,12,on?C.red:C.green,650,'','middle');
+ const meter=(y,name,value,share,mark,hot)=>txt(576,y,name,14,ready?C.ink:C.line,650)+txt(930,y,value,14,ready?(hot?C.red:C.ink):C.line,600,'mono','end')+rect(576,y+10,354,8,C.soft,'none',4)+rect(576,y+10,354*clamp(share),8,ready?(hot?C.red:C.blue):C.line,'none',4)+line(576+354*mark,y+5,576+354*mark,y+23,C.ink,2);
+ s+=meter(360,'redo-aware threads',ready?counted+' / '+BUDGET:'–',counted/24,BUDGET/24,false);
+ s+=meter(414,'commit latency',ready?lat.toFixed(1)+'ms / '+THRESHOLD+'ms':'–',lat/140,THRESHOLD/140,ready&&lat>=THRESHOLD);
+ if(ready){s+=chip(360,false,'under budget')+chip(414,lat>=THRESHOLD,lat>=THRESHOLD?'throttling':'under limit');}
+ s+=txt(576,450,'Δ commit latency ÷ Δ commits, sampled every five seconds',12,C.muted);
+ s+=line(576,466,1044,466,C.line);
+ const p=progress[Math.round(t*20)];
+ s+=txt(576,494,'orders',15,C.ink,600,'mono')+rect(652,483,300,10,C.soft,'none',4)+rect(652,483,300*p,10,throttled?C.amber:C.blue,'none',4)+txt(1044,494,Math.floor(p*100)+'%',15,C.ink,600,'mono','end');
+ if(t<COPY_START)s+=txt(576,528,'waiting for the throttler to start',13,C.muted,500,'mono');
+ else if(throttled){const pulse=frac(t)<.25;s+=txt(576,524,'(throttled) commit-latency '+lat.toFixed(1)+'ms >= '+THRESHOLD+'ms',13,C.amber,650,'mono')+`<circle cx="582" cy="540" r="4" fill="${pulse?C.amber:C.line}"/>`+txt(594,544,'waiting · rechecks every second',12,C.muted);}
+ else s+=txt(576,528,'copying chunks',13,C.blue,600,'mono');
+ s+=rect(36,576,1028,57,C.soft)+txt(55,612,captions[phase],17,C.ink,500);
+ s+=txt(36,659,'Illustrative timing · On community MySQL the Aurora counters are absent, so neither Aurora signal is enabled.',12,C.muted);
+ s+=txt(36,678,'Without performance_schema access, Spirit counts Threads_running instead, which includes redo-log waiters.',12,C.muted);
+ document.getElementById('art').innerHTML=s;return {phase,counted,lat,throttled};
+}
+window.renderFrame=renderFrame;renderFrame(0);
+</script></html>

@@ -2,7 +2,7 @@
 const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
 const {execFileSync}=require('node:child_process');
 const {chromium}=require('playwright');
-const illustrations={'spirit-ddl-selection':30,'spirit-change-lifecycle':22,'spirit-checkpoint-resume':22};
+const illustrations={'spirit-ddl-selection':30,'spirit-change-lifecycle':22,'spirit-checkpoint-resume':22,'spirit-write-thread-scaling':24,'spirit-throttling':32,'spirit-aurora-upsize':28};
 // Keep the lifecycle motion, but allow four to five seconds to read each short phase.
 function frameDelay(name,t){
  if(name!=='spirit-change-lifecycle')return 5;
@@ -31,7 +31,7 @@ browser=await chromium.launch({headless:true,...(process.env.CHROME ? {executabl
   if(i%100===0)console.log('Rendered frame '+i+'/'+fps*duration);
  }
  if(pageError)throw pageError;
- const colors=['ffffff','f6f8fa','d1d9e0','1f2328','59636e','0969da','ddf4ff','1a7f37','dafbe1','9a6700','fff8c5','8250df','fbefff'];
+ const colors=['ffffff','f6f8fa','d1d9e0','1f2328','59636e','0969da','ddf4ff','1a7f37','dafbe1','9a6700','fff8c5','8250df','fbefff','cf222e','ffebe9'];
  const swatches=path.join(framesDir,'fixed.ppm'),palette=path.join(framesDir,'palette.png'),adaptive=path.join(framesDir,'adaptive.png');
  fs.writeFileSync(swatches,'P3\n'+colors.length+' 1\n255\n'+colors.map(h=>h.match(/../g).map(v=>parseInt(v,16)).join(' ')).join('\n'));
  execFileSync('magick',[...frames.filter((_,i)=>i%20===0).map(f=>f.file),'-append','-colors',String(256-colors.length),'-unique-colors',adaptive]);
