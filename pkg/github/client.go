@@ -771,7 +771,10 @@ type PullRequestInfo struct {
 	HeadRef string
 	HeadSHA string
 	BaseRef string
-	User    string
+	// DefaultBranch is the default branch of the repository the PR targets,
+	// read from the same response as BaseRef.
+	DefaultBranch string
+	User          string
 	// State is the PR's lifecycle state as GitHub reports it: "open" or
 	// "closed" (a merged PR reads as closed).
 	State string
@@ -938,12 +941,13 @@ func (ic *InstallationClient) fetchPullRequest(ctx context.Context, repo string,
 		return nil, err
 	}
 	return &PullRequestInfo{
-		HeadRef: ghPR.GetHead().GetRef(),
-		HeadSHA: ghPR.GetHead().GetSHA(),
-		BaseRef: ghPR.GetBase().GetRef(),
-		User:    ghPR.GetUser().GetLogin(),
-		State:   ghPR.GetState(),
-		Merged:  ghPR.GetMerged(),
+		HeadRef:       ghPR.GetHead().GetRef(),
+		HeadSHA:       ghPR.GetHead().GetSHA(),
+		BaseRef:       ghPR.GetBase().GetRef(),
+		DefaultBranch: ghPR.GetBase().GetRepo().GetDefaultBranch(),
+		User:          ghPR.GetUser().GetLogin(),
+		State:         ghPR.GetState(),
+		Merged:        ghPR.GetMerged(),
 	}, nil
 }
 
@@ -1141,7 +1145,8 @@ type SchemaChangeComparison struct {
 	// commit's merge base or a descendant of it.
 	BaseMovedForward bool
 	// BaseIsDefaultBranch is true when the pull request targets the
-	// repository's default branch.
+	// repository's default branch. It is false when the default branch is
+	// unknown, so unknown base content is never trusted.
 	BaseIsDefaultBranch bool
 }
 
@@ -1158,16 +1163,16 @@ type SchemaChangeComparison struct {
 // unchanged when the base branch changed it since the approved commit's base:
 // what the pull request did there has been replaced by base branch content,
 // as when a stacked pull request below this one merges and this one is
-// rebased. Both rules hold only when the pull request targets the
-// repository's default branch, the branch whose changes are expected to have
-// had their own review, and only when the head's base content is
-// newer than the approved commit's: the head's merge base must descend from
-// the approved commit's. A head rebuilt on older base content would otherwise
-// carry an older version of a path the pull request never touched, which
-// nobody approved for this change. Identical content on different bases is
-// not unchanged either: the head would undo or overwrite the base branch's
-// change. Rebasing onto, or
-// merging in, a newer base branch therefore leaves the change unchanged; a
+// rebased. Both rules hold only when baseRef is defaultBranch, the
+// repository's default branch, whose changes are expected to have had their
+// own review, and only when the head's base content is newer than the
+// approved commit's: the head's merge base must descend from the approved
+// commit's. A head rebuilt on older base content would otherwise carry an
+// older version of a path the pull request never touched, which nobody
+// approved for this change. Identical content on different bases is not
+// unchanged either: the head would undo or overwrite the base branch's
+// change. Rebasing onto, or merging in, a newer base branch therefore leaves
+// the change unchanged; a
 // path the pull request edits, adds, deletes, or resolves differently at the
 // head does not. Directories that satisfy neither are compared entry by entry.
 //
@@ -1181,13 +1186,8 @@ type SchemaChangeComparison struct {
 // too large to list completely, a path runs through a symlink, a symlink
 // points outside the repository, or there were more distinct symlinks to read
 // than maxSchemaSymlinkReads.
-func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, approvedSHA, headSHA string, paths []string) (SchemaChangeComparison, error) {
-	var result SchemaChangeComparison
-	defaultBranch, err := ic.repositoryDefaultBranch(ctx, repo)
-	if err != nil {
-		return result, err
-	}
-	result.BaseIsDefaultBranch = baseRef == defaultBranch
+func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, defaultBranch, approvedSHA, headSHA string, paths []string) (SchemaChangeComparison, error) {
+	result := SchemaChangeComparison{BaseIsDefaultBranch: defaultBranch != "" && baseRef == defaultBranch}
 	baseTipSHA, err := ic.branchTipSHA(ctx, repo, baseRef)
 	if err != nil {
 		return result, err
@@ -1332,10 +1332,11 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 // the same base, it leaves the path alone at both commits, or it no longer
 // touches a path the base branch has changed since the approval. The last two
 // trust base branch content, so they hold only when that content is newer
-// default branch content (see baseContentReviewed). supersededByBase never decides a
-// directory on every side: inside it, a file the pull request dropped without
-// the base branch changing it must still count as a change, so the directory
-// is compared entry by entry instead.
+// default branch content (see baseContentReviewed).
+//
+// supersededByBase never decides a directory on every side: inside it, a file
+// the pull request dropped without the base branch changing it must still
+// count as a change, so the directory is compared entry by entry instead.
 func (c *schemaChangeComparer) pathUnchanged(s [4]gitSide) bool {
 	if sameChange(s) {
 		return true
