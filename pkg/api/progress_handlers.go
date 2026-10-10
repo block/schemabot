@@ -261,7 +261,7 @@ func (s *Service) resolveReleaseLatch(ctx context.Context, apply *storage.Apply,
 	return released
 }
 
-// progressOperationsFromRows projects// progressOperationsFromRows projects already-fetched operation rows into the
+// progressOperationsFromRows projects already-fetched operation rows into the
 // API response shape and the operation-id→member map. Keeping the
 // transformation separate from the storage read lets a single ListByApply
 // result feed both multi-operation detection and per-member enrichment on the
@@ -297,6 +297,13 @@ func (s *Service) bestEffortProgressOperations(ctx context.Context, apply *stora
 		return nil, nil, nil, false
 	}
 	return operations, memberByOperationID, ops, s.resolveReleaseLatch(ctx, apply, ops)
+}
+
+// isMultiOperationApply reports whether an apply is made of more than one
+// operation: more than one is attached, or its generation manifest declares
+// more than one, of which some are still to attach one dispatch at a time.
+func isMultiOperationApply(apply *storage.Apply, ops []*storage.ApplyOperation) bool {
+	return len(ops) > 1 || len(apply.ExpectedOperationKeys) > 1
 }
 
 // handleProgressByApplyID handles GET /api/progress/apply/{apply_id} requests.
@@ -353,7 +360,7 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// (which would also rewrite a running aggregate to pending). On a storage
 	// error, fall back to the single-deployment path: every apply created today
 	// has one operation, so this only degrades the dormant multi-op case.
-	if opsErr == nil && len(ops) > 1 {
+	if opsErr == nil && isMultiOperationApply(apply, ops) {
 		httpResp, err := s.progressFromLocalStorage(r.Context(), apply)
 		if err != nil {
 			s.logger.Warn("failed to read multi-operation apply progress from storage; falling back to the single-deployment path",

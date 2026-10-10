@@ -16,11 +16,16 @@ import (
 // and table. Each keyspace table becomes one row with its shards listed under
 // it, a table on its keyspace's only shard keeps its own rows, and each
 // finalizer with a VSchema diff joins the VSchema display metadata, all read
-// against the stored plan. Operations still lists every row. Any other apply
-// is left as it is.
+// against the stored plan. The apply reads as every operation its generation
+// manifest declares, not only those attached so far: a declared operation
+// still to attach joins Operations and its table's shards as pending, so the
+// rollout's scope holds steady while its operations attach one dispatch at a
+// time. Operations still lists every attached row. Any other apply is left as
+// it is.
 //
 // rows are the apply's table rows, one per task, in the order of tasks.
-func (s *Service) rollUpShardedProgress(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, rows []*apitypes.TableProgressResponse) {
+func (s *Service) rollUpShardedProgress(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, attached []*storage.ApplyOperation, tasks []*storage.Task, rows []*apitypes.TableProgressResponse) {
+	ops := withPendingDeclaredOperations(apply, attached)
 	keyed := make([]presentation.KeyedOperation, 0, len(ops))
 	for _, op := range ops {
 		keyed = append(keyed, presentation.KeyedOperation{Deployment: op.Deployment, OperationKey: op.OperationKey})
@@ -30,9 +35,43 @@ func (s *Service) rollUpShardedProgress(ctx context.Context, resp *apitypes.Prog
 		return
 	}
 	resp.Sharded = true
+	for _, op := range ops[len(attached):] {
+		resp.Operations = append(resp.Operations, progressOperationResponseFromStorage(op))
+	}
 	plan := s.storedPlanForShardedProgress(ctx, apply)
 	resp.Tables = shardedTableRows(ops, tasks, rows, plan)
 	s.addFinalizerVSchemaChanges(resp, apply, ops, plan)
+}
+
+// withPendingDeclaredOperations returns the apply's attached operations
+// followed by a pending stand-in for each key its generation manifest declares
+// with no operation attached yet (storage.Apply.MissingExpectedOperationKeys),
+// on the deployment its attached operations run on. A stand-in has ID zero,
+// which no stored task references, so it carries no rows.
+func withPendingDeclaredOperations(apply *storage.Apply, attached []*storage.ApplyOperation) []*storage.ApplyOperation {
+	missing := apply.MissingExpectedOperationKeys(attached)
+	if len(missing) == 0 {
+		return attached
+	}
+	deployment := apply.Deployment
+	if len(attached) > 0 {
+		deployment = attached[0].Deployment
+	}
+	ops := slices.Clone(attached)
+	for _, key := range missing {
+		kind := storage.ApplyOperationKindWork
+		if _, ok := state.NamespaceFinalizerKey(key); ok {
+			kind = storage.ApplyOperationKindGroupFinalizer
+		}
+		ops = append(ops, &storage.ApplyOperation{
+			ApplyID:       apply.ID,
+			Deployment:    deployment,
+			OperationKey:  key,
+			OperationKind: kind,
+			State:         state.ApplyOperation.Pending,
+		})
+	}
+	return ops
 }
 
 // shardedTableRows rolls a sharded apply's per-task rows up into one row per

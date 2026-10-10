@@ -80,6 +80,27 @@ func TestWriteProgressShardedApplyRollsShardsUpUnderTheTable(t *testing.T) {
 	assert.NotContains(t, output, "group_finalizer")
 }
 
+// Every state that shows a sharded table's copy percentage says which shards
+// it covers while only some have started, so a stopped, cancelled, or
+// recovering copy of the first shard never reads as the whole table's.
+func TestFormatTableProgressNamesThePartialShardCoverageInEveryCopyState(t *testing.T) {
+	table := ParseProgressResponse(multiShardRunningResponse()).Tables[0]
+	for status, want := range map[string]string{
+		state.Apply.Stopped:    "Stopped at 62.00% (1 of 4 shards)",
+		state.Apply.Cancelled:  "Cancelled at 62.00% (1 of 4 shards)",
+		state.Apply.Recovering: "Row copy in progress (62.00% (1 of 4 shards))",
+	} {
+		t.Run(status, func(t *testing.T) {
+			table.Status = status
+			output := FormatTableProgress(table)
+			assert.Contains(t, output, want)
+			if status == state.Apply.Stopped {
+				assert.Contains(t, output, "Rows: 620 / 1,000 across 1 of 4 shards · ~23.4 GB across all 4 shards\n")
+			}
+		})
+	}
+}
+
 // A sharded apply shows no operation sections, so when only a failed
 // operation recorded why the apply failed, its error stands in for the
 // apply's, naming the shard when a shard failed.

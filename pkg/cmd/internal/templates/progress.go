@@ -538,8 +538,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.ChecksumRowsTotal > 0 {
 			checksumPct := int(math.Round(float64(t.ChecksumRowsChecked) * 100 / float64(t.ChecksumRowsTotal)))
 			pct := ui.RowCopyDisplayPercent(checksumPct, t.ChecksumRowsChecked)
-			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data (%s)%s", ui.ProgressBarRowCopy(pct),
-				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), throttledSuffix(t))
+			writeTableLine(&b, t, "%s 🔍 Checksumming to verify data (%s%s)%s", ui.ProgressBarRowCopy(pct),
+				ui.FormatRowCopyPercent(checksumPct, t.ChecksumRowsChecked, t.ChecksumRowsTotal), shardCoverageSuffix(t), throttledSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatTableDDL(t))
 			}
@@ -582,8 +582,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if recoveringIsCopyingRows(t) {
 			pct := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBarRowCopy(pct)
-			writeTableLine(&b, t, "%s Row copy in progress (%s)", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
+			writeTableLine(&b, t, "%s Row copy in progress (%s%s)", bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
 			if t.DDL != "" {
 				b.WriteString(formatTableDDL(t))
 			}
@@ -680,8 +680,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		if t.PercentComplete > 0 || t.RowsCopied > 0 {
 			cancelledPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 			bar := ui.ProgressBar(cancelledPercent, ui.ColorOrange)
-			writeTableLine(&b, t, "%s 🚫 Cancelled at %s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
+			writeTableLine(&b, t, "%s 🚫 Cancelled at %s%s", bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
 		} else {
 			writeTableLine(&b, t, "🚫 Cancelled (not started)")
 		}
@@ -700,8 +700,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			// At 100% = was waiting for cutover when stopped
 			writeTableLine(&b, t, "%s ⏹️ Stopped (was waiting for cutover)", bar)
 		case t.PercentComplete > 0 || t.RowsCopied > 0:
-			writeTableLine(&b, t, "%s ⏹️ Stopped at %s", bar,
-				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal))
+			writeTableLine(&b, t, "%s ⏹️ Stopped at %s%s", bar,
+				ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t))
 		default:
 			writeTableLine(&b, t, "⏹️ Stopped (not started)")
 		}
@@ -709,7 +709,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 			b.WriteString(formatTableDDL(t))
 		}
 		if t.RowsTotal > 0 && (t.PercentComplete > 0 || t.RowsCopied > 0) {
-			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), ui.FormatTableSizeClause(t.EstimatedBytes))
+			coverage, size, _ := rowsCoverageAndSize(t)
+			fmt.Fprintf(&b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size)
 		}
 		b.WriteString("\n")
 		b.WriteString(formatTableParts(t))
@@ -837,13 +838,10 @@ func recoveringIsCopyingRows(t TableProgress) bool {
 }
 
 func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
-	size := ui.FormatTableSizeClause(t.EstimatedBytes)
-	coverage, eta := "", ui.FormatETA(t.ETASeconds)
-	if reporting, ok := partialShardCoverage(t); ok {
-		// The unreported shards can only add rows and time, so the figures
-		// cover the shards named and the ETA is a floor.
-		coverage = fmt.Sprintf(" across %d of %d shards", reporting, shardTotal(t))
-		size = ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards)
+	coverage, size, partial := rowsCoverageAndSize(t)
+	eta := ui.FormatETA(t.ETASeconds)
+	if partial {
+		// The unreported shards can only add time, so the ETA is a floor.
 		eta = "≥ " + eta
 	}
 	if t.ETASeconds > 0 {
@@ -851,6 +849,19 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 		return
 	}
 	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size)
+}
+
+// rowsCoverageAndSize returns the clauses a table's rows line carries after
+// its row counts: the shards the counts cover when only some have reported,
+// and the table's planned size, which then names the shards it covers. partial
+// reports whether the counts cover only some shards.
+func rowsCoverageAndSize(t TableProgress) (coverage, size string, partial bool) {
+	reporting, ok := partialShardCoverage(t)
+	if !ok {
+		return "", ui.FormatTableSizeClause(t.EstimatedBytes), false
+	}
+	return fmt.Sprintf(" across %d of %d shards", reporting, shardTotal(t)),
+		ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards), true
 }
 
 // partialShardCoverage returns how many of a sharded table's shards have

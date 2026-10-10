@@ -22,11 +22,14 @@ import (
 const shardedTestDDL = "ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`)"
 
 // shardedProgress serves the progress of a running apply made of the given
-// operation rows and tasks, with the given stored plan, and decodes it.
-func shardedProgress(t *testing.T, ops []*storage.ApplyOperation, tasks []*storage.Task, plans *staticPlanStore) apitypes.ProgressResponse {
+// operation rows and tasks, with the given stored plan and generation
+// manifest, and decodes it.
+func shardedProgress(t *testing.T, ops []*storage.ApplyOperation, tasks []*storage.Task, plans *staticPlanStore, manifest ...string) apitypes.ProgressResponse {
 	t.Helper()
 	apply := activeTestApply("apply-sharded")
 	apply.PlanID = 7
+	apply.ExternalID = "remote-apply"
+	apply.ExpectedOperationKeys = manifest
 	for _, op := range ops {
 		op.ApplyID = apply.ID
 		op.Deployment = "data-plane"
@@ -108,6 +111,40 @@ func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
 	require.Len(t, table.Shards, 2)
 	assert.Equal(t, apitypes.ShardProgressResponse{Shard: "-80", Status: state.Task.Running, RowsCopied: 620, RowsTotal: 1000}, *table.Shards[0])
 	assert.Equal(t, apitypes.ShardProgressResponse{Shard: "80-", Status: state.ApplyOperation.Pending}, *table.Shards[1])
+
+	changes, err := apitypes.ParseVSchemaChanges(resp.Metadata)
+	require.NoError(t, err)
+	assert.Equal(t, []apitypes.VSchemaChange{{Namespace: "shop_001", Status: "", Diff: "+ orders"}}, changes)
+}
+
+// While a sharded apply's operations attach one dispatch at a time, it reads
+// as every operation its manifest declares: with only its first shard
+// attached, the apply is still served as the rollout, the declared shard still
+// to attach lists as pending under the table and among the operations, and the
+// declared finalizer's VSchema change shows.
+func TestProgressByApplyIDReadsAShardedApplyAsItsDeclaredOperations(t *testing.T) {
+	ops := []*storage.ApplyOperation{shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running)}
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+		Tables:   []storage.TableChange{{Table: "orders"}},
+		Finalize: true,
+		Metadata: map[string]string{storage.PlanMetadataVSchemaDiff: "+ orders"},
+	}}}
+
+	resp := shardedProgress(t, ops, []*storage.Task{shardTask(1, state.Task.Running, 620, 1000)}, &staticPlanStore{plan: plan},
+		"shop_001/-80/orders", "shop_001/80-/orders", "shop_001/group_finalizer")
+
+	assert.Equal(t, state.Apply.Running, resp.State, "the stored apply state, not one operation's remote view")
+	assert.True(t, resp.Sharded)
+	require.Len(t, resp.Operations, 3)
+	assert.Equal(t, "shop_001/80-/orders", resp.Operations[1].OperationKey)
+	assert.Equal(t, state.ApplyOperation.Pending, resp.Operations[1].State)
+	assert.Equal(t, storage.ApplyOperationKindWork, resp.Operations[1].OperationKind)
+	assert.Equal(t, "shop_001/group_finalizer", resp.Operations[2].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, resp.Operations[2].OperationKind)
+	require.Len(t, resp.Tables, 1)
+	require.Len(t, resp.Tables[0].Shards, 2)
+	assert.Equal(t, apitypes.ShardProgressResponse{Shard: "-80", Status: state.Task.Running, RowsCopied: 620, RowsTotal: 1000}, *resp.Tables[0].Shards[0])
+	assert.Equal(t, apitypes.ShardProgressResponse{Shard: "80-", Status: state.ApplyOperation.Pending}, *resp.Tables[0].Shards[1])
 
 	changes, err := apitypes.ParseVSchemaChanges(resp.Metadata)
 	require.NoError(t, err)
