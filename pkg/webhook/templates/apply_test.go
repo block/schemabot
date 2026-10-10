@@ -853,6 +853,18 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		"  - ◉ `slow1`: 12%\n"+
 		"  - ◉ `fast1`: 80%\n\n")
 
+	// A table waiting on its deploy request, or reverting, is still in flight,
+	// so it lists its shards too.
+	for _, status := range []string{state.Task.WaitingForDeploy, state.Task.Reverting} {
+		phase := RenderApplyStatusComment(ApplyStatusCommentData{
+			Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
+			Tables: []TableProgressData{{TableName: "users", Status: status,
+				Shards: []ShardProgressData{{Shard: "-80", Status: status}, {Shard: "80-", Status: "completed"}}}},
+		})
+		assert.Containsf(t, phase, "- Shards: 2 (", "a table %s lists its shards:\n%s", status, phase)
+		assert.Containsf(t, phase, "  - ✓ `80-`: complete\n", "a table %s lists its shards:\n%s", status, phase)
+	}
+
 	// Suppressed once the table completes — no shard line even with shard rows.
 	done := RenderApplyStatusComment(ApplyStatusCommentData{
 		Database: "shop", Environment: "staging", State: "completed", Engine: "Vitess",

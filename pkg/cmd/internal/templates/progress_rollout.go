@@ -437,12 +437,12 @@ func pendingTargetsWord(t TableProgress) string {
 
 // formatHaltedAcrossTargets renders a halted table across targets the way the
 // PR comment's table line does: the table reads as its halt, with no bar. A
-// stopped table lists its targets, each line saying where that target
-// stopped; any other counts them on its line.
+// table with a stopped or in-flight target lists its targets, each stopped
+// target's line saying where it stopped; any other counts them on its line.
 func formatHaltedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
 	coverage := targetsCoverage(t)
-	if presentation.ListsTargets(t.Status) {
+	if listsTargets(t) {
 		// The list counts the targets, so the line does not repeat them.
 		coverage = ""
 	}

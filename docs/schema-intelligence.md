@@ -758,8 +758,9 @@ read `2 tables done on 2 targets` once every table is done on every target. A
 target that already had the change ran no table and is not counted. Targets in
 an outcome an operator acts on are counted beside it, failures first, so a
 failed `refunds` on `shop-002` reads `1 of 2 tables done on 2 targets · 1 target
-failed`. A table lists its targets while it is in flight on them or once it
-stopped; any other table counts them on its own line.
+failed`. A table lists its targets while it is in flight on any of them or any of
+them stopped, even when another target's failure makes the table read as
+failed; any other table counts them on its own line.
 
 </details>
 

@@ -328,8 +328,9 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 		} else {
 			b.WriteString(FormatKeyspaceHeader(g.namespaces[0]))
 			for i, t := range g.tables {
-				// A table whose shards or targets are listed ends on the
-				// listing, so a blank line sets the next table apart.
+				// A blank line sets every table after the first apart from
+				// the one before it, unless that one already ended on a blank
+				// line, as a table whose shards or targets are listed does.
 				if i > 0 && !strings.HasSuffix(b.String(), "\n\n") {
 					b.WriteString("\n")
 				}

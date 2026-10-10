@@ -367,21 +367,30 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		// the change is live on the completed targets.
 		phrase = "⊘ Cancelled"
 	}
-	if listsTargets(status, strip) {
+	lists := listsTargets(strip)
+	if lists {
 		// The list counts the targets, so the headline does not repeat them.
 		coverage = ""
 	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
 	writeDDL()
-	if listsTargets(status, strip) {
+	if lists {
 		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 	}
 }
 
-// listsTargets reports whether a table line in status lists its targets one
-// per line under it (writeMemberList, presentation.ListsTargets).
-func listsTargets(status string, strip []ShardProgressData) bool {
-	return len(strip) > 1 && presentation.ListsTargets(status)
+// listsTargets reports whether a table line lists its targets one per line
+// under it (writeMemberList, presentation.ListsTargets), decided by where each
+// target stands rather than by the table's rolled-up status.
+func listsTargets(strip []ShardProgressData) bool {
+	if len(strip) <= 1 {
+		return false
+	}
+	statuses := make([]string, len(strip))
+	for i, s := range strip {
+		statuses[i] = s.Status
+	}
+	return presentation.ListsTargets(statuses)
 }
 
 // partlyCompleted reports whether a rolled-up table has completed on some of

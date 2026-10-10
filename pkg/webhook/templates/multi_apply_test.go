@@ -2069,6 +2069,34 @@ func TestRenderMultiDeploymentApplyComment_StoppedTableListsWhereEachTargetStopp
 	assert.Contains(t, out, "- Targets: 2 (1 stopped, 1 complete)\n  - ○ `testapp-002`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
 }
 
+// orders rolls out to four targets. testapp-002 fails, and the operator stops
+// the apply while testapp-003 and testapp-004 are 40% through their copies.
+// The failure makes the table read as failed, and its targets are still listed
+// so the two stopped ones say where each will resume.
+func TestRenderMultiDeploymentApplyComment_FailedTableListsWhereItsStoppedTargetsStopped(t *testing.T) {
+	model := presentation.Derive([]presentation.Operation{
+		parallelTarget("primary", "testapp-001", so.Completed),
+		parallelTarget("primary", "testapp-002", so.Failed),
+		parallelTarget("primary", "testapp-003", so.Stopped),
+		parallelTarget("primary", "testapp-004", so.Stopped),
+	})
+	orders := func(database, status string, copied int64) *ApplyStatusCommentData {
+		d := tablesDetail(database, TableProgressData{TableName: "orders", Status: status, RowsCopied: copied, PercentComplete: int(copied * 100 / 1000)})
+		d.State = state.Apply.Stopped
+		return d
+	}
+	out := renderTargets(model,
+		orders("testapp_001", state.Task.Completed, 1000),
+		orders("testapp_002", state.Task.Failed, 300),
+		orders("testapp_003", state.Task.Stopped, 400),
+		orders("testapp_004", state.Task.Stopped, 400),
+	)
+
+	assert.Contains(t, out, "**`orders`**: ❌ Failed\n", "%s", out)
+	assert.Contains(t, out, "- Targets: 4 (1 failed, 2 stopped, 1 complete)\n", "%s", out)
+	assert.Contains(t, out, "  - ○ `testapp-003`: stopped at 40.00% · 400 / 1,000 rows\n  - ○ `testapp-004`: stopped at 40.00% · 400 / 1,000 rows\n", "%s", out)
+}
+
 // A rollout of `stations` then `refunds` table by table settled failed when
 // testapp-002 failed `stations`, so no target starts `refunds`. The headline
 // counts the tables done and then the targets by how they ended, and each

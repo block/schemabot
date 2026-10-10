@@ -62,12 +62,17 @@ func ListsParts(status string) bool {
 	return state.IsInFlightTaskState(state.NormalizeTaskStatus(status))
 }
 
-// ListsTargets reports whether a table across a rollout's targets in status
-// lists them one per line under it: while the change is in flight on them
-// (ListsParts), and once it stopped, since each target resumes from where it
-// stopped and the listing is what says where that is.
-func ListsTargets(status string) bool {
-	return ListsParts(status) || state.IsState(status, state.Task.Stopped)
+// ListsTargets reports whether a table across a rollout's targets, each in
+// the status at the same index of statuses, lists them one per line under it:
+// while the change is in flight on any of them (ListsParts), and while any of
+// them is stopped, since a stopped target resumes from where it stopped and
+// the listing is what says where that is. It reads the targets rather than the
+// table's rolled-up status, because a failed target outranks a stopped or
+// copying one in the rollup and would otherwise hide where they stand.
+func ListsTargets(statuses []string) bool {
+	return slices.ContainsFunc(statuses, func(status string) bool {
+		return ListsParts(status) || state.NormalizeTaskStatus(status) == state.Task.Stopped
+	})
 }
 
 // TargetCoverage is the " · 40 complete, 4 copying, 19 queued, 1 failed,

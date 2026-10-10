@@ -469,9 +469,10 @@ func TestInFlightRollupOrder_CoversEveryInFlightTaskState(t *testing.T) {
 // A table on which no target is still working and one has halted reads as
 // its halt, the way the PR comment's table line does. Its summed rows would
 // cover only the targets that finished, so no bar or rows line speaks for the
-// table. A stopped table lists its targets, each line saying where that target
-// stopped, since that is where it resumes; any other counts on its own line
-// the targets that finished or failed. "not started" is said only when no
+// table. A table with a stopped target lists its targets, each stopped
+// target's line saying where it stopped, since that is where it resumes, even
+// when a failed sibling makes the table read as failed; any other counts on
+// its own line the targets that finished or failed. "not started" is said only when no
 // target got as far as a row.
 func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 	stoppedAt := func(copied int64) rolloutTarget {
@@ -500,6 +501,11 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 			targets: []rolloutTarget{completedTarget(), failedAt(300)},
 			line:    "~ orders: ❌ Failed · 1 complete, 1 failed\n",
 		},
+		"one target done, one failed, and two stopped part-way": {
+			targets: []rolloutTarget{completedTarget(), failedAt(300), stoppedAt(400), stoppedAt(400)},
+			line:    "~ orders: ❌ Failed\n",
+			listing: []string{"• Targets: 4 (1 failed, 2 stopped, 1 complete)", "✗ payments-002: failed", "○ payments-003: stopped at 40.00% · 400 / 1,000 rows", "○ payments-004: stopped at 40.00% · 400 / 1,000 rows", "✓ payments-001: 1,000 rows"},
+		},
 		"one target done and one cancelled before copying": {
 			targets: []rolloutTarget{completedTarget(), cancelledBeforeCopying},
 			line:    "~ orders: 🚫 Cancelled · 1 complete\n",
@@ -513,7 +519,7 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 			out := renderRollout(t, targetRolloutData(tc.targets))
 			assert.Contains(t, out, tc.line, "the table reads as its halt, with no bar:\n%s", out)
 			if len(tc.listing) == 0 {
-				assert.NotContains(t, out, "• Targets:", "only a stopped table lists its targets:\n%s", out)
+				assert.NotContains(t, out, "• Targets:", "only a table with a stopped target lists its targets:\n%s", out)
 			} else {
 				prev := tc.line
 				for _, line := range tc.listing {
