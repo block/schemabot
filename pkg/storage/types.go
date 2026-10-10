@@ -663,6 +663,13 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 	return n.Artifacts[VSchemaArtifactName] != ""
 }
 
+// FinalizesWithoutVSchemaChange reports whether the engine finalizes this
+// namespace with no VSchema change for plan and apply surfaces to show: its
+// finalizer runs, but there is nothing of its own to review.
+func (n *NamespacePlanData) FinalizesWithoutVSchemaChange() bool {
+	return n != nil && n.Finalize && !n.ShowsVSchemaChange()
+}
+
 // ShowsVSchemaChange reports whether plan and apply surfaces show this
 // namespace's VSchema change as one. It is the stored-plan counterpart of
 // apitypes.SchemaChangeResponse.ShowsVSchemaChange: a change the engine
@@ -1255,6 +1262,21 @@ func (a *Apply) AllowsOperationKey(key string) bool {
 		return true
 	}
 	return slices.Contains(a.ExpectedOperationKeys, key)
+}
+
+// DeclaredOperationKeys returns the keys of every operation the apply is made
+// of: the manifest the dispatcher declared when the apply carries one, since
+// its operations may still be attaching, and the attached operations' keys
+// otherwise.
+func (a *Apply) DeclaredOperationKeys(ops []*ApplyOperation) []string {
+	if a != nil && len(a.ExpectedOperationKeys) > 0 {
+		return a.ExpectedOperationKeys
+	}
+	keys := make([]string, 0, len(ops))
+	for _, op := range ops {
+		keys = append(keys, op.OperationKey)
+	}
+	return keys
 }
 
 // MissingExpectedOperationKeys returns the manifest keys with no attached

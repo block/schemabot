@@ -73,7 +73,7 @@ func WriteProgress(data ProgressData) {
 		fmt.Println("No active schema change")
 		return
 	}
-	if len(data.Operations) > 1 {
+	if RendersOperationSections(data.Operations, data.SingleShard) {
 		writeMultiDeploymentProgress(data)
 		return
 	}

@@ -43,27 +43,6 @@ func TestFormatApplyStatusComment_ShardedAttributionFromCaller(t *testing.T) {
 	assert.NotContains(t, out, "github:", "the raw structured caller is not rendered")
 }
 
-func TestParseShardOperationKey(t *testing.T) {
-	ns, shard, table, ok := parseShardOperationKey("cdb_resolute_sharded/-40/mutes")
-	require.True(t, ok)
-	assert.Equal(t, "cdb_resolute_sharded", ns)
-	assert.Equal(t, "-40", shard)
-	assert.Equal(t, "mutes", table)
-
-	for _, key := range []string{"", "cdb_resolute_sharded/group_finalizer", "deployment-only", "ns//table"} {
-		_, _, _, ok := parseShardOperationKey(key)
-		assert.False(t, ok, "key %q must not parse as a shard work key", key)
-	}
-
-	finalizerNS, ok := parseFinalizerOperationKey("cdb_resolute_sharded/group_finalizer")
-	require.True(t, ok)
-	assert.Equal(t, "cdb_resolute_sharded", finalizerNS)
-	for _, key := range []string{"cdb_resolute_sharded/-40/mutes", "group_finalizer", ""} {
-		_, ok := parseFinalizerOperationKey(key)
-		assert.False(t, ok, "key %q must not parse as a finalizer key", key)
-	}
-}
-
 func TestIsShardedApply(t *testing.T) {
 	shardOp := func(shard string) *storage.ApplyOperation {
 		return &storage.ApplyOperation{Deployment: "cake", OperationKey: "ks/" + shard + "/mutes"}

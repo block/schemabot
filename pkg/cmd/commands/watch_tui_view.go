@@ -42,7 +42,7 @@ func (m WatchModel) View() string {
 	if state.IsState(m.state, state.NoActiveChange) {
 		return "No active schema change for this database.\n"
 	}
-	if len(m.operations) > 1 {
+	if templates.RendersOperationSections(m.operations, m.singleShard) {
 		return m.fitToWindow(m.multiDeploymentProgressSections())
 	}
 

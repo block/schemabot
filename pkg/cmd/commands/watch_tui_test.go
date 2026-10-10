@@ -504,6 +504,35 @@ func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	assert.NotContains(t, withSingleOperation, "us-east — running table copy")
 }
 
+// A sharded apply on a keyspace's only shard, with no VSchema change to show,
+// watches like an apply with one operation, as its PR comments render it: the
+// table once under its keyspace, and no section for the finalizer beside it.
+func TestWatchModel_SingleShardApplyDoesNotUseMultiView(t *testing.T) {
+	progress := apitypes.ProgressResponse{
+		State:       state.Apply.Running,
+		ApplyID:     "apply-single-shard",
+		Database:    "shop",
+		Environment: "staging",
+		SingleShard: true,
+		Operations: []*apitypes.ProgressOperationResponse{
+			{Deployment: "data-plane", OperationKey: "shop_001/-/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running},
+			{Deployment: "data-plane", OperationKey: "shop_001/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Pending},
+		},
+		Tables: []*apitypes.TableProgressResponse{
+			{Deployment: "data-plane", Keyspace: "shop_001", TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD COLUMN `note` text", Status: state.Task.Running, RowsCopied: 420, RowsTotal: 1000, PercentComplete: 42},
+		},
+	}
+	m := NewWatchModel("http://localhost:8080", "shop", "staging", false)
+	m.initialized = true
+	updated, _ := m.Update(parseProgressResult(&progress))
+
+	view := updated.(WatchModel).View()
+
+	assert.Equal(t, 1, strings.Count(view, "orders:"), "the table renders once:\n%s", view)
+	assert.NotContains(t, view, "group_finalizer")
+	assert.NotContains(t, view, "Deployments:")
+}
+
 func multiDeploymentTUITestProgress() apitypes.ProgressResponse {
 	return apitypes.ProgressResponse{
 		State:       state.Apply.Failed,

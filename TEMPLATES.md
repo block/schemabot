@@ -10055,6 +10055,32 @@ To cut over prod/payments-001:
 
 To resume from where it stopped:
   schemabot start apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-on-a-keyspaces-only-shard"></a><strong>Sharded Apply On A Keyspace's Only Shard</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-a1b2c3d4                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Completed                              │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:29:00 UTC                    │
+│  Duration:     6s                                     │
+└───────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
 ```
 </details>
 

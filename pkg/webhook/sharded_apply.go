@@ -16,60 +16,21 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
-const finalizerKeySegment = "group_finalizer"
-
-// parseShardOperationKey splits a sharded work operation key
-// "namespace/shard/table" into its parts. ok is false for any other shape — an
-// empty key (a non-sharded apply) or a "namespace/group_finalizer" finalizer
-// key — so callers can tell shard work apart from the rest.
-func parseShardOperationKey(key string) (namespace, shard, table string, ok bool) {
-	// Split without a limit so a key with extra segments (e.g.
-	// "ns/-40/table/extra") fails the exact-three-parts check rather than folding
-	// the remainder into the table and being misclassified as shard work.
-	parts := strings.Split(key, "/")
-	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
-		return "", "", "", false
-	}
-	return parts[0], parts[1], parts[2], true
-}
-
-// parseFinalizerOperationKey splits a "namespace/group_finalizer" finalizer
-// operation key into its namespace. ok is false for any other shape, including
-// the bare "group_finalizer" key a vschema-only plan produces — that shape has
-// no shard work alongside it, so it never reaches the sharded layout.
-func parseFinalizerOperationKey(key string) (namespace string, ok bool) {
-	ns, ok := strings.CutSuffix(key, "/"+finalizerKeySegment)
-	if !ok || ns == "" || strings.Contains(ns, "/") {
-		return "", false
-	}
-	return ns, true
-}
-
 // isShardedApply reports whether the apply's operations are the per-shard
-// fan-out of one or more keyspaces within one deployment: at least one work
-// operation carries a "namespace/shard/table" key, every operation is a shard
-// or finalizer operation, and they all share one deployment. A non-sharded
-// multi-deployment apply (empty operation keys) and an apply spanning more than
-// one deployment return false, so they keep the deployment-unit layout — their
-// operations differ by deployment, not shard.
+// fan-out of one or more keyspaces within one deployment
+// (presentation.IsShardedApply).
 func isShardedApply(ops []*storage.ApplyOperation) bool {
-	deployment := ""
-	hasShard := false
+	return presentation.IsShardedApply(keyedOperations(ops))
+}
+
+// keyedOperations maps operation rows to the deployment and key the sharded
+// layout decisions read.
+func keyedOperations(ops []*storage.ApplyOperation) []presentation.KeyedOperation {
+	keyed := make([]presentation.KeyedOperation, 0, len(ops))
 	for _, op := range ops {
-		_, _, _, isShard := parseShardOperationKey(op.OperationKey)
-		if _, isFinalizer := parseFinalizerOperationKey(op.OperationKey); !isShard && !isFinalizer {
-			return false
-		}
-		if deployment == "" {
-			deployment = op.Deployment
-		} else if op.Deployment != deployment {
-			return false
-		}
-		if isShard {
-			hasShard = true
-		}
+		keyed = append(keyed, presentation.KeyedOperation{Deployment: op.Deployment, OperationKey: op.OperationKey})
 	}
-	return hasShard
+	return keyed
 }
 
 // shardWorkGroup is one shard's work within a keyspace: the (namespace, shard)
@@ -119,11 +80,11 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 	var finalizes []templates.ShardedFinalize
 	finalizerError := ""
 	for _, op := range ops {
-		ns, shard, table, ok := parseShardOperationKey(op.OperationKey)
+		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
 			// isShardedApply admits only shard work and finalizer keys, so a
 			// non-shard key here is a finalizer: one keyspace's VSchema change.
-			finalizerNS, isFinalizer := parseFinalizerOperationKey(op.OperationKey)
+			finalizerNS, isFinalizer := state.NamespaceFinalizerKey(op.OperationKey)
 			if !isFinalizer {
 				continue
 			}
@@ -306,7 +267,7 @@ func resolveShardedPlanView(ctx context.Context, stor storage.Storage, apply *st
 		if d := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; d != "" {
 			view.vschemaDiffs[namespace] = d
 		}
-		if nsData.Finalize && !nsData.ShowsVSchemaChange() {
+		if nsData.FinalizesWithoutVSchemaChange() {
 			view.finalizeOnly[namespace] = true
 		}
 	}
@@ -527,7 +488,7 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 	var order []keyspaceTable
 	rollups := make(map[keyspaceTable]*tableRollup)
 	for _, op := range ops {
-		ns, shard, table, ok := parseShardOperationKey(op.OperationKey)
+		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
 			// Finalizers render in the VSchema section, not as a table.
 			continue
@@ -751,45 +712,14 @@ func shardStateRank(s string) int {
 	}
 }
 
-// fullKeyRangeShard is the name of the shard that covers a keyspace's whole
-// keyrange, which makes it the keyspace's only shard.
-const fullKeyRangeShard = "-"
-
 // rendersAsSingleShard reports whether a sharded apply reads as one change on
-// one database, so its comments take the single-deployment layout, with its
-// progress bars and DDL, instead of the shard rollup. That holds when every
-// keyspace with shard work runs on the shard covering its whole keyrange and
-// every finalizer only finalizes a keyspace beside its DDL, with no VSchema
-// change to show. The shard is judged by its keyrange, not by how many shards
-// the apply touches: operations exist only for the shards that change, so one
-// changing shard of a keyspace with several is still a sharded change and
-// keeps the shard layout, which names it. So do a VSchema change, a keyspace
-// whose only work is its finalize, and a stored plan that could not be read
-// (a nil view). The decision reads every operation the apply declared, not
-// only those attached so far, so an apply whose operations attach over time
-// takes one layout from its first comment rather than switching as its
-// siblings appear.
+// one database (presentation.ReadsAsSingleShard), so its comments take the
+// single-deployment layout, with its progress bars and DDL, instead of the
+// shard rollup. A stored plan that could not be read (a nil view) keeps the
+// shard layout. The decision reads every operation the apply declared, not
+// only those attached so far.
 func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, view *shardedPlanView) bool {
-	keyspacesWithWork := make(map[string]bool)
-	var finalizerKeyspaces []string
-	for _, key := range applyOperationKeys(apply, ops) {
-		if ns, shard, _, ok := parseShardOperationKey(key); ok {
-			if shard != fullKeyRangeShard {
-				return false
-			}
-			keyspacesWithWork[ns] = true
-			continue
-		}
-		if ns, ok := parseFinalizerOperationKey(key); ok {
-			finalizerKeyspaces = append(finalizerKeyspaces, ns)
-		}
-	}
-	for _, ns := range finalizerKeyspaces {
-		if !keyspacesWithWork[ns] || !view.finalizesOnly(ns) {
-			return false
-		}
-	}
-	return len(keyspacesWithWork) > 0
+	return presentation.ReadsAsSingleShard(apply.DeclaredOperationKeys(ops), view.finalizesOnly)
 }
 
 // buildSingleShardApplyCommentData maps a sharded apply that rendersAsSingleShard
@@ -806,7 +736,7 @@ func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.Apply
 	var workTasks []*storage.Task
 	var workOps []*storage.ApplyOperation
 	for _, op := range ops {
-		if _, _, _, ok := parseShardOperationKey(op.OperationKey); ok {
+		if _, _, _, ok := state.ShardWorkKey(op.OperationKey); ok {
 			workOps = append(workOps, op)
 			workTasks = append(workTasks, tasksByOp[op.ID]...)
 		}
@@ -825,19 +755,4 @@ func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.Apply
 		}
 	}
 	return data
-}
-
-// applyOperationKeys returns the keys of every operation the apply is made of:
-// the manifest the dispatcher declared when the apply carries one, since its
-// operations may still be attaching, and the attached operations' keys
-// otherwise.
-func applyOperationKeys(apply *storage.Apply, ops []*storage.ApplyOperation) []string {
-	if apply != nil && len(apply.ExpectedOperationKeys) > 0 {
-		return apply.ExpectedOperationKeys
-	}
-	keys := make([]string, 0, len(ops))
-	for _, op := range ops {
-		keys = append(keys, op.OperationKey)
-	}
-	return keys
 }

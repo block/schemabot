@@ -71,6 +71,7 @@ func previewCLIMultiDeployAllOutput() {
 		{"MULTI-TARGET ROLLOUT PAST A FAILED TARGET", previewCLIMultiTargetRolloutInProgress},
 		{"MULTI-TARGET ROLLOUT WAITING FOR CUTOVER", previewCLIMultiTargetRolloutWaitingForCutover},
 		{"MULTI-TARGET ROLLOUT STOPPED", previewCLIMultiTargetRolloutStopped},
+		{"SHARDED APPLY ON A KEYSPACE'S ONLY SHARD", previewCLISingleShardApplyCompleted},
 	}
 	for i, section := range sections {
 		if i > 0 {
@@ -151,6 +152,30 @@ func previewCLIMultiTargetRolloutStopped() {
 	data := multiDeploymentProgressData(ops, tables)
 	data.State = state.Apply.Stopped
 	WriteProgress(data)
+}
+
+// previewCLISingleShardApplyCompleted is a completed apply on a keyspace's
+// only shard, finalized with no VSchema change to show: one change on one
+// database, rendered without a section for the shard or the finalizer.
+func previewCLISingleShardApplyCompleted() {
+	ddl := "ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL"
+	WriteProgress(ProgressData{
+		ApplyID:     "apply-shard-a1b2c3d4",
+		Database:    "shop",
+		Environment: "production",
+		Caller:      "github:octocat@acme/shop#412",
+		State:       state.Apply.Completed,
+		StartedAt:   previewTime.Add(-1 * time.Minute).Format(time.RFC3339),
+		CompletedAt: previewTime.Add(-54 * time.Second).Format(time.RFC3339),
+		SingleShard: true,
+		Operations: []ProgressOperation{
+			{Deployment: "prod", OperationKey: "shop_001/-/orders", OperationKind: storage.ApplyOperationKindWork, ExternalOperationID: "1157", State: state.ApplyOperation.Completed},
+			{Deployment: "prod", OperationKey: "shop_001/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer, ExternalOperationID: "1158", State: state.ApplyOperation.Completed},
+		},
+		Tables: []TableProgress{
+			{Deployment: "prod", Namespace: "shop_001", TableName: "orders", ChangeType: "alter", Dialect: schema.DialectMySQL, DDL: ddl, Status: state.Task.Completed, RowsCopied: 80000, RowsTotal: 80000, PercentComplete: 100},
+		},
+	})
 }
 
 func multiDeploymentProgressData(ops []ProgressOperation, tables []TableProgress) ProgressData {

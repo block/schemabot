@@ -151,6 +151,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		tables:       data.Tables,
 		operations:   data.Operations,
 		released:     data.Released,
+		singleShard:  data.SingleShard,
 		deferCutover: data.Options["defer_cutover"] == "true",
 		errorMsg:     data.ErrorMessage,
 		applyID:      result.ApplyID,
