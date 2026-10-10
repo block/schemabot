@@ -21,6 +21,41 @@ import (
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
+// The rollback comment names a finding's rule only in its lint fold, so it
+// shows warning-severity findings and withholds error-severity ones. It links a
+// guide only for what it shows: an operator reading "Related guidance" with nothing above it naming
+// the rule has no way to tell what the link is about.
+func TestRollbackPlanCommentRelatedGuidance(t *testing.T) {
+	for _, severity := range []string{"warning", "error"} {
+		t.Run(severity, func(t *testing.T) {
+			resp := &apitypes.PlanResponse{
+				Changes: []*apitypes.SchemaChangeResponse{{Namespace: "app", TableChanges: []*apitypes.TableChangeResponse{{TableName: "customers", DDL: "ALTER TABLE `customers` DROP INDEX `idx_created_at`;"}}}},
+				LintResults: []*apitypes.LintViolationResponse{
+					{Table: "customers", Linter: "primary_key", Severity: severity, Message: `Primary key column "id" has type "varchar"`},
+					{Table: "orders", Linter: "primary_key", Severity: severity, Message: `Primary key column "id" has type "varchar"`},
+				},
+			}
+			h, _, _ := newTestHandler(t)
+			data := h.rollbackCommentData("app", "mysql", "staging", "apply_abc123", resp, "")
+			if severity == "warning" {
+				require.Len(t, data.LintViolations, 2)
+				assert.Equal(t, "primary_key", data.LintViolations[0].LinterName)
+			} else {
+				assert.Empty(t, data.LintViolations)
+			}
+			out := templates.RenderRollbackPlanComment(data)
+			if severity == "warning" {
+				assert.Equal(t, 1, strings.Count(out, "docs/mysql.md#choosing-a-primary-key"),
+					"two findings on one rule link the guide once")
+				assert.Contains(t, out, "📖 **Related guidance:**\n\n- [Choosing a primary key]")
+			} else {
+				assert.NotContains(t, out, "docs/mysql.md#choosing-a-primary-key")
+				assert.NotContains(t, out, "📖 **Related guidance:**")
+			}
+		})
+	}
+}
+
 func TestWebhookRollbackDispatch(t *testing.T) {
 	h, _, _ := newTestHandler(t)
 
