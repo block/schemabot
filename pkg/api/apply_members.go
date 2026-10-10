@@ -150,7 +150,11 @@ func (s *Service) MemberPlansForReviewRound(ctx context.Context, plan *storage.P
 	}
 	stored, err := s.storage.Plans().List(ctx, reviewRoundListing(plan, environment))
 	if err != nil {
-		return nil, fmt.Errorf("list member plans for %s/%s round %s: %w", plan.Database, environment, plan.PlanIdentifier, err)
+		return nil, &applyStorageError{
+			Operation: fmt.Sprintf("list member plans for %s/%s round %s", plan.Database, environment, plan.PlanIdentifier),
+			Plan:      plan,
+			Err:       err,
+		}
 	}
 	byMember := make(map[string]*storage.Plan, len(stored))
 	for _, candidate := range stored {

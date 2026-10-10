@@ -401,6 +401,7 @@ func previewCommentApplyFlowAllOutput() {
 		{"ROLLBACK CONFIRM BLOCKED (UNSAFE CHANGE)", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackUnsafeBlocked()) }},
 		{"ROLLBACK STATUS: RUNNING", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackStatus()) }},
 		{"SUMMARY: ROLLBACK COMPLETE", func() { fmt.Print(webhooktemplates.PreviewCommentRollbackSummaryCompleted()) }},
+		{"ROLLBACK-CONFIRM REFUSED: ROLLBACK PLAN STORED WITHOUT ROUTING", func() { fmt.Print(webhook.PreviewRollbackConfirmPlanWithoutRouting()) }},
 	}
 	printSections(sections)
 }
