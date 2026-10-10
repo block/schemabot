@@ -11,6 +11,10 @@ func writable(id, serverID string) WriterCandidate {
 	return WriterCandidate{ID: id, Status: WriterStatus{Writable: true, ServerID: serverID}}
 }
 
+func writableReplicaOf(id, serverID string, sources ...string) WriterCandidate {
+	return WriterCandidate{ID: id, Status: WriterStatus{Writable: true, ServerID: serverID, SourceIDs: sources}}
+}
+
 func replicaOf(id, serverID, reason string, sources ...string) WriterCandidate {
 	return WriterCandidate{ID: id, Status: WriterStatus{ReadOnlyReason: reason, ServerID: serverID, SourceIDs: sources}}
 }
@@ -48,6 +52,22 @@ func TestSelectWriter(t *testing.T) {
 				replicaOf("standby", "uuid-standby", "innodb_read_only=1", "uuid-blue"),
 			},
 			want: 0,
+		},
+		{
+			name: "writer replicating back from its standby",
+			candidates: []WriterCandidate{
+				writableReplicaOf("blue", "uuid-blue", "uuid-green"),
+				replicaOf("green", "uuid-green", "read_only=1", "uuid-blue"),
+			},
+			want: 0,
+		},
+		{
+			name: "writer relaying from a server outside the candidates",
+			candidates: []WriterCandidate{
+				writableReplicaOf("blue", "uuid-blue", "uuid-upstream"),
+				replicaOf("green", "uuid-green", "read_only=1", "uuid-blue"),
+			},
+			wantErr: []string{"writable candidate blue replicates from server uuid-upstream, which is not one of the candidates"},
 		},
 		{
 			name:       "two writable candidates",

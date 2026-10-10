@@ -3,9 +3,11 @@ package inventory
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 
 	"github.com/block/schemabot/pkg/mysqlconn"
@@ -73,7 +75,7 @@ func (p MySQLWriterProbe) ProbeWriter(ctx context.Context, dsn string) (WriterSt
 func mysqlReplicationSources(ctx context.Context, conn *sql.Conn) ([]string, error) {
 	rows, err := conn.QueryContext(ctx, "SHOW REPLICA STATUS")
 	if err != nil {
-		return nil, fmt.Errorf("read replication status: %w", err)
+		return nil, replicationStatusError(err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -110,4 +112,18 @@ func mysqlReplicationSources(ctx context.Context, conn *sql.Conn) ([]string, err
 		return nil, fmt.Errorf("iterate replication status: %w", err)
 	}
 	return sources, nil
+}
+
+// mysqlParseError is the server error for a statement it cannot parse.
+const mysqlParseError = 1064
+
+// replicationStatusError wraps a failed SHOW REPLICA STATUS. A server that
+// cannot parse the statement predates it, which is a reason the operator can
+// act on, so it is reported as unsupported rather than as a generic failure.
+func replicationStatusError(err error) error {
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlParseError {
+		return &UnsupportedServerError{Reason: "the server does not support SHOW REPLICA STATUS, which needs MySQL 8.0.22 or later", Err: err}
+	}
+	return fmt.Errorf("read replication status: %w", err)
 }

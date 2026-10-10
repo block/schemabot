@@ -1,10 +1,13 @@
 package etre
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -230,30 +233,39 @@ func (r *EtreResolver) connect(ctx context.Context, req inventory.Request, entit
 // one inventory.SelectWriter chooses. Any candidate it cannot connect to or
 // probe fails the resolution, because the remaining candidates cannot then be
 // proven to hold the only writer.
+//
+// The candidates are probed concurrently, so a slow candidate costs one probe
+// timeout rather than one per candidate. They are ordered by Etre id, then
+// host, first, so a candidate named by its position keeps its name from one
+// resolution to the next whatever order the query returned.
 func (r *EtreResolver) resolveWriter(ctx context.Context, req inventory.Request, entities []etre.Entity) (connection, error) {
 	if len(entities) > maxWriterCandidates {
 		return connection{}, fmt.Errorf("resolve target %q: %d etre entities matched, more than the %d a writer probe will check; narrow the selector", req.Target, len(entities), maxWriterCandidates)
 	}
 
-	conns := make([]connection, 0, len(entities))
-	candidates := make([]inventory.WriterCandidate, 0, len(entities))
-	for i, entity := range entities {
-		conn, err := r.connect(ctx, req, entity)
-		if err != nil {
-			return connection{}, fmt.Errorf("writer candidate %s: %w", candidateID(entity, i), err)
+	ordered := slices.Clone(entities)
+	slices.SortStableFunc(ordered, func(a, b etre.Entity) int {
+		return cmp.Or(
+			cmp.Compare(StringField(a, "_id"), StringField(b, "_id")),
+			cmp.Compare(StringField(a, r.cfg.HostField), StringField(b, r.cfg.HostField)),
+		)
+	})
+
+	results := make([]probedCandidate, len(ordered))
+	var wg sync.WaitGroup
+	for i, entity := range ordered {
+		wg.Go(func() { results[i] = r.probeCandidate(ctx, req, entity, i) })
+	}
+	wg.Wait()
+
+	conns := make([]connection, 0, len(results))
+	candidates := make([]inventory.WriterCandidate, 0, len(results))
+	for _, result := range results {
+		if result.err != nil {
+			return connection{}, result.err
 		}
-		conn.entityID = candidateID(entity, i)
-		status, err := r.probe(ctx, conn)
-		if err != nil {
-			r.cfg.Logger.Warn("etre: writer probe failed; refusing to resolve the target",
-				"target", req.Target, "environment", req.Environment, "candidate", conn.entityID, "host", conn.host, "error", err)
-			// The probe error carries the candidate's endpoint (a dial error
-			// names the host), and a resolution error can reach a PR comment,
-			// so the raw error stays in the log above.
-			return connection{}, fmt.Errorf("resolve target %q: writer candidate %s could not be probed; see server logs", req.Target, conn.entityID)
-		}
-		conns = append(conns, conn)
-		candidates = append(candidates, inventory.WriterCandidate{ID: conn.entityID, Status: status})
+		conns = append(conns, result.conn)
+		candidates = append(candidates, inventory.WriterCandidate{ID: result.conn.entityID, Status: result.status})
 	}
 
 	chosen, err := inventory.SelectWriter(candidates)
@@ -264,6 +276,44 @@ func (r *EtreResolver) resolveWriter(ctx context.Context, req inventory.Request,
 	}
 	r.logWriterChoice(req, conns[chosen], conns, candidates)
 	return conns[chosen], nil
+}
+
+// probedCandidate is one candidate's connection and what probing it found, or
+// the resolution error it ends in.
+type probedCandidate struct {
+	conn   connection
+	status inventory.WriterStatus
+	err    error
+}
+
+// probeCandidate connects to one matched entity and probes it.
+func (r *EtreResolver) probeCandidate(ctx context.Context, req inventory.Request, entity etre.Entity, index int) probedCandidate {
+	id := candidateID(entity, index)
+	conn, err := r.connect(ctx, req, entity)
+	if err != nil {
+		return probedCandidate{err: fmt.Errorf("writer candidate %s: %w", id, err)}
+	}
+	conn.entityID = id
+	status, err := r.probe(ctx, conn)
+	if err != nil {
+		r.cfg.Logger.Warn("etre: writer probe failed; refusing to resolve the target",
+			"target", req.Target, "environment", req.Environment, "candidate", conn.entityID, "host", conn.host, "error", err)
+		return probedCandidate{err: probeFailure(req, conn, err)}
+	}
+	return probedCandidate{conn: conn, status: status}
+}
+
+// probeFailure is the resolution error for a candidate that could not be
+// probed. The probe error can carry the candidate's endpoint (a dial error
+// names the host), and a resolution error can reach a PR comment, so the raw
+// error stays in the server log and only a reason the probe wrote for display
+// is shown.
+func probeFailure(req inventory.Request, conn connection, err error) error {
+	var unsupported *inventory.UnsupportedServerError
+	if errors.As(err, &unsupported) {
+		return fmt.Errorf("resolve target %q: writer candidate %s could not be probed: %s", req.Target, conn.entityID, unsupported.Reason)
+	}
+	return fmt.Errorf("resolve target %q: writer candidate %s could not be probed; see server logs", req.Target, conn.entityID)
 }
 
 // candidateID names a matched entity in errors and logs by its Etre id, which

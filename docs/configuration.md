@@ -210,6 +210,10 @@ accepts writes only when both of these hold:
 - Exactly one match has `read_only` and `innodb_read_only` off.
 - Every other match replicates from it: its replication status names the
   writable match's `server_uuid` as a source.
+- The writable match replicates from no server outside the matches. It may
+  replicate back from its own standby, but a writable relay fed from elsewhere
+  is not the authoritative copy, and a change made on it would collide with
+  the same change arriving from its source.
 
 Anything else refuses to resolve the target, and the error names each match
 and what it reported. That covers no writable match, two writable matches, a
@@ -219,15 +223,17 @@ from the writer is refused rather than ignored, because nothing then shows that
 the two matches are copies of one database.
 
 A lookup that matches one entity is not probed. A lookup that matches more than
-four is refused without probing. The probe runs each time the target is
+four is refused without probing. The matches are probed at the same time, each
+under its own timeout. The probe runs each time the target is
 resolved, so a switchover is picked up on the next request without any change
 to the inventory. It chooses the writer when a request resolves the target; it
 does not watch an apply that is already running.
 
 The probe connects with the same credentials and TLS settings as the schema
 change, and needs the `REPLICATION CLIENT` privilege to read the replication
-status. Resolvers for the other database types refuse a lookup that matches
-more than one entity.
+status. `SHOW REPLICA STATUS` needs MySQL 8.0.22 or later; on an older server
+the probe refuses the target and its error says so. Resolvers for the other
+database types refuse a lookup that matches more than one entity.
 
 ### PostgreSQL Etre targets
 

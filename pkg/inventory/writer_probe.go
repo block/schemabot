@@ -33,6 +33,20 @@ type WriterStatus struct {
 	SourceIDs []string
 }
 
+// UnsupportedServerError reports a candidate that was reached but cannot answer
+// the probe, such as a server too old for a statement the probe needs. Reason
+// is written by the probe and names no connection detail, so a resolver may
+// show it where the wrapped driver error, which can name the endpoint, cannot
+// go.
+type UnsupportedServerError struct {
+	Reason string
+	Err    error
+}
+
+func (e *UnsupportedServerError) Error() string { return e.Reason + ": " + e.Err.Error() }
+
+func (e *UnsupportedServerError) Unwrap() error { return e.Err }
+
 // WriterCandidate is one probed candidate. ID names it in errors and logs; it
 // must identify the inventory record without revealing connection details.
 type WriterCandidate struct {
@@ -50,6 +64,12 @@ type WriterCandidate struct {
 // refused rather than either chosen or silently passed over. Two writable
 // candidates (a switchover in progress, or a split) and no writable candidate
 // are refused too, since there is no single place a change can safely land.
+//
+// The writer itself may replicate only from other candidates, as the active
+// side of a pair replicating in both directions does. A writer that replicates
+// from a server outside the candidates is a relay, not the authoritative copy:
+// a change made on it would later collide with the same change arriving from
+// its source, and break that replication.
 func SelectWriter(candidates []WriterCandidate) (int, error) {
 	if len(candidates) == 0 {
 		return -1, fmt.Errorf("no candidates to choose a writer from")
@@ -73,6 +93,9 @@ func SelectWriter(candidates []WriterCandidate) (int, error) {
 	if writer.Status.ServerID == "" {
 		return -1, fmt.Errorf("writable candidate %s reported no server identity, so its replicas cannot be verified", writer.ID)
 	}
+	if source, ok := sourceOutside(writer, candidates); ok {
+		return -1, fmt.Errorf("writable candidate %s replicates from server %s, which is not one of the candidates, so it is not the authoritative copy (%s)", writer.ID, source, describeCandidates(candidates))
+	}
 	for i, c := range candidates {
 		if i == writable[0] {
 			continue
@@ -82,6 +105,20 @@ func SelectWriter(candidates []WriterCandidate) (int, error) {
 		}
 	}
 	return writable[0], nil
+}
+
+// sourceOutside returns the first server writer replicates from that is not
+// one of the candidates.
+func sourceOutside(writer WriterCandidate, candidates []WriterCandidate) (string, bool) {
+	for _, source := range writer.Status.SourceIDs {
+		inCandidates := slices.ContainsFunc(candidates, func(c WriterCandidate) bool {
+			return c.Status.ServerID == source
+		})
+		if !inCandidates {
+			return source, true
+		}
+	}
+	return "", false
 }
 
 // describeCandidates renders each candidate's observed state for an error.

@@ -3,7 +3,9 @@ package etre
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/block/mysql"
 	"github.com/square/etre"
@@ -14,10 +16,12 @@ import (
 )
 
 // fakeWriterProbe reports a fixed status per connection address and records
-// which addresses were probed.
+// which addresses were probed. The resolver probes candidates concurrently, so
+// the record is guarded.
 type fakeWriterProbe struct {
 	byAddr map[string]inventory.WriterStatus
 	errs   map[string]error
+	mu     sync.Mutex
 	probed []string
 }
 
@@ -26,7 +30,9 @@ func (f *fakeWriterProbe) ProbeWriter(_ context.Context, dsn string) (inventory.
 	if err != nil {
 		return inventory.WriterStatus{}, fmt.Errorf("parse probed dsn: %w", err)
 	}
+	f.mu.Lock()
 	f.probed = append(f.probed, cfg.Addr)
+	f.mu.Unlock()
 	if err := f.errs[cfg.Addr]; err != nil {
 		return inventory.WriterStatus{}, err
 	}
@@ -141,6 +147,17 @@ func TestEtreResolverWriterProbeRefusesWithoutOneProvenWriter(t *testing.T) {
 			errs:    map[string]error{"orders-green.example:3306": fmt.Errorf("dial tcp orders-green.example:3306: i/o timeout")},
 			wantErr: []string{"writer candidate id-green could not be probed; see server logs"},
 		},
+		{
+			name: "one side is too old to probe",
+			byAddr: map[string]inventory.WriterStatus{
+				"orders.example:3306": {Writable: true, ServerID: "uuid-blue"},
+			},
+			errs: map[string]error{"orders-green.example:3306": &inventory.UnsupportedServerError{
+				Reason: "the server does not support SHOW REPLICA STATUS, which needs MySQL 8.0.22 or later",
+				Err:    fmt.Errorf("orders-green.example:3306: Error 1064: You have an error in your SQL syntax"),
+			}},
+			wantErr: []string{"writer candidate id-green could not be probed: the server does not support SHOW REPLICA STATUS, which needs MySQL 8.0.22 or later"},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -199,4 +216,75 @@ func TestEtreResolverWithoutWriterProbeRefusesTwoMatches(t *testing.T) {
 	_, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "orders-dsid"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "expected exactly one")
+}
+
+// barrierWriterProbe answers only once every expected probe is in flight, so a
+// resolver that probed one candidate at a time would never get an answer.
+type barrierWriterProbe struct {
+	byAddr  map[string]inventory.WriterStatus
+	arrived chan struct{}
+	release chan struct{}
+	want    int
+	once    sync.Once
+}
+
+func (b *barrierWriterProbe) ProbeWriter(ctx context.Context, dsn string) (inventory.WriterStatus, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return inventory.WriterStatus{}, fmt.Errorf("parse probed dsn: %w", err)
+	}
+	b.arrived <- struct{}{}
+	if len(b.arrived) == b.want {
+		b.once.Do(func() { close(b.release) })
+	}
+	select {
+	case <-b.release:
+		return b.byAddr[cfg.Addr], nil
+	case <-ctx.Done():
+		return inventory.WriterStatus{}, fmt.Errorf("probe of %s was never joined by the other candidates: %w", cfg.Addr, ctx.Err())
+	}
+}
+
+// The candidates are probed at the same time, so a target whose candidates are
+// slow to answer waits for the slowest one rather than for all of them in turn.
+func TestEtreResolverWriterProbeProbesCandidatesConcurrently(t *testing.T) {
+	probe := &barrierWriterProbe{
+		byAddr: map[string]inventory.WriterStatus{
+			"orders.example:3306":       {Writable: true, ServerID: "uuid-blue"},
+			"orders-green.example:3306": {ReadOnlyReason: "read_only=1", ServerID: "uuid-green", SourceIDs: []string{"uuid-blue"}},
+		},
+		arrived: make(chan struct{}, 2),
+		release: make(chan struct{}),
+		want:    2,
+	}
+	r := newEtreResolverForTest(t, nil, pairEntities(), EtreResolverConfig{
+		TargetLabel: "dsid",
+		EnvLabel:    "env",
+		HostField:   "writer_endpoint",
+		WriterProbe: probe,
+	})
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	target, err := r.ResolveTarget(ctx, inventory.Request{Target: "orders-dsid", DatabaseType: "mysql", Environment: "staging"})
+	require.NoError(t, err)
+	assert.Equal(t, "orders.example:3306", resolvedAddr(t, target))
+}
+
+// A candidate without an Etre id is named by its position, and the position is
+// taken after ordering the candidates by host, so the same server keeps the
+// same name whichever order the inventory returned them in.
+func TestEtreResolverWriterProbeNamesCandidatesStably(t *testing.T) {
+	blue := etre.Entity{"writer_endpoint": "orders.example"}
+	green := etre.Entity{"writer_endpoint": "orders-green.example"}
+	probe := &fakeWriterProbe{byAddr: map[string]inventory.WriterStatus{
+		"orders.example:3306":       {ReadOnlyReason: "read_only=1", ServerID: "uuid-blue"},
+		"orders-green.example:3306": {ReadOnlyReason: "innodb_read_only=1", ServerID: "uuid-green"},
+	}}
+	for _, entities := range [][]etre.Entity{{blue, green}, {green, blue}} {
+		r := newWriterProbeResolver(t, entities, probe)
+		_, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "orders-dsid", DatabaseType: "mysql", Environment: "staging"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "match 1 read-only: innodb_read_only=1; match 2 read-only: read_only=1")
+	}
 }
