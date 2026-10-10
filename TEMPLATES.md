@@ -10090,23 +10090,24 @@ To resume from where it stopped:
 
 ```
 
-┌───────────────────────────────────────────────────────┐
-│  Apply ID:     apply-shard-e5f6a7b8                   │
-│  Database:     shop                                   │
-│  Environment:  production                             │
-│  State:        Running                                │
-│  Caller:       github:octocat                         │
-│  Source:       https://github.com/acme/shop/pull/412  │
-│  Started:      Jan 15 14:26:00 UTC                    │
-│  Duration:     4m                                     │
-└───────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                     │
+│  Database:     shop                                     │
+│  Environment:  production                               │
+│  State:        Running                                  │
+│  Shards:       1 running table copy, 3 waiting for -40  │
+│  Caller:       github:octocat                           │
+│  Source:       https://github.com/acme/shop/pull/412    │
+│  Started:      Jan 15 14:26:00 UTC                      │
+│  Duration:     4m                                       │
+└─────────────────────────────────────────────────────────┘
 
 
   ── shop_001 ──
 
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38% (1 of 4 shards)
        ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
-       • Rows: 914,707 / 1,466,232 across 1 of 4 shards · ETA: ≥ 3m 15s
+       • Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
        • Shards: 4 (1 copying, 3 queued)
            ◉ -40: 62.38% · 914,707 / 1,466,232 rows · ETA: 3m 15s
            ○ 40-80: queued
@@ -10128,6 +10129,7 @@ To resume from where it stopped:
 │  Database:     shop                                   │
 │  Environment:  production                             │
 │  State:        Failed                                 │
+│  Shards:       1 failed, 3 cancelled                  │
 │  Caller:       github:octocat                         │
 │  Source:       https://github.com/acme/shop/pull/412  │
 │  Started:      Jan 15 14:26:00 UTC                    │

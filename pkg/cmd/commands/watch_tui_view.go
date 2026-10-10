@@ -132,6 +132,12 @@ func (m WatchModel) progressSections() (string, string) {
 		b.WriteString(m.spinner.View() + "Starting...\n")
 	}
 
+	if m.sharded {
+		if counts := templates.ShardCounts(m.operations, m.released); counts != "" {
+			fmt.Fprintf(&b, "  Shards:  %s\n", counts)
+		}
+	}
+
 	// Keep the PlanetScale deploy request link visible throughout the apply,
 	// not only during deploy-request setup, so operators can open the console
 	// to inspect a copy in flight. Setup phases already show it inline above;

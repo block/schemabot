@@ -60,15 +60,17 @@ func TestWriteProgressShardRowsWithoutShardedKeepTheirSections(t *testing.T) {
 // renders as one table with its shards under it, as the PR comment does. Its
 // row figures cover the one started shard, so the bar and the rows line say
 // so, and the ETA reads as a floor, rather than passing that shard's fraction
-// off as the table's. The finalizer's VSchema change shows under the tables,
-// and no line counts the operation rows as deployments.
+// off as the table's, while the planned size names the shards it covers. The
+// header counts the shards by status, the finalizer's VSchema change shows
+// under the tables, and no line counts the operation rows as deployments.
 func TestWriteProgressShardedApplyRollsShardsUpUnderTheTable(t *testing.T) {
 	data := ParseProgressResponse(multiShardRunningResponse())
 	output := captureStdout(t, func() { WriteProgress(data) })
 
 	assert.Equal(t, 1, strings.Count(output, "~ orders:"), "the table renders once:\n%s", output)
 	assert.Contains(t, output, "62.00% (1 of 4 shards)")
-	assert.Contains(t, output, "Rows: 620 / 1,000 across 1 of 4 shards · ETA: ≥ ")
+	assert.Contains(t, output, "Shards:       1 running table copy, 3 waiting for -40")
+	assert.Contains(t, output, "Rows: 620 / 1,000 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ ")
 	assert.Contains(t, output, "Shards: 4 (1 copying, 3 queued)")
 	assert.Contains(t, output, "◉ -40"+ANSIReset+": 62.00% · 620 / 1,000 rows")
 	assert.Contains(t, output, "○ 40-80: queued")
@@ -98,8 +100,9 @@ func TestParseProgressResponseShardedTakesAFailedOperationsError(t *testing.T) {
 
 // multiShardRunningResponse is a sharded apply copying `orders` across a
 // keyspace's four shards, as the server reports it: one table row rolled up
-// across the shards, of which only -40 has started, and the finalizer's
-// pending VSchema change in the display metadata.
+// across the shards, of which only -40 has started, with the table's planned
+// size across all four, and the finalizer's pending VSchema change in the
+// display metadata.
 func multiShardRunningResponse() *apitypes.ProgressResponse {
 	ops := []*apitypes.ProgressOperationResponse{
 		{Deployment: "data-plane", OperationKey: "shop_001/-40/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running},
@@ -125,6 +128,7 @@ func multiShardRunningResponse() *apitypes.ProgressResponse {
 			TableName: "orders", Keyspace: "shop_001", Deployment: "data-plane", ChangeType: "alter",
 			DDL:    "ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`)",
 			Status: state.Task.Running, RowsCopied: 620, RowsTotal: 1000, PercentComplete: 62, ETASeconds: 195,
+			EstimatedBytes: new(int64(23_400_000_000)), PlannedShards: 4,
 			Shards: []*apitypes.ShardProgressResponse{
 				{Shard: "-40", Status: state.Task.Running, RowsCopied: 620, RowsTotal: 1000, PercentComplete: 62, ETASeconds: 195},
 				{Shard: "40-80", Status: state.Task.Pending},

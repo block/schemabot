@@ -136,7 +136,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 		errorMessage = finalizerError
 	}
 
-	shardsByKeyspace := shardStatusesByKeyspace(groupOrder, len(keyspaceOrder) > 1, released, tasksByOp)
+	shardsByKeyspace := shardStatusesByKeyspace(groupOrder, released, tasksByOp)
 	tablesByKeyspace := shardedTableStatusesByKeyspace(ops, tasksByOp, view)
 	keyspaces := make([]templates.ShardedKeyspace, 0, len(keyspaceOrder))
 	for _, ns := range keyspaceOrder {
@@ -373,63 +373,35 @@ func isOperationFailureState(opState string) bool {
 	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
 }
 
-// shardStatusesByKeyspace derives one status per (keyspace, shard) group and
-// buckets the results per keyspace, preserving resolved order. Each shard's
-// operations are aggregated to a single representative state, then every
-// shard — across all keyspaces — is projected through pkg/presentation in one
-// pass so ordering labels reference sibling shards regardless of keyspace.
-// The presentation identity is the shard name; when the apply spans more than
-// one keyspace it is keyspace-qualified ("keyspace/shard"), because shard
-// names repeat across keyspaces (every unsharded keyspace's shard is "-") and
-// an ordering label naming a bare duplicate shard would be ambiguous. The
-// status row's own Shard stays the plain name either way — it renders under
-// its keyspace heading. Either way the identity is unique across groups —
-// bare names are unique within a single keyspace, qualified names are unique
-// by construction — so results key back to their groups by identity rather
-// than by output position.
-func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, released bool, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardStatus {
-	inputs := make([]presentation.Operation, 0, len(groups))
+// shardStatusesByKeyspace derives one status per (keyspace, shard) group
+// (presentation.DeriveShards) and buckets the results per keyspace, preserving
+// resolved order. The status row's Shard is the plain name; it renders under
+// its keyspace heading.
+func shardStatusesByKeyspace(groups []shardWorkGroup, released bool, tasksByOp map[int64][]*storage.Task) map[string][]templates.ShardStatus {
+	work := make([]presentation.ShardWork, 0, len(groups))
 	for _, g := range groups {
-		st, errMsg := aggregateShardState(g.ops, tasksByOp)
-		first := g.ops[0]
-		identity := g.shard
-		if qualifyIdentity {
-			identity = g.namespace + "/" + g.shard
+		sw := presentation.ShardWork{Keyspace: g.namespace, Shard: g.shard}
+		for _, op := range g.ops {
+			sw.Operations = append(sw.Operations, presentation.Operation{
+				State:             op.State,
+				Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
+				Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
+				ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
+				PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
+				Released:          released,
+				Error:             shardOperationError(op, tasksByOp[op.ID]),
+			})
 		}
-		inputs = append(inputs, presentation.Operation{
-			Deployment:        identity,
-			State:             st,
-			Barrier:           first.CutoverPolicy == storage.CutoverPolicyBarrier,
-			Parallel:          first.CutoverPolicy == storage.CutoverPolicyParallel,
-			ContinueOnFailure: first.OnFailure == storage.OnFailureContinue,
-			PauseOnFailure:    first.OnFailure == storage.OnFailurePause,
-			Released:          released,
-			Error:             errMsg,
-		})
-	}
-	derived := presentation.Derive(inputs).Deployments
-	byIdentity := make(map[string]presentation.Deployment, len(derived))
-	for _, d := range derived {
-		byIdentity[d.Deployment] = d
+		work = append(work, sw)
 	}
 	out := make(map[string][]templates.ShardStatus, len(groups))
-	for i, g := range groups {
-		d, ok := byIdentity[inputs[i].Deployment]
-		if !ok {
-			// Derive returns one deployment per input operation with its
-			// identity preserved; a missing identity means that contract broke.
-			// Omit the row rather than render some other shard's status under
-			// this shard's name.
-			slog.Warn("sharded apply comment will omit a shard status row: presentation returned no deployment for identity",
-				"identity", inputs[i].Deployment, "keyspace", g.namespace, "shard", g.shard)
-			continue
-		}
-		out[g.namespace] = append(out[g.namespace], templates.ShardStatus{
-			Shard: g.shard,
-			Emoji: d.Emoji,
-			Label: d.Label,
-			State: d.State,
-			Error: d.Error,
+	for _, s := range presentation.DeriveShards(work) {
+		out[s.Keyspace] = append(out[s.Keyspace], templates.ShardStatus{
+			Shard: s.Shard,
+			Emoji: s.Emoji,
+			Label: s.Label,
+			State: s.State,
+			Error: s.Error,
 		})
 	}
 	return out
@@ -500,26 +472,16 @@ func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) prese
 	return presentation.ShardOperationCopy(op.State, copies)
 }
 
-// aggregateShardState reduces a shard's operations to its most significant
-// state (and that operation's error), so a shard whose tables are in different
-// states shows the state an operator should act on first. A shard with a single
-// operation — the common case — returns that operation's state unchanged. When
-// the chosen operation row carries no error message (a remote failure records
-// the error on the operation's tasks, and the operator may not have stamped the
-// row), it falls back to the first task error so a failed shard always shows why
-// — otherwise the comment is silent and the operator has to dig through logs.
-func aggregateShardState(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) (string, string) {
-	best := ops[0]
-	for _, op := range ops[1:] {
-		if shardStateRank(op.State) > shardStateRank(best.State) {
-			best = op
-		}
+// shardOperationError is a shard operation's error. When the row carries no
+// error message (a remote failure records the error on the operation's tasks,
+// and the operator may not have stamped the row), it falls back to the first
+// task error so a failed shard always shows why; otherwise the comment is
+// silent and the operator has to dig through logs.
+func shardOperationError(op *storage.ApplyOperation, tasks []*storage.Task) string {
+	if op.ErrorMessage != "" {
+		return op.ErrorMessage
 	}
-	errMsg := best.ErrorMessage
-	if errMsg == "" {
-		errMsg = firstTaskError(tasksByOp[best.ID])
-	}
-	return best.State, errMsg
+	return firstTaskError(tasks)
 }
 
 // firstTaskError returns the first non-empty task error for an operation.
@@ -530,42 +492,6 @@ func firstTaskError(tasks []*storage.Task) string {
 		}
 	}
 	return ""
-}
-
-// shardStateRank orders operation states by how much they demand attention, so
-// aggregateShardState surfaces the most actionable one. Failure ranks highest;
-// completed lowest.
-func shardStateRank(s string) int {
-	switch s {
-	case state.ApplyOperation.Failed:
-		return 12
-	case state.ApplyOperation.FailedRetryable:
-		return 11
-	case state.ApplyOperation.Running:
-		return 10
-	case state.ApplyOperation.CuttingOver:
-		return 9
-	case state.ApplyOperation.WaitingForCutover:
-		return 8
-	case state.ApplyOperation.Recovering:
-		return 7
-	case state.ApplyOperation.Resuming:
-		return 6
-	case state.ApplyOperation.Stopped:
-		return 5
-	case state.ApplyOperation.RevertWindow:
-		return 4
-	case state.ApplyOperation.Pending:
-		return 3
-	case state.ApplyOperation.Cancelled:
-		return 2
-	case state.ApplyOperation.Reverted:
-		return 1
-	case state.ApplyOperation.Completed:
-		return 0
-	default:
-		return 3
-	}
 }
 
 // rendersAsSingleShard reports whether a sharded apply reads as one change on
@@ -633,11 +559,25 @@ func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.Apply
 		}
 	}
 	if data.ErrorMessage == "" {
-		if opState, errMsg := aggregateShardState(ops, tasksByOp); isOperationFailureState(opState) {
-			data.ErrorMessage = errMsg
-		}
+		data.ErrorMessage = mostSignificantFailure(ops, tasksByOp)
 	}
 	return data
+}
+
+// mostSignificantFailure is the error of the operation an operator should act
+// on first (presentation.ShardStateRank) when that operation failed, and ""
+// otherwise.
+func mostSignificantFailure(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task) string {
+	best := ops[0]
+	for _, op := range ops[1:] {
+		if presentation.ShardStateRank(op.State) > presentation.ShardStateRank(best.State) {
+			best = op
+		}
+	}
+	if !isOperationFailureState(best.State) {
+		return ""
+	}
+	return shardOperationError(best, tasksByOp[best.ID])
 }
 
 // applyOperationKeys returns the keys of every operation the apply is made of:

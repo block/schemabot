@@ -222,7 +222,7 @@ func previewCLIShardedApplyRunning() {
 		{Shard: "40-80", Status: state.Task.Pending},
 		{Shard: "80-c0", Status: state.Task.Pending},
 		{Shard: "c0-", Status: state.Task.Pending},
-	}, TableProgress{Status: state.Task.Running, RowsCopied: 914707, RowsTotal: 1466232, PercentComplete: 62, ETASeconds: 195}))
+	}, TableProgress{Status: state.Task.Running, RowsCopied: 914707, RowsTotal: 1466232, PercentComplete: 62, ETASeconds: 195, EstimatedBytes: new(int64(23_400_000_000)), PlannedShards: 4}))
 }
 
 // previewCLIShardedApplyFailed is a sharded apply whose first shard failed,

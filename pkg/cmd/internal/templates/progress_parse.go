@@ -89,6 +89,9 @@ type TableProgress struct {
 	// EstimatedBytes is the table's on-disk size when it was planned, shown
 	// beside the row counts. Nil when the plan had no estimate.
 	EstimatedBytes *int64
+	// PlannedShards is how many shards a sharded table's change spans per its
+	// plan, the shards EstimatedBytes covers. Zero when the plan recorded none.
+	PlannedShards int
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -206,6 +209,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
 			EstimatedBytes:      tbl.EstimatedBytes,
+			PlannedShards:       int(tbl.PlannedShards),
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,

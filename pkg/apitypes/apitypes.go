@@ -1819,8 +1819,13 @@ type TableProgressResponse struct {
 	// (data plus indexes), for display beside the row counts. It is the
 	// table's size when planned, not a measure of copy progress. Absent when
 	// the plan had no estimate and for a task scoped to one shard, since the
-	// estimate covers the whole table.
+	// estimate covers the whole table. A sharded table rolled up across its
+	// shards carries it, covering every shard.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+	// PlannedShards is how many shards a sharded table's change spans per its
+	// plan, the shards EstimatedBytes covers. Zero when the plan recorded no
+	// count and for a table not rolled up across shards.
+	PlannedShards int32 `json:"planned_shards,omitempty"`
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`

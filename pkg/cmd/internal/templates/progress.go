@@ -103,6 +103,11 @@ func WriteProgress(data ProgressData) {
 		rows = append(rows, BoxRow{"Environment", data.Environment})
 	}
 	rows = append(rows, BoxRow{"State", displayState})
+	if data.Sharded {
+		if counts := ShardCounts(data.Operations, data.Released); counts != "" {
+			rows = append(rows, BoxRow{"Shards", counts})
+		}
+	}
 	rows = append(rows, callerAndSourceBoxRows(data.Caller, data.PullRequestURL)...)
 	if len(data.Options) > 0 {
 		var opts []string
@@ -836,7 +841,8 @@ func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 	if reporting, ok := partialShardCoverage(t); ok {
 		// The unreported shards can only add rows and time, so the figures
 		// cover the shards named and the ETA is a floor.
-		coverage = fmt.Sprintf(" across %d of %d shards", reporting, len(t.Shards))
+		coverage = fmt.Sprintf(" across %d of %d shards", reporting, shardTotal(t))
+		size = ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards)
 		eta = "≥ " + eta
 	}
 	if t.ETASeconds > 0 {
@@ -861,14 +867,21 @@ func partialShardCoverage(t TableProgress) (int, bool) {
 			reporting++
 		}
 	}
-	return reporting, reporting > 0 && reporting < len(t.Shards)
+	return reporting, reporting > 0 && reporting < shardTotal(t)
+}
+
+// shardTotal is how many shards a sharded table's copy spans: the plan's
+// count, or the shards listed when more are listed than the plan recorded or
+// it recorded none, as the PR comment counts them.
+func shardTotal(t TableProgress) int {
+	return max(len(t.Shards), t.PlannedShards)
 }
 
 // shardCoverageSuffix annotates a sharded table's copy percentage with the
 // shards it covers when only some have reported (partialShardCoverage).
 func shardCoverageSuffix(t TableProgress) string {
 	if reporting, ok := partialShardCoverage(t); ok {
-		return fmt.Sprintf(" (%d of %d shards)", reporting, len(t.Shards))
+		return fmt.Sprintf(" (%d of %d shards)", reporting, shardTotal(t))
 	}
 	return ""
 }

@@ -72,8 +72,8 @@ func shardTask(opID int64, taskState string, copied, total int64) *storage.Task 
 
 // A table copying across a keyspace's shards reads as one table with each
 // shard listed under it, as the PR comment shows it: a shard whose wave has
-// not started, and so has no task yet, lists as queued, and the table's rows
-// cover only the shard that reported. The finalizer's VSchema change joins the
+// not started, and so has no task yet, lists as queued, the table's rows
+// cover only the shard that reported, and its planned size covers every shard. The finalizer's VSchema change joins the
 // VSchema display metadata with the diff the stored plan carries, and every
 // operation row is still listed.
 func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
@@ -83,6 +83,7 @@ func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
 		shardOp(3, "shop_001/group_finalizer", state.ApplyOperation.Pending),
 	}
 	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
+		Tables:    []storage.TableChange{{Table: "orders", EstimatedBytes: new(int64(23_400_000_000)), ShardCount: 2}},
 		Finalize:  true,
 		Artifacts: map[string]string{storage.VSchemaArtifactName: `{"tables":{"orders":{}}}`},
 		Metadata:  map[string]string{storage.PlanMetadataVSchemaDiff: "+ orders"},
@@ -101,6 +102,9 @@ func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
 	assert.Equal(t, int64(620), table.RowsCopied)
 	assert.Equal(t, int64(1000), table.RowsTotal)
 	assert.Equal(t, int32(62), table.PercentComplete)
+	require.NotNil(t, table.EstimatedBytes, "the table carries its planned size")
+	assert.Equal(t, int64(23_400_000_000), *table.EstimatedBytes)
+	assert.Equal(t, int32(2), table.PlannedShards)
 	require.Len(t, table.Shards, 2)
 	assert.Equal(t, apitypes.ShardProgressResponse{Shard: "-80", Status: state.Task.Running, RowsCopied: 620, RowsTotal: 1000}, *table.Shards[0])
 	assert.Equal(t, apitypes.ShardProgressResponse{Shard: "80-", Status: state.ApplyOperation.Pending}, *table.Shards[1])

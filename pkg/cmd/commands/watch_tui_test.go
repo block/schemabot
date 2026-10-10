@@ -504,9 +504,9 @@ func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	assert.NotContains(t, withSingleOperation, "us-east — running table copy")
 }
 
-// A sharded apply watches as one change, as its PR comments render it: each
-// table once under its keyspace with its shards listed beneath it, and no
-// section for a shard or the finalizer.
+// A sharded apply watches as one change, as its PR comments render it: the
+// shards counted by status, each table once under its keyspace with its
+// shards listed beneath it, and no section for a shard or the finalizer.
 func TestWatchModel_ShardedApplyDoesNotUseMultiView(t *testing.T) {
 	progress := apitypes.ProgressResponse{
 		State:       state.Apply.Running,
@@ -535,6 +535,7 @@ func TestWatchModel_ShardedApplyDoesNotUseMultiView(t *testing.T) {
 	view := updated.(WatchModel).View()
 
 	assert.Equal(t, 1, strings.Count(view, "orders:"), "the table renders once:\n%s", view)
+	assert.Contains(t, view, "Shards:  2 running table copy")
 	assert.Contains(t, view, "Shards: 2 (2 copying)")
 	assert.NotContains(t, view, "group_finalizer")
 	assert.NotContains(t, view, "Deployments:")

@@ -15,8 +15,9 @@ import (
 // one change across its keyspaces' shards, not as an operation row per shard
 // and table. Each keyspace table becomes one row with its shards listed under
 // it, a table on its keyspace's only shard keeps its own rows, and each
-// finalizer with a VSchema change joins the VSchema display metadata.
-// Operations still lists every row. Any other apply is left as it is.
+// finalizer with a VSchema change joins the VSchema display metadata, all read
+// against the stored plan. Operations still lists every row. Any other apply
+// is left as it is.
 //
 // rows are the apply's table rows, one per task, in the order of tasks.
 func (s *Service) rollUpShardedProgress(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, ops []*storage.ApplyOperation, tasks []*storage.Task, rows []*apitypes.TableProgressResponse) {
@@ -29,8 +30,9 @@ func (s *Service) rollUpShardedProgress(ctx context.Context, resp *apitypes.Prog
 		return
 	}
 	resp.Sharded = true
-	resp.Tables = shardedTableRows(ops, tasks, rows)
-	s.addFinalizerVSchemaChanges(ctx, resp, apply, ops)
+	plan := s.storedPlanForShardedProgress(ctx, apply)
+	resp.Tables = shardedTableRows(ops, tasks, rows, plan)
+	s.addFinalizerVSchemaChanges(resp, apply, ops, plan)
 }
 
 // shardedTableRows rolls a sharded apply's per-task rows up into one row per
@@ -38,8 +40,9 @@ func (s *Service) rollUpShardedProgress(ctx context.Context, resp *apitypes.Prog
 // table running only on its keyspace's only shard keeps its task rows as they
 // are, since there is no shard to name. Rows of finalizer operations are
 // dropped: a finalizer is a keyspace's VSchema change, not a table. A row whose
-// task belongs to no listed operation is kept as it is.
-func shardedTableRows(ops []*storage.ApplyOperation, tasks []*storage.Task, rows []*apitypes.TableProgressResponse) []*apitypes.TableProgressResponse {
+// task belongs to no listed operation is kept as it is. A rolled-up row carries
+// the table's planned size from plan, which may be nil.
+func shardedTableRows(ops []*storage.ApplyOperation, tasks []*storage.Task, rows []*apitypes.TableProgressResponse, plan *storage.Plan) []*apitypes.TableProgressResponse {
 	opByID := make(map[int64]*storage.ApplyOperation, len(ops))
 	for _, op := range ops {
 		opByID[op.ID] = op
@@ -79,7 +82,9 @@ func shardedTableRows(ops []*storage.ApplyOperation, tasks []*storage.Task, rows
 			out = append(out, rowsByOp[tableOps[0].ID]...)
 			continue
 		}
-		out = append(out, shardedTableRow(key.namespace, key.table, tableOps, tasksByOp, rowsByOp))
+		row := shardedTableRow(key.namespace, key.table, tableOps, tasksByOp, rowsByOp)
+		row.EstimatedBytes, row.PlannedShards = plannedTableSize(plan, key.namespace, key.table)
+		out = append(out, row)
 	}
 	return append(out, unattributed...)
 }
@@ -146,6 +151,21 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 	return row
 }
 
+// plannedTableSize is a keyspace table's size across all its shards and the
+// number of shards it spans, as plan recorded them, or nil and zero when plan
+// is nil or recorded no estimate for the table.
+func plannedTableSize(plan *storage.Plan, namespace, table string) (*int64, int32) {
+	if plan == nil || plan.Namespaces[namespace] == nil {
+		return nil, 0
+	}
+	for _, tc := range plan.Namespaces[namespace].Tables {
+		if tc.Table == table && tc.EstimatedBytes != nil {
+			return tc.EstimatedBytes, int32(tc.ShardCount)
+		}
+	}
+	return nil, 0
+}
+
 // taskCopies is a shard operation's stored tasks as the shard rollup reads
 // them.
 func taskCopies(tasks []*storage.Task) []presentation.ShardCopy {
@@ -167,10 +187,10 @@ func taskCopies(tasks []*storage.Task) []presentation.ShardCopy {
 // (presentation.FinalizerVSchemaStatus) and the diff the stored plan carries,
 // the change the operator approved. A finalizer the plan says only finalizes
 // its keyspace, with no VSchema change, adds nothing. A plan that cannot be
-// read shows every finalizer as a VSchema change without a diff, as the PR
-// comments do, so no VSchema change goes unshown. A VSchema change the engine
-// already reported is left as it is.
-func (s *Service) addFinalizerVSchemaChanges(ctx context.Context, resp *apitypes.ProgressResponse, apply *storage.Apply, ops []*storage.ApplyOperation) {
+// read (a nil plan) shows every finalizer as a VSchema change without a diff,
+// as the PR comments do, so no VSchema change goes unshown. A VSchema change
+// the engine already reported is left as it is.
+func (s *Service) addFinalizerVSchemaChanges(resp *apitypes.ProgressResponse, apply *storage.Apply, ops []*storage.ApplyOperation, plan *storage.Plan) {
 	existing, err := apitypes.ParseVSchemaChanges(resp.Metadata)
 	if err != nil {
 		s.logger.Warn("progress response will keep the engine's VSchema display metadata without the finalizers': failed to decode it",
@@ -181,17 +201,11 @@ func (s *Service) addFinalizerVSchemaChanges(ctx context.Context, resp *apitypes
 	for _, c := range existing {
 		reported[c.Namespace] = true
 	}
-	var plan *storage.Plan
-	planRead := false
 	changes := existing
 	for _, op := range ops {
 		ns, ok := state.NamespaceFinalizerKey(op.OperationKey)
 		if !ok || reported[ns] {
 			continue
-		}
-		if !planRead {
-			planRead = true
-			plan = s.storedPlanForShardedProgress(ctx, apply)
 		}
 		var nsPlan *storage.NamespacePlanData
 		if plan != nil {
@@ -221,18 +235,19 @@ func (s *Service) addFinalizerVSchemaChanges(ctx context.Context, resp *apitypes
 	resp.Metadata[apitypes.VSchemaChangesMetadataKey] = encoded
 }
 
-// storedPlanForShardedProgress loads the apply's stored plan for its
-// finalizers' VSchema changes, or nil when it cannot be read. The progress
+// storedPlanForShardedProgress loads the apply's stored plan for its tables'
+// planned sizes and its finalizers' VSchema changes, or nil when it cannot be
+// read. The progress
 // response is display only, so a failed read is logged rather than failing it.
 func (s *Service) storedPlanForShardedProgress(ctx context.Context, apply *storage.Apply) *storage.Plan {
 	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
-		s.logger.Warn("progress response will show every finalizer as a VSchema change without a diff: failed to load stored plan",
+		s.logger.Warn("progress response will show every table without its planned size and every finalizer as a VSchema change without a diff: failed to load stored plan",
 			append(apply.LogAttrs(), "plan_id", apply.PlanID, "error", err)...)
 		return nil
 	}
 	if plan == nil {
-		s.logger.Warn("progress response will show every finalizer as a VSchema change without a diff: stored plan row not found",
+		s.logger.Warn("progress response will show every table without its planned size and every finalizer as a VSchema change without a diff: stored plan row not found",
 			append(apply.LogAttrs(), "plan_id", apply.PlanID)...)
 		return nil
 	}

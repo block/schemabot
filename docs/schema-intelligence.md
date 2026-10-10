@@ -628,7 +628,9 @@ keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
 then rolled up across the shards: one entry per keyspace table, with `status`
 the shard state that needs attention first, `rows_copied` and `rows_total`
 summed over the shards that have reported a total, and `shards` listing each
-shard's own state and rows. A shard whose wave has not started reports its
+shard's own state and rows. `estimated_bytes` is the table's planned size
+across all its shards, and `planned_shards` the number of shards the plan
+recorded it spanning. A shard whose wave has not started reports its
 operation's state and no rows. A table on its keyspace's only shard keeps its
 task's entry, with its `task_id`, and lists no shards. Each finalizer that
 changes its keyspace's VSchema appears in `metadata.vschema_changes` with its
