@@ -51,8 +51,9 @@ const MaxWebhookEventAttempts = 5
 const (
 	// CutoverPolicyRolling keeps the rollout fully serial: a later deployment
 	// does not start until every earlier sibling in deployment_order has
-	// completed. It is the default for an environment without a targets list,
-	// and the fallback for an operation inserted without a policy.
+	// completed. It is the default for an environment with any member outside
+	// a targets list, and the fallback for an operation inserted without a
+	// policy.
 	CutoverPolicyRolling = "rolling"
 
 	// CutoverPolicyBarrier lets later deployments run their copy phase once
@@ -64,8 +65,8 @@ const (
 	// the cutover phase stays deployment-ordered, exactly like barrier. This
 	// collapses copy wall-clock toward "longest copy" for rollouts whose
 	// hours-long copy dominates, while preserving the ordered, one-at-a-time
-	// cutover swaps. It is the default for an environment that routes through
-	// a targets list.
+	// cutover swaps. It is the default for an environment whose every member
+	// comes from a targets list.
 	CutoverPolicyParallel = "parallel"
 )
 

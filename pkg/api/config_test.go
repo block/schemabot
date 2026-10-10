@@ -2377,10 +2377,13 @@ func TestValidateDeploymentOrder_EmptyMapKey(t *testing.T) {
 }
 
 // TestServerConfig_CutoverPolicyFor verifies the cutover-policy resolver: an
-// explicit policy always wins; left unset, a multi-target environment (a
-// targets list at the environment level or inside a deployments entry)
-// resolves to parallel, and every other environment, configured or not,
-// resolves to rolling.
+// explicit policy always wins; left unset, an environment whose every member
+// comes from a targets list (at the environment level, or in every entry of a
+// deployments map) resolves to parallel, and every other environment,
+// configured or not, resolves to rolling. A deployments map that mixes a
+// targets list with a single target resolves to rolling, since its
+// single-target members are the ones a serial rollout lets an operator watch
+// one region at a time.
 func TestServerConfig_CutoverPolicyFor(t *testing.T) {
 	oneTargetMap := map[string]DeploymentTarget{"payments-a": {Target: "payments"}}
 	targetsList := []TargetEntry{{Target: "payments-001"}, {Target: "payments-002"}}
@@ -2399,6 +2402,9 @@ func TestServerConfig_CutoverPolicyFor(t *testing.T) {
 					"targets-barrier":            {Targets: targetsList, Deployment: "payments-a", CutoverPolicy: storage.CutoverPolicyBarrier},
 					"deployment-targets-unset":   {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetsList}}},
 					"deployment-targets-rolling": {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetsList}}, CutoverPolicy: storage.CutoverPolicyRolling},
+					"every-deployment-targets":   {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Targets: []TargetEntry{{Target: "shop-002"}}}}},
+					"mixed-deployments-unset":    {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Target: "shop-eu"}}},
+					"mixed-deployments-parallel": {Deployments: map[string]DeploymentTarget{"us": {Targets: []TargetEntry{{Target: "shop-001"}}}, "eu": {Target: "shop-eu"}}, CutoverPolicy: storage.CutoverPolicyParallel},
 				},
 			},
 		},
@@ -2414,6 +2420,9 @@ func TestServerConfig_CutoverPolicyFor(t *testing.T) {
 	assert.Equal(t, storage.CutoverPolicyBarrier, cfg.CutoverPolicyFor("payments", "targets-barrier"), "explicit barrier on a targets list is barrier")
 	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "deployment-targets-unset"), "a targets list inside a deployments entry defaults to parallel")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "deployment-targets-rolling"), "explicit rolling on a deployment's targets list is rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "every-deployment-targets"), "a deployments map whose every entry is a targets list defaults to parallel")
+	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "mixed-deployments-unset"), "a deployments map mixing a targets list with a single target defaults to rolling")
+	assert.Equal(t, storage.CutoverPolicyParallel, cfg.CutoverPolicyFor("payments", "mixed-deployments-parallel"), "explicit parallel on a mixed deployments map is parallel")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("payments", "missing-env"), "unconfigured env defaults to rolling")
 	assert.Equal(t, storage.CutoverPolicyRolling, cfg.CutoverPolicyFor("missing-db", "policy-barrier"), "unconfigured database defaults to rolling")
 }
