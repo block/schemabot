@@ -138,8 +138,8 @@ func TestEtreResolverWriterProbeRefusesWithoutOneProvenWriter(t *testing.T) {
 			byAddr: map[string]inventory.WriterStatus{
 				"orders.example:3306": {Writable: true, ServerID: "uuid-blue"},
 			},
-			errs:    map[string]error{"orders-green.example:3306": fmt.Errorf("dial tcp: i/o timeout")},
-			wantErr: []string{"probe writer candidate id-green", "i/o timeout"},
+			errs:    map[string]error{"orders-green.example:3306": fmt.Errorf("dial tcp orders-green.example:3306: i/o timeout")},
+			wantErr: []string{"writer candidate id-green could not be probed; see server logs"},
 		},
 	}
 	for _, tt := range tests {
@@ -153,7 +153,9 @@ func TestEtreResolverWriterProbeRefusesWithoutOneProvenWriter(t *testing.T) {
 			for _, want := range tt.wantErr {
 				assert.Contains(t, err.Error(), want)
 			}
-			assert.NotContains(t, err.Error(), "orders.example", "errors name candidates by inventory id, not endpoint")
+			for _, endpoint := range []string{"orders.example", "orders-green.example"} {
+				assert.NotContains(t, err.Error(), endpoint, "errors name candidates by inventory id, not endpoint")
+			}
 		})
 	}
 }

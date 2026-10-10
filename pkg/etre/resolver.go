@@ -247,7 +247,10 @@ func (r *EtreResolver) resolveWriter(ctx context.Context, req inventory.Request,
 		if err != nil {
 			r.cfg.Logger.Warn("etre: writer probe failed; refusing to resolve the target",
 				"target", req.Target, "environment", req.Environment, "candidate", conn.entityID, "host", conn.host, "error", err)
-			return connection{}, fmt.Errorf("resolve target %q: probe writer candidate %s: %w", req.Target, conn.entityID, err)
+			// The probe error carries the candidate's endpoint (a dial error
+			// names the host), and a resolution error can reach a PR comment,
+			// so the raw error stays in the log above.
+			return connection{}, fmt.Errorf("resolve target %q: writer candidate %s could not be probed; see server logs", req.Target, conn.entityID)
 		}
 		conns = append(conns, conn)
 		candidates = append(candidates, inventory.WriterCandidate{ID: conn.entityID, Status: status})

@@ -144,10 +144,11 @@ func resolvePair(t *testing.T, r *EtreResolver) (*inventory.Target, error) {
 // When the read-only side stops replicating, nothing proves the two are copies
 // of one database, so the target does not resolve at all.
 func TestEtreResolverWriterProbeAgainstReplicatedPair(t *testing.T) {
-	nw, err := tcnetwork.New(t.Context())
+	ctx := t.Context()
+	nw, err := tcnetwork.New(ctx)
 	require.NoError(t, err, "create docker network")
 	t.Cleanup(func() {
-		if err := nw.Remove(t.Context()); err != nil {
+		if err := nw.Remove(context.WithoutCancel(ctx)); err != nil {
 			t.Logf("remove docker network: %v", err)
 		}
 	})
