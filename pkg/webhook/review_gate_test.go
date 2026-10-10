@@ -377,6 +377,56 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			want: wantChanged,
 		},
 		{
+			// The PR was stacked on another, so its approved diff carried the
+			// lower PR's table. The lower PR merged with a revised table, and
+			// the rebase left this PR changing only its own files.
+			name: "a rebase after the stacked PR below it merged a revised table counts",
+			prChange: addVotesAnd(func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			}),
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, `task_id` bigint, PRIMARY KEY (`id`))"
+			},
+			headChange: addVotes,
+			want:       wantCovers,
+		},
+		{
+			name: "a rebase after the stacked PR below it merged unchanged counts",
+			prChange: addVotesAnd(func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			}),
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			headChange: addVotes,
+			want:       wantCovers,
+		},
+		{
+			name: "a table the PR dropped beside one the default branch took over does not count",
+			prChange: func(files map[string]string) {
+				files["schema/testdb/captures/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+				files["schema/testdb/captures/capture_events.sql"] = "CREATE TABLE `capture_events` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/captures/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			headChange: func(map[string]string) {},
+			want:       wantChanged,
+		},
+		{
+			name: "a head rebuilt on an older default branch that no longer carries the PR's edit does not count",
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, PRIMARY KEY (`id`))"
+			},
+			prChange: func(files map[string]string) {
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, `note` text, PRIMARY KEY (`id`))"
+			},
+			headChange:        func(map[string]string) {},
+			approvedOnNewBase: true,
+			headOnOldBase:     true,
+			want:              wantChanged,
+		},
+		{
 			name:       "the PR dropping a table it had added after the approval does not count",
 			prChange:   addVotes,
 			headChange: func(map[string]string) {},

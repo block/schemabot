@@ -1151,7 +1151,11 @@ type SchemaChangeComparison struct {
 // when the pull request turns the same base content into the same result at
 // both commits, or when it leaves the path as its base branch has it at both
 // commits, so any difference came from the base branch rather than from the
-// pull request. That second rule holds only when the head's base content is
+// pull request. A path the pull request no longer touches at the head is also
+// unchanged when the base branch changed it since the approved commit's base:
+// what the pull request did there has been replaced by base branch content,
+// as when a stacked pull request below this one merges and this one is
+// rebased. Both rules hold only when the head's base content is
 // newer than the approved commit's: the head's merge base must descend from
 // the approved commit's. A head rebuilt on older base content would otherwise
 // carry an older version of a path the pull request never touched, which
@@ -1283,7 +1287,7 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 		s := item.sides
 		identical := sameGitObject(s[sideApproved], s[sideHead])
 		switch {
-		case sameChange(s) || (c.baseMovedForward && untouchedByPR(s)):
+		case c.pathUnchanged(s):
 			sides := []gitSide{s[sideHead]}
 			if !identical {
 				sides = append(sides, s[sideApproved])
@@ -1311,6 +1315,25 @@ func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (str
 	return "", nil
 }
 
+// pathUnchanged reports whether the pull request's change to a path is the
+// same at the approved commit and the head, or differs only by base branch
+// content that had its own review: the pull request makes the same change on
+// the same base, it leaves the path alone at both commits, or it no longer
+// touches a path the base branch has changed since the approval. The last two
+// hold only when the base moved forward. supersededByBase never decides a
+// directory on every side: inside it, a file the pull request dropped without
+// the base branch changing it must still count as a change, so the directory
+// is compared entry by entry instead.
+func (c *schemaChangeComparer) pathUnchanged(s [4]gitSide) bool {
+	if sameChange(s) {
+		return true
+	}
+	if !c.baseMovedForward {
+		return false
+	}
+	return untouchedByPR(s) || (supersededByBase(s) && !onlyTrees(s))
+}
+
 // sameChange reports whether the pull request turns the same base content
 // into the same result at both commits. Identical results on different bases
 // are not the same change: the head would then undo, or overwrite, what the
@@ -1324,6 +1347,18 @@ func sameChange(sides [4]gitSide) bool {
 // base branch.
 func untouchedByPR(sides [4]gitSide) bool {
 	return sameGitObject(sides[sideApproved], sides[sideApprovedBase]) && sameGitObject(sides[sideHead], sides[sideHeadBase])
+}
+
+// supersededByBase reports whether the pull request leaves the path as its
+// base branch has it at the head, and the base branch has changed the path
+// since the approved commit's base. Whatever the pull request did to the path
+// when it was approved has been replaced by base branch content that reached
+// the base branch through its own review, as when a stacked pull request
+// below this one merges and this one is rebased onto it. A path the pull
+// request stopped changing that the base branch did not change is not
+// superseded: dropping part of a change is a different change.
+func supersededByBase(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideHead], sides[sideHeadBase]) && !sameGitObject(sides[sideApprovedBase], sides[sideHeadBase])
 }
 
 // onlyTrees reports whether every side where the path exists is a directory,
