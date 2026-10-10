@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 
@@ -134,7 +135,24 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 		Credentials:     creds,
 		Assembler:       assembler,
 		TableOwner:      etreTableOwner(cfg),
+		WriterProbe:     etreWriterProbe(cfg),
+		Logger:          logger,
 	})
+}
+
+// writerProbeConnectTimeout bounds the dial to each candidate a writer probe
+// checks.
+const writerProbeConnectTimeout = 5 * time.Second
+
+// etreWriterProbe returns the writer probe for the configured engine, or nil
+// for an engine without one, where a lookup matching more than one entity is
+// refused. Only MySQL has one: a MySQL target is the server the schema change
+// runs on, so the probe checks the server that will be changed.
+func etreWriterProbe(cfg EtreConfig) inventory.WriterProbe {
+	if cfg.DatabaseType != storage.DatabaseTypeMySQL {
+		return nil
+	}
+	return inventory.MySQLWriterProbe{ConnectTimeout: writerProbeConnectTimeout}
 }
 
 // etreHostField returns the entity field holding the connection host for the

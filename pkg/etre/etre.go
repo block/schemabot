@@ -164,26 +164,38 @@ func newClient(entities etre.EntityClient, entityType string, logger *slog.Logge
 // Selector predicates are equality matches joined into an Etre query; keys are
 // sorted so the query string is deterministic.
 func (c *Client) QueryOne(ctx context.Context, selector map[string]string) (etre.Entity, error) {
+	matches, err := c.Query(ctx, selector)
+	if err != nil {
+		return nil, err
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("%d etre %q entities matched %q (expected exactly one); narrow the selector to disambiguate", len(matches), c.entityType, buildQuery(selector))
+	}
+	c.logger.Debug("etre: resolved one entity", "entity_type", c.entityType, "query", buildQuery(selector))
+	return matches[0], nil
+}
+
+// Query returns every entity matching selector, for callers that choose among
+// several matches themselves rather than requiring exactly one.
+//
+// An empty selector or zero matches are errors, as for QueryOne; zero matches
+// wrap ErrNotFound. The result is never empty when the error is nil.
+func (c *Client) Query(ctx context.Context, selector map[string]string) ([]etre.Entity, error) {
 	if len(selector) == 0 {
 		return nil, fmt.Errorf("selector is required to query etre %q entities", c.entityType)
 	}
 
 	query := buildQuery(selector)
-	c.logger.Debug("etre: querying for one entity", "entity_type", c.entityType, "query", query)
+	c.logger.Debug("etre: querying entities", "entity_type", c.entityType, "query", query)
 
 	matches, err := c.entities.Query(ctx, query, etre.QueryFilter{})
 	if err != nil {
 		return nil, fmt.Errorf("query etre %q entities matching %q: %w", c.entityType, query, err)
 	}
-	switch len(matches) {
-	case 0:
+	if len(matches) == 0 {
 		return nil, fmt.Errorf("no etre %q entity matched %q: %w", c.entityType, query, ErrNotFound)
-	case 1:
-		c.logger.Debug("etre: resolved one entity", "entity_type", c.entityType, "query", query)
-		return matches[0], nil
-	default:
-		return nil, fmt.Errorf("%d etre %q entities matched %q (expected exactly one); narrow the selector to disambiguate", len(matches), c.entityType, query)
 	}
+	return matches, nil
 }
 
 // buildQuery turns equality predicates into a deterministic Etre query string
