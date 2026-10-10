@@ -3,6 +3,7 @@ package psclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -466,6 +467,117 @@ func TestListKeyspacesFailsWhenNextPageDoesNotAdvance(t *testing.T) {
 	assert.Equal(t, []string{"1", "2"}, requested)
 }
 
+// stalledPageRequestTimeout is the per-request timeout in the stalled-listing
+// tests. It is far longer than the bounds those tests exercise, so a listing
+// that ends in time was ended by the bound under test, not by a page timeout.
+const stalledPageRequestTimeout = 10 * time.Second
+
+// stalledKeyspacesWrapper returns a wrapper whose API answers the pages in
+// pages and never answers any other page: the request stays open until the
+// client gives up on it. Its listing bound is listingTimeout.
+func stalledKeyspacesWrapper(t *testing.T, pages map[string]string, listingTimeout time.Duration) *psClientWrapper {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if body, ok := pages[r.URL.Query().Get("page")]; ok {
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	// Cleanups run last-registered-first: release any stalled handler before
+	// Close waits for its connection.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	client, err := NewPSClientWithBaseURL("token-name", "token-value", srv.URL)
+	require.NoError(t, err)
+	wrapper, ok := client.(*psClientWrapper)
+	require.True(t, ok)
+	wrapper.httpClient.Timeout = stalledPageRequestTimeout
+	wrapper.keyspaceListingTimeout = listingTimeout
+	return wrapper
+}
+
+func listOrdersKeyspacesWith(ctx context.Context, wrapper *psClientWrapper) ([]*ps.Keyspace, error) {
+	return wrapper.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
+		Organization: "block",
+		Database:     "orders",
+		Branch:       "main",
+	})
+}
+
+// A caller with no deadline of its own lists a branch whose API answers the
+// first page and then stops answering. The listing ends at its overall bound,
+// long before any page request times out, and the error says the listing as a
+// whole timed out, which branch it was, and how far it got.
+func TestListKeyspacesEndsAtTheOverallBound(t *testing.T) {
+	wrapper := stalledKeyspacesWrapper(t, map[string]string{
+		"1": `{"current_page":1,"next_page":2,"data":[{"name":"orders"}]}`,
+	}, 200*time.Millisecond)
+
+	start := time.Now()
+	keyspaces, err := listOrdersKeyspacesWith(t.Context(), wrapper)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main: listing as a whole timed out after 200ms (pages read: 1, waiting on page 2)")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at its overall bound, not at a page timeout")
+}
+
+// Which deadline ended a page request is decided by which fired first, not by
+// which contexts have ended by the time the failure is classified. Both
+// deadlines have expired before classification in every case here.
+func TestListingBoundEndedFollowsTheFirstDeadline(t *testing.T) {
+	t.Run("listing bound fired before the caller's deadline", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancelCaller()
+		listCtx, cancel := context.WithTimeoutCause(caller, time.Millisecond, errKeyspaceListingBound)
+		defer cancel()
+		<-listCtx.Done()
+		<-caller.Done()
+
+		assert.True(t, listingBoundEnded(listCtx, fmt.Errorf("page 2: %w", context.DeadlineExceeded)))
+		assert.False(t, listingBoundEnded(listCtx, errors.New("page 2: connection reset")), "a page that failed for its own reason keeps its error")
+	})
+
+	t.Run("caller's deadline fired before the listing bound", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(t.Context(), time.Millisecond)
+		defer cancelCaller()
+		listCtx, cancel := context.WithTimeoutCause(caller, 50*time.Millisecond, errKeyspaceListingBound)
+		defer cancel()
+		<-caller.Done()
+		<-listCtx.Done()
+
+		assert.False(t, listingBoundEnded(listCtx, fmt.Errorf("page 1: %w", context.DeadlineExceeded)))
+	})
+}
+
+// A caller whose own deadline comes before the listing's bound ends the
+// listing at that deadline, and the error reports the caller's context
+// ending on the page in flight rather than the listing bound.
+func TestListKeyspacesCallerDeadlineWins(t *testing.T) {
+	wrapper := stalledKeyspacesWrapper(t, map[string]string{}, stalledPageRequestTimeout)
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	keyspaces, err := listOrdersKeyspacesWith(ctx, wrapper)
+	elapsed := time.Since(start)
+
+	require.Error(t, err)
+	assert.Nil(t, keyspaces)
+	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main page 1")
+	assert.NotContains(t, err.Error(), "listing as a whole")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at the caller's deadline")
+}
+
 // requestedURL makes one SDK call and one raw-HTTP call on a cancelled context,
 // so neither leaves the process, and returns the URL each was addressed to.
 func requestedURL(t *testing.T, client PSClient) (sdkURL, rawURL string) {
@@ -593,6 +705,7 @@ func TestPSClientConstructorsBoundRawRequests(t *testing.T) {
 		require.True(t, ok, name)
 		require.NotNil(t, wrapper.httpClient, name)
 		assert.Equal(t, planetScaleHTTPTimeout, wrapper.httpClient.Timeout, name)
+		assert.Equal(t, defaultKeyspaceListingTimeout, wrapper.keyspaceListingTimeout, name)
 	}
 }
 
