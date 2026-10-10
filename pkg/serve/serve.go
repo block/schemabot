@@ -1024,7 +1024,9 @@ func (s *Server) Handler() http.Handler {
 // instrumentation never sees. A request the middleware rejects is labeled with
 // its route too, so a burst of 401s names the endpoint it hit. A request that
 // matches no route carries no route, even when an embedder's outer mux already
-// recorded the pattern this handler is mounted under.
+// recorded the pattern this handler is mounted under. The request written here
+// is the copy the OTel handler made, so an embedder's own request keeps its
+// pattern.
 func withMatchedRoute(mux *http.ServeMux, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, r.Pattern = mux.Handler(r)

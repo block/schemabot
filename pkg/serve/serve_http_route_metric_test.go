@@ -24,8 +24,9 @@ import (
 // burst of errors hit. Every request through the server handler is labeled
 // with the route it matched: one the auth middleware let through to its
 // handler, one the middleware rejected, and the unauthenticated webhook alike.
-// A request that matches no route carries no route label, including when the
-// handler is mounted under another mux.
+// A request that matches no route carries no route label. Mounted under an
+// embedder's mux, the handler labels its own metrics without changing the
+// pattern the embedder's request carries.
 func TestServerHandlerLabelsHTTPMetricsWithRoute(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	cfg := &api.ServerConfig{
@@ -53,7 +54,7 @@ func TestServerHandlerLabelsHTTPMetricsWithRoute(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 5*time.Second)
 		defer cancel()
 		assert.NoError(t, mp.Shutdown(shutdownCtx))
 	})
@@ -82,19 +83,31 @@ func TestServerHandlerLabelsHTTPMetricsWithRoute(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, serve(http.MethodGet, "/api/status", "203.0.113.5:1234", ""))
 	// A path with a wildcard is labeled with its pattern, not the request path.
 	require.Equal(t, http.StatusUnauthorized, serve(http.MethodGet, "/api/history/orders", "203.0.113.5:1234", ""))
+	// Bypasses the auth middleware; with no GitHub App configured the webhook
+	// answers 503.
+	require.Equal(t, http.StatusServiceUnavailable, serve(http.MethodPost, "/webhook", "203.0.113.5:1234", ""))
 	// Matches no route.
 	require.Equal(t, http.StatusNotFound, serve(http.MethodGet, "/api/nope", "192.0.2.1:1234", "owners"))
 
-	// Mounted under an embedder's mux, a path this handler does not route stays
-	// unlabeled instead of inheriting the pattern it is mounted under.
+	// Mounted under an embedder's mux, a routed path is labeled with this
+	// handler's pattern and an unrouted one stays unlabeled rather than
+	// inheriting the mount pattern. The embedder's request keeps its own
+	// pattern either way.
+	var embedderPatterns []string
 	outer := http.NewServeMux()
-	outer.Handle("/", handler)
+	outer.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		handler.ServeHTTP(w, r)
+		embedderPatterns = append(embedderPatterns, r.Pattern)
+	})
+	require.Equal(t, http.StatusBadRequest, serveVia(outer, http.MethodPost, "/api/plan", "192.0.2.1:1234", "owners"))
 	require.Equal(t, http.StatusNotFound, serveVia(outer, http.MethodGet, "/api/missing", "192.0.2.1:1234", "owners"))
+	assert.Equal(t, []string{"/", "/"}, embedderPatterns)
 
 	assert.Equal(t, map[string]int64{
-		"POST 400 /api/plan":              1,
+		"POST 400 /api/plan":              2,
 		"GET 401 /api/status":             1,
 		"GET 401 /api/history/{database}": 1,
+		"POST 503 /webhook":               1,
 		"GET 404 ":                        2,
 	}, requestCountsByRoute(t, reader))
 }
