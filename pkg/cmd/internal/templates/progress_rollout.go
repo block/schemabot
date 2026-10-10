@@ -50,42 +50,35 @@ func RolloutCountsUnit(groups []presentation.Group) string {
 }
 
 // RolloutCounts is the rollout's status counts as a label and its text, for
-// the progress header and the watch view. A rollout of one deployment run
-// table by table counts its table steps, "Tables: 1 of 3 done on 4 targets",
-// since between tables most targets are done with one and waiting on the
-// next, which a count of target states reads as queued. It counts the targets
-// that ran a table, not the ones that already had the change, and adds the
-// targets the PR comment's headline adds (TableStepOutcomes): "1 of 3 done on
-// 4 targets · 3 failed". Any other rollout counts its members' states. The
-// text is empty when there is nothing to count.
+// the progress header and the watch view: its members' states. A rollout of
+// one deployment run table by table has no counts there, since its
+// deployment's line already states it (tableStepsHeadline). The text is empty
+// when there is nothing to count.
 func RolloutCounts(model presentation.Apply, groups []presentation.Group) (label, text string) {
-	if len(groups) == 1 && len(groups[0].Members) > 1 {
-		steps, ok := model.TableSteps(groups[0])
-		progress := model.TargetProgress(groups[0])
-		if ok && progress.Total > progress.AlreadyHad {
-			text := fmt.Sprintf("%d of %d done on %s", steps.Done, steps.Steps, targetCount(progress.Total-progress.AlreadyHad))
-			return "Tables", withTableStepOutcomes(text, model, steps, progress)
+	if len(groups) == 1 {
+		if _, ok := tableStepsHeadline(model, groups[0]); ok {
+			return "", ""
 		}
 	}
 	return RolloutCountsUnit(groups), FormatStateCounts(model.Counts)
 }
 
-// withTableStepOutcomes appends to a table-step count the target counts that
-// TableStepOutcomes says it carries.
-func withTableStepOutcomes(text string, model presentation.Apply, steps presentation.TableSteps, progress presentation.TargetProgress) string {
+// tableStepsHeadline is the line a deployment run table by table reads, the
+// PR comment's (presentation.TableStepsHeadline): "0 of 2 tables done on 3
+// targets · 1 target failed, 2 halted". It reports false for a deployment
+// that does not run table by table, or whose every target already had the
+// change.
+func tableStepsHeadline(model presentation.Apply, g presentation.Group) (string, bool) {
+	if len(g.Members) < 2 {
+		return "", false
+	}
+	steps, ok := model.TableSteps(g)
+	progress := model.TargetProgress(g)
+	if !ok || progress.Total == progress.AlreadyHad {
+		return "", false
+	}
 	settled := state.IsState(model.State, state.SettledApplyStates...)
-	if outcomes := progress.TableStepOutcomes(steps, settled); len(outcomes) > 0 {
-		text += " · " + FormatStateCounts(outcomes)
-	}
-	return text
-}
-
-// targetCount is "1 target" or "3 targets".
-func targetCount(n int) string {
-	if n == 1 {
-		return "1 target"
-	}
-	return fmt.Sprintf("%d targets", n)
+	return presentation.TableStepsHeadline(steps, progress, settled, false), true
 }
 
 // FormatStateCounts joins a status histogram into "40 completed · 3 running".
@@ -104,11 +97,11 @@ func FormatStateCounts(counts []presentation.StateCount) string {
 // the number of targets.
 func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 	var b strings.Builder
-	status := FormatStateCounts(g.Counts)
-	if steps, ok := v.Model.TableSteps(g); ok {
-		status = withTableStepOutcomes(fmt.Sprintf("%d of %d tables done", steps.Done, steps.Steps), v.Model, steps, v.Model.TargetProgress(g))
+	if headline, ok := tableStepsHeadline(v.Model, g); ok {
+		fmt.Fprintf(&b, "%s %s — %s\n", g.Lead.Emoji, g.Deployment, headline)
+	} else {
+		fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, FormatStateCounts(g.Counts), len(g.Members))
 	}
-	fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, status, len(g.Members))
 	if !v.SetupPhase {
 		writeTargetTables(&b, v, g)
 	}
@@ -443,17 +436,47 @@ func pendingTargetsWord(t TableProgress) string {
 }
 
 // formatHaltedAcrossTargets renders a halted table across targets the way the
-// PR comment's table line does: the table reads as its halt, with no bar, and
-// each target's line beneath says where that target finished or halted.
+// PR comment's table line does: the table reads as its halt, with no bar. A
+// table with a stopped or in-flight target lists its targets, each stopped
+// target's line saying where it stopped; any other counts them on its line.
 func formatHaltedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
-	writeTableLine(&b, t, "%s", haltedAcrossTargetsPhrase(t))
+	coverage := targetsCoverage(t)
+	if listsTargets(t) {
+		// The list counts the targets, so the line does not repeat them.
+		coverage = ""
+	}
+	writeTableLine(&b, t, "%s%s", haltedAcrossTargetsPhrase(t), coverage)
 	if t.DDL != "" {
 		b.WriteString(formatTableDDL(t))
 	}
 	b.WriteString("\n")
 	b.WriteString(formatTableParts(t))
 	return b.String()
+}
+
+// targetsCoverage counts a rolled-up table's targets for its line, as the PR
+// comment's table line counts them (presentation.TargetCoverage): " · 2
+// complete, 1 failed". A target in its revert window has completed the
+// change, a target that has not reported is still to run, and a stopped or
+// cancelled one is named by the table's own state.
+func targetsCoverage(t TableProgress) string {
+	var done, running, queued, failed, retrying int
+	for _, target := range t.Shards {
+		switch state.NormalizeTaskStatus(target.Status) {
+		case state.Task.Completed, state.Task.RevertWindow:
+			done++
+		case state.Task.Running:
+			running++
+		case state.Task.Pending:
+			queued++
+		case state.Task.Failed:
+			failed++
+		case state.Task.FailedRetryable:
+			retrying++
+		}
+	}
+	return presentation.TargetCoverage(done, running, queued+t.UnreportedTargets, failed, retrying, pendingTargetsWord(t))
 }
 
 // haltedAcrossTargetsPhrase names a halted table's state across its targets.
@@ -558,7 +581,11 @@ func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Grou
 	if len(attention) == 0 {
 		return
 	}
-	fmt.Fprintf(b, "\n  %sTargets needing attention:%s\n", ANSIBold, ANSIReset)
+	// A table whose targets are not listed already ends on a blank line.
+	if !strings.HasSuffix(b.String(), "\n\n") {
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(b, "  %sTargets needing attention:%s\n", ANSIBold, ANSIReset)
 	for _, i := range attention[:min(len(attention), rolloutAttentionLimit)] {
 		d := v.Model.Deployments[i]
 		line := fmt.Sprintf("    %s %s — %s", d.Emoji, memberTargetName(d), d.Label)

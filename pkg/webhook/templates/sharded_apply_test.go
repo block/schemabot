@@ -976,6 +976,12 @@ func TestShardedTableStatusPhrase_TerminalStatesNamed(t *testing.T) {
 	assert.Equal(t, "🟡 Waiting for deploy", shardedTableStatusPhrase(state.Task.WaitingForDeploy))
 }
 
+// A stopped table reads with the stop glyph the comment's title and the CLI's
+// table line use, so a stop looks the same wherever an operator reads it.
+func TestShardedTableStatusPhrase_StoppedUsesTheStopGlyph(t *testing.T) {
+	assert.Equal(t, "⏹️ Stopped", shardedTableStatusPhrase(state.Task.Stopped))
+}
+
 // An apply cancelled after part of the fleet landed must not read as if
 // nothing happened: the table line states the landed coverage, and the
 // divergent outcome promotes the per-shard status table so the summary names
@@ -1048,8 +1054,9 @@ func TestRenderShardedApplyComment_FailurePromotesSiblingKeyspaceShardTables(t *
 
 // Between dispatch waves a partially-landed table aggregates to pending; the
 // table line states the landed coverage so it never regresses to a bare
-// "Queued" after earlier waves finished. An in-flight aggregate stays
-// suffix-free — its compact shard summary already carries the breakdown — and
+// "Queued" after earlier waves finished. An in-flight aggregate, including one
+// waiting on its deploy request or reverting, stays suffix-free — its compact
+// shard summary already carries the breakdown — and
 // the routine wave rollout does not promote the per-shard table.
 func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 	mixed := func(tableStatus, inFlightStatus string) ShardedApplyData {
@@ -1083,10 +1090,14 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 	assert.NotContains(t, betweenWaves, "| Shard | Status |",
 		"a routine wave rollout does not promote the per-shard table")
 
-	inFlight := RenderShardedApplyComment(mixed(state.Task.Running, state.Task.Running))
-	assert.NotContains(t, inFlight, "applied on",
-		"an in-flight aggregate's shard summary already carries the breakdown")
-	assert.Contains(t, inFlight, "- Shards: 4 (")
+	// Waiting on a deploy request and reverting are in flight too, so the
+	// shard summary carries the landed coverage there as well.
+	for _, status := range []string{state.Task.Running, state.Task.WaitingForDeploy, state.Task.Reverting} {
+		inFlight := RenderShardedApplyComment(mixed(status, status))
+		assert.NotContainsf(t, inFlight, "applied on",
+			"a %s aggregate's shard summary already carries the breakdown", status)
+		assert.Containsf(t, inFlight, "- Shards: 4 (", "a %s aggregate lists its shards", status)
+	}
 }
 
 // A table that changes on only some of the keyspace's shards names them above

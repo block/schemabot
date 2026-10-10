@@ -1,7 +1,9 @@
 package presentation
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/state"
 )
@@ -52,11 +54,46 @@ func (a Apply) TableSteps(g Group) (TableSteps, bool) {
 }
 
 // tableStepOutcomeStates are the target statuses a table-step headline names
-// beside its table count: outcomes an operator acts on. A target copying,
-// queued, waiting between tables, at cutover or in its revert window is where
-// the table count already places it.
+// beside its table count: outcomes an operator acts on, the failures first,
+// since the targets held or halted are held or halted by them. A target
+// copying, queued, waiting between tables, at cutover or in its revert window
+// is where the table count already places it.
 var tableStepOutcomeStates = []PresentationState{
-	StateHalted, StatePaused, StateFailed, StateRetrying, StateStopped, StateCancelled, StateReverted, StateUnknown,
+	StateFailed, StateRetrying, StateHalted, StatePaused, StateStopped, StateCancelled, StateReverted, StateUnknown,
+}
+
+// TableStepsHeadline states a rollout run table by table in one line, the
+// same on the PR comment and in the CLI: "1 of 3 tables done on 4 targets"
+// while it runs or once it settled short, and "3 tables done on 4 targets"
+// once every table is done on every target. A table finishes on every target
+// before the next starts, so the targets are counted only as the rollout's
+// size: most of them are between tables, which a count of target states would
+// read as queued. The targets in an outcome an operator acts on follow
+// (TableStepOutcomes), the first count naming them as
+// targets so it does not read as a count of tables: "0 of 2 tables done on 3
+// targets · 1 target failed, 2 halted". A rollback says "rolled back" for
+// "done". A target that already had the change ran no table, so it is not
+// counted.
+func TableStepsHeadline(steps TableSteps, p TargetProgress, settled, rollback bool) string {
+	verb := "done"
+	if rollback {
+		verb = "rolled back"
+	}
+	targets := TargetNoun.Count(p.Total - p.AlreadyHad)
+	line := fmt.Sprintf("%d of %d tables %s on %s", steps.Done, steps.Steps, verb, targets)
+	if settled && p.Unsettled == 0 && steps.Done == steps.Steps {
+		line = fmt.Sprintf("%d tables %s on %s", steps.Steps, verb, targets)
+	}
+	outcomes := p.TableStepOutcomes(steps, settled)
+	if len(outcomes) == 0 {
+		return line
+	}
+	parts := make([]string, len(outcomes))
+	for i, c := range outcomes {
+		parts[i] = fmt.Sprintf("%d %s", c.Count, c.Label)
+	}
+	parts[0] = TargetNoun.Count(outcomes[0].Count) + " " + outcomes[0].Label
+	return line + " · " + strings.Join(parts, ", ")
 }
 
 // TableStepOutcomes is the target counts a table-step headline carries beside
@@ -70,26 +107,30 @@ func (p TargetProgress) TableStepOutcomes(steps TableSteps, settled bool) []Stat
 	if settled && p.Unsettled == 0 && steps.Done < steps.Steps && p.Done > 0 {
 		outcomes = append(outcomes, StateCount{Label: "completed", Count: p.Done})
 	}
+	var named []StateCount
 	for _, count := range p.Others {
-		if isTableStepOutcome(count.Label) {
-			outcomes = append(outcomes, count)
+		if tableStepOutcomeRank(count.Label) >= 0 {
+			named = append(named, count)
 		}
 	}
-	return outcomes
+	slices.SortStableFunc(named, func(a, b StateCount) int {
+		return tableStepOutcomeRank(a.Label) - tableStepOutcomeRank(b.Label)
+	})
+	return append(outcomes, named...)
 }
 
-// isTableStepOutcome reports whether the summary category labelled label
-// counts a status in tableStepOutcomeStates.
-func isTableStepOutcome(label string) bool {
+// tableStepOutcomeRank is where the summary category labelled label falls in
+// tableStepOutcomeStates, or -1 when it counts none of them.
+func tableStepOutcomeRank(label string) int {
 	for _, category := range summaryCategoryOrder {
 		if category.label != label {
 			continue
 		}
 		for _, s := range category.states {
-			if slices.Contains(tableStepOutcomeStates, s) {
-				return true
+			if i := slices.Index(tableStepOutcomeStates, s); i >= 0 {
+				return i
 			}
 		}
 	}
-	return false
+	return -1
 }

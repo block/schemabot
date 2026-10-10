@@ -14,6 +14,14 @@ var (
 	DeploymentNoun = Noun{Singular: "deployment", Plural: "deployments"}
 )
 
+// Count is n members by name: "1 target" or "3 targets".
+func (n Noun) Count(count int) string {
+	if count == 1 {
+		return "1 " + n.Singular
+	}
+	return fmt.Sprintf("%d %s", count, n.Plural)
+}
+
 // CoveragePhrase states how much of the whole a group of count members
 // covers: "all 32 shards" when it covers every member, "12 of 32 shards" for
 // a subset, or a bare count when the total is unknown — a subset must never

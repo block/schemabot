@@ -261,9 +261,9 @@ func TestWriteProgress_SixtyFourTargetRolloutStaysOneScreen(t *testing.T) {
 	assert.True(t, strings.HasSuffix(out, "schemabot stop apply-7f3c -e production\n"), "%s", out)
 }
 
-// A change that failed on all 64 targets still stays short: the table names
-// the first five failed targets and counts the rest, and the attention list caps
-// its own entries, so the output does not grow by a line per target.
+// A change that failed on all 64 targets still stays short: the table counts
+// its failed targets on its own line, as the PR comment does, and the attention
+// list caps its own entries, so the output does not grow by a line per target.
 func TestWriteProgress_AllTargetsFailedStaysBounded(t *testing.T) {
 	var targets []rolloutTarget
 	for range 64 {
@@ -276,9 +276,8 @@ func TestWriteProgress_AllTargetsFailedStaysBounded(t *testing.T) {
 	data.State = state.Apply.Failed
 
 	out := renderRollout(t, data)
-	assert.Contains(t, out, "• Targets: 64 (64 failed)")
-	assert.Contains(t, out, "✗ payments-005: failed\n           ... 59 more failed targets\n",
-		"failed targets past the cap are counted, not listed:\n%s", out)
+	assert.Contains(t, out, "~ orders: ❌ Failed · 64 failed\n", "the table counts its failed targets:\n%s", out)
+	assert.NotContains(t, out, "✗ payments-", "a settled table lists no targets:\n%s", out)
 	assert.Contains(t, out, "…and 44 more")
 	assert.Less(t, strings.Count(out, "\n"), 60, "the output does not grow by a line per failed target:\n%s", out)
 }
@@ -470,8 +469,11 @@ func TestInFlightRollupOrder_CoversEveryInFlightTaskState(t *testing.T) {
 // A table on which no target is still working and one has halted reads as
 // its halt, the way the PR comment's table line does. Its summed rows would
 // cover only the targets that finished, so no bar or rows line speaks for the
-// table; each target's line says where that target finished or halted, and
-// "not started" is said only when no target got as far as a row.
+// table. A table with a stopped target lists its targets, each stopped
+// target's line saying where it stopped, since that is where it resumes, even
+// when a failed sibling makes the table read as failed; any other counts on
+// its own line the targets that finished or failed. "not started" is said only when no
+// target got as far as a row.
 func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 	stoppedAt := func(copied int64) rolloutTarget {
 		return rolloutTarget{opState: state.ApplyOperation.Stopped, status: state.Task.Stopped, rowsCopied: copied, rowsTotal: 1000, startedAt: "2026-09-30T12:00:00Z"}
@@ -481,44 +483,53 @@ func TestWriteProgress_HaltedTargetRollupReadsAsItsHalt(t *testing.T) {
 	}
 	cancelledBeforeCopying := rolloutTarget{opState: state.ApplyOperation.Cancelled, status: state.Task.Cancelled, rowsTotal: 1000}
 	for name, tc := range map[string]struct {
-		targets  []rolloutTarget
-		headline string
-		lines    []string
+		targets []rolloutTarget
+		line    string
+		listing []string
 	}{
 		"two targets stopped part-way": {
-			targets:  []rolloutTarget{stoppedAt(400), stoppedAt(400)},
-			headline: "~ orders: ⏹️ Stopped\n",
-			lines:    []string{"○ payments-001: stopped at 40.00% · 400 / 1,000 rows", "○ payments-002: stopped at 40.00% · 400 / 1,000 rows"},
+			targets: []rolloutTarget{stoppedAt(400), stoppedAt(400)},
+			line:    "~ orders: ⏹️ Stopped\n",
+			listing: []string{"• Targets: 2 (2 stopped)", "○ payments-001: stopped at 40.00% · 400 / 1,000 rows", "○ payments-002: stopped at 40.00% · 400 / 1,000 rows"},
 		},
 		"one target done and one stopped part-way": {
-			targets:  []rolloutTarget{completedTarget(), stoppedAt(400)},
-			headline: "~ orders: ⏹️ Stopped\n",
-			lines:    []string{"○ payments-002: stopped at 40.00% · 400 / 1,000 rows", "✓ payments-001: 1,000 rows"},
+			targets: []rolloutTarget{completedTarget(), stoppedAt(400)},
+			line:    "~ orders: ⏹️ Stopped\n",
+			listing: []string{"• Targets: 2 (1 stopped, 1 complete)", "○ payments-002: stopped at 40.00% · 400 / 1,000 rows", "✓ payments-001: 1,000 rows"},
 		},
 		"one target done and one failed part-way": {
-			targets:  []rolloutTarget{completedTarget(), failedAt(300)},
-			headline: "~ orders: ❌ Failed\n",
-			lines:    []string{"✗ payments-002: failed", "✓ payments-001: 1,000 rows"},
+			targets: []rolloutTarget{completedTarget(), failedAt(300)},
+			line:    "~ orders: ❌ Failed · 1 complete, 1 failed\n",
+		},
+		"one target done, one failed, and two stopped part-way": {
+			targets: []rolloutTarget{completedTarget(), failedAt(300), stoppedAt(400), stoppedAt(400)},
+			line:    "~ orders: ❌ Failed\n",
+			listing: []string{"• Targets: 4 (1 failed, 2 stopped, 1 complete)", "✗ payments-002: failed", "○ payments-003: stopped at 40.00% · 400 / 1,000 rows", "○ payments-004: stopped at 40.00% · 400 / 1,000 rows", "✓ payments-001: 1,000 rows"},
 		},
 		"one target done and one cancelled before copying": {
-			targets:  []rolloutTarget{completedTarget(), cancelledBeforeCopying},
-			headline: "~ orders: 🚫 Cancelled\n",
-			lines:    []string{"○ payments-002: cancelled", "✓ payments-001: 1,000 rows"},
+			targets: []rolloutTarget{completedTarget(), cancelledBeforeCopying},
+			line:    "~ orders: 🚫 Cancelled · 1 complete\n",
 		},
 		"every target cancelled before copying": {
-			targets:  []rolloutTarget{cancelledBeforeCopying, cancelledBeforeCopying},
-			headline: "~ orders: 🚫 Cancelled (not started)\n",
-			lines:    []string{"○ payments-001: cancelled", "○ payments-002: cancelled"},
+			targets: []rolloutTarget{cancelledBeforeCopying, cancelledBeforeCopying},
+			line:    "~ orders: 🚫 Cancelled (not started)\n",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := renderRollout(t, targetRolloutData(tc.targets))
-			assert.Contains(t, out, tc.headline, "the table reads as its halt, with no bar:\n%s", out)
-			assertLess(t, out, tc.headline, tc.lines[0])
-			assertLess(t, out, tc.lines[0], tc.lines[1])
+			assert.Contains(t, out, tc.line, "the table reads as its halt, with no bar:\n%s", out)
+			if len(tc.listing) == 0 {
+				assert.NotContains(t, out, "• Targets:", "only a table with a stopped target lists its targets:\n%s", out)
+			} else {
+				prev := tc.line
+				for _, line := range tc.listing {
+					assertLess(t, out, prev, line)
+					prev = line
+				}
+			}
 			assert.NotContains(t, out, "Rows:", "no summed rows speak for a halted table:\n%s", out)
 			assert.NotContains(t, out, "was waiting for cutover")
-			if !strings.Contains(tc.headline, "not started") {
+			if !strings.Contains(tc.line, "not started") {
 				assert.NotContains(t, out, "not started")
 			}
 		})
@@ -609,13 +620,14 @@ func TestFormatTargetRollup_AllocationDoesNotScaleWithTargetsTimesTables(t *test
 	assert.Less(t, allocated, 20*tablesBytes, "a render allocates in proportion to the tables, not to targets times tables")
 }
 
-// A rolled-up table's target counts head the list under it, so the bar, which
-// sums only the targets that have started, never reads as the rollout's
-// progress: one target half copied out of 64 is counted beside the 63 queued,
-// a table still copying on one target while 63 failed counts the failures
-// first, and a table finished on 63 targets and queued on the last reads as
-// complete on 63 of 64, as it does in its revert window. A table every target
-// finished carries no count.
+// A rolled-up table still copying counts its targets at the head of the list
+// under it, so the bar, which sums only the targets that have started, never
+// reads as the rollout's progress: one target half copied out of 64 is counted
+// beside the 63 queued, and a table copying on one target while 63 failed
+// counts the failures first. A table finished on 63 targets and queued on the
+// last reads as complete on 63 of 64 on its own line and lists no targets, as
+// it does in its revert window. A table every target finished carries no
+// count.
 func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 	queuedWithRow := rolloutTarget{opState: state.ApplyOperation.Pending, status: state.Task.Pending, rowsTotal: 1000}
 	failed := rolloutTarget{opState: state.ApplyOperation.Failed, status: state.Task.Failed, rowsCopied: 300, rowsTotal: 1000, err: "Error 1062: Duplicate entry"}
@@ -644,17 +656,19 @@ func TestFormatTargetRollup_TableCountsItsTargets(t *testing.T) {
 		"63 complete and one queued": {
 			targets: append(repeat(completedTarget(), 63), queuedWithRow),
 			line:    "~ orders: ✓ Complete on 63 of 64 targets · 1 queued\n",
-			counts:  "• Targets: 64 (1 queued, 63 complete)\n",
 		},
 		"one in its revert window and one queued": {
 			targets: []rolloutTarget{{opState: state.ApplyOperation.RevertWindow, status: state.Task.RevertWindow, rowsCopied: 1000, rowsTotal: 1000}, queuedWithRow},
 			line:    "~ orders: ✓ Complete on 1 of 2 targets · 1 queued\n",
-			counts:  "• Targets: 2 (1 revert window open, 1 queued)\n",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := renderRollout(t, targetRolloutData(tc.targets))
 			assert.Contains(t, out, tc.line, "%s", out)
+			if tc.counts == "" {
+				assert.NotContains(t, out, "• Targets:", "a table no target is copying lists no targets:\n%s", out)
+				return
+			}
 			assertLess(t, out, tc.line, tc.counts)
 		})
 	}
@@ -746,8 +760,9 @@ func TestWriteProgress_TargetRollupRanksUnreportedTargetsAsQueued(t *testing.T) 
 // A rollout run table by table has a row per target and table: payments-001
 // finished `bikes` and is queued for `docks`, while payments-002 still copies
 // `bikes`. The deployment is one section listing both tables, each table
-// counting the two targets, not the four rows, and the header and the
-// deployment line count the tables done.
+// counting the two targets, not the four rows, and the deployment line counts
+// the tables done, in the words of the PR comment's headline. The table still
+// copying lists its targets; the one queued on every target does not.
 func TestWriteProgress_TableByTableRolloutCountsTargets(t *testing.T) {
 	step := map[string]int{"bikes": 1, "docks": 2}
 	row := func(target, table, opState, status string, copied int64) (ProgressOperation, TableProgress) {
@@ -780,21 +795,21 @@ func TestWriteProgress_TableByTableRolloutCountsTargets(t *testing.T) {
 
 	out := renderRollout(t, data)
 
-	assert.Contains(t, out, "Tables:       0 of 2 done on 2 targets")
-	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 0 of 2 tables done (2 targets)"), "one section for the deployment")
+	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 0 of 2 tables done on 2 targets\n"), "one section for the deployment:\n%s", out)
+	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
 	assert.Equal(t, 1, strings.Count(out, "~ bikes:"))
-	assert.Equal(t, 1, strings.Count(out, "~ docks:"))
-	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 complete)")
-	assert.Contains(t, out, "• Targets: 2 (2 queued)")
+	assert.Equal(t, 1, strings.Count(out, "~ docks: ⏳ Queued\n"))
+	assert.Equal(t, 1, strings.Count(out, "• Targets: 2 (1 copying, 1 complete)"), "only the copying table lists its targets:\n%s", out)
+	assert.Equal(t, 1, strings.Count(out, "• Targets:"), "only the copying table lists its targets:\n%s", out)
+	assert.Contains(t, out, "✓ payments-001: 1,000 rows\n\n     ~ docks:", "a blank line sets the next table apart from a listing:\n%s", out)
 	assert.NotContains(t, out, "4 targets")
 }
 
 // A rollout runs `bikes` then `docks` table by table on payments-001 and
 // payments-002, and every target has finished `bikes`: payments-001 is copying
-// `docks` and payments-002 waits for it. The header and the deployment line
-// count the tables done across the targets, since a count of target states
-// would read payments-002, done with one table and waiting on the next, as
-// queued.
+// `docks` and payments-002 waits for it. The deployment line counts the tables
+// done across the targets, since a count of target states would read
+// payments-002, done with one table and waiting on the next, as queued.
 func TestWriteProgress_TableByTableRolloutCountsTableSteps(t *testing.T) {
 	data := tableStepProgress(state.Apply.Running, []tableStepRow{
 		{"payments-001", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
@@ -805,18 +820,19 @@ func TestWriteProgress_TableByTableRolloutCountsTableSteps(t *testing.T) {
 
 	out := renderRollout(t, data)
 
-	assert.Contains(t, out, "Tables:       1 of 2 done on 2 targets")
 	assert.NotContains(t, out, "Targets:      ")
-	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 1 of 2 tables done (2 targets)"), "one section for the deployment")
-	assert.Contains(t, out, "• Targets: 2 (2 complete)")
+	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
+	assert.Equal(t, 1, strings.Count(out, "🔄 prod — 1 of 2 tables done on 2 targets\n"), "one section for the deployment:\n%s", out)
+	assert.Contains(t, out, "~ bikes: "+ui.ProgressBarComplete()+" ✓ Complete\n")
 	assert.Contains(t, out, "• Targets: 2 (1 copying, 1 queued)")
+	assert.Equal(t, 1, strings.Count(out, "• Targets:"), "only the copying table lists its targets:\n%s", out)
 }
 
 // A rollout under on_failure continue finished `bikes` on all three targets,
 // and `docks` failed on payments-001 and payments-002 while payments-003 still
-// copies it. The table count says how far the rollout got, so the header and
-// the deployment line also name the two failed targets, as the PR comment's
-// headline does.
+// copies it. The table count says how far the rollout got, so the deployment
+// line also counts the two failed targets, in the words of the PR comment's
+// headline.
 func TestWriteProgress_TableByTableRolloutNamesFailedTargets(t *testing.T) {
 	data := tableStepProgress(state.Apply.Running, []tableStepRow{
 		{"payments-001", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
@@ -829,13 +845,37 @@ func TestWriteProgress_TableByTableRolloutNamesFailedTargets(t *testing.T) {
 
 	out := renderRollout(t, data)
 
-	assert.Contains(t, out, "Tables:       1 of 2 done on 3 targets · 2 failed")
-	assert.Contains(t, out, "prod — 1 of 2 tables done · 2 failed (3 targets)")
+	assert.Contains(t, out, "prod — 1 of 2 tables done on 3 targets · 2 targets failed\n", "%s", out)
+	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
+}
+
+// A rollout of `stations` then `docks` table by table settled failed when
+// payments-002 failed `stations`, so no target starts `docks`. The deployment
+// line reads as the PR comment's headline does, counting the tables done and
+// then the targets by how they ended, and each table counts its targets on its
+// own line rather than listing them.
+func TestWriteProgress_SettledTableByTableRolloutReadsLikeThePRComment(t *testing.T) {
+	data := tableStepProgress(state.Apply.Failed, []tableStepRow{
+		{"payments-001", "stations", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-002", "stations", 1, state.ApplyOperation.Failed, state.Task.Failed, 300, false},
+		{"payments-003", "stations", 1, state.ApplyOperation.Completed, state.Task.Completed, 1000, false},
+		{"payments-001", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+		{"payments-002", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+		{"payments-003", "docks", 2, state.ApplyOperation.Pending, state.Task.Pending, 0, false},
+	})
+
+	out := renderRollout(t, data)
+
+	assert.Contains(t, out, "❌ prod — 0 of 2 tables done on 3 targets · 1 target failed, 2 halted\n", "%s", out)
+	assertLess(t, out, "~ stations: ❌ Failed · 2 complete, 1 failed\n", "~ docks: ⊘ Not started\n")
+	assert.NotContains(t, out, "• Targets:", "a table no target is copying lists no targets:\n%s", out)
+	assert.NotContains(t, out, "Tables:", "the deployment line carries the table count, not the box:\n%s", out)
+	assert.Contains(t, out, "❌ payments-002 — failed", "the failed target is still named for attention:\n%s", out)
 }
 
 // payments-000 already held the change, so the rollout gave it one settled row
-// in the first step and it ran no table. The header counts the two targets
-// that run the tables, as the PR comment's headline does.
+// in the first step and it ran no table. The deployment line counts the two
+// targets that run the tables, as the PR comment's headline does.
 func TestWriteProgress_TableByTableRolloutLeavesOutConvergedTargets(t *testing.T) {
 	data := tableStepProgress(state.Apply.Running, []tableStepRow{
 		{"payments-000", "bikes", 1, state.ApplyOperation.Completed, state.Task.Completed, 0, true},
@@ -847,8 +887,8 @@ func TestWriteProgress_TableByTableRolloutLeavesOutConvergedTargets(t *testing.T
 
 	out := renderRollout(t, data)
 
-	assert.Contains(t, out, "Tables:       1 of 2 done on 2 targets")
-	assert.Contains(t, out, "prod — 1 of 2 tables done (3 targets)")
+	assert.Contains(t, out, "prod — 1 of 2 tables done on 2 targets\n", "%s", out)
+	assert.Contains(t, out, "1 of 3 targets already had this schema; nothing ran there.")
 }
 
 // tableStepRow is one target's row for one table of a rollout run table by
@@ -885,9 +925,9 @@ func tableStepProgress(applyState string, rows []tableStepRow) ProgressData {
 }
 
 // Once a rollout settles, a table still pending on a target never starts
-// there, so the CLI reads it as not started rather than queued, the way the PR
-// comment does: on the table line, in the targets heading and on each
-// target's line.
+// there, so the CLI reads it as not started rather than queued on the table
+// line, the way the PR comment does. No target is copying the table, so it
+// lists none.
 func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 	heldBack := rolloutTarget{opState: state.ApplyOperation.Failed, status: state.Task.Pending}
 	t.Run("some targets finished it", func(t *testing.T) {
@@ -895,8 +935,7 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 		data.State = state.Apply.Failed
 		out := renderRollout(t, data)
 		assert.Contains(t, out, "orders: ✓ Complete on 2 of 3 targets · 1 not started\n", out)
-		assert.Contains(t, out, "Targets: 3 (1 not started, 2 complete)", out)
-		assert.Contains(t, out, "payments-003: not started", out)
+		assert.NotContains(t, out, "• Targets:", out)
 		assert.NotContains(t, out, "queued", out)
 	})
 	t.Run("no target ran it", func(t *testing.T) {
@@ -905,7 +944,7 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 		data.State = state.Apply.Cancelled
 		out := renderRollout(t, data)
 		assert.Contains(t, out, "orders: ⊘ Not started\n", out)
-		assert.Contains(t, out, "Targets: 3 (3 not started)", out)
+		assert.NotContains(t, out, "• Targets:", out)
 		assert.NotContains(t, out, "Queued", out)
 		assert.NotContains(t, out, "queued", out)
 	})
@@ -913,7 +952,7 @@ func TestWriteProgress_SettledRolloutTableReadsNotStarted(t *testing.T) {
 		pending := rolloutTarget{opState: state.ApplyOperation.Pending, status: state.Task.Pending}
 		out := renderRollout(t, targetRolloutData([]rolloutTarget{completedTarget(), pending}))
 		assert.Contains(t, out, "orders: ✓ Complete on 1 of 2 targets · 1 queued\n", out)
-		assert.Contains(t, out, "payments-002: queued", out)
+		assert.NotContains(t, out, "• Targets:", out)
 		assert.NotContains(t, out, "not started", out)
 	})
 }

@@ -151,3 +151,39 @@ func TestListParts(t *testing.T) {
 		assert.Equal(t, []string{task.Stopped, unlisted, task.Cancelled}, statuses)
 	})
 }
+
+// A table lists its parts in every state in which an engine is still working
+// on the change, waiting on a deploy request and reverting included, and in
+// none in which it has not started or has settled. A rollout's targets are
+// listed once stopped too, since each resumes from the row the listing names.
+func TestListsParts(t *testing.T) {
+	for _, s := range []string{
+		state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum,
+		state.Task.WaitingForCutover, state.Task.CuttingOver, state.Task.WaitingForDeploy, state.Task.Recovering, state.Task.Reverting,
+	} {
+		assert.Truef(t, ListsParts(s), "a table %s lists its parts", s)
+		assert.Truef(t, ListsTargets([]string{state.Task.Completed, s}), "a table with a target %s lists its targets", s)
+	}
+	for _, s := range []string{
+		state.Task.Pending, state.Task.Completed, state.Task.RevertWindow, state.Task.Failed,
+		state.Task.FailedRetryable, state.Task.Cancelled, state.Task.Reverted, state.Task.Stopped,
+	} {
+		assert.Falsef(t, ListsParts(s), "a table %s counts its parts on its line", s)
+	}
+}
+
+// TestListsTargets pins that a table across targets decides its listing from
+// each target, not from its rolled-up status: a stopped or copying target is
+// listed even when a failed sibling makes the table read as failed, since the
+// stopped target resumes from the row it reached and only the listing says
+// which row that is.
+func TestListsTargets(t *testing.T) {
+	assert.True(t, ListsTargets([]string{state.Task.Stopped, state.Task.Stopped}), "a stopped table lists where each target stopped")
+	assert.True(t, ListsTargets([]string{state.Task.Completed, state.Task.Failed, state.Task.Stopped, state.Task.Stopped}),
+		"a failed table lists the targets that stopped beside the failure")
+	assert.True(t, ListsTargets([]string{state.Task.Failed, state.Task.Running}), "a failed table lists a target still copying")
+	assert.True(t, ListsTargets([]string{"STATE_STOPPED"}), "a target's raw status is normalized before it is read")
+	assert.False(t, ListsTargets([]string{state.Task.Completed, state.Task.Failed}), "a settled table counts its targets on its line")
+	assert.False(t, ListsTargets([]string{state.Task.Cancelled, state.Task.Completed}), "a cancelled table counts its targets on its line")
+	assert.False(t, ListsTargets(nil), "a table with no targets lists nothing")
+}

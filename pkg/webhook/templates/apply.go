@@ -1072,38 +1072,28 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 	sb.WriteString("\n")
 }
 
-// shardSummaryBreakdownState reports whether a table's aggregate status is
-// in-flight work whose line carries the compact per-shard breakdown.
-func shardSummaryBreakdownState(status string) bool {
-	switch state.NormalizeTaskStatus(status) {
-	case state.Task.Running, state.Task.CatchingUp, state.Task.Checksumming, state.Task.PostChecksum, state.Task.Recovering, state.Task.CuttingOver, state.Task.WaitingForCutover:
-		return true
-	default:
-		return false
-	}
-}
-
-// renderShardSummary lists a sharded table's shards while it is in flight.
+// renderShardSummary lists a sharded table's shards while it is in flight. A
+// settled table's line already says where it ended, so the listing stays out
+// of the way then.
 func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
-	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards, presentation.PendingQueued, budget)
+	if !presentation.ListsParts(table.Status) {
+		return // completed/pending/cancelled/failed: no breakdown, stay quiet
+	}
+	writeMemberList(sb, presentation.ShardNoun, table.Shards, presentation.PendingQueued, budget)
 }
 
 // writeMemberList lists a table's members, the shards of a sharded table or
-// the targets of a multi-target deployment, while the table is in flight: a
-// line counting them by state, then one line per member with its state in
-// words. It is the listing the CLI shows (presentation.ListParts), so a wide
-// table names only its failures and slowest members, leaving the rest to the
-// counts, rather than growing a line per member. A settled table's line
-// already says where it ended, so the listing stays out of the way then. A
-// comment that would not fit otherwise keeps only the line counting them
+// the targets of a multi-target deployment: a line counting them by state,
+// then one line per member with its state in words. Its callers decide when a
+// table lists its members (presentation.ListsParts, presentation.ListsTargets).
+// It is the listing the CLI shows (presentation.ListParts), so a wide table
+// names only its failures and slowest members, leaving the rest to the counts,
+// rather than growing a line per member. A comment that would not fit otherwise keeps only the line counting them
 // (ddlBlockBudget.listsMembers). pendingWord names the members still to run
 // (presentation.PendingWord), in the count and on their lines alike.
-func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
 	if len(members) <= 1 {
 		return
-	}
-	if !shardSummaryBreakdownState(status) {
-		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
 	part := func(i int) presentation.Part {
 		m := members[i]

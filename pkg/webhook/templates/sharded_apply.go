@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -585,7 +586,7 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *dd
 		writeShardedTableCopyProgress(sb, t, writeDDL)
 	} else {
 		phrase := shardedTableStatusPhrase(status)
-		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !shardSummaryBreakdownState(status) {
+		if landed := landedShardCount(t.Shards); landed > 0 && landed < len(t.Shards) && !presentation.ListsParts(status) {
 			if status == state.Task.Cancelled {
 				// The pure-cancelled parenthetical ("not started") would be false
 				// here: the change is live on the landed shards.
@@ -716,7 +717,7 @@ func shardedTableStatusPhrase(status string) string {
 	case state.Task.FailedRetryable:
 		return "🔄 Interrupted — retrying automatically"
 	case state.Task.Stopped:
-		return "⏸ Stopped"
+		return "⏹️ Stopped"
 	case state.Task.Cancelled:
 		return "⊘ Cancelled (not started)"
 	case state.Task.RevertWindow:

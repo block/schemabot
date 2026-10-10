@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
@@ -52,6 +53,55 @@ const (
 	maxFailedParts  = 5
 	maxCopyingParts = 3
 )
+
+// ListsParts reports whether a table in status lists its parts one per line
+// under it: only while the change is in flight on it (state.IsInFlightTaskState).
+// A table that has not started, or has settled, says where it stands on its
+// own line, so the PR comment and the CLI both leave the listing out then.
+func ListsParts(status string) bool {
+	return state.IsInFlightTaskState(state.NormalizeTaskStatus(status))
+}
+
+// ListsTargets reports whether a table across a rollout's targets, each in
+// the status at the same index of statuses, lists them one per line under it:
+// while the change is in flight on any of them (ListsParts), and while any of
+// them is stopped, since a stopped target resumes from where it stopped and
+// the listing is what says where that is. It reads the targets rather than the
+// table's rolled-up status, because a failed target outranks a stopped or
+// copying one in the rollup and would otherwise hide where they stand.
+func ListsTargets(statuses []string) bool {
+	return slices.ContainsFunc(statuses, func(status string) bool {
+		return ListsParts(status) || state.NormalizeTaskStatus(status) == state.Task.Stopped
+	})
+}
+
+// TargetCoverage is the " · 40 complete, 4 copying, 19 queued, 1 failed,
+// 1 retrying" suffix of a table's line across a rollout's targets, naming only
+// the states some target is in, or "" when there are none. Queued targets are
+// waiting on the apply's driver cap or on their turn in order; pendingWord
+// names them, "not started" once the rollout has settled (PendingWord).
+func TargetCoverage(done, running, queued, failed, retrying int, pendingWord string) string {
+	var parts []string
+	if done > 0 {
+		parts = append(parts, fmt.Sprintf("%d complete", done))
+	}
+	if running > 0 {
+		parts = append(parts, fmt.Sprintf("%d copying", running))
+	}
+	if queued > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s", queued, pendingWord))
+	}
+	if failed > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", failed))
+	}
+	if retrying > 0 {
+		parts = append(parts, fmt.Sprintf("%d retrying", retrying))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " · " + strings.Join(parts, ", ")
+}
 
 // PartListLine is one line of a table's part listing: the part at index Part,
 // or, when Summary is set, a count of parts the listing does not name.
