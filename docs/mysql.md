@@ -303,7 +303,7 @@ For progress bar colors, phase labels, and keyboard controls, see the
 
 ## Throttling
 
-![Spirit detects Aurora, counts threads on CPU while skipping threads parked on a redo-log flush, watches average commit latency, and pauses the copy when latency crosses 100ms until it recovers](../assets/spirit-throttling.gif)
+![An application and Spirit's copy write to one Aurora writer; as application traffic grows, average commit latency climbs past 100ms and Spirit waits before each chunk, slowing the copy until latency recovers](../assets/spirit-throttling.gif)
 
 When a schema change's progress bar carries a `(throttled)` annotation, Spirit's
 throttler is deliberately pausing the copy or the checksum verify to protect

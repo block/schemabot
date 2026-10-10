@@ -10,6 +10,14 @@ const txt=(x,y,s,size=16,color=C.ink,weight=400,cls='',anchor='start')=>`<text x
 const line=(x1,y1,x2,y2,color=C.line,w=1)=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="${w}"/>`;
 const clamp=x=>Math.max(0,Math.min(1,x)),ease=x=>{x=clamp(x);return x*x*(3-2*x);},mix=(a,b,k)=>a+(b-a)*k;
 function eta(hours){if(hours>=47.5)return Math.round(hours/24)+' days';const h=Math.max(1,Math.round(hours));return h+(h===1?' hour':' hours');}
+const ROWS=107;
+// Elapsed hours per second of animation: a long crawl, a short restart, then the fast finish.
+const hoursPerSecond=t=>t<8?18/8:t<11?.25/3:2.1/13;
+// Copy rate in millions of rows per hour, from Spirit's write threads.
+const writeAt=t=>t<11?1:Math.round(6+4*ease((t-14.5)/5)),rateAt=t=>t<8?ROWS/840:t<11?0:5.6*writeAt(t);
+const model=[];{let h=0,rows=0;for(let i=0;i<=28*20;i++){model.push({h,rows});const t=i/20;if(rows<ROWS){h+=hoursPerSecond(t)/20;rows=Math.min(ROWS,rows+rateAt(t)*hoursPerSecond(t)/20);}}}
+const UPSIZE_H=18,AXIS_H=21;
+function clock(h){const m=Math.round(h*60);return Math.floor(m/60)+'h '+String(m%60).padStart(2,'0')+'m';}
 function renderFrame(t){
  t=Math.max(0,Math.min(t,27.95));
  const phase=Math.min(3,Math.floor(t/7));
@@ -17,17 +25,18 @@ function renderFrame(t){
  const resize=ease((t-8)/3),grow=ease((t-14.5)/5),after=t>=11;
  // The new class comes up with all its vCPUs at once.
  const vcpus=resize>=.5?8:2;
- const write=after?Math.round(mix(6,10,grow)):1,read=after?Math.round(mix(2,4,grow)):1;
+ const write=writeAt(t),read=after?Math.round(mix(2,4,grow)):1;
  const cpu=after?mix(99.7,91,ease((t-11)/4)):99.7,commitMs=after?mix(4.4,1.85,ease((t-11)/5)):4.4;
  // The writer restarts into its new class during the resize, so the copy waits.
  const resizing=t>=8&&!after,throttled=t<8&&((t*1.3)%1)<.85;
- const hours=after?Math.exp(mix(Math.log(840),Math.log(2),grow)):840;
+ const {h:elapsed,rows}=model[Math.round(t*20)],done=rows>=ROWS,rate=rateAt(t);
+ const hours=done?0:rate>0?(ROWS-rows)/rate:840;
  const labels=['On a 2-vCPU writer','Change the instance class','Autoscaling engages','Days become hours'];
  const captions=['The application already fills 2 vCPUs, so the copy is throttled almost continuously.',
   'Raising the instance class from db.r6g.large to db.r6g.2xlarge quadruples the vCPUs.',
   'At 8 vCPUs Spirit leaves small-instance mode and grows its write threads from 6 toward a ceiling of 12.',
   'The copy finished in about 2 hours instead of 35 days, and the application got faster too.'];
- let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'A larger writer turns a 35-day copy into 2 hours.',32,C.ink,650);
+ let s=rect(0,0,1100,690,'#fff','none',0)+txt(36,37,'SCHEMABOT / SPIRIT',13,C.muted,650)+txt(36,105,'Upsizing Aurora turns a 35-day copy into 2 hours.',32,C.ink,650);
  for(let i=0;i<4;i++){const x=36+i*263;s+=rect(x,130,247,3,i<phase?C.green:i===phase?C.blue:C.line)+txt(x,158,labels[i],16,i===phase?C.blue:C.muted,i===phase?650:500);}
  // The writer and its instance class setting.
  s+=rect(36,190,500,366,'#fff',C.line,12)+txt(56,224,'Aurora writer',20,C.ink,650);
@@ -46,15 +55,21 @@ function renderFrame(t){
  s+=pool(260,'Write threads',write,12)+pool(316,'Read threads',read,4);
  s+=txt(732,330,after?'autoscaling':'small-instance mode · fixed',12,after?C.green:C.muted,600);
  s+=line(576,366,1044,366,C.line);
- s+=txt(576,394,'ETA',14,C.muted,600)+txt(576,432,eta(hours),34,hours<48?C.green:C.ink,650,'mono');
- s+=txt(1044,412,throttled?'(throttled)':resizing?'writer restarting':after?'copying':'',14,throttled?C.amber:resizing?C.muted:C.blue,650,'mono','end');
+ s+=txt(576,394,'ETA',14,C.muted,600)+txt(576,432,done?'done':eta(hours),34,hours<48?C.green:C.ink,650,'mono');
+ s+=txt(1044,412,throttled?'(throttled)':resizing?'writer restarting':done?'cut over':after?'copying':'',14,throttled?C.amber:resizing?C.muted:C.blue,650,'mono','end');
  if(throttled)s+=txt(1044,432,'redo-aware 4 > 3',13,C.muted,500,'mono','end');
- // The two ETAs on one scale: the after bar is a sliver of the before bar.
- const before=444;
- s+=txt(576,472,'db.r6g.large',12,C.muted,600,'mono')+rect(576,480,before,12,C.amber,'none',4)+txt(576+before-6,489,'35 days',11,'#fff',650,'','end');
- if(t>=19.5)s+=txt(576,516,'db.r6g.2xlarge',12,C.muted,600,'mono')+rect(576,524,Math.max(3,before*2/840),12,C.green,'none',2)+txt(588,534,'about 2 hours',12,C.green,650);
+ // The table copy, and the time it has taken so far.
+ s+=txt(576,466,'orders',13,C.ink,600,'mono')+txt(1044,466,rows.toFixed(1)+'M / '+ROWS+'M rows',13,C.ink,600,'mono','end');
+ s+=rect(576,474,468,10,C.soft,'none',4)+rect(576,474,468*rows/ROWS,10,done?C.green:after?C.purple:C.amber,'none',4);
+ const ax=h=>576+468*Math.min(h,AXIS_H)/AXIS_H;
+ s+=txt(576,510,'elapsed',13,C.muted,600)+txt(1044,510,clock(elapsed),13,C.ink,600,'mono','end');
+ s+=rect(576,519,ax(Math.min(elapsed,UPSIZE_H))-576,6,C.amber,'none',3);
+ if(elapsed>UPSIZE_H)s+=rect(ax(UPSIZE_H),519,ax(elapsed)-ax(UPSIZE_H),6,C.green,'none',3);
+ s+=line(576,522,1044,522,C.line)+`<circle cx="${ax(elapsed)}" cy="522" r="5" fill="${done?C.green:C.ink}"/>`;
+ for(const h of [0,6,12])s+=line(ax(h),517,ax(h),527,C.line)+txt(ax(h),543,h+'h',11,C.muted,500,'','middle');
+ s+=line(ax(UPSIZE_H),514,ax(UPSIZE_H),530,C.ink,1.5)+txt(ax(UPSIZE_H),543,'upsize',11,C.ink,650,'','middle');
  s+=rect(36,576,1028,57,C.soft)+txt(55,612,captions[phase],17,C.ink,500);
- s+=txt(36,659,'From a staging schema change on a 107M-row table · Thread counts follow Spirit’s sizing for each instance class.',12,C.muted);
+ s+=txt(36,659,'From a staging schema change on a 107M-row table · Timeline illustrative · Thread counts follow Spirit’s sizing per class.',12,C.muted);
  s+=txt(36,678,'Changing the instance class restarts the writer; schedule it like any other instance change.',12,C.muted);
  document.getElementById('art').innerHTML=s;return {phase,vcpus,write,read,hours};
 }

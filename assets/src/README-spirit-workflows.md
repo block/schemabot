@@ -18,17 +18,17 @@ illustrative, not performance measurements.
   These boxes are not separate required deployments. Rows pass through the Spirit process.
   A compatible restart repeats work beyond the saved checkpoint and replays retained logs.
   This loop remains 22 seconds.
-- `spirit-throttling.html` follows Spirit's Aurora throttler on a 16-vCPU writer: the Aurora
-  probe, the redo-aware thread count against its budget of vCPUs plus one, and the commit-latency
-  average against its 100ms threshold. Storage pressure parks more threads on the redo log, so the
-  count falls while commit latency crosses the threshold and pauses the copy. Thread tiles,
-  latency values, and timing are illustrative; the copy's wait rechecks every second.
+- `spirit-throttling.html` shows an application and Spirit's copy writing to one Aurora writer.
+  Application traffic grows, average commit latency climbs past Spirit's 100ms threshold, and the
+  copy waits before each chunk until latency recovers. Traffic, latency, and timing are
+  illustrative.
 - `spirit-write-thread-scaling.html` steps Spirit's write-thread controller once per tick: below
   the band it adds a thread, inside it holds, above it sheds one, and at the limit it halves the
   pool while the copy pauses. Load values are illustrative; the zone order matches Spirit's
-  `pkg/autoscale`.
+  `pkg/autoscale`. The renderer plays it at 1.6x its 24-second timeline.
 - `spirit-aurora-upsize.html` retells a staging schema change on a 107M-row table that moved from
   `db.r6g.large` to `db.r6g.2xlarge`. The ETAs, CPU, and commit latency are the observed values;
+  the elapsed timeline before the upsize is illustrative, and the copy progress follows the ETAs;
   the thread pools follow Spirit's sizing for each instance class (small-instance mode below
   4 vCPUs, write threads from vCPUs minus two up to twice that).
 
