@@ -89,7 +89,7 @@ func TestRecoverApplyPendingStop_ClaimErrorDoesNotConsumeTick(t *testing.T) {
 
 	consumed := svc.recoverApplyPendingStop(t.Context(), 1, driverLeaseOwner(1))
 
-	assert.False(t, consumed, "a failed stop-reconciliation claim must not consume the driver tick")
+	assert.Equal(t, claimFellThrough, consumed, "a failed stop-reconciliation claim must not consume the driver tick")
 }
 
 type noopProgressObserver struct{}
@@ -1671,7 +1671,7 @@ func TestRecoverApplyOperationCutover_RoutesThroughCutoverDrive(t *testing.T) {
 
 	consumed := svc.recoverApplyOperationCutover(t.Context(), 1, "driver-1")
 
-	assert.True(t, consumed, "claiming a parked cutover must consume the tick")
+	assert.Equal(t, claimSpent, consumed, "claiming a parked cutover must consume the tick, and a task-less failure must not re-run the ladder")
 	assert.True(t, opStore.claimed, "the cutover claim predicate must be queried")
 	deploymentClient.resumeMu.Lock()
 	cutoverID := deploymentClient.resumeCutoverOperationID
@@ -1718,7 +1718,7 @@ func TestRecoverApplyOperationCutover_RejectsSingleOperationSet(t *testing.T) {
 
 	consumed := svc.recoverApplyOperationCutover(t.Context(), 1, "driver-1")
 
-	assert.True(t, consumed, "claiming any operation consumes the tick even when it is rejected")
+	assert.Equal(t, claimSpent, consumed, "claiming any operation consumes the tick even when it is rejected")
 	deploymentClient.resumeMu.Lock()
 	cutoverID := deploymentClient.resumeCutoverOperationID
 	copyID := deploymentClient.resumeOperationID
