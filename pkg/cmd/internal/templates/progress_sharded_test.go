@@ -75,6 +75,7 @@ func TestWriteProgressShardedApplyRollsShardsUpUnderTheTable(t *testing.T) {
 	assert.Contains(t, output, "◉ -40"+ANSIReset+": 62.00% · 620 / 1,000 rows")
 	assert.Contains(t, output, "○ 40-80: queued")
 	assert.Contains(t, output, "~ VSchema (shop_001): Pending")
+	assert.Contains(t, output, `"orders": {}`)
 	assert.NotContains(t, output, "Deployments:")
 	assert.NotContains(t, output, "group_finalizer")
 }
@@ -111,7 +112,7 @@ func multiShardRunningResponse() *apitypes.ProgressResponse {
 		{Deployment: "data-plane", OperationKey: "shop_001/c0-/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Pending},
 		{Deployment: "data-plane", OperationKey: "shop_001/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Pending},
 	}
-	vschema, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{{Namespace: "shop_001"}})
+	vschema, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{{Namespace: "shop_001", Diff: "+  \"orders\": {}"}})
 	if err != nil {
 		panic(err)
 	}

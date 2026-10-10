@@ -340,20 +340,21 @@ func FormatNamespacedTablesWithActivity(tables []TableProgress, activityBar, act
 	return b.String()
 }
 
-// FormatVSchemaStatus renders each keyspace's VSchema-application status and
-// diff surfaced on a progress response's display metadata. Returns empty when
-// the apply carries no VSchema change. A keyspace's diff is a VSchema diff (not
-// SQL), rendered with diff coloring via colorizeDiffLine.
+// FormatVSchemaStatus renders the VSchema-application status and diff of each
+// keyspace surfaced on a progress response's display metadata that carries a
+// diff to show. Returns empty when no change does. A keyspace's diff is a
+// VSchema diff (not SQL), rendered with diff coloring via colorizeDiffLine.
 func FormatVSchemaStatus(changes []apitypes.VSchemaChange) string {
-	if len(changes) == 0 {
-		return ""
-	}
 	var b strings.Builder
 	for _, c := range changes {
-		fmt.Fprintf(&b, "    ~ VSchema (%s): %s\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
-		if c.Diff != "" {
-			b.WriteString(FormatVSchemaDiff(c.Diff, indentContent))
+		if c.Diff == "" {
+			continue
 		}
+		fmt.Fprintf(&b, "    ~ VSchema (%s): %s\n", c.Namespace, ui.VSchemaStatusLabel(c.Status))
+		b.WriteString(FormatVSchemaDiff(c.Diff, indentContent))
+	}
+	if b.Len() == 0 {
+		return ""
 	}
 	b.WriteString("\n")
 	return b.String()

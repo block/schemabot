@@ -10114,6 +10114,11 @@ To resume from where it stopped:
            ○ 80-c0: queued
            ○ c0-: queued
     ~ VSchema (shop_001): Pending
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
 
 
 ```
@@ -10150,6 +10155,11 @@ To resume from where it stopped:
            ○ 80-c0: cancelled
            ○ c0-: cancelled
     ~ VSchema (shop_001): Cancelled
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
 
 
 To recover: Fix the issue above, then run a new apply.

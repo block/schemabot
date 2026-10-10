@@ -181,10 +181,18 @@ func previewCLISingleShardApplyCompleted() {
 	})
 }
 
+// previewShardedVSchemaDiff is the VSchema diff of the sharded previews'
+// keyspace: a vindex for the table the apply indexes.
+const previewShardedVSchemaDiff = `   "tables": {
+     "orders": {
++      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+     }
+   }`
+
 // shardedPreviewProgress is a sharded apply changing `orders` across the four
 // shards of shop_001, as the server reports it: the table rolled up across
 // its shards, the operation rows for each shard and the keyspace's finalizer,
-// and the finalizer's VSchema change in the display metadata.
+// and the finalizer's VSchema change, with its diff, in the display metadata.
 func shardedPreviewProgress(applyState, finalizerState, vschemaStatus string, shards []ShardProgress, table TableProgress) ProgressData {
 	keys := []string{"shop_001/-40/orders", "shop_001/40-80/orders", "shop_001/80-c0/orders", "shop_001/c0-/orders"}
 	var ops []ProgressOperation
@@ -192,7 +200,7 @@ func shardedPreviewProgress(applyState, finalizerState, vschemaStatus string, sh
 		ops = append(ops, ProgressOperation{Deployment: "prod", OperationKey: key, OperationKind: storage.ApplyOperationKindWork, State: shards[i].Status})
 	}
 	ops = append(ops, ProgressOperation{Deployment: "prod", OperationKey: "shop_001/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: finalizerState})
-	vschema, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{{Namespace: "shop_001", Status: vschemaStatus}})
+	vschema, err := apitypes.EncodeVSchemaChanges([]apitypes.VSchemaChange{{Namespace: "shop_001", Status: vschemaStatus, Diff: previewShardedVSchemaDiff}})
 	if err != nil {
 		panic(err)
 	}

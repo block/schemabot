@@ -15,7 +15,7 @@ import (
 // one change across its keyspaces' shards, not as an operation row per shard
 // and table. Each keyspace table becomes one row with its shards listed under
 // it, a table on its keyspace's only shard keeps its own rows, and each
-// finalizer with a VSchema change joins the VSchema display metadata, all read
+// finalizer with a VSchema diff joins the VSchema display metadata, all read
 // against the stored plan. Operations still lists every row. Any other apply
 // is left as it is.
 //
@@ -182,15 +182,16 @@ func taskCopies(tasks []*storage.Task) []presentation.ShardCopy {
 	return copies
 }
 
-// addFinalizerVSchemaChanges adds each finalizer that changes its keyspace's
-// VSchema to the response's VSchema display metadata, with its status
-// (presentation.FinalizerVSchemaStatus) and the diff the stored plan carries,
-// the change the operator approved. A finalizer the plan says only finalizes
-// its keyspace, with no VSchema change, adds nothing. A plan that cannot be
-// read (a nil plan) shows every finalizer as a VSchema change without a diff,
-// as the PR comments do, so no VSchema change goes unshown. A VSchema change
-// the engine already reported is left as it is.
+// addFinalizerVSchemaChanges adds each finalizer whose keyspace's VSchema
+// diff the stored plan carries, the change the operator approved, to the
+// response's VSchema display metadata, with its status
+// (presentation.FinalizerVSchemaStatus). A finalizer with no diff to show adds
+// nothing, nor does any finalizer when the plan cannot be read (a nil plan). A
+// VSchema change the engine already reported is left as it is.
 func (s *Service) addFinalizerVSchemaChanges(resp *apitypes.ProgressResponse, apply *storage.Apply, ops []*storage.ApplyOperation, plan *storage.Plan) {
+	if plan == nil {
+		return
+	}
 	existing, err := apitypes.ParseVSchemaChanges(resp.Metadata)
 	if err != nil {
 		s.logger.Warn("progress response will keep the engine's VSchema display metadata without the finalizers': failed to decode it",
@@ -204,21 +205,14 @@ func (s *Service) addFinalizerVSchemaChanges(resp *apitypes.ProgressResponse, ap
 	changes := existing
 	for _, op := range ops {
 		ns, ok := state.NamespaceFinalizerKey(op.OperationKey)
-		if !ok || reported[ns] {
+		if !ok || reported[ns] || plan.Namespaces[ns] == nil {
 			continue
 		}
-		var nsPlan *storage.NamespacePlanData
-		if plan != nil {
-			nsPlan = plan.Namespaces[ns]
-		}
-		if nsPlan.FinalizesWithoutVSchemaChange() {
+		diff := plan.Namespaces[ns].Metadata[storage.PlanMetadataVSchemaDiff]
+		if diff == "" {
 			continue
 		}
-		change := apitypes.VSchemaChange{Namespace: ns, Status: presentation.FinalizerVSchemaStatus(apply.State, op.State)}
-		if nsPlan != nil {
-			change.Diff = nsPlan.Metadata[storage.PlanMetadataVSchemaDiff]
-		}
-		changes = append(changes, change)
+		changes = append(changes, apitypes.VSchemaChange{Namespace: ns, Status: presentation.FinalizerVSchemaStatus(apply.State, op.State), Diff: diff})
 	}
 	if len(changes) == len(existing) {
 		return
@@ -242,12 +236,12 @@ func (s *Service) addFinalizerVSchemaChanges(resp *apitypes.ProgressResponse, ap
 func (s *Service) storedPlanForShardedProgress(ctx context.Context, apply *storage.Apply) *storage.Plan {
 	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
 	if err != nil {
-		s.logger.Warn("progress response will show every table without its planned size and every finalizer as a VSchema change without a diff: failed to load stored plan",
+		s.logger.Warn("progress response will show every table without its planned size and no finalizer VSchema change: failed to load stored plan",
 			append(apply.LogAttrs(), "plan_id", apply.PlanID, "error", err)...)
 		return nil
 	}
 	if plan == nil {
-		s.logger.Warn("progress response will show every table without its planned size and every finalizer as a VSchema change without a diff: stored plan row not found",
+		s.logger.Warn("progress response will show every table without its planned size and no finalizer VSchema change: stored plan row not found",
 			append(apply.LogAttrs(), "plan_id", apply.PlanID)...)
 		return nil
 	}

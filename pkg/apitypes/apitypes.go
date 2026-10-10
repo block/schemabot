@@ -1513,6 +1513,20 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 	return tables
 }
 
+// FinalizesOnly reports whether a namespace's only work in the plan is the
+// finalize its engine asked for: no VSchema change to show and no DDL, whether
+// the namespace carries its DDL itself or on its shards. A namespace with DDL
+// finalizes as part of that work, so surfaces name the finalize on its own line
+// only when this holds.
+func (r *PlanResponse) FinalizesOnly(sc *SchemaChangeResponse) bool {
+	if sc == nil || !sc.NeedsFinalizer() || sc.ShowsVSchemaChange() || len(sc.TableChanges) > 0 {
+		return false
+	}
+	return !slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && sp.Namespace == sc.Namespace && len(sp.Changes) > 0
+	})
+}
+
 // HasChanges reports whether the plan carries any work an apply would execute:
 // table DDL in any namespace or on any shard, a VSchema update, or a finalizer
 // the engine asked for. Gates that decide whether a plan is actionable must use

@@ -133,13 +133,15 @@ func TestProgressByApplyIDKeepsAnOnlyShardTablesRow(t *testing.T) {
 	assert.NotContains(t, resp.Metadata, apitypes.VSchemaChangesMetadataKey)
 }
 
-// A stored plan that cannot be read shows every finalizer as a VSchema change
-// without a diff, as the PR comments do, so no VSchema change goes unshown.
-func TestProgressByApplyIDShowsEveryFinalizerWhenThePlanCannotBeRead(t *testing.T) {
+// A finalizer shows a VSchema change only with the diff the stored plan
+// carries for its keyspace, so a plan that cannot be read, or carries no diff,
+// shows none.
+func TestProgressByApplyIDShowsAFinalizerOnlyWithItsVSchemaDiff(t *testing.T) {
 	for name, plans := range map[string]*staticPlanStore{
 		"a plan read error":           {err: errors.New("storage unavailable")},
 		"a missing stored plan":       {},
 		"a plan without the keyspace": {plan: &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{}}},
+		"a plan without a diff":       {plan: &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {Finalize: true}}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			ops := []*storage.ApplyOperation{
@@ -150,9 +152,8 @@ func TestProgressByApplyIDShowsEveryFinalizerWhenThePlanCannotBeRead(t *testing.
 
 			resp := shardedProgress(t, ops, nil, plans)
 
-			changes, err := apitypes.ParseVSchemaChanges(resp.Metadata)
-			require.NoError(t, err)
-			assert.Equal(t, []apitypes.VSchemaChange{{Namespace: "shop_001", Status: "applying"}}, changes)
+			assert.True(t, resp.Sharded)
+			assert.NotContains(t, resp.Metadata, apitypes.VSchemaChangesMetadataKey)
 		})
 	}
 }
