@@ -24,7 +24,8 @@ import (
 // burst of errors hit. Every request through the server handler is labeled
 // with the route it matched: one the auth middleware let through to its
 // handler, one the middleware rejected, and the unauthenticated webhook alike.
-// A request that matches no route carries no route label.
+// A request that matches no route carries no route label, including when the
+// handler is mounted under another mux.
 func TestServerHandlerLabelsHTTPMetricsWithRoute(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	cfg := &api.ServerConfig{
@@ -44,14 +45,6 @@ func TestServerHandlerLabelsHTTPMetricsWithRoute(t *testing.T) {
 	require.NoError(t, err)
 	authz, err := buildServerAuthorizer(t.Context(), cfg, logger)
 	require.NoError(t, err)
-	telemetry, err := api.SetupTelemetry(logger)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-		defer cancel()
-		_ = telemetry.Shutdown(shutdownCtx)
-	})
-
 	// The OTel HTTP handler takes its meter from the global provider when it is
 	// built, so the reader is installed before Handler is called.
 	reader := sdkmetric.NewManualReader()
@@ -60,13 +53,15 @@ func TestServerHandlerLabelsHTTPMetricsWithRoute(t *testing.T) {
 	otel.SetMeterProvider(mp)
 	t.Cleanup(func() {
 		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(t.Context()))
+		shutdownCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		assert.NoError(t, mp.Shutdown(shutdownCtx))
 	})
 
-	srv := &Server{cfg: cfg, svc: svc, logger: logger, webhook: webhook, telemetry: telemetry, authz: authz}
+	srv := &Server{cfg: cfg, svc: svc, logger: logger, webhook: webhook, authz: authz}
 	handler := srv.Handler()
 
-	serve := func(method, path, remoteAddr, groups string) int {
+	serveVia := func(h http.Handler, method, path, remoteAddr, groups string) int {
 		req := httptest.NewRequestWithContext(t.Context(), method, path, nil)
 		req.RemoteAddr = remoteAddr
 		if groups != "" {
@@ -74,8 +69,11 @@ func TestServerHandlerLabelsHTTPMetricsWithRoute(t *testing.T) {
 			req.Header.Set("X-Forwarded-Capabilities", groups)
 		}
 		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, req)
+		h.ServeHTTP(rec, req)
 		return rec.Code
+	}
+	serve := func(method, path, remoteAddr, groups string) int {
+		return serveVia(handler, method, path, remoteAddr, groups)
 	}
 
 	// Authorized, so it reaches the plan handler, which rejects the empty body.
@@ -87,11 +85,17 @@ func TestServerHandlerLabelsHTTPMetricsWithRoute(t *testing.T) {
 	// Matches no route.
 	require.Equal(t, http.StatusNotFound, serve(http.MethodGet, "/api/nope", "192.0.2.1:1234", "owners"))
 
+	// Mounted under an embedder's mux, a path this handler does not route stays
+	// unlabeled instead of inheriting the pattern it is mounted under.
+	outer := http.NewServeMux()
+	outer.Handle("/", handler)
+	require.Equal(t, http.StatusNotFound, serveVia(outer, http.MethodGet, "/api/missing", "192.0.2.1:1234", "owners"))
+
 	assert.Equal(t, map[string]int64{
 		"POST 400 /api/plan":              1,
 		"GET 401 /api/status":             1,
 		"GET 401 /api/history/{database}": 1,
-		"GET 404 ":                        1,
+		"GET 404 ":                        2,
 	}, requestCountsByRoute(t, reader))
 }
 

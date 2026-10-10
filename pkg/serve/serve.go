@@ -1022,12 +1022,12 @@ func (s *Server) Handler() http.Handler {
 // endpoint. The middleware hands the mux a copy of the request carrying the
 // verified caller, and the mux records the pattern on that copy, which the
 // instrumentation never sees. A request the middleware rejects is labeled with
-// its route too, so a burst of 401s names the endpoint it hit.
+// its route too, so a burst of 401s names the endpoint it hit. A request that
+// matches no route carries no route, even when an embedder's outer mux already
+// recorded the pattern this handler is mounted under.
 func withMatchedRoute(mux *http.ServeMux, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if _, pattern := mux.Handler(r); pattern != "" {
-			r.Pattern = pattern
-		}
+		_, r.Pattern = mux.Handler(r)
 		next.ServeHTTP(w, r)
 	})
 }
