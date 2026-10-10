@@ -504,6 +504,43 @@ func TestWatchModel_SingleDeploymentOutputDoesNotUseMultiView(t *testing.T) {
 	assert.NotContains(t, withSingleOperation, "us-east — running table copy")
 }
 
+// A sharded apply watches as one change, as its PR comments render it: the
+// shards counted by status, each table once under its keyspace with its
+// shards listed beneath it, and no section for a shard or the finalizer.
+func TestWatchModel_ShardedApplyDoesNotUseMultiView(t *testing.T) {
+	progress := apitypes.ProgressResponse{
+		State:       state.Apply.Running,
+		ApplyID:     "apply-sharded",
+		Database:    "shop",
+		Environment: "staging",
+		Sharded:     true,
+		Operations: []*apitypes.ProgressOperationResponse{
+			{Deployment: "data-plane", OperationKey: "shop_001/-80/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running},
+			{Deployment: "data-plane", OperationKey: "shop_001/80-/orders", OperationKind: storage.ApplyOperationKindWork, State: state.ApplyOperation.Running},
+			{Deployment: "data-plane", OperationKey: "shop_001/group_finalizer", OperationKind: storage.ApplyOperationKindGroupFinalizer, State: state.ApplyOperation.Pending},
+		},
+		Tables: []*apitypes.TableProgressResponse{{
+			Deployment: "data-plane", Keyspace: "shop_001", TableName: "orders", ChangeType: "alter",
+			DDL: "ALTER TABLE `orders` ADD COLUMN `note` text", Status: state.Task.Running, RowsCopied: 840, RowsTotal: 2000, PercentComplete: 42,
+			Shards: []*apitypes.ShardProgressResponse{
+				{Shard: "-80", Status: state.Task.Running, RowsCopied: 420, RowsTotal: 1000, PercentComplete: 42},
+				{Shard: "80-", Status: state.Task.Running, RowsCopied: 420, RowsTotal: 1000, PercentComplete: 42},
+			},
+		}},
+	}
+	m := NewWatchModel("http://localhost:8080", "shop", "staging", false)
+	m.initialized = true
+	updated, _ := m.Update(parseProgressResult(&progress))
+
+	view := updated.(WatchModel).View()
+
+	assert.Equal(t, 1, strings.Count(view, "orders:"), "the table renders once:\n%s", view)
+	assert.Contains(t, view, "Shards:  2 running table copy")
+	assert.Contains(t, view, "Shards: 2 (2 copying)")
+	assert.NotContains(t, view, "group_finalizer")
+	assert.NotContains(t, view, "Deployments:")
+}
+
 func multiDeploymentTUITestProgress() apitypes.ProgressResponse {
 	return apitypes.ProgressResponse{
 		State:       state.Apply.Failed,
@@ -855,7 +892,7 @@ func TestGetProgress_ServerReturns500_CLIReturnsError(t *testing.T) {
 
 // Two targets of one deployment each copy their own tables against their own
 // schema. The watch view rolls the deployment up the way the progress output
-// does, listing each table once under the targets that copied it, so a
+// does, listing each table once and naming the targets that copied it, so a
 // deployment addressing several targets does not show every copy twice.
 func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	m := NewWatchModel("http://localhost:8080", "testapp", "production", false)
@@ -867,8 +904,8 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 		{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 	}
 	m.tables = []templates.TableProgress{
-		{Deployment: "primary", Target: "testapp-001", TableName: "users_001", ChangeType: "alter", Status: state.Task.Completed},
-		{Deployment: "primary", Target: "testapp-002", TableName: "users_002", ChangeType: "alter", Status: state.Task.Running},
+		{Deployment: "primary", Target: "testapp-001", TableName: "users_001", ChangeType: "alter", DDL: "ALTER TABLE `users_001` ADD COLUMN `region` varchar(20)", Status: state.Task.Completed},
+		{Deployment: "primary", Target: "testapp-002", TableName: "users_002", ChangeType: "alter", DDL: "ALTER TABLE `users_002` ADD COLUMN `region` varchar(20)", Status: state.Task.Running},
 	}
 
 	view := m.View()
@@ -876,14 +913,14 @@ func TestWatchModel_MultiTargetRollupScopesTablesToTheirMember(t *testing.T) {
 	assertContainsInOrder(t, view,
 		"Targets: 1 completed · 1 running",
 		"primary — 1 completed · 1 running (2 targets)",
-		"target testapp-001",
-		"users_001",
-		"target testapp-002",
 		"users_002",
+		"target testapp-002",
+		"users_001",
+		"target testapp-001",
 		"To stop this schema change:",
 		"schemabot stop apply-multi-target -e production",
 		"ESC to detach",
 	)
-	assert.Equal(t, 1, strings.Count(view, "users_001"))
-	assert.Equal(t, 1, strings.Count(view, "users_002"))
+	assert.Equal(t, 1, strings.Count(view, "users_001:"))
+	assert.Equal(t, 1, strings.Count(view, "users_002:"))
 }

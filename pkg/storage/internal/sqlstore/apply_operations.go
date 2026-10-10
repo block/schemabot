@@ -24,7 +24,7 @@ import (
 
 // applyOperationColumns lists all columns for SELECT queries.
 const applyOperationColumns = `id, apply_id, plan_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message,
-	cutover_policy, on_failure, attempt, already_converged, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
+	cutover_policy, on_failure, attempt, already_converged, rollout_step, started_at, completed_at, lease_owner, lease_token, lease_acquired_at,
 	engine_resume_context, engine_resume_metadata, progress_metadata, created_at, updated_at`
 
 // applyOperationStore implements storage.ApplyOperationStore using MySQL.
@@ -81,6 +81,11 @@ func insertApplyOperation(ctx context.Context, exec queryExecer, identity identi
 		operationKind = storage.ApplyOperationKindWork
 	}
 
+	if ad.RolloutStep < 0 {
+		return 0, fmt.Errorf("insert apply_operations (apply=%d, deployment=%s, operation_key=%s): rollout step %d is negative; a row runs step 1 or later, or 0 for a member's whole change",
+			ad.ApplyID, ad.Deployment, ad.OperationKey, ad.RolloutStep)
+	}
+
 	// A row is recorded as already converged only as the completed work no
 	// driver ever ran. Anything else would tell an operator a target already
 	// had the change when work was still to run there, or did run.
@@ -92,11 +97,11 @@ func insertApplyOperation(ctx context.Context, exec queryExecer, identity identi
 	id, err := identity.InsertID(ctx, exec, `
 		INSERT INTO apply_operations (
 			apply_id, plan_id, deployment, operation_key, operation_kind, target, external_id, external_operation_id, state, error_message, cutover_policy, on_failure,
-			already_converged, started_at, completed_at, engine_resume_context, engine_resume_metadata
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			already_converged, rollout_step, started_at, completed_at, engine_resume_context, engine_resume_metadata
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		ad.ApplyID, nullInt64(ad.PlanID), ad.Deployment, ad.OperationKey, operationKind, ad.Target, nullString(ad.ExternalID), nullString(ad.ExternalOperationID), stateVal, nullString(ad.ErrorMessage), cutoverPolicy, onFailure,
-		ad.AlreadyConverged, ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
+		ad.AlreadyConverged, ad.RolloutStep, ad.StartedAt, ad.CompletedAt, nullString(ad.EngineResumeContext), nullString(ad.EngineResumeMetadata),
 	)
 	if err != nil {
 		if classifier.IsDuplicateKey(err) {
@@ -976,10 +981,12 @@ func finalizerStartGateArgs() []any {
 // Parallel leaves copy start unordered, but still obeys failure admission.
 // Under rolling, and any unrecognized value, which fails closed to the serial
 // gate via NOT IN (barrier, parallel), only a completed earlier sibling stops
-// blocking. The fragment references the apply_operations alias; see
+// blocking. A table step of a rollout that runs table by table also waits on
+// rolloutStepGateSQL. The fragment references the apply_operations alias; see
 // workStartGateArgs for its placeholders.
 func workStartGateSQL(d Dialect) string {
-	return `NOT EXISTS (
+	return `(
+NOT EXISTS (
 	SELECT 1
 	FROM apply_operations AS earlier
 	WHERE earlier.apply_id = apply_operations.apply_id
@@ -999,8 +1006,33 @@ func workStartGateSQL(d Dialect) string {
 			)
 		)
 		AND ` + releasedFailureExemptionSQL(d) + `
+)
+AND ` + rolloutStepGateSQL + `
 )`
 }
+
+// rolloutStepGateSQL is the table-step boundary of a rollout that runs table by
+// table: a work row of step N starts only once every row of an earlier step in
+// its deployment has completed, so each table lands on every target before any
+// target starts the next. It holds under every cutover_policy, since parallel
+// and barrier order only targets within a step, and under every on_failure,
+// since a failure the policy continues past lets the step's remaining targets
+// run but never starts the next table on a fleet where one target is missing
+// the last. A row of step zero runs its member's whole change and is never
+// gated here, and an earlier step-zero row never holds one. As with the member
+// gate, an apply a remote dispatch created leaves the order to its dispatcher
+// (rolloutMembersOrderedHereSQL). The fragment references the apply_operations
+// alias; its one placeholder is completed.
+const rolloutStepGateSQL = `NOT EXISTS (
+	SELECT 1
+	FROM apply_operations AS earlier_step
+	WHERE earlier_step.apply_id = apply_operations.apply_id
+		AND earlier_step.deployment = apply_operations.deployment
+		AND earlier_step.rollout_step > 0
+		AND earlier_step.rollout_step < apply_operations.rollout_step
+		AND earlier_step.state <> ?
+		AND ` + rolloutMembersOrderedHereSQL + `
+)`
 
 // workStartGateArgs returns the positional arguments for workStartGateSQL,
 // in placeholder order.
@@ -1019,7 +1051,8 @@ func workStartGateArgs() []any {
 		storage.CutoverPolicyParallel,
 		state.ApplyOperation.Completed,
 	)
-	return append(args, releasedFailureExemptionArgs()...)
+	args = append(args, releasedFailureExemptionArgs()...)
+	return append(args, state.ApplyOperation.Completed)
 }
 
 // operationStartGateSQL is the member-order gate every claim arm that starts
@@ -2621,7 +2654,7 @@ func scanApplyOperationInto(s scanner) (*storage.ApplyOperation, error) {
 
 	if err := s.Scan(
 		&ad.ID, &ad.ApplyID, &planID, &ad.Deployment, &ad.OperationKey, &ad.OperationKind, &ad.Target, &externalID, &externalOperationID, &ad.State, &errMsg,
-		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &ad.AlreadyConverged, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
+		&ad.CutoverPolicy, &ad.OnFailure, &ad.Attempt, &ad.AlreadyConverged, &ad.RolloutStep, &startedAt, &completedAt, &ad.LeaseOwner, &ad.LeaseToken, &leaseAcquiredAt,
 		&engineResumeContext, &engineResumeMetadata, &progressMetadata, &ad.CreatedAt, &ad.UpdatedAt,
 	); err != nil {
 		return nil, err

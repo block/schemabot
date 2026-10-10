@@ -1872,8 +1872,10 @@ func (s applyTaskScope) generationOperationKeys() []string {
 
 // stampMemberTarget names the dispatch's rollout member target on the request,
 // so the data plane derives the same target-qualified operation key the
-// planner stored. A scope with no member target leaves the request untouched,
-// keeping every single-target dispatch byte-for-byte what it was.
+// planner stored, and the table step the operation runs when the rollout runs
+// table by table, so the data plane runs only that step's tables. A scope with
+// no member target leaves the request untouched, keeping every single-target
+// dispatch byte-for-byte what it was.
 func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
 	if s.memberTarget == "" {
 		return
@@ -1882,6 +1884,9 @@ func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
 		req.Options = make(map[string]string)
 	}
 	req.Options[dispatchMemberTargetOption] = s.memberTarget
+	if s.operation != nil && s.operation.RolloutStep > 0 {
+		req.Options[dispatchRolloutStepOption] = strconv.Itoa(s.operation.RolloutStep)
+	}
 }
 
 // remoteOperationScope returns the remote operation id this drive's Progress

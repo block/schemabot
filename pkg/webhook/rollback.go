@@ -391,8 +391,9 @@ func (h *Handler) rollbackCommentData(database, dbType, environment, sourceApply
 
 	for _, w := range planResp.LintNonErrors() {
 		commentData.LintViolations = append(commentData.LintViolations, templates.LintViolationData{
-			Message: w.Message,
-			Table:   w.Table,
+			Message:    w.Message,
+			Table:      w.Table,
+			LinterName: w.Linter,
 		})
 	}
 	commentData.Errors = planResp.Errors

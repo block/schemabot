@@ -175,7 +175,10 @@ type PlanCommentData struct {
 
 	Changes        []KeyspaceChangeData
 	LintViolations []LintViolationData
-	Errors         []string
+
+	// LintRuleNames includes rule IDs from findings of every severity.
+	LintRuleNames []string
+	Errors        []string
 
 	// IgnoredNamespaces lists the namespaces whose schema files were excluded
 	// from this plan by the repository's ignore_namespaces config — only entries
@@ -671,6 +674,7 @@ func renderPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	if !data.IsLocked {
 		writePlanWideLint(&sb, data.LintViolations, data.DeploymentDrift, targetPlans)
 	}
+	writeRelatedGuidance(&sb, data.disclosesEverySeverity())
 
 	// Errors
 	if len(data.Errors) > 0 {
@@ -3292,6 +3296,14 @@ func renderMultiEnvPlanComment(data MultiEnvPlanCommentData, budget *ddlBlockBud
 		}
 	}
 
+	var guidanceScopes []guidanceScope
+	for _, env := range data.Environments {
+		if plan := data.Plans[env]; plan != nil && data.Errors[env] == "" {
+			guidanceScopes = append(guidanceScopes, plan.disclosesEverySeverity())
+		}
+	}
+	writeRelatedGuidance(&sb, guidanceScopes...)
+
 	// Footer with apply instructions
 	sb.WriteString("---\n\n")
 	writeMultiEnvFooter(&sb, data)
@@ -3607,22 +3619,36 @@ func scopedCommand(baseCommand, environment, database, tenant string) string {
 }
 
 // ApplyCommandOptions are the flags an apply or apply-confirm command carries
-// beyond its target. A pasteable hint for either command has to repeat them,
-// because the command reads its options from the comment that carries it and
-// nothing else: a hint that drops --defer-cutover runs the cutover the operator
-// chose to defer, and one that drops --allow-unsafe is blocked again.
+// beyond its environment and database. A pasteable hint for either command has
+// to repeat them, because the command reads its options from the comment that
+// carries it and nothing else: a hint that drops --defer-cutover runs the
+// cutover the operator chose to defer, one that drops --allow-unsafe is blocked
+// again, and one that drops --target applies to every rollout member instead of
+// the one the operator narrowed to. Target is set only for apply hints:
+// apply-confirm takes its target from the plan it confirms.
 type ApplyCommandOptions struct {
+	Target       string
 	Tenant       string
 	AllowUnsafe  bool
 	DeferCutover bool
 	SkipRevert   bool
 }
 
+// ApplyCommand renders a pasteable apply command for one environment, carrying
+// the database the operator named with -d and the options they typed, so a
+// refusal that asks the operator to re-run their apply names the apply they
+// asked for.
+func ApplyCommand(environment, database string, opts ApplyCommandOptions) string {
+	return scopedApplyCommand("schemabot apply", environment, database, opts)
+}
+
 // scopedApplyCommand renders a pasteable apply or apply-confirm command for one
-// environment: the target first (-e, then -d), the deployment qualifier, then
-// the option flags in the order the locked plan comment lists them.
+// environment: the target first (-e, then -d, then --target), the deployment
+// qualifier, then the option flags in the order the locked plan comment lists
+// them.
 func scopedApplyCommand(baseCommand, environment, database string, opts ApplyCommandOptions) string {
-	command := scopedCommand(baseCommand, environment, database, opts.Tenant)
+	command := appendDatabaseFlag(fmt.Sprintf("%s -e %s", baseCommand, environment), database)
+	command = appendTenantFlag(appendTargetFlag(command, opts.Target), opts.Tenant)
 	if opts.AllowUnsafe {
 		command += " --allow-unsafe"
 	}

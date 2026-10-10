@@ -227,6 +227,15 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 
 	writePlanSummary(&sb, summary, totalStatements, keyspaceUpdates)
 
+	// Lint findings, and the guides for what they name. This is where the
+	// operator decides whether to pass --allow-unsafe, so the reading that
+	// informs the decision belongs above the rejection rather than only on the
+	// plan comment that preceded it.
+	if len(data.LintViolations) > 0 {
+		writeLintViolations(&sb, data.LintViolations)
+	}
+	writeRelatedGuidance(&sb, data.disclosesEverySeverity())
+
 	applyCmd := appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase), data.Target)
 	if data.Tenant != "" {
 		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)

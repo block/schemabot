@@ -1415,6 +1415,7 @@ var optionalCapabilityVerdicts = map[reflect.Type]bool{
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,
 	reflect.TypeFor[engine.CancelledArtifactReleaser]():       false,
 	reflect.TypeFor[engine.ControlResumeValidator]():          false,
+	reflect.TypeFor[engine.ShardKeyedPlanning]():              false,
 }
 
 // TestOptionalCapabilitySet checks the recorded verdicts against the engine's

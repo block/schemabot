@@ -850,6 +850,13 @@ type PlanRolloutResponse struct {
 	// schema, so members are expected to differ. False means every member is
 	// expected to run the primary's plan.
 	Independent bool `json:"independent,omitempty"`
+	// MultiTarget is true when some deployment of the rollout addresses more
+	// than one target. An apply of such a rollout refuses --defer-cutover.
+	MultiTarget bool `json:"multi_target,omitempty"`
+	// ShapeRefusal is why apply creation refuses an apply of the whole rollout
+	// whatever options it carries, naming the apply to run instead. It is
+	// empty when the rollout's shape admits one.
+	ShapeRefusal string `json:"shape_refusal,omitempty"`
 	// Groups holds one entry per distinct plan, naming the members that run
 	// it, with the primary's group first.
 	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
@@ -1506,6 +1513,20 @@ func (r *PlanResponse) RenderedTables() []*TableChangeResponse {
 	return tables
 }
 
+// FinalizesOnly reports whether a namespace's only work in the plan is the
+// finalize its engine asked for: no VSchema change to show and no DDL, whether
+// the namespace carries its DDL itself or on its shards. A namespace with DDL
+// finalizes as part of that work, so surfaces name the finalize on its own line
+// only when this holds.
+func (r *PlanResponse) FinalizesOnly(sc *SchemaChangeResponse) bool {
+	if sc == nil || !sc.NeedsFinalizer() || sc.ShowsVSchemaChange() || len(sc.TableChanges) > 0 {
+		return false
+	}
+	return !slices.ContainsFunc(r.Shards, func(sp *ShardPlanResponse) bool {
+		return sp != nil && sp.Namespace == sc.Namespace && len(sp.Changes) > 0
+	})
+}
+
 // HasChanges reports whether the plan carries any work an apply would execute:
 // table DDL in any namespace or on any shard, a VSchema update, or a finalizer
 // the engine asked for. Gates that decide whether a plan is actionable must use
@@ -1747,6 +1768,13 @@ type ProgressResponse struct {
 	// on_failure=pause no longer holds later deployments — the rollout proceeds
 	// like continue. Apply-level: it applies to every operation of the apply.
 	Released bool `json:"released,omitempty"`
+	// Sharded is true when the apply is one change fanned out across its
+	// keyspaces' shards. Tables then carries one row per keyspace table with
+	// its shards listed under it (a table on its keyspace's only shard keeps
+	// its own row and names no shard), and Metadata carries each finalizer's
+	// VSchema change. Operations still lists every shard and finalizer row,
+	// but a client renders the apply as one change, the way its PR comments do.
+	Sharded bool `json:"sharded,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.
@@ -1773,9 +1801,13 @@ type ProgressOperationResponse struct {
 	// AlreadyConverged is true for an operation recorded completed when the
 	// apply was created, because its target already held the change and
 	// nothing ran there.
-	AlreadyConverged bool   `json:"already_converged,omitempty"`
-	StartedAt        string `json:"started_at,omitempty"`
-	CompletedAt      string `json:"completed_at,omitempty"`
+	AlreadyConverged bool `json:"already_converged,omitempty"`
+	// RolloutStep is the table step this operation runs, numbered from 1, when
+	// the rollout runs table by table: one operation per target and table.
+	// Omitted for an operation that runs its member's whole change.
+	RolloutStep int    `json:"rollout_step,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.
@@ -1801,8 +1833,13 @@ type TableProgressResponse struct {
 	// (data plus indexes), for display beside the row counts. It is the
 	// table's size when planned, not a measure of copy progress. Absent when
 	// the plan had no estimate and for a task scoped to one shard, since the
-	// estimate covers the whole table.
+	// estimate covers the whole table. A sharded table rolled up across its
+	// shards carries it, covering every shard.
 	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+	// PlannedShards is how many shards a sharded table's change spans per its
+	// plan, the shards EstimatedBytes covers. Zero when the plan recorded no
+	// count and for a table not rolled up across shards.
+	PlannedShards int32 `json:"planned_shards,omitempty"`
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64 `json:"checksum_rows_checked,omitempty"`

@@ -57,7 +57,7 @@ func TestTUIShardRendering(t *testing.T) {
 			},
 			// The ETA pins the shard-field plumbing end to end: unlike the
 			// percent, formatShardLine cannot re-derive it from row counts.
-			contains: []string{"Shards:", "2 copying", "ETA 2m 30s"},
+			contains: []string{"Shards:", "2 copying", "ETA: 2m 30s"},
 		},
 		{
 			name: "uppercase and prefixed statuses normalized for rendering",
@@ -166,7 +166,7 @@ func TestTUIBranchApplyProgress(t *testing.T) {
 				engine:      "PlanetScale",
 			}
 
-			view := m.progressView()
+			view := m.View()
 			for _, expected := range tt.contains {
 				assert.Contains(t, view, expected, "expected %q in TUI output", expected)
 			}
@@ -191,6 +191,6 @@ func TestTUIShowsDeployRequestURLWhileRunning(t *testing.T) {
 		engine:      "PlanetScale",
 	}
 
-	view := m.progressView()
+	view := m.View()
 	assert.Contains(t, view, "Deploy Request:  "+url)
 }

@@ -62,26 +62,26 @@ func TestReplanVerdictForTask_ShardTaskUnderANamespaceUnitReplan(t *testing.T) {
 	unitKey := shardTableKey{namespace: "appdb_sharded", table: "orders"}
 	shardKey := shardTableKey{namespace: "appdb_sharded", shard: "-40", table: "orders"}
 
-	verdict, key := replanVerdictForTask(map[shardTableKey][]string{unitKey: {resumeTaskDDL}}, task)
+	verdict, key := replanVerdictForTask(map[shardTableKey][]string{unitKey: {resumeTaskDDL}}, false, task)
 	assert.Equal(t, replanNeedsChange, verdict, "the unit still owing the table is reason to run the reviewed statement")
 	assert.Equal(t, unitKey, key)
 
-	verdict, _ = replanVerdictForTask(map[shardTableKey][]string{}, task)
+	verdict, _ = replanVerdictForTask(map[shardTableKey][]string{}, false, task)
 	assert.Equal(t, replanCannotAttribute, verdict, "the unit's silence is not evidence about this shard")
 
-	verdict, key = replanVerdictForTask(map[shardTableKey][]string{shardKey: {resumeTaskDDL}}, task)
+	verdict, key = replanVerdictForTask(map[shardTableKey][]string{shardKey: {resumeTaskDDL}}, false, task)
 	assert.Equal(t, replanNeedsChange, verdict)
 	assert.Equal(t, shardKey, key)
 
 	otherShard := shardTableKey{namespace: "appdb_sharded", shard: "40-", table: "orders"}
-	verdict, _ = replanVerdictForTask(map[shardTableKey][]string{otherShard: {resumeTaskDDL}}, task)
+	verdict, _ = replanVerdictForTask(map[shardTableKey][]string{otherShard: {resumeTaskDDL}}, false, task)
 	assert.Equal(t, replanChangeLanded, verdict, "a re-plan that keys by shard and omits this one speaks for it")
 }
 
 // shardTaskFixture is a resume of one shard-tagged task whose reviewed
 // statement the engine runs, against a re-plan that describes the namespace as
 // a unit.
-func shardTaskFixture(eng *replanTargetEngine) (*LocalClient, *storage.Apply, *storage.Task) {
+func shardTaskFixture(eng engine.Engine) (*LocalClient, *storage.Apply, *storage.Task) {
 	client, apply, task, _ := lostWorkPollFixtureInState(eng, lostWorkTrustBudgetAmple, state.Task.Pending)
 	client.heartbeatInterval = 10 * time.Second
 	client.storage.(*exactProgressStorage).applies = &mockApplyStore{apply: apply}
@@ -250,6 +250,81 @@ func TestResumeApplySequential_ShardTaskRunsWhenTheUnitIsSilent(t *testing.T) {
 	assert.Equal(t, 1, eng.applies, "the engine runs the task and decides its outcome")
 	assert.Equal(t, state.Task.Completed, task.State)
 	assertTimelineMentions(t, logs, unattributableStartLog)
+}
+
+// shardKeyedReplanEngine is a replanTargetEngine that declares its Plan lists
+// every shard that still needs a change.
+type shardKeyedReplanEngine struct {
+	*replanTargetEngine
+}
+
+func (shardKeyedReplanEngine) PlansEachShard() bool { return true }
+
+// An engine that plans each shard on its own leaves out every shard that
+// already has the change, and leaves out a namespace whose every shard has it.
+// Its re-plan therefore speaks for a shard it does not mention, even when it
+// mentions no shard of the namespace at all.
+func TestReplanVerdictForTask_ShardTaskUnderAShardKeyedReplan(t *testing.T) {
+	task := &storage.Task{Namespace: "appdb_sharded", Shard: "-40", TableName: "orders"}
+	shardKey := shardTableKey{namespace: "appdb_sharded", shard: "-40", table: "orders"}
+
+	verdict, _ := replanVerdictForTask(map[shardTableKey][]string{}, true, task)
+	assert.Equal(t, replanChangeLanded, verdict, "a namespace the plan does not mention has the change on every shard")
+
+	verdict, key := replanVerdictForTask(map[shardTableKey][]string{shardKey: {resumeTaskDDL}}, true, task)
+	assert.Equal(t, replanNeedsChange, verdict)
+	assert.Equal(t, shardKey, key)
+
+	otherNamespace := shardTableKey{namespace: "appdb_other", shard: "-40", table: "orders"}
+	verdict, _ = replanVerdictForTask(map[shardTableKey][]string{otherNamespace: {resumeTaskDDL}}, true, task)
+	assert.Equal(t, replanChangeLanded, verdict, "another namespace still owing the table says nothing against this one")
+
+	unitKey := shardTableKey{namespace: "appdb_sharded", table: "orders"}
+	verdict, key = replanVerdictForTask(map[shardTableKey][]string{unitKey: {resumeTaskDDL}}, true, task)
+	assert.Equal(t, replanNeedsChange, verdict, "a plan still asking for the change on the namespace is never read as the shard having it")
+	assert.Equal(t, unitKey, key)
+}
+
+// A resume of a shard task whose change already landed, on an engine that
+// plans each shard on its own, settles the task as completed and never runs
+// its statement again. Every shard of the namespace has the change, so the
+// re-plan does not mention the namespace at all. Running the statement again
+// is not safe to rely on failing: adding an unnamed index or foreign key a
+// second time succeeds and leaves the shard with two.
+func TestResumeApplySequential_ShardTaskSettlesWhenTheEnginePlansEachShard(t *testing.T) {
+	eng := &replanTargetEngine{plan: &engine.PlanResult{NoChanges: true}}
+	client, apply, task := shardTaskFixture(shardKeyedReplanEngine{eng})
+	logs := captureApplyLogs(client)
+
+	err := client.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7}, nil)
+
+	require.NoError(t, err)
+	assert.Zero(t, eng.applies, "the landed statement is not run again")
+	assert.Equal(t, state.Task.Completed, task.State)
+	assert.NotContains(t, timelineMessages(logs), unattributableStartLog)
+}
+
+// The resume-entry re-plan settles the same task the same way, so a grouped
+// resume does not keep it active either.
+func TestReplanAndFilterTasks_ShardTaskSettlesWhenTheEnginePlansEachShard(t *testing.T) {
+	eng := &replanTargetEngine{plan: &engine.PlanResult{NoChanges: true}}
+	client, apply, task := shardTaskFixture(shardKeyedReplanEngine{eng})
+
+	rp, err := client.replanAndFilterTasks(t.Context(), apply, []*storage.Task{task}, &storage.Plan{ID: 7})
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), rp.CompletedCount)
+	assert.Empty(t, rp.ActiveTasks)
+	assert.Equal(t, state.Task.Completed, task.State)
+}
+
+// timelineMessages joins every timeline line the client wrote.
+func timelineMessages(logs *capturingApplyLogStore) string {
+	messages := make([]string, 0, len(logs.entries))
+	for _, entry := range logs.entries {
+		messages = append(messages, entry.Message)
+	}
+	return strings.Join(messages, "\n")
 }
 
 // blockedDrainEngine is an engine whose in-process work from an earlier drive

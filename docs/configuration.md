@@ -197,6 +197,44 @@ The PostgreSQL shape differs from MySQL in three ways:
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
 
+### Etre targets with more than one match
+
+An `etre` resolver expects its lookup to match one entity. Some inventories
+record both sides of a replicated pair under one target, such as a cluster and
+its standby during a blue/green switchover. A `mysql` resolver handles these
+without any configuration: when its lookup matches more than one entity, it
+connects to each match and reads `read_only`, `innodb_read_only`,
+`server_uuid`, and `SHOW REPLICA STATUS`. The target resolves to the match that
+accepts writes only when both of these hold:
+
+- Exactly one match has `read_only` and `innodb_read_only` off.
+- Every other match replicates from it: its replication status names the
+  writable match's `server_uuid` as a source.
+- The writable match replicates from no server outside the matches. It may
+  replicate back from its own standby, but a writable relay fed from elsewhere
+  is not the authoritative copy, and a change made on it would collide with
+  the same change arriving from its source.
+
+Anything else refuses to resolve the target, and the error names each match
+and what it reported. That covers no writable match, two writable matches, a
+read-only match that replicates from somewhere else or from nothing, and a
+match the probe cannot connect to. A read-only match that does not replicate
+from the writer is refused rather than ignored, because nothing then shows that
+the two matches are copies of one database.
+
+A lookup that matches one entity is not probed. A lookup that matches more than
+four is refused without probing. The matches are probed at the same time, each
+under its own timeout. The probe runs each time the target is
+resolved, so a switchover is picked up on the next request without any change
+to the inventory. It chooses the writer when a request resolves the target; it
+does not watch an apply that is already running.
+
+The probe connects with the same credentials and TLS settings as the schema
+change, and needs the `REPLICATION CLIENT` privilege to read the replication
+status. `SHOW REPLICA STATUS` needs MySQL 8.0.22 or later; on an older server
+the probe refuses the target and its error says so. Resolvers for the other
+database types refuse a lookup that matches more than one entity.
+
 ### PostgreSQL Etre targets
 
 An `etre` resolver with `database_type: postgres` discovers PostgreSQL targets
@@ -237,22 +275,155 @@ resolver whose engine decodes its secret (`postgres` or `vitess`) refuses to
 start when a username is configured, on both the `secret_ref` and `awssm`
 backends, rather than ignoring it.
 
-The `awssm` backend reads every target's secret from the one `region` it is
-given. When each cluster's secret is provisioned in the region that cluster
-runs in, set `region_attribute` instead, naming the entity attribute that holds
-it (for example `region_attribute: aws_region`). Set exactly one of the two. A
-target whose entity has no value for the attribute, or a value that is not an
-AWS region name, fails resolution rather than being read from another region.
-
-Switching an existing resolver from `region` to `region_attribute` applies to
-every target it serves at once, and a target whose entity lacks the attribute
-fails only when something next resolves it. Before switching, query the
-inventory for the entities the resolver matches and confirm each one carries a
-region name in that attribute.
+The `awssm` backend reads the secret in the region its `region` settings
+choose; see [Etre credentials from AWS Secrets
+Manager](#etre-credentials-from-aws-secrets-manager).
 
 `table_owner` and `ca_ref` mean the same as on a `dsn_from` target. They apply
 to every target the resolver serves, so a resolver serves clusters that share
 one owner role.
+
+### Etre credentials from AWS Secrets Manager
+
+An `etre` resolver with `credentials.type: awssm` reads each target's database
+credentials from AWS Secrets Manager. Three groups of settings decide which
+secret it reads:
+
+| Settings | Decide | Default |
+|---|---|---|
+| `secret_name` | the secret, templated over `{target}` and any `{attribute}` | required |
+| `role_arn`, `account_attribute`, `external_id` | the AWS account, by assuming `role_arn` in the account `account_attribute` names | the data plane's own account |
+| `region`, `region_attribute`, `reachable_regions` | the region the secret is read in | required: `region` |
+
+#### Which region a secret is read in
+
+`region` is the data plane's home region. Roles are assumed through STS there,
+and secrets are read there unless the two optional settings place a target
+elsewhere:
+
+- `region_attribute` names the entity attribute that holds the region of each
+  target's cluster, for example `aws_region`.
+- `reachable_regions` lists the regions, besides `region`, whose Secrets
+  Manager the data plane can call. It requires `region_attribute`, and every
+  listed region must be in the same AWS partition as `region`.
+
+For each target:
+
+```
+region of the target's cluster, from region_attribute
+├─ region, or listed in reachable_regions → read the secret in the cluster's region
+└─ any other region                       → read the secret in region, as a replica
+```
+
+Without `region_attribute`, every secret is read in `region`.
+
+Each deployment shape below needs a different combination:
+
+**All clusters are in the data plane's region.** Set `region` alone.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-east-1
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+**Clusters run in several regions, and the data plane can call Secrets Manager
+only in its own.** Replicate every secret into the home region and add
+`region_attribute`. Reads stay in `region`, and when a secret is missing the
+error names the cluster's region and the replica it expected.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+**The data plane can call Secrets Manager in every region its clusters run
+in.** List those regions in `reachable_regions`, and each secret is read beside
+its cluster with no replica needed. Roles are still assumed through STS in
+`region`, because credentials from a regional STS endpoint are valid in every
+region of the same AWS partition, so only Secrets Manager has to be reachable
+in the listed regions. For the same reason, every listed region must be in the
+partition of `region`: credentials from the commercial partition cannot read a
+secret in GovCloud, China, or an isolated partition, so the resolver refuses
+to start with such a region listed.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  reachable_regions: [us-east-1]
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+Shapes can mix: a cluster in a region that is not listed still has its secret
+read in `region`, so it needs a replica there while the clusters in listed
+regions do not.
+
+#### What each target account provides
+
+In the account and region a target's secret is read in, the read needs:
+
+- The secret, named as `secret_name` renders for the target. In the home region
+  that is usually a replica of a secret whose primary is in the cluster's
+  region.
+- With `role_arn`: the role, trusting the data plane's identity and allowed to
+  call `secretsmanager:GetSecretValue` on the secret in that region.
+- Permission for the reading identity to decrypt with the KMS key that encrypts
+  the secret in that region. A replica is encrypted by a key in the replica's
+  own region, so a policy that grants decrypt by key alias needs the alias to
+  exist in that region as well.
+
+#### Errors
+
+With `reachable_regions` set, the attribute chooses where a secret is read, so
+a target whose entity has no value for `region_attribute`, or a value that is
+not an AWS region name, fails before any read rather than having its secret read
+in a region chosen for it:
+
+```
+target "orders" has no "aws_region" attribute naming the region of its cluster
+target "orders" has "aws_region" attribute "us-east", which is not an AWS region name
+```
+
+Without `reachable_regions`, every secret is read in `region` whatever the
+attribute says, so such a target is still read there. It only loses the
+cluster's region from the error below if its secret is missing, and the
+resolver logs a warning for a value that is not a region name.
+
+A secret missing from the home region, for a cluster in a region that is not
+reachable, names the fix:
+
+```
+fetch secret "orders/schemabot" for target "orders" in account 111111111111, region us-west-2:
+get secret value "orders/schemabot": ... ResourceNotFoundException: Secrets Manager can't find
+the specified secret.; the target's cluster is in us-east-1, which is not a reachable region, so
+its secret is read in us-west-2: replicate the secret to us-west-2, or list us-east-1 as a
+reachable region if this data plane can call Secrets Manager there
+```
+
+For a cluster in another AWS partition, where neither fix can work, the error
+says instead that the target has to be served by a data plane in that
+partition.
+
+#### Changing the region settings
+
+A change to these settings moves the reads of every target the resolver serves
+at once, and a target it breaks fails only when something next resolves it.
+Before listing `reachable_regions`, query the inventory for the entities the
+resolver matches and confirm each one carries a region name in
+`region_attribute`, since from then on a target without one fails. Before
+listing a region there, also confirm that the data plane can
+call Secrets Manager there and that every target in that region has its secret
+there: a listed region the data plane cannot reach turns each of those reads
+into a connection failure.
 
 ## gRPC Mode
 
@@ -330,7 +501,7 @@ Rules:
 - The map MUST contain at least one entry, each entry MUST set a non-empty `target`, and each map key MUST resolve through `tern_deployments` with an endpoint configured for this environment.
 - Keys under `deployments:` must be lowercase; the server refuses to start otherwise.
 - A single-entry map is accepted and behaves identically to the scalar `target` / `deployment` shape. Single-deployment environments should continue to use the scalar shape.
-- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling` (the default), `barrier`, or `parallel`; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
+- `cutover_policy` and `on_failure` are only valid alongside a `deployments` map or a `targets` list. `cutover_policy` accepts `rolling`, `barrier`, or `parallel`, and defaults to `parallel` when every member of the environment comes from a `targets` list and to `rolling` otherwise, including for a `deployments` map that mixes `targets` entries with single `target` entries; `on_failure` accepts `halt` (the default), `continue`, or `pause`. Both values are captured on every operation row when the apply is created, so the policy in force at that moment travels with the rollout.
 
 ### Planning and the Primary Deployment
 
@@ -347,7 +518,7 @@ Being primary decides which plan is stored, not which deployment is reviewed. A 
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
 
-Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
+Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. A deployment with a `targets` list is the exception: each of its targets cuts over as its table finishes, so an apply to it refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
 
 ## Multi-Target Environment (preview)
 
@@ -382,6 +553,8 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
             target: payments-003
 ```
 
+An apply that spans several deployments, one of them with a `targets` list, is not supported yet and is refused before it takes the lock. Apply one target at a time instead, in rollout order: `schemabot apply -e production --target payments-001`, then the next target. The refusal names the first one. A rollout already up to date applies nothing, so an apply that confirms it converged still succeeds.
+
 ### Selecting namespaces per target
 
 When a database's namespaces are spread across its targets, an entry can be a mapping that names which namespaces live on that target. A bare string and a mapping without `namespaces` both mean the target holds every namespace the schema files declare.
@@ -406,7 +579,8 @@ Rules:
 - `targets` is mutually exclusive with `target` at the same level, and with a local `dsn` / `dsn_from`.
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
-- `cutover_policy` and `on_failure` order the listed targets the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default, `rolling`, runs one target at a time, and under the default `on_failure: halt` a failed target stops every later one from starting. A large fleet can set `cutover_policy: parallel`, which starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order.
+- A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
+- `cutover_policy` and `on_failure` order the listed targets within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default here is `parallel`: it starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order. Under the default `on_failure: halt` a failed target stops every queued target from starting, and holds the cutover of every later target already copying: each of those finishes its copy and waits at the cutover barrier until an operator stops or cancels it. `max_drivers_per_apply` is therefore what bounds how many targets copy at once, and how many a failure can leave holding a finished copy, so raising it widens both; size it for the targets that share a host's disk and network as well as for throughput. An environment that relies on an unset `cutover_policy` running one target at a time needs `cutover_policy: rolling` to keep doing so: a failed target then stops every later one before it starts copying. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
@@ -1629,7 +1803,7 @@ Approval is checked at the time of `schemabot apply` and `schemabot apply-confir
 
 An approval counts only for the schema change it reviewed, whatever the repository's branch protection does with stale approvals. Each reviewer's latest decisive review is used, and an approval satisfies the gate when it was given on the PR's current head commit, or on an earlier commit at which the PR's change to the database's schema inputs is the same as at the head. A database's schema inputs are its schema directory, the environment symlink that directory was resolved through (if any), its `schemabot.yaml`, and the target of every symlink inside them. Changes elsewhere in the repository, including another database's schema, do not affect the approval.
 
-The PR's change is measured against the default branch it was built on: SchemaBot finds the merge base of each commit with the base branch's current tip and compares content at all four commits. A schema input counts as unchanged when the PR turns the same base content into the same result at both commits, or when the PR leaves it as the base branch has it at both commits and the head was built on newer default branch content than the approved commit. So rebasing onto, or merging in, a newer default branch keeps the approval even when that default branch added tables beside the PR's, changed the database's `schemabot.yaml`, or removed a namespace: those changes are not the PR's, and they reached the default branch through their own PR and review. The approval stops counting when the PR edits, adds, or removes a schema input after it, including when a rebase combines the PR's edit with a default branch edit to the same file, keeps the PR's version over the default branch's, or restores content the default branch changed. Rebuilding the PR on an older default branch commit than the one it was approved on also stops the approval from counting when any schema input differs between the two, since the head would carry a version of that input nobody approved for this PR. Keeping an approval across default branch changes relies on the default branch requiring review for every change that reaches it: a change pushed to it directly, without its own review, is carried past an earlier approval like any other default branch change. Protect the default branch with required reviews when the review gate is enabled.
+The PR's change is measured against the default branch it was built on: SchemaBot finds the merge base of each commit with the base branch's current tip and compares content at all four commits. A schema input counts as unchanged when the PR turns the same base content into the same result at both commits, or when the PR leaves it as the base branch has it at both commits and the head was built on newer default branch content than the approved commit. So rebasing onto, or merging in, a newer default branch keeps the approval even when that default branch added tables beside the PR's, changed the database's `schemabot.yaml`, or removed a namespace: those changes are not the PR's, and they reached the default branch through their own PR and review. The same holds for a stacked PR: when the PR below it merges, even with revisions, and this PR is rebased onto it, the schema files that came from the lower PR are now the default branch's, and the approval keeps counting as long as this PR's own change is the same. The approval stops counting when the PR edits, adds, or removes a schema input after it, or stops changing a schema input the default branch has not changed since, including when a rebase combines the PR's edit with a default branch edit to the same file, keeps the PR's version over the default branch's, or restores content the default branch changed. Rebuilding the PR on an older default branch commit than the one it was approved on also stops the approval from counting when any schema input differs between the two, since the head would carry a version of that input nobody approved for this PR. These rules trust default branch content, so they apply only to a PR that targets the repository's default branch; a PR targeting any other branch keeps an approval only for a schema input whose base content and PR change are both the same at the two commits, so on such a PR, a rebase or merge that brings in any change to its schema inputs needs a new approval, and the Review Required comment names the target branch to say so. Keeping an approval across default branch changes relies on the default branch requiring review for every change that reaches it: a change pushed to it directly, without its own review, is carried past an earlier approval like any other default branch change. Protect the default branch with required reviews when the review gate is enabled.
 
 If the PR's change differs, the Review Required comment names the reviewers whose approvals no longer count, and the reviewer must approve the current head. If the comparison cannot be completed (GitHub cannot find the approved commit, a directory is too large to list, a symlink points outside the repository, or there are more distinct symlinks than a comparison reads) and no other approval covers the head, that approval does not count and the apply is blocked with a Review Gate Error comment. The comment names the approval that did not count, lists who can approve, and asks for an approval of the latest commit, which needs no comparison. The reason goes to the server logs. Asking GitHub again would return the same answer, so the command is not retried. If GitHub is unavailable while the gate compares the commits, the command fails with a retryable error instead of reporting that a review is required. `apply-confirm` re-checks the gate, so a schema change pushed between `apply` and `apply-confirm` also needs a fresh approval.
 

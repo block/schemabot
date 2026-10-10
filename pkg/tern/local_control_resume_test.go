@@ -523,7 +523,7 @@ func TestResumeTaskReplan_ReturnsReplannedDDL(t *testing.T) {
 
 	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
-	verdict, key := replanVerdictForTask(replanDDL, task)
+	verdict, key := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
 	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	assert.True(t, needsChange)
 	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, replanned)
@@ -561,7 +561,7 @@ func TestResumeTaskReplan_TableAbsentReportsDone(t *testing.T) {
 
 	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
-	verdict, key := replanVerdictForTask(replanDDL, task)
+	verdict, key := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
 	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	assert.False(t, needsChange)
 	assert.Empty(t, replanned)
@@ -597,7 +597,7 @@ func TestResumeTaskReplan_DriftFailsClosed(t *testing.T) {
 
 	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
-	verdict, key := replanVerdictForTask(replanDDL, task)
+	verdict, key := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
 	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	require.True(t, needsChange)
 	_, _, err = c.verifyReplannedTaskDDL(task, replanned, []*storage.Task{task})

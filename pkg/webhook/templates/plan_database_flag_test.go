@@ -216,6 +216,20 @@ func TestConfirmationRefusalsCarryLongCommandsIntact(t *testing.T) {
 	assert.NotContains(t, unavailable, "…")
 }
 
+// A re-run hint for an apply narrowed to one rollout member repeats the
+// operator's --target between the database and the tenant, the order every
+// apply hint in a plan comment uses, so a command lifted from a refusal reads
+// the same as one lifted from the plan. Each flag appears only when set.
+func TestApplyCommandCarriesTargetInPlanCommentOrder(t *testing.T) {
+	assert.Equal(t, "schemabot apply -e production -d orders --target replica-eu --tenant acme --allow-unsafe --defer-cutover --skip-revert",
+		ApplyCommand("production", "orders", ApplyCommandOptions{
+			Target: "replica-eu", Tenant: "acme", AllowUnsafe: true, DeferCutover: true, SkipRevert: true,
+		}))
+	assert.Equal(t, "schemabot apply -e production --target replica-eu",
+		ApplyCommand("production", "", ApplyCommandOptions{Target: "replica-eu"}))
+	assert.Equal(t, "schemabot apply -e production", ApplyCommand("production", "", ApplyCommandOptions{}))
+}
+
 // A plan run without -e answers with one comment covering every environment,
 // and each of its commands carries the operator's -d the same way the
 // single-environment comment does.

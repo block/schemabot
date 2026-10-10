@@ -45,10 +45,13 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL, true)
 	}
 
-	// Lint violations
+	// Lint violations. Only the lint fold names a finding's rule here: the
+	// unsafe section lists changes, not findings, so error-severity findings
+	// link no guide.
 	if len(data.LintViolations) > 0 {
 		writeLintViolations(&sb, data.LintViolations)
 	}
+	writeRelatedGuidance(&sb, data.disclosesNonErrorsOnly())
 
 	// Errors
 	if len(data.Errors) > 0 {

@@ -82,13 +82,15 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 // countDeploymentTablesWithDDL counts the DDL blocks the per-deployment detail
 // sections render between them, so one comment's DDL budget is shared across
 // every deployment rather than granted to each. A rolled-up deployment renders
-// each distinct change once, however many targets run it.
+// each table's DDL once, however many targets run it.
 func countDeploymentTablesWithDDL(data MultiDeploymentApplyData) int {
 	count := 0
 	for _, g := range data.Model.Groups() {
 		if len(g.Members) > 1 {
-			for _, work := range targetWorkGroups(data, g) {
-				count += countTablesWithDDL(work.tables)
+			for _, line := range targetTableLines(data, g) {
+				if line.table.DDL != "" {
+					count++
+				}
 			}
 			continue
 		}
@@ -195,6 +197,9 @@ func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, 
 		progress.AlreadyHad += leftOut
 	}
 	status := targetRolloutStatus(progress, settled, data.Rollback)
+	if steps, ok := data.Model.TableSteps(g); ok && progress.Total > progress.AlreadyHad {
+		status = presentation.TableStepsHeadline(steps, progress, settled, data.Rollback)
+	}
 	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
 	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
 	sb.WriteString("\n")
@@ -222,11 +227,11 @@ func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) 
 	var line string
 	switch {
 	case !settled || p.Unsettled > 0:
-		line = fmt.Sprintf("%s %d of %s done", ongoing, p.Done, targetCount(changing))
+		line = fmt.Sprintf("%s %d of %s done", ongoing, p.Done, targetNoun.Count(changing))
 	case changing == 0:
 		return fmt.Sprintf("All %d targets already had this schema", p.Total)
 	case p.Done == changing && p.AlreadyHad > 0:
-		line = fmt.Sprintf("%s %s", finished, targetCount(changing))
+		line = fmt.Sprintf("%s %s", finished, targetNoun.Count(changing))
 	case p.Done == changing && changing == 2:
 		line = finished + " both targets"
 	case p.Done == changing:
@@ -234,20 +239,12 @@ func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) 
 	case p.Done == 0:
 		line = finished + " no targets"
 	default:
-		line = fmt.Sprintf("%s %d of %s", finished, p.Done, targetCount(changing))
+		line = fmt.Sprintf("%s %d of %s", finished, p.Done, targetNoun.Count(changing))
 	}
 	if len(p.Others) > 0 {
 		line += ", " + countsPhrase(p.Others)
 	}
 	return line
-}
-
-// targetCount is "1 target" or "3 targets".
-func targetCount(n int) string {
-	if n == 1 {
-		return "1 " + targetNoun.Singular
-	}
-	return fmt.Sprintf("%d %s", n, targetNoun.Plural)
 }
 
 // writeAggregateMetadata writes the apply-level metadata line. The database is
@@ -486,9 +483,9 @@ func writeDeploymentSummaryList(sb *strings.Builder, model presentation.Apply, g
 func groupCountsLabel(model presentation.Apply, g presentation.Group) string {
 	changing := changingMembers(model, g)
 	if changing == 0 {
-		return fmt.Sprintf("%s (%s)", presentation.AlreadyAppliedLabel, targetCount(len(g.Members)))
+		return fmt.Sprintf("%s (%s)", presentation.AlreadyAppliedLabel, targetNoun.Count(len(g.Members)))
 	}
-	return fmt.Sprintf("%s (%s)", countsPhrase(countsWithChanges(g.Counts)), targetCount(changing))
+	return fmt.Sprintf("%s (%s)", countsPhrase(countsWithChanges(g.Counts)), targetNoun.Count(changing))
 }
 
 // countsWithChanges drops the count of members that already had the change:

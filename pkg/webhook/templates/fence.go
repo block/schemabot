@@ -145,6 +145,18 @@ type ddlBlockBudget struct {
 	// of several members, whose stored plan is its first member's, saying the
 	// rest of the group runs the same DDL. Empty otherwise.
 	groupNote string
+
+	// countsMembersOnly makes a table's member listing keep its heading, which
+	// counts every member by state, and leave out the line per member. It is
+	// set on a pass after the rest of the comment alone ran past the limit:
+	// the per-member lines are the part of it that grows with the apply.
+	countsMembersOnly bool
+}
+
+// listsMembers reports whether a table's member listing names its members
+// one per line, or only counts them.
+func (b *ddlBlockBudget) listsMembers() bool {
+	return b == nil || !b.countsMembersOnly
 }
 
 // newDDLBlockBudget opens the per-comment DDL budget for a comment about to
@@ -188,6 +200,20 @@ func (b *ddlBlockBudget) pointerMarker(plan storedPlanRef) string {
 // group's targets, until the returned restore runs.
 func (b *ddlBlockBudget) forTargetGroup(members []string) (restore func()) {
 	return b.scopePlan(targetGroupPlanScope(members))
+}
+
+// forNamedTargets marks the DDL rendered from here on as one table's DDL on the
+// targets named above it, naming the first one's stored plan, until the
+// returned restore runs.
+func (b *ddlBlockBudget) forNamedTargets(members []string) (restore func()) {
+	// The targets are named above the DDL, so the note says so rather than
+	// listing them again.
+	scope, groupNote := targetGroupPlanScope(members)
+	note := ""
+	if groupNote != "" {
+		note = "every target named above runs the same DDL"
+	}
+	return b.scopePlan(scope, note)
 }
 
 // forSoleTargetGroup marks the DDL rendered from here on as the plan of the
@@ -278,22 +304,32 @@ func newUnboundedDDLBudget(blocks int) *ddlBlockBudget {
 // the whole limit; a comment whose other sections fit alongside is done. When
 // the body overshoots, the DDL budget is cut by the overshoot plus, for every
 // block not yet carrying a truncation marker, the marker its own section
-// writes, so the next pass fits. The render callback must produce the same non-DDL text and take the
-// same blocks in the same sections on every pass: only the budget it is
-// handed changes.
+// writes, so the next pass fits. When even an empty DDL budget would leave the
+// body over the limit, the next pass instead lists each table's members by
+// their counts alone and offers the DDL the whole limit again, and the pass
+// after it cuts the DDL to whatever room that leaves. The render callback must
+// produce the same non-DDL text and take the same blocks in the same sections
+// on every pass: only the budget it is handed changes.
 func renderWithinCommentLimit(blocks, reserve int, render func(*ddlBlockBudget) string) string {
 	limit := commentBodyLimit - reserve
 	ddlLimit := limit
+	countsMembersOnly := false
 	var body string
 	for range commentFitPasses {
 		budget := newDDLBlockBudget(blocks, ddlLimit)
+		budget.countsMembersOnly = countsMembersOnly
 		body = render(budget)
 		over := len(body) - limit
 		if over <= 0 {
 			return body
 		}
 		spent := ddlLimit - budget.remaining
-		ddlLimit = max(spent-over-budget.uncutMarkerBytes, 0)
+		next := spent - over - budget.uncutMarkerBytes
+		if next < 0 && !countsMembersOnly {
+			countsMembersOnly, ddlLimit = true, limit
+			continue
+		}
+		ddlLimit = max(next, 0)
 	}
 	return body
 }

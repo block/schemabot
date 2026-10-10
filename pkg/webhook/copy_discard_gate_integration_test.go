@@ -5,7 +5,9 @@ package webhook
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -667,7 +669,7 @@ func TestRepinPendingConfirmationPreservesANewerIntent(t *testing.T) {
 	// The rollback the operator issued while the gate ran holds the pending
 	// confirmation, so the stop leaves it alone.
 	acquire(t, "rollback:the-operator-just-asked-for-this")
-	err := f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+	err := f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql", "staging", action.ApplyConfirm,
 		"plan-the-apply-observed", "plan-disclosing-the-copy", true)
 	require.ErrorIs(t, err, storage.ErrLockIntentChanged)
 
@@ -682,7 +684,7 @@ func TestRepinPendingConfirmationPreservesANewerIntent(t *testing.T) {
 	// With the observed intent still in place, the re-pin moves the confirmation
 	// onto the disclosing plan and records what that comment showed.
 	acquire(t, "plan-the-apply-observed")
-	require.NoError(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+	require.NoError(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql", "staging", action.ApplyConfirm,
 		"plan-the-apply-observed", "plan-disclosing-the-copy", true))
 
 	lock, err = f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -754,7 +756,7 @@ func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
 				locks.armed = true
 			}
 
-			repinErr := f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+			repinErr := f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql", "staging", action.ApplyConfirm,
 				"plan-the-apply-observed", "plan-disclosing-the-copy", true)
 			require.ErrorIs(t, repinErr, storage.ErrLockIntentChanged)
 			if tt.releasedDuringWrite {
@@ -766,16 +768,17 @@ func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
 			require.NoError(t, err)
 			assert.Nil(t, lock, "the stop must not re-create a released lock")
 
-			require.True(t, f.handler.reportRepinRefused(repinErr, repo, pr, 1, action.ApplyConfirm, dbName, "staging", "testuser"),
+			recoveryCommand := "schemabot apply -e staging -d " + dbName + " --defer-cutover"
+			require.True(t, f.handler.reportRepinRefused(repinErr, repo, pr, 1, action.ApplyConfirm, dbName, "staging", "testuser", recoveryCommand),
 				"a gone lock is answered as a lock that changed under the apply")
 			reply := awaitCommentContaining(t, f.result, "changed the lock on")
-			assert.Contains(t, reply, applyLockIntentChangedRefusal(dbName))
+			assert.Contains(t, reply, applyLockIntentChangedRefusal(dbName, recoveryCommand))
 		})
 	}
 
 	// A stop that observed no pending confirmation has nothing to move, so it
 	// must not take the free lock either.
-	require.Error(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql",
+	require.Error(t, f.handler.repinPendingConfirmation(t.Context(), repo, pr, dbName, "mysql", "staging", action.ApplyConfirm,
 		"", "plan-disclosing-the-copy", true))
 	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
 	require.NoError(t, err)
@@ -788,7 +791,9 @@ func TestRepinPendingConfirmationRefusesWhenTheLockIsGone(t *testing.T) {
 // the disclosing plan, the operator's `schemabot rollback` on the same PR pins
 // its plan on the lock. The rollback's pin survives, so rollback-confirm still
 // has it to execute, no apply starts, and the operator is told the lock changed
-// under the apply and that a retry names the command holding it.
+// under the apply and that a retry names the command holding it. The refusal
+// is logged once, and that record names the environment and the command that
+// was refused, since the lock alone is keyed by database.
 func TestE2EApplyConfirmStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
 	const dbName = "webhook_copy_discard_rb_race"
 	locks := &concurrentRollbackLocks{
@@ -803,6 +808,8 @@ func TestE2EApplyConfirmStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
 		locks.LockStore = st.Locks()
 		return &concurrentRollbackStorage{Storage: st, locks: locks}
 	})
+	logs := &syncBuffer{}
+	f.handler.logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	// The operator is confirming a staging plan that told them nothing about
 	// a copy. The lock is taken on the wrapped store's inner store so the
@@ -827,7 +834,7 @@ func TestE2EApplyConfirmStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
 
 	refusal := awaitCommentContaining(t, f.result, "changed the lock on")
 	assert.Contains(t, refusal, "`"+dbName+"`")
-	assert.Contains(t, refusal, "Retry the apply")
+	assert.Contains(t, refusal, "Re-run `schemabot apply -e staging`")
 	require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 	lock, err := f.svc.Storage().Locks().Get(t.Context(), dbName, "mysql")
@@ -836,6 +843,28 @@ func TestE2EApplyConfirmStopKeepsRollbackPinnedAfterItsRead(t *testing.T) {
 	assert.Equal(t, locks.pin.PendingPlanID, lock.PendingPlanID, "the concurrent rollback's pin must survive the stop")
 	assert.False(t, lock.DisclosedCopyDiscard, "no consent is recorded on the rollback's pin")
 	requireNoApplies(t, f.svc, dbName)
+
+	refusals := logRecordsContaining(t, logs, "preserved the lock's current intent")
+	require.Len(t, refusals, 1, "the refusal is logged exactly once")
+	assert.Equal(t, "staging", refusals[0]["environment"])
+	assert.Equal(t, action.ApplyConfirm, refusals[0]["action"])
+	assert.Equal(t, true, refusals[0]["lock_present"])
+}
+
+// logRecordsContaining returns the JSON log records in logs whose message
+// contains want.
+func logRecordsContaining(t *testing.T, logs *syncBuffer, want string) []map[string]any {
+	t.Helper()
+	var records []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+		var rec map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &rec))
+		msg, _ := rec["msg"].(string)
+		if strings.Contains(msg, want) {
+			records = append(records, rec)
+		}
+	}
+	return records
 }
 
 // The consent record's whole claim is that the operator was shown the copy, so

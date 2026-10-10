@@ -553,7 +553,7 @@ func TestRenderShardedApplyComment_TableLinesReplaceShardTable(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "**`mutes`**: 🔄 Row copy in progress")
-	assert.Contains(t, out, "└ shards: ◐ -40 45% · ⏳ 80-", "the in-flight table carries the compact shard summary")
+	assert.Contains(t, out, "- Shards: 2 (1 copying, 1 queued)\n  - ◉ `-40`: 45%\n  - ○ `80-`: queued\n", "the in-flight table lists its shards")
 	assert.NotContains(t, out, "| Shard | Status |", "a healthy uniform keyspace renders no per-shard table")
 }
 
@@ -581,7 +581,8 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 
 	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62%")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
-	assert.Contains(t, out, "└ shards: ◐ -40 71% · ◐ 80- 54%", "the shard summary stays below the rows line")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- Shards: 2 (2 copying)\n  - ◉ `80-`: 54%\n  - ◉ `-40`: 71%\n",
+		"the shard list sits below the rows line, the shard furthest behind first")
 	assert.NotContains(t, out, "Row copy in progress", "the bar replaces the state phrase")
 	assert.NotContains(t, out, "across", "full coverage needs no disclosure")
 	assert.NotContains(t, out, "62% (", "full coverage carries no headline qualifier")
@@ -611,7 +612,7 @@ func TestRenderShardedApplyComment_TableCopyPartialCoverageDisclosed(t *testing.
 
 	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62% (1 of 2 shards)")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ETA: ≥ 3m 15s")
-	assert.Contains(t, out, "└ shards: ◐ -40 62% · ⏳ 80-", "the shard summary stays below the rows line")
+	assert.Contains(t, out, "- Shards: 2 (1 copying, 1 queued)\n  - ◉ `-40`: 62%\n  - ○ `80-`: queued\n", "the shard list sits below the rows line")
 }
 
 // A copying table carries its planned size beside its rows. With every shard
@@ -975,6 +976,12 @@ func TestShardedTableStatusPhrase_TerminalStatesNamed(t *testing.T) {
 	assert.Equal(t, "🟡 Waiting for deploy", shardedTableStatusPhrase(state.Task.WaitingForDeploy))
 }
 
+// A stopped table reads with the stop glyph the comment's title and the CLI's
+// table line use, so a stop looks the same wherever an operator reads it.
+func TestShardedTableStatusPhrase_StoppedUsesTheStopGlyph(t *testing.T) {
+	assert.Equal(t, "⏹️ Stopped", shardedTableStatusPhrase(state.Task.Stopped))
+}
+
 // An apply cancelled after part of the fleet landed must not read as if
 // nothing happened: the table line states the landed coverage, and the
 // divergent outcome promotes the per-shard status table so the summary names
@@ -1047,8 +1054,9 @@ func TestRenderShardedApplyComment_FailurePromotesSiblingKeyspaceShardTables(t *
 
 // Between dispatch waves a partially-landed table aggregates to pending; the
 // table line states the landed coverage so it never regresses to a bare
-// "Queued" after earlier waves finished. An in-flight aggregate stays
-// suffix-free — its compact shard summary already carries the breakdown — and
+// "Queued" after earlier waves finished. An in-flight aggregate, including one
+// waiting on its deploy request or reverting, stays suffix-free — its compact
+// shard summary already carries the breakdown — and
 // the routine wave rollout does not promote the per-shard table.
 func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 	mixed := func(tableStatus, inFlightStatus string) ShardedApplyData {
@@ -1082,10 +1090,14 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 	assert.NotContains(t, betweenWaves, "| Shard | Status |",
 		"a routine wave rollout does not promote the per-shard table")
 
-	inFlight := RenderShardedApplyComment(mixed(state.Task.Running, state.Task.Running))
-	assert.NotContains(t, inFlight, "applied on",
-		"an in-flight aggregate's shard summary already carries the breakdown")
-	assert.Contains(t, inFlight, "└ shards:")
+	// Waiting on a deploy request and reverting are in flight too, so the
+	// shard summary carries the landed coverage there as well.
+	for _, status := range []string{state.Task.Running, state.Task.WaitingForDeploy, state.Task.Reverting} {
+		inFlight := RenderShardedApplyComment(mixed(status, status))
+		assert.NotContainsf(t, inFlight, "applied on",
+			"a %s aggregate's shard summary already carries the breakdown", status)
+		assert.Containsf(t, inFlight, "- Shards: 4 (", "a %s aggregate lists its shards", status)
+	}
 }
 
 // A table that changes on only some of the keyspace's shards names them above
@@ -1130,7 +1142,7 @@ func TestRenderShardedApplyComment_CopyingTableReadsLikeVitess(t *testing.T) {
 	bar := strings.Index(out, "**`mutes`**: 🟦")
 	ddl := strings.Index(out, "```sql\nALTER TABLE `mutes` ADD INDEX")
 	rows := strings.Index(out, "- Rows: 500 / 1,000")
-	shards := strings.Index(out, "└ shards:")
+	shards := strings.Index(out, "- Shards:")
 	require.NotEqual(t, -1, bar, "the aggregated progress bar renders:\n%s", out)
 	assert.Contains(t, out, "50%", "the bar aggregates both shards' rows")
 	assert.Less(t, bar, ddl, "the DDL follows the progress bar")
