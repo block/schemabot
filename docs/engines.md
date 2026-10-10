@@ -382,7 +382,7 @@ copy, watching read-replica lag and replication slot lag.
 
 None of this is a promise about your workload. Capacity you are already using is capacity the
 change will compete for, and the protection you get is the engine's, not SchemaBot's.
-[throttle.md](throttle.md) explains each throttle signal and what a sustained one means.
+For MySQL, [throttling](mysql.md#throttling) explains each Spirit throttle signal and what a sustained one means.
 
 ## Dropped tables
 
@@ -412,7 +412,7 @@ place to keep data.
 - [postgresql.md](postgresql.md) for the full PostgreSQL support envelope: which plans are
   blocked, which statements are admitted, and how each refusal is reported.
 - [vitess.md](vitess.md) for the PlanetScale service token permissions the Vitess engine needs.
-- [throttle.md](throttle.md) for what each throttle signal means when you see one.
+- [mysql.md](mysql.md#throttling) for what each Spirit throttle signal means when you see one.
 - [pending-drops.md](pending-drops.md) for the quarantine lifecycle.
 - [direct-execution.md](direct-execution.md) for when a change runs directly instead of through a
   copy.

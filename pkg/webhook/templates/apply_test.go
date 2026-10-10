@@ -440,17 +440,17 @@ func TestRenderApplyStatusComment_Throttled(t *testing.T) {
 
 	assert.Contains(t, result, "45.00% (throttled)",
 		"the annotation lands on the header line next to the percent")
-	assert.Contains(t, result, "- ℹ️ _Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+	assert.Contains(t, result, "- ℹ️ _Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling))_",
 		"the reason renders as a tooltip bullet with its tip and the doc link")
 
 	data.Tables[0].ThrottleReason = "redo-aware 4 > 3; commit-latency 112.4ms >= 100ms"
 	composite := RenderApplyStatusComment(data)
-	assert.Contains(t, composite, "- ℹ️ _Throttled: redo-aware 4 > 3; commit-latency 112.4ms >= 100ms · backing off while the database's active threads exceed its budget; backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+	assert.Contains(t, composite, "- ℹ️ _Throttled: redo-aware 4 > 3; commit-latency 112.4ms >= 100ms · backing off while the database's active threads exceed its budget; backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling))_",
 		"concurrently-throttling signals join their tips in reason order")
 
 	data.Tables[0].ThrottleReason = "commit-latency 112.4ms >= `100ms` [gradual]"
 	escapedWithTip := RenderApplyStatusComment(data)
-	assert.Contains(t, escapedWithTip, "- ℹ️ _Throttled: commit-latency 112.4ms >= \\`100ms\\` \\[gradual\\] · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_",
+	assert.Contains(t, escapedWithTip, "- ℹ️ _Throttled: commit-latency 112.4ms >= \\`100ms\\` \\[gradual\\] · backing off while database writes commit slowly ([docs](https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling))_",
 		"a recognized reason is escaped before its tip is appended")
 
 	data.Tables[0].ThrottleReason = ""
@@ -490,7 +490,7 @@ func TestRenderApplyStatusComment_ThrottledChecksumming(t *testing.T) {
 	result := RenderApplyStatusComment(data)
 
 	assert.Contains(t, result, "🔍 Checksumming to verify data (21.92%) (throttled)")
-	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/throttle.md))_")
+	assert.Contains(t, result, "- ℹ️ _Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget ([docs](https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling))_")
 }
 
 func TestUnsafeDropIndexUsageTargets(t *testing.T) {

@@ -593,7 +593,7 @@ live view:
   • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
-  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
 ```
 
 Use `schemabot status apply-example-73` for a single snapshot. SQL rendering
@@ -990,7 +990,7 @@ Output excerpt:
   • Rows: 6,000,000 / 10,000,000 · ~3.2 GB · ETA: 42m 0s
   • ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget
 
-  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
 ```
 
 Here, `orders` is 60% copied with an estimated 42 minutes remaining. The

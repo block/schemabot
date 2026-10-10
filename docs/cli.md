@@ -596,7 +596,7 @@ $ schemabot progress apply-example-73
        • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
        • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
 
-  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/mysql.md#throttling
 
 
 
@@ -617,11 +617,11 @@ For progress bar colors, phase labels, and keyboard controls, see the
 When copying is throttled, the live view explains why. This MySQL example
 pauses when commits are slow, then continues as conditions improve. Recognized
 signals include a short explanation beside each affected table. One shared
-link to the [throttle reference](throttle.md) appears below the tables.
-The link shows the page's path, `docs/throttle.md`, in supported terminals and
+link to the [MySQL throttling guide](mysql.md#throttling) appears below the tables.
+The link shows the page's path, `docs/mysql.md`, in supported terminals and
 the full URL in plain output, matching how `list-plans` and `status` link a PR.
 
-![MySQL progress shows a commit-latency throttle signal, its docs link, and completion](../assets/cli-throttle.gif)
+![MySQL progress shows a commit-latency throttle signal, its docs link, and completion](../assets/cli-mysql-throttle.gif)
 
 ### Stop and resume a change
 
