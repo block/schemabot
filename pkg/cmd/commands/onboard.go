@@ -297,9 +297,10 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 				Reason:    group.Reason,
 			})
 		}
-		if len(tableNames) == 0 && len(pulled.Artifacts) == 0 {
+		if len(tableNames) == 0 {
 			// Keep empty scope explicit: a comment-only SQL file declares no tables
 			// while preserving the namespace for future plans and version control.
+			// Keep the SQL starter even when routing artifacts such as VSchema exist.
 			// A namespace whose every table is withheld lands here too — the
 			// namespace is still the plan's, it simply declares nothing.
 			files[filepath.Join(namespace, "schema.sql")] = schema.EmptyNamespaceDeclaration

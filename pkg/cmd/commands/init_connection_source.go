@@ -34,7 +34,7 @@ func resolveInitConnection(ref string) (string, error) {
 }
 
 func normalizeInitConnection(engine, value string) (string, error) {
-	if engine == "mysql" && strings.HasPrefix(value, "mysql://") {
+	if (engine == "mysql" || engine == "vitess") && strings.HasPrefix(value, "mysql://") {
 		u, err := url.Parse(value)
 		if err != nil || u.Hostname() == "" || u.User == nil || u.Fragment != "" {
 			return "", fmt.Errorf("check the MySQL connection string format")
