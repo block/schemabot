@@ -251,7 +251,7 @@ const maxKeyspacePages = 100
 // defaultKeyspaceListingTimeout bounds a keyspace listing as a whole. The page
 // bound alone does not: each page request may run for the full per-request
 // timeout, so a caller with no deadline of its own could otherwise wait for the
-// page bound times that timeout. Two per-request timeouts lets one slow page use
+// page bound times that timeout. Two per-request timeouts let one slow page use
 // its whole budget and still leaves the rest of the listing room to finish, while
 // a branch whose API answers every page just inside the per-request timeout ends
 // after a couple of pages rather than after all of them.
@@ -281,7 +281,7 @@ const defaultKeyspaceListingTimeout = 2 * planetScaleHTTPTimeout
 // whole timed out and how many pages it had read, which tells it apart from a
 // single page timing out and from ctx itself ending.
 func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
-	listCtx, cancel := context.WithTimeout(ctx, w.keyspaceListingTimeout)
+	listCtx, cancel := context.WithTimeoutCause(ctx, w.keyspaceListingTimeout, errKeyspaceListingBound)
 	defer cancel()
 
 	// Each name is its own path segment, so a character that URL syntax gives
@@ -300,7 +300,7 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 		query.Set("per_page", strconv.Itoa(keyspacesPerPage))
 		respBody, err := w.doRawJSON(listCtx, http.MethodGet, basePath+"?"+query.Encode(), nil)
 		if err != nil {
-			if listingBoundEnded(ctx, listCtx) {
+			if listingBoundEnded(listCtx, err) {
 				return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: listing as a whole timed out after %s (pages read: %d, waiting on page %d): %w",
 					req.Organization, req.Database, req.Branch, w.keyspaceListingTimeout, fetched-1, page, err)
 			}
@@ -333,11 +333,22 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 	}
 }
 
-// listingBoundEnded reports whether the listing's own overall bound ended
-// listCtx while the caller's ctx is still live. When ctx has ended too, the
-// caller's deadline or cancellation is the cause, and it is reported as such.
-func listingBoundEnded(ctx, listCtx context.Context) bool {
-	return listCtx.Err() != nil && ctx.Err() == nil
+// errKeyspaceListingBound is the cancellation cause recorded on a listing's
+// context when its own overall bound, rather than the caller's deadline or
+// cancellation, ends it. It wraps context.DeadlineExceeded because the HTTP
+// client reports a request ended by its context with the context's cause, and
+// callers match a listing that ran out of time as a deadline.
+var errKeyspaceListingBound = fmt.Errorf("keyspace listing bound reached: %w", context.DeadlineExceeded)
+
+// listingBoundEnded reports whether a page request failed because the
+// listing's own overall bound ended listCtx. The context's cause records which
+// deadline fired first, so the answer does not depend on when this runs: a
+// caller deadline that expires after the listing bound fired does not take the
+// failure over, and a caller deadline that fired first is never reported as
+// the listing's. The request error must itself be a deadline, so a page that
+// failed for another reason as the bound fired keeps its own error.
+func listingBoundEnded(listCtx context.Context, err error) bool {
+	return errors.Is(context.Cause(listCtx), errKeyspaceListingBound) && errors.Is(err, context.DeadlineExceeded)
 }
 
 func (w *psClientWrapper) GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {

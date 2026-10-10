@@ -3,6 +3,7 @@ package psclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -527,6 +528,34 @@ func TestListKeyspacesEndsAtTheOverallBound(t *testing.T) {
 	assert.Contains(t, err.Error(), "list keyspaces for block/orders branch main: listing as a whole timed out after 200ms (pages read: 1, waiting on page 2)")
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at its overall bound, not at a page timeout")
+}
+
+// Which deadline ended a page request is decided by which fired first, not by
+// which contexts have ended by the time the failure is classified. Both
+// deadlines have expired before classification in every case here.
+func TestListingBoundEndedFollowsTheFirstDeadline(t *testing.T) {
+	t.Run("listing bound fired before the caller's deadline", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancelCaller()
+		listCtx, cancel := context.WithTimeoutCause(caller, time.Millisecond, errKeyspaceListingBound)
+		defer cancel()
+		<-listCtx.Done()
+		<-caller.Done()
+
+		assert.True(t, listingBoundEnded(listCtx, fmt.Errorf("page 2: %w", context.DeadlineExceeded)))
+		assert.False(t, listingBoundEnded(listCtx, errors.New("page 2: connection reset")), "a page that failed for its own reason keeps its error")
+	})
+
+	t.Run("caller's deadline fired before the listing bound", func(t *testing.T) {
+		caller, cancelCaller := context.WithTimeout(t.Context(), time.Millisecond)
+		defer cancelCaller()
+		listCtx, cancel := context.WithTimeoutCause(caller, 50*time.Millisecond, errKeyspaceListingBound)
+		defer cancel()
+		<-caller.Done()
+		<-listCtx.Done()
+
+		assert.False(t, listingBoundEnded(listCtx, fmt.Errorf("page 1: %w", context.DeadlineExceeded)))
+	})
 }
 
 // A caller whose own deadline comes before the listing's bound ends the
