@@ -68,19 +68,23 @@ at the top level of the **server configuration**:
 ```yaml
 direct_execution:
   enabled: true
-  max_table_rows: 10000
+  max_table_bytes: 100MiB
   lock_acquisition_timeout: 10s
 ```
 
-With this example, a refused statement can run directly on a table with at most
-10,000 rows. SchemaBot checks the table's estimated size, then confirms eligibility
-with a bounded exact count. A table above the limit, an unavailable count, or a
-failed check stays blocked. It checks again before execution, so growth after
-planning can still prevent the change from running.
+With this example, a refused statement can run directly on a table holding at
+most 100 MiB of data and indexes. SchemaBot reads the table's size from InnoDB
+statistics (`DATA_LENGTH + INDEX_LENGTH`). A table above the limit, an
+unavailable size, or a failed check stays blocked. It checks again before
+execution, so growth after planning can still prevent the change from running.
 
-Choose the row limit for the amount of disruption you can accept. A small table
-can still have large rows or expensive DDL: this is a size limit, not a promise
-that a change finishes within a particular time.
+The size is an estimate, so it can lag a table that just grew. To confirm
+eligibility with a bounded exact count instead, set `max_table_rows`; a policy
+sets one bound or the other. See [the size bound](direct-execution.md#the-size-bound).
+
+Choose the limit for the amount of disruption you can accept. A small table
+can still have expensive DDL: this is a size limit, not a promise that a change
+finishes within a particular time.
 
 The policy covers MySQL databases on that server, including changes sent to a
 remote deployment over gRPC. An environment can replace it with its own policy
@@ -248,7 +252,7 @@ reach copying and fail verification; do not treat a checksum failure as permissi
 
 The safeguard also does not report a refusal during statement planning, which SchemaBot needs
 to offer [direct execution](#when-a-change-needs-direct-execution). Enabling that policy or
-raising its row limit alone does not make this change eligible.
+raising its size limit alone does not make this change eligible.
 
 ### What the lint finding means
 
