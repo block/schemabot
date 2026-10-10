@@ -14,7 +14,7 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
-	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
@@ -27,30 +27,13 @@ const (
 	maxStatusLimit     = 1000
 )
 
-// changeTypeToString converts a proto ChangeType enum to a lowercase string.
+// changeTypeToString converts a proto change type for progress responses.
+// Unmapped values stay empty because progress omits unavailable change types.
 func changeTypeToString(ct ternv1.ChangeType) string {
-	switch ct {
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(ddl.StatementDropTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
-		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
-	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
-		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
-		return ddl.StatementTypeToOp(ddl.StatementCreateView)
-	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
-		return "vschema_update"
-	default:
-		return ""
+	if op, ok := ternconv.ChangeTypeToOp(ct); ok {
+		return op
 	}
+	return ""
 }
 
 // deriveErrorCode returns an error code based on apply state
@@ -115,6 +98,8 @@ func engineName(e ternv1.Engine) string {
 		return "Spirit"
 	case ternv1.Engine_ENGINE_PLANETSCALE:
 		return "PlanetScale"
+	case ternv1.Engine_ENGINE_STRATA:
+		return "Strata"
 	case ternv1.Engine_ENGINE_POSTGRES:
 		return "PostgreSQL"
 	default:
@@ -185,6 +170,7 @@ func progressResponseFromProto(resp *ternv1.ProgressResponse) *apitypes.Progress
 			Status:              t.Status,
 			RowsCopied:          t.RowsCopied,
 			RowsTotal:           t.RowsTotal,
+			EstimatedBytes:      t.EstimatedBytes,
 			PercentComplete:     t.PercentComplete,
 			ETASeconds:          t.EtaSeconds,
 			ChecksumRowsChecked: t.ChecksumRowsChecked,
@@ -236,6 +222,8 @@ func progressOperationResponseFromStorage(op *storage.ApplyOperation) *apitypes.
 		OnFailure:           op.OnFailure,
 		ErrorCode:           deriveErrorCode(op.State, op.ErrorMessage),
 		ErrorMessage:        op.ErrorMessage,
+		AlreadyConverged:    op.AlreadyConverged,
+		RolloutStep:         op.RolloutStep,
 	}
 	if op.StartedAt != nil {
 		resp.StartedAt = op.StartedAt.Format(time.RFC3339)
@@ -428,8 +416,9 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	// Reuse the operation rows already listed above for multi-op detection.
 	// Operation rows are observability enrichment, not an apply safety gate, so
 	// a storage error (already logged) just omits the per-deployment breakdown.
+	var memberByOperationID map[int64]routing.ExecutionTarget
 	if opsErr == nil {
-		httpResp.Operations, _ = progressOperationsFromRows(ops)
+		httpResp.Operations, memberByOperationID = progressOperationsFromRows(ops)
 		httpResp.Released = s.resolveReleaseLatch(r.Context(), apply, ops)
 	}
 	httpResp.ApplyID = apply.ApplyIdentifier
@@ -464,23 +453,43 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 
 	setRevertSkippedMetadata(httpResp, apply)
 
-	// Overlay per-table timestamps from task records. The proto response
+	// Overlay each table row with its stored task. The data plane mints its
+	// own task identifiers and knows nothing of the control plane's operation
+	// rows, so a proxied row carries the control-plane task identity and
+	// rollout member only once its stored task is matched; polls answered from
+	// storage already carry both, and a watcher keying on task_id must see the
+	// same identity whichever source answered. The proto response also
 	// doesn't carry task timestamps, but storage has them from engine
 	// progress polling (e.g., SHOW VITESS_MIGRATIONS started_timestamp).
 	if tasks, err := s.storage.Tasks().GetByApplyID(r.Context(), apply.ID); err == nil {
-		taskIndex := tern.NewStatementIndex[storage.Task](len(tasks))
+		// The routed projection reports each statement as its deployment
+		// spells it, so a stored task is matched by canonical form rather than
+		// by the reviewed text it carries.
+		canon, canonErr := tern.StatementCanonicalizerForDatabaseType(apply.DatabaseType, s.logger)
+		if canonErr != nil {
+			s.logger.Warn("progress response matches task timestamps by statement text only",
+				append(apply.LogAttrs(), "error", canonErr)...)
+		}
+		taskIndex := tern.NewCanonicalStatementIndex[storage.Task](len(tasks), canon)
 		for _, t := range tasks {
 			taskIndex.Add(t.Namespace, t.TableName, t.DDL, t)
 		}
 		for _, tpr := range httpResp.Tables {
 			task, ok := taskIndex.Lookup(tpr.Keyspace, tpr.TableName, tpr.DDL)
-			if ok {
-				if task.StartedAt != nil && tpr.StartedAt == "" {
-					tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
-				}
-				if task.CompletedAt != nil && tpr.CompletedAt == "" {
-					tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
-				}
+			if !ok {
+				s.logger.Debug("progress row keeps the data plane's task identifier: no stored task matches its statement",
+					append(apply.LogAttrs(),
+						"namespace", tpr.Keyspace,
+						"table", tpr.TableName,
+						"ddl", tpr.DDL)...)
+				continue
+			}
+			attributeStoredTask(tpr, task, memberByOperationID)
+			if task.StartedAt != nil && tpr.StartedAt == "" {
+				tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
+			}
+			if task.CompletedAt != nil && tpr.CompletedAt == "" {
+				tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
 			}
 		}
 	}
@@ -941,12 +950,13 @@ func (s *Service) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // statusOperationForDeployment narrows an apply's operations to the requested
 // deployment for the status list. A single matching operation is returned
-// as-is. Multiple matches (a deployment applied per shard) fold into a
-// synthetic summary row: aggregated state and timestamps, plus the
-// deployment's one shared data-plane apply id as the external id — every
-// operation of a deployment attaches into the same data-plane apply, so the
-// deployment has exactly one. Per-operation external ids stay out of the
-// summary; they belong to the per-shard detail views.
+// as-is. Multiple matches (a deployment applied per shard, or per target when
+// it addresses several) fold into a synthetic summary row: aggregated state
+// and timestamps, plus the deployment's one shared data-plane apply id as the
+// external id — every operation of a deployment, whichever shard or target it
+// covers, attaches into the same data-plane apply, so the deployment has
+// exactly one. Per-operation external operation ids stay out of the summary;
+// they belong to the per-shard and per-target detail views.
 func (s *Service) statusOperationForDeployment(apply *storage.Apply, ops []*storage.ApplyOperation, deployment string) *storage.ApplyOperation {
 	if apply == nil {
 		return nil
@@ -1038,6 +1048,7 @@ func activeApplyResponseFromStorage(apply *storage.Apply, op *storage.ApplyOpera
 		}
 		active.ExternalOperationID = op.ExternalOperationID
 		active.State = op.State
+		active.ApplyState = apply.State
 		active.ErrorMessage = op.ErrorMessage
 		active.UpdatedAt = op.UpdatedAt.Format("2006-01-02T15:04:05Z07:00")
 		if op.StartedAt != nil {
@@ -1183,20 +1194,15 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 			Status:              task.State,
 			RowsCopied:          task.RowsCopied,
 			RowsTotal:           task.RowsTotal,
+			EstimatedBytes:      task.EstimatedBytes,
 			PercentComplete:     int32(task.ProgressPercent),
 			ChecksumRowsChecked: task.ChecksumRowsChecked,
 			ChecksumRowsTotal:   task.ChecksumRowsTotal,
 			Throttled:           task.Throttled,
 			ThrottleReason:      task.ThrottleReason,
 			IsInstant:           task.IsInstant,
-			TaskID:              task.TaskIdentifier,
 		}
-		if task.ApplyOperationID != nil {
-			if member, ok := memberByOperationID[*task.ApplyOperationID]; ok {
-				tpr.Deployment = member.Deployment
-				tpr.Target = member.Target
-			}
-		}
+		attributeStoredTask(tpr, task, memberByOperationID)
 		if task.StartedAt != nil {
 			tpr.StartedAt = task.StartedAt.Format(time.RFC3339)
 		}
@@ -1207,6 +1213,22 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	}
 
 	return httpResp, nil
+}
+
+// attributeStoredTask stamps a table row with the control-plane identity of
+// its stored task: the task identifier, and the rollout member that runs it
+// when the task belongs to an operation row the caller has loaded. Every
+// progress source hands its rows through here so one task reads under one
+// task_id, deployment, and target on every poll.
+func attributeStoredTask(tpr *apitypes.TableProgressResponse, task *storage.Task, memberByOperationID map[int64]routing.ExecutionTarget) {
+	tpr.TaskID = task.TaskIdentifier
+	if task.ApplyOperationID == nil {
+		return
+	}
+	if member, ok := memberByOperationID[*task.ApplyOperationID]; ok {
+		tpr.Deployment = member.Deployment
+		tpr.Target = member.Target
+	}
 }
 
 // overlayApplyOptions populates the options map on the response from the apply record.

@@ -1,9 +1,13 @@
 package ddl
 
 import (
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
+	"unicode"
+
+	pgstatement "github.com/block/pg-sprite/pkg/statement"
 
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -12,46 +16,272 @@ import (
 // It first canonicalizes using Spirit's parser, then formats:
 //   - ALTER statements: each clause on its own line
 //   - CREATE TABLE statements: each column/index on its own line
+//   - ENUM and SET value lists, and LIST partition value lists (FOR VALUES
+//     IN on PostgreSQL), too long for a line of their own: wrapped onto
+//     indented lines
+//   - partition definition lists: each definition on its own indented line
 //   - Data types, functions, and charset/collate values are lowercased
 //     while SQL keywords remain uppercase (PlanetScale style).
 func FormatDDL(ddl string) string {
 	return FormatDDLForDialect(schema.DialectMySQL, ddl)
 }
 
-// layoutDDL line-breaks a canonicalized statement for readability: a CREATE
-// TABLE gets each column/index and table option on its own line, and a
-// multi-clause ALTER TABLE gets each clause on its own line. The layout is
-// plain string splitting on the statement's own text, so it applies to any
-// dialect's canonical form. Other statement types are returned unchanged.
-func layoutDDL(ddl string) string {
+// FormatSchemaFileForDialect formats one declarative table file for source
+// control. Unlike FormatDDLForDialect, which is a best-effort display helper,
+// this function is strict: the file must match the dialect's supported
+// declarative shape, and a single-line file must render across multiple lines
+// with every statement canonicalizing to the same SQL as its input. PostgreSQL
+// files may include the supported row-security declaration after their table
+// and indexes. Existing multiline SQL is kept verbatim apart from its final
+// newline. Single-line SQL with comments is refused when reformatting cannot
+// preserve them, including MySQL executable comments. MySQL canonical forms
+// containing comments are also refused: they can flag discarded option values.
+// The returned file ends with one newline.
+func FormatSchemaFileForDialect(dialect schema.Dialect, content string) (string, error) {
+	parser, err := ParserForDialect(dialect)
+	if err != nil {
+		return "", err
+	}
+	statements, err := schemaFileStatements(dialect, parser, content)
+	if err != nil {
+		return "", fmt.Errorf("parse declarative schema file: %w", err)
+	}
+	trimmed := strings.TrimSpace(content)
+	if strings.Contains(trimmed, "\n") {
+		return strings.TrimRight(content, "\r\n") + "\n", nil
+	}
+	if dialect == schema.DialectPostgres {
+		if err := pgstatement.CheckNoComments(content); err != nil {
+			return "", fmt.Errorf("format PostgreSQL declarative schema file: %w", err)
+		}
+	}
+	if dialect == schema.DialectMySQL && containsMySQLComment(content, true) {
+		return "", fmt.Errorf("cannot preserve MySQL comments while formatting; format the schema file across multiple lines manually")
+	}
+
+	formatted := make([]string, 0, len(statements))
+	for i, stmt := range statements {
+		// Canonical equality cannot prove preservation when Restore emits a
+		// comment in place of an option's original value. Do not write that
+		// canonical form, even if reparsing it would compare equal.
+		if dialect == schema.DialectMySQL && containsMySQLComment(parser.Canonicalize(stmt), false) {
+			return "", fmt.Errorf("cannot prove statement %d preserved its SQL: canonical SQL contains comments; format the schema file across multiple lines manually", i+1)
+		}
+		rendered, equivalent := formatDDLForDialect(dialect, parser, stmt, i == 0)
+		if !equivalent {
+			return "", fmt.Errorf("formatter could not prove statement %d preserved its SQL", i+1)
+		}
+		formatted = append(formatted, rendered)
+	}
+
+	// Admission guarantees a CREATE TABLE first. Separators between later
+	// statements must not stand in for line breaks inside the table itself.
+	if !strings.Contains(formatted[0], "\n") {
+		return "", fmt.Errorf("formatter produced a single-line CREATE TABLE")
+	}
+	result := strings.Join(formatted, "\n\n") + "\n"
+	after, err := schemaFileStatements(dialect, parser, result)
+	if err != nil {
+		return "", fmt.Errorf("validate formatted declarative schema file: %w", err)
+	}
+	if len(after) != len(statements) {
+		return "", fmt.Errorf("formatter changed statement count from %d to %d", len(statements), len(after))
+	}
+	for i := range statements {
+		if parser.Canonicalize(statements[i]) != parser.Canonicalize(after[i]) {
+			return "", fmt.Errorf("formatter could not prove statement %d preserved its SQL", i+1)
+		}
+	}
+	return result, nil
+}
+
+// containsMySQLComment checks for comment openers outside quoted content. It
+// is only a content-loss guard; the dialect parser still validates the SQL.
+// Source literals allow backslash escapes, while Restore uses doubled quotes
+// and literal backslashes. Backtick identifiers only use doubled backticks.
+func containsMySQLComment(sql string, backslashEscapes bool) bool {
+	var quote byte
+	for i := 0; i < len(sql); i++ {
+		c := sql[i]
+		if quote != 0 {
+			if backslashEscapes && quote != '`' && c == '\\' {
+				i++
+				continue
+			}
+			if c == quote {
+				if i+1 < len(sql) && sql[i+1] == quote {
+					i++
+				} else {
+					quote = 0
+				}
+			}
+			continue
+		}
+		if isQuote(c) {
+			quote = c
+			continue
+		}
+		if c == '#' || strings.HasPrefix(sql[i:], "/*") {
+			return true
+		}
+		// Unlike PostgreSQL, MySQL requires whitespace/control after --.
+		if strings.HasPrefix(sql[i:], "--") && (i+2 == len(sql) || sql[i+2] <= ' ' || unicode.IsSpace(rune(sql[i+2]))) {
+			return true
+		}
+	}
+	return false
+}
+
+// schemaFileStatements validates a declarative file under the grammar that
+// consumes it and returns its statements in execution order. PostgreSQL row
+// security is a broader desired-file shape than the greenfield create sets
+// used by apply, so it must use pg-sprite's dedicated admission boundary.
+func schemaFileStatements(dialect schema.Dialect, parser StatementParser, content string) ([]string, error) {
+	if dialect == schema.DialectPostgres {
+		return postgresSchemaFileStatements(content)
+	}
+	createSet, err := ParseCreateSet(parser, content)
+	if err != nil {
+		return nil, err
+	}
+	if createSet.Type != StatementCreateTable {
+		return nil, fmt.Errorf("declarative schema file must start with CREATE TABLE, got %s", createSet.Type)
+	}
+	return createSet.Statements, nil
+}
+
+func postgresSchemaFileStatements(content string) ([]string, error) {
+	hasRowSecurity, err := pgstatement.HasRowSecurityDeclaration(content)
+	if err != nil {
+		return nil, err
+	}
+
+	// Both desired-schema parsers require a table and return it first, even
+	// when an index precedes the table in the source file.
+	var statements []pgstatement.Statement
+	if hasRowSecurity {
+		desired, err := pgstatement.ParseDesiredWithRowSecurity(content)
+		if err != nil {
+			return nil, err
+		}
+		statements = desired.Statements()
+	} else {
+		desired, err := pgstatement.ParseDesired(content)
+		if err != nil {
+			return nil, err
+		}
+		statements = desired.Statements()
+	}
+
+	result := make([]string, len(statements))
+	for i, stmt := range statements {
+		result[i] = stmt.SQL()
+	}
+	return result, nil
+}
+
+// layoutDDLWithOptions applies the ordinary display layout and can force even
+// a one-column CREATE TABLE onto multiple lines for checked-in schema files.
+// The layout is plain string splitting on the statement's canonical text, so
+// it applies to any dialect's canonical form. Other statements stay unchanged.
+func layoutDDLWithOptions(ddl string, multilineCreate bool) string {
 	upperDDL := strings.ToUpper(ddl)
 
 	switch {
 	case strings.HasPrefix(upperDDL, "CREATE TABLE"):
-		return formatCreateTable(ddl)
+		return formatCreateTableWithOptions(ddl, multilineCreate)
 	case strings.HasPrefix(upperDDL, "ALTER TABLE"):
-		clauses := splitAlterClauses(ddl)
-		if len(clauses) <= 1 {
-			return ddl
-		}
-		// Extract table header (ALTER TABLE `name`) from first clause
-		tableEnd := findTableNameEnd(clauses[0])
-		tableHeader := strings.TrimSpace(clauses[0][:tableEnd-1]) // -1 to remove trailing space
-		firstClause := strings.TrimSpace(clauses[0][tableEnd:])
-
-		// Format with header on first line, each clause on its own indented line
-		var sb strings.Builder
-		sb.WriteString(tableHeader)
-		sb.WriteString("\n    ")
-		sb.WriteString(firstClause)
-		for i := 1; i < len(clauses); i++ {
-			sb.WriteString(",\n    ")
-			sb.WriteString(clauses[i])
-		}
-		return sb.String()
+		return formatAlterTable(ddl)
 	default:
 		return ddl
 	}
+}
+
+// formatAlterTable puts the table header of a multi-clause ALTER TABLE on its
+// first line and each clause on an indented line of its own. A trailing
+// partitioning clause, which follows the other clauses with no comma between
+// them, gets a line of its own after them. A statement with one clause, or
+// with only a partitioning clause, stays on one line.
+func formatAlterTable(ddl string) string {
+	body, partitioning := splitAlterPartitioning(ddl)
+	clauses := splitAlterClauses(body)
+	if partitioning == "" && len(clauses) <= 1 {
+		return ddl
+	}
+	// Extract table header (ALTER TABLE `name`) from first clause
+	tableEnd := findTableNameEnd(clauses[0])
+	if tableEnd >= len(clauses[0]) {
+		return ddl
+	}
+	tableHeader := strings.TrimSpace(clauses[0][:tableEnd-1]) // -1 to remove trailing space
+	firstClause := strings.TrimSpace(clauses[0][tableEnd:])
+
+	// Format with header on first line, each clause on its own indented line
+	var sb strings.Builder
+	sb.WriteString(tableHeader)
+	sb.WriteString("\n    ")
+	sb.WriteString(firstClause)
+	for i := 1; i < len(clauses); i++ {
+		sb.WriteString(",\n    ")
+		sb.WriteString(clauses[i])
+	}
+	if partitioning != "" {
+		sb.WriteString("\n    ")
+		sb.WriteString(partitioning)
+	}
+	return sb.String()
+}
+
+// splitAlterPartitioning separates an ALTER TABLE's trailing partitioning
+// clause, PARTITION BY or REMOVE PARTITIONING, from the clauses before it.
+// MySQL's grammar puts that clause after every other one, separated by a
+// space rather than a comma. Parentheses and quoted regions are opaque, so a
+// window function's PARTITION BY or a COMMENT mentioning one is never taken
+// for the clause; an unterminated quote leaves the statement whole.
+func splitAlterPartitioning(ddl string) (body, partitioning string) {
+	depth := 0
+	for i := findTableNameEnd(ddl); i < len(ddl); i++ {
+		c := ddl[i]
+		if isQuote(c) {
+			end, ok := quotedEnd(ddl, i)
+			if !ok {
+				return ddl, ""
+			}
+			i = end - 1
+			continue
+		}
+		switch c {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth != 0 || ddl[i-1] != ' ' || !startsPartitioningClause(ddl[i:]) {
+			continue
+		}
+		body = strings.TrimRight(ddl[:i], " ")
+		if strings.HasSuffix(body, ",") {
+			return ddl, ""
+		}
+		return body, ddl[i:]
+	}
+	return ddl, ""
+}
+
+// startsPartitioningClause reports whether s opens a PARTITION BY or REMOVE
+// PARTITIONING clause.
+func startsPartitioningClause(s string) bool {
+	return startsWithKeyword(s, "PARTITION BY") || startsWithKeyword(s, "REMOVE PARTITIONING")
+}
+
+// startsWithKeyword reports whether s opens with keyword, case-insensitively,
+// followed by the end of the statement or a character that cannot continue
+// the keyword.
+func startsWithKeyword(s, keyword string) bool {
+	if len(s) < len(keyword) || !strings.EqualFold(s[:len(keyword)], keyword) {
+		return false
+	}
+	return len(s) == len(keyword) || !isIdentifierByte(s[len(keyword)])
 }
 
 // FormatDDLForDialect formats a DDL statement for display under the dialect's
@@ -63,8 +293,12 @@ func layoutDDL(ddl string) string {
 // the dialect's parser rejects — or any statement of a dialect with no
 // registered parser (logged, since it means a database type reached the
 // display layer without a parser) — renders unformatted, with only
-// surrounding whitespace trimmed and a trailing semicolon enforced. Display
-// transformations preserve quoted names and values, and unknown dialects emit
+// surrounding whitespace trimmed and a trailing semicolon enforced. Value
+// lists too long for a line of their own wrap onto indented lines, and a
+// MySQL partition definition list puts each definition on a line of its own;
+// each wrapping is kept only when the dialect's parser reads the wrapped
+// statement as the same SQL. Display transformations preserve quoted names and values,
+// and unknown dialects emit
 // only a debug diagnostic so interactive prompts remain readable.
 func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 	raw := strings.TrimRight(strings.TrimSpace(stmt), ";") + ";"
@@ -73,19 +307,258 @@ func FormatDDLForDialect(dialect schema.Dialect, stmt string) string {
 		slog.Debug("DDL display formatting has no parser for this dialect; preserving original SQL", "dialect", dialect, "error", err)
 		return raw
 	}
+	formatted, equivalent := formatDDLForDialect(dialect, parser, raw, false)
+	if !equivalent {
+		slog.Debug("DDL display normalization changed the statement; preserving original SQL", "dialect", dialect)
+		return raw
+	}
+	if dialect == schema.DialectMySQL {
+		formatted = keepEquivalentWrap(dialect, parser, formatted, wrapPartitionDefinitions(formatted), "partition-definition")
+	}
+	return keepEquivalentWrap(dialect, parser, formatted, wrapLongValueLists(formatted, valueListPatternFor(dialect)), "value-list")
+}
+
+// keepEquivalentWrap returns wrapped when the dialect's parser reads it as the
+// same statement as formatted, and formatted otherwise. kind names the
+// wrapping in the diagnostic logged when it is discarded.
+//
+// The comparison fails closed on a statement the parser cannot read only
+// because StatementParser.Canonicalize returns its input unchanged on a parse
+// failure: wrapped and formatted then canonicalize to two different strings,
+// and the wrap is discarded. A Canonicalize that returned a fixed value on
+// failure would make the two sides equal and keep an unverified wrap.
+func keepEquivalentWrap(dialect schema.Dialect, parser StatementParser, formatted, wrapped, kind string) string {
+	if wrapped == formatted {
+		return formatted
+	}
+	if parser.Canonicalize(wrapped) != parser.Canonicalize(formatted) {
+		slog.Debug("DDL display wrapping changed the statement; preserving unwrapped SQL", "dialect", dialect, "wrapping", kind)
+		return formatted
+	}
+	return wrapped
+}
+
+// wrapPartitionDefinitions puts each definition of a MySQL partition
+// definition list on an indented line of its own, with the closing
+// parenthesis back at the line's own indentation:
+//
+//	PARTITION BY RANGE COLUMNS (`created_on`) (
+//	    PARTITION `p2024` VALUES LESS THAN ('2025-01-01'),
+//	    PARTITION `future` VALUES LESS THAN (MAXVALUE)
+//	)
+//
+// That covers the list after PARTITION BY and the new partitions of ADD
+// PARTITION and REORGANIZE PARTITION ... INTO. A list of one definition stays
+// inline unless its line is too long to read. A partition's own subpartition
+// list stays on its definition's line.
+//
+// The scan works on the canonical text rather than the parser's partition
+// definitions because canonical ALTER TABLE text comes from Spirit's
+// normalized clause string, which does not expose them. It only inserts
+// whitespace at commas between definitions, and FormatDDLForDialect keeps
+// the result only when the parser reads it as the same statement.
+//
+// Each line is scanned on its own, so a list is wrapped only when it opens
+// and closes on one line, as it does in canonical text. A list an earlier
+// step had already broken across lines is left as it is: its opening line
+// has no matching parenthesis. A quoted literal that spans lines can still be
+// misread, which the equivalence check catches.
+func wrapPartitionDefinitions(ddl string) string {
+	lines := strings.Split(ddl, "\n")
+	for i, line := range lines {
+		lines[i] = wrapLinePartitionDefinitions(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// wrapLinePartitionDefinitions wraps the partition definition lists on one
+// line of a statement. MySQL reserves PARTITION, so outside a quoted region
+// a parenthesis followed by it can only open a definition list.
+func wrapLinePartitionDefinitions(line string) string {
+	indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+	innerIndent := indent + "    "
+
+	var sb strings.Builder
+	start := 0
+	for i := 0; i < len(line); i++ {
+		if isQuote(line[i]) {
+			end, ok := quotedEnd(line, i)
+			if !ok {
+				return line
+			}
+			i = end - 1
+			continue
+		}
+		if line[i] != '(' || !startsWithKeyword(line[i+1:], "PARTITION") {
+			continue
+		}
+		closeParen := findMatchingParen(line, i)
+		if closeParen == -1 {
+			return line
+		}
+		definitions := splitByComma(line[i+1 : closeParen])
+		if len(definitions) == 1 && len(line) <= valueListWrapWidth {
+			i = closeParen
+			continue
+		}
+		sb.WriteString(line[start : i+1])
+		sb.WriteString("\n")
+		for j, definition := range definitions {
+			sb.WriteString(innerIndent)
+			sb.WriteString(strings.TrimSpace(definition))
+			if j < len(definitions)-1 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(indent)
+		start = closeParen
+		i = closeParen
+	}
+	sb.WriteString(line[start:])
+	return sb.String()
+}
+
+// valueListWrapWidth is the line width a displayed statement's value lists
+// are wrapped to. Beyond keeping the DDL readable without scrolling, short
+// lines keep GitHub's syntax highlighting on: it renders a very long line as
+// plain text.
+const valueListWrapWidth = 100
+
+// mysqlValueListPattern matches the opening of a MySQL ENUM or SET column
+// type's value list, or of a LIST partition's VALUES IN list. A MySQL
+// statement only opens a parenthesis directly after SET in that type;
+// CHARACTER SET and SET DEFAULT never take one. A LIST COLUMNS partition's
+// values are tuples, which pack whole.
+var mysqlValueListPattern = regexp.MustCompile(`(?i)^(enum|set|values\s+in)\s*\(`)
+
+// postgresValueListPattern matches the opening of an ENUM value list, or of a
+// list partition's FOR VALUES IN bound. Outside the MySQL family SET is not a
+// type, and SET ( opens a parameter list such as a table's storage
+// parameters, so it never wraps.
+var postgresValueListPattern = regexp.MustCompile(`(?i)^(enum|values\s+in)\s*\(`)
+
+// valueListPatternFor returns the matcher for the dialect's value lists.
+func valueListPatternFor(dialect schema.Dialect) *regexp.Regexp {
+	if dialect == schema.DialectMySQL {
+		return mysqlValueListPattern
+	}
+	return postgresValueListPattern
+}
+
+// wrapLongValueLists breaks each value list matched by listPattern that
+// cannot fit on a line of its own across indented lines packed to
+// valueListWrapWidth, with the closing parenthesis back at the line's own
+// indentation:
+//
+//	MODIFY COLUMN `status` enum(
+//	    'PENDING', 'ACTIVE', ...
+//	) NOT NULL
+//
+// Lists short enough to fit stay inline. Quoted regions on a line are never
+// searched or split, but each line is scanned on its own, so a literal that
+// spans lines, or a quoting form the scanner does not know such as a
+// PostgreSQL dollar-quoted body, can be misread as SQL. FormatDDLForDialect
+// keeps the result only when the parser reads it as the same statement.
+func wrapLongValueLists(ddl string, listPattern *regexp.Regexp) string {
+	lines := strings.Split(ddl, "\n")
+	for i, line := range lines {
+		lines[i] = wrapLineValueLists(line, listPattern)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// wrapLineValueLists wraps the long value lists on one line of a statement.
+func wrapLineValueLists(line string, listPattern *regexp.Regexp) string {
+	if len(line) <= valueListWrapWidth {
+		return line
+	}
+	indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+	innerIndent := indent + "    "
+
+	var sb strings.Builder
+	start := 0
+	for i := 0; i < len(line); i++ {
+		if isQuote(line[i]) {
+			end, ok := quotedEnd(line, i)
+			if !ok {
+				return line
+			}
+			i = end - 1
+			continue
+		}
+		if i > 0 && isIdentifierByte(line[i-1]) {
+			continue
+		}
+		loc := listPattern.FindStringIndex(line[i:])
+		if loc == nil {
+			continue
+		}
+		openParen := i + loc[1] - 1
+		closeParen := findMatchingParen(line, openParen)
+		if closeParen == -1 {
+			return line
+		}
+		body := line[openParen+1 : closeParen]
+		if len(innerIndent)+len(body) <= valueListWrapWidth {
+			i = closeParen
+			continue
+		}
+		sb.WriteString(line[start : openParen+1])
+		sb.WriteString("\n")
+		for _, packed := range packValues(splitByComma(body), valueListWrapWidth-len(innerIndent)) {
+			sb.WriteString(innerIndent)
+			sb.WriteString(packed)
+			sb.WriteString("\n")
+		}
+		sb.WriteString(indent)
+		start = closeParen
+		i = closeParen
+	}
+	sb.WriteString(line[start:])
+	return sb.String()
+}
+
+// packValues joins values with ", " into lines no wider than width, ending
+// every line but the last with the comma that separates it from the next. A
+// value wider than width gets a line of its own.
+func packValues(values []string, width int) []string {
+	var lines []string
+	current := ""
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		switch {
+		case current == "":
+			current = value
+		case len(current)+len(", ")+len(value)+len(",") > width:
+			lines = append(lines, current+",")
+			current = value
+		default:
+			current += ", " + value
+		}
+	}
+	return append(lines, current)
+}
+
+// isIdentifierByte reports whether c can continue an unquoted identifier, so
+// a type keyword is only matched where it starts a word.
+func isIdentifierByte(c byte) bool {
+	return c == '_' || c == '$' || unicode.IsLetter(rune(c)) || unicode.IsDigit(rune(c))
+}
+
+// formatDDLForDialect formats one statement and reports whether the parser can
+// prove that the result is equivalent to the input. The strict schema-file
+// formatter asks it to line-break even a one-column CREATE TABLE; display
+// callers retain their established compact form.
+func formatDDLForDialect(dialect schema.Dialect, parser StatementParser, stmt string, multilineCreate bool) (string, bool) {
+	raw := strings.TrimRight(strings.TrimSpace(stmt), ";") + ";"
 	canonical := parser.Canonicalize(raw)
-	formatted := layoutDDL(canonical)
+	formatted := layoutDDLWithOptions(canonical, multilineCreate)
 	if dialect == schema.DialectMySQL {
 		formatted = lowercaseTypes(formatted)
 	}
 	formatted = strings.TrimRight(formatted, "; ") + ";"
-	// Keep the original SQL whenever canonical comparison cannot prove that
-	// display layout and case changes preserve quoted identifiers and values.
-	if canonical != parser.Canonicalize(formatted) {
-		slog.Debug("DDL display normalization changed the statement; preserving original SQL", "dialect", dialect)
-		return raw
-	}
-	return formatted
+	return formatted, canonical == parser.Canonicalize(formatted)
 }
 
 // dataTypePattern matches SQL data types that should be lowercased.
@@ -173,6 +646,10 @@ func lowercaseUnquotedTypes(ddl string) string {
 
 // formatCreateTable formats a CREATE TABLE statement with line breaks.
 func formatCreateTable(ddl string) string {
+	return formatCreateTableWithOptions(ddl, false)
+}
+
+func formatCreateTableWithOptions(ddl string, multiline bool) string {
 	// Find the opening parenthesis
 	openParen := findOpeningParen(ddl)
 	if openParen == -1 {
@@ -182,6 +659,14 @@ func formatCreateTable(ddl string) string {
 	// Find the matching closing parenthesis (for the column definitions)
 	closeParen := findMatchingParen(ddl, openParen)
 	if closeParen == -1 {
+		return ddl
+	}
+
+	// A PostgreSQL partition with no column list opens its first parenthesis
+	// in its partition bound, which is not a column list. Display leaves the
+	// bound to value-list wrapping; source files keep their established
+	// one-value-per-line form.
+	if !multiline && opensPartitionBound(ddl[:openParen]) {
 		return ddl
 	}
 
@@ -196,7 +681,7 @@ func formatCreateTable(ddl string) string {
 	options := strings.TrimSpace(footer[1:]) // Skip the ")"
 	options, partition := splitPartitionClause(options)
 
-	if len(parts) <= 1 {
+	if len(parts) <= 1 && !multiline {
 		// Single column — no line-break formatting for columns,
 		// but still format table options if present
 		if options != "" || partition != "" {
@@ -210,6 +695,9 @@ func formatCreateTable(ddl string) string {
 	sb.WriteString(header)
 	sb.WriteString("\n")
 	for i, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			continue
+		}
 		sb.WriteString("    ")
 		sb.WriteString(strings.TrimSpace(part))
 		if i < len(parts)-1 {
@@ -217,10 +705,48 @@ func formatCreateTable(ddl string) string {
 		}
 		sb.WriteString("\n")
 	}
-	sb.WriteString(")")
-	sb.WriteString(formatFooter(options, partition))
+	if multiline {
+		// Source files need all table options, including those the display
+		// formatter does not recognize. Keep the canonical suffix intact.
+		sb.WriteString(footer)
+	} else {
+		sb.WriteString(")")
+		sb.WriteString(formatFooter(options, partition))
+	}
 
 	return sb.String()
+}
+
+// opensPartitionBound reports whether the CREATE TABLE text before its first
+// parenthesis ends in a PostgreSQL partition bound, FOR VALUES IN, FROM or
+// WITH, as in PARTITION OF orders FOR VALUES IN (, so that parenthesis is the
+// bound's and not the start of a column list. Quoted regions are skipped, so
+// a table named "audit for values log" is not taken for a bound; an
+// unterminated quote reports false.
+func opensPartitionBound(beforeParen string) bool {
+	var unquoted strings.Builder
+	for i := 0; i < len(beforeParen); i++ {
+		if isQuote(beforeParen[i]) {
+			end, ok := quotedEnd(beforeParen, i)
+			if !ok {
+				return false
+			}
+			unquoted.WriteString(" quoted ")
+			i = end - 1
+			continue
+		}
+		unquoted.WriteByte(beforeParen[i])
+	}
+	words := strings.Fields(strings.ToUpper(unquoted.String()))
+	if len(words) < 3 || words[len(words)-3] != "FOR" || words[len(words)-2] != "VALUES" {
+		return false
+	}
+	switch words[len(words)-1] {
+	case "IN", "FROM", "WITH":
+		return true
+	default:
+		return false
+	}
 }
 
 // splitPartitionClause separates the trailing PARTITION BY clause, if any,
@@ -518,10 +1044,17 @@ func findTableNameEnd(ddl string) int {
 	return len(ddl)
 }
 
-// isClauseKeyword checks if the string starts with an ALTER TABLE clause keyword.
+// alterTableOptionPattern matches a table option starting an ALTER TABLE
+// clause, such as DEFAULT COLLATE = utf8mb4_bin or ENGINE = InnoDB.
+var alterTableOptionPattern = regexp.MustCompile(`^(?i)(DEFAULT\s|CHARACTER\s+SET\s|CHARSET\s|COLLATE\s|[A-Z_]+\s*=)`)
+
+// isClauseKeyword checks if the string starts an ALTER TABLE clause: a clause
+// keyword, or a table option, which gets a line of its own so a new default
+// charset or collation does not trail the last column change.
 func isClauseKeyword(s string) bool {
 	upper := strings.ToUpper(s)
-	return strings.HasPrefix(upper, "ADD ") ||
+	return alterTableOptionPattern.MatchString(s) ||
+		strings.HasPrefix(upper, "ADD ") ||
 		strings.HasPrefix(upper, "DROP ") ||
 		strings.HasPrefix(upper, "MODIFY ") ||
 		strings.HasPrefix(upper, "CHANGE ") ||

@@ -1461,7 +1461,7 @@ func TestProgressReportsExecutorStepPosition(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 3}
 	tracker := newTestTracker(t)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
 	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
 
 	before, err := eng.Progress(t.Context(), req)
@@ -1497,7 +1497,7 @@ func TestProgressMetadataIsStableWhilePositionIsUnchanged(t *testing.T) {
 	tracker := newTestTracker(t)
 	tracker.Start(3, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now().Add(-time.Minute), change, ""), tracker, slog.Default(), false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now().Add(-time.Minute), change, ""), tracker, slog.Default(), false, nil, "")
 	req := &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}}
 
 	first, err := eng.Progress(t.Context(), req)
@@ -1544,7 +1544,7 @@ func TestPublishProgressKeepsTerminalPositionAsPublished(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
 	tracker := newTestTracker(t)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
 	tracker.Start(2, progress.OperationAdmitting)
 	tracker.StartStep(2, progress.OperationBrief, "CREATE INDEX widgets_name_idx ON public.widgets (name)")
 	tracker.Finish(errors.New("boom"))
@@ -1659,10 +1659,17 @@ func applyAlterUsers(t *testing.T, eng *Engine, scripted *scriptedExecutor, key 
 // cannot outlive the test or hold Drain open.
 func applyChange(t *testing.T, eng *Engine, scripted *scriptedExecutor, key, ddl string, logger *slog.Logger) {
 	t.Helper()
+	applyChangeUnder(t, t.Context(), eng, scripted, key, ddl, logger)
+}
+
+// applyChangeUnder is applyChange with the Apply made under ctx, so a test
+// can name the owner the change is started for.
+func applyChangeUnder(t *testing.T, ctx context.Context, eng *Engine, scripted *scriptedExecutor, key, ddl string, logger *slog.Logger) {
+	t.Helper()
 	eng.execute = scripted.execute
 	t.Cleanup(eng.Drain)
 	t.Cleanup(scripted.release)
-	accepted, err := eng.Apply(t.Context(), &engine.ApplyRequest{
+	accepted, err := eng.Apply(ctx, &engine.ApplyRequest{
 		Database: "app",
 		Changes: []engine.SchemaChange{{
 			Namespace: "public",
@@ -1859,6 +1866,30 @@ func TestHaltForShutdownEndsConcurrentBuildsWithoutRecordingACancel(t *testing.T
 	assert.NotEqual(t, engine.StateCancelled, terminal.State, "a halt is not an operator cancel")
 }
 
+// One engine serves every drive of a target in this process. A drive that
+// hands its apply back halts the build it started and leaves the build
+// another drive started running.
+func TestHaltWorkOwnedByEndsOnlyThatOwnersBuild(t *testing.T) {
+	scripted := newScriptedExecutor(func(*progress.Tracker) error {
+		return errors.New("the executor must be ended by its context, not released")
+	})
+	eng := New()
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	applyChangeUnder(t, engine.WithWorkOwner(t.Context(), "drive-a"), eng, scripted, "task-a", concurrentIndexDDL, discard)
+	scripted.envelope(t)
+	scripted.tracker(t)
+	applyChangeUnder(t, engine.WithWorkOwner(t.Context(), "drive-b"), eng, scripted, "task-b", concurrentIndexDDL, discard)
+	scripted.envelope(t)
+	scripted.tracker(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), backgroundApplyDeadline)
+	defer cancel()
+	require.NoError(t, eng.HaltWorkOwnedBy(ctx, "drive-a"))
+
+	assert.True(t, pollProgress(t, eng, "task-a").State.IsTerminal(), "drive-a's build came down before the halt returned")
+	assert.Equal(t, engine.StateRunning, pollProgress(t, eng, "task-b").State, "drive-b's build is not drive-a's to halt")
+}
+
 // A halt for shutdown leaves plain DDL to finish, so a statement that will not
 // return within the shutdown budget is reported as still holding the target
 // rather than interrupted.
@@ -1952,7 +1983,7 @@ func TestProgressReadsTheTrackerOutsideTheEngineLock(t *testing.T) {
 	session := &blockingProgressSession{started: make(chan struct{}), release: make(chan struct{})}
 	tracker.SetConcurrentBuild(session, 42)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, false, nil, "")
 
 	polled := make(chan error, 1)
 	go func() {
@@ -1968,7 +1999,7 @@ func TestProgressReadsTheTrackerOutsideTheEngineLock(t *testing.T) {
 	claimed := make(chan struct{})
 	go func() {
 		defer close(claimed)
-		eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), newTestTracker(t), logger, false, nil)
+		eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), newTestTracker(t), logger, false, nil, "")
 		eng.publishProgress("task-b", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), logger)
 	}()
 	select {
@@ -1994,7 +2025,7 @@ func TestProgressNeverReadsTheTrackerForATerminalApply(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "widgets", sql: "CREATE TABLE public.widgets (id bigint PRIMARY KEY)", steps: 2}
 	tracker, session := activeBuildTracker(t, errors.New("progress view unavailable"))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
 	terminal := progressResult(engine.StateFailed, "failed", time.Now(), change, "detail")
 	terminal.Metadata["step"] = "2"
 	eng.publishProgress("task-a", terminal, slog.Default())
@@ -2098,7 +2129,7 @@ func claimRunningIndexBuild(t *testing.T, eng *Engine, session *publishedIndexPr
 	tracker.StartStep(2, progress.OperationConcurrentIndex, "CREATE INDEX CONCURRENTLY widgets_name_idx ON public.widgets (name)")
 	tracker.SetAttempt(3)
 	tracker.SetConcurrentBuild(session, 42)
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
 	return tracker
 }
 
@@ -2243,7 +2274,7 @@ func TestProgressStraddlingAReclaimDoesNotFloorToTheRetiredRecord(t *testing.T) 
 	session.row = &heapScan
 	session.onRead = func() {
 		session.onRead = nil
-		eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), false, nil)
+		eng.claimProgress("task-a", progressResult(engine.StateRunning, "running", time.Now(), change, ""), tracker, slog.Default(), false, nil, "")
 	}
 	got := pollRunningIndexBuild(t, eng)
 	assert.Equal(t, engine.StateRunning, got.State)
@@ -2374,7 +2405,7 @@ func TestProgressAnswersLastKnownPositionWhenTrackerReadFails(t *testing.T) {
 	tracker, _ := activeBuildTracker(t, errors.New("connection reset by peer"))
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), change, ""), tracker, logger, false, nil, "")
 
 	got, err := eng.Progress(t.Context(), &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: "task-a"}})
 
@@ -2427,6 +2458,9 @@ func TestRefusalForOutcomeTotalOverExecutorCodes(t *testing.T) {
 		// DDL onto its own result, so the apply waits for an operator to
 		// read the catalog instead.
 		executor.CodeBlockingOutcomeUnknown: "a retry replays a statement that may have committed",
+		// Keep the outcome vocabulary total. pg-sprite requires catalog inspection
+		// before retrying an unknown commit outcome.
+		executor.CodeRowSecurityOutcomeUnknown: "inspect the catalog before deciding whether to retry",
 	}
 	for _, code := range executor.Codes() {
 		t.Run(string(code), func(t *testing.T) {
@@ -3316,7 +3350,7 @@ func TestRecoveryFailureDetailNamesTheAbandonedIndex(t *testing.T) {
 func TestProgressIsKeyedToTheRequestingApply(t *testing.T) {
 	eng := New()
 	change := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
-	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), newTestTracker(t), slog.Default(), false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), change, ""), newTestTracker(t), slog.Default(), false, nil, "")
 
 	tracked, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
@@ -3348,8 +3382,8 @@ func TestConcurrentAppliesEachAnswerForTheirOwnWork(t *testing.T) {
 	eng := New()
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil)
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil)
+	eng.claimProgress("task-a", progressResult(engine.StateRunning, "preflight", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil, "")
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil, "")
 
 	first, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-a"},
@@ -3377,10 +3411,10 @@ func TestClaimProgressRetiresSettledApplies(t *testing.T) {
 	settled := nativeApply{namespace: "public", table: "t_settled", sql: "ALTER TABLE public.t_settled ADD COLUMN a text"}
 	running := nativeApply{namespace: "public", table: "t_running", sql: "ALTER TABLE public.t_running ADD COLUMN b text"}
 	fresh := nativeApply{namespace: "public", table: "t_fresh", sql: "ALTER TABLE public.t_fresh ADD COLUMN c text"}
-	eng.claimProgress("task-settled", progressResult(engine.StateCompleted, "completed", time.Now(), settled, ""), newTestTracker(t), slog.Default(), false, nil)
-	eng.claimProgress("task-running", progressResult(engine.StateRunning, "preflight", time.Now(), running, ""), newTestTracker(t), slog.Default(), false, nil)
+	eng.claimProgress("task-settled", progressResult(engine.StateCompleted, "completed", time.Now(), settled, ""), newTestTracker(t), slog.Default(), false, nil, "")
+	eng.claimProgress("task-running", progressResult(engine.StateRunning, "preflight", time.Now(), running, ""), newTestTracker(t), slog.Default(), false, nil, "")
 
-	eng.claimProgress("task-fresh", progressResult(engine.StateRunning, "preflight", time.Now(), fresh, ""), newTestTracker(t), slog.Default(), false, nil)
+	eng.claimProgress("task-fresh", progressResult(engine.StateRunning, "preflight", time.Now(), fresh, ""), newTestTracker(t), slog.Default(), false, nil, "")
 
 	retired, err := eng.Progress(t.Context(), &engine.ProgressRequest{
 		ResumeState: &engine.ResumeState{MigrationContext: "task-settled"},
@@ -3406,7 +3440,7 @@ func TestUntrackedApplyProgressIsDiscarded(t *testing.T) {
 	eng := New()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil)
+	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil, "")
 
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	eng.publishProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), logger)
@@ -3434,8 +3468,8 @@ func TestDrainStopsTrackingEverySchemaChange(t *testing.T) {
 	eng := New()
 	changeA := nativeApply{namespace: "public", table: "t_a", sql: "ALTER TABLE public.t_a ADD COLUMN a text"}
 	changeB := nativeApply{namespace: "public", table: "t_b", sql: "ALTER TABLE public.t_b ADD COLUMN b text"}
-	eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil)
-	eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil)
+	close(eng.claimProgress("task-a", progressResult(engine.StateCompleted, "completed", time.Now(), changeA, ""), newTestTracker(t), slog.Default(), false, nil, ""))
+	close(eng.claimProgress("task-b", progressResult(engine.StateRunning, "preflight", time.Now(), changeB, ""), newTestTracker(t), slog.Default(), false, nil, ""))
 
 	eng.Drain()
 
@@ -3590,4 +3624,31 @@ func TestExecuteOptimisticRefusesUnreadableCABundle(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "open pg-sprite apply pool")
 	assert.Contains(t, err.Error(), "read CA bundle")
+}
+
+// Malformed SQL must retain the operator-facing refusal, not expose parser internals.
+func TestValidateOptimisticApplyRefusesMalformedSQL(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	req := &engine.ApplyRequest{
+		Database: "app",
+		Changes: []engine.SchemaChange{{Namespace: "public", TableChanges: []engine.TableChange{{
+			Table: "widgets", DDL: "ALTER TABLE public.widgets ADD COLUMN",
+		}}}},
+		Credentials: &engine.Credentials{DSN: "postgres://localhost/app"},
+	}
+	_, err := validateOptimisticApply(req)
+	require.EqualError(t, err, `apply PostgreSQL table "widgets": planned DDL is not one statement or a valid greenfield create set`)
+	assert.Contains(t, logs.String(), "syntax error")
+	assert.Contains(t, logs.String(), "database=app")
+	assert.Contains(t, logs.String(), "table=widgets")
+}
+
+func TestChangedRowSecurityReviewRequiresNewPlan(t *testing.T) {
+	r := classifyRefusal(executor.ErrRowSecurityPlanChanged, "documents")
+	require.NotNil(t, r)
+	assert.Equal(t, "row-security-plan-changed", r.reason)
+	assert.Equal(t, "re-plan and review the new SQL before applying", r.remedy)
 }

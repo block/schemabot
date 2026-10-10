@@ -10,13 +10,21 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 )
 
+// mustIgnoredTables indexes ignore_tables entries the test knows are valid.
+func mustIgnoredTables(t *testing.T, entries []string) engine.IgnoredTables {
+	t.Helper()
+	ignored, err := engine.NewIgnoredTables(entries)
+	require.NoError(t, err)
+	return ignored
+}
+
 // The loader drops an archive table before reading its definition. Moving that
 // exclusion to this side would cost one SHOW CREATE TABLE per archive table on
 // every plan, and would fail a plan outright on an archive-named object that
 // cannot be read — neither of which a repository configuring nothing should
 // pay for.
 func TestLiveSchemaFilterOptions_ArchiveExclusionStaysWithTheLoader(t *testing.T) {
-	opts := liveSchemaFilterOptions(engine.NewIgnoredTables(nil))
+	opts := liveSchemaFilterOptions(mustIgnoredTables(t, nil))
 	assert.Contains(t, opts, table.WithoutArchiveTables)
 	assert.Contains(t, opts, table.WithoutUnderscoreTables)
 	assert.Contains(t, opts, table.WithStrippedAutoIncrement)
@@ -25,7 +33,7 @@ func TestLiveSchemaFilterOptions_ArchiveExclusionStaysWithTheLoader(t *testing.T
 // A config that withholds an ordinary table says nothing about archive tables,
 // so the loader keeps that exclusion and the plan reads no archive table.
 func TestLiveSchemaFilterOptions_UnrelatedEntriesKeepTheLoaderExclusion(t *testing.T) {
-	opts := liveSchemaFilterOptions(engine.NewIgnoredTables([]string{"flyway_schema_history"}))
+	opts := liveSchemaFilterOptions(mustIgnoredTables(t, []string{"flyway_schema_history"}))
 	assert.Contains(t, opts, table.WithoutArchiveTables)
 }
 
@@ -36,7 +44,7 @@ func TestLiveSchemaFilterOptions_UnrelatedEntriesKeepTheLoaderExclusion(t *testi
 func TestLiveSchemaFilterOptions_AnArchiveNamedEntryTakesTheExclusionBack(t *testing.T) {
 	require.True(t, table.IsArchiveTable("orders_archive_2024"), "fixture must be archive-shaped")
 
-	opts := liveSchemaFilterOptions(engine.NewIgnoredTables([]string{"orders_archive_2024"}))
+	opts := liveSchemaFilterOptions(mustIgnoredTables(t, []string{"orders_archive_2024"}))
 	assert.NotContains(t, opts, table.WithoutArchiveTables)
 	assert.Contains(t, opts, table.WithoutUnderscoreTables)
 }

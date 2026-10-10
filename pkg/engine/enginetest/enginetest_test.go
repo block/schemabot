@@ -103,11 +103,13 @@ func TestContractCaseCoverage(t *testing.T) {
 var optionalCapabilityDecisions = map[reflect.Type]string{
 	reflect.TypeFor[engine.Drainer]():                         "lifecycle cleanup is outside the error-typing contract",
 	reflect.TypeFor[engine.ShutdownHalter]():                  "shutdown behavior has engine-specific tests",
+	reflect.TypeFor[engine.OwnedWorkHalter]():                 "drive-exit halt behavior has engine-specific tests",
 	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    "recovery signaling has engine-specific tests",
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): "routing policy is outside the conformance suite",
 	reflect.TypeFor[engine.SynchronousWorkRegistration]():     "registration timing is outside the conformance suite",
 	reflect.TypeFor[engine.ControlResumeValidator]():          "resume metadata is engine-specific",
 	reflect.TypeFor[engine.CancelledArtifactReleaser]():       "artifact naming and disposal are engine-specific",
+	reflect.TypeFor[engine.ShardKeyedPlanning]():              "plan shape is judged by the resume re-plan tests",
 }
 
 func TestOptionalCapabilityCoverage(t *testing.T) {

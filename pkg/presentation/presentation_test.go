@@ -1,6 +1,7 @@
 package presentation
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/block/schemabot/pkg/state"
@@ -23,8 +24,9 @@ func barrier(dep, st string) Operation {
 }
 
 // parallel builds a parallel, halt-on-failure operation. Under parallel the copy
-// phase has no earlier-sibling gate, so a pending parallel operation is never
-// shown waiting for or halted by an earlier sibling.
+// phase has no earlier-sibling ordering, so a pending parallel operation is
+// never shown waiting for an earlier sibling; a terminal-failed earlier sibling
+// still holds it under halt.
 func parallel(dep, st string) Operation {
 	return Operation{Deployment: dep, State: st, Parallel: true}
 }
@@ -157,10 +159,10 @@ func TestDerivePending_Ordering(t *testing.T) {
 			label: "queued — next in order",
 		},
 		{
-			name:  "parallel: earlier failed does not halt copy start",
+			name:  "parallel: earlier failed halts copy start",
 			ops:   []Operation{parallel("eu", so.Failed), parallel("us", so.Pending)},
-			want:  StateQueuedNext,
-			label: "queued — next in order",
+			want:  StateHalted,
+			label: "halted — eu failed",
 		},
 		{
 			name:  "parallel: earlier cancelled does not halt copy start",
@@ -507,6 +509,56 @@ func TestDerive_PauseFailureWithPendingSiblingHoldsPaused(t *testing.T) {
 	assert.Equal(t, "eu", got.FirstFailure.Deployment)
 }
 
+// TestDerivePending_ParallelHeldByFailedEarlierMember: under parallel a pending
+// operation is still held by a terminal-failed earlier sibling, even while
+// another sibling is mid-copy, because the copy-start gate's failure arm applies
+// to every cutover policy. The hold renders halted by default, paused for a
+// human under on_failure=pause, and is lifted under on_failure=continue, so the
+// label agrees with what the driver will claim next.
+func TestDerivePending_ParallelHeldByFailedEarlierMember(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func(dep, st string) Operation
+		want  PresentationState
+		label string
+	}{
+		{
+			name:  "halt",
+			build: parallel,
+			want:  StateHalted,
+			label: "halted — eu failed",
+		},
+		{
+			name: "pause",
+			build: func(dep, st string) Operation {
+				return Operation{Deployment: dep, State: st, Parallel: true, PauseOnFailure: true}
+			},
+			want:  StatePaused,
+			label: "paused — eu failed; release or stop",
+		},
+		{
+			name: "continue",
+			build: func(dep, st string) Operation {
+				return Operation{Deployment: dep, State: st, Parallel: true, ContinueOnFailure: true}
+			},
+			want:  StateQueuedNext,
+			label: "queued — next in order",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Derive([]Operation{
+				tc.build("eu", so.Failed),
+				tc.build("ap", so.Running),
+				tc.build("us", so.Pending),
+			})
+			require.Len(t, got.Deployments, 3)
+			assert.Equal(t, tc.want, got.Deployments[2].Presentation)
+			assert.Equal(t, tc.label, got.Deployments[2].Label)
+		})
+	}
+}
+
 // TestDerive_ReleasedPauseRunsDegradedLikeContinue: once an apply is released a
 // pause failure behaves like continue — the held siblings proceed and the
 // aggregate runs degraded rather than paused.
@@ -595,4 +647,217 @@ func TestDerive_KeyedApplyStaysNamedByDeployment(t *testing.T) {
 	require.Len(t, got.Deployments, 2)
 	assert.Equal(t, "us-east", got.Deployments[0].Name)
 	assert.Equal(t, "us-east", got.Deployments[1].Name)
+}
+
+// A deployment addressing many targets is one group: its members keep their
+// resolved order, the group is headed by the member that most needs attention
+// rather than the first one, it counts its own members only, and it opens when
+// any member would. A single-target deployment is a group of one.
+func TestGroups_RollsUpEachDeploymentsTargets(t *testing.T) {
+	target := func(dep, tgt, st string) Operation {
+		return Operation{Deployment: dep, Target: tgt, State: st, Parallel: true, ContinueOnFailure: true}
+	}
+	apply := Derive([]Operation{
+		target("primary", "t_000", so.Completed),
+		target("primary", "t_001", so.Running),
+		target("primary", "t_002", so.Failed),
+		target("eu", "orders_eu", so.Completed),
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 2)
+
+	primary := groups[0]
+	assert.Equal(t, "primary", primary.Deployment)
+	assert.Equal(t, []int{0, 1, 2}, primary.Members)
+	assert.Equal(t, "primary/t_002", primary.Lead.Name, "the failed target heads the group")
+	assert.Equal(t, []StateCount{{"completed", 1}, {"running", 1}, {"failed", 1}}, primary.Counts)
+	assert.True(t, primary.Open)
+
+	eu := groups[1]
+	assert.Equal(t, "eu", eu.Deployment)
+	assert.Equal(t, []int{3}, eu.Members)
+	assert.Equal(t, "eu", eu.Lead.Name)
+	assert.Equal(t, []StateCount{{"completed", 1}}, eu.Counts)
+	assert.False(t, eu.Open)
+}
+
+// A group's progress counts the targets that ran the change apart from the
+// ones that already had it, and the rest by status, so the parts always add up
+// to every target the group addresses.
+func TestTargetProgress_CountsRanAndAlreadyHadApart(t *testing.T) {
+	target := func(tgt, st string) Operation {
+		return Operation{Deployment: "primary", Target: tgt, State: st, Parallel: true, ContinueOnFailure: true}
+	}
+	converged := target("t_004", so.Completed)
+	converged.NeverStarted = true
+	converged.AlreadyConverged = true
+	apply := Derive([]Operation{
+		target("t_000", so.Completed),
+		target("t_001", so.Running),
+		target("t_002", so.Pending),
+		target("t_003", so.Failed),
+		converged,
+	})
+
+	groups := apply.Groups()
+	require.Len(t, groups, 1)
+	assert.Equal(t, TargetProgress{
+		Total:      5,
+		Done:       1,
+		AlreadyHad: 1,
+		Others:     []StateCount{{"running", 1}, {"queued", 1}, {"failed", 1}},
+		Unsettled:  2,
+	}, apply.TargetProgress(groups[0]), "the running and queued targets can still run; the failed one cannot")
+}
+
+// Every status is in exactly one histogram category, so a group's status line
+// accounts for each of its targets: with one target in every status, the counts
+// still add up to every target the group addresses.
+func TestTargetProgress_EveryStatusIsCounted(t *testing.T) {
+	var apply Apply
+	var group Group
+	for ps := range presentationStateCount {
+		categories := 0
+		for _, cat := range summaryCategoryOrder {
+			if slices.Contains(cat.states, ps) {
+				categories++
+			}
+		}
+		assert.Equal(t, 1, categories, "status %d must be in exactly one histogram category", ps)
+
+		group.Members = append(group.Members, len(apply.Deployments))
+		apply.Deployments = append(apply.Deployments, Deployment{Presentation: ps})
+	}
+
+	p := apply.TargetProgress(group)
+	counted := p.Done + p.AlreadyHad
+	for _, c := range p.Others {
+		counted += c.Count
+	}
+	assert.Equal(t, p.Total, counted, "every target is counted once: %+v", p)
+	assert.Equal(t, int(presentationStateCount), p.Total)
+}
+
+// Members that are not distinct targets, such as keyed operations with no
+// target or several operations dividing one target's work, are not rolled up:
+// each stays a group of its own, so no surface counts them as targets.
+func TestGroups_OnlyDistinctTargetsRollUp(t *testing.T) {
+	for name, ops := range map[string][]Operation{
+		"no target": {
+			{Deployment: "primary", State: so.Running, Parallel: true},
+			{Deployment: "primary", State: so.Running, Parallel: true},
+		},
+		"one target's work": {
+			{Deployment: "primary", Target: "orders-001", State: so.Running, Parallel: true},
+			{Deployment: "primary", Target: "orders-001", State: so.Running, Parallel: true},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			groups := Derive(ops).Groups()
+			require.Len(t, groups, 2)
+			assert.Equal(t, []int{0}, groups[0].Members)
+			assert.Equal(t, []int{1}, groups[1].Members)
+			assert.Equal(t, "primary", groups[1].Deployment)
+		})
+	}
+}
+
+// targetsRollout builds deployment payments-a's targets-list rollout of an
+// orders change: for each target, two shards of work keyed
+// "<target>/orders/<shard>/orders" and an orders finalizer, every row under
+// the given on_failure flags. states gives each target's -80, 80- and
+// finalizer states.
+func targetsRollout(cont, pause bool, states map[string][3]string, targets ...string) []Operation {
+	var ops []Operation
+	for _, target := range targets {
+		st := states[target]
+		for i, shard := range []string{"-80", "80-"} {
+			ops = append(ops, Operation{
+				Deployment: "payments-a", Target: target,
+				OperationKey: target + "/orders/" + shard + "/orders", Work: true,
+				State: st[i], ContinueOnFailure: cont, PauseOnFailure: pause,
+			})
+		}
+		ops = append(ops, Operation{
+			Deployment: "payments-a", Target: target,
+			OperationKey: target + "/orders/group_finalizer", Finalizer: true,
+			State: st[2], ContinueOnFailure: cont, PauseOnFailure: pause,
+		})
+	}
+	return ops
+}
+
+// TestDerive_OrphanedFinalizerSettlesLikeStorage: in a targets-list rollout,
+// shard -80 of payments-001 fails and payments-002 completes, which leaves
+// payments-001's finalizer pending with nothing that will ever start it.
+// Storage settles that rollout failed, so the header must read failed too,
+// not running (degraded) under continue or paused under an unreleased pause.
+// While the finalizer's own work is only parked, it still holds the rollout.
+func TestDerive_OrphanedFinalizerSettlesLikeStorage(t *testing.T) {
+	orphaned := map[string][3]string{
+		"payments-001": {so.Failed, so.Completed, so.Pending},
+		"payments-002": {so.Completed, so.Completed, so.Completed},
+	}
+	for _, tc := range []struct {
+		name        string
+		cont, pause bool
+	}{
+		{name: "continue", cont: true},
+		{name: "unreleased pause", pause: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := targetsRollout(tc.cont, tc.pause, orphaned, "payments-001", "payments-002")
+			got := Derive(ops)
+			assert.Equal(t, state.Apply.Failed, got.State)
+			assert.Equal(t, "failed", got.Label)
+			assert.Equal(t, NextActionReviewFailure, got.NextAction.Kind)
+			assert.Equal(t, "payments-001", got.NextAction.Target)
+		})
+	}
+
+	// payments-002's -80 is still parked at the barrier, so the rollout is
+	// still live and continue keeps it degraded.
+	live := map[string][3]string{
+		"payments-001": {so.Failed, so.Completed, so.Pending},
+		"payments-002": {so.WaitingForCutover, so.Completed, so.Pending},
+	}
+	got := Derive(targetsRollout(true, false, live, "payments-001", "payments-002"))
+	assert.Equal(t, state.Apply.RunningDegraded, got.State)
+}
+
+// TestDerive_NeverStartedStoppedSettlesLikePending: region-a failed under
+// halt, and a stop caught region-b before any driver claimed it. region-b
+// counts as pending, so the header reads failed; had region-b started before
+// the stop, it would still hold the rollout degraded.
+func TestDerive_NeverStartedStoppedSettlesLikePending(t *testing.T) {
+	failedA := Operation{Deployment: "region-a", Work: true, State: so.Failed, Error: "boom"}
+	neverStarted := Operation{Deployment: "region-b", Work: true, State: so.Stopped, NeverStarted: true}
+	assert.Equal(t, state.Apply.Failed, Derive([]Operation{failedA, neverStarted}).State)
+
+	started := Operation{Deployment: "region-b", Work: true, State: so.Stopped}
+	assert.Equal(t, state.Apply.RunningDegraded, Derive([]Operation{failedA, started}).State)
+}
+
+// Each member carries its own operation's data-plane identifiers and whether
+// a driver ever started it, so a surface reads them from the member rather
+// than pairing the model with the operations it was derived from.
+func TestDerive_MemberCarriesItsOperationsIdentifiers(t *testing.T) {
+	model := Derive([]Operation{
+		{Deployment: "prod", Target: "payments-001", State: state.ApplyOperation.Completed, NeverStarted: true, ExternalID: "spirit-001", ExternalOperationID: "spirit-op-001"},
+		{Deployment: "prod", Target: "payments-002", State: state.ApplyOperation.Failed, Error: "Error 1062: Duplicate entry", ExternalID: "spirit-002", ExternalOperationID: "spirit-op-002"},
+	})
+	require.Len(t, model.Deployments, 2)
+	for _, want := range []struct {
+		target, externalID, externalOperationID string
+		neverStarted                            bool
+	}{
+		{"payments-001", "spirit-001", "spirit-op-001", true},
+		{"payments-002", "spirit-002", "spirit-op-002", false},
+	} {
+		d := model.Deployments[slices.IndexFunc(model.Deployments, func(d Deployment) bool { return d.Target == want.target })]
+		assert.Equal(t, want.externalID, d.ExternalID, want.target)
+		assert.Equal(t, want.externalOperationID, d.ExternalOperationID, want.target)
+		assert.Equal(t, want.neverStarted, d.NeverStarted, want.target)
+	}
 }

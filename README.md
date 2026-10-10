@@ -67,11 +67,11 @@ Grab the CLI from [Releases](#releases). From your application’s project direc
 schemabot init
 ```
 
-![Connect a database with the SchemaBot wizard and review your first schema change plan](./assets/init-demo.gif)
+![Choose a PostgreSQL sample, edit its schema, review and apply the change, then verify the result](./assets/init-sample-demo.gif)
 
 The wizard connects to your MySQL or PostgreSQL database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit and run `schemabot plan` to preview changes. Run `schemabot apply` when you’re ready to apply them. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
 
-Want to try SchemaBot with demo databases? See the [examples guide](./examples/README.md).
+For more local examples, see the [examples guide](./examples/README.md).
 
 To run the PR workflow for your team, deploy the server from [Releases](#releases) (binary, container image, or Helm chart), then follow [docs/github-app-setup.md](./docs/github-app-setup.md) to wire up GitHub and [docs/configuration.md](./docs/configuration.md) for the server config. [`schemabot onboard`](./docs/github-app-setup.md#6-add-schemabotyaml-config-to-your-repository) pulls a live database's schema into a new declarative schema directory against that server, so you start from your real tables rather than writing them out by hand.
 
@@ -99,6 +99,7 @@ Guides and reference:
 - [Engines](./docs/engines.md): See how changes run on your database engine
 - [MySQL](./docs/mysql.md): Understand online copies, direct execution, and primary key choices
 - [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
+- [Vitess on PlanetScale](./docs/vitess.md): Grant the service token the permissions SchemaBot needs
 - [Configuration](./docs/configuration.md): Set things up for your environment
 - [Storage schema](./docs/storage-schema.md): Keep SchemaBot’s own bookkeeping database converged across deploys
 - [Authentication](./docs/auth.md): Choose who can read and change your databases

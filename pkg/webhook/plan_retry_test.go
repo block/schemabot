@@ -132,7 +132,7 @@ func TestExecutePlanTransientRetryRecovers(t *testing.T) {
 	}
 	h := newPlanRetryTestHandler(client, time.Millisecond)
 
-	resp, err := h.executePlanWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
+	_, resp, err := h.executePlanProtoWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
 
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -149,7 +149,7 @@ func TestExecutePlanTransientRetryRecoversOnFinalRetry(t *testing.T) {
 	}
 	h := newPlanRetryTestHandler(client, time.Millisecond)
 
-	resp, err := h.executePlanWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
+	_, resp, err := h.executePlanProtoWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
 
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -167,7 +167,7 @@ func TestExecutePlanTransientRetryExhausted(t *testing.T) {
 	}
 	h := newPlanRetryTestHandler(client, time.Millisecond)
 
-	resp, err := h.executePlanWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
+	_, resp, err := h.executePlanProtoWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
 
 	require.Error(t, err)
 	assert.Nil(t, resp)
@@ -188,7 +188,7 @@ func TestExecutePlanNoRetryForNonTransientErrors(t *testing.T) {
 	}
 	h := newPlanRetryTestHandler(client, time.Millisecond)
 
-	resp, err := h.executePlanWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
+	_, resp, err := h.executePlanProtoWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
 
 	require.Error(t, err)
 	assert.Nil(t, resp)
@@ -206,7 +206,7 @@ func TestExecutePlanTransientRetryStopsOnNonTransientError(t *testing.T) {
 	}}
 	h := newPlanRetryTestHandler(client, time.Millisecond)
 
-	resp, err := h.executePlanWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
+	_, resp, err := h.executePlanProtoWithTransientRetry(t.Context(), planRetryTestRequest(), "octocat/hello-world", 1)
 
 	require.Error(t, err)
 	assert.Nil(t, resp)
@@ -227,7 +227,7 @@ func TestExecutePlanTransientRetryHonorsContextCancellation(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	resp, err := h.executePlanWithTransientRetry(ctx, planRetryTestRequest(), "octocat/hello-world", 1)
+	_, resp, err := h.executePlanProtoWithTransientRetry(ctx, planRetryTestRequest(), "octocat/hello-world", 1)
 
 	require.Error(t, err)
 	assert.Nil(t, resp)

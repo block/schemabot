@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -272,7 +274,7 @@ func (c *LocalClient) startDeferredDeploy(ctx context.Context, apply *storage.Ap
 	if err != nil {
 		return nil, fmt.Errorf("build deferred deploy request for task %s: %w", applyTasks[0].TaskIdentifier, err)
 	}
-	result, err := eng.Start(ctx, controlReq)
+	result, err := eng.Start(withDriveWorkOwner(ctx), controlReq)
 	if err != nil {
 		return nil, fmt.Errorf("start deferred deploy: %w", err)
 	}
@@ -319,6 +321,10 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 	if !state.IsState(apply.State, state.Apply.WaitingForDeploy) {
 		return false, nil
 	}
+	// The engine starts the deploy inside startDeferredDeploy, so every exit
+	// before the poll takes it over halts it.
+	work := c.trackAcceptedEngineWork(ctx, logger)
+	defer work.haltUnlessPolled()
 	started, err := c.startDeferredDeploy(ctx, apply, controlRequestCaller(controlReq))
 	if err != nil {
 		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
@@ -362,14 +368,21 @@ func (c *LocalClient) processPendingStartControlRequest(ctx context.Context, app
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 	}
-	c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier)
+	work.handToPoll()
+	if err := c.pollForCompletionAtomic(ctx, apply, started.tasks, started.credentials, started.resumeState, options, releaseAtCutoverBarrier); err != nil {
+		return true, err
+	}
 	return true, ctx.Err()
 }
 
 // resumeApplySequential processes resumed tasks one at a time in sequence.
 // This preserves the sequential behavior of the original apply when --defer-cutover
 // was NOT used. Each task gets its own eng.Apply + pollTaskToCompletion cycle.
-func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) {
+// It returns ErrApplyTaskRowMissing when a task loaded for this resume no
+// longer has a row, so the operator refuses to derive an operation verdict from
+// the rows that remain; every other early exit leaves the apply claimable and
+// returns nil.
+func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string) error {
 	ctx, cancelApply := context.WithCancel(ctx)
 	defer cancelApply()
 	defer c.startApplyHeartbeat(ctx, apply, cancelApply)()
@@ -384,6 +397,13 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	// Mutable attrs (task state, apply state) stay per-call so they are never
 	// frozen stale into the bound logger.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// Registered after the heartbeat, so on a return the drive was not
+	// cancelled for it runs while the claim is still renewed. A cancelled
+	// drive's heartbeat has already stopped; the halt's bound keeps it inside
+	// the claim's staleness window unless the heartbeat's own failure ended
+	// the drive, in which case the claim is already stale and only the
+	// halt's owner scope keeps it to this drive's work.
+	defer c.haltEngineWorkLeftByDrive(ctx, logger)
 
 	var failedTask *storage.Task
 	var stoppedByUser bool
@@ -392,7 +412,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 			logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 				"error", err)
-			return
+			return nil
 		} else if standDown {
 			stoppedByUser = true
 			break
@@ -400,10 +420,20 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 
 		action := c.checkTaskReady(ctx, logger, task)
 		if action == taskHandover {
-			return
+			return nil
+		}
+		if action == taskAbort {
+			return nil
+		}
+		if action == taskMissing {
+			return fmt.Errorf("apply %s task %s: %w", apply.ApplyIdentifier, task.TaskIdentifier, ErrApplyTaskRowMissing)
 		}
 		if action == taskStopped {
 			stoppedByUser = true
+			break
+		}
+		if action == taskAlreadyFailed {
+			failedTask = task
 			break
 		}
 		if action == taskSkip {
@@ -418,19 +448,30 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 		// Wait for any in-flight engine work to finish before checking schema.
 		// Without this, the previous task's cutover might complete between our
 		// schema check and the new eng.Apply() call, causing "Duplicate key name".
-		if drainer, ok := eng.(engine.Drainer); ok {
-			drainer.Drain()
+		if proceed, err := c.drainEngineForDrive(ctx, apply, eng); err != nil || !proceed {
+			return err
 		}
 
 		// Verify this table still needs changes before applying. There's a race
 		// between re-plan (which reads schema) and Spirit's cutover (which renames
 		// the shadow table). If Spirit completed the cutover after the re-plan read
-		// the schema, the table already has the desired changes.
-		replanned, needsChange, err := c.tableStillNeedsChange(ctx, apply, plan, task)
+		// the schema, the table already has the desired changes. A target that
+		// cannot be re-planned is unverified, so the task is not started on it.
+		replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
 		if err != nil {
-			logger.Warn("could not verify table schema state, proceeding with apply",
-				"task_id", task.TaskIdentifier, "table", task.TableName, "error", err)
-		} else if !needsChange {
+			if c.driveCancelled(ctx, apply, "while re-planning the target before resuming a task") {
+				return nil
+			}
+			logger.Error("could not re-plan the target before resuming the task; the resume stops without starting it, and the apply stays active for a later drive",
+				append(task.LogAttrs(), "error", err)...)
+			return fmt.Errorf("re-plan before resuming task %s on table %s: %w", task.TaskIdentifier, task.TableName, err)
+		}
+		verdict, replanKey := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
+		if verdict == replanCannotAttribute {
+			logger.Warn("the re-plan describes the table's namespace as a unit and does not mention this shard; the task resumes with its reviewed statement and the engine decides its outcome",
+				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
+		} else if verdict == replanChangeLanded {
 			logger.Info("table already has desired schema, skipping",
 				"task_id", task.TaskIdentifier, "table", task.TableName)
 			now := time.Now()
@@ -447,18 +488,24 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				fmt.Sprintf("Task %s already completed (cutover raced with re-plan)", task.TaskIdentifier)); err != nil {
 				logger.Error("resume aborting: persisting a raced-cutover task settlement failed; the apply stays active for a later drive to redo the settlement",
 					"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-				return
+				return nil
 			}
 			continue
-		} else if _, landed, err := c.verifyReplannedTaskDDL(task, replanned, tasks); err != nil {
+		} else if _, landed, err := c.verifyReplannedTaskDDL(task, replanDDL[replanKey], tasks); err != nil {
 			// The statements this shard now needs no longer include what this
 			// task was reviewed with. Fail closed rather than apply unreviewed
 			// DDL.
 			logger.Error("resume aborting task: the re-plan no longer includes the task's reviewed DDL",
 				"task_id", task.TaskIdentifier, "table", task.TableName, "state", task.State, "error", err)
-			c.markTaskFailed(ctx, task, err.Error())
+			if verdictAction := c.failureVerdictAction(apply.ApplyIdentifier, task, c.markTaskFailed(ctx, task, err.Error())); verdictAction != taskFailed {
+				return nil
+			}
 			failedTask = task
 			break
+		} else if landed && !replanKeyedByTaskShard(task, replanKey) {
+			logger.Warn("the re-plan describes the table's namespace as a unit and lists only sibling statements; the task resumes with its reviewed statement and the engine decides its outcome",
+				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
 		} else if landed {
 			// The table still has pending statements, but every one of them
 			// is the reviewed DDL of a sibling task that is not yet terminal:
@@ -473,24 +520,26 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				fmt.Sprintf("Task %s already completed (its statement landed before its outcome was recorded)", task.TaskIdentifier)); err != nil {
 				logger.Error("resume aborting: persisting a landed-statement task settlement failed; the apply stays active for a later drive to redo the settlement",
 					append(task.LogAttrs(), "error", err)...)
-				return
+				return nil
 			}
 			continue
 		}
 
-		action = c.runEngineTask(ctx, apply, task, options)
-
+		// The task row moves to running only once the engine accepts the task,
+		// so this records that the resume is starting it, not a transition.
 		taskID := task.ID
-		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Task %s resumed (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
-			state.Task.Stopped, state.Task.Running)
+		c.logApplyEvent(ctx, apply.ID, &taskID, storage.LogLevelInfo, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			fmt.Sprintf("Resuming task %s (sequential %d/%d)", task.TaskIdentifier, i+1, len(tasks)),
+			"", "")
+
+		action = c.runEngineTask(ctx, apply, task, plan, tasks, options)
 
 		if action == taskFailed {
 			failedTask = task
 			break
 		}
 		if action == taskAbort || action == taskHandover {
-			return
+			return nil
 		}
 		if action == taskStopped {
 			stoppedByUser = true
@@ -499,8 +548,11 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 	}
 
 	// Update apply state based on task outcomes
-	c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser)
+	if err := c.finalizeSequentialApply(ctx, apply, tasks, failedTask, stoppedByUser); err != nil {
+		return fmt.Errorf("finalize sequential resume: %w", err)
+	}
 	logger.Info("sequential resume finished", "state", apply.State)
+	return nil
 }
 
 // shardTableKey identifies a table change within a specific (namespace, shard).
@@ -604,32 +656,88 @@ const (
 	// replanCannotAttribute: the re-plan does not speak for this task's scope,
 	// so its silence is not evidence either way.
 	replanCannotAttribute
+
+	// replanVerdictCount is not a verdict. It stays last so a test can range
+	// over every verdict and prove each one settles a task to a real state.
+	replanVerdictCount
 )
 
 // replanVerdictForTask judges one task against a target re-plan.
 //
 // A table still in the re-plan needs its change. A table absent from it is
 // where the caller has to be careful: absence only means "already applied"
-// when the re-plan actually covers the scope the task ran in. Re-planning the
-// reviewed schema set describes whole namespaces — no engine's Plan emits a
-// per-shard change, because an engine that fans a change out to its shards
-// behind one endpoint reports the namespace as a unit — while a shard-scoped
-// dispatch tags its tasks with the shard they ran on. Such a task can never
-// match a whole-namespace key, so reading its absence as success would
+// when the re-plan actually covers the scope the task ran in. A shard-scoped
+// dispatch tags its tasks with the shard they ran on, but not every engine's
+// Plan speaks per shard: an engine that fans a change out to its shards behind
+// one endpoint reports the namespace as a unit. A shard-tagged task can never
+// match such a whole-namespace key, so reading its absence as success would
 // complete a shard's change on evidence that never mentioned the shard. It is
-// unattributable instead, and the caller rests it retryable.
+// unattributable instead, and no caller completes it on that evidence.
 //
-// The check is on what the re-plan demonstrably covered rather than on the
-// engine, so a plan that does key by shard settles its shard-tagged tasks
-// normally.
-func replanVerdictForTask(replanDDL map[shardTableKey][]string, task *storage.Task) replanVerdict {
-	if _, needsChange := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]; needsChange {
-		return replanNeedsChange
+// Coverage comes from two places. An engine that plans each shard on its own
+// declares it (plansEachShard, see engine.ShardKeyedPlanning), and its plan
+// covers every namespace, including one whose every shard already has the
+// change and which its plan therefore does not mention at all. Without the
+// declaration, a plan that keys any of the namespace's tables by shard is read
+// as covering the namespace's shards.
+//
+// A namespace-unit re-plan that still lists the table is read as needing the
+// change on the task's shard too, whether or not the engine declares that it
+// plans each shard: the declaration settles a task the plan is silent about,
+// never one the plan still asks for. An unattributable task runs its reviewed
+// statement again. Either can be wrong for a shard that already has the
+// change, but it is wrong in the direction that runs the statement rather than
+// the direction that reports a change as made. Running it is not free. Most
+// statements a shard already has fail the second time, such as MySQL adding a
+// column the shard already has, and the apply fails on a change that may have
+// landed; the operator plans the schema change again to see the target as it
+// is. Some succeed instead: MySQL names an unnamed index or foreign key itself,
+// so adding one again leaves the shard with two. That is why an engine that
+// can say its plan covers every shard should declare it. Callers record each
+// such start in the apply's timeline (logUnattributableTaskStart), so the
+// outcome traces back to this decision.
+//
+// The returned key is where the re-plan's statements for the task live when
+// it needs the change. When that is the namespace unit's key rather than the
+// task's own, the statements describe the namespace, so the task's statement
+// missing from them is not evidence that it landed on the shard; callers check
+// this with replanKeyedByTaskShard before settling on that absence.
+func replanVerdictForTask(replanDDL map[shardTableKey][]string, plansEachShard bool, task *storage.Task) (replanVerdict, shardTableKey) {
+	key := shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}
+	if _, needsChange := replanDDL[key]; needsChange {
+		return replanNeedsChange, key
 	}
-	if task.Shard != "" && !replanCoversShards(replanDDL, task.Namespace) {
-		return replanCannotAttribute
+	if task.Shard != "" {
+		unitKey := shardTableKey{namespace: task.Namespace, table: task.TableName}
+		if _, needsChange := replanDDL[unitKey]; needsChange {
+			return replanNeedsChange, unitKey
+		}
+		if !plansEachShard && !replanCoversShards(replanDDL, task.Namespace) {
+			return replanCannotAttribute, key
+		}
 	}
-	return replanChangeLanded
+	return replanChangeLanded, key
+}
+
+// enginePlansEachShard reports whether this client's engine declares that its
+// Plan lists every shard that still needs a change (engine.ShardKeyedPlanning).
+func (c *LocalClient) enginePlansEachShard() bool {
+	return engine.PlansEachShard(c.getEngine())
+}
+
+// replanKeyedByTaskShard reports whether the re-plan statements read for a
+// task came from the task's own shard rather than its namespace as a unit.
+// Only then does the task's statement missing from them mean it landed.
+func replanKeyedByTaskShard(task *storage.Task, replanKey shardTableKey) bool {
+	return replanKey.shard == task.Shard
+}
+
+// logUnattributableTaskStart records in the apply's timeline that a task runs
+// its reviewed statement on a re-plan that could not say whether the task's
+// shard already has the change.
+func (c *LocalClient) logUnattributableTaskStart(ctx context.Context, apply *storage.Apply, task *storage.Task) {
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+		fmt.Sprintf("A fresh plan could not tell whether table %s on shard %s already has its change, so the task runs its reviewed statement again. If the engine reports the change as already present, plan the schema change again to see the target as it is.", task.TableName, task.Shard), "", "")
 }
 
 // replanCoversShards reports whether a re-plan described the namespace one
@@ -644,19 +752,25 @@ func replanCoversShards(replanDDL map[shardTableKey][]string, namespace string) 
 	return false
 }
 
-// tableStillNeedsChange re-plans the full schema set and then looks up whether
-// this task's table still needs a change on its (namespace, shard). Returns
-// false if it already has the desired schema (e.g., Spirit's cutover completed
-// during the stop sequence). When the table still needs changes, it also returns
-// the statements the re-plan would now apply to it so the caller can confirm the
-// task's own statement is still among them before applying it.
-func (c *LocalClient) tableStillNeedsChange(ctx context.Context, apply *storage.Apply, plan *storage.Plan, task *storage.Task) ([]string, bool, error) {
-	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
-	if err != nil {
-		return nil, false, err
+// drainEngineForDrive waits for in-process engine work to exit before the
+// drive reads the target, for as long as the drive's context lasts. A drive
+// whose claim is gone has its context cancelled, so it never sits behind a run
+// for longer than it holds the apply. It reports whether the drive may go on;
+// a drive cancelled while it waited, or as the wait ended, hands the apply
+// back without verifying or starting anything.
+func (c *LocalClient) drainEngineForDrive(ctx context.Context, apply *storage.Apply, eng engine.Engine) (bool, error) {
+	if drainer, ok := eng.(engine.Drainer); ok {
+		if err := drainer.DrainContext(ctx); err != nil {
+			if c.driveCancelled(ctx, apply, "while waiting for in-process engine work to exit") {
+				return false, nil
+			}
+			return false, fmt.Errorf("wait for in-process engine work before driving apply %s: %w", apply.ApplyIdentifier, err)
+		}
 	}
-	statements, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
-	return statements, stillNeeded, nil
+	if c.driveCancelled(ctx, apply, "as in-process engine work exited") {
+		return false, nil
+	}
+	return true, nil
 }
 
 // replanResult holds the result of replanAndFilterTasks.
@@ -719,8 +833,20 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			activeTasks = append(activeTasks, task)
 			continue
 		}
-		replanned, stillNeeded := replanDDL[shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}]
-		if !stillNeeded {
+		verdict, replanKey := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
+		if verdict == replanCannotAttribute {
+			// The re-plan's silence says nothing about this shard, and
+			// completion is the one direction it must never be guessed in.
+			// The task stays active with its reviewed statement, and the
+			// engine decides its outcome.
+			c.logger.Warn("resume re-plan describes the table's namespace as a unit and does not mention this shard; keeping the task active with its reviewed statement",
+				task.LogAttrs()...)
+			c.logUnattributableTaskStart(ctx, apply, task)
+			activeTasks = append(activeTasks, task)
+			continue
+		}
+		replanned := replanDDL[replanKey]
+		if verdict == replanChangeLanded {
 			// The re-plan diffs the reviewed target (plan.SchemaFiles) against
 			// this shard's live schema. A table dropping out of that diff means
 			// live already matches the reviewed target, so there is no remaining
@@ -748,6 +874,17 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			if err != nil {
 				return nil, err
 			}
+			if landed && !replanKeyedByTaskShard(task, replanKey) {
+				// The unit's statements are the namespace's, not the shard's:
+				// the task's own statement missing from them says nothing about
+				// whether it reached this shard. The task stays active with its
+				// reviewed statement, and the engine decides its outcome.
+				c.logger.Warn("resume re-plan describes the table's namespace as a unit and lists only sibling statements; keeping the task active with its reviewed statement",
+					task.LogAttrs()...)
+				c.logUnattributableTaskStart(ctx, apply, task)
+				activeTasks = append(activeTasks, task)
+				continue
+			}
 			if landed {
 				// The table is still in the diff, but only for the reviewed
 				// DDL of siblings that will still run it: this task's own
@@ -770,7 +907,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// tightened here, never relaxed, so the resumed drive's blocked-row
 			// gate judges what this target says today rather than a verdict
 			// frozen at admission.
-			key := replanStatementKey{shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}, ddl}
+			key := replanStatementKey{replanKey, ddl}
 			if reason, blocked := blockedStatements[key]; blocked && !task.EngineBlocked() {
 				c.logger.Warn("resume re-plan now refuses a task's statement; the resumed drive will refuse the row",
 					append(task.LogAttrs(), "mode_reason", reason)...)
@@ -1038,40 +1175,53 @@ func sameApplyOperation(a, b *int64) bool {
 
 // prepareRetryableTasksForResume queues only the task work that previously
 // stopped on a retryable engine failure. Completed tasks remain completed, and
-// pending tasks remain queued behind the retried work.
-func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) {
+// pending tasks remain queued behind the retried work. A requeue write that
+// does not land is returned: the task row is still failed_retryable, so driving
+// on would run its DDL while storage records it at rest. The caller exits the
+// drive with the apply still retryable, and the next claim retries the requeue.
+func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	if !state.IsState(apply.State, state.Apply.FailedRetryable) {
-		return
+		return nil
 	}
 	apply.ErrorMessage = ""
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.FailedRetryable) {
 			continue
 		}
+		previous := *task
 		task.Attempt++
 		task.ErrorMessage = ""
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier)); err != nil {
+			*task = previous
+			return fmt.Errorf("requeue retryable task %s for retry of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 // prepareStoppedTasksForResume turns an operator-claimed start request back into
 // runnable task work. The start intent stays pending until stopped task rows are
 // requeued and the apply is ready for execution, so a driver crash can still be
 // recovered by another operator driver.
-func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) {
+func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, startRequested bool) error {
 	if !startRequested {
-		return
+		return nil
 	}
 	for _, task := range tasks {
 		if !state.IsState(task.State, state.Task.Stopped) {
 			continue
 		}
+		previous := *task
 		task.CompletedAt = nil
-		c.transitionTaskState(ctx, task, apply.ID, state.Task.Pending,
-			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier))
+		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
+			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier)); err != nil {
+			*task = previous
+			return fmt.Errorf("requeue stopped task %s for start of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+		}
 	}
+	return nil
 }
 
 func shouldInspectDeferredCutoverSignal(apply *storage.Apply) bool {
@@ -1174,8 +1324,8 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		return fmt.Errorf("resolve credentials for grouped resume apply %s: %w", apply.ApplyIdentifier, err)
 	}
 
-	if drainer, ok := eng.(engine.Drainer); ok {
-		drainer.Drain()
+	if proceed, err := c.drainEngineForDrive(ctx, apply, eng); err != nil || !proceed {
+		return err
 	}
 
 	rp, err := c.replanAndFilterTasks(ctx, apply, tasks, plan)
@@ -1225,6 +1375,10 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 			"All tasks already terminal on resume (final schema check shows no remaining changes)", oldApplyState, terminalState)
+		// A previous drive can have settled every task and exited before it
+		// recorded the apply's outcome, leaving requests the outcome moots
+		// pending. Settle them before the summary posts.
+		c.settleRequestsForStoredOutcome(ctx, c.logger.With(apply.IdentityLogAttrs()...), apply)
 		c.notifyTerminalObserver(apply, allTasks)
 		return nil
 	}
@@ -1250,6 +1404,11 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		}
 	}()
 
+	// From the reattach on the engine runs this drive's work, so every exit
+	// before the poll takes it over halts it.
+	work := c.trackAcceptedEngineWork(ctx, c.logger.With(apply.IdentityLogAttrs()...))
+	defer work.haltUnlessPolled()
+
 	// Resume the grouped apply with the engine's persisted state so it
 	// reattaches to in-flight engine work instead of launching a duplicate
 	// schema change. The changes are rebuilt from the stored tasks so the
@@ -1261,18 +1420,21 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		Changes:      groupedResumeChanges(tasks, plan),
 		TargetShards: taskTargetShards(tasks),
 		SchemaFiles:  plan.SchemaFiles,
+		IgnoreTables: plan.IgnoreTables(),
 		Options:      options,
 		ResumeState:  resumeState,
 		Credentials:  creds,
 		Logger:       c.logger.With(apply.IdentityLogAttrs()...),
-		OnStateChange: func(rs *engine.ResumeState) {
+		OnStateChange: func(rs *engine.ResumeState) error {
 			if rs == nil {
 				c.logger.Debug("OnStateChange: nil resume state", "apply_id", apply.ApplyIdentifier)
-				return
+				return nil
 			}
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, rs); saveErr != nil {
 				c.logger.Warn("OnStateChange: failed to persist opaque resume state", append(apply.LogAttrs(), "error", saveErr)...)
+				return fmt.Errorf("persist engine resume state for apply %s: %w", apply.ApplyIdentifier, saveErr)
 			}
+			return nil
 		},
 	})
 	if err != nil {
@@ -1315,13 +1477,14 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		// heartbeats the operation row instead.
 		stopHeartbeat := c.startParentApplyHeartbeat(pollCtx, apply, suppressParent, cancelPoll)
 		defer stopHeartbeat()
-		c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
-		return nil
+		work.handToPoll()
+		return c.pollForCompletionAtomic(pollCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
 	}
 
 	resumeCtx, cancelResume := context.WithCancel(context.WithoutCancel(ctx))
 	stopHeartbeat := c.startParentApplyHeartbeat(resumeCtx, apply, suppressParent, cancelResume)
 	pollDetached = true
+	work.handToPoll()
 	// The detached poll deliberately outlives the caller's context, so its log
 	// wiring has to as well: a callback holding the caller's context records
 	// nothing once that context is cancelled, and the engine lines for the rest
@@ -1331,7 +1494,9 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 		defer cancelResume()
 		defer stopHeartbeat()
 		defer stopEngineLogging()
-		c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+		if err := c.pollForCompletionAtomic(resumeCtx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier); err != nil {
+			c.logger.Warn("detached grouped drive exited with an error", append(apply.MutableLogAttrs(), "error", err)...)
+		}
 	}()
 	return nil
 }
@@ -1703,28 +1868,102 @@ func (c *LocalClient) ResumeApplyOperationCutover(ctx context.Context, apply *st
 }
 
 // finalizerOperationKeySuffix is the trailing segment of a namespace-scoped
-// group_finalizer operation key (namespace + "/" + segment), assigned at apply
-// creation. The drive parses the namespace back out to reconstruct the VSchema
-// change.
-const finalizerOperationKeySuffix = "/group_finalizer"
+// group_finalizer operation key within one target (namespace + "/" + segment),
+// assigned at apply creation. The drive parses the namespace back out to
+// reconstruct the VSchema change.
+const finalizerOperationKeySuffix = state.OperationKeyDelimiter + state.GroupFinalizerKeySegment
 
 // finalizerDeploymentScopedKey is the operation key of a deployment-scoped
 // group_finalizer — the single operation a VSchema-only apply is shaped as. It
 // carries no namespace: the drive applies every VSchema-changed namespace in
 // the plan in one engine apply, because the engine treats the deployment (one
 // branch, one deploy) as the unit of change.
-const finalizerDeploymentScopedKey = "group_finalizer"
+const finalizerDeploymentScopedKey = state.GroupFinalizerKeySegment
 
-// namespaceFromFinalizerKey recovers the namespace a group_finalizer operation
-// targets from its operation key. Returns empty for any key without a
-// namespace prefix — callers must distinguish the deployment-scoped key
-// (finalizerDeploymentScopedKey, where empty means "all VSchema namespaces")
-// from a malformed key, which is a fail-closed condition.
-func namespaceFromFinalizerKey(operationKey string) string {
-	if !strings.HasSuffix(operationKey, finalizerOperationKeySuffix) {
-		return ""
+// resolveFinalizerNamespace returns the namespace a group_finalizer operation
+// finalizes, or empty for a deployment-scoped finalizer, which finalizes every
+// namespace its plan asks to. It reads the operation's key in the shape the key
+// writer gave it (see finalizerNamespaceFromKey). A data-plane apply shared by
+// a deployment's targets records that its keys lead with a target, since the
+// first target's finalizer can drive before any sibling target has attached;
+// every other apply's operation rows say which shape its keys have.
+func resolveFinalizerNamespace(ctx context.Context, store storage.Storage, apply *storage.Apply, op *storage.ApplyOperation) (string, error) {
+	ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("list operations of apply %s to resolve group_finalizer apply_operation %d scope: %w", apply.ApplyIdentifier, op.ID, err)
 	}
-	return strings.TrimSuffix(operationKey, finalizerOperationKeySuffix)
+	targetQualified := apply.GetOptions().OperationKeysLeadWithTarget || operationKeysLeadWithTarget(ops, op)
+	namespace, err := finalizerNamespaceFromKey(op.OperationKey, op.Target, targetQualified)
+	if err != nil {
+		return "", fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q: %w", op.ID, apply.ApplyIdentifier, op.OperationKey, err)
+	}
+	return namespace, nil
+}
+
+// operationKeysLeadWithTarget reports whether op's key leads with its target.
+// The key writer puts the target in front of every key of a deployment that
+// addresses more than one target (routing.MultiTargetDeployments over the
+// apply's members), so the reader applies that rule to the apply's operation
+// rows, op's own included.
+func operationKeysLeadWithTarget(ops []*storage.ApplyOperation, op *storage.ApplyOperation) bool {
+	members := make([]routing.ExecutionTarget, 0, len(ops)+1)
+	members = append(members, routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target})
+	for _, sibling := range ops {
+		members = append(members, routing.ExecutionTarget{Deployment: sibling.Deployment, Target: sibling.Target})
+	}
+	return routing.MultiTargetDeployments(members)[op.Deployment]
+}
+
+// finalizerNamespaceFromKey reads the namespace out of a group_finalizer
+// operation key, or empty for a deployment-scoped finalizer. target is the
+// operation's own target, and targetQualified says whether the writer put it in
+// front of the key.
+//
+// A deployment that addresses one target keys its finalizers within that
+// target: "ns_0/group_finalizer", or the bare "group_finalizer" when
+// deployment-scoped. A deployment that addresses several targets leads each key
+// with the operation's target: "orders-001/ns_0/group_finalizer", or
+// "orders-001/group_finalizer" when deployment-scoped. The key alone cannot
+// tell a namespace from a target in "orders/group_finalizer", since a target
+// can share a namespace's name, so targetQualified decides it. Two components
+// in front of the segment are always a target and a namespace, because a
+// namespace cannot contain the delimiter; that key must still lead with the
+// operation's own target.
+//
+// Any other key, or a qualified key led by another target, is an error: the
+// drive must not finalize a scope it cannot name.
+func finalizerNamespaceFromKey(operationKey, target string, targetQualified bool) (string, error) {
+	if operationKey == state.GroupFinalizerKeySegment {
+		if targetQualified {
+			return "", fmt.Errorf("deployment addresses several targets, so the key must lead with target %q", target)
+		}
+		return "", nil
+	}
+	scope, ok := state.FinalizerScope(operationKey)
+	if !ok {
+		return "", fmt.Errorf("key does not end in %q after a scope", finalizerOperationKeySuffix)
+	}
+	parts := strings.Split(scope, state.OperationKeyDelimiter)
+	if slices.Contains(parts, "") {
+		return "", fmt.Errorf("scope %q has an empty component", scope)
+	}
+	switch len(parts) {
+	case 1:
+		if !targetQualified {
+			return parts[0], nil
+		}
+		if parts[0] != target {
+			return "", fmt.Errorf("deployment addresses several targets, so the key must lead with target %q", target)
+		}
+		return "", nil
+	case 2:
+		if target == "" || parts[0] != target {
+			return "", fmt.Errorf("scope %q names target %q, not the operation's target %q", scope, parts[0], target)
+		}
+		return parts[1], nil
+	default:
+		return "", fmt.Errorf("scope %q has more components than a target and a namespace", scope)
+	}
 }
 
 // driveGroupFinalizer drives a task-less group_finalizer operation: it applies
@@ -1754,9 +1993,9 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 	if plan == nil {
 		return fmt.Errorf("plan %d for group_finalizer apply_operation %d (apply %s): %w", planID, op.ID, apply.ApplyIdentifier, ErrPlanMissingForApplyOperation)
 	}
-	namespace := namespaceFromFinalizerKey(op.OperationKey)
-	if namespace == "" && op.OperationKey != finalizerDeploymentScopedKey {
-		return fmt.Errorf("group_finalizer apply_operation %d (apply %s): malformed operation key %q", op.ID, apply.ApplyIdentifier, op.OperationKey)
+	namespace, err := resolveFinalizerNamespace(ctx, c.storage, apply, op)
+	if err != nil {
+		return err
 	}
 	changes, err := finalizerVSchemaChanges(plan, namespace)
 	if err != nil {
@@ -1771,18 +2010,7 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		return fmt.Errorf("resolve credentials for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
 
-	c.logger.Info("driving group_finalizer VSchema apply",
-		"apply_id", apply.ApplyIdentifier,
-		"apply_operation_id", op.ID,
-		"deployment", op.Deployment,
-		"namespace", namespace,
-		"namespace_count", len(changes),
-		"database", apply.Database,
-	)
-	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
-		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
-	}
-
+	work := finalizerWork(changes)
 	failClosed := func(cause error) error {
 		if markErr := c.storage.ApplyOperations().MarkFailed(ctx, op.ID, cause.Error()); markErr != nil {
 			c.logger.Error("group_finalizer: failed to mark operation failed",
@@ -1790,9 +2018,12 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		}
 		return cause
 	}
-	persistResume := func(rs *engine.ResumeState) {
+	// saveResume reports whether the finalizer's resume state landed, which is
+	// what the engine's OnStateChange needs; persistResume is the log-only form
+	// for the polls that save the latest state as they go.
+	saveResume := func(rs *engine.ResumeState) error {
 		if rs == nil {
-			return
+			return nil
 		}
 		if saveErr := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
 			ApplyOperationID: op.ID,
@@ -1801,40 +2032,92 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		}); saveErr != nil {
 			c.logger.Warn("group_finalizer: failed to persist engine resume state",
 				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "error", saveErr)
+			return fmt.Errorf("persist group finalizer resume state for apply %s: %w", apply.ApplyIdentifier, saveErr)
+		}
+		return nil
+	}
+	persistResume := func(rs *engine.ResumeState) {
+		if err := saveResume(rs); err != nil {
+			c.logger.Debug("group_finalizer: resume state save failed and was logged; the next poll saves the latest state again",
+				"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID)
 		}
 	}
 
 	var resumeState *engine.ResumeState
+	handedToEngine := false
 	stored, getErr := c.storage.ApplyOperations().GetEngineResumeState(ctx, op.ID)
 	switch {
 	case errors.Is(getErr, storage.ErrEngineResumeStateNotFound):
-		// No persisted resume state yet — this is the finalizer's first drive, so
-		// start fresh.
+		// No drive has recorded handing this finalizer's work to the engine, so
+		// this drive is the first to reach it and starts fresh.
 	case getErr != nil:
 		// A storage read failure must not be treated as "fresh": proceeding would
 		// risk the engine restarting or duplicating in-flight VSchema work after a
 		// transient DB error. Fail closed for the operator to retry.
 		return failClosed(fmt.Errorf("load engine resume state for group_finalizer apply_operation %d (apply %s): %w", op.ID, apply.ApplyIdentifier, getErr))
 	case stored != nil:
-		resumeState = &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
+		handedToEngine = true
+		resumeState = finalizerEngineResumeState(stored)
 	}
 
+	if err := c.storage.ApplyOperations().MarkStarted(ctx, op.ID); err != nil {
+		return fmt.Errorf("mark group_finalizer apply_operation %d started (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
+	}
+
+	// An operator's pending cancel or stop decides whether this finalizer may
+	// hand its VSchema to the engine at all, the same way a work operation's
+	// drive consumes pending commands before it resumes its tasks. The read is
+	// the drive's last read before the engine call, after the start is durable,
+	// so every command committed before the engine is reached is seen here. A
+	// command committed after it arrives while the finalizer is already handing
+	// its work to the engine: that is the in-flight case, and the apply's
+	// terminal settlement resolves it as outrun rather than dropping it.
+	if standDown, err := c.finalizerStandsDownForPendingControl(ctx, apply, op, namespace, handedToEngine); standDown || err != nil {
+		return err
+	}
+
+	// Record the handoff before the engine is reached, so a later drive of this
+	// row knows the VSchema may already be live even when the engine reports no
+	// resume state of its own (a synchronous apply, or a deploy that has not yet
+	// produced one) or a later save of that state fails. The record is what
+	// keeps a re-drive from settling the row cancelled or stopped over work the
+	// engine already carried out, so a failure to write it stops the drive
+	// before the engine call; the row stays running for a later drive to retry.
+	if !handedToEngine {
+		if err := c.storage.ApplyOperations().SaveEngineResumeState(ctx, op.ID, &storage.EngineResumeState{
+			ApplyOperationID: op.ID,
+			Metadata:         finalizerEngineHandoffMetadata,
+		}); err != nil {
+			return fmt.Errorf("record engine handoff for group_finalizer apply_operation %d (apply %s) before applying its VSchema: %w", op.ID, apply.ApplyIdentifier, err)
+		}
+	}
+
+	c.logger.Info("driving group_finalizer",
+		"work", work,
+		"apply_id", apply.ApplyIdentifier,
+		"apply_operation_id", op.ID,
+		"deployment", op.Deployment,
+		"namespace", namespace,
+		"namespace_count", len(changes),
+		"database", apply.Database,
+	)
 	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
 		Database:      apply.Database,
 		PlanID:        plan.PlanIdentifier,
 		Changes:       changes,
 		SchemaFiles:   plan.SchemaFiles,
+		IgnoreTables:  plan.IgnoreTables(),
 		Options:       apply.GetOptions().Map(),
 		ResumeState:   resumeState,
 		Credentials:   creds,
 		Logger:        c.logger.With(apply.IdentityLogAttrs()...),
-		OnStateChange: persistResume,
+		OnStateChange: saveResume,
 	})
 	if err != nil {
-		return failClosed(fmt.Errorf("apply VSchema for group_finalizer (apply %s): %w", apply.ApplyIdentifier, err))
+		return failClosed(fmt.Errorf("group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 	}
 	if result == nil || !result.Accepted {
-		return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s was not accepted", apply.ApplyIdentifier))
+		return failClosed(fmt.Errorf("group_finalizer %s for apply %s was not accepted", work, apply.ApplyIdentifier))
 	}
 
 	// A nil resume state means the engine has no in-flight work to track: the
@@ -1846,46 +2129,212 @@ func (c *LocalClient) driveGroupFinalizer(ctx context.Context, apply *storage.Ap
 		persistResume(result.ResumeState)
 		finalState, err := c.driveFinalizerToTerminal(ctx, eng, apply, creds, result.ResumeState, persistResume)
 		if err != nil {
-			return failClosed(fmt.Errorf("await group_finalizer VSchema apply (apply %s): %w", apply.ApplyIdentifier, err))
+			return failClosed(fmt.Errorf("await group_finalizer %s (apply %s): %w", work, apply.ApplyIdentifier, err))
 		}
 		if !finalizerVSchemaApplied(finalState) {
-			return failClosed(fmt.Errorf("group_finalizer VSchema apply for apply %s ended in non-success state %q", apply.ApplyIdentifier, finalState))
+			return failClosed(fmt.Errorf("group_finalizer %s for apply %s ended in non-success state %q", work, apply.ApplyIdentifier, finalState))
 		}
 	}
 	if err := c.storage.ApplyOperations().MarkCompleted(ctx, op.ID); err != nil {
 		return fmt.Errorf("mark group_finalizer apply_operation %d completed (apply %s): %w", op.ID, apply.ApplyIdentifier, err)
 	}
-	c.logger.Info("group_finalizer VSchema apply completed",
-		"apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
+	c.logger.Info("group_finalizer completed",
+		"work", work, "apply_id", apply.ApplyIdentifier, "apply_operation_id", op.ID, "namespace", namespace)
 	return nil
 }
 
-// finalizerVSchemaChanges reconstructs the VSchema change(s) a group_finalizer
-// applies, from the plan. A namespace-scoped finalizer (operation key
-// "<ns>/group_finalizer", from a sharded fan-out) applies that one namespace's
-// VSchema. A finalizer with no namespace in its key (a non-sharded VSchema-only
-// apply on an externally-authoritative engine) applies every VSchema-changed
-// namespace in the plan, because that engine deploys the whole branch in one
-// operation.
+// finalizerStandsDownForPendingControl answers an operator's pending cancel or
+// stop for a group_finalizer before the finalizer hands anything to the engine.
+// Cancel is consulted first, in the order every drive consumes the two
+// (processPendingCancelOrStopControlRequest): a cancel is not forward progress
+// but an escalation of a pending stop, and the finalizer must settle the way
+// the apply's other operations do, since a finalizer left stopped under a
+// cancelled rollout would be resumable into publishing a VSchema for shard work
+// the operator threw away. A finalizer whose work has not reached the engine
+// settles its own operation row: cancelled for a cancel, and for a stop the
+// state the database type's stop settles to (stopped, or cancelled where a stop
+// cannot pause). The drive then stands down without applying the VSchema.
+//
+// The request itself stays pending. A finalizer owns only its own row, while
+// the command belongs to the whole apply: sibling operations still have to
+// consume it, and the rollout projection completes it once the apply resolves.
+//
+// inFlight reports that an earlier drive already handed the finalizer's work
+// to the engine (engine resume state, or the handoff record written before the
+// engine call, is stored). The engine may have published the VSchema or still
+// be deploying it, so settling storage would record a cancel or stop over work
+// that is live. The drive instead re-applies or reattaches and records the
+// outcome the engine reports.
+func (c *LocalClient) finalizerStandsDownForPendingControl(ctx context.Context, apply *storage.Apply, op *storage.ApplyOperation, namespace string, inFlight bool) (bool, error) {
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
+		controlReq, err := pendingControlRequest(ctx, c.storage, apply, operation)
+		if err != nil {
+			return false, fmt.Errorf("check pending %s before group_finalizer apply_operation %d (apply %s): %w", operation, op.ID, apply.ApplyIdentifier, err)
+		}
+		if controlReq == nil {
+			continue
+		}
+		caller := controlRequestCaller(controlReq)
+		logAttrs := append(apply.LogAttrs(),
+			"apply_operation_id", op.ID, "operation_deployment", op.Deployment, "operation_key", op.OperationKey,
+			"namespace", namespace, "control_operation", operation, "requested_by", caller)
+		if inFlight {
+			c.logger.Warn("group_finalizer has VSchema work in flight on the engine; the drive follows it to the engine's outcome and leaves the pending command to the rest of the apply",
+				logAttrs...)
+			return false, nil
+		}
+		settledState := finalizerSettledStateForControl(operation, apply.DatabaseType)
+		if err := c.settleFinalizerOperation(ctx, op, settledState); err != nil {
+			return true, fmt.Errorf("settle group_finalizer apply_operation %d (apply %s) %s for pending %s: %w", op.ID, apply.ApplyIdentifier, settledState, operation, err)
+		}
+		// The drive's MarkStarted already moved the row to running, so running is
+		// the state this settle writes over, whatever the claim loaded.
+		previousState := state.ApplyOperation.Running
+		c.logger.Info("group_finalizer settled for a pending command before it applied anything; the rollout projection completes the command",
+			append(logAttrs, "previous_operation_state", previousState, "operation_state", settledState)...)
+		logEvent := storage.LogEventCancelRequested
+		if operation == storage.ControlOperationStop {
+			logEvent = storage.LogEventStopRequested
+		}
+		eventMsg := fmt.Sprintf("%s requested: VSchema finalizer for %s %s before it applied anything",
+			capitalizeControlVerb(string(operation)), finalizerScopeLabel(namespace), settledState)
+		if caller != "" {
+			eventMsg += callerApplyLogSuffix(caller)
+		}
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, logEvent, storage.LogSourceSchemaBot,
+			eventMsg, previousState, settledState)
+		return true, nil
+	}
+	return false, nil
+}
+
+// finalizerEngineHandoffMetadata is the engine resume state a group_finalizer
+// drive records immediately before its first engine call. It marks the row as
+// handed to the engine until the engine reports resume state of its own, which
+// replaces it.
+const finalizerEngineHandoffMetadata = `{"` + finalizerEngineHandoffKey + `":"true"}`
+
+// finalizerEngineHandoffKey is the one field of the handoff record.
+const finalizerEngineHandoffKey = "group_finalizer_engine_handoff"
+
+// finalizerEngineResumeState is the resume state a re-drive hands the engine,
+// from what an earlier drive of the finalizer stored. A bare handoff record
+// carries nothing the engine can resume from, so the drive re-applies the
+// VSchema from the plan, which is idempotent; anything else is the engine's own
+// state and is passed back unchanged.
+func finalizerEngineResumeState(stored *storage.EngineResumeState) *engine.ResumeState {
+	if isFinalizerHandoffRecordOnly(stored) {
+		return nil
+	}
+	return &engine.ResumeState{MigrationContext: stored.MigrationContext, Metadata: stored.Metadata}
+}
+
+// isFinalizerHandoffRecordOnly reports that the stored resume state is the
+// drive's own handoff record, with nothing the engine reported since. The
+// metadata is compared as JSON, not as text: a JSON storage column returns it
+// re-serialized, so the stored bytes need not match what the drive wrote.
+func isFinalizerHandoffRecordOnly(stored *storage.EngineResumeState) bool {
+	if stored.MigrationContext != "" {
+		return false
+	}
+	var fields map[string]string
+	if err := json.Unmarshal([]byte(stored.Metadata), &fields); err != nil {
+		return false
+	}
+	return len(fields) == 1 && fields[finalizerEngineHandoffKey] == "true"
+}
+
+// finalizerSettledStateForControl is the operation state a never-started
+// finalizer settles to for a pending command. A stop settles to stopped so a
+// later start resumes the finalizer, except on an engine whose stop is
+// permanent, where the single stop-terminality decision makes it cancelled.
+func finalizerSettledStateForControl(operation storage.ControlOperation, databaseType string) string {
+	if operation == storage.ControlOperationStop && !stopTerminatesChange(databaseType) {
+		return state.ApplyOperation.Stopped
+	}
+	return state.ApplyOperation.Cancelled
+}
+
+// settleFinalizerOperation moves the finalizer's own row to settledState under
+// the drive's lease. stopped is resumable and keeps completed_at nil.
+func (c *LocalClient) settleFinalizerOperation(ctx context.Context, op *storage.ApplyOperation, settledState string) error {
+	if state.IsState(settledState, state.ApplyOperation.Stopped) {
+		return c.storage.ApplyOperations().UpdateState(ctx, op.ID, settledState)
+	}
+	return c.storage.ApplyOperations().MarkTerminal(ctx, op.ID, settledState)
+}
+
+// finalizerScopeLabel names what a finalizer covers in the apply log: its one
+// namespace, or every VSchema namespace for a deployment-scoped finalizer.
+func finalizerScopeLabel(namespace string) string {
+	if namespace == "" {
+		return "every namespace"
+	}
+	return "namespace " + namespace
+}
+
+// finalizerVSchemaChanges reconstructs the change(s) a group_finalizer applies,
+// from the plan. A namespace-scoped finalizer (operation key
+// "<ns>/group_finalizer", from a sharded fan-out) finalizes that one namespace.
+// A finalizer with no namespace in its key (a finalizer-only apply) finalizes
+// every namespace in the plan that needs it, because an externally-authoritative
+// engine deploys the whole branch in one operation.
+//
+// Each change says what the finalizer is for: vschema_changed when the
+// namespace's VSchema document changes, and needs_finalizer when the engine
+// asked to finalize the namespace. A namespace the engine asked to finalize
+// whose VSchema is unchanged carries only needs_finalizer, so the engine
+// finalizes it without being told to apply a VSchema it does not have.
 func finalizerVSchemaChanges(plan *storage.Plan, namespace string) ([]engine.SchemaChange, error) {
-	vschemaChange := func(ns string) engine.SchemaChange {
-		return engine.SchemaChange{Namespace: ns, Metadata: map[string]string{"vschema_changed": "true"}}
+	finalizerChange := func(ns string) engine.SchemaChange {
+		nsData := plan.Namespaces[ns]
+		metadata := map[string]string{}
+		if nsData.ChangesVSchema() {
+			metadata[storage.PlanMetadataVSchemaChanged] = "true"
+		}
+		if nsData.Finalize {
+			metadata[engine.MetadataNeedsFinalizer] = "true"
+		}
+		return engine.SchemaChange{Namespace: ns, Metadata: metadata}
 	}
 	if namespace != "" {
-		if !plan.Namespaces[namespace].ChangesVSchema() {
-			return nil, fmt.Errorf("plan %d has no VSchema artifact for namespace %q", plan.ID, namespace)
+		if !plan.Namespaces[namespace].NeedsFinalizer() {
+			return nil, fmt.Errorf("plan %d has neither a VSchema artifact nor a finalize request for namespace %q", plan.ID, namespace)
 		}
-		return []engine.SchemaChange{vschemaChange(namespace)}, nil
+		return []engine.SchemaChange{finalizerChange(namespace)}, nil
 	}
-	namespaces := plan.VSchemaNamespaces()
+	namespaces := plan.FinalizerNamespaces()
 	if len(namespaces) == 0 {
-		return nil, fmt.Errorf("plan %d has no VSchema artifact for a deployment-scoped finalizer", plan.ID)
+		return nil, fmt.Errorf("plan %d has neither a VSchema artifact nor a finalize request for a deployment-scoped finalizer", plan.ID)
 	}
 	changes := make([]engine.SchemaChange, 0, len(namespaces))
 	for _, ns := range namespaces {
-		changes = append(changes, vschemaChange(ns))
+		changes = append(changes, finalizerChange(ns))
 	}
 	return changes, nil
+}
+
+// finalizerWork names what a group_finalizer's changes ask the engine to do,
+// for its logs and errors: apply a changed VSchema, finalize a namespace whose
+// VSchema is unchanged, or both across namespaces. Triage then looks for a
+// VSchema document only when there is one.
+func finalizerWork(changes []engine.SchemaChange) string {
+	var vschema, finalizeOnly bool
+	for _, change := range changes {
+		if change.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
+			vschema = true
+		} else {
+			finalizeOnly = true
+		}
+	}
+	switch {
+	case vschema && finalizeOnly:
+		return "VSchema apply and finalize"
+	case vschema:
+		return "VSchema apply"
+	default:
+		return "finalize"
+	}
 }
 
 // finalizerVSchemaApplied reports whether an engine progress state means the
@@ -1951,6 +2400,109 @@ func (c *LocalClient) drivePlanID(apply *storage.Apply, op *storage.ApplyOperati
 	return storage.PlanIDForOperation(apply, op)
 }
 
+// failedTaskDecidingOutcome returns the failed task that already decides the
+// apply's outcome, or nil when none does. When every loaded task is terminal,
+// any failed task fails the apply. A grouped drive runs its tasks as one
+// engine operation, so there a single failed task fails the apply even while
+// siblings read non-terminal — a sibling whose failed write was refused is
+// still part of the operation that failed.
+//
+// Tasks spanning more than one operation never decide: the whole-apply drive
+// that loads every task of a rollout sees a sibling deployment's recorded
+// failure next to deployments that have not started, and that failure is the
+// rollout projection's to weigh under the apply's failure policy, not this
+// drive's unrecorded outcome. Reading it as one would fail a never-started
+// sibling with a failure that is not its own and turn a pending stop into a
+// permanent failure (ST-10, CO-4).
+func failedTaskDecidingOutcome(tasks []*storage.Task, grouped bool) *storage.Task {
+	if !tasksShareOneOperation(tasks) {
+		return nil
+	}
+	var failed *storage.Task
+	allTerminal := true
+	for _, task := range tasks {
+		if !state.IsTerminalTaskState(task.State) {
+			allTerminal = false
+		}
+		if failed == nil && state.IsState(task.State, state.Task.Failed) {
+			failed = task
+		}
+	}
+	if allTerminal || grouped {
+		return failed
+	}
+	return nil
+}
+
+// failedTaskDecidingResume returns the failed task that decides the outcome of
+// the apply this drive is resuming, or nil when the drive must go on to its
+// pending requests and re-plan. A stopped apply is claimed only to deliver a
+// pending control request, so its failed tasks never decide: the stop already
+// settled them, and the pending start or cancel is answered first.
+func (c *LocalClient) failedTaskDecidingResume(apply *storage.Apply, tasks []*storage.Task, options map[string]string) *storage.Task {
+	if state.IsState(apply.State, state.Apply.Stopped) {
+		return nil
+	}
+	return failedTaskDecidingOutcome(tasks, c.usesGroupedApply(apply, options))
+}
+
+// tasksShareOneOperation reports whether every task belongs to the same
+// operation, so a failed task among them is that operation's outcome. Tasks
+// that name no operation are one operation's work.
+func tasksShareOneOperation(tasks []*storage.Task) bool {
+	if len(tasks) == 0 {
+		return true
+	}
+	first := tasks[0].ApplyOperationID
+	for _, task := range tasks[1:] {
+		if (first == nil) != (task.ApplyOperationID == nil) {
+			return false
+		}
+		if first != nil && *first != *task.ApplyOperationID {
+			return false
+		}
+	}
+	return true
+}
+
+// settledTaskFailureMessage is the apply's failure message derived from its
+// failed task: the task's own error when it recorded one.
+func settledTaskFailureMessage(task *storage.Task) string {
+	if task.ErrorMessage != "" {
+		return task.ErrorMessage
+	}
+	return fmt.Sprintf("task %s failed", task.TaskIdentifier)
+}
+
+// planIDForTasks resolves the plan a drive's tasks were built from, for the
+// paths that judge those tasks against their reviewed schema without an
+// operation in hand. Each task records its plan, and the rollout member
+// targets sharing one apply were each planned against their own live schema,
+// so the apply's plan, which is the plan of the dispatch that created it,
+// would judge a sibling target's tasks against another target's schema set.
+// Tasks naming different plans are refused rather than judged against one of
+// them. Tasks that record no plan fall back to the apply's.
+func planIDForTasks(apply *storage.Apply, tasks []*storage.Task) (int64, error) {
+	var planID int64
+	for _, task := range tasks {
+		switch {
+		case task.PlanID == 0:
+			// Judged against the plan its siblings name, or the apply's.
+		case planID == 0:
+			planID = task.PlanID
+		case task.PlanID != planID:
+			return 0, fmt.Errorf("tasks of apply %s were built from different plans (%d and %d); refusing to judge them against one", apply.ApplyIdentifier, planID, task.PlanID)
+		}
+	}
+	if planID != 0 {
+		return planID, nil
+	}
+	if apply.PlanID == 0 {
+		return 0, fmt.Errorf("neither the tasks nor apply %s name a plan", apply.ApplyIdentifier)
+	}
+	return apply.PlanID, nil
+}
+
 // resumeApplyWithTasks drives an apply (or one of its operations) from the set
 // of tasks the caller has loaded. Callers choose whether tasks are scoped to the
 // whole apply or to a single operation.
@@ -1966,6 +2518,18 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	// Mutable attrs (state, deployment) stay per-call so the bound logger
 	// never freezes stale values.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	// A drive that failed its tasks and then could not record the apply failed
+	// leaves the apply active over failed task rows, some of them possibly
+	// still non-terminal where a task write was refused. The failed task
+	// already carries the outcome, so the apply fails from it, its remaining
+	// tasks fail with it, and it owes the same terminal side effects as the
+	// drive that failed it; re-planning instead would read the failed tasks as
+	// work to settle or re-run.
+	if failed := c.failedTaskDecidingResume(apply, tasks, options); failed != nil {
+		logger.Warn("a failed task decides the outcome of an apply that is still active; recording the apply failed from its tasks",
+			append(apply.MutableLogAttrs(), "failed_task_id", failed.TaskIdentifier)...)
+		return c.failApplyAndNotify(ctx, apply, tasks, settledTaskFailureMessage(failed))
+	}
 	// Before consuming a pending stop/cancel, learn whether the engine's
 	// backend already drove the change to a terminal outcome. If it did, the
 	// command can no longer act — the drive adopts the engine's truth and the
@@ -2018,9 +2582,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	if plan == nil {
 		logger.Warn("plan row does not exist for apply; recovery cannot rebuild the reviewed DDL, marking apply failed",
 			apply.MutableLogAttrs()...)
-		c.failApplyWithTasks(ctx, apply, tasks, "plan not found during recovery")
-		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, "plan not found during recovery")
 	}
 	if len(tasks) == 0 && !isTasklessVSchemaOnlyPlan(tasks, plan) {
 		// A task-less apply has no per-table work to drive — e.g. a sharded
@@ -2077,7 +2639,9 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	if state.IsState(apply.State, state.Apply.Pending) && apply.StartedAt == nil {
-		c.dispatchQueuedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier)
+		if err := c.dispatchQueuedApply(ctx, apply, tasks, plan, options, releaseAtCutoverBarrier); err != nil {
+			return err
+		}
 		return ctx.Err()
 	}
 
@@ -2118,7 +2682,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 							"error", err)
 						return fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err)
 					}
-					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err), false)
+					return c.handleGroupedResumeFailure(ctx, apply, tasks, fmt.Errorf("recover deferred cutover apply %s from checkpoint: %w", apply.ApplyIdentifier, err))
 				}
 				return ctx.Err()
 			}
@@ -2137,19 +2701,15 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	}
 
 	activeTasks := rp.ActiveTasks
+	// The apply is terminal from here, so it owes every terminal side effect
+	// now: the start that admitted this claim is answered, the requests the
+	// outcome moots are swept, and the summary posts. Nothing later re-claims
+	// a failed apply to do any of them.
 	if deferredCutoverSignalAbsent && len(activeTasks) > 0 {
 		message := "deferred cutover signal is absent but live schema does not match desired schema; manual reconciliation required"
 		logger.Error("deferred cutover recovery cannot reconcile absent cutover signal",
 			"active_task_count", len(activeTasks))
-		c.failApplyWithTasks(ctx, apply, activeTasks, message)
-		// A multi-operation drive owns only its operation; the operator's
-		// projection settles the parent and posts the terminal summary.
-		// failApplyWithTasks already logged the suppressed settle.
-		if suppressParentApplyWrites(ctx) {
-			return nil
-		}
-		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, message)
 	}
 	startControlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
 	if err != nil {
@@ -2180,6 +2740,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 				return err
 			}
 		}
+		// A previous drive can have settled every task and exited before it
+		// recorded the apply's outcome, leaving requests the outcome moots
+		// pending. Settle them before the summary posts, since nothing later
+		// re-claims a completed apply to do it.
+		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		c.notifyTerminalObserver(apply, tasks)
 		return nil
 	}
@@ -2188,25 +2753,8 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 	// Task rows carry the admitting deployment's verdict, tightened to the
 	// re-plan's where this target refuses the statement now, allowing a
 	// resumed drive to fail closed without trusting whichever plan it loaded.
-	// The apply is terminal from here, so the start request that admitted this
-	// claim is settled and the observer posts the summary now; nothing later
-	// re-claims a failed apply to do either.
 	if err := blockedTaskError(activeTasks); err != nil {
-		c.failApplyWithTasks(ctx, apply, activeTasks, err.Error())
-		// A multi-operation drive owns only its operation; the operator's
-		// projection settles the parent, resolves pending control requests,
-		// and posts the terminal summary. failApplyWithTasks already logged
-		// the suppressed settle.
-		if suppressParent {
-			return nil
-		}
-		if startRequested {
-			if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
-				return failErr
-			}
-		}
-		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		return c.failApplyAndNotify(ctx, apply, tasks, err.Error())
 	}
 	// A revert-phase task is settled only by reattaching to the engine that
 	// holds its revert window or is unwinding it, and only the grouped drive
@@ -2233,8 +2781,21 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		}
 	}
 
-	c.prepareRetryableTasksForResume(ctx, apply, activeTasks)
-	c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested)
+	retryableApplyError := apply.ErrorMessage
+	if err := c.prepareRetryableTasksForResume(ctx, apply, activeTasks); err != nil {
+		// Nothing has written the apply row yet, so it still records the
+		// retryable pause it was claimed in; only the in-memory error message
+		// was cleared for the retry, and it is put back to match the row.
+		apply.ErrorMessage = retryableApplyError
+		logger.Warn("could not requeue retryable tasks for the retry; the apply stays retryable for the next claim",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
+	if err := c.prepareStoppedTasksForResume(ctx, apply, activeTasks, startRequested); err != nil {
+		logger.Warn("could not requeue stopped tasks for start; the request remains pending for the next claim",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return err
+	}
 
 	if grouped {
 		resumeCtx, cancelResume := context.WithCancel(ctx)
@@ -2247,7 +2808,7 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 					"error", err)
 				return err
 			}
-			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err, startRequested)
+			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err)
 		}
 	} else {
 		// Sequential mode: process each task one at a time
@@ -2278,13 +2839,29 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		cancelGeneration := c.setApplyCancel(cancelResume)
 		defer c.clearApplyCancel(cancelGeneration)
 		defer cancelResume()
-		c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options)
+		if err := c.resumeApplySequential(resumeCtx, apply, activeTasks, plan, options); err != nil {
+			return err
+		}
 	}
 
 	return ctx.Err()
 }
 
-func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error, startRequested bool) error {
+// handleGroupedResumeFailure settles a grouped resume the engine refused. A
+// retryable refusal pauses the apply for operator retry; a permanent one fails
+// it through failApplyAndNotify, which owes the stored failure every terminal
+// side effect, and the engine's error is returned so the drive reports why it
+// ended. A failure write that did not land is returned instead, with nothing
+// settled, for the claim that picks the apply up next to record.
+//
+// A multi-operation drive owns only its operation: its failed tasks carry the
+// outcome, and the operator's projection settles the parent, resolves pending
+// control requests, and posts the terminal summary. The drive itself returns
+// nil there — the failure is already durably settled in the tasks, and an
+// error would read as a transient drive failure that leaves the operation
+// claimable, re-leasing already-settled work instead of letting the claim loop
+// persist the operation row from its now-failed tasks immediately.
+func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, err error) error {
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	// A cancelled drive is why the resume returned, so the error describes the
 	// driver rather than the schema change it was reattaching to.
@@ -2294,34 +2871,21 @@ func (c *LocalClient) handleGroupedResumeFailure(ctx context.Context, apply *sto
 	if c.shouldRetryEngineError(err) {
 		logger.Warn("engine apply failed during recovery, pausing apply for operator retry",
 			"error", err)
-		c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
-		return nil
+		return c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
 	}
 
 	logger.Error("engine apply failed during recovery",
 		"error", err)
-	c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-	// A multi-operation drive owns only its operation: its failed tasks carry
-	// the outcome, and the operator's projection settles the parent, resolves
-	// pending control requests, and posts the terminal summary. The drive
-	// itself returns nil — the failure is already durably settled in the
-	// tasks, and an error here would read as a transient drive failure that
-	// leaves the operation claimable, re-leasing already-settled work instead
-	// of letting the claim loop persist the operation row from its now-failed
-	// tasks immediately. failApplyWithTasks already logged the suppressed settle.
+	if failErr := c.failApplyAndNotify(ctx, apply, tasks, err.Error()); failErr != nil {
+		return failErr
+	}
 	if suppressParentApplyWrites(ctx) {
 		return nil
 	}
-	if startRequested {
-		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, err.Error()); failErr != nil {
-			return failErr
-		}
-	}
-	c.notifyTerminalObserver(apply, tasks)
 	return err
 }
 
-func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
 	applyCtx, cancelApply := context.WithCancel(ctx)
 	cancelGeneration := c.setApplyCancel(cancelApply)
 	defer c.clearApplyCancel(cancelGeneration)
@@ -2334,5 +2898,5 @@ func (c *LocalClient) dispatchQueuedApply(ctx context.Context, apply *storage.Ap
 		"task_count", len(tasks),
 	)
 
-	c.runApplyExecution(applyCtx, apply, tasks, plan, options, releaseAtCutoverBarrier)
+	return c.runApplyExecution(applyCtx, apply, tasks, plan, options, releaseAtCutoverBarrier)
 }

@@ -65,3 +65,20 @@ func TestMatchesAnyGroup(t *testing.T) {
 	assert.False(t, matchesAnyGroup([]string{"other-org/schema-admins"}, admin),
 		"same slug under a different org must not match")
 }
+
+func TestMatchedGroups(t *testing.T) {
+	configured := []string{"octocat/orders-oncall", "orders-operators", "octocat/orders-operators"}
+
+	assert.Equal(t, []string{"octocat/orders-oncall", "octocat/orders-operators", "orders-operators"},
+		MatchedGroups([]string{"orders-operators", "orders-oncall"}, configured),
+		"every matched configured group is returned by its configured name, sorted")
+	assert.Equal(t, []string{"orders-operators"},
+		MatchedGroups([]string{"other-org/orders-operators"}, configured),
+		"an org-qualified caller group matches a bare configured slug but not another org's name")
+	assert.Equal(t, []string{"orders-operators"},
+		MatchedGroups([]string{"orders-operators"}, []string{"orders-operators", "orders-operators"}),
+		"a group configured twice is returned once")
+	assert.Empty(t, MatchedGroups([]string{"payments-team"}, configured))
+	assert.Empty(t, MatchedGroups(nil, configured))
+	assert.Empty(t, MatchedGroups([]string{"orders-operators"}, nil))
+}

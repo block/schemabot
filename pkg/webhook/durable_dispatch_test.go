@@ -33,6 +33,7 @@ type durableWebhookTestStorage struct {
 	webhookEvents storage.WebhookEventStore
 	locks         storage.LockStore
 	applies       storage.ApplyStore
+	settings      storage.SettingsStore
 }
 
 func (s *durableWebhookTestStorage) WebhookEvents() storage.WebhookEventStore {
@@ -65,6 +66,10 @@ func TestDurableWebhookTestStorageDefaults(t *testing.T) {
 	require.NotNil(t, s.Locks())
 	require.NotNil(t, s.Applies())
 	require.NotNil(t, s.Checks())
+}
+
+func (s *durableWebhookTestStorage) Settings() storage.SettingsStore {
+	return s.settings
 }
 
 type recordingWebhookEventStore struct {

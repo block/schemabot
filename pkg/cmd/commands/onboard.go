@@ -11,6 +11,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -24,7 +25,7 @@ type OnboardCmd struct {
 	SchemaDir         string   `short:"s" required:"" help:"Schema root to write schemabot.yaml and namespace directories" name:"schema_dir"`
 	Type              string   `help:"Database type override; resolved from the server's registered config when omitted"`
 	Namespaces        []string `name:"namespace" help:"Concrete live namespace to onboard. Repeat for multiple namespaces. Omit to discover all non-reserved namespaces."`
-	TemplateEnvSuffix bool     `help:"Write namespaces ending in _<environment> as _$ENV directories" name:"template-env-suffix"`
+	TemplateEnvSuffix bool     `help:"Write namespaces ending in _<environment> as _{env} directories" name:"template-env-suffix"`
 	DryRun            bool     `help:"Preview files without writing them" name:"dry-run"`
 	Force             bool     `help:"Overwrite existing generated files"`
 	SkipVerify        bool     `help:"Skip plan verification after writing files" name:"skip-verify"`
@@ -167,8 +168,8 @@ func onboardPullNamespaces(namespaces []string) ([]string, error) {
 		if err := validateRelativePathPart("namespace", outputNamespace); err != nil {
 			return nil, err
 		}
-		if strings.Contains(outputNamespace, "$ENV") {
-			return nil, fmt.Errorf("namespace %q must be a concrete live namespace; use --template-env-suffix to write _$ENV directories when a live namespace ends with _<environment>", outputNamespace)
+		if schema.HasNamespaceEnvironmentPlaceholder(outputNamespace) {
+			return nil, fmt.Errorf("namespace %q must be a concrete live namespace; use --template-env-suffix to write _{env} directories when a live namespace ends with _<environment>", outputNamespace)
 		}
 		if _, ok := seen[outputNamespace]; ok {
 			return nil, fmt.Errorf("duplicate namespace %q", outputNamespace)
@@ -185,6 +186,9 @@ func rewriteOnboardNamespaces(resp *apitypes.PullSchemaResponse, environment str
 	}
 	rewritten := make(map[string]*apitypes.PulledNamespace, len(resp.Namespaces))
 	for pullNamespace, pulled := range resp.Namespaces {
+		if schema.HasNamespaceEnvironmentPlaceholder(pullNamespace) {
+			return fmt.Errorf("pulled namespace %q must be a concrete live namespace; {env} and $ENV are reserved for schema directory names", pullNamespace)
+		}
 		outputNamespace := onboardOutputNamespace(pullNamespace, environment, templateEnvSuffix)
 		if _, ok := rewritten[outputNamespace]; ok {
 			return fmt.Errorf("multiple pulled namespaces resolve to output namespace %q", outputNamespace)
@@ -201,7 +205,7 @@ func onboardOutputNamespace(namespace, environment string, templateEnvSuffix boo
 	}
 	environmentSuffix := "_" + environment
 	if environment != "" && strings.HasSuffix(namespace, environmentSuffix) {
-		return strings.TrimSuffix(namespace, environmentSuffix) + "_$ENV"
+		return strings.TrimSuffix(namespace, environmentSuffix) + "_{env}"
 	}
 	return namespace
 }
@@ -247,8 +251,12 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	// refuse — a table both withheld from the planner and declared to it — and
 	// re-onboarding an already-configured repository is where that happens,
 	// because the entries it preserves name tables the pull just returned.
-	ignored := engine.NewIgnoredTables(exclusions.Tables)
+	ignored, err := engine.NewIgnoredTables(exclusions.Tables)
+	if err != nil {
+		return nil, fmt.Errorf("read the existing schemabot.yaml's ignore_tables: %w", err)
+	}
 	var withheldGroups []*apitypes.ExemptTablesResponse
+	var formatErrors []error
 
 	for _, namespace := range namespaces {
 		if err := validateRelativePathPart("namespace", namespace); err != nil {
@@ -271,9 +279,9 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		if err := rejectCaseCollisions("table in "+namespace, tableNames); err != nil {
 			return nil, err
 		}
-		// The filter above is exact, because an entry must never withhold a
-		// table it does not name, while the engines refuse a declared-and-
-		// ignored table with case folded. A live DATABASECHANGELOG under an
+		// The filter above matches as written, because an entry must never
+		// withhold a table it does not name, while the engines refuse a
+		// declared-and-ignored table with case folded. A live DATABASECHANGELOG under an
 		// entry spelling it databasechangelog therefore survives the filter
 		// and lands in a file that every later plan refuses. Refusing here,
 		// against the tables about to be declared and with the engines' own
@@ -300,11 +308,25 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 			if err := validateRelativePathPart("table", tableName); err != nil {
 				return nil, err
 			}
-			files[filepath.Join(namespace, tableName+".sql")] = pulled.Tables[tableName]
+			content, err := ddl.FormatSchemaFileForDialect(schema.DialectForDatabaseType(resp.Type), pulled.Tables[tableName])
+			if err != nil {
+				formatErrors = append(formatErrors, fmt.Errorf("format pulled schema for namespace %s table %s: %w", namespace, tableName, err))
+			} else {
+				files[filepath.Join(namespace, tableName+".sql")] = content
+			}
 		}
 		if vschema := pulled.Artifacts["vschema.json"]; vschema != "" {
 			files[filepath.Join(namespace, "vschema.json")] = vschema
 		}
+	}
+
+	if len(formatErrors) > 0 {
+		return nil, fmt.Errorf("onboarding refused; no files were written:\n%w\n\n"+
+			"To recover, use pull with -o json and the same database, environment, connection, and namespace flags to retrieve the original SQL. "+
+			"Create the schema root manually, preserving every managed table, schema option, comment, and namespace artifact; format the SQL across multiple lines. "+
+			"Then run plan against the source environment and require no schema changes. "+
+			"See docs/cli.md#recovering-from-onboarding-formatting-errors. "+
+			"Editing local files and rerunning onboard will not help: onboard pulls the source again", errors.Join(formatErrors...))
 	}
 
 	return &onboardWritePlan{
@@ -553,7 +575,9 @@ func verifyOnboardPlan(endpoint, database, environment string, plan *onboardWrit
 	var planResult *apitypes.PlanResponse
 	err := withLoading("Verifying pulled schema...", true, func() error {
 		var planErr error
-		planResult, _, planErr = client.CallPlanAPI(endpoint, database, plan.databaseType, environment, plan.root, "", 0, plan.exclusions, false)
+		// The verification reads every rollout member's plan: it fails on a
+		// member listed for attention and on work on any member.
+		planResult, _, planErr = client.CallPlanAPIForTarget(endpoint, database, plan.databaseType, environment, plan.root, "", 0, plan.exclusions, false, "", true)
 		return planErr
 	})
 	if err != nil {
@@ -585,6 +609,13 @@ func validateOnboardPlanResult(result *apitypes.PlanResponse, database, environm
 	if len(result.Errors) > 0 {
 		return fmt.Errorf("verify pulled schema for database %s environment %s: plan returned errors:\n  %s", database, environment, strings.Join(result.Errors, "\n  "))
 	}
+	if rollout := result.WholeRollout(); rollout != nil && len(rollout.Attention) > 0 {
+		lines := make([]string, 0, len(rollout.Attention))
+		for _, a := range rollout.Attention {
+			lines = append(lines, fmt.Sprintf("%s: %s", a.Member, a.Detail))
+		}
+		return fmt.Errorf("verify pulled schema for database %s environment %s: %d of %d rollout members could not be verified:\n  %s", database, environment, len(rollout.Attention), rollout.Members, strings.Join(lines, "\n  "))
+	}
 	if hasResultChanges(result) {
 		return fmt.Errorf("verify pulled schema for database %s environment %s: pulled files still produce schema changes:\n  %s", database, environment, strings.Join(describeOnboardPlanChanges(result), "\n  "))
 	}
@@ -598,9 +629,35 @@ const onboardVerifyDDLPreviewLimit = 120
 
 // describeOnboardPlanChanges renders one line per planned change so a failed
 // verification names the offending tables and DDL without a separate plan run.
+// When a rollout's members run different plans, each line names the members
+// that run it, since the primary can be converged while another member is not.
 func describeOnboardPlanChanges(result *apitypes.PlanResponse) []string {
+	rollout := result.WholeRollout()
 	var lines []string
-	for _, change := range result.Changes {
+	for i, plan := range result.MemberPlans() {
+		prefix := ""
+		if rollout != nil && len(rollout.Groups) > 1 {
+			prefix = onboardGroupLabel(rollout.Groups[i].Members) + ": "
+		}
+		for _, line := range describeOnboardChanges(plan.Changes) {
+			lines = append(lines, prefix+line)
+		}
+	}
+	return lines
+}
+
+// onboardGroupLabel names the members of a rollout plan group, folding a wide
+// group so a verification line stays one line.
+func onboardGroupLabel(members []string) string {
+	if len(members) <= 2 {
+		return strings.Join(members, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", members[0], len(members)-1)
+}
+
+func describeOnboardChanges(changes []*apitypes.SchemaChangeResponse) []string {
+	var lines []string
+	for _, change := range changes {
 		if change == nil {
 			continue
 		}
@@ -610,8 +667,11 @@ func describeOnboardPlanChanges(result *apitypes.PlanResponse) []string {
 			}
 			lines = append(lines, fmt.Sprintf("%s/%s (%s): %s", change.Namespace, tableChange.TableName, strings.ToLower(tableChange.ChangeType), onboardDDLPreview(tableChange.DDL)))
 		}
-		if change.HasVSchemaChange() {
+		switch {
+		case change.ShowsVSchemaChange():
 			lines = append(lines, fmt.Sprintf("%s: vschema change", change.Namespace))
+		case change.NeedsFinalizer() && len(change.TableChanges) == 0:
+			lines = append(lines, fmt.Sprintf("%s: engine finalize requested", change.Namespace))
 		}
 	}
 	return lines

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"log/slog"
 	"os"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -381,4 +382,283 @@ func TestLocalClient_Apply_AttachNotBlockedByOwnSiblingTasks(t *testing.T) {
 	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
 	require.NoError(t, err)
 	assert.Len(t, ops, 2, "the same-shard sibling must attach as its own operation")
+}
+
+// memberTargetDispatchRequest is the whole-target dispatch the control plane
+// sends for one target of a deployment that addresses several: the
+// deployment's idempotency key, a manifest declaring every target's operation,
+// and the target named so the data plane keys the operation by it.
+func memberTargetDispatchRequest(planID, key, target string) *ternv1.ApplyRequest {
+	return &ternv1.ApplyRequest{
+		PlanId:                  planID,
+		Environment:             localClientTestEnvironment,
+		Database:                "testdb",
+		Type:                    "mysql",
+		Target:                  target,
+		IdempotencyKey:          key,
+		GenerationOperationKeys: []string{"payments-001", "payments-002"},
+		Options:                 map[string]string{dispatchMemberTargetOption: target},
+		DdlChanges: []*ternv1.TableChange{{
+			Namespace:  "testdb",
+			TableName:  "users",
+			Ddl:        "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		}},
+	}
+}
+
+// storeMemberTargetPlan stores a copy of a plan produced for one target, as the
+// planner stores each target's own plan of a deployment that addresses
+// several, and returns its identifier.
+func storeMemberTargetPlan(t *testing.T, stor storage.Storage, planID, target string) string {
+	t.Helper()
+	plan, err := stor.Plans().Get(t.Context(), planID)
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+	member := *plan
+	member.ID = 0
+	member.PlanIdentifier = planID + "-" + target
+	member.Target = target
+	_, err = stor.Plans().Create(t.Context(), &member)
+	require.NoError(t, err)
+	return member.PlanIdentifier
+}
+
+// A deployment addressing targets payments-001 and payments-002 dispatches
+// both under the deployment's one idempotency key, as the shards of a Vitess
+// deployment are. The first dispatch creates the remote apply and the second
+// attaches its own operation to it: the data plane keys each operation by its
+// target, echoes that key, and returns a distinct operation id, and
+// payments-001's pending work does not refuse payments-002 as a conflict,
+// because it belongs to the apply payments-002 attaches to. A replay of
+// either resolves to that target's own operation. A dispatch naming
+// payments-002 but carrying payments-001's plan is refused before it can run
+// that plan, so one target is never tracked as, or run as, another.
+func TestLocalClient_Apply_MemberTargetsShareTheDeploymentsApply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, basePlanID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	const key = "schemabot:v1:member-target-test"
+	firstPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+	secondPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-002")
+
+	first, err := client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, key, "payments-001"))
+	require.NoError(t, err)
+	require.True(t, first.Accepted, "the first target's dispatch must be accepted: %s", first.ErrorMessage)
+	assert.Equal(t, "payments-001", first.OperationKey, "the response must echo the target-qualified operation key")
+
+	second, err := client.Apply(ctx, memberTargetDispatchRequest(secondPlanID, key, "payments-002"))
+	require.NoError(t, err)
+	require.True(t, second.Accepted, "the second target must attach to the deployment's apply: %s", second.ErrorMessage)
+	assert.Equal(t, first.ApplyId, second.ApplyId, "both targets share the deployment's one apply")
+	assert.Equal(t, "payments-002", second.OperationKey)
+	assert.NotEqual(t, first.ApplyOperationId, second.ApplyOperationId, "each target owns its own operation")
+
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, first.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	assert.Equal(t, []string{"payments-001", "payments-002"}, apply.ExpectedOperationKeys)
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.Len(t, ops, 2)
+	byKey := map[string]*storage.ApplyOperation{}
+	for _, op := range ops {
+		byKey[op.OperationKey] = op
+	}
+	require.Contains(t, byKey, "payments-001")
+	require.Contains(t, byKey, "payments-002")
+	assert.Equal(t, strconv.FormatInt(byKey["payments-001"].ID, 10), first.ApplyOperationId)
+	assert.Equal(t, strconv.FormatInt(byKey["payments-002"].ID, 10), second.ApplyOperationId)
+	assert.Equal(t, "payments-001", byKey["payments-001"].Target)
+	assert.Equal(t, "payments-002", byKey["payments-002"].Target)
+
+	// The apply names the plan of the target dispatched first. Each target's
+	// drive runs the plan its own operation names, so payments-002 runs
+	// payments-002's plan and never payments-001's.
+	firstPlan, err := stor.Plans().Get(ctx, firstPlanID)
+	require.NoError(t, err)
+	require.NotNil(t, firstPlan)
+	secondPlan, err := stor.Plans().Get(ctx, secondPlanID)
+	require.NoError(t, err)
+	require.NotNil(t, secondPlan)
+	require.Equal(t, firstPlan.ID, apply.PlanID, "the apply names the plan of the dispatch that created it")
+	for target, wantPlan := range map[string]*storage.Plan{"payments-001": firstPlan, "payments-002": secondPlan} {
+		drivesPlan, err := client.drivePlanID(apply, byKey[target])
+		require.NoError(t, err)
+		assert.Equal(t, wantPlan.ID, drivesPlan, "%s's drive must run %s", target, wantPlan.PlanIdentifier)
+	}
+	assert.Equal(t, secondPlan.ID, byKey["payments-002"].PlanID, "the attached operation records the plan it was dispatched with")
+
+	replay, err := client.Apply(ctx, memberTargetDispatchRequest(secondPlanID, key, "payments-002"))
+	require.NoError(t, err)
+	require.True(t, replay.Accepted, "replay must be accepted: %s", replay.ErrorMessage)
+	assert.Equal(t, second.ApplyOperationId, replay.ApplyOperationId, "a replay resolves to that target's own operation")
+	assert.Equal(t, "payments-002", replay.OperationKey)
+
+	_, err = client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, key, "payments-002"))
+	require.Error(t, err, "a target dispatched under its sibling's plan must be refused")
+	assert.Contains(t, err.Error(), `which was produced for target "payments-001"`)
+
+	ops, err = stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 2, "the refused dispatch must not attach an operation")
+}
+
+// A direct caller dispatches payments-001's plan under one idempotency key,
+// once naming payments-001 as the rollout member and once naming no member,
+// with no generation manifest to hold the key set. The two shapes derive
+// different operation keys for the same target's work, so each is refused
+// once the apply holds the other: a replay under the other shape never
+// attaches a second copy of payments-001's DDL, in either order. A sibling
+// target of the same shape still attaches.
+func TestLocalClient_Apply_MemberTargetKeyingCannotMixWithinADeployment(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	memberDispatch := func(planID, key, target string) *ternv1.ApplyRequest {
+		req := memberTargetDispatchRequest(planID, key, target)
+		req.GenerationOperationKeys = nil
+		return req
+	}
+	unnamedDispatch := func(planID, key, target string) *ternv1.ApplyRequest {
+		req := memberDispatch(planID, key, target)
+		req.Options = nil
+		return req
+	}
+	operationKeys := func(t *testing.T, stor storage.Storage, applyID string) []string {
+		t.Helper()
+		apply, err := stor.Applies().GetByApplyIdentifier(t.Context(), applyID)
+		require.NoError(t, err)
+		require.NotNil(t, apply)
+		ops, err := stor.ApplyOperations().ListByApply(t.Context(), apply.ID)
+		require.NoError(t, err)
+		keys := make([]string, 0, len(ops))
+		for _, op := range ops {
+			keys = append(keys, op.OperationKey)
+		}
+		slices.Sort(keys)
+		return keys
+	}
+	t.Run("member dispatch first", func(t *testing.T) {
+		const key = "schemabot:v1:member-keying-member-first"
+		stor, client, basePlanID := setupAttachDispatchClient(t)
+		firstPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+		secondPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-002")
+
+		created, err := client.Apply(t.Context(), memberDispatch(firstPlanID, key, "payments-001"))
+		require.NoError(t, err)
+		require.True(t, created.Accepted, "the member dispatch must create the apply: %s", created.ErrorMessage)
+		assert.Equal(t, "payments-001", created.OperationKey)
+
+		unnamed, err := client.Apply(t.Context(), unnamedDispatch(firstPlanID, key, "payments-001"))
+		require.NoError(t, err)
+		assert.False(t, unnamed.Accepted, "a replay naming no member must not attach payments-001's DDL a second time")
+		assert.Contains(t, unnamed.ErrorMessage, "cannot share one deployment's apply")
+
+		sibling, err := client.Apply(t.Context(), memberDispatch(secondPlanID, key, "payments-002"))
+		require.NoError(t, err)
+		require.True(t, sibling.Accepted, "a sibling member target must still attach: %s", sibling.ErrorMessage)
+		assert.Equal(t, []string{"payments-001", "payments-002"}, operationKeys(t, stor, created.ApplyId))
+	})
+
+	t.Run("unnamed dispatch first", func(t *testing.T) {
+		const key = "schemabot:v1:member-keying-unnamed-first"
+		stor, client, basePlanID := setupAttachDispatchClient(t)
+		firstPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+
+		created, err := client.Apply(t.Context(), unnamedDispatch(firstPlanID, key, "payments-001"))
+		require.NoError(t, err)
+		require.True(t, created.Accepted, "the dispatch naming no member must create the apply: %s", created.ErrorMessage)
+		assert.Empty(t, created.OperationKey)
+
+		named, err := client.Apply(t.Context(), memberDispatch(firstPlanID, key, "payments-001"))
+		require.NoError(t, err)
+		assert.False(t, named.Accepted, "a replay naming the member must not attach payments-001's DDL a second time")
+		assert.Contains(t, named.ErrorMessage, "cannot share one deployment's apply")
+		assert.Equal(t, []string{""}, operationKeys(t, stor, created.ApplyId))
+	})
+}
+
+// A generation declares payments-001 and payments-002, but only payments-002
+// is ever dispatched, and it completes. Its apply stays open waiting for
+// payments-001. The operator re-runs the apply: the new generation is
+// admitted rather than refused as a conflict, because everything the held
+// apply attached has settled, and it records that it took over the held
+// apply's work. A payments-001 dispatch arriving late for the held apply is
+// then refused, so the held apply can never start work on a target the new
+// generation now owns.
+func TestLocalClient_Apply_RerunAdmittedPastSettledManifestHold(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	stor, client, basePlanID := setupAttachDispatchClient(t)
+	ctx := t.Context()
+	firstPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-001")
+	secondPlanID := storeMemberTargetPlan(t, stor, basePlanID, "payments-002")
+
+	const heldKey = "schemabot:v1:held-generation"
+	held, err := client.Apply(ctx, memberTargetDispatchRequest(secondPlanID, heldKey, "payments-002"))
+	require.NoError(t, err)
+	require.True(t, held.Accepted, "the held generation's dispatch must be accepted: %s", held.ErrorMessage)
+
+	heldApply := settleDispatchedApply(t, stor, held.ApplyId, state.Apply.Running)
+
+	rerun := memberTargetDispatchRequest(firstPlanID, "schemabot:v1:rerun-generation", "payments-001")
+	rerun.GenerationOperationKeys = []string{"payments-001"}
+	admitted, err := client.Apply(ctx, rerun)
+	require.NoError(t, err)
+	require.True(t, admitted.Accepted, "the re-run must be admitted past the settled hold: %s", admitted.ErrorMessage)
+	assert.NotEqual(t, held.ApplyId, admitted.ApplyId, "the re-run runs under its own apply")
+	storedHeld, err := stor.Applies().GetByApplyIdentifier(ctx, held.ApplyId)
+	require.NoError(t, err)
+	require.NotNil(t, storedHeld)
+	assert.Equal(t, admitted.ApplyId, storedHeld.SupersededBy, "the re-run records that it took over the held apply's work")
+
+	late, err := client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, heldKey, "payments-001"))
+	require.NoError(t, err)
+	assert.False(t, late.Accepted, "a late operation for the held apply must be refused while the re-run is in flight")
+	assert.Contains(t, late.ErrorMessage, "a newer apply took over the work of apply "+held.ApplyId,
+		"the refusal names the takeover, not the re-run's table conflict")
+
+	settleDispatchedApply(t, stor, admitted.ApplyId, state.Apply.Completed)
+	late, err = client.Apply(ctx, memberTargetDispatchRequest(firstPlanID, heldKey, "payments-001"))
+	require.NoError(t, err)
+	assert.False(t, late.Accepted, "a late operation for the held apply must be refused after the re-run finishes")
+	assert.Contains(t, late.ErrorMessage, "a newer apply took over the work of apply "+held.ApplyId)
+
+	ops, err := stor.ApplyOperations().ListByApply(ctx, heldApply.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the refused dispatches must not attach an operation")
+}
+
+// settleDispatchedApply records every task and operation of a dispatched apply
+// as completed, as its drive would once the work finished, records the apply
+// itself in applyState, and returns the apply.
+func settleDispatchedApply(t *testing.T, stor storage.Storage, applyIdentifier, applyState string) *storage.Apply {
+	t.Helper()
+	ctx := t.Context()
+	apply, err := stor.Applies().GetByApplyIdentifier(ctx, applyIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, apply)
+	tasks, err := stor.Tasks().GetByApplyID(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, tasks)
+	for _, task := range tasks {
+		task.State = state.Task.Completed
+		require.NoError(t, stor.Tasks().Update(ctx, task))
+	}
+	ops, err := stor.ApplyOperations().ListByApply(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotEmpty(t, ops)
+	for _, op := range ops {
+		require.NoError(t, stor.ApplyOperations().UpdateState(ctx, op.ID, state.ApplyOperation.Completed))
+	}
+	apply.State = applyState
+	require.NoError(t, stor.Applies().Update(ctx, apply))
+	return apply
 }

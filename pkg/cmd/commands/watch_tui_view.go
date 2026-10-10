@@ -43,14 +43,16 @@ func (m WatchModel) View() string {
 		return "No active schema change for this database.\n"
 	}
 	if len(m.operations) > 1 {
-		return m.multiDeploymentProgressView()
+		return m.fitToWindow(m.multiDeploymentProgressSections())
 	}
 
-	return m.progressView()
+	return m.fitToWindow(m.progressSections())
 }
 
-// progressView renders the progress display.
-func (m WatchModel) progressView() string {
+// progressSections renders the progress display as its body (the status line
+// and tables) and its footer (the outcome or the keys the operator can press),
+// so a view too tall for the window can give up body lines and keep the footer.
+func (m WatchModel) progressSections() (string, string) {
 	var b strings.Builder
 
 	// Sort tables by status priority (running first, then pending, then completed)
@@ -146,126 +148,127 @@ func (m WatchModel) progressView() string {
 		b.WriteString(templates.FormatThrottleReference(tables))
 	}
 
+	var f strings.Builder
 	// Footer based on state
 	isCuttingOver := state.IsState(m.state, state.Apply.CuttingOver) || m.cutoverTriggered
 
 	switch {
 	case state.IsState(m.state, state.Apply.Completed):
-		b.WriteString("\n\n")
-		b.WriteString(templates.FormatApplyCompleteWithSummary(countTableProgressChanges(m.tables).summary(), m.applyID))
-		b.WriteString("\n")
+		f.WriteString("\n\n")
+		f.WriteString(templates.FormatApplyCompleteWithSummary(countTableProgressChanges(m.tables).summary(), m.applyID))
+		f.WriteString("\n")
 	case state.IsState(m.state, state.Apply.Failed):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if m.errorMsg != "" {
 			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-			b.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
+			f.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
 		}
-		b.WriteString(templates.FormatApplyFailed())
-		b.WriteString("\n")
+		f.WriteString(templates.FormatApplyFailed())
+		f.WriteString("\n")
 	case state.IsState(m.state, state.Apply.Cancelled):
-		b.WriteString("\n\n")
-		b.WriteString("🚫 Schema change cancelled.\n")
-		b.WriteString("The deploy request has been cancelled. Start a new apply to retry.\n")
+		f.WriteString("\n\n")
+		f.WriteString("🚫 Schema change cancelled.\n")
+		f.WriteString("The deploy request has been cancelled. Start a new apply to retry.\n")
 	case state.IsState(m.state, state.Apply.Reverting):
-		b.WriteString("\n\n")
-		b.WriteString(m.spinner.View() + "Reverting — undoing the schema change...\n")
+		f.WriteString("\n\n")
+		f.WriteString(m.spinner.View() + "Reverting — undoing the schema change...\n")
 	case state.IsState(m.state, state.Apply.RevertWindow, state.Apply.SkippingRevert):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if state.IsState(m.state, state.Apply.SkippingRevert) || m.skipRevertTriggered || (m.metadata != nil && m.metadata["revert_skipped"] == "true") {
 			elapsed := ""
 			if !m.skipRevertAt.IsZero() {
 				elapsed = fmt.Sprintf(" (%ds)", int(time.Since(m.skipRevertAt).Seconds()))
 			}
-			b.WriteString(m.spinner.View() + "Finalizing — closing revert window..." + elapsed + "\n")
+			f.WriteString(m.spinner.View() + "Finalizing — closing revert window..." + elapsed + "\n")
 		} else {
-			b.WriteString("Schema change deployed. Revert window is open.\n\n")
-			b.WriteString("Press Enter to skip revert or ESC to detach\n")
+			f.WriteString("Schema change deployed. Revert window is open.\n\n")
+			f.WriteString("Press Enter to skip revert or ESC to detach\n")
 		}
 	case effectivelyStopped:
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if m.errorMsg != "" {
 			errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
-			b.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
+			f.WriteString(errStyle.Render("Error: "+m.errorMsg) + "\n\n")
 		}
-		b.WriteString(templates.FormatApplyStopped())
-		b.WriteString("\n")
+		f.WriteString(templates.FormatApplyStopped())
+		f.WriteString("\n")
 		if m.applyID != "" {
-			fmt.Fprintf(&b, "Use '%s start -e %s %s' to resume.\n", cliname.Name(), m.environment, m.applyID)
+			fmt.Fprintf(&f, "Use '%s start -e %s %s' to resume.\n", cliname.Name(), m.environment, m.applyID)
 		} else {
-			fmt.Fprintf(&b, "Use '%s status -d %s -e %s' to find the apply ID.\n", cliname.Name(), m.database, m.environment)
+			fmt.Fprintf(&f, "Use '%s status -d %s -e %s' to find the apply ID.\n", cliname.Name(), m.database, m.environment)
 		}
 	case isCuttingOver:
 		// During cutover, show minimal footer - no detach/stop allowed
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
-		b.WriteString(dimStyle.Render("Cutover in progress - please wait..."))
-		b.WriteString("\n")
+		f.WriteString(dimStyle.Render("Cutover in progress - please wait..."))
+		f.WriteString("\n")
 	case m.deployTriggered:
-		b.WriteString("\n\n")
-		b.WriteString(m.spinner.View() + "Deploying...\n")
+		f.WriteString("\n\n")
+		f.WriteString(m.spinner.View() + "Deploying...\n")
 	case state.IsState(m.state, state.Apply.WaitingForDeploy):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if m.deployRequestURL != "" {
-			b.WriteString("Deploy request created: " + m.deployRequestURL + "\n")
+			f.WriteString("Deploy request created: " + m.deployRequestURL + "\n")
 		} else {
-			b.WriteString("Deploy request created.\n")
+			f.WriteString("Deploy request created.\n")
 		}
 		if m.metadata != nil && m.metadata["is_instant"] == "true" {
-			b.WriteString("⚡ This change will be applied using instant mode.\n")
+			f.WriteString("⚡ This change will be applied using instant mode.\n")
 		}
-		b.WriteString("\n")
+		f.WriteString("\n")
 		if m.allowControlActions {
-			b.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
+			f.WriteString("Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&b, "To proceed: %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
+				fmt.Fprintf(&f, "To proceed: %s start -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 			} else {
-				fmt.Fprintf(&b, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
+				fmt.Fprintf(&f, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
 			}
-			b.WriteString("Watching for deploy... (ESC to detach)\n")
+			f.WriteString("Watching for deploy... (ESC to detach)\n")
 		}
 	case state.IsState(m.state, state.Apply.WaitingForCutover):
-		b.WriteString("\n\n")
-		b.WriteString("Row copy complete. All data has been copied and new writes\n")
-		b.WriteString("continue to be replicated to keep the shadow table in sync.\n\n")
+		f.WriteString("\n\n")
+		f.WriteString("Row copy complete. All data has been copied and new writes\n")
+		f.WriteString("continue to be replicated to keep the shadow table in sync.\n\n")
 		if m.allowControlActions {
-			b.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
+			f.WriteString("Press Enter to proceed with cutover (or ESC to detach)\n")
 		} else {
 			if m.applyID != "" {
-				fmt.Fprintf(&b, "To proceed: %s cutover -e %s %s\n", cliname.Name(), m.environment, m.applyID)
+				fmt.Fprintf(&f, "To proceed: %s cutover -e %s %s\n", cliname.Name(), m.environment, m.applyID)
 			} else {
-				fmt.Fprintf(&b, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
+				fmt.Fprintf(&f, "To find the apply ID: %s status -d %s -e %s\n", cliname.Name(), m.database, m.environment)
 			}
-			b.WriteString("Watching for cutover... (ESC to detach)\n")
+			f.WriteString("Watching for cutover... (ESC to detach)\n")
 		}
 	case state.IsState(m.state, state.Apply.Recovering):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		if pct, ok := recoveringCopyPercent(m.tables); ok {
-			fmt.Fprintf(&b, "SchemaBot is recovering after restart.\nRow copy is in progress (%s); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
+			fmt.Fprintf(&f, "SchemaBot is recovering after restart.\nRow copy is in progress (%s); once recovery completes, progress returns to the normal row-copy view. (ESC to detach)\n", pct)
 		} else {
-			b.WriteString("SchemaBot is recovering after restart.\n")
-			b.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
+			f.WriteString("SchemaBot is recovering after restart.\n")
+			f.WriteString("Cutover will be available once recovery completes. (ESC to detach)\n")
 		}
 	case state.IsRunningApplyState(m.state):
-		b.WriteString("\n\n")
-		b.WriteString(m.formatFooter())
-		b.WriteString("\n")
+		f.WriteString("\n\n")
+		f.WriteString(m.formatFooter())
+		f.WriteString("\n")
 	case state.IsSetupPhase(m.state):
-		b.WriteString("\n\n")
+		f.WriteString("\n\n")
 		dimStyle := lipgloss.NewStyle().Faint(true)
-		b.WriteString(dimStyle.Render("ESC to detach"))
-		b.WriteString("\n")
+		f.WriteString(dimStyle.Render("ESC to detach"))
+		f.WriteString("\n")
 	}
 
 	// Fetch error during active progress (mid-flight). State and tables are
 	// preserved from the last successful poll; the error tells the user
 	// the server is currently unreachable.
 	if m.errorMsg != "" && m.consecutiveErrors > 0 {
-		b.WriteString("\n")
-		b.WriteString(m.fetchErrorLine())
+		f.WriteString("\n")
+		f.WriteString(m.fetchErrorLine())
 	}
 
-	return b.String()
+	return b.String(), f.String()
 }
 
 // fetchErrorLine formats the fetch error with consecutive failure count.

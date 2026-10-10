@@ -69,6 +69,9 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
+func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string, string) error {
+	return nil
+}
 func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
@@ -76,6 +79,18 @@ type capturingPlanStore struct {
 	mockPlanLookupStore
 	created   *storage.Plan
 	createErr error
+	// routed records each UpdateRoute call as "plan_id deployment/target",
+	// followed by " narrowed to <member>" for a narrowed plan.
+	routed []string
+}
+
+func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target, narrowedTo string) error {
+	call := planIdentifier + " " + deployment + "/" + target
+	if narrowedTo != "" {
+		call += " narrowed to " + narrowedTo
+	}
+	s.routed = append(s.routed, call)
+	return nil
 }
 
 func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int64, error) {
@@ -259,6 +274,39 @@ func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifi
 }
 func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 	return s.apply, s.err
+}
+
+// finishedAfterReadApplyStore hands a lookup a copy of the apply in readState
+// while the stored row is already finished: the view a handler holds when a
+// driver finishes the apply after the handler read it. Update refuses stopped
+// over a settled row the way the storage finished-apply guard does, and Get returns
+// the stored row.
+type finishedAfterReadApplyStore struct {
+	storage.ApplyStore
+	stored         *storage.Apply
+	readState      string
+	refusedUpdates int
+}
+
+func (s *finishedAfterReadApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
+	read := *s.stored
+	read.State = s.readState
+	read.CompletedAt = nil
+	return &read, nil
+}
+
+func (s *finishedAfterReadApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	stored := *s.stored
+	return &stored, nil
+}
+
+func (s *finishedAfterReadApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	if state.IsState(apply.State, state.Apply.Stopped) && state.IsState(s.stored.State, state.SettledApplyStates...) {
+		s.refusedUpdates++
+		return fmt.Errorf("apply %s is %s: %w", s.stored.ApplyIdentifier, s.stored.State, storage.ErrApplyReopenRefused)
+	}
+	*s.stored = *apply
+	return nil
 }
 func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
 	return nil
@@ -833,13 +881,16 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr      error
-	planResp       *ternv1.PlanResponse
-	planErr        error
-	planReq        *ternv1.PlanRequest
-	planDiffResp   *ternv1.PlanDiffResponse
-	planDiffErr    error
-	planDiffReq    *ternv1.PlanRequest
+	healthErr    error
+	planResp     *ternv1.PlanResponse
+	planErr      error
+	planReq      *ternv1.PlanRequest
+	planDiffResp *ternv1.PlanDiffResponse
+	planDiffErr  error
+	planDiffReq  *ternv1.PlanRequest
+	// planDiffMu guards planDiffReq: a rollout plan diffs its members
+	// concurrently, so one client can serve several diffs at once.
+	planDiffMu     sync.Mutex
 	pullSchemaResp *ternv1.PullSchemaResponse
 	pullSchemaErr  error
 	pullSchemaReq  *ternv1.PullSchemaRequest
@@ -916,7 +967,9 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	return nil, m.planErr
 }
 func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	m.planDiffMu.Lock()
 	m.planDiffReq = req
+	m.planDiffMu.Unlock()
 	if m.planDiffResp != nil {
 		return m.planDiffResp, m.planDiffErr
 	}
@@ -1593,9 +1646,20 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		assert.Empty(t, plans.created.SchemaPath)
 	})
 
-	t.Run("duplicate plan identifier is tolerated", func(t *testing.T) {
+	// A planner that shares the service's storage stores the row for a plan
+	// with changes first, stamped with the database it was configured with as
+	// the deployment. The service keeps that row and restamps it with the
+	// rollout member it planned, so the apply can find the primary target by it.
+	t.Run("duplicate plan identifier keeps the stored row on the planned route", func(t *testing.T) {
 		svc, _, plans := newPolicyService()
 		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     "payments",
+			Target:         "payments-staging-target",
+		}
 		pr := int32(1)
 
 		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
@@ -1613,6 +1677,52 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		require.NotNil(t, resp)
 		require.NotNil(t, plans.created)
 		assert.Equal(t, "schema/payments", plans.created.SchemaPath)
+		assert.Equal(t, []string{"plan-source-policy " + DefaultDeployment + "/payments-staging-target"}, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier already on the planned route is kept as is", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     DefaultDeployment,
+			Target:         "payments-staging-target",
+		}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.NoError(t, err)
+		assert.Empty(t, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier for another database fails the plan", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{PlanIdentifier: "plan-source-policy", Database: "orders", Environment: "staging"}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "collides with a stored plan for database \"orders\"")
+		assert.Empty(t, plans.routed)
 	})
 }
 
@@ -3367,7 +3477,11 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
+	// A rollout-wide apply runs from the rollout primary's plan.
+	plan := executeApplyTestPlan()
+	plan.Deployment = "default-a"
+	plan.Target = "testdb-a"
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -4026,6 +4140,69 @@ func TestProgressByApplyIDDisplaysStoredStateNotLiveProto(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, state.Apply.WaitingForCutover, resp.State,
 		"displayed state must come from the stored apply state, not the live engine proto")
+}
+
+func TestProgressByApplyIDOverlaysTaskTimestampsByCanonicalStatement(t *testing.T) {
+	// A deployment's progress projection spells each statement as its own
+	// engine emitted it, qualified with its own physical schema, while the
+	// stored task rows carry the reviewed text. The per-table timestamps live
+	// only on the task rows, so each projected statement must find its task by
+	// canonical form: two statements on one table each get their own
+	// timestamps, and a projected statement that is a different change on
+	// that table gets none rather than a sibling's.
+	started := time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)
+	completed := started.Add(2 * time.Minute)
+	indexStarted := started.Add(3 * time.Minute)
+	const (
+		reviewedCreate = `CREATE TABLE "app-region-a".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
+		reviewedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-a".recall USING btree (consumer_uuid)`
+		renderedCreate = `CREATE TABLE "app-region-b".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
+		renderedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall USING btree (consumer_uuid)`
+		renderedOther  = `CREATE INDEX idx_recall_agency ON "app-region-b".recall USING btree (agency_id)`
+	)
+	mock := &mockTernClient{
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			ApplyId: "remote-apply-canon",
+			State:   ternv1.State_STATE_RUNNING,
+			Tables: []*ternv1.TableProgress{
+				{Namespace: "app", TableName: "recall", Ddl: renderedCreate, Status: state.Task.Completed, PercentComplete: 100},
+				{Namespace: "app", TableName: "recall", Ddl: renderedIndex, Status: state.Task.Running, PercentComplete: 40},
+				{Namespace: "app", TableName: "recall", Ddl: renderedOther, Status: state.Task.Pending},
+			},
+		},
+	}
+	apply := activeTestApply("apply-canon-overlay")
+	apply.ExternalID = "remote-apply-canon"
+	apply.DatabaseType = storage.DatabaseTypePostgres
+	tasks := []*storage.Task{
+		{ID: 1, TaskIdentifier: "task-create", ApplyID: apply.ID, Namespace: "app", TableName: "recall", DDL: reviewedCreate, State: state.Task.Completed, StartedAt: &started, CompletedAt: &completed},
+		{ID: 2, TaskIdentifier: "task-index", ApplyID: apply.ID, Namespace: "app", TableName: "recall", DDL: reviewedIndex, State: state.Task.Running, StartedAt: &indexStarted},
+	}
+	svc := newControlTestServiceWithTasks(mock, apply, tasks)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-canon-overlay", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Tables, 3)
+
+	assert.Equal(t, renderedCreate, resp.Tables[0].DDL, "the projection keeps the deployment's own spelling")
+	assert.Equal(t, started.Format(time.RFC3339), resp.Tables[0].StartedAt)
+	assert.Equal(t, completed.Format(time.RFC3339), resp.Tables[0].CompletedAt)
+
+	assert.Equal(t, renderedIndex, resp.Tables[1].DDL)
+	assert.Equal(t, indexStarted.Format(time.RFC3339), resp.Tables[1].StartedAt)
+	assert.Empty(t, resp.Tables[1].CompletedAt)
+
+	assert.Equal(t, renderedOther, resp.Tables[2].DDL)
+	assert.Empty(t, resp.Tables[2].StartedAt, "a different change on the table must not borrow a sibling's timestamps")
+	assert.Empty(t, resp.Tables[2].CompletedAt)
 }
 
 func TestProgressByApplyIDOnlySendsApplyIDAndEnvironment(t *testing.T) {
@@ -5219,6 +5396,7 @@ func TestHandleStatusDeploymentFilterProjectsMatchingOperation(t *testing.T) {
 	assert.Equal(t, "remote-operation-202", resp.Applies[0].ExternalOperationID)
 	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
 	assert.Equal(t, state.Apply.Completed, resp.Applies[0].State)
+	assert.Equal(t, state.Apply.Running, resp.Applies[0].ApplyState, "the parent's state is reported beside the operation's, since the apply still holds the deployment")
 }
 
 // A deployment applied per shard has exactly one data-plane apply, so the
@@ -5702,6 +5880,19 @@ func TestServiceClose(t *testing.T) {
 	assert.NoError(t, svc.Close())
 }
 
+// serveApplyRequest sends body to POST /api/apply through the service's routes
+// and returns the recorded response.
+func serveApplyRequest(t *testing.T, svc *Service, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	return w
+}
+
 func TestApplyHandler(t *testing.T) {
 	t.Run("returns bad request for unsupported apply feature", func(t *testing.T) {
 		plan := executeApplyTestPlan()
@@ -5723,6 +5914,108 @@ func TestApplyHandler(t *testing.T) {
 		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
 		assert.Equal(t, `apply rejected: database "testdb": deferred cutover is not supported for database_type: postgres`, resp.Error)
 		assert.Nil(t, applies.apply)
+	})
+
+	// A caller naming a plan_id SchemaBot never stored gets a 404 telling them
+	// to check the ID, not a 500 that reads like a server outage.
+	t.Run("returns not found for an unknown plan", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, tasks := newQueueApplyTestService(nil, &mockTernClient{}, applies)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-missing","environment":"staging"}`)
+
+		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Equal(t, "apply rejected: plan not found: plan-missing; check the plan_id or create a new plan", resp.Error)
+		assert.Nil(t, applies.apply, "an unknown plan must not store an apply")
+		assert.Empty(t, tasks.tasks)
+	})
+
+	// A plan store that reports a missing plan through the ErrPlanNotFound
+	// sentinel instead of a nil plan gets the same 404, not the 500 reserved
+	// for a read that actually failed.
+	t.Run("returns not found when the store reports the missing plan as an error", func(t *testing.T) {
+		logger := slog.New(slog.DiscardHandler)
+		plans := &mockPlanLookupStore{err: storage.ErrPlanNotFound}
+		svc := New(&mockStorageWithPlanLookup{plans: plans}, testServerConfig(), nil, logger)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-missing","environment":"staging"}`)
+
+		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Equal(t, "apply rejected: plan not found: plan-missing; check the plan_id or create a new plan", resp.Error)
+	})
+
+	// A plan reviewed for staging is refused when the caller asks to apply it
+	// to production: the request is wrong, so it is a 400 naming both
+	// environments, and nothing is queued against production.
+	t.Run("returns bad request when the plan was created for another environment", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, tasks := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"production"}`)
+
+		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+		assert.Equal(t, `apply rejected: plan plan-1 was created for environment "staging", not "production"; apply it to "staging" or create a plan for "production"`, resp.Error)
+		assert.Nil(t, applies.apply, "a mismatched environment must not store an apply")
+		assert.Empty(t, tasks.tasks)
+	})
+
+	// A stored plan missing either routing field is a 400 naming that field:
+	// the request cannot supply what the plan lacks, so the caller is told to
+	// create a new plan. Both fields are checked because each has its own
+	// branch, and nothing is queued for either.
+	t.Run("returns bad request when the plan lacks routing metadata", func(t *testing.T) {
+		missingDeployment := executeApplyTestPlan()
+		missingDeployment.Deployment = ""
+		missingTarget := executeApplyTestPlan()
+		missingTarget.Target = ""
+
+		cases := map[string]*storage.Plan{
+			"deployment": missingDeployment,
+			"target":     missingTarget,
+		}
+		for field, plan := range cases {
+			t.Run(field, func(t *testing.T) {
+				applies := &capturingApplyStore{}
+				svc, tasks := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+
+				w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+				require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+				var resp apitypes.ErrorResponse
+				require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+				assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+				assert.Equal(t, fmt.Sprintf(`apply rejected: plan plan-1 is missing server-side routing metadata field %q; create a new plan and retry apply`, field), resp.Error)
+				assert.Nil(t, applies.apply, "a plan without routing metadata must not store an apply")
+				assert.Empty(t, tasks.tasks)
+			})
+		}
+	})
+
+	// When the plan read itself fails, the apply is a server failure: a 500
+	// with the storage error code, and the raw storage error (which can carry
+	// hostnames) stays in the server log rather than the response.
+	t.Run("returns internal error without storage detail when the plan lookup fails", func(t *testing.T) {
+		logger := slog.New(slog.DiscardHandler)
+		storageErr := errors.New("dial tcp 10.0.0.5:3306: connect: connection refused")
+		svc := New(&mockStorageWithPlanLookup{plans: &mockPlanLookupStore{err: storageErr}}, testServerConfig(), nil, logger)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Equal(t, "apply failed: failed to get plan plan-1; see server logs, then retry", resp.Error)
+		assert.NotContains(t, w.Body.String(), "10.0.0.5")
 	})
 
 	t.Run("returns conflict when an active apply already exists", func(t *testing.T) {
@@ -6647,6 +6940,69 @@ func TestStartHandler(t *testing.T) {
 		require.NoError(t, err, "failed to decode response")
 		assert.True(t, resp.Accepted, "expected accepted=true")
 		assert.Equal(t, int64(1), resp.StartedCount)
+	})
+
+	// The handler reads a running apply with a pending stop, and the data plane
+	// reports it stopped; before the handler records that, a driver finishes
+	// the apply. Storage refuses to write stopped over the completed row, so
+	// the start is refused for the verdict that won, nothing is queued, and the
+	// stop request stays pending for whoever finished the apply.
+	t.Run("refuses start when the apply finished during the remote stop check", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_STOPPED,
+				Tables: []*ternv1.TableProgress{{
+					TableName: "users",
+					Status:    state.Task.Stopped,
+				}},
+			},
+		}
+		completedAt := time.Now().Add(-time.Second)
+		stored := activeTestApply("apply-remote-stop-finished")
+		stored.ExternalID = "remote-apply-stop-finished"
+		stored.State = state.Apply.Completed
+		stored.CompletedAt = &completedAt
+		applies := &finishedAfterReadApplyStore{stored: stored, readState: state.Apply.Running}
+		controls := &memoryControlRequestStore{}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorageWithApplyStores{
+			applies:  applies,
+			tasks:    &capturingTaskStore{},
+			controls: controls,
+		}, testServerConfig(), map[string]tern.Client{
+			"default/staging": mock,
+		}, logger)
+		_, alreadyPending, err := controls.RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID:     stored.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-stop-finished", "caller": "cli:starter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), state.Apply.Completed, "the refusal names the stored verdict")
+		require.NotNil(t, mock.progressReq)
+		assert.Nil(t, mock.startReq)
+		assert.Equal(t, state.Apply.Completed, stored.State, "the finished apply keeps its verdict")
+		assert.Equal(t, 1, applies.refusedUpdates, "the handler tried to record stopped exactly once")
+		pendingStop, err := controls.GetPending(t.Context(), stored.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, pendingStop, "the stop request stays with whoever finished the apply")
+		assert.Equal(t, "cli:stopper", pendingStop.RequestedBy)
+		pendingStart, err := controls.GetPending(t.Context(), stored.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		assert.Nil(t, pendingStart, "no start is queued against a finished apply")
 	})
 
 	t.Run("returns already requested for remote duplicate after operator claim", func(t *testing.T) {
@@ -7677,4 +8033,74 @@ func TestSetRevertSkippedMetadata(t *testing.T) {
 	now := time.Now()
 	setRevertSkippedMetadata(resp, &storage.Apply{RevertSkippedAt: &now})
 	assert.Equal(t, "true", resp.Metadata["revert_skipped"], "flag set once revert_skipped_at is present")
+}
+
+// A gRPC apply is polled from two sources over its life: control-plane storage
+// while it is queued and once it is terminal, and the data plane's own progress
+// while it runs. The data plane mints its own task identifiers and knows
+// nothing of the control plane's operation rows, so a watcher keying its
+// per-table state on task_id would otherwise see the same statement under two
+// identities. Every source must report the stored task's identity and rollout
+// member.
+func TestProgressByApplyIDReportsOneTaskIdentityAcrossProgressSources(t *testing.T) {
+	const (
+		reviewed = "ALTER TABLE orders ADD COLUMN status INT"
+		rendered = "alter table `orders` add column `status` int"
+	)
+	opID := int64(41)
+	mock := &mockTernClient{
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			ApplyId: "remote-apply-identity",
+			State:   ternv1.State_STATE_RUNNING,
+			Tables: []*ternv1.TableProgress{
+				{Namespace: "testdb", TableName: "orders", Ddl: rendered, Status: state.Task.Running, TaskId: "task-data-plane", PercentComplete: 40},
+			},
+		},
+	}
+	apply := activeTestApply("apply-task-identity")
+	apply.ExternalID = ""
+	tasks := []*storage.Task{
+		{ID: 1, TaskIdentifier: "task-control-plane", ApplyID: apply.ID, ApplyOperationID: &opID, Namespace: "testdb", TableName: "orders", DDL: reviewed, State: state.Task.Pending},
+	}
+	operations := []*storage.ApplyOperation{
+		{ID: opID, ApplyID: apply.ID, Deployment: "commerce-a", Target: "shop-001", State: state.ApplyOperation.Running},
+	}
+	svc := newControlTestServiceWithOperations(mock, apply, tasks, operations)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	poll := func(t *testing.T) *apitypes.TableProgressResponse {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-task-identity", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var resp apitypes.ProgressResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		require.Len(t, resp.Tables, 1)
+		return resp.Tables[0]
+	}
+	assertIdentity := func(t *testing.T, tbl *apitypes.TableProgressResponse) {
+		t.Helper()
+		assert.Equal(t, "task-control-plane", tbl.TaskID)
+		assert.Equal(t, "commerce-a", tbl.Deployment)
+		assert.Equal(t, "shop-001", tbl.Target)
+	}
+
+	queued := poll(t)
+	require.Nil(t, mock.progressReq, "a queued remote apply is served from storage")
+	assertIdentity(t, queued)
+
+	apply.ExternalID = "remote-apply-identity"
+	tasks[0].State = state.Task.Running
+	active := poll(t)
+	require.NotNil(t, mock.progressReq, "an active remote apply is proxied to the data plane")
+	assert.Equal(t, rendered, active.DDL, "the projection keeps the deployment's own spelling")
+	assert.Equal(t, int32(40), active.PercentComplete, "live figures come from the data plane")
+	assertIdentity(t, active)
+
+	apply.State = state.Apply.Completed
+	tasks[0].State = state.Task.Completed
+	assertIdentity(t, poll(t))
 }

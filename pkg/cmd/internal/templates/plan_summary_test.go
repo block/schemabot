@@ -1,11 +1,15 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
-	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/schema"
+	webhooktemplates "github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestDDLSummaryParts_DeduplicatesTableChanges(t *testing.T) {
@@ -50,14 +54,57 @@ func TestPlanSummarySurfacesShareCounts(t *testing.T) {
 		}}},
 	}
 
-	assert.Equal(t, []string{"1 table to create", "2 tables to alter", "1 other DDL statement"}, ddlSummaryParts(cliChanges))
-	assert.Equal(t, "1 create, 2 alters, 1 other DDL statement", webhooktemplates.SummarizeChanges(commentData))
+	assert.Equal(t, []string{"1 table to create", "2 tables to alter", "1 index to create"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "1 create, 2 alters, 1 index create", webhooktemplates.SummarizeChanges(commentData))
+}
+
+// A CREATE INDEX on a table no other statement touches is one index to
+// create on both surfaces, not a table to alter, and a PostgreSQL DROP INDEX
+// is one index to drop on both even though only the CLI's change record
+// carries the table the engine resolved for it.
+func TestPlanSummarySurfacesShareIndexCounts(t *testing.T) {
+	cliChanges := []DDLChange{
+		{ChangeType: "CHANGE_TYPE_ALTER", TableName: "orders"},
+		{ChangeType: "CHANGE_TYPE_CREATE_INDEX", TableName: "events"},
+		{ChangeType: "CHANGE_TYPE_DROP_INDEX", TableName: "orders"},
+	}
+	commentData := webhooktemplates.PlanCommentData{
+		DatabaseType: "postgres",
+		Changes: []webhooktemplates.KeyspaceChangeData{{Keyspace: "app", Statements: []string{
+			"ALTER TABLE orders ADD COLUMN state text",
+			"CREATE INDEX CONCURRENTLY events_at_idx ON events (occurred_at)",
+			"DROP INDEX CONCURRENTLY orders_legacy_idx",
+		}}},
+	}
+
+	assert.Equal(t, []string{"1 table to alter", "1 index to create", "1 index to drop"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "1 alter, 1 index create, 1 index drop", webhooktemplates.SummarizeChanges(commentData))
+}
+
+// A CREATE INDEX planned as its own step on a table the same plan creates is
+// one table to create and one index to create on both surfaces: the index is
+// its own apply task, and the table is never also counted as a table to alter.
+func TestPlanSummarySurfacesCountIndexOnNewTableAsIndexWork(t *testing.T) {
+	cliChanges := []DDLChange{
+		{ChangeType: "CHANGE_TYPE_CREATE", TableName: "widgets"},
+		{ChangeType: "CHANGE_TYPE_CREATE_INDEX", TableName: "widgets"},
+	}
+	commentData := webhooktemplates.PlanCommentData{
+		DatabaseType: "postgres",
+		Changes: []webhooktemplates.KeyspaceChangeData{{Keyspace: "app", Statements: []string{
+			"CREATE TABLE widgets (id bigint PRIMARY KEY, sku text)",
+			"CREATE INDEX CONCURRENTLY widgets_sku_idx ON widgets (sku)",
+		}}},
+	}
+
+	assert.Equal(t, []string{"1 table to create", "1 index to create"}, ddlSummaryParts(cliChanges))
+	assert.Equal(t, "1 create, 1 index create", webhooktemplates.SummarizeChanges(commentData))
 }
 
 // The CLI plan summary counts every statement the plan will run, matching the
-// PR comment: statements outside the create/alter/drop buckets are named in a
-// mixed plan and a plan made only of them reports its raw total, so an
-// index-only or type-only plan never prints a blank summary.
+// PR comment: index work is named in its own clauses, statements outside every
+// bucket are named in a mixed plan, and a plan made only of them reports its
+// raw total, so a type-only plan never prints a blank summary.
 func TestWritePlanSummary_CountsEveryStatement(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -79,14 +126,22 @@ func TestWritePlanSummary_CountsEveryStatement(t *testing.T) {
 			changes: []DDLChange{
 				{ChangeType: "alter", TableName: "orders"},
 				{ChangeType: "create_index", TableName: "orders"},
+				{ChangeType: "create_index", TableName: "events"},
 				{ChangeType: "other", TableName: "order_state"},
 			},
-			want: "📋 Plan: 1 table to alter, 2 other DDL statements\n\n",
+			want: "📋 Plan: 1 table to alter, 2 indexes to create, 1 other DDL statement\n\n",
+		},
+		{
+			name: "index work only is named as index work",
+			changes: []DDLChange{
+				{ChangeType: "drop_index", TableName: "orders"},
+			},
+			want: "📋 Plan: 1 index to drop\n\n",
 		},
 		{
 			name: "only unbucketed statements report the raw total",
 			changes: []DDLChange{
-				{ChangeType: "create_index", TableName: "orders"},
+				{ChangeType: "other", TableName: "order_state"},
 			},
 			want: "📋 Plan: 1 DDL statement\n\n",
 		},
@@ -104,13 +159,43 @@ func TestWritePlanSummary_CountsEveryStatement(t *testing.T) {
 }
 
 // The vschema variant shares the DDL clauses with WritePlanSummary and appends
-// the vschema count, so a per-shard index plus a vschema update names both.
+// the vschema count, so a per-shard index drop plus a vschema update names both.
 func TestWritePlanSummaryWithVSchema_CountsEveryStatement(t *testing.T) {
 	out := captureStdout(t, func() {
 		WritePlanSummaryWithVSchema(
-			[]DDLChange{{ChangeType: "create_index", TableName: "orders"}},
+			[]DDLChange{{ChangeType: "drop_index", TableName: "orders"}},
 			[]VSchemaChange{{Keyspace: "orders"}},
 		)
 	})
-	assert.Equal(t, "📋 **Plan**: 1 DDL statement, 1 VSchema change\n\n", out)
+	assert.Equal(t, "📋 Plan: 1 index to drop, 1 VSchema change\n\n", out)
+}
+
+// A terminal does not render markdown, so the VSchema-aware summary writer
+// prints the same plain summary line as WritePlanSummary for the same DDL.
+func TestWritePlanSummaryWithVSchema_MatchesThePlainSummaryLine(t *testing.T) {
+	changes := []DDLChange{{ChangeType: "CREATE", TableName: "orders"}, {ChangeType: "ALTER", TableName: "users"}}
+	plain := captureStdout(t, func() { WritePlanSummary(changes) })
+	withVSchema := captureStdout(t, func() { WritePlanSummaryWithVSchema(changes, nil) })
+	assert.Equal(t, "📋 Plan: 1 table to create, 1 table to alter\n\n", plain)
+	assert.Equal(t, plain, withVSchema)
+}
+
+// Six keyspaces add the same table and the engine finalizes each. The finalize
+// is part of the DDL's work, so they collapse like any keyspaces with identical
+// DDL. Keyspaces whose only work is a finalize keep a line each instead.
+func TestWriteNamespaceChangesCollapsesFinalizedKeyspacesWithTheSameDDL(t *testing.T) {
+	changes := []DDLChange{{ChangeType: "create", TableName: "refunds", DDL: "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"}}
+	var withDDL, finalizeOnly []NamespaceChange
+	for _, ks := range []string{"payments_001", "payments_002", "payments_003", "payments_004", "payments_005", "payments_006"} {
+		withDDL = append(withDDL, NamespaceChange{Namespace: ks, Changes: changes, Finalize: true})
+		finalizeOnly = append(finalizeOnly, NamespaceChange{Namespace: ks, Finalize: true})
+	}
+
+	collapsed := ansi.Strip(captureStdout(t, func() { WriteNamespaceChanges(withDDL, false, "payments", schema.DialectMySQL) }))
+	assert.Contains(t, collapsed, "... and 3 more keyspaces with identical changes")
+	assert.Equal(t, 1, strings.Count(collapsed, "+ refunds"), "%s", collapsed)
+	assert.NotContains(t, collapsed, "Finalized by the engine")
+
+	listed := ansi.Strip(captureStdout(t, func() { WriteNamespaceChanges(finalizeOnly, false, "payments", schema.DialectMySQL) }))
+	assert.Equal(t, 6, strings.Count(listed, "~ Finalized by the engine once every shard's DDL has landed"), "%s", listed)
 }

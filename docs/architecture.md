@@ -221,6 +221,7 @@ When applying, users can pass options that control execution:
 | `--defer-deploy` | Hold the change before any work starts until manually started (Vitess only). |
 | `--skip-revert` | Skip the revert window that normally opens after cutover (Vitess only), finalizing the change immediately. |
 | `--allow-unsafe` | Permit destructive changes (see [Unsafe Changes](#unsafe-changes) below). |
+| `--target <target>` | Plan and apply one target of the environment's rollout only (see [Apply to one target of a rollout](cli.md#apply-to-one-target-of-a-rollout)). `plan` takes it too. |
 
 ### Unsafe Changes
 
@@ -264,8 +265,9 @@ Users can control a running schema change via CLI, PR comments, or PlanetScale U
 Not every engine supports every operation — [Engines](engines.md) has the per-engine
 capability matrix and where in a change's life each operation acts.
 
-SchemaBot exposes no throughput control. On Spirit, the copy autoscales its write
-threads from live throttler feedback. On Vitess, throughput is a property of the
+SchemaBot exposes no throughput control. On Spirit, the copy autoscales its
+thread pools from live throttler feedback on Aurora targets; on other MySQL
+targets it runs at fixed thread counts. On Vitess, throughput is a property of the
 deploy request itself: adjust its throttle directly in the PlanetScale console,
 where the setting is the one the platform actually applies.
 

@@ -17,6 +17,7 @@ type RollbackCmd struct {
 	AutoApprove  bool   `short:"y" help:"Skip confirmation prompt" name:"auto-approve"`
 	Watch        bool   `short:"w" help:"Watch progress until completion" default:"true" negatable:""`
 	DeferCutover bool   `help:"Defer cutover until manual trigger" name:"defer-cutover"`
+	AllowUnsafe  bool   `help:"Allow destructive changes (DROP TABLE, DROP COLUMN, etc.)" name:"allow-unsafe"`
 }
 
 // Run executes the rollback command.
@@ -79,9 +80,25 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 	templates.WriteRollbackPlan(planResult, cmd.ApplyID)
 
-	// Disclose unsafe changes before the confirmation prompt. Rollback has no
-	// --allow-unsafe flag; the interactive confirmation is the acknowledgment.
-	templates.WriteUnsafeChangesWarning(planResult.UnsafeChanges())
+	// A rollback plan gets the same execution verdicts as an apply plan, and
+	// the server refuses to submit a blocked one, so it is refused here,
+	// below the plan that shows the refused statement, before any prompt or
+	// lock.
+	if err := blockedPlanError("rollback", planResult); err != nil {
+		return err
+	}
+
+	// Unsafe changes need --allow-unsafe, exactly as for apply. Neither the
+	// confirmation prompt nor -y stands in for it: a rollback that drops a table
+	// is as destructive as an apply that does.
+	unsafeChanges := planResult.UnsafeChanges()
+	if len(unsafeChanges) > 0 && !cmd.AllowUnsafe {
+		templates.WriteUnsafeChangesBlocked(unsafeChanges, fmt.Sprintf("rollback %s -e %s --allow-unsafe", cmd.ApplyID, cmd.Environment))
+		return ErrSilent
+	}
+	if cmd.AllowUnsafe {
+		templates.WriteUnsafeWarningAllowed(unsafeChanges, templates.UnsafeConsentAllowFlag)
+	}
 
 	// Show options if any flags are set
 	templates.WriteOptions(cmd.DeferCutover, false)
@@ -142,6 +159,12 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 
 	fmt.Println("\nApplying rollback...")
 
-	err = applyAndWatch(ep, planResult, database, environment, owner, "rollback", cmd.DeferCutover, false, false, true, "", cmd.Watch, OutputFormatInteractive, 0)
+	// A rollback has one plan, and it is the plan every member it runs on
+	// runs: the server refuses to roll back an apply narrowed to one member,
+	// pairs each member of a mirrored environment with this plan, and refuses
+	// a rollout-wide rollback where members are planned on their own, since
+	// none of them has a rollback plan. So showing this plan shows what runs
+	// on every member, though not which members those are.
+	_, err = applyAndWatch(ep, planResult, true, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
 	return err
 }

@@ -89,6 +89,25 @@ func recordHistogram(ctx context.Context, name string, value float64, descriptio
 	hist.Record(ctx, value, otelmetric.WithAttributes(attrs...))
 }
 
+// recordCountHistogram records a small integer count into a named
+// Int64Histogram with the given unit and explicit bucket boundaries, logging
+// and skipping if the instrument cannot be created. Counts need their own
+// boundaries: the default duration buckets lump every healthy small count
+// together with the first few degraded ones.
+func recordCountHistogram(ctx context.Context, name string, value int64, description, unit string, boundaries []float64, attrs ...attribute.KeyValue) {
+	meter := otel.Meter(meterName)
+	hist, err := meter.Int64Histogram(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+		otelmetric.WithExplicitBucketBoundaries(boundaries...),
+	)
+	if err != nil {
+		slog.Warn("failed to create count histogram", "metric", name, "error", err)
+		return
+	}
+	hist.Record(ctx, value, otelmetric.WithAttributes(attrs...))
+}
+
 // recordGauge records value into a named Int64Gauge with the given attributes,
 // logging and skipping if the instrument cannot be created.
 func recordGauge(ctx context.Context, name string, value int64, description, unit string, attrs ...attribute.KeyValue) {
@@ -142,9 +161,10 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 // RecordPlanCommentRetirement counts the outcome of retiring one superseded
 // plan comment. Outcomes: "minimized" (hidden on GitHub but still expandable
 // as the record of what was planned), "deleted" (no apply ever acted on the
-// plan and the repository opted into deletion, so the comment is removed from
-// the timeline), "apply_owned" (kept fully expanded because an apply owns the
-// plan's head and the repository uses the minimize-based policy),
+// plan and the deployment uses the default delete-based policy, so the comment
+// is removed from the timeline), "apply_owned" (kept fully expanded because an
+// apply owns the plan's head and the deployment opted out to the
+// minimize-based policy),
 // "guard_error" (apply-ownership lookup failed, comment left untouched fail
 // closed — investigate storage), "minimize_error" / "delete_error" (the
 // GitHub call failed; retried on the next supersede — investigate GitHub API
@@ -395,7 +415,7 @@ func KnownReviewDriftClassification(classification string) bool {
 //
 // classification="planned" is the healthy outcome for a member that holds its
 // own schema: it was planned against that schema and never compared to the
-// reviewed plan, so it is the independent counterpart of "match" and not a
+// primary plan, so it is the independent counterpart of "match" and not a
 // signal to alert on. It has to be listed here rather than left to the unknown
 // bucket, which is reserved for a classification the code emits and this
 // contract does not know about — a coding gap, which normal independent
@@ -408,7 +428,7 @@ func RecordReviewDrift(ctx context.Context, database, environment, deployment, c
 		classification = "unknown"
 	}
 	addCounter(ctx, "schemabot.review_drift.total",
-		"review-time per-member classifications: against the reviewed primary plan where members mirror it, against the member's own schema where they do not", "{deployment}",
+		"review-time per-member classifications: against the primary target's plan where members mirror it, against the member's own schema where they do not", "{deployment}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("deployment", deployment),
@@ -968,10 +988,34 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     sustained rate means new applies are repeatedly dispatched against a
 //     target that already has actively driven work — check who is submitting
 //     the duplicates.
+//   - "fresh_operation_lease": a live drive holds the lease of the operation
+//     that owns the task, even though the apply's own lease reads stale, so
+//     the local engine probe was skipped and the live drive stays
+//     authoritative. Read it the same way as "fresh_lease".
+//   - "operation_lease_unreadable": the lease of the operation that owns the
+//     task could not be read, so a live drive could not be ruled out and the
+//     task kept blocking. Any sustained rate is a storage problem, not a
+//     workload one.
 //   - "foreign_terminal_report": the lease is stale and this process's engine
 //     memory reports terminal, but the lease was last held by another process,
 //     so the report was refused. Driver stale-claim recovery settles the task;
 //     investigate if the same task repeats here without converging.
+//   - "unattributed_terminal_report": this process's engine memory reports
+//     terminal for an in-flight task, but the apply records no lease holder
+//     (its lease was released, or its work runs under an operation lease), so
+//     the report cannot be attributed to this process and was refused. The
+//     driver that claims the apply or its operation settles the task;
+//     investigate if the same task repeats here without converging.
+//   - "terminal_report_other_table": this process's engine memory reports
+//     terminal for tables that do not include the in-flight task's, so the
+//     report is a later run's on the same database and was refused. The driver
+//     that owns the task settles it; investigate if the same task repeats here
+//     without converging.
+//   - "unattributed_no_active_report": this process's engine memory reports no
+//     active work for an in-flight task, but the apply records no lease holder,
+//     so the report cannot distinguish abandoned work from work driven under an
+//     operation lease. The task remains blocking until its driver or the elected
+//     reaper settles it.
 //   - "pending_control_request": a stopped task's apply carries an operator
 //     command a driver has not delivered yet, so the task still holds its
 //     database. A sustained rate means commands are queued but not being
@@ -2133,6 +2177,41 @@ func RecordWebhookCheckSuiteRecovery(ctx context.Context, repo string, outcome s
 		attribute.String("outcome", outcome))
 }
 
+// RecordWebhookReconcileScanTruncated counts reconcile passes whose
+// missing-delivery scan ran out of page budget before reaching the lookback
+// cutoff for a repository. The scan resumes from its persisted cursor next
+// pass, so occasional truncation on a busy repository is expected and heals;
+// a sustained rate combined with high reconcile_scan_cycle_passes means the
+// page budget is too small for the repository's open-PR volume — raise the
+// budget with WEBHOOK_RECONCILE_MAX_PAGES or shorten the lookback with
+// WEBHOOK_RECONCILE_LOOKBACK so the backstop covers its window promptly.
+func RecordWebhookReconcileScanTruncated(ctx context.Context, repo string) {
+	addCounter(ctx, "schemabot.webhook.reconcile_scan_truncated_total",
+		"Total number of reconcile passes whose missing-delivery scan was truncated by the page budget", "{pass}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
+// webhookReconcileScanCyclePassBoundaries buckets the pass count of a scan
+// cycle so the healthy single-pass cycle, a cycle that needed a few passes,
+// and a chronically truncated cycle land in different buckets.
+var webhookReconcileScanCyclePassBoundaries = []float64{1, 2, 3, 5, 8, 13, 21}
+
+// RecordWebhookReconcileScanCycleCompleted records how many reconcile passes
+// one full missing-delivery scan cycle took to reach the lookback cutoff for
+// a repository. One pass is the healthy case; a growing pass count means the
+// scan is chronically truncated and recovery of lost deliveries deep in the
+// listing is delayed by roughly passes × reconcile interval — the bound to
+// alert on when delivery-gap healing must complete within a target time. The
+// remedies are the same as for reconcile_scan_truncated_total.
+func RecordWebhookReconcileScanCycleCompleted(ctx context.Context, repo string, passes int64) {
+	recordCountHistogram(ctx, "schemabot.webhook.reconcile_scan_cycle_passes", passes,
+		"Reconcile passes needed for one full missing-delivery scan cycle to reach the lookback cutoff", "{pass}",
+		webhookReconcileScanCyclePassBoundaries,
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
 // RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
 // reconciler terminated because they were parked in processing with an expired
 // lease at the attempt cap — a driver hard-killed on its final attempt. A
@@ -2266,12 +2345,14 @@ func RecordDropTableAlreadyAbsent(ctx context.Context, database string) {
 // completed, failed, or stopped; refused statements the policy does not route
 // directly are blocked with the reason encoded in the outcome.
 var knownDirectExecutionOutcomes = map[string]bool{
-	"completed":               true,
-	"failed":                  true,
-	"stopped":                 true,
-	"blocked_policy_disabled": true,
-	"blocked_size_limit":      true,
-	"blocked_size_unknown":    true,
+	"completed":                      true,
+	"failed":                         true,
+	"stopped":                        true,
+	"blocked_policy_disabled":        true,
+	"blocked_size_limit":             true,
+	"blocked_size_unknown":           true,
+	"blocked_force_kill_unavailable": true,
+	"blocked_force_kill_unknown":     true,
 }
 
 // RecordDirectExecution increments the counter for a statement the
@@ -2281,7 +2362,11 @@ var knownDirectExecutionOutcomes = map[string]bool{
 // in failed means native DDL is erroring on the target (check the apply logs
 // for the statement and MySQL error), and a spike in blocked_size_unknown
 // means row estimates are unavailable (check target connectivity and
-// information_schema access).
+// information_schema access). blocked_force_kill_unavailable means the target
+// user lacks a grant the kill needs (grant SELECT on performance_schema.*,
+// PROCESS, and CONNECTION_ADMIN or SUPER, or on RDS EXECUTE on mysql.rds_kill);
+// blocked_force_kill_unknown means checking those grants failed (check target
+// connectivity).
 func RecordDirectExecution(ctx context.Context, database, outcome string) {
 	if !knownDirectExecutionOutcomes[outcome] {
 		outcome = "unknown"

@@ -157,24 +157,55 @@ func TestRenderMultipleConfigsUsageExample(t *testing.T) {
 }
 
 func TestRenderUnmanagedSchemaConfigsNotice(t *testing.T) {
-	t.Run("lists each dropped config with its database", func(t *testing.T) {
-		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+	t.Run("lists each dropped config with its database across every environment", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice([]string{"staging", "production"}, []UnmanagedSchemaConfigNoticeData{
 			{Database: "inventory", SchemaPath: "services/inventory/schema"},
 			{Database: "billing", SchemaPath: "services/billing/schema"},
 		})
-		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot\n\n**Environments**: `staging`, `production`\n\nThis PR changes schema")
+		assert.Contains(t, body, "which SchemaBot is not configured to manage in any environment")
 		assert.Contains(t, body, "- `services/inventory/schema` — declares database `inventory`")
 		assert.Contains(t, body, "- `services/billing/schema` — declares database `billing`")
-		assert.Contains(t, body, "will **not** be planned or applied")
+		assert.Contains(t, body, "These schema changes will **not** be planned or applied in any environment, and the SchemaBot checks on this PR do not cover them.")
 		assert.Contains(t, body, "`allowed_dirs`")
 	})
 
+	t.Run("omits the environments header when none are known", func(t *testing.T) {
+		body := RenderUnmanagedSchemaConfigsNotice(nil, []UnmanagedSchemaConfigNoticeData{
+			{Database: "inventory", SchemaPath: "services/inventory/schema"},
+		})
+		assert.Contains(t, body, "## ⚠️ Schema Changes Not Managed by SchemaBot\n\nThis PR changes schema")
+		assert.NotContains(t, body, "**Environments**")
+	})
+
 	t.Run("normalizes values that would break markdown code spans", func(t *testing.T) {
-		body := RenderUnmanagedSchemaConfigsNotice([]UnmanagedSchemaConfigNoticeData{
+		body := RenderUnmanagedSchemaConfigsNotice(nil, []UnmanagedSchemaConfigNoticeData{
 			{Database: "inven`tory", SchemaPath: "services/inventory\nschema"},
 		})
 		assert.Contains(t, body, "- `services/inventory schema` — declares database `` inven`tory ``")
 		assert.NotContains(t, body, "inventory\nschema")
+	})
+}
+
+func TestRenderUnmanagedSchemaPassingCheck(t *testing.T) {
+	configs := []UnmanagedSchemaConfigNoticeData{
+		{Database: "merchants", SchemaPath: "services/merchants/schema"},
+		{Database: "ledger_sandbox", SchemaPath: "services/ledger/schema_sandbox"},
+	}
+
+	t.Run("names the environment the check covers", func(t *testing.T) {
+		title, summary := RenderUnmanagedSchemaPassingCheck("production", configs)
+		assert.Equal(t, "No schema changes managed in production", title)
+		assert.Equal(t, "This PR changes schema only under paths SchemaBot does not manage in `production`, so there is nothing to plan or apply in `production`:\n\n"+
+			"- `services/merchants/schema` declares database `merchants`\n"+
+			"- `services/ledger/schema_sandbox` declares database `ledger_sandbox`\n", summary)
+	})
+
+	t.Run("covers every environment for a deployment serving all of them", func(t *testing.T) {
+		title, summary := RenderUnmanagedSchemaPassingCheck("", configs[:1])
+		assert.Equal(t, "No schema changes managed by SchemaBot", title)
+		assert.Equal(t, "This PR changes schema only under paths SchemaBot does not manage in any environment, so there is nothing to plan or apply in any environment:\n\n"+
+			"- `services/merchants/schema` declares database `merchants`\n", summary)
 	})
 }
 
@@ -343,6 +374,83 @@ func TestRenderDatabaseNotConfigured(t *testing.T) {
 	assert.Contains(t, body, "A `schemabot.yaml` declaring `database: payments` is not enough on its own")
 	assert.Contains(t, body, "Check that the database name, from `-d` or from `schemabot.yaml`, matches one this instance serves, or ask a SchemaBot operator to configure the database")
 	assert.NotContains(t, body, "was found in this repository")
+}
+
+// TestRenderDatabaseNotRegistered pins the comment an aggregate leader posts
+// for a schemabot.yaml whose database its own registry lacks. The claim covers
+// only the deployment posting it, which the comment names in the header and
+// the explanation; another deployment on the repository may register the
+// database. One config names its database and schema directory in the header
+// and gives both remedies: register the database, or move the config under
+// the directory registered for it. Several configs are listed together under
+// a plural title, so one reply covers them all.
+func TestRenderDatabaseNotRegistered(t *testing.T) {
+	removedFleetClaims := []string{
+		"No SchemaBot deployment on this repository manages",
+		"outside every directory the other deployments manage",
+	}
+
+	t.Run("one config", func(t *testing.T) {
+		body := RenderDatabaseNotRegistered(SchemaErrorData{
+			RequestedBy: "hubot",
+			Timestamp:   "2026-07-16 18:56:00",
+			Deployment:  "staging",
+			CommandName: "plan",
+			UnregisteredConfigs: []UnregisteredSchemaConfigData{
+				{Database: "ledger", SchemaPath: "services/ledger/schema"},
+			},
+		})
+		assert.Contains(t, body, "## ⚠️ Database Not Registered\n\n"+
+			"**Database**: `ledger` | **Schema directory**: `services/ledger/schema` | **Deployment**: `staging`\n")
+		assert.Contains(t, body, "*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
+		assert.Contains(t, body, "The staging SchemaBot deployment has no `ledger` entry under `databases`, and this schema directory is not under any path it expects another deployment to report on.\n\n"+
+			"If `ledger` is new to SchemaBot, ask a SchemaBot operator to register it with this schema directory. "+
+			"If it is already registered, move the `schemabot.yaml` and its schema files under the schema directory registered for it.")
+		for _, claim := range removedFleetClaims {
+			assert.NotContains(t, body, claim)
+		}
+	})
+
+	t.Run("several configs", func(t *testing.T) {
+		body := RenderDatabaseNotRegistered(SchemaErrorData{
+			RequestedBy: "hubot",
+			Timestamp:   "2026-07-16 18:56:00",
+			Deployment:  "staging",
+			CommandName: "plan",
+			UnregisteredConfigs: []UnregisteredSchemaConfigData{
+				{Database: "ledger", SchemaPath: "services/ledger/schema"},
+				{Database: "payments", SchemaPath: "services/payments/schema"},
+			},
+		})
+		assert.Contains(t, body, "## ⚠️ Databases Not Registered\n\n**Deployment**: `staging`\n")
+		assert.NotContains(t, body, "**Database**:")
+		assert.Contains(t, body, "*Requested by @hubot at 2026-07-16 18:56:00 UTC*")
+		assert.Contains(t, body, "The staging SchemaBot deployment has none of these databases under `databases`, and none of these schema directories is under a path it expects another deployment to report on:\n\n"+
+			"- `services/ledger/schema` declares database `ledger`\n"+
+			"- `services/payments/schema` declares database `payments`\n")
+		assert.Contains(t, body, "For each database that is new to SchemaBot, ask a SchemaBot operator to register it with its schema directory")
+		assert.Contains(t, body, "For each one already registered, move its `schemabot.yaml` and schema files under the schema directory registered for it")
+		for _, claim := range removedFleetClaims {
+			assert.NotContains(t, body, claim)
+		}
+	})
+
+	// A deployment serving several environments has no one name, so the
+	// comment speaks for "this" deployment and the header lists what it
+	// serves.
+	t.Run("deployment serving several environments", func(t *testing.T) {
+		body := RenderDatabaseNotRegistered(SchemaErrorData{
+			RequestedBy:  "hubot",
+			Timestamp:    "2026-07-16 18:56:00",
+			Environments: []string{"staging", "production"},
+			CommandName:  "plan",
+			UnregisteredConfigs: []UnregisteredSchemaConfigData{
+				{Database: "ledger", SchemaPath: "services/ledger/schema"},
+			},
+		})
+		assert.Contains(t, body, "**Database**: `ledger` | **Schema directory**: `services/ledger/schema` | **Environments**: `staging`, `production`\n")
+		assert.Contains(t, body, "This SchemaBot deployment has no `ledger` entry under `databases`")
+	})
 }
 
 // TestRenderDatabaseRepoNotAllowed pins the comment for a database whose

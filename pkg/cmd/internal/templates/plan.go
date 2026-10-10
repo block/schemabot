@@ -113,13 +113,21 @@ type NamespaceChange struct {
 	Changes        []DDLChange
 	VSchemaChanged bool
 	VSchemaDiff    string
+	// Finalize marks a namespace the engine asked to finalize after its DDL.
+	// It gets its own line only when it is the namespace's only work.
+	Finalize bool
 }
 
 // WriteNamespaceChanges writes per-namespace DDL and VSchema sections.
 // For MySQL with a single namespace matching the database, the namespace header is omitted.
-// For Vitess, each keyspace gets a header with optional VSchema diff.
+// For Vitess, each keyspace gets a header, and a keyspace whose VSchema
+// changes shows that change whatever engine reported the plan.
 func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string, dialect schema.Dialect) {
-	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
+	names := make([]string, len(namespaces))
+	for i, ns := range namespaces {
+		names[i] = ns.Namespace
+	}
+	singleNamespace := OmitsNamespaceHeader(names, isMySQL, database)
 
 	// Sort a copy so callers aren't affected by reordering. This keeps output
 	// stable and groups similarly named namespaces together, but collapsing
@@ -137,13 +145,13 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 	}
 	var groups []nsGroup
 	for _, ns := range namespaces {
-		if len(ns.Changes) == 0 && !ns.VSchemaChanged {
+		if len(ns.Changes) == 0 && !ns.VSchemaChanged && !ns.Finalize {
 			continue
 		}
 		// Try to merge with previous group if DDL is identical
-		if len(groups) > 0 && !ns.VSchemaChanged {
+		if len(groups) > 0 && collapsible(ns) {
 			prev := &groups[len(groups)-1]
-			if !prev.namespaces[0].VSchemaChanged && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
+			if collapsible(prev.namespaces[0]) && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
 				prev.namespaces = append(prev.namespaces, ns)
 				continue
 			}
@@ -172,12 +180,15 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 				if !singleNamespace {
 					fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 				}
-				if ns.VSchemaChanged && !isMySQL {
+				if ns.VSchemaChanged {
 					fmt.Println(indentTable + "~ VSchema:")
 					if ns.VSchemaDiff != "" {
 						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, indentContent))
 						fmt.Println()
 					}
+				}
+				if ns.Finalize && !ns.VSchemaChanged && len(ns.Changes) == 0 {
+					fmt.Println(indentTable + "~ Finalized by the engine once every shard's DDL has landed")
 				}
 				if len(ns.Changes) > 0 {
 					WriteSQLChanges(ns.Changes, dialect)
@@ -185,6 +196,22 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 			}
 		}
 	}
+}
+
+// OmitsNamespaceHeader reports whether WriteNamespaceChanges writes the
+// changes of these namespaces without a header above each: a MySQL plan of
+// the one namespace named for its database. Every other plan opens on a
+// namespace header, which brings its own blank line above it.
+func OmitsNamespaceHeader(namespaces []string, isMySQL bool, database string) bool {
+	return len(namespaces) == 1 && isMySQL && namespaces[0] == database
+}
+
+// collapsible reports whether a namespace renders as its DDL alone, so it can
+// collapse with neighbours that have the same DDL. A VSchema change renders
+// its own section, and a finalize renders its own line when it is the
+// namespace's only work.
+func collapsible(ns NamespaceChange) bool {
+	return !ns.VSchemaChanged && (!ns.Finalize || len(ns.Changes) > 0)
 }
 
 // ddlChangesEqual returns true if two slices of DDL changes have identical content.
@@ -349,6 +376,22 @@ type VSchemaChange struct {
 
 // WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.
 func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchemaChange) {
+	WritePlanSummaryWithKeyspaceUpdates(ddlChanges, vschemaChanges, 0)
+}
+
+// WritePlanSummaryWithKeyspaceUpdates writes a single plan summary line
+// including VSchema changes and the keyspaces whose only work is a finalize.
+func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) {
+	if parts := planSummaryParts(ddlChanges, vschemaChanges, finalizes); len(parts) > 0 {
+		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
+		fmt.Println()
+	}
+}
+
+// planSummaryParts builds the clauses of the plan summary: the table and
+// index clauses, then VSchema changes and keyspaces whose only work is a
+// finalize.
+func planSummaryParts(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) []string {
 	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
@@ -357,18 +400,21 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 		}
 		parts = append(parts, fmt.Sprintf("%d %s", len(vschemaChanges), word))
 	}
-
-	if len(parts) > 0 {
-		fmt.Printf("📋 **Plan**: %s\n", strings.Join(parts, ", "))
-		fmt.Println()
+	if finalizes > 0 {
+		word := "keyspace"
+		if finalizes > 1 {
+			word = "keyspaces"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s to finalize", finalizes, word))
 	}
+	return parts
 }
 
-// ddlSummaryParts builds the create/alter/drop clauses of the plan summary.
-// Statements outside those buckets (indexes, types, extensions, comments)
-// still run, so a mixed plan names them alongside the table counts, and a plan
-// made only of them reports its raw statement total so it never reads as "no
-// changes".
+// ddlSummaryParts builds the table and index clauses of the plan summary.
+// Index builds and drops on existing tables are named in their own clauses.
+// Statements outside every bucket (types, extensions, comments) still run, so
+// a mixed plan names them alongside the counted clauses, and a plan made only
+// of them reports its raw statement total so it never reads as "no changes".
 func ddlSummaryParts(changes []DDLChange) []string {
 	var counts ui.PlanCounts
 	for _, c := range changes {
@@ -532,6 +578,16 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	fmt.Println()
 }
 
+// UnsafeChangesBlockedSummary is WriteUnsafeChangesBlocked on one line, for a
+// refusal with nowhere to print the list, such as JSON output: the same count
+// and findings, and the command that permits them, starting with the binary
+// name so it runs as pasted. rerun is built as for WriteUnsafeChangesBlocked.
+func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun string) string {
+	findings := unsafeFindingLines(changes)
+	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s %s",
+		len(findings), strings.Join(findings, "; "), cliname.Name(), rerun)
+}
+
 // WriteUnsafeWarningAllowed writes a warning when destructive changes are
 // permitted and will run.
 //
@@ -560,19 +616,26 @@ const UnsafeConsentAllowFlag = "--allow-unsafe enabled"
 // always equals the number of lines below it and a finding can be referenced
 // by its number.
 func writeUnsafeChangesList(changes []UnsafeChange) {
-	n := 0
+	for i, finding := range unsafeFindingLines(changes) {
+		fmt.Printf("  %d. %s\n", i+1, finding)
+	}
+}
+
+// unsafeFindingLines is each unsafe finding as "table: finding", in the order
+// the list numbers them.
+func unsafeFindingLines(changes []UnsafeChange) []string {
+	var lines []string
 	for _, c := range changes {
 		reasons := unsafeChangeFindings(c)
 		if len(reasons) == 0 {
-			n++
-			fmt.Printf("  %d. %s: %s\n", n, c.Table, c.ChangeType)
+			lines = append(lines, c.Table+": "+c.ChangeType)
 			continue
 		}
 		for _, r := range reasons {
-			n++
-			fmt.Printf("  %d. %s: %s\n", n, c.Table, r)
+			lines = append(lines, c.Table+": "+r)
 		}
 	}
+	return lines
 }
 
 // countUnsafeFindings sums the individual findings across changes so the
@@ -613,7 +676,7 @@ func WriteRelatedGuidance(rules []string, isMySQL bool) {
 	if len(guides) == 0 {
 		return
 	}
-	fmt.Println("📖 Related guidance:")
+	fmt.Println(glyph.Docs + " Related guidance:")
 	for _, guide := range guides {
 		fmt.Printf("  • %s: %s\n", guide.Label, guide.URL)
 	}

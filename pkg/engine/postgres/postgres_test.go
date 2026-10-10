@@ -29,6 +29,39 @@ import (
 	"github.com/block/schemabot/pkg/schema"
 )
 
+// mustIgnoredTables indexes ignore_tables entries the test knows are valid.
+func mustIgnoredTables(t *testing.T, entries []string) engine.IgnoredTables {
+	t.Helper()
+	ignored, err := engine.NewIgnoredTables(entries)
+	require.NoError(t, err)
+	return ignored
+}
+
+func TestBaselinePolicyTableMembership(t *testing.T) {
+	declared := map[string]bool{"users": true, "audit_log_archive_2019": true}
+	ignored := mustIgnoredTables(t, []string{"flyway_schema_history", "audit_log_archive_2018"})
+	tests := []struct {
+		table              string
+		wantRollbackReason string
+	}{
+		{table: "users"},
+		{table: "legacy_users"},
+		{table: "flyway_schema_history", wantRollbackReason: engine.ExemptReasonIgnoreTables},
+		{table: "Flyway_schema_history"},
+		{table: "audit_log_archive_2019"},
+		{table: "audit_log_archive_2020", wantRollbackReason: exemptReasonArchiveNaming},
+		{table: "audit_log_archive_2018", wantRollbackReason: engine.ExemptReasonIgnoreTables},
+	}
+	for _, tt := range tests {
+		t.Run(tt.table, func(t *testing.T) {
+			assert.Equal(t, tt.wantRollbackReason, rollbackBaseline(declared, ignored).exclusionReason(tt.table))
+			assert.Empty(t, pulledBaseline.exclusionReason(tt.table), "pull exports every enumerated table")
+		})
+	}
+	assert.Equal(t, engine.ExemptReasonIgnoreTables, rollbackBaseline(declared, mustIgnoredTables(t, []string{"audit_log_archive_2019"})).exclusionReason("audit_log_archive_2019"),
+		"the exact ignore policy withholds a named table before introspection; the plan separately refuses declared contradictions")
+}
+
 func TestExecutionVerdict(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -1227,6 +1260,88 @@ func TestPlanRejectsInvalidInputsBeforeConnecting(t *testing.T) {
 	assert.Contains(t, err.Error(), "DSN credentials are required")
 }
 
+// Two schema files in one namespace that declare the same table give the plan
+// no single desired definition: diffing each on its own would drop from the
+// live table whatever only the other file declares. The namespace planner
+// fails before diffing any file, naming the table and both files.
+func TestPlanSchemasRefusesTableDeclaredByTwoFiles(t *testing.T) {
+	req := &engine.PlanRequest{
+		Database: "orders_db",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql":         "CREATE TABLE users (id bigint PRIMARY KEY, email text NOT NULL)",
+				"users_profile.sql": "CREATE TABLE users (id bigint PRIMARY KEY, display_name text)",
+			}},
+		},
+	}
+
+	// The nil pool proves the refusal lands before any file is diffed.
+	_, err := planSchemas(t.Context(), nil, req, DefaultNativeSafeTableSizeLimitBytes, "")
+	require.Error(t, err)
+	assert.EqualError(t, err, `plan PostgreSQL namespace "public": table "users" is declared by both schema files "users.sql" and "users_profile.sql". Declare each table in exactly one schema file`)
+}
+
+// Table identity follows PostgreSQL's parser: an unquoted name folds to lower
+// case, so Users and users are one table, while a quoted "Users" is a
+// different table. A file declaring row security names its table through the
+// same admission parse, so it collides with a plain file for that table too.
+func TestRefuseTableDeclaredTwice(t *testing.T) {
+	tests := []struct {
+		name    string
+		files   map[string]string
+		wantErr string
+	}{
+		{
+			name: "different tables plan independently",
+			files: map[string]string{
+				"orders.sql": "CREATE TABLE orders (id bigint PRIMARY KEY)",
+				"users.sql":  "CREATE TABLE users (id bigint PRIMARY KEY)",
+			},
+		},
+		{
+			name: "quoted mixed-case name is a different table",
+			files: map[string]string{
+				"a.sql": `CREATE TABLE "Users" (id bigint PRIMARY KEY)`,
+				"b.sql": "CREATE TABLE users (id bigint PRIMARY KEY)",
+			},
+		},
+		{
+			name: "unquoted names fold to the same table",
+			files: map[string]string{
+				"a.sql": "CREATE TABLE Users (id bigint PRIMARY KEY)",
+				"b.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			},
+			wantErr: `plan PostgreSQL namespace "public": table "users" is declared by both schema files "a.sql" and "b.sql". Declare each table in exactly one schema file`,
+		},
+		{
+			name: "row security file collides with a plain file",
+			files: map[string]string{
+				"accounts.sql":     "CREATE TABLE accounts (id bigint PRIMARY KEY)",
+				"accounts_rls.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY); ALTER TABLE accounts ENABLE ROW LEVEL SECURITY",
+			},
+			wantErr: `plan PostgreSQL namespace "public": table "accounts" is declared by both schema files "accounts.sql" and "accounts_rls.sql". Declare each table in exactly one schema file`,
+		},
+		{
+			name: "unparseable file names the file",
+			files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY",
+			},
+			wantErr: `plan PostgreSQL schema in "public"/"users.sql"`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := refuseTableDeclaredTwice("public", tc.files)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
 // Lifecycle controls without a PostgreSQL execution phase decline with a typed unsupported-operation error:
 // PostgreSQL DDL runs each statement as a single transactional statement with
 // no engine phase to pause, resume, swap, revert, or retune. The typed decline
@@ -1294,11 +1409,13 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 var optionalCapabilityVerdicts = map[reflect.Type]bool{
 	reflect.TypeFor[engine.Drainer]():                         true,
 	reflect.TypeFor[engine.ShutdownHalter]():                  true,
+	reflect.TypeFor[engine.OwnedWorkHalter]():                 true,
 	reflect.TypeFor[engine.SynchronousWorkRegistration]():     true,
 	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    false,
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): false,
 	reflect.TypeFor[engine.CancelledArtifactReleaser]():       false,
 	reflect.TypeFor[engine.ControlResumeValidator]():          false,
+	reflect.TypeFor[engine.ShardKeyedPlanning]():              false,
 }
 
 // TestOptionalCapabilitySet checks the recorded verdicts against the engine's

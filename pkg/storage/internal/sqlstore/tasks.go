@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
@@ -21,7 +24,7 @@ import (
 const taskColumns = `id, task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
-	rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
+	rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
@@ -44,10 +47,11 @@ var terminalTaskStatesSQL = func() string {
 
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
-	db       *rebindDB
-	dialect  Dialect
-	identity identityInserter
-	locker   namedlock.Locker
+	db         *rebindDB
+	dialect    Dialect
+	identity   identityInserter
+	locker     namedlock.Locker
+	classifier ErrorClassifier
 }
 
 func canonicalizeTaskIdentity(task *storage.Task) {
@@ -64,6 +68,7 @@ func (s *taskStore) Create(ctx context.Context, task *storage.Task) (int64, erro
 
 func insertTask(ctx context.Context, exec queryExecer, identity identityInserter, task *storage.Task) (int64, error) {
 	canonicalizeTaskIdentity(task)
+	boundEngineReportedFields(task)
 
 	// Ensure options has valid JSON (empty object if nil)
 	options := task.Options
@@ -76,16 +81,16 @@ func insertTask(ctx context.Context, exec queryExecer, identity identityInserter
 			task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 			namespace, table_name, shard, ddl, ddl_action,
 			engine, repository, pull_request, environment, state, error_message, options, attempt,
-			rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
+			rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 			is_instant, engine_migration_id,
 			started_at, completed_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
 		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
+		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 	)
@@ -107,58 +112,185 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 	return scanTask(row)
 }
 
+// maxStoredETASeconds is the largest value the tasks.eta_seconds column holds,
+// a signed 32-bit integer in every dialect.
+const maxStoredETASeconds = math.MaxInt32
+
+// maxStoredThrottleReasonChars is the width of the tasks.throttle_reason
+// column, in characters in every dialect.
+const maxStoredThrottleReasonChars = 255
+
+// boundEngineReportedFields fits the task's engine-reported display fields to
+// the columns that hold them, on the caller's task, so the task a drive keeps
+// in memory and the row it reads back agree. These values come from an engine
+// and have no bound of their own; written unbounded, one would refuse every
+// progress write for the task and freeze the row over a display value.
+func boundEngineReportedFields(task *storage.Task) {
+	task.ETASeconds = storedETASeconds(task.ETASeconds)
+	task.ThrottleReason = storedThrottleReason(task.ThrottleReason)
+}
+
+// storedETASeconds bounds an engine-reported ETA to what the column holds. The
+// ETA is an engine's estimate and has no upper bound of its own: one paced on
+// key distance rather than rows reports decades for a table whose keys have a
+// wide gap, so a larger value is stored as the column's maximum, which still
+// reads as far beyond any useful estimate. A negative estimate means nothing,
+// and is stored as no estimate.
+func storedETASeconds(eta int) int {
+	return max(0, min(eta, maxStoredETASeconds))
+}
+
+// storedThrottleReason cuts an engine's throttle reason to the column's width
+// on a character boundary, marking the cut with an ellipsis.
+func storedThrottleReason(reason string) string {
+	if utf8.RuneCountInString(reason) <= maxStoredThrottleReasonChars {
+		return reason
+	}
+	runes := []rune(reason)
+	return string(runes[:maxStoredThrottleReasonChars-1]) + "…"
+}
+
+// taskUpdateAssignments is the SET list Update writes from the caller's task.
+// Each column binds one placeholder, in this order, ahead of the WHERE clause's
+// placeholders; taskUpdateStatement appends the updated_at stamp.
+var taskUpdateAssignments = []JoinedUpdateAssignment{
+	{Column: "state", Expr: "?"},
+	{Column: "error_message", Expr: "?"},
+	{Column: "options", Expr: "?"},
+	{Column: "attempt", Expr: "?"},
+	{Column: "rows_copied", Expr: "?"},
+	{Column: "rows_total", Expr: "?"},
+	{Column: "progress_percent", Expr: "?"},
+	{Column: "eta_seconds", Expr: "?"},
+	{Column: "checksum_rows_checked", Expr: "?"},
+	{Column: "checksum_rows_total", Expr: "?"},
+	{Column: "throttled", Expr: "?"},
+	{Column: "throttle_reason", Expr: "?"},
+	{Column: "execution_mode", Expr: "?"},
+	{Column: "mode_reason", Expr: "?"},
+	{Column: "cutover_attempts", Expr: "?"},
+	{Column: "is_instant", Expr: "?"},
+	{Column: "engine_migration_id", Expr: "?"},
+	{Column: "ddl", Expr: "?"},
+	{Column: "started_at", Expr: "?"},
+	{Column: "completed_at", Expr: "?"},
+}
+
+// taskLeaseGuard selects the lease check Update's statement carries.
+type taskLeaseGuard int
+
+const (
+	// taskGuardNone writes without a lease check: no lease is on the context.
+	taskGuardNone taskLeaseGuard = iota
+	// taskGuardOperation checks the token on the task's own apply_operations row.
+	taskGuardOperation
+	// taskGuardApply checks the token on the task's parent applies row.
+	taskGuardApply
+	// taskGuardOperationAbsent holds no lease: it admits the write only while
+	// no drive holds a fresh lease on the task's operation, read through
+	// unleasedOperationGate so a repair write and the reapers agree on what
+	// "unleased" means.
+	taskGuardOperationAbsent
+)
+
+// taskUpdateStatement renders Update's statement for guard. The lease token
+// lives on a different row from the task, so the leased renderings join that
+// row and check it through LeaseTokenFence; the unguarded and absence-guarded
+// renderings are portable single-table UPDATEs. Every rendering binds the SET
+// placeholders, then the task ID, then the guard's own: the operation ID and
+// token for an operation lease, the token for an apply lease, the apply ID and
+// operation ID for an absence guard. Every rendering also stamps updated_at,
+// the task's drive liveness signal the stranded-task sweeps read; stamping it
+// is the application's job on every dialect.
+func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
+	// Clip so the append copies rather than writing the updated_at stamp into
+	// spare capacity behind the shared package-level slice.
+	assignments := append(slices.Clip(taskUpdateAssignments), JoinedUpdateAssignment{Column: "updated_at", Expr: "NOW()"})
+	switch guard {
+	case taskGuardOperation:
+		return d.JoinedUpdate(
+			"tasks", "t", "apply_operations", "ao", "ao.id = t.apply_operation_id",
+			assignments,
+			"t.id = ? AND ao.id = ? AND "+d.LeaseTokenFence("apply_operations", "ao", "id", "lease_token"),
+		)
+	case taskGuardApply:
+		return d.JoinedUpdate(
+			"tasks", "t", "applies", "a", "a.id = t.apply_id",
+			assignments,
+			"t.id = ? AND "+d.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		)
+	case taskGuardNone, taskGuardOperationAbsent:
+		sets := make([]string, len(assignments))
+		for i, assignment := range assignments {
+			sets[i] = assignment.Column + " = " + assignment.Expr
+		}
+		statement := "UPDATE tasks SET " + strings.Join(sets, ", ") + " WHERE id = ?"
+		if guard == taskGuardOperationAbsent {
+			statement += " AND apply_id = ? AND apply_operation_id = ? AND " + unleasedOperationGate(d)
+		}
+		return statement
+	default:
+		panic(fmt.Sprintf("sqlstore: unknown task lease guard %d", guard))
+	}
+}
+
 // Update updates an existing task.
 //
 // The write is guarded by whichever lease is on the context: an operation lease
 // takes precedence over the parent apply lease so the operator can move to
 // operation-scoped writes while callers that have not adopted operation leases
 // keep falling back to the apply lease. An operation lease scopes the write to
-// the task's own operation; the apply lease scopes it to the parent apply.
+// the task's own operation; the apply lease scopes it to the parent apply. An
+// operation lease absence guard takes precedence over both: it is the repair
+// write of a caller that holds no lease and must land only while no drive holds
+// the task's operation, and it fails with ErrOperationLeaseActive when one does.
+//
+// A token check that did not lock the lease row would read it from the
+// statement's snapshot: a driver displaced by a steal that had not yet
+// committed would pass against the token the steal was replacing, and its write
+// would land after the new driver took over. The fence taskUpdateStatement
+// renders instead waits out the steal and fails, or wins the row lock and holds
+// the steal off until the task write commits.
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
+	boundEngineReportedFields(task)
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
 		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
-		task.IsInstant, nullString(task.EngineMigrationID),
+		task.IsInstant, nullString(task.EngineMigrationID), task.DDL,
 		task.StartedAt, task.CompletedAt,
 		task.ID,
 	}
 
-	leasePredicate := ""
+	guard := taskGuardNone
 	var verifyLeaseStillOwned func() error
-	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+	if absence, ok := storage.OperationLeaseAbsenceFromContext(ctx); ok {
+		if absence.ApplyID != task.ApplyID || task.ApplyOperationID == nil || *task.ApplyOperationID != absence.OperationID {
+			return fmt.Errorf("invalid operation lease absence guard for task %d: %w", task.ID, storage.ErrOperationLeaseActive)
+		}
+		guard = taskGuardOperationAbsent
+		args = append(args, absence.ApplyID, absence.OperationID)
+		verifyLeaseStillOwned = func() error { return storage.ErrOperationLeaseActive }
+	} else if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
 			return fmt.Errorf("invalid operation lease for task %d: %w", task.ID, storage.ErrApplyLeaseLost)
 		}
-		leasePredicate = `
-			AND tasks.apply_operation_id = ?
-			AND EXISTS (
-				SELECT 1 FROM apply_operations ao
-				WHERE ao.id = ? AND ao.lease_token = ?
-			)`
-		args = append(args, opLease.OperationID, opLease.OperationID, opLease.Token)
+		guard = taskGuardOperation
+		args = append(args, opLease.OperationID, opLease.Token)
 		verifyLeaseStillOwned = func() error { return ensureOperationLeaseStillOwned(ctx, s.db, opLease) }
 	} else if lease, hasLease, err := applyLeaseFromContext(ctx, task.ApplyID); err != nil {
 		return err
 	} else if hasLease {
-		leasePredicate = `
-			AND EXISTS (
-				SELECT 1 FROM applies a
-				WHERE a.id = tasks.apply_id AND a.lease_token = ?
-			)`
+		guard = taskGuardApply
 		args = append(args, lease.Token)
 		verifyLeaseStillOwned = func() error { return ensureApplyLeaseStillOwned(ctx, s.db, lease) }
 	}
 
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE tasks SET
-			state = ?, error_message = ?, options = ?, attempt = ?,
-			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?, checksum_rows_checked = ?, checksum_rows_total = ?, throttled = ?, throttle_reason = ?, execution_mode = ?, mode_reason = ?, cutover_attempts = ?,
-			is_instant = ?, engine_migration_id = ?,
-			started_at = ?, completed_at = ?, updated_at = NOW()
-		WHERE id = ?`+leasePredicate+`
-	`, args...)
+	result, err := s.db.ExecContext(ctx, taskUpdateStatement(s.dialect, guard), args...)
 	if err != nil {
-		return err
+		if s.classifier != nil && s.classifier.IsValueRejected(err) {
+			return fmt.Errorf("update task %d (%s): %w: %w", task.ID, task.TaskIdentifier, storage.ErrValueRejected, err)
+		}
+		return fmt.Errorf("update task %d (%s): %w", task.ID, task.TaskIdentifier, err)
 	}
 	if verifyLeaseStillOwned == nil {
 		return nil
@@ -187,7 +319,8 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 // the insert is gated on the matching lease token so a displaced operator fails
 // closed (ErrApplyLeaseLost) instead of writing stale rows. The update path
 // reuses the lease-guarded Update, which applies the same lease precedence. On
-// conflict only the progress fields change; identity and DDL are preserved.
+// conflict identity is preserved and the statement text follows the caller's
+// task like every other mutable column.
 func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task) error {
 	canonicalizeTaskIdentity(task)
 
@@ -285,29 +418,43 @@ const shardTaskInsertColumns = `
 	task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
-	rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
+	rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
 // shardTaskInsertValues returns the placeholder list and value args for a
-// per-shard task INSERT ... SELECT, matching shardTaskInsertColumns. The caller
-// appends its own lease-guard ("FROM <lease table> WHERE ... lease_token = ?")
-// and the guard's args.
+// per-shard task INSERT ... SELECT, matching shardTaskInsertColumns.
+// shardTaskInsertStatement renders the lease guard; the caller appends the
+// guard's args.
 func shardTaskInsertValues(task *storage.Task) (string, []any) {
+	boundEngineReportedFields(task)
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
-	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
+	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		[]any{
 			task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
 			task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-			task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
+			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 			task.IsInstant, nullString(task.EngineMigrationID),
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 		}
+}
+
+// shardTaskInsertStatement renders a lease-guarded per-shard INSERT … SELECT
+// whose only source row is the lease row, reached through leaseAlias over
+// leaseTable. It binds the values' placeholders, then the lease row's ID, then
+// the lease token. The token check goes through LeaseSourceFence so it
+// serializes against a concurrent steal instead of passing against a token the
+// statement's snapshot still holds, at whatever isolation level the storage
+// session runs.
+func shardTaskInsertStatement(d Dialect, values, leaseTable, leaseAlias string) string {
+	return "INSERT INTO tasks (" + shardTaskInsertColumns + ") SELECT " + values +
+		" FROM " + leaseTable + " " + leaseAlias +
+		" WHERE " + leaseAlias + ".id = ? AND " + d.LeaseSourceFence(leaseTable, leaseAlias, "id", "lease_token")
 }
 
 // insertShardTaskGuarded inserts a new per-shard task row only while the
@@ -317,19 +464,21 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Task, opLease storage.OperationLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, opLease.OperationID, opLease.Token)
-	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
-		INSERT INTO tasks (`+shardTaskInsertColumns+`)
-		SELECT `+values+`
-		FROM apply_operations ao
-		WHERE ao.id = ? AND ao.lease_token = ?
-	`, args...)
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db,
+		shardTaskInsertStatement(s.dialect, values, "apply_operations", "ao"), args...)
 	if err != nil {
 		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q: %w",
 			opLease.OperationID, task.Namespace, task.TableName, task.Shard, err)
 	}
 	if !inserted {
-		// Zero rows inserted means the operation lease is no longer current.
-		return ensureOperationLeaseStillOwned(ctx, s.db, opLease)
+		// Zero rows inserted means the operation lease is no longer current. A
+		// miss while the lease still reads as current wrote nothing, so it is an
+		// error rather than a success with no row behind it.
+		if err := ensureOperationLeaseStillOwned(ctx, s.db, opLease); err != nil {
+			return err
+		}
+		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q matched no rows despite current lease",
+			opLease.OperationID, task.Namespace, task.TableName, task.Shard)
 	}
 	task.ID = id
 	return nil
@@ -343,19 +492,21 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *storage.Task, lease storage.ApplyLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, lease.ApplyID, lease.Token)
-	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
-		INSERT INTO tasks (`+shardTaskInsertColumns+`)
-		SELECT `+values+`
-		FROM applies a
-		WHERE a.id = ? AND a.lease_token = ?
-	`, args...)
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db,
+		shardTaskInsertStatement(s.dialect, values, "applies", "a"), args...)
 	if err != nil {
 		return fmt.Errorf("insert shard task for apply %d %s.%s shard %q: %w",
 			lease.ApplyID, task.Namespace, task.TableName, task.Shard, err)
 	}
 	if !inserted {
-		// Zero rows inserted means the apply lease is no longer current.
-		return ensureApplyLeaseStillOwned(ctx, s.db, lease)
+		// Zero rows inserted means the apply lease is no longer current. A miss
+		// while the lease still reads as current wrote nothing, so it is an
+		// error rather than a success with no row behind it.
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return err
+		}
+		return fmt.Errorf("insert shard task for apply %d %s.%s shard %q matched no rows despite current lease",
+			lease.ApplyID, task.Namespace, task.TableName, task.Shard)
 	}
 	task.ID = id
 	return nil
@@ -1071,6 +1222,7 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 	var options []byte
 	var applyOperationID, etaSeconds sql.NullInt64
 	var startedAt, completedAt sql.NullTime
+	var estimatedBytes sql.NullInt64
 
 	err := s.Scan(
 		&task.ID,
@@ -1095,6 +1247,7 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 		&task.Attempt,
 		&task.RowsCopied,
 		&task.RowsTotal,
+		&estimatedBytes,
 		&task.ProgressPercent,
 		&etaSeconds,
 		&task.ChecksumRowsChecked,
@@ -1127,6 +1280,10 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 	if applyOperationID.Valid {
 		v := applyOperationID.Int64
 		task.ApplyOperationID = &v
+	}
+	if estimatedBytes.Valid {
+		v := estimatedBytes.Int64
+		task.EstimatedBytes = &v
 	}
 	if startedAt.Valid {
 		task.StartedAt = &startedAt.Time

@@ -28,11 +28,11 @@ From most to least severe:
 |---|---|---|---|---|
 | ⛔ | **Cannot apply** | The engine refuses the statement outright | Always — the apply would fail | None. Rewrite the change |
 | ⚠️ | **Issues** | Unsafe (destructive) changes detected | Yes, until acknowledged | `--allow-unsafe` |
-| ⚙️ | **Direct execution** | Statements that will run as native DDL outside the schema change engine | No — it is a consent disclosure | Confirming the apply consents |
+| ⚙️ | **Direct execution** | Statements that will run as native DDL outside the schema change engine | No — the policy approved them; this discloses how they run | None needed |
 | 💡 | **Lint Warnings** | Advisory best-practice findings | Never | Not needed |
 
 The first two are safety gates. Direct execution is not a severity — it is a
-disclosure of *how* certain statements will run (blocking, non-revertible; see
+disclosure of *how* certain statements will run (as native DDL that blocks writes; see
 [direct-execution.md](./direct-execution.md)). Lint warnings are purely
 advisory: they never gate anything.
 
@@ -74,6 +74,27 @@ resolve the findings that have a mechanical fix, and lists the ones that need a
 human decision. `--dry-run` previews the fixes without writing anything. Run it
 locally when a plan comes back with lint warnings you agree with — it edits
 your declarative files, so the fixes land in the same PR as the change.
+
+Only files that need a fix are rewritten, and only those are listed. A file
+with nothing to fix keeps its exact bytes, so a file in the
+`SHOW CREATE TABLE` form `onboard` writes stays in that form. A fixed file is
+written back as the parser's canonical rendering of the fixed table: one line,
+backtick-quoted identifiers, uppercase types. SQL comments in the file, the
+trailing semicolon, and the final newline are not kept.
+
+It reads the same files `plan` does: `.sql` files directly in the schema
+directory, or one level of namespace subdirectories (`<schema-dir>/<namespace>/*.sql`),
+and writes each fix back to the file it came from. Namespaces listed in
+`schemabot.yaml` `ignore_namespaces` are left alone, as is the empty-namespace
+marker `onboard` writes. Like `plan`, it rejects a directory that mixes the two
+layouts without changing any file. It exits non-zero when the directory holds
+no `.sql` files, since that almost always means a wrong path, and when any
+finding needs a manual fix.
+
+The fixer parses and rewrites with the MySQL grammar, so `fix-lint` is for
+MySQL-family databases (`mysql`, `vitess`, `strata`). A schema directory whose
+`schemabot.yaml` declares another type, such as `postgres`, is refused before
+any file is read; a directory with no `schemabot.yaml` is taken to be MySQL.
 
 ## Auditing a live schema (`pull --lint`)
 
@@ -127,6 +148,19 @@ classified unsafe when any of the following hold:
 - a lint rule raised it at error severity (for example dropping an index that
   was never made invisible).
 
+On the MySQL family, a new table is also unsafe when Spirit could not alter it
+later (the `spirit_compatible` rule, error severity). The rule applies to
+Vitess targets too: Vitess online DDL also needs a primary key and refuses
+foreign-key tables by default. Every table SchemaBot creates should stay
+changeable through an online schema change, so a
+`CREATE TABLE` is flagged when the table has no primary key, has a `FLOAT` or
+`BIT` primary key column, takes part in a foreign key at either end, or has a
+`.` or backtick in its name. Only tables the plan creates are checked. An
+existing table that Spirit cannot alter is left to the runtime checks, so a
+legacy table does not block unrelated changes. `--allow-unsafe` overrides the
+rule. Use it only for legacy cases, because the table can then only be
+changed by blocking DDL, which is limited to small tables.
+
 A Vitess VSchema change is unsafe when it removes anything from the current
 VSchema: a vindex definition, a table's routing entry, or a table's
 column-vindex association. A removal changes query routing the moment the
@@ -145,10 +179,31 @@ in a different table immediately, leaving the old table stale. The blast
 radius matches removing the vindex outright, so mutations take the same
 `--allow-unsafe` acknowledgment.
 
-Additions-only VSchema changes (new vindexes, new tables, new column-vindex
-associations) are not unsafe. Removals and mutations are detected structurally
-by comparing the current and desired VSchema documents; a VSchema that cannot
-be parsed fails the plan rather than skipping detection.
+The same holds for in-place changes to the keyspace or a table's routing:
+flipping the keyspace's `sharded` or `require_explicit_routing` flag, changing
+a table's `type`, changing how a table is keyed (its primary vindex — the
+first `column_vindexes` entry, including by reordering the entries — or its
+`pinned` keyspace id, or swapping one for the other), re-pointing a reference
+table's `source`, and adding, removing, or re-pointing a table's
+`auto_increment`. A new primary vindex or pin computes every row's keyspace
+id differently while the rows stay on their current shards; without its
+sequence, inserts pass through to the database, whose backing column is not
+guaranteed to generate an id. These sequence semantics also apply to
+unsharded keyspaces, where a table needs no VSchema entry to be routed: a new
+entry that gives a table the keyspace already holds a sequence changes where
+that table's ids come from, so it is unsafe too, while an entry for a table
+the same plan creates is an addition.
+
+Additions-only VSchema changes (new vindexes, new tables, new secondary
+column-vindex associations) are not unsafe. A keyspace's first VSchema is
+compared as if its current document were an empty keyspace, so the live
+tables it already routes are protected the same way. The one exemption is the
+`sharded` flag: a sharded keyspace's first document saying it is sharded is
+how the keyspace is onboarded, and a keyspace with one shard routes every
+keyspace id to that shard, so the flag alone re-routes nothing. Removals and
+mutations are detected structurally by comparing the current and desired
+VSchema documents; a VSchema that cannot be parsed fails the plan rather than
+skipping detection.
 
 Unsafe does not mean broken. An unsafe change will usually apply successfully —
 the point of the gate is that it is destructive or irreversible, so SchemaBot
@@ -187,7 +242,9 @@ execute the statement at all, so an apply is guaranteed to fail on it. There is
 no flag that lets a blocked change through — the guidance is to rewrite the
 statement as a supported schema change. Blocked changes render on the plan
 comment and again on the locked apply comment, and any apply command is
-rejected up front while they are present. Local apply admission re-checks the
+rejected up front while they are present. The plan comment offers no apply
+command for an environment with a blocked change; its footer offers the
+re-plan to run once the statement is rewritten. Local apply admission re-checks the
 whole stored plan before creating or attaching apply work, so a dispatch for
 one table or shard cannot partially apply a plan whose other step is blocked.
 A deployment that did not plan locally re-plans the dispatched changes against
@@ -209,7 +266,7 @@ shadow table rather than prevent a statement from running.
 | ⛔ | Plan comment (**Cannot apply**), unsafe/blocked apply-rejection comments (**Apply rejected**), and the **Apply Blocked** headings where retrying unchanged refuses again (merged/closed PR, failing required checks, missing or untrusted prior-environment check, unlisted environment), plus CLI apply-blocked headings (**Apply blocked**) | Refusal: this will not or did not proceed |
 | ⚠️ | Plan comment (**Issues**), CLI plan output (**Unsafe Changes Detected**), the **Check before applying** heading for destructive changes SchemaBot cannot attribute to the PR, and the stale-base **Apply rejected — base schema is newer** heading cleared by rebasing. These are the plan and apply-decision sites, not every ⚠️ on the surface — see the note below | Caution: look at this before you apply |
 | 🚨 | Apply-rejection comment; CLI apply output | The `--allow-unsafe` instruction, or (CLI) the banner confirming it was supplied |
-| ⚙️ | Plan and locked apply comments (**Direct execution**) | Consent disclosure for native-DDL statements |
+| ⚙️ | Plan and locked apply comments (**Direct execution**) | Disclosure of how native-DDL statements run |
 | 💡 | Plan comment and CLI (**Lint Warnings**) | Advisory best-practice findings |
 | ✅ | Plan comment | No schema changes detected |
 | ❌ | Failed apply/rollback headings, error and first-failure callouts | An attempted operation failed |

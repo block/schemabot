@@ -214,8 +214,12 @@ jobs:
             mysql:8.0 \
             mysql:8.4 \
             postgres:16 \
+            postgres:17 \
             ministackorg/ministack:1.5.10 \
             testcontainers/ryuk:0.13.0
+      - name: "Pre-pull Supabase PostgreSQL"
+        if: matrix.shard == 'per-package'
+        run: scripts/ci/prepull-images.sh supabase/postgres:17.6.1.136@sha256:f371b5f3f2ac0a05703f33d6e6134515fb2498cab708fb948a0aeb7481467c00
       - name: "Test"
         # Cap package-level parallelism: the integration suite runs many heavy
         # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
@@ -313,7 +317,27 @@ jobs:
           # Searched recursively: the shard runner tests every package under
           # pkg/localscale that carries test files, so a test in a nested
           # package that no shard filter names would be run by nobody.
-          tests=$(find pkg/localscale -name '*_test.go' -exec grep -h -o 'func Test[^(]*' {} + | sed 's/func //' | grep -v '/' | sort -u)
+          # grep exits 1 when no test file matches and 2 when the tree is
+          # unusable. Under `set -e` either would abort here with a bare exit
+          # status, so both are absorbed and reported apart: a missing or
+          # unreadable tree says so rather than being described as an empty
+          # test set. The status check below is the fail-closed gate, not
+          # just the label: with `set +e` in force, grep still prints the
+          # matches from every file it could read, so without the check one
+          # unreadable test file's tests would drop out of every shard filter
+          # and the job would pass with nobody running them.
+          # A Go identifier cannot contain `/`, so a match carrying
+          # one came from prose that mentions `func Test`, not from a
+          # declaration, and is dropped after discovery.
+          set +e
+          matches=$(grep -r --include='*_test.go' -h -o 'func Test[^(]*' pkg/localscale)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::pkg/localscale is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed -e 's/func //' -e '/\//d' | sort -u)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no localscale tests discovered"
@@ -525,6 +549,8 @@ jobs:
             run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability|BarrierReleaseBounded)$$
           - shard: failure-policy
             run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue|OnFailurePauseRelease)$$
+          - shard: targets
+            run: TestGRPCMultiDeploy_(TargetsRolloutThroughCLI)$$
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -599,7 +625,20 @@ jobs:
           set -euo pipefail
           NUM_SHARDS=3
           # Deterministic order so a test always lands in the same bucket.
-          tests=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go | sed 's/func //' | sort)
+          # grep exits 1 when the file has no matching test and 2 when the
+          # file itself is unusable. Under `set -e` either would abort here
+          # with a bare exit status, so both are absorbed and reported apart:
+          # a missing or unreadable file says so rather than being described
+          # as an empty test set.
+          set +e
+          matches=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::e2e/local/vitess_test.go is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed 's/func //' | sort)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no vitess e2e tests discovered"

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/lintguidance"
 )
 
@@ -52,6 +53,6 @@ func writeRelatedGuidance(sb *strings.Builder, scopes ...guidanceScope) {
 		links = append(links, fmt.Sprintf("[%s](%s)", guide.Label, guide.URL))
 	}
 	if len(links) > 0 {
-		fmt.Fprintf(sb, "📖 **Related guidance:**\n\n- %s\n\n", strings.Join(links, "\n- "))
+		fmt.Fprintf(sb, "%s **Related guidance:**\n\n- %s\n\n", glyph.Docs, strings.Join(links, "\n- "))
 	}
 }

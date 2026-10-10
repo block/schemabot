@@ -133,7 +133,33 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 		AttributeFields: resolverAttributeFields(cfg),
 		Credentials:     creds,
 		Assembler:       assembler,
+		TableOwner:      etreTableOwner(cfg),
 	})
+}
+
+// etreHostField returns the entity field holding the connection host for the
+// configured engine. MySQL/Strata resolve a MySQL host; Vitess resolves the
+// optional vtgate host used for SHOW VITESS_MIGRATIONS progress (its own block,
+// since it is independent of the PlanetScale API connection); PostgreSQL reads
+// its own block.
+func etreHostField(cfg EtreConfig) string {
+	switch cfg.DatabaseType {
+	case storage.DatabaseTypeVitess:
+		return cfg.Vitess.HostField
+	case storage.DatabaseTypePostgres:
+		return cfg.Postgres.HostField
+	default:
+		return cfg.MySQL.HostField
+	}
+}
+
+// etreTableOwner returns the role new tables are created as, which only the
+// PostgreSQL engine configures.
+func etreTableOwner(cfg EtreConfig) string {
+	if cfg.DatabaseType == storage.DatabaseTypePostgres {
+		return cfg.Postgres.TableOwner
+	}
+	return ""
 }
 
 // etreAssembler selects the engine-specific connection assembler for the
@@ -142,23 +168,13 @@ func buildEtreResolver(ctx context.Context, cfg EtreConfig, logger *slog.Logger)
 // cluster reached over the MySQL protocol, so it assembles its connection the
 // same way (host + port + credentials → DSN) and reads the same MySQL block;
 // Vitess assembles PlanetScale API metadata and decodes a token secret rather
-// than a username/password. A new engine (postgres) is a new case here; an
-// unsupported type fails closed.
-// etreHostField returns the entity field holding the connection host for the
-// configured engine. MySQL/Strata resolve a MySQL host; Vitess resolves the
-// optional vtgate host used for SHOW VITESS_MIGRATIONS progress (its own block,
-// since it is independent of the PlanetScale API connection).
-func etreHostField(cfg EtreConfig) string {
-	if cfg.DatabaseType == storage.DatabaseTypeVitess {
-		return cfg.Vitess.HostField
-	}
-	return cfg.MySQL.HostField
-}
-
+// than a username/password; PostgreSQL connects to one database, so it builds
+// a DSN carrying the database name, which it decodes from the credential
+// secret. An unsupported type fails closed.
 func etreAssembler(cfg EtreConfig) (inventory.ConnectionAssembler, inventory.SecretDecoder, error) {
 	switch cfg.DatabaseType {
 	case "":
-		return nil, nil, fmt.Errorf("target_resolver.etre.database_type is required (%q, %q, or %q)", storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata, storage.DatabaseTypeVitess)
+		return nil, nil, fmt.Errorf("target_resolver.etre.database_type is required (%q, %q, %q, or %q)", storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres)
 	case storage.DatabaseTypeMySQL, storage.DatabaseTypeStrata:
 		if cfg.MySQL.HostField == "" {
 			return nil, nil, fmt.Errorf("target_resolver.etre.mysql.host_field is required for the %q engine", cfg.DatabaseType)
@@ -174,6 +190,25 @@ func etreAssembler(cfg EtreConfig) (inventory.ConnectionAssembler, inventory.Sec
 			APIURL:                cfg.Vitess.APIURL,
 			DefaultPort:           cfg.Vitess.DefaultPort,
 		}, inventory.DecodePlanetScaleSecret, nil
+	case storage.DatabaseTypePostgres:
+		if cfg.Postgres.HostField == "" {
+			return nil, nil, fmt.Errorf("target_resolver.etre.postgres.host_field is required for the %q engine", cfg.DatabaseType)
+		}
+		if cfg.Postgres.CARef != "" {
+			if err := inventory.ValidatePostgresCARef(cfg.Postgres.CARef); err != nil {
+				return nil, nil, fmt.Errorf("target_resolver.etre.postgres.ca_ref: %w", err)
+			}
+		}
+		if err := inventory.ValidateTableOwner(cfg.DatabaseType, cfg.Postgres.TableOwner); err != nil {
+			return nil, nil, fmt.Errorf("target_resolver.etre.postgres.table_owner: %w", err)
+		}
+		// The inventory does not record the database name, so the credential
+		// secret carries it and is decoded as JSON rather than read as a plain
+		// password.
+		return inventory.PostgresConnectionAssembler{
+			DefaultPort: cfg.Postgres.DefaultPort,
+			CARef:       cfg.Postgres.CARef,
+		}, inventory.DecodePostgresSecret, nil
 	default:
 		return nil, nil, fmt.Errorf("target_resolver.etre.database_type %q is not supported", cfg.DatabaseType)
 	}
@@ -202,11 +237,16 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 		if cfg.PasswordRef == "" {
 			return nil, fmt.Errorf("target_resolver.etre.credentials.password_ref is required")
 		}
-		// A decoder (for example a Vitess token) produces the full credential from
-		// the secret, so no separate username is configured; require a username
-		// only for the plain username + password form.
-		if decode == nil && cfg.Username == "" {
+		// A decoder (a Vitess token, a PostgreSQL RDS-format secret) produces the
+		// full credential from the secret, so a configured username would be
+		// silently ignored and the engine would authenticate as a role the
+		// operator did not configure. Require a username only for the plain
+		// username + password form, and reject one alongside a decoder.
+		switch {
+		case decode == nil && cfg.Username == "":
 			return nil, fmt.Errorf("target_resolver.etre.credentials.username is required")
+		case decode != nil && cfg.Username != "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.username cannot be combined with an engine that decodes the secret itself (vitess, postgres); the secret names the user")
 		}
 		return inventory.SecretRefCredentialResolver{Username: cfg.Username, PasswordRef: cfg.PasswordRef, Decode: decode}, nil
 
@@ -217,11 +257,16 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 		// optional: without it the backend reads from the caller's own account.
 		switch {
 		case cfg.Region == "":
-			return nil, fmt.Errorf("target_resolver.etre.credentials.region is required for the awssm backend")
+			return nil, fmt.Errorf("target_resolver.etre.credentials.region is required for the awssm backend; it is the data plane's home region")
+		case len(cfg.ReachableRegions) > 0 && cfg.RegionAttribute == "":
+			return nil, fmt.Errorf("target_resolver.etre.credentials.reachable_regions requires region_attribute, which names the region of each target's cluster")
 		case cfg.SecretName == "":
 			return nil, fmt.Errorf("target_resolver.etre.credentials.secret_name is required for the awssm backend")
 		case cfg.Username != "" && decode != nil:
-			return nil, fmt.Errorf("target_resolver.etre.credentials.username (plain-password secrets) cannot be combined with a token-decoding engine such as vitess")
+			return nil, fmt.Errorf("target_resolver.etre.credentials.username (plain-password secrets) cannot be combined with an engine that decodes the secret itself (vitess, postgres)")
+		}
+		if err := awscreds.ValidateRegions(cfg.Region, cfg.ReachableRegions); err != nil {
+			return nil, fmt.Errorf("target_resolver.etre.credentials: %w", err)
 		}
 		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 		if err != nil {
@@ -230,6 +275,8 @@ func buildCredentialResolver(ctx context.Context, cfg EtreCredentialsConfig, dec
 		resolver, err := awscreds.New(awscreds.Config{
 			AWSConfig:        awsCfg,
 			Region:           cfg.Region,
+			RegionAttribute:  cfg.RegionAttribute,
+			ReachableRegions: cfg.ReachableRegions,
 			RoleARN:          cfg.RoleARN,
 			ExternalID:       cfg.ExternalID,
 			SecretName:       cfg.SecretName,
@@ -276,6 +323,10 @@ func resolverAttributeFields(cfg EtreConfig) []string {
 				accountAttr = "aws_account_id"
 			}
 			fields = ensureField(fields, accountAttr)
+		}
+		// The region of each target's cluster comes from an attribute.
+		if cfg.Credentials.RegionAttribute != "" {
+			fields = ensureField(fields, cfg.Credentials.RegionAttribute)
 		}
 		// The secret name and username may template over resolved attributes;
 		// surface those so the resolver fetches them for the credential backend.

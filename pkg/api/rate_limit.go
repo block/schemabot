@@ -20,8 +20,11 @@ const (
 	rateLimitDecisionLimit = "limit"
 )
 
-// pullRateLimitEndpoint labels the pull endpoint's rate-limit metrics.
-const pullRateLimitEndpoint = "/api/pull"
+// The endpoint labels on rate-limit metrics.
+const (
+	pullRateLimitEndpoint          = "/api/pull"
+	checksInspectRateLimitEndpoint = "/api/checks/inspect"
+)
 
 // targetRateLimitKey builds the per-target bucket key. The NUL separator keeps
 // two different targets from ever colliding on one bucket, which a printable
@@ -144,6 +147,47 @@ func (s *Service) pullCallerRateLimitReason() string {
 	return apitypes.PullRateLimitSharedReason
 }
 
+// checkChecksInspectCallerBudget spends the request's per-caller inspection
+// budget and reports whether it may proceed. It runs before the inspection
+// resolves a GitHub client, so a refused request costs the installation's
+// quota nothing. When the budget is exhausted it writes the 429 itself and
+// returns false, so the caller only has to return. A disabled budget returns
+// without recording a decision, for the same reason pullRateLimitEnforced
+// gives.
+func (s *Service) checkChecksInspectCallerBudget(w http.ResponseWriter, r *http.Request, req ChecksInspectRequest) bool {
+	if s.checksInspectLimiter == nil {
+		return true
+	}
+
+	ctx := r.Context()
+	metricEnvironment := s.config.metricEnvironmentAttribute(req.Environment)
+
+	caller := callerRateLimitKey(r)
+	if allowed, retryAfter := s.checksInspectLimiter.Allow(caller); !allowed {
+		metrics.RecordRateLimitDecision(ctx, checksInspectRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionLimit, metricEnvironment)
+		s.logger.Warn("check inspection rejected because the caller exceeded its request budget",
+			"caller", caller,
+			"repo", req.Repo,
+			"pr", req.PullRequest,
+			"environment", req.Environment,
+			"retry_after", retryAfter,
+		)
+		s.writeRateLimited(w, retryAfter, s.checksInspectCallerRateLimitReason())
+		return false
+	}
+	metrics.RecordRateLimitDecision(ctx, checksInspectRateLimitEndpoint, rateLimitScopeCaller, rateLimitDecisionAllow, metricEnvironment)
+	return true
+}
+
+// checksInspectCallerRateLimitReason is pullCallerRateLimitReason for the
+// check inspection.
+func (s *Service) checksInspectCallerRateLimitReason() string {
+	if s.config.Auth.Enabled() {
+		return apitypes.ChecksInspectRateLimitCallerReason
+	}
+	return apitypes.ChecksInspectRateLimitSharedReason
+}
+
 // pullRateLimitEnforced reports whether either lane can refuse a request.
 // Rate limiting being off is a configuration decision, logged once at startup,
 // so a disabled server returns here without recording a decision it never
@@ -154,9 +198,8 @@ func (s *Service) pullRateLimitEnforced() bool {
 
 // writeRateLimited writes a 429 carrying how long the caller must wait, both as
 // the standard Retry-After header and in the response body. The body repeats it
-// because the CLI's HTTP client reads error bodies and not response headers, so
-// a header-only hint would be invisible to the client most likely to be
-// limited. Both come from the same rounded value the response body carries, so
+// so a client that reads only the error body, such as an older CLI, still sees
+// the wait. Both come from the same rounded value the response body carries, so
 // the header and the message can never disagree.
 func (s *Service) writeRateLimited(w http.ResponseWriter, retryAfter time.Duration, reason string) {
 	body := apitypes.NewRateLimitedResponse(reason, retryAfter)

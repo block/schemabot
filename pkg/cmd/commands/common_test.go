@@ -3,6 +3,7 @@
 package commands
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/e2eutil"
 )
 
@@ -80,6 +82,55 @@ func TestApplyChangeCountsSummary(t *testing.T) {
 	assert.Equal(t, "Changes: 2 created, 1 altered, 2 dropped, 2 VSchema updates.", countTableProgressChanges(tables).summary())
 }
 
+// Index builds and drops are counted in their own clauses whether the change
+// type arrives in the REST form or the proto form, so an apply that only ran
+// index work does not complete with an empty summary and a table that also
+// gained an index is not counted as altered twice.
+func TestApplyChangeCountsSummaryNamesIndexWork(t *testing.T) {
+	tables := []templates.TableProgress{
+		{TableName: "orders", ChangeType: "alter"},
+		{TableName: "orders", ChangeType: "create_index"},
+		{TableName: "events", ChangeType: "CHANGE_TYPE_CREATE_INDEX"},
+		{TableName: "orders", ChangeType: "CHANGE_TYPE_DROP_INDEX"},
+	}
+
+	assert.Equal(t, "Changes: 1 altered, 2 indexes created, 1 index dropped.", countTableProgressChanges(tables).summary())
+	assert.Equal(t, "Changes: 1 index created.", countTableProgressChanges(tables[2:3]).summary())
+}
+
+// A change type outside the named buckets — a DDL kind the counter does not
+// name, or an empty one the producer could not map — is reported as other DDL
+// rather than dropped, and the clause sits between the typed counts and the
+// VSchema clause so the typed counts never read as the whole apply.
+func TestApplyChangeCountsSummaryNamesOtherDDL(t *testing.T) {
+	tables := []templates.TableProgress{
+		{TableName: "orders", ChangeType: "alter"},
+		{TableName: "orders", ChangeType: "rename"},
+		{TableName: "events", ChangeType: ""},
+		{ChangeType: "vschema_update"},
+	}
+
+	assert.Equal(t, "Changes: 1 altered, 2 other DDL statements, 1 VSchema update.", countTableProgressChanges(tables).summary())
+	assert.Equal(t, "Changes: 1 other DDL statement.", countTableProgressChanges(tables[1:2]).summary())
+}
+
+// TestApplyChangeCountsSummaryNamesEveryDDLKind walks the DDL statement
+// vocabulary and pins that a task of every kind appears in the completion
+// summary, so a kind without a named bucket is still reported instead of
+// leaving an apply that ran it with an empty or short Changes clause.
+func TestApplyChangeCountsSummaryNamesEveryDDLKind(t *testing.T) {
+	for st := range ddl.StatementType(64) {
+		if !st.IsDDL() {
+			continue
+		}
+		op := ddl.StatementTypeToOp(st)
+		t.Run(fmt.Sprintf("%d_%s", int(st), op), func(t *testing.T) {
+			tables := []templates.TableProgress{{TableName: "orders", ChangeType: op}}
+			assert.NotEmpty(t, countTableProgressChanges(tables).summary(), "a %q task is missing from the completion summary", op)
+		})
+	}
+}
+
 func TestApplyChangeCountsSummaryVSchemaOnly(t *testing.T) {
 	tables := []templates.TableProgress{{ChangeType: "vschema_update"}}
 
@@ -132,4 +183,28 @@ func TestLoadCLIConfig_RejectsIgnoreTablePaths(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, cfg)
 	assert.Contains(t, err.Error(), "not a path")
+}
+
+// A pattern entry is read as written and travels to the plan request
+// unresolved: only the target's catalog says which tables it matches.
+func TestLoadCLIConfig_ParsesIgnoreTablePatterns(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\nignore_tables:\n  - legacy_audit_log\n  - '/^relay_\\d+_feed$/'\n  - /^relay_[0-9]+_cursor$/\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"legacy_audit_log", `/^relay_\d+_feed$/`, `/^relay_[0-9]+_cursor$/`}, cfg.PlanExclusions().Tables,
+		"quoted or not, as the docs show it")
+}
+
+func TestLoadCLIConfig_RejectsInvalidIgnoreTablePattern(t *testing.T) {
+	dir := t.TempDir()
+	content := "database: mydb\ntype: mysql\nignore_tables:\n  - '/^relay_(\\d+_feed$/'\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "schemabot.yaml"), []byte(content), 0644))
+
+	cfg, err := LoadCLIConfig(dir)
+	require.Error(t, err)
+	assert.Nil(t, cfg)
+	assert.Contains(t, err.Error(), `schemabot.yaml: ignore_tables entry "/^relay_(\d+_feed$/" is not a valid regular expression`)
 }

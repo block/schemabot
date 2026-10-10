@@ -138,7 +138,7 @@ proportion to the rows in it, on every pod, inside the boot's budget (see
 
 **PostgreSQL stops the boot rather than make a change that locks a table for as
 long as the change takes.** A new column does that when it is `NOT NULL` with no
-`DEFAULT`, generated, an identity column, `UNIQUE`, or a foreign key with a
+`DEFAULT`, generated, an identity or `serial` column, `UNIQUE`, or a foreign key with a
 `DEFAULT`. One error names every change in that state, and none of them converge
 until all are resolved.
 
@@ -453,10 +453,34 @@ $ schemabot storage apply --dsn "$SCHEMABOT_STORAGE_DSN"
 ✓ Ran 3 statements against schemabot on db-1.example. Nothing is outstanding.
 ```
 
+MySQL prints `converged=` too, once a convergence spans more than one table.
+Each table converges in an engine run of its own, and the engine measures rows
+only while it copies them. A statement the server takes natively, such as a
+nullable column added in place, copies nothing, so a poll during it has no
+table to report and no rows to count. That line is about the convergence, and
+what it carries is how much of the convergence is behind it. Here three tables
+each gain a nullable column:
+
+```console
+$ schemabot storage apply --dsn "$SCHEMABOT_STORAGE_DSN"
+...
+15:04:05 Convergence started status=running
+15:04:07 Table completed table=applies progress=100%
+15:04:09 Convergence running converged=33%
+15:04:11 Table completed table=checks progress=100%
+15:04:15 Table completed table=plans progress=100%
+✓ Ran 3 statements against schemabot on db-1.example. Nothing is outstanding.
+```
+
+A table that does copy can show the same key on its first line. A later run's
+table polled before its copy has measured anything reads
+`Table started table=checks status=copyRows converged=50%`. Its next line
+reads `progress=` as soon as there are rows to count.
+
 The two percentages are deliberately different keys. `progress=` counts rows
-within one table; `converged=` counts statements within the run. One key
-carrying both denominators is how an alert written against one silently
-matches the other.
+within one table; `converged=` counts statements within the run, on every
+dialect and whether or not the line names a table. One key carrying both
+denominators is how an alert written against one silently matches the other.
 
 `--deployment` prints none. That convergence is reached over the API, which
 answers once, when it is done, and there is nothing to stream through a single

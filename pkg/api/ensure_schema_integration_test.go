@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
@@ -45,6 +46,31 @@ func TestEnsureSchema(t *testing.T) {
 	// rely on it.
 	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", "apply_operation_id"),
 		"tasks.apply_operation_id column not found")
+}
+
+// A storage database converged by a binary that did not record lock acquirers
+// gains the nullable acquirer columns on the next startup, without disturbing
+// the locks already held: they read back with no acquirer recorded.
+func TestEnsureSchema_AddsLockAcquirerColumns(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+	_, err := db.ExecContext(ctx, "ALTER TABLE `locks` DROP COLUMN `acquired_by`, DROP COLUMN `acquired_by_operator_groups`")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO `locks` (`database_name`, `database_type`, `repository`, `pull_request`, `owner`) VALUES ('orders', 'mysql', 'org/repo', 7, 'org/repo#7')")
+	require.NoError(t, err)
+
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "locks", "acquired_by"))
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "locks", "acquired_by_operator_groups"))
+	var acquiredBy, acquiredByGroups sql.NullString
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT `acquired_by`, `acquired_by_operator_groups` FROM `locks` WHERE `database_name` = 'orders'").Scan(&acquiredBy, &acquiredByGroups))
+	assert.False(t, acquiredBy.Valid, "a lock held across the schema change records no acquirer")
+	assert.False(t, acquiredByGroups.Valid)
 }
 
 // A cold bootstrap must refuse nothing. The refusal gate reads the plan's
@@ -654,7 +680,7 @@ func TestEnsureSchema_RollbackFailsWhenADroppedUniqueIndexHasDuplicates(t *testi
 	// The rolled-back binary declares the index, so its boot tries to re-add it
 	// and cannot: the duplicate it would have prevented is already there.
 	err = EnsureSchema(dsn, logger)
-	require.ErrorContains(t, err, "storage schema change failed",
+	require.ErrorContains(t, err, `storage schema change to table "tasks" failed`,
 		"re-adding a unique index over duplicate rows must fail the boot, not be skipped")
 	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "tasks", droppedUniqueIndex),
 		"the unique index cannot be re-added while the duplicate rows remain")
@@ -966,4 +992,106 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// A convergence spanning several tables hands the engine one table at a time.
+// The engine attempts native DDL — the algorithm MySQL picks, metadata-only
+// where the clause shape and server version allow it — only for a change
+// confined to a single table; given several it declines the attempt and copies
+// every one of them. On the startup path that copy is synchronous, bounded by a
+// budget a boot cannot extend, and throttled by whatever the target is doing,
+// so a release adding a nullable column to three tables must not turn into
+// three full copies.
+//
+// What this pins is that each table is asked on its own, not that the server
+// answers yes: whether any given add is metadata-only is MySQL's decision, and
+// a copy is still what runs when it says no.
+func TestEnsureSchema_ConvergesOneTablePerEngineRun(t *testing.T) {
+	ctx := t.Context()
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	bootstrapLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	require.NoError(t, EnsureSchema(dsn, bootstrapLogger))
+
+	// Drift three tables in the additive direction: each is missing one
+	// nullable column the embedded schema declares, and no index covers any of
+	// them, so the outstanding delta is exactly one ADD COLUMN per table.
+	drifted := map[string]string{
+		"applies": "revert_skipped_at",
+		"checks":  "change_summary",
+		"plans":   "direct_execution",
+	}
+	for table, column := range drifted {
+		_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `%s` DROP COLUMN `%s`", table, column))
+		require.NoError(t, err, "drop %s.%s", table, column)
+		require.False(t, testutil.ColumnExists(t, db, sdb.Name, table, column))
+	}
+
+	// The observer runs inline on the convergence's own goroutine, which here
+	// is this one, so the recorded observations need no synchronization.
+	var observations []StorageConvergenceProgress
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, logger, WithConvergenceProgress(func(o StorageConvergenceProgress) {
+		observations = append(observations, o)
+	})))
+
+	for table, column := range drifted {
+		assert.True(t, testutil.ColumnExists(t, db, sdb.Name, table, column),
+			"%s.%s must converge", table, column)
+	}
+
+	// Every run reports its own table as it finishes, so each table has to
+	// appear — and no observation may ever carry two, which is exactly the
+	// condition under which the engine declines the native-DDL attempt.
+	observed := map[string]bool{}
+	for _, o := range observations {
+		assert.LessOrEqual(t, len(o.Tables), 1,
+			"an observation carrying several tables means the engine was handed several at once")
+		for _, tp := range o.Tables {
+			if tp.State == string(engine.StateCompleted) {
+				observed[tp.Table] = true
+			}
+		}
+	}
+	// Each table has to be reported finished. A statement taken natively
+	// copies nothing, so the engine never marks its table done on its own —
+	// an operator watching this pass would otherwise see three tables start
+	// and none of them finish.
+	for table := range drifted {
+		assert.True(t, observedTable(observed, table),
+			"%s must converge under a run of its own and be reported finished; observed %v", table, observed)
+	}
+
+	logs := logBuf.String()
+	assert.Equal(t, len(drifted), strings.Count(logs, `msg="converging storage table"`),
+		"a convergence of three tables is three engine runs")
+	assert.Contains(t, logs, fmt.Sprintf("run_count=%d", len(drifted)))
+
+	// The next boot finds nothing left to do, so the split converged the whole
+	// delta rather than a prefix of it. It logs to a buffer of its own: the
+	// converging boot's lines are already in logBuf, so reading that buffer
+	// would pass even if this boot had to finish what the last one left.
+	var nextBootBuf syncBuffer
+	nextBootLogger := slog.New(slog.NewTextHandler(&nextBootBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, nextBootLogger))
+	nextBoot := nextBootBuf.String()
+	assert.Contains(t, nextBoot, `msg="storage schema up-to-date"`)
+	assert.NotContains(t, nextBoot, "schema change detected",
+		"a boot after a complete convergence plans nothing")
+	assert.Zero(t, strings.Count(nextBoot, `msg="converging storage table"`),
+		"a boot after a complete convergence runs nothing")
+}
+
+// observedTable reports whether any observed subject is the named table. The
+// engine qualifies a table it reports on with the database it is in, so the
+// name an observation carries is not always the bare one the schema declares.
+func observedTable(observed map[string]bool, table string) bool {
+	for name := range observed {
+		if name == table || strings.HasSuffix(name, "."+table) {
+			return true
+		}
+	}
+	return false
 }

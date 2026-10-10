@@ -17,6 +17,21 @@ func previewPlanOutput() {
 	WriteOptions(true, false) // Show defer cutover option
 }
 
+// previewPartitionedPlanOutput shows a plan for partitioned tables, each
+// partition definition on its own line.
+func previewPartitionedPlanOutput() {
+	WritePlanHeader(PlanHeaderData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		IsMySQL:     true,
+	})
+
+	changes := samplePartitionedPlanChanges()
+	WriteSQLChanges(changes, schema.DialectMySQL)
+	WritePlanSummary(changes)
+}
+
 func previewVitessPlanOutput() {
 	WritePlanHeader(PlanHeaderData{
 		Database:    "commerce",
@@ -61,6 +76,26 @@ func previewVitessPlanOutput() {
 		allChanges = append(allChanges, ns.Changes...)
 	}
 	WritePlanSummary(allChanges)
+}
+
+// previewPostgresPlanOutput renders a PostgreSQL plan whose standalone index
+// build on an existing table is named as an index to create in the summary.
+func previewPostgresPlanOutput() {
+	WritePlanHeader(PlanHeaderData{
+		Engine:      "postgres",
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		IsMySQL:     true,
+	})
+
+	changes := []DDLChange{
+		{ChangeType: "CREATE", TableName: "sessions", DDL: "CREATE TABLE sessions (id uuid PRIMARY KEY, user_id bigint NOT NULL, payload jsonb, created_at timestamptz NOT NULL DEFAULT now())"},
+		{ChangeType: "ALTER", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN last_seen_at timestamptz, ADD COLUMN preferences jsonb"},
+		{ChangeType: "CREATE_INDEX", TableName: "orders", DDL: "CREATE INDEX CONCURRENTLY idx_orders_placed_at ON orders USING btree (placed_at)"},
+	}
+	WriteSQLChanges(changes, schema.DialectPostgres)
+	WritePlanSummary(changes)
 }
 
 func previewPlanNoChangesOutput() {

@@ -136,16 +136,44 @@ type Storage interface {
 type LockStore interface {
 	// Acquire attempts to acquire a lock. Returns ErrLockHeld if already held by another owner.
 	// If the same owner already holds the lock, this is a no-op (idempotent).
+	// When Acquire creates the lock row it sets lock.ID to the new row's ID; a
+	// re-acquire leaves lock.ID as passed, so a caller passing a new Lock can
+	// tell a row it created (non-zero ID) from one the owner already held.
 	Acquire(ctx context.Context, lock *Lock) error
+
+	// AcquireIfPendingPlanID acquires like Acquire, but only while the lock is
+	// in the state the caller observed: free when observedPendingPlanID is
+	// empty, or held by the same owner with observedPendingPlanID as its
+	// pending plan. Any other same-owner state returns ErrLockIntentChanged and
+	// leaves the stored pending plan alone, so a command that planned against
+	// one intent can never overwrite an intent another command pinned since.
+	AcquireIfPendingPlanID(ctx context.Context, lock *Lock, observedPendingPlanID string) error
 
 	// Release releases a lock. Only succeeds if caller is the owner.
 	// Returns ErrLockNotOwned if the lock is not owned by the caller.
 	Release(ctx context.Context, database, dbType, owner string) error
 
+	// ReleaseByID releases the lock only while the row with the given ID still
+	// holds it under the given owner and pending plan, so a caller that
+	// authorized the release against the row it read can never delete a newer
+	// lock, nor a lock its owner acquired again for a new plan since. It
+	// returns ErrLockNotFound when no lock is held, ErrLockReplaced when a
+	// different row holds the lock, ErrLockNotOwned when the row is held under
+	// another owner, and ErrLockIntentChanged when the row now carries another
+	// pending plan.
+	ReleaseByID(ctx context.Context, id int64, database, dbType, owner, pendingPlanID string) error
+
 	// ReleaseIfPendingPlanID releases a lock only while both its owner and
 	// pending plan still match. A mismatch is a no-op so a superseding apply or
 	// rollback intent owned by the same PR remains intact.
 	ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error)
+
+	// ClearPendingPlanID withdraws a pending plan from a lock the owner keeps
+	// holding, only while both its owner and pending plan still match: the lock
+	// stays held with no pending plan and no disclosure record. It reports
+	// whether it cleared the plan; a mismatch is a no-op so a newer intent
+	// pinned since stays intact. An empty pendingPlanID never matches.
+	ClearPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error)
 
 	// ForceRelease releases a lock regardless of owner (admin override).
 	// Used by `schemabot unlock` command and --force flag.
@@ -199,6 +227,14 @@ type CheckStore interface {
 	// than a refusal, so callers never report a vanished gate as one an apply
 	// is holding.
 	UpsertPlanResult(ctx context.Context, check *Check, drift PlanDriftState) (stored bool, err error)
+
+	// UpsertGuardBlock records a guard block over plan-derived check state. Like
+	// UpsertPlanResult it refuses (stored=false) while an in-progress apply owns
+	// the row. A row whose stored blocking reason is in preserve keeps that block:
+	// the write refreshes only its head SHA and check run id, so a weaker block
+	// never replaces a stronger one. The stored reason is read under the same row
+	// lock as the write.
+	UpsertGuardBlock(ctx context.Context, check *Check, preserve []string) (stored bool, err error)
 
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
@@ -293,6 +329,14 @@ type SettingsStore interface {
 
 	// Set saves a setting. Creates if not exists, updates if exists.
 	Set(ctx context.Context, key string, value string) error
+
+	// CompareAndSet writes value under key only while the stored setting still
+	// matches previous: a nil previous means no setting may exist yet, and a
+	// non-nil previous means the stored value must equal previous.Value. It
+	// reports whether the write happened. A writer that reads a setting,
+	// derives the next value from it, and writes it back uses this so a
+	// slower writer cannot overwrite a value a faster one already advanced.
+	CompareAndSet(ctx context.Context, key string, previous *Setting, value string) (bool, error)
 
 	// List returns all settings, ordered by key ascending.
 	List(ctx context.Context) ([]*Setting, error)
@@ -502,7 +546,7 @@ type ListPlansOptions struct {
 	// within one repository, so List errors when it is set alone.
 	PullRequest int
 	// PrimaryPlanIdentifier, when set, restricts results to the member plans
-	// produced alongside that reviewed plan — the one review round's members,
+	// produced alongside that primary plan — the one review round's members,
 	// rather than every plan stored for the pull request.
 	PrimaryPlanIdentifier string
 	// Since, when set, restricts results to plans created at or after this
@@ -536,6 +580,17 @@ type PlanStore interface {
 
 	// GetByPR returns all plans for a PR.
 	GetByPR(ctx context.Context, repo string, pr int) ([]*Plan, error)
+
+	// UpdateRoute restamps the stored plan with the rollout member it was
+	// planned for: its deployment and target, and narrowedTo, the member a
+	// narrowed plan is held to ("" for a plan of the whole rollout). It is for
+	// the service's own row write finding the row a planner sharing this
+	// storage already stored under the same identifier, stamped with the route
+	// the planner knew and no narrowing. It never replaces a narrowing the row
+	// already records with a different one, the empty one included: such a row
+	// is left unchanged and an error is returned. It changes nothing else on
+	// the row.
+	UpdateRoute(ctx context.Context, planIdentifier, deployment, target, narrowedTo string) error
 
 	// List returns plans matching opts, newest first. Ordering is
 	// deterministic on created_at ties (see the sqlstore GetByPR ordering
@@ -589,8 +644,14 @@ type ApplyStore interface {
 	// land on an apply no drive will pick up again. The (apply_id, deployment,
 	// operation_key) unique index is the idempotency guard: a concurrent attach
 	// of the same operation loses with ErrApplyOperationExists, which the
-	// caller resolves by re-reading the winner's row. On success the operation's
-	// ID and every task's ID and ApplyOperationID are populated.
+	// caller resolves by re-reading the winner's row. Under the same lock, an
+	// operation keyed by its target is refused with
+	// ErrApplyOperationKeyingMismatch when the deployment's existing work
+	// operations of the apply are not keyed that way, and the reverse, so one
+	// target's work can never attach under two keys. An attach to an apply
+	// whose work a newer generation took over (Apply.SupersededBy) fails with
+	// ErrApplyTakenOver. On success the operation's ID and every
+	// task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
 	// Get returns an apply by ID, or nil if not found.
@@ -619,6 +680,14 @@ type ApplyStore interface {
 	// Returns ErrActiveApplyExists when moving an apply into an active state
 	// would overlap another active apply for the same database, database type,
 	// and environment.
+	// Returns ErrApplyReopenRefused when the write would reopen a finished
+	// apply: an active state over a terminal row, or stopped over a settled
+	// one, since a stopped apply can be claimed to resume. Returns
+	// ErrApplyOutcomeSettled when the write would replace a settled outcome
+	// with a different one. Every other terminal write is allowed, including
+	// cancelling a stopped apply and same-state refreshes. Returns
+	// ErrApplyNotFound when a guarded write matches no row because the apply
+	// does not exist.
 	Update(ctx context.Context, apply *Apply) error
 
 	// UpdateDerivedState compare-and-swaps the rollout-projected applies.state.
@@ -802,9 +871,45 @@ type ApplyStore interface {
 	// when the marker was earned.
 	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
 
+	// GetSupersededBy returns the apply's superseded_by marker, the identifier
+	// of the apply that took over its work, or "" when nothing has. It reads
+	// the one column, so a driver checking the marker on every projection pass
+	// does not reload the whole row. It returns ErrApplyNotFound when the apply
+	// does not exist.
+	GetSupersededBy(ctx context.Context, applyID int64) (string, error)
+
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.
 	CheckLease(ctx context.Context, lease ApplyLease) error
+
+	// WithExclusiveTarget runs fn while holding the apply target's advisory
+	// lock, having first refused to run it at all if another active apply owns
+	// that target.
+	//
+	// It is for work that touches the target database rather than storage, and
+	// that would destroy another apply's live work if it ran alongside one —
+	// reclaiming what a cancelled schema change left on the target, say, where
+	// the leftovers are named after the target's own tables and so are
+	// indistinguishable from a running apply's. What fn is given is the lock,
+	// held for its whole run, rather than a fact about the target read once at
+	// the start: the lock is what keeps the next apply out while fn works,
+	// where a read would only ever have been true of the instant it happened.
+	// Task rows are not a substitute for either, because they see only one
+	// deployment's work and fail toward "nothing is running", the wrong
+	// direction for a destructive one.
+	//
+	// The lock keeps SchemaBot's own applies off the target. It says nothing
+	// about a schema change run against the same schema from outside
+	// SchemaBot, which takes no lock here and leaves no active apply for the
+	// re-check to find. Work under fn that could destroy such a change's
+	// artifacts needs a guard of its own; this is not it.
+	//
+	// Returns ErrActiveApplyExists without running fn when another active apply
+	// owns the target, so the caller can report the skip rather than proceed.
+	//
+	// The lock is held for as long as fn runs, so fn must be bounded: every
+	// apply competing for this target waits behind it.
+	WithExclusiveTarget(ctx context.Context, apply *Apply, fn func(context.Context) error) error
 
 	// ExpireRetryable transitions failed_retryable applies that exhausted their
 	// retry budget or recovery freshness window to permanent failed, settling
@@ -913,7 +1018,14 @@ type TaskStore interface {
 	// Get returns a task by task_identifier (external identifier), or nil if not found.
 	Get(ctx context.Context, taskIdentifier string) (*Task, error)
 
-	// Update updates an existing task.
+	// Update writes an existing task's mutable columns: its state, progress,
+	// execution mode, engine identifiers, timestamps, and statement text. The
+	// statement is written because a task may adopt the deployment's own
+	// rendering of its reviewed statement; every operator surface re-reads
+	// it from the row, and so does the next dispatch of the task, which
+	// sends the stored statement to that deployment. Identity columns
+	// (apply, operation, namespace, table, shard) never change through
+	// Update.
 	// Returns ErrTaskNotFound if the task does not exist.
 	Update(ctx context.Context, task *Task) error
 
@@ -924,8 +1036,9 @@ type TaskStore interface {
 	// the context: the single lease-holding operator is the only writer of an
 	// operation's per-shard rows, so the lookup-then-write is serialized by that
 	// lease and needs no unique constraint. A displaced operator (lost lease)
-	// fails closed with ErrApplyLeaseLost. On conflict only the progress fields
-	// change; identity and DDL are preserved.
+	// fails closed with ErrApplyLeaseLost. On conflict the row is rewritten
+	// through Update: identity is preserved, and the statement text follows
+	// the caller's task like every other mutable column.
 	UpsertShardProgress(ctx context.Context, task *Task) error
 
 	// GetByApplyID returns all tasks for an apply, in creation order — the
@@ -1274,20 +1387,20 @@ type ApplyOperationStore interface {
 	// completed / failed.
 	MarkTerminal(ctx context.Context, id int64, newState string) error
 
-	// SaveExternalOperationID stores the remote data plane's apply_operation_id
-	// on the operation that owns the dispatch.
-	SaveExternalOperationID(ctx context.Context, operationID int64, externalOperationID string) error
-
-	// SaveExternalID stores the remote data plane's apply_id on the operation
-	// that owns the dispatch. The write is atomic with its deployment
-	// invariant: in one transaction the store locks the apply's operation
-	// rows, verifies the operation's deployment records no remote apply id
-	// other than the one being stored, and only then writes. Sibling
-	// operations of one deployment persist concurrently across the driver
-	// pool, so a check outside the writing transaction cannot stop two of
-	// them from recording divergent ids. Divergence returns an error wrapping
-	// ErrRemoteApplyDeploymentIDConflict.
-	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID string) error
+	// SaveExternalID stores the remote data plane's apply_id, and its
+	// apply_operation_id when the data plane named one (externalOperationID
+	// may be empty), on the operation that owns the dispatch. Both ids land in
+	// one write, so no reader ever sees an operation correlated to a remote
+	// apply without the remote operation its progress and cutover address.
+	// The write is atomic with its deployment invariant: in one transaction
+	// the store locks the apply's operation rows, verifies the operation's
+	// deployment records no remote apply id other than the one being stored
+	// and the operation records no other remote operation id, and only then
+	// writes. Sibling operations of one deployment persist concurrently across
+	// the driver pool, so a check outside the writing transaction cannot stop
+	// two of them from recording divergent ids. Deployment divergence returns
+	// an error wrapping ErrRemoteApplyDeploymentIDConflict.
+	SaveExternalID(ctx context.Context, applyID, operationID int64, externalID, externalOperationID string) error
 
 	// ApplyIdentifierForRemoteApply returns the identifier of the apply this
 	// control plane dispatched as the given remote apply, or "" when it
@@ -1327,6 +1440,17 @@ type ApplyOperationStore interface {
 	// changing their state. Other terminal rows
 	// (completed/failed/cancelled/reverted) are never claimed.
 	//
+	// A pending row starts only once its cutover_policy and on_failure admit it
+	// past the earlier rollout members of its apply. A member is a (deployment,
+	// target) pair, so the targets of one deployment are ordered exactly like the
+	// deployments of a map, while the operations of one member (a sharded
+	// target's per-shard work) do not gate each other's start. Under barrier
+	// and parallel they are still ordered at cutover, by
+	// FindNextApplyOperationCutover; under rolling they cut over in their own
+	// drives. A member's finalizer starts only once the work it finalizes has
+	// completed, and it waits on earlier members as rolling does, for them to
+	// complete, under every policy.
+	//
 	// owner identifies the claiming driver and is required; it is recorded as
 	// the operation's lease owner. Returns the claimed row, or nil if nothing
 	// needs work.
@@ -1339,10 +1463,12 @@ type ApplyOperationStore interface {
 	// (claims pending rows → running); this one gates the cutover phase.
 	//
 	// A waiting_for_cutover row is claimed and transitioned to cutting_over only
-	// when every earlier deployment_order sibling has reached completed (the
+	// when every earlier operation of the apply has reached completed (the
 	// cutover gate is completed-only, with the on_failure "continue" exemption
 	// for a terminal-failed earlier sibling) and no pending stop control request
-	// exists for the apply. Separately, a row already in cutting_over or
+	// exists for the apply. The gate covers every earlier operation, whichever
+	// member it belongs to, so one member's shards also cut over one at a time.
+	// Separately, a row already in cutting_over or
 	// revert_window whose heartbeat has been stale for more than one minute is
 	// re-leased without changing its state — recovering an in-flight cutover whose
 	// driver died, which carries no ordering gate.
@@ -1350,6 +1476,20 @@ type ApplyOperationStore interface {
 	// owner identifies the claiming driver and is required. Returns the claimed
 	// row, or nil if nothing is ready to cut over.
 	FindNextApplyOperationCutover(ctx context.Context, owner string) (*ApplyOperation, error)
+
+	// CutoverBlocker returns the earliest earlier operation of another rollout
+	// member (deployment, target) that holds the operation's cutover, or nil
+	// when it is that operation's turn. It applies the same rule as
+	// FindNextApplyOperationCutover: an earlier sibling holds until it has
+	// completed, unless the rollout's on_failure policy continues past its
+	// terminal failure. A manually requested cutover uses it so that it lands
+	// on the member whose turn it is, in the order the automatic cutover claim
+	// would follow between members. Operations of the same member, its shards
+	// and tables, never hold each other's requested cutover: the request
+	// addresses the member's remote apply, which takes whichever of them are
+	// parked. The automatic claim still cuts them over one at a time. It claims
+	// nothing.
+	CutoverBlocker(ctx context.Context, operationID int64) (*ApplyOperation, error)
 
 	// ReleaseClaim releases an operation lease the calling driver holds but
 	// cannot use — typically because the parent apply lease it also needs was

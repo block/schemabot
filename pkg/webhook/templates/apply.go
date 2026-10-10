@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -30,6 +31,9 @@ type TableProgressData struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// EstimatedBytes is the table's on-disk size when it was planned, shown
+	// beside the row counts. Nil when the plan had no estimate.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -177,6 +181,26 @@ type ApplyStatusCommentData struct {
 	// the drive triggers cutover automatically — surfacing the command there
 	// would tell the operator to act when no action is needed.
 	DeferCutover bool
+
+	// PlanID names the plan this member is running, alongside the database and
+	// the apply identifier. It is set only when the members of one apply do not
+	// all run the same work, which is the only case where naming it tells the
+	// reader anything: it ties a running member back to the block it came from
+	// among the several the review showed. A rollout the review showed as one
+	// block names no plan, whether its members share a plan row or were each
+	// planned into their own and came out running the same change. DDL cut to
+	// fit the comment names the command that prints this plan in full.
+	PlanID string
+
+	// CLIName is the tool name the comment's CLI command hints start with,
+	// the server's cli_name. Empty renders the CLI's own default.
+	CLIName string
+
+	// InRolloutSection marks this comment as rendered inside one member's
+	// section of a rollout. The rollout comment carries the apply ID, who
+	// applied it, and the one command that acts on the whole rollout, so the
+	// section leaves out all three.
+	InRolloutSection bool
 }
 
 // RenderApplyStatusComment renders a PR comment for the current apply status.
@@ -195,7 +219,14 @@ func renderApplyStatusComment(data ApplyStatusCommentData, includeLastUpdated bo
 	})
 }
 
+// storedPlan is the stored plan the apply's DDL comes from, when the comment
+// names one, so DDL cut to fit points at the command that prints it in full.
+func (data ApplyStatusCommentData) storedPlan() storedPlanRef {
+	return storedPlanRef{cliName: data.CLIName, environment: data.Environment, id: data.PlanID}
+}
+
 func renderApplyStatusCommentBody(data ApplyStatusCommentData, includeLastUpdated bool, renderedAt string, budget *ddlBlockBudget) string {
+	defer budget.pointAt(data.storedPlan())()
 	var sb strings.Builder
 
 	// Header varies by state
@@ -328,19 +359,36 @@ func writeRollbackHeader(sb *strings.Builder, data ApplyStatusCommentData) {
 	}
 }
 
-// writeApplyMetadata writes the database, apply ID, and requester info.
+// writeApplyMetadata writes the database, apply ID, plan, and requester info. A
+// rollout member section leaves out the apply ID and requester, which the
+// rollout header above it already shows.
 func writeApplyMetadata(sb *strings.Builder, data ApplyStatusCommentData, renderedAt string) {
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
+	parts = appendPlanMetadata(parts, data.PlanID)
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
+	if data.InRolloutSection {
+		return
+	}
 	attributionAt := renderedAt
 	if data.RequestedBy == "" {
 		attributionAt = startedAtDisplay(data.StartedAt, renderedAt)
 	}
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, attributionAt)
+}
+
+// appendPlanMetadata adds the plan the member is running to a metadata line,
+// beside the database and apply identifiers it belongs with. An unset plan adds
+// nothing: every apply runs some plan, so the field is set only where naming it
+// distinguishes this member from its siblings.
+func appendPlanMetadata(parts []string, planID string) []string {
+	if planID == "" {
+		return parts
+	}
+	return append(parts, fmt.Sprintf("**Plan**: `%s`", planID))
 }
 
 func startedAtDisplay(startedAt, fallback string) string {
@@ -468,7 +516,18 @@ func writeStopOrCancelFooterAction(sb *strings.Builder, data ApplyStatusCommentD
 	if command == "cancel" {
 		prefix = cancelPrefix
 	}
-	writeFooterAction(sb, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, prefix, appendTenantFlag(fmt.Sprintf("schemabot %s %s -e %s", command, data.ApplyID, data.Environment), data.Tenant))
+}
+
+// writeMemberFooterAction writes a footer action, unless the comment is one
+// member's section of a rollout. Every control command addresses the whole
+// apply, so a rollout writes its commands once, in the footer at the bottom of
+// the comment, instead of under every member.
+func writeMemberFooterAction(sb *strings.Builder, data ApplyStatusCommentData, label, command string) {
+	if data.InRolloutSection {
+		return
+	}
+	writeFooterAction(sb, label, command)
 }
 
 // revertWindowCountdown returns the time remaining before the revert window
@@ -1008,7 +1067,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		renderRunningTable(sb, dialect, table, budget)
 	}
 
-	renderShardSummary(sb, table)
+	renderShardSummary(sb, table, budget)
 
 	sb.WriteString("\n")
 }
@@ -1024,142 +1083,45 @@ func shardSummaryBreakdownState(status string) bool {
 	}
 }
 
-// renderShardSummary appends a single compact per-shard status line for a
-// sharded table, only while it is in flight. It keeps the PR
-// comment quiet: at most one extra line per table. With few shards it lists each
-// shard's state (and percent for actively-copying shards); with many it collapses
-// to per-state counts plus the slowest copying shard, so even hundreds of shards
-// fit on one line. Detailed per-shard rows/ETAs stay in the CLI.
-func renderShardSummary(sb *strings.Builder, table TableProgressData) {
-	if len(table.Shards) <= 1 {
+// renderShardSummary lists a sharded table's shards while it is in flight.
+func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
+	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards, presentation.PendingQueued, budget)
+}
+
+// writeMemberList lists a table's members, the shards of a sharded table or
+// the targets of a multi-target deployment, while the table is in flight: a
+// line counting them by state, then one line per member with its state in
+// words. It is the listing the CLI shows (presentation.ListParts), so a wide
+// table names only its failures and slowest members, leaving the rest to the
+// counts, rather than growing a line per member. A settled table's line
+// already says where it ended, so the listing stays out of the way then. A
+// comment that would not fit otherwise keeps only the line counting them
+// (ddlBlockBudget.listsMembers). pendingWord names the members still to run
+// (presentation.PendingWord), in the count and on their lines alike.
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
+	if len(members) <= 1 {
 		return
 	}
-	if !shardSummaryBreakdownState(table.Status) {
+	if !shardSummaryBreakdownState(status) {
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
-
-	if len(table.Shards) <= shardNamesInlineLimit {
-		parts := make([]string, 0, len(table.Shards))
-		for _, sh := range table.Shards {
-			if isCopyingShardStatus(sh.Status) && (sh.PercentComplete > 0 || sh.RowsCopied > 0) {
-				parts = append(parts, fmt.Sprintf("%s %s %s", shardGlyph(sh.Status), sh.Shard,
-					ui.FormatRowCopyPercent(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal)))
-				continue
-			}
-			part := fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard)
-			// Glyphs whose meaning isn't self-evident carry the same word the
-			// bucketed form uses, so the line reads without a legend.
-			if word := shardStatusWord(sh.Status); word != "" {
-				part += " " + word
-			}
-			parts = append(parts, part)
-		}
-		fmt.Fprintf(sb, "  └ shards: %s\n", strings.Join(parts, " · "))
+	part := func(i int) presentation.Part {
+		m := members[i]
+		return presentation.Part{Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal}
+	}
+	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
+	c.PendingLabel = pendingWord
+	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
+	if !budget.listsMembers() {
 		return
 	}
-
-	var complete, copying, ready, failed, queued, other int
-	slowestShard, slowestText := "", ""
-	slowestFraction := -1.0
-	for _, sh := range table.Shards {
-		// Shards parked at the cutover barrier count through the shared
-		// readiness predicate, keeping the shard buckets consistent with the
-		// table summaries.
-		if TaskStatusReadyForCutover(sh.Status) {
-			ready++
+	for _, line := range presentation.ListParts(len(members), part, noun) {
+		if line.Summary != "" {
+			fmt.Fprintf(sb, "  - … %s\n", line.Summary)
 			continue
 		}
-		switch state.NormalizeShardStatus(sh.Status) {
-		case state.Task.Completed:
-			complete++
-		case state.Task.Failed, state.Task.FailedRetryable:
-			failed++
-		case state.Task.Pending:
-			queued++
-		default:
-			if isCopyingShardStatus(sh.Status) {
-				copying++
-				if frac := ui.RowCopyFraction(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal); slowestFraction < 0 || frac < slowestFraction {
-					slowestFraction = frac
-					slowestShard = sh.Shard
-					slowestText = ui.FormatRowCopyPercent(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal)
-				}
-			} else {
-				other++
-			}
-		}
-	}
-	var buckets []string
-	if complete > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ✓", complete))
-	}
-	if copying > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ◐ copying", copying))
-	}
-	if ready > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ● ready", ready))
-	}
-	if queued > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ⏳", queued))
-	}
-	if failed > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ✗ failed", failed))
-	}
-	if other > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d …", other))
-	}
-	line := fmt.Sprintf("  └ %d shards: %s", len(table.Shards), strings.Join(buckets, " · "))
-	if slowestShard != "" && slowestFraction >= 0 {
-		line += fmt.Sprintf(" · slowest %s %s", slowestShard, slowestText)
-	}
-	sb.WriteString(line + "\n")
-}
-
-// shardGlyph maps a shard's status to its compact summary glyph.
-func shardGlyph(status string) string {
-	switch state.NormalizeShardStatus(status) {
-	case state.Task.Completed:
-		return "✓" // ✓
-	case state.Task.WaitingForCutover:
-		return "●" // ●
-	case state.Task.Failed, state.Task.FailedRetryable:
-		return "✗" // ✗
-	case state.Task.Pending:
-		return "⏳" // ⏳
-	default:
-		if isCopyingShardStatus(status) {
-			return "◐" // ◐
-		}
-		return "•" // •
-	}
-}
-
-// shardStatusWord returns the word the bucketed summary pairs with a shard's
-// glyph, for glyphs a reader can't decode on sight. Self-evident glyphs
-// (✓ complete, ⏳ queued) return "", and so does the unknown-status catch-all
-// — the bucketed form keeps its "…" bucket bare too. Copying shards return
-// "copying", which the caller replaces with a percent when one is available.
-func shardStatusWord(status string) string {
-	switch state.NormalizeShardStatus(status) {
-	case state.Task.WaitingForCutover:
-		return "ready"
-	case state.Task.Failed, state.Task.FailedRetryable:
-		return "failed"
-	default:
-		if isCopyingShardStatus(status) {
-			return "copying"
-		}
-		return ""
-	}
-}
-
-// isCopyingShardStatus reports whether a shard is actively doing copy/cutover work.
-func isCopyingShardStatus(status string) bool {
-	switch state.NormalizeShardStatus(status) {
-	case state.Task.Running, state.Task.Recovering, state.Task.CuttingOver:
-		return true
-	default:
-		return false
+		p := part(line.Part)
+		fmt.Fprintf(sb, "  - %s %s: %s\n", presentation.PartGlyph(p.Status), inlineCode(p.Name), presentation.PartDetail(p, pendingWord))
 	}
 }
 
@@ -1272,9 +1234,10 @@ func renderStoppedTable(sb *strings.Builder, dialect schema.Dialect, table Table
 
 	// Show rows (no ETA) for stopped tables with progress
 	if table.RowsTotal > 0 && (table.PercentComplete > 0 || table.RowsCopied > 0) {
-		fmt.Fprintf(sb, "- Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(ui.ClampRows(table.RowsCopied, table.RowsTotal)),
-			ui.FormatNumber(table.RowsTotal))
+			ui.FormatNumber(table.RowsTotal),
+			ui.FormatTableSizeClause(table.EstimatedBytes))
 	}
 }
 
@@ -1330,15 +1293,18 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 		return
 	}
 	copied := ui.ClampRows(table.RowsCopied, table.RowsTotal)
+	size := ui.FormatTableSizeClause(table.EstimatedBytes)
 	if table.ETASeconds > 0 {
-		fmt.Fprintf(sb, "- Rows: %s / %s \u00b7 ETA: %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s \u00b7 ETA: %s\n",
 			ui.FormatNumber(copied),
 			ui.FormatNumber(table.RowsTotal),
+			size,
 			ui.FormatETA(table.ETASeconds))
 	} else {
-		fmt.Fprintf(sb, "- Rows: %s / %s\n",
+		fmt.Fprintf(sb, "- Rows: %s / %s%s\n",
 			ui.FormatNumber(copied),
-			ui.FormatNumber(table.RowsTotal))
+			ui.FormatNumber(table.RowsTotal),
+			size)
 	}
 }
 
@@ -1347,6 +1313,9 @@ func writeRowsAndETA(sb *strings.Builder, table TableProgressData) {
 // with no recovery command (a cancelled change cannot be resumed) instead render
 // explanatory guidance pointing at the right next step.
 func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
+	if data.InRolloutSection {
+		return
+	}
 	switch data.State {
 	case state.Apply.WaitingForDeploy:
 		writeFooterAction(sb, "To deploy:", appendTenantFlag(fmt.Sprintf("schemabot cutover %s -e %s", data.ApplyID, data.Environment), data.Tenant))
@@ -1387,15 +1356,15 @@ func writeApplyFooter(sb *strings.Builder, data ApplyStatusCommentData) {
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To stop retrying:",
 			"An error interrupted this schema change. SchemaBot retries automatically and marks it failed if retries are exhausted. To cancel it:")
 	case state.Apply.Stopped:
-		writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.Cancelled:
 		sb.WriteString("\n---\n\n")
 		sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 	case state.Apply.Failed:
-		writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 	case state.Apply.RevertWindow:
 		// Skip-revert (finalize) is the common path, so it leads; revert (undo) follows.
-		writeFooterAction(sb, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+		writeMemberFooterAction(sb, data, "To skip revert and keep changes:", appendTenantFlag(fmt.Sprintf("schemabot skip-revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 		fmt.Fprintf(sb, "\nTo revert:\n```\n%s\n```\n", appendTenantFlag(fmt.Sprintf("schemabot revert %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 	case state.Apply.SkippingRevert:
 		sb.WriteString("\n---\n\n")
@@ -1419,6 +1388,7 @@ func RenderApplySummaryComment(data ApplyStatusCommentData) string {
 }
 
 func renderApplySummaryComment(data ApplyStatusCommentData, budget *ddlBlockBudget) string {
+	defer budget.pointAt(data.storedPlan())()
 	var sb strings.Builder
 
 	completedCount, failedCount := countTableOutcomes(data.Tables)
@@ -1481,9 +1451,16 @@ func completedOutcomeMessage(singular, rollback bool) string {
 // writeSummaryCompletedMetadata writes a clean metadata line for completed applies.
 // Only shows database — environment is already in the title, and apply ID plus
 // duration are operational details that add clutter without value for most users.
+// A rollout member running a plan its siblings do not also names that plan, the
+// record that ties its outcome back to the block it was reviewed as.
 func writeSummaryCompletedMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	writeDBLine(sb, data.Database)
-	sb.WriteString("\n")
+	if data.PlanID == "" || data.Database == "" {
+		writeDBLine(sb, data.Database)
+		sb.WriteString("\n")
+		return
+	}
+	parts := appendPlanMetadata([]string{fmt.Sprintf("**Database**: `%s`", data.Database)}, data.PlanID)
+	fmt.Fprintf(sb, "%s\n\n", strings.Join(parts, " | "))
 }
 
 func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, completedCount, _, totalTables int, budget *ddlBlockBudget) {
@@ -1499,7 +1476,7 @@ func writeSummaryFailed(sb *strings.Builder, data ApplyStatusCommentData, comple
 	}
 
 	writeSummaryTableList(sb, data, budget)
-	writeFooterAction(sb, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, "To retry:", appendTenantFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.Tenant))
 }
 
 func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, completedCount int, totalTables int, budget *ddlBlockBudget) {
@@ -1511,7 +1488,7 @@ func writeSummaryStopped(sb *strings.Builder, data ApplyStatusCommentData, compl
 	}
 
 	writeSummaryTableList(sb, data, budget)
-	writeFooterAction(sb, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
+	writeMemberFooterAction(sb, data, "Paused — to resume from where it stopped:", appendTenantFlag(fmt.Sprintf("schemabot start %s -e %s", data.ApplyID, data.Environment), data.Tenant))
 }
 
 // writeSummaryCancelled renders the terminal summary for a cancelled schema
@@ -1531,21 +1508,28 @@ func writeSummaryCancelled(sb *strings.Builder, data ApplyStatusCommentData, com
 	}
 
 	writeSummaryTableList(sb, data, budget)
+	if data.InRolloutSection {
+		return
+	}
 	sb.WriteString("\n---\n\n")
 	sb.WriteString("This schema change was cancelled and cannot be resumed. Open a new schema change to apply it again.\n")
 }
 
 func writeSummaryMetadata(sb *strings.Builder, data ApplyStatusCommentData) {
-	// Combine database, apply ID, and duration on one metadata line.
+	// Combine database, apply ID, plan, and duration on one metadata line.
 	var parts []string
 	parts = append(parts, fmt.Sprintf("**Database**: `%s`", data.Database))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		parts = append(parts, fmt.Sprintf("**Apply ID**: `%s`", data.ApplyID))
 	}
+	parts = appendPlanMetadata(parts, data.PlanID)
 	if d := durationDisplay(data.StartedAt, data.CompletedAt); d != "" {
 		parts = append(parts, fmt.Sprintf("**Duration**: %s", d))
 	}
 	fmt.Fprintf(sb, "%s\n", strings.Join(parts, " | "))
+	if data.InRolloutSection {
+		return
+	}
 	writeAppliedByOrTimestampAt(sb, data.RequestedBy, startedAtDisplay(data.StartedAt, currentTimestamp()))
 }
 
@@ -1617,14 +1601,14 @@ func writeCompletedSummaryDetails(sb *strings.Builder, data ApplyStatusCommentDa
 	if len(data.Tables) == 0 && len(data.VSchemaChanges) == 0 {
 		// No per-operation detail to collapse (e.g. a task-less apply that found
 		// no changes). Still surface the Apply ID so the summary stays auditable.
-		if data.ApplyID != "" {
+		if data.ApplyID != "" && !data.InRolloutSection {
 			fmt.Fprintf(sb, "\n_Apply ID: `%s`_\n", data.ApplyID)
 		}
 		return
 	}
 
 	fmt.Fprintf(sb, "\n<details><summary>%s</summary>\n\n", completedSummaryDetailsLabel(data))
-	if data.ApplyID != "" {
+	if data.ApplyID != "" && !data.InRolloutSection {
 		fmt.Fprintf(sb, "_Apply ID: `%s`_\n\n", data.ApplyID)
 	}
 	writeCompletedNamespaceSummary(sb, data)

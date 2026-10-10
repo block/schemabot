@@ -87,6 +87,57 @@ func TestPlanBlockedChanges(t *testing.T) {
 	assert.Equal(t, "testdb", changes[1].Namespace)
 }
 
+// TestPlanAllChangesDirect verifies that a plan is all-direct only when every
+// table and per-shard change runs as direct execution and at least one exists,
+// so --defer-cutover is refused only where it has nothing to defer.
+func TestPlanAllChangesDirect(t *testing.T) {
+	direct := TableChange{Table: "users", Operation: "alter", ExecutionMode: "direct"}
+	engine := TableChange{Table: "orders", Operation: "alter"}
+	tests := []struct {
+		name string
+		plan *Plan
+		want bool
+	}{
+		{name: "nil plan", plan: nil, want: false},
+		{name: "no changes", plan: &Plan{Namespaces: map[string]*NamespacePlanData{"testdb": {}}}, want: false},
+		{name: "every table change direct", plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+			"testdb": {Tables: []TableChange{direct, direct}},
+		}}, want: true},
+		{name: "one table change through the engine", plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+			"testdb": {Tables: []TableChange{direct, engine}},
+		}}, want: false},
+		{name: "a shard change through the engine", plan: &Plan{
+			Namespaces: map[string]*NamespacePlanData{"testdb": {Tables: []TableChange{direct}}},
+			Shards:     []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{engine}}},
+		}, want: false},
+		{name: "direct shard changes under an engine-driven collapsed row", plan: &Plan{
+			Namespaces: map[string]*NamespacePlanData{"testdb": {Tables: []TableChange{engine}}},
+			Shards: []ShardPlan{
+				{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}},
+				{Namespace: "testdb", Shard: "80-", Changes: []TableChange{direct}},
+			},
+		}, want: true},
+		{name: "an engine-driven namespace no shard carries", plan: &Plan{
+			Namespaces: map[string]*NamespacePlanData{
+				"testdb":  {Tables: []TableChange{direct}},
+				"lookups": {Tables: []TableChange{engine}},
+			},
+			Shards: []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}}},
+		}, want: false},
+		{name: "direct shard changes only", plan: &Plan{
+			Shards: []ShardPlan{{Namespace: "testdb", Shard: "-80", Changes: []TableChange{direct}}},
+		}, want: true},
+		{name: "a namespace to finalize", plan: &Plan{Namespaces: map[string]*NamespacePlanData{
+			"testdb": {Tables: []TableChange{direct}, Finalize: true},
+		}}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.plan.AllChangesDirect())
+		})
+	}
+}
+
 // TestPlanBlockedApplyError verifies the refusal every admission path returns
 // for a plan with a blocked step: it names the first blocked table and its
 // reason, falls back to a fixed reason when the engine recorded none, and is
@@ -453,6 +504,30 @@ func TestTargetOperationKey(t *testing.T) {
 	}
 }
 
+// TestApplyOperationKeyedByTarget covers which operation rows carry the key a
+// member target's whole-target work is stored under, the shape an attach may
+// not mix with any other within one deployment of an apply.
+func TestApplyOperationKeyedByTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		op   *ApplyOperation
+		want bool
+	}{
+		{"whole-target member work", &ApplyOperation{OperationKey: "orders-002", Target: "orders-002", OperationKind: ApplyOperationKindWork}, true},
+		{"unset kind is work", &ApplyOperation{OperationKey: "orders-002", Target: "orders-002"}, true},
+		{"whole-deployment work of a target", &ApplyOperation{OperationKey: "", Target: "orders-002"}, false},
+		{"shard work of a target", &ApplyOperation{OperationKey: ShardOperationKey("main", "-80", "customers"), Target: "orders-002"}, false},
+		{"work with no target", &ApplyOperation{OperationKey: ""}, false},
+		{"finalizer whose key matches its target", &ApplyOperation{OperationKey: "group_finalizer", Target: "group_finalizer", OperationKind: ApplyOperationKindGroupFinalizer}, false},
+		{"nil operation", nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, tc.op.KeyedByTarget())
+		})
+	}
+}
+
 // TestPlanIDForOperation covers which plan a member executes: members planned
 // together share their apply's plan, a member planned against its own live
 // schema carries its own, and a member with neither is not executable and must
@@ -545,12 +620,14 @@ func TestApplyOptionsCarryTheAdmittedDirectExecutionPolicy(t *testing.T) {
 	admitted := ApplyOptions{DirectExecution: &DirectExecutionPolicy{
 		Enabled:                       true,
 		MaxTableRows:                  10000,
+		MaxTableBytes:                 100 << 20,
 		LockAcquisitionTimeoutSeconds: 5,
 	}}
 
 	options := admitted.Map()
 	assert.Equal(t, "true", options[engine.MetadataDirectExecution])
 	assert.Equal(t, "10000", options[engine.MetadataDirectExecutionMaxTableRows])
+	assert.Equal(t, "104857600", options[engine.MetadataDirectExecutionMaxTableBytes])
 	assert.Equal(t, "5", options[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds])
 	assert.Equal(t, admitted.DirectExecution, ApplyOptionsFromMap(options).DirectExecution)
 
@@ -561,6 +638,7 @@ func TestApplyOptionsCarryTheAdmittedDirectExecutionPolicy(t *testing.T) {
 	disabledOptions := disabled.Map()
 	assert.Equal(t, "false", disabledOptions[engine.MetadataDirectExecution])
 	assert.NotContains(t, disabledOptions, engine.MetadataDirectExecutionMaxTableRows)
+	assert.NotContains(t, disabledOptions, engine.MetadataDirectExecutionMaxTableBytes)
 	assert.Equal(t, disabled.DirectExecution, ApplyOptionsFromMap(disabledOptions).DirectExecution)
 
 	// Saying nothing is its own state: the executing server's configuration
@@ -582,5 +660,101 @@ func TestDirectExecutionPolicyEngineMetadata(t *testing.T) {
 		engine.MetadataDirectExecution:             "true",
 		engine.MetadataDirectExecutionMaxTableRows: "10000",
 	}, (&DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000}).EngineMetadata(),
-		"an unset lock bound leaves the engine's own default in effect")
+		"an unset lock bound leaves the engine's own default in effect, and an unset byte bound states none")
+	assert.Equal(t, map[string]string{
+		engine.MetadataDirectExecution:              "true",
+		engine.MetadataDirectExecutionMaxTableRows:  "10000",
+		engine.MetadataDirectExecutionMaxTableBytes: "104857600",
+	}, (&DirectExecutionPolicy{Enabled: true, MaxTableRows: 10000, MaxTableBytes: 100 << 20}).EngineMetadata())
+	assert.Equal(t, map[string]string{
+		engine.MetadataDirectExecution:              "true",
+		engine.MetadataDirectExecutionMaxTableBytes: "104857600",
+	}, (&DirectExecutionPolicy{Enabled: true, MaxTableBytes: 100 << 20}).EngineMetadata(),
+		"a byte bound alone is a complete policy, and an unset row bound states none")
+	assert.Equal(t, map[string]string{engine.MetadataDirectExecution: "true"},
+		(&DirectExecutionPolicy{Enabled: true}).EngineMetadata(),
+		"an enabled policy with no bound renders no bound, which the engine refuses")
+}
+
+// A stored size bound that cannot be read back never disappears from the
+// policy. Both bounds are optional, so reading a garbled one as zero would
+// silently run the apply under a different policy from the one it was
+// admitted with. It reads as -1 instead, which renders back onto the engine
+// metadata for the engine to refuse, so the apply blocks.
+func TestApplyOptionsFromMapKeepsAnUnreadableSizeBound(t *testing.T) {
+	bounds := map[string]struct {
+		key   string
+		other string
+		read  func(*DirectExecutionPolicy) int64
+	}{
+		"row bound": {
+			key:   engine.MetadataDirectExecutionMaxTableRows,
+			other: engine.MetadataDirectExecutionMaxTableBytes,
+			read:  func(p *DirectExecutionPolicy) int64 { return p.MaxTableRows },
+		},
+		"byte bound": {
+			key:   engine.MetadataDirectExecutionMaxTableBytes,
+			other: engine.MetadataDirectExecutionMaxTableRows,
+			read:  func(p *DirectExecutionPolicy) int64 { return p.MaxTableBytes },
+		},
+	}
+	for boundName, bound := range bounds {
+		for name, raw := range map[string]string{
+			"not a number": "100MiB",
+			"zero":         "0",
+			"negative":     "-5",
+			"empty":        "",
+		} {
+			t.Run(boundName+"/"+name, func(t *testing.T) {
+				policy := ApplyOptionsFromMap(map[string]string{
+					engine.MetadataDirectExecution: "true",
+					bound.other:                    "10000",
+					bound.key:                      raw,
+				}).DirectExecution
+				require.NotNil(t, policy)
+				assert.Equal(t, int64(-1), bound.read(policy))
+				assert.Equal(t, "-1", policy.EngineMetadata()[bound.key])
+			})
+		}
+		t.Run(boundName+"/absent", func(t *testing.T) {
+			policy := ApplyOptionsFromMap(map[string]string{
+				engine.MetadataDirectExecution: "true",
+				bound.other:                    "10000",
+			}).DirectExecution
+			require.NotNil(t, policy)
+			assert.Zero(t, bound.read(policy), "an apply admitted without this bound reads back without one")
+			assert.NotContains(t, policy.EngineMetadata(), bound.key)
+		})
+	}
+}
+
+// Component state is recognised by its key namespace alone, so a repository
+// name that happens to contain the prefix text is not mistaken for it and an
+// operator key that merely resembles the prefix is not hidden.
+func TestIsComponentStateSettingKey(t *testing.T) {
+	assert.True(t, IsComponentStateSettingKey(WebhookReconcileScanCursorSettingKeyPrefix+"octo/payments"))
+	assert.True(t, IsComponentStateSettingKey(WebhookReconcileScanCursorSettingKeyPrefix),
+		"a cursor row with an empty repository is still the reconciler's row, not an operator's")
+	assert.False(t, IsComponentStateSettingKey("webhook_reconcile_scan_cursor"),
+		"without the separator the key is an operator's, whatever it is named")
+	assert.False(t, IsComponentStateSettingKey("spirit_debug_logs"))
+	assert.False(t, IsComponentStateSettingKey("octo/"+WebhookReconcileScanCursorSettingKeyPrefix+"repo"),
+		"the namespace is a prefix, not a substring")
+}
+
+// A task spanning the whole table carries the plan's estimate, copied so the
+// task does not alias the plan's value. A task scoped to one shard carries
+// none, since the plan's figure covers every shard of the table.
+func TestTableChangeTaskEstimatedBytes(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	change := TableChange{Table: "orders", EstimatedBytes: &bytes}
+
+	whole := change.TaskEstimatedBytes("")
+	require.NotNil(t, whole)
+	assert.Equal(t, bytes, *whole)
+	*whole = 1
+	assert.Equal(t, int64(23_400_000_000), *change.EstimatedBytes, "the task gets its own copy of the estimate")
+
+	assert.Nil(t, change.TaskEstimatedBytes("-80"), "a shard-scoped task carries no whole-table estimate")
+	assert.Nil(t, TableChange{Table: "users"}.TaskEstimatedBytes(""), "no estimate at plan time means none on the task")
 }

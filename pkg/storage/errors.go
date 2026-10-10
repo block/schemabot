@@ -18,8 +18,16 @@ var (
 	// ErrLockNotOwned is returned when attempting to release a lock not owned by caller.
 	ErrLockNotOwned = errors.New("lock not owned by caller")
 
-	// ErrLockIntentChanged is returned when an apply's captured lock owner or
-	// pending plan no longer matches at durable apply creation time.
+	// ErrLockReplaced is returned when a release pinned to one lock row finds
+	// the lock key held by a different row: the lock the caller checked was
+	// released and a new one acquired in its place.
+	ErrLockReplaced = errors.New("lock was replaced by a new lock")
+
+	// ErrLockIntentChanged is returned when the lock's pending plan is no longer
+	// the one a caller observed: an apply's captured lock owner or pending plan
+	// no longer matches at durable apply creation time, a conditional acquire
+	// finds the same owner's lock pinned to another intent, or a row-pinned
+	// release finds the row re-acquired for another plan.
 	ErrLockIntentChanged = errors.New("lock intent changed")
 
 	// ErrCheckNotFound is returned when a check does not exist.
@@ -38,14 +46,42 @@ var (
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
 
+	// ErrApplyTakenOver is returned when an operation would attach to an
+	// apply whose work a newer apply took over (Apply.SupersededBy). The older
+	// apply can only settle over what it already attached.
+	ErrApplyTakenOver = errors.New("a newer apply took over the work of this apply")
+
 	// ErrApplyNotActive is returned when a write requires the apply to still be
 	// active (non-terminal) and it is not — e.g. attaching a new operation to
 	// an apply no drive will pick up again.
 	ErrApplyNotActive = errors.New("apply is not active")
 
+	// ErrApplyReopenRefused is returned when a general apply update would
+	// reopen a finished apply: an active state written over a terminal row, or
+	// stopped written over a settled one. The guard covers Update alone: the
+	// claim transitions and the rollout projection (UpdateDerivedState) move
+	// the state through their own conditional writes and never return it.
+	ErrApplyReopenRefused = errors.New("refused to reopen a finished apply")
+
+	// ErrApplyOutcomeSettled is returned when a general apply update would
+	// replace a settled outcome (completed, failed, cancelled, reverted) with a
+	// different one. The settled row records what happened on the database, so
+	// a later writer, such as a cancel that arrives after the apply completed,
+	// learns the outcome already landed instead of overwriting it.
+	ErrApplyOutcomeSettled = errors.New("apply outcome already settled")
+
+	// ErrValueRejected is returned when storage refuses a write because a value
+	// does not fit its column. The same write is refused on every attempt, so
+	// it is not a transient failure to retry.
+	ErrValueRejected = errors.New("storage rejected a value its column cannot hold")
+
 	// ErrApplyLeaseLost is returned when an operator-owned write no longer
 	// matches the apply lease token stored by the latest operator claimant.
 	ErrApplyLeaseLost = errors.New("apply lease lost")
+
+	// ErrOperationLeaseActive is returned when a repair write requires an
+	// operation to remain unleased but a live drive owns it.
+	ErrOperationLeaseActive = errors.New("operation lease is active")
 
 	// ErrApplyAlreadySuperseded is returned when a handoff would reassign an
 	// apply's superseded_by marker to a different successor. The marker is
@@ -78,6 +114,13 @@ var (
 	// ErrApplyOperationExists is returned when an apply_operations row for
 	// (apply_id, deployment, operation_key) is being inserted but already exists.
 	ErrApplyOperationExists = errors.New("apply operation already exists")
+
+	// ErrApplyOperationKeyingMismatch is returned when an attached operation is
+	// keyed by its target (see ApplyOperation.KeyedByTarget) and the
+	// deployment's existing operations of the apply are not, or the reverse.
+	// Mixing the two shapes would let one target's work attach twice under two
+	// keys, so the attach is refused.
+	ErrApplyOperationKeyingMismatch = errors.New("apply operation keying does not match the deployment's existing operations")
 
 	// ErrEngineResumeStateNotFound is returned when no opaque engine resume state exists for an operation.
 	ErrEngineResumeStateNotFound = errors.New("engine resume state not found")

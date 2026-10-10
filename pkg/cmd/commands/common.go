@@ -81,9 +81,10 @@ type CLIConfig struct {
 	// IgnoreNamespaces lists namespace subdirectories of the schema root that
 	// SchemaBot must not reconcile against the live database.
 	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
-	// IgnoreTables lists live tables SchemaBot must not reconcile. Without the
-	// exclusion a live table no schema file declares is planned as DROP TABLE,
-	// which blocks the merge.
+	// IgnoreTables lists live tables SchemaBot must not reconcile, by name or,
+	// wrapped in slashes, by a regular expression over the whole name. Without
+	// the exclusion a live table no schema file declares is planned as DROP
+	// TABLE, which blocks the merge.
 	IgnoreTables []string `yaml:"ignore_tables"`
 	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
 }
@@ -456,13 +457,30 @@ func resolveControlFlags(endpoint, profile, applyID, environment string) (string
 	return ep, nil
 }
 
+// writeNarrowedTo tells the operator a plan covers one rollout member, so a
+// plan with no changes is not read as the whole environment being up to date.
+func writeNarrowedTo(planResult *apitypes.PlanResponse) {
+	if planResult == nil || planResult.NarrowedTo == "" {
+		return
+	}
+	fmt.Printf("Target: %s (this plan covers only this rollout member)\n", planResult.NarrowedTo)
+}
+
 // applyAndWatch extracts a plan ID, calls the apply API, prints status, and
-// optionally watches progress. Used by both RunApply and RunRollback.
-func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
-	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) error {
+// optionally watches progress. It returns the apply ID the server assigned,
+// which is empty when the server accepted the apply without naming one. Used by
+// both RunApply and RunRollback.
+//
+// rendersRollout says whether this caller shows the operator the plan every
+// rollout member runs, the client capability the server checks before a
+// rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
+// decides it for its own output, so a new caller has to decide it rather than
+// inherit it.
+func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
+	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
-		return fmt.Errorf("no plan_id in response")
+		return "", fmt.Errorf("no plan_id in response")
 	}
 
 	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, allowUnsafe, branch, watch, format)
@@ -470,15 +488,17 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	var applyResult *apitypes.ApplyResponse
 	err := withLoading("Submitting schema change...", format != OutputFormatJSON, func() error {
 		var applyErr error
-		applyResult, applyErr = client.CallApplyAPI(ep, planResult.PlanID, environment, caller, options)
+		// A narrowed plan is applied to the member it was made for and nowhere
+		// else; the server refuses to run it rollout-wide.
+		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, options)
 		return applyErr
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if err := checkAccepted(applyResponseWrapper{applyResult}, operation); err != nil {
-		return err
+		return "", err
 	}
 
 	applyID := applyResult.ApplyID
@@ -491,7 +511,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 		}
 		enc := json.NewEncoder(os.Stdout)
 		_ = enc.Encode(result)
-		return nil
+		return applyID, nil
 	}
 
 	label := strings.ToUpper(operation[:1]) + operation[1:]
@@ -503,15 +523,15 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 
 	if !watch {
 		printWatchInstructions(applyID, database, environment)
-		return nil
+		return applyID, nil
 	}
 
 	fmt.Println("Watching progress...")
 	if err := WatchApplyProgressWithFormat(ep, applyID, environment, true, format, logHeartbeat); err != nil {
-		return err
+		return applyID, err
 	}
 
-	return nil
+	return applyID, nil
 }
 
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {
@@ -546,10 +566,20 @@ func printWatchInstructions(applyID, database, environment string) {
 	}
 }
 
+// applyChangeCounts tallies the apply's tasks by change type for the
+// completion summary. Index builds and drops are counted in their own buckets,
+// matching the plan summary, so an apply made only of index tasks does not
+// complete with an empty summary and an index task is never reported as a
+// table alteration. Every task lands in some bucket: a change type outside the
+// named ones — including an empty one — counts as other DDL, so the summary
+// never omits work the apply ran.
 type applyChangeCounts struct {
 	created        int
 	altered        int
 	dropped        int
+	indexesCreated int
+	indexesDropped int
+	other          int
 	vschemaUpdates int
 }
 
@@ -577,8 +607,14 @@ func (c *applyChangeCounts) add(changeType string) {
 		c.altered++
 	case "DROP", "CHANGE_TYPE_DROP":
 		c.dropped++
+	case "CREATE_INDEX", "CHANGE_TYPE_CREATE_INDEX":
+		c.indexesCreated++
+	case "DROP_INDEX", "CHANGE_TYPE_DROP_INDEX":
+		c.indexesDropped++
 	case "VSCHEMA", "VSCHEMA_UPDATE", "CHANGE_TYPE_VSCHEMA":
 		c.vschemaUpdates++
+	default:
+		c.other++
 	}
 }
 
@@ -592,6 +628,15 @@ func (c applyChangeCounts) summary() string {
 	}
 	if c.dropped > 0 {
 		parts = append(parts, fmt.Sprintf("%d dropped", c.dropped))
+	}
+	if c.indexesCreated > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s created", c.indexesCreated, ui.PluralizeNoun("index", c.indexesCreated)))
+	}
+	if c.indexesDropped > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s dropped", c.indexesDropped, ui.PluralizeNoun("index", c.indexesDropped)))
+	}
+	if c.other > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", c.other, ui.PluralizeNoun("statement", c.other)))
 	}
 	if c.vschemaUpdates > 0 {
 		word := "updates"

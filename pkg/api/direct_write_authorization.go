@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 )
@@ -23,11 +24,17 @@ import (
 // Reasons are stable for metrics and mirror the PR-door
 // ActorAuthorizationResult vocabulary.
 const (
-	DirectWriteReasonAdminAllow            = "admin_allow"
-	DirectWriteReasonScopedAllow           = "scoped_allow"
-	DirectWriteReasonScopedLaneDisabled    = "scoped_lane_disabled"
-	DirectWriteReasonTargetUnresolved      = "target_unresolved"
-	DirectWriteReasonMissingIdentity       = "missing_identity"
+	DirectWriteReasonAdminAllow         = "admin_allow"
+	DirectWriteReasonScopedAllow        = "scoped_allow"
+	DirectWriteReasonScopedLaneDisabled = "scoped_lane_disabled"
+	DirectWriteReasonTargetUnresolved   = "target_unresolved"
+	DirectWriteReasonMissingIdentity    = "missing_identity"
+	// DirectWriteReasonUnverifiedIdentity is an attribution outcome, not an
+	// authorization one: the caller is authenticated and the write is allowed,
+	// but the identity came from a lane the server did not verify, so no
+	// acquirer is recorded. It is logged by the handler and never reaches the
+	// authorization decision metric.
+	DirectWriteReasonUnverifiedIdentity    = "unverified_identity"
 	DirectWriteReasonNotAdmin              = "not_admin"
 	DirectWriteReasonNotDatabaseOperator   = "not_database_operator"
 	DirectWriteReasonEnvironmentNotAllowed = "environment_not_allowed"
@@ -295,8 +302,8 @@ func (s *Service) authorizeDirectWrite(w http.ResponseWriter, r *http.Request, o
 // stored plan — the source of truth for what an apply will mutate — and then
 // enforces the per-database half of the direct-write decision. The plan must
 // exist and resolve at decision time: a missing plan rejects the request with
-// the same error the apply path reports for it, and a plan-load storage failure
-// rejects it with the operation's 500 error. Neither is an authorization
+// the same 404 the apply path reports for it, and a plan-load storage failure
+// rejects it with the same 500 storage error. Neither is an authorization
 // denial; both land on the decision metric as skipped/target_unresolved, and
 // neither lets the request proceed — an unresolvable target must never
 // authorize. Failing closed here (rather than deferring the missing plan to the
@@ -313,14 +320,14 @@ func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *ht
 		s.logger.Error("failed to load plan for direct write authorization",
 			"operation", operation, "plan_id", planID, "environment", environment, "error", err)
 		s.recordUnresolvedDirectWriteTarget(r, operation, environment)
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: get plan %s: %v", operation, planID, err))
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage(operation, planID))
 		return false
 	}
 	if plan == nil {
 		s.logger.Warn("rejecting direct write because the stored plan does not exist",
 			"operation", operation, "plan_id", planID, "environment", environment)
 		s.recordUnresolvedDirectWriteTarget(r, operation, environment)
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: plan not found: %s", operation, planID))
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, storedPlanNotFoundMessage(operation, planID))
 		return false
 	}
 	return s.authorizeDirectWrite(w, r, operation, plan.Database, environment)
@@ -337,10 +344,11 @@ func (s *Service) recordUnresolvedDirectWriteTarget(r *http.Request, operation, 
 }
 
 // authorizeDirectDatabaseWrite is authorizeDirectWrite for environment-less
-// operations (database locks).
-func (s *Service) authorizeDirectDatabaseWrite(w http.ResponseWriter, r *http.Request, operation, database string) bool {
+// operations (database locks). It also returns the decision, whose reason says
+// whether the caller holds a lock by its owner string alone.
+func (s *Service) authorizeDirectDatabaseWrite(w http.ResponseWriter, r *http.Request, operation, database string) (DirectWriteAuthorizationResult, bool) {
 	result := s.config.AuthorizeDirectDatabaseWrite(auth.UserFromContext(r.Context()), database)
-	return s.finishDirectWriteDecision(w, r, operation, database, "", result)
+	return result, s.finishDirectWriteDecision(w, r, operation, database, "", result)
 }
 
 // authorizeDirectAdminWrite enforces admin-only access for mutating endpoints

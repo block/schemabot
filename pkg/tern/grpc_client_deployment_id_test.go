@@ -157,3 +157,33 @@ func TestPersistRemoteApplyIDHonorsLegacyResumeContextCarrier(t *testing.T) {
 	assert.Contains(t, err.Error(), `"apply-remote-west"`)
 	assert.Empty(t, operationStore.ops[42].ExternalID)
 }
+
+// A rollout member target's progress and cutover address its own remote
+// operation, so its remote apply id is only useful beside that operation's id.
+// When the write carrying the remote operation id never lands — the pod dies,
+// or storage refuses it — the member records neither id: its next drive sees
+// nothing dispatched and dispatches again under the same idempotency key,
+// instead of finding a remote apply it can neither re-dispatch nor address.
+func TestPersistRemoteApplyIDRecordsAMemberTargetsIDsTogetherOrNotAtAll(t *testing.T) {
+	client, apply, operationStore := persistDeploymentIDHarness(map[int64]*storage.ApplyOperation{
+		41: {ID: 41, ApplyID: 7, Deployment: "default", Target: "payments-001", OperationKey: "payments-001", State: state.ApplyOperation.Running, ExternalID: "apply-remote-default", ExternalOperationID: "901"},
+		42: {ID: 42, ApplyID: 7, Deployment: "default", Target: "payments-002", OperationKey: "payments-002", State: state.ApplyOperation.Running},
+	})
+	operationStore.operationIDWriteErr = fmt.Errorf("connection reset while storing the remote operation id")
+	scope := applyTaskScope{multiOperation: true, operation: operationStore.ops[42], memberTarget: "payments-002"}
+
+	err := client.persistRemoteApplyID(t.Context(), apply, scope, "apply-remote-default", "902")
+
+	require.ErrorContains(t, err, "connection reset while storing the remote operation id")
+	assert.Empty(t, operationStore.ops[42].ExternalID, "a member target must not record its remote apply without its remote operation")
+	assert.Empty(t, operationStore.ops[42].ExternalOperationID)
+	assert.True(t, shouldDispatchQueuedRemoteApply(apply, scope), "the member's next drive must dispatch again under the same idempotency key")
+
+	operationStore.operationIDWriteErr = nil
+	require.NoError(t, client.persistRemoteApplyID(t.Context(), apply, scope, "apply-remote-default", "902"))
+	assert.Equal(t, "apply-remote-default", operationStore.ops[42].ExternalID)
+	assert.Equal(t, "902", operationStore.ops[42].ExternalOperationID)
+	remoteOperationID, err := scope.remoteOperationScope()
+	require.NoError(t, err)
+	assert.Equal(t, "902", remoteOperationID)
+}

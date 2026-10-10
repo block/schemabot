@@ -1,6 +1,9 @@
 package ddl
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // StatementType identifies the kind of SQL statement a StatementParser
 // classified. It is owned by pkg/ddl — not by any dialect's parser library —
@@ -52,7 +55,9 @@ func (t StatementType) String() string {
 	case StatementDelete:
 		return "DELETE"
 	default:
-		return "UNKNOWN"
+		// A value with no name of its own is printed by number so it stays
+		// distinguishable from StatementUnknown in diagnostics.
+		return fmt.Sprintf("StatementType(%d)", int(t))
 	}
 }
 

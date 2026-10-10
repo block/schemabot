@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestSanitizeCheckRunErrorSummary(t *testing.T) {
@@ -41,5 +43,32 @@ func TestSanitizeCheckRunErrorSummary(t *testing.T) {
 	t.Run("text that sanitizes to nothing falls back to a fixed summary", func(t *testing.T) {
 		assert.Equal(t, "Plan failed", sanitizeCheckRunErrorSummary(" \n\t \x1b[31m "))
 		assert.Equal(t, "Plan failed", sanitizeCheckRunErrorSummary(""))
+	})
+}
+
+// A passing aggregate says "No schema files changed" only when the PR changes
+// no schema. When it changes schema this deployment does not manage, the
+// environment-scoped check names its environment, and the check of a
+// deployment serving every environment speaks for all of them.
+func TestPassingAggregateOutput(t *testing.T) {
+	unmanaged := []templates.UnmanagedSchemaConfigNoticeData{{Database: "merchants", SchemaPath: "services/merchants/schema"}}
+
+	t.Run("no schema changes", func(t *testing.T) {
+		title, summary := passingAggregateOutput("production", nil)
+		assert.Equal(t, "No schema files changed", title)
+		assert.Equal(t, "SchemaBot found no changes to managed schema files in this PR.", summary)
+	})
+
+	t.Run("environment-scoped check names its environment", func(t *testing.T) {
+		title, summary := passingAggregateOutput("production", unmanaged)
+		assert.Equal(t, "No schema changes managed in production", title)
+		assert.Contains(t, summary, "SchemaBot does not manage in `production`")
+		assert.Contains(t, summary, "- `services/merchants/schema` declares database `merchants`")
+	})
+
+	t.Run("check of a deployment serving every environment", func(t *testing.T) {
+		title, summary := passingAggregateOutput(aggregateSentinel, unmanaged)
+		assert.Equal(t, "No schema changes managed by SchemaBot", title)
+		assert.Contains(t, summary, "SchemaBot does not manage in any environment")
 	})
 }

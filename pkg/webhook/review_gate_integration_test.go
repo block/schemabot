@@ -56,7 +56,12 @@ func setupFakeGitHubForReviewGate(
 		})
 	})
 
-	// PR reviews
+	// PR reviews. A review without a commit is served as submitted on the head.
+	for _, r := range reviews {
+		if r.CommitID == nil {
+			r.CommitID = new("abc123")
+		}
+	}
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/reviews", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(reviews)

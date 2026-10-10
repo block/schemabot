@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/postgresconn"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -36,8 +37,6 @@ const inspectUnmodeledPostgresTableObjects = `
 SELECT
   EXISTS (SELECT 1 FROM pg_catalog.pg_trigger
           WHERE tgrelid OPERATOR(pg_catalog.=) c.oid AND NOT tgisinternal),
-  c.relrowsecurity OR c.relforcerowsecurity,
-  EXISTS (SELECT 1 FROM pg_catalog.pg_policy WHERE polrelid OPERATOR(pg_catalog.=) c.oid),
   EXISTS (SELECT 1 FROM pg_catalog.pg_description
           WHERE objoid OPERATOR(pg_catalog.=) c.oid AND objsubid OPERATOR(pg_catalog.>=) 0),
   COALESCE(pg_catalog.cardinality(c.reloptions), 0) OPERATOR(pg_catalog.>) 0,
@@ -49,16 +48,14 @@ WHERE n.nspname OPERATOR(pg_catalog.=) $1 AND c.relname OPERATOR(pg_catalog.=) $
 
 type unmodeledTableObjects struct {
 	trigger     bool
-	rowSecurity bool
-	policy      bool
 	comment     bool
 	reloptions  bool
 	inheritance bool
 }
 
 // PullSchema exports tables that the PostgreSQL declarative format can
-// represent. It refuses tables carrying user triggers, row-level security,
-// policies, comments, non-default relation options, or table inheritance, as
+// represent. It refuses tables carrying user triggers,
+// table or column comments, non-default relation options, or table inheritance, as
 // well as shapes rejected by the renderer. PostgreSQL currently supports only
 // basic catalog detail.
 func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
@@ -118,7 +115,7 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 		// accountable for, so a pulled baseline declares exactly what a later
 		// plan would otherwise report as undeclared. Partitions and
 		// extension-owned tables have no file of their own and are left out.
-		tables, tableErrors, err := renderPostgresTables(ctx, pool, namespace, pulledBaseline)
+		tables, tableErrors, err := renderPostgresTables(ctx, pool, e.pullDatabase, namespace, pulledBaseline)
 		if err != nil {
 			return nil, fmt.Errorf("pull PostgreSQL database %q: %w", e.pullDatabase, err)
 		}
@@ -138,28 +135,52 @@ func (e *Engine) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) 
 // The two baselines SchemaBot renders answer those questions differently
 // because they are read by different parties.
 type baselinePolicy struct {
+	// includeRowSecurity exports access rules for pull. Rollback cannot yet
+	// execute these definitions and must not advertise a recoverable baseline.
+	includeRowSecurity bool
 	// refuseUnmodeledObjects refuses a table that carries objects the
-	// declarative format does not represent — a trigger, a policy, a comment
+	// declarative format does not represent — a trigger or a table/column comment
 	// — even though the renderer would happily render its columns and
 	// indexes without them.
 	refuseUnmodeledObjects bool
-	// skipArchiveTables leaves archive-named tables out of the baseline, the
-	// same tables the plan leaves in place instead of dropping.
-	skipArchiveTables bool
+	// skipUndeclaredArchiveTables leaves archive-named tables out only when
+	// no forward schema file declares them. Declared archives are managed.
+	skipUndeclaredArchiveTables bool
+	declaredTables              map[string]bool
+	ignoredTables               engine.IgnoredTables
 }
 
 // pulledBaseline becomes the owner's declared schema, so a table the format
 // would describe incompletely is refused rather than written down without
 // its trigger or comment, and every table the plan would hold a file
 // accountable for is present, archive tables included.
-var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true}
+var pulledBaseline = baselinePolicy{refuseUnmodeledObjects: true, includeRowSecurity: true}
 
 // rollbackBaseline is read only by a rollback re-plan, which manages the
 // same table set the forward plan did. Objects the differ cannot see are
 // left in place by any apply and by any rollback, so they cost the
-// namespace nothing; an archive table sits outside management on both
-// plans, so its shape — renderable or not — is not the baseline's concern.
-var rollbackBaseline = baselinePolicy{skipArchiveTables: true}
+// namespace nothing. Ignored tables and undeclared archives sit outside
+// management, so their shapes are not the baseline's concern.
+func rollbackBaseline(declared map[string]bool, ignored engine.IgnoredTables) baselinePolicy {
+	return baselinePolicy{
+		skipUndeclaredArchiveTables: true,
+		declaredTables:              declared,
+		ignoredTables:               ignored,
+	}
+}
+
+// exclusionReason names the rule that leaves a table out of the baseline,
+// using the same reason strings a plan reports for its exempt tables, or
+// returns "" when the baseline carries the table.
+func (p baselinePolicy) exclusionReason(table string) string {
+	if p.ignoredTables.Withholds(table) {
+		return engine.ExemptReasonIgnoreTables
+	}
+	if p.skipUndeclaredArchiveTables && !p.declaredTables[table] && spirittable.IsArchiveTable(table) {
+		return exemptReasonArchiveNaming
+	}
+	return ""
+}
 
 // baselineIntrospectionConcurrency caps how many tables a baseline render
 // introspects at once. Each introspection is one read-only transaction of
@@ -201,17 +222,19 @@ type renderedTable struct {
 // the whole render with an error, and cancels the introspections still in
 // flight, instead of being recorded as a per-table refusal and carried on
 // past.
-func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
+func renderPostgresTables(ctx context.Context, pool *pgxpool.Pool, database, namespace string, policy baselinePolicy) (map[string]string, []error, error) {
 	tables, err := schemadiff.ListManagedTables(ctx, pool, namespace)
 	if err != nil {
 		return nil, nil, fmt.Errorf("list PostgreSQL tables in schema %q: %w", namespace, err)
 	}
 	managedTables := make([]string, 0, len(tables))
 	for _, table := range tables {
-		if policy.skipArchiveTables && spirittable.IsArchiveTable(table) {
-			slog.Debug("PostgreSQL archive table is outside management and left out of the rendered baseline",
+		if reason := policy.exclusionReason(table); reason != "" {
+			slog.Debug("PostgreSQL table is outside management and left out of the rendered baseline",
+				"database", database,
 				"namespace", namespace,
-				"table", table)
+				"table", table,
+				"reason", reason)
 			continue
 		}
 		managedTables = append(managedTables, table)
@@ -277,6 +300,9 @@ func renderPostgresTable(ctx context.Context, pool *pgxpool.Pool, namespace, tab
 		return nil, fmt.Errorf("introspect schema %q table %q: %w", namespace, table, err)
 	}
 	content, err := schemadiff.Render(model)
+	if policy.includeRowSecurity && errors.Is(err, schemadiff.ErrUnrenderableRowSecurity) {
+		content, err = schemadiff.RenderWithRowSecurity(model)
+	}
 	if err != nil {
 		return &renderedTable{renderErr: fmt.Errorf("schema %q table %q: render: %w", namespace, table, err)}, nil
 	}
@@ -324,8 +350,6 @@ func pullUnmodeledTableObjects(ctx context.Context, pool *pgxpool.Pool, namespac
 	var objects unmodeledTableObjects
 	err := pool.QueryRow(ctx, inspectUnmodeledPostgresTableObjects, namespace, table).Scan(
 		&objects.trigger,
-		&objects.rowSecurity,
-		&objects.policy,
 		&objects.comment,
 		&objects.reloptions,
 		&objects.inheritance,
@@ -346,8 +370,6 @@ func unmodeledTableObjectsError(namespace, table string, objects unmodeledTableO
 		present bool
 	}{
 		{"trigger", objects.trigger},
-		{"row-level security", objects.rowSecurity},
-		{"policy", objects.policy},
 		{"comment", objects.comment},
 		{"relation options", objects.reloptions},
 		{"table inheritance", objects.inheritance},

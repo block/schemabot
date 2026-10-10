@@ -5,6 +5,8 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +97,68 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	reloaded, err = store.Tasks().Get(ctx, "task_oplease_users")
 	require.NoError(t, err)
 	assert.Equal(t, state.Task.Completed, reloaded.State)
+}
+
+// An operation lease absence guard is the conflict check's settlement write: it
+// holds no lease of its own and lands only while no drive holds the task's
+// operation. A heartbeated operation lease refuses the write and leaves the row
+// untouched; once the lease has aged past the reclaim window the write lands.
+func TestTaskStore_OperationLeaseAbsenceGuardsUpdate(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_task_opabsence", 1)
+
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	stampOperationLease(t, opID, "driver", "op-token")
+
+	now := time.Now()
+	taskID, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier:   "task_opabsence_users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		PlanID:           apply.PlanID,
+		Database:         apply.Database,
+		DatabaseType:     apply.DatabaseType,
+		Engine:           storage.EngineSpirit,
+		Environment:      apply.Environment,
+		State:            state.Task.Running,
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)",
+		DDLAction:        "ALTER",
+		Options:          []byte("{}"),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	task.ID = taskID
+	guarded := storage.WithOperationLeaseAbsent(ctx, storage.OperationLeaseAbsence{ApplyID: apply.ID, OperationID: opID})
+
+	task.State = state.Task.Failed
+	require.ErrorIs(t, store.Tasks().Update(guarded, task), storage.ErrOperationLeaseActive,
+		"a drive heartbeating the operation keeps the task")
+	reloaded, err := store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Running, reloaded.State)
+
+	_, err = testDB.ExecContext(ctx,
+		`UPDATE apply_operations SET updated_at = DATE_SUB(NOW(), INTERVAL ? SECOND) WHERE id = ?`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Tasks().Update(guarded, task), "a stale operation lease no longer holds the task")
+	reloaded, err = store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Failed, reloaded.State)
 }
 
 // CountByApplyID reports every task row an apply owns — unsharded drive rows
@@ -364,6 +428,69 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 	assert.Empty(t, cleared.ThrottleReason)
 	assert.Equal(t, "blocked", cleared.ExecutionMode, "the admitting verdict survives an update that touched other columns")
 	assert.Equal(t, "requires privileges unavailable to the engine", cleared.ModeReason)
+}
+
+// An engine's ETA and throttle reason are display values it may report past
+// what their columns hold, as a copy over a sparse primary key can. The
+// progress write fits them to the columns instead of being refused, so the row
+// keeps updating, and the caller's task carries the values the row holds.
+// A value storage refuses outright comes back as storage.ErrValueRejected, so
+// the drive can tell it apart from a write a retry would land.
+func TestTaskStore_UpdateBoundsEngineReportedValuesAndReportsRejectedValues(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testapp", "mysql")
+	apply := createTestApply(t, store, lock, "apply_eta", 1)
+	now := time.Now()
+	_, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_eta",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Running,
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+		DDLAction:      "ALTER",
+		ETASeconds:     -1,
+		ThrottleReason: strings.Repeat("x", 300),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Zero(t, task.ETASeconds, "a negative estimate is stored as no estimate")
+	assert.Equal(t, strings.Repeat("x", 254)+"…", task.ThrottleReason, "the insert fits the reason to its column")
+	task.ETASeconds = math.MaxInt32 + 1_000_000
+	task.ThrottleReason = strings.Repeat("é", 300)
+	task.RowsCopied = 42
+	require.NoError(t, store.Tasks().Update(ctx, task), "engine values past their columns do not refuse the progress write")
+
+	stored, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt32, stored.ETASeconds)
+	assert.Equal(t, strings.Repeat("é", 254)+"…", stored.ThrottleReason, "the reason is cut on a character boundary")
+	assert.Equal(t, int64(42), stored.RowsCopied, "the rest of the progress lands with it")
+	assert.Equal(t, stored.ETASeconds, task.ETASeconds, "the caller's task holds what the row holds")
+	assert.Equal(t, stored.ThrottleReason, task.ThrottleReason)
+
+	stored.ETASeconds = -5
+	require.NoError(t, store.Tasks().Update(ctx, stored))
+	reread, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Zero(t, reread.ETASeconds, "a negative estimate is stored as no estimate")
+
+	reread.ExecutionMode = strings.Repeat("x", 60)
+	err = store.Tasks().Update(ctx, reread)
+	require.ErrorIs(t, err, storage.ErrValueRejected, "a value the column cannot hold is reported as rejected")
 }
 
 // A sharded work operation's operation key identifies which shard task is real
@@ -679,11 +806,22 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, got[0].State, "a lost lease must not overwrite the shard row")
 	assert.Equal(t, 100, got[0].ProgressPercent)
 
-	// A different shard under the same operation is a separate row.
-	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), shardTask("80-")))
+	// A different shard under the same operation is a separate row. The insert
+	// fits the engine's display values to their columns rather than being
+	// refused over them.
+	second := shardTask("80-")
+	second.ETASeconds = math.MaxInt32 + 1_000_000
+	second.ThrottleReason = strings.Repeat("x", 300)
+	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), second))
 	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
-	assert.Len(t, got, 2, "a different shard is its own per-shard task row")
+	require.Len(t, got, 2, "a different shard is its own per-shard task row")
+	for _, row := range got {
+		if row.Shard == "80-" {
+			assert.Equal(t, math.MaxInt32, row.ETASeconds)
+			assert.Equal(t, strings.Repeat("x", 254)+"…", row.ThrottleReason)
+		}
+	}
 
 	// A row targeting a different operation than the held lease is refused, so
 	// the lease cannot gate a write that points at another operation.
@@ -807,6 +945,76 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	crossApply := shardTask("a0-")
 	crossApply.ApplyOperationID = &otherOpID // belongs to otherApply, not the leased apply
 	require.ErrorContains(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), crossApply), "belongs to apply")
+}
+
+// missingInsert reports every guarded insert as a miss without running it, so
+// a test can reach the branch where the fence let nothing through while the
+// lease still reads as current — a path real SQL cannot produce today.
+type missingInsert struct{ identityInserter }
+
+func (missingInsert) InsertGuardedID(context.Context, queryExecer, string, ...any) (int64, bool, error) {
+	return 0, false, nil
+}
+
+// A guarded shard insert that writes nothing while the lease is still current
+// must not report success: no row exists and task.ID is still zero, so the
+// caller would carry on as if its progress row were stored. Both lease paths
+// match ApplyLogs().Append and return an error that is not a lease loss.
+func TestTaskStore_UpsertShardProgressReportsMissUnderCurrentLease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	lock := createTestLock(t, store, "probe_shard_miss_db", "vitess")
+	apply := createTestApply(t, store, lock, "apply_probe_shard_miss", 939)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	realInserter := store.tasks.identity
+	store.tasks.identity = missingInsert{realInserter}
+	t.Cleanup(func() { store.tasks.identity = realInserter })
+
+	shardTask := func() *storage.Task {
+		now := time.Now()
+		return &storage.Task{
+			TaskIdentifier: "task_shard_miss", ApplyID: apply.ID, ApplyOperationID: &opID,
+			PlanID: apply.PlanID, Database: apply.Database, DatabaseType: apply.DatabaseType,
+			Engine: storage.EnginePlanetScale, Environment: apply.Environment,
+			State: state.Task.Running, Namespace: "payments", TableName: "users", Shard: "-80",
+			DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "ALTER",
+			ProgressPercent: 20, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+
+	t.Run("apply lease", func(t *testing.T) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
+		`, "driver-a", "apply-token", apply.ID)
+		require.NoError(t, err)
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "apply-token"})
+
+		task := shardTask()
+		err = store.Tasks().UpsertShardProgress(ownerCtx, task)
+		require.Error(t, err, "no shard row was written, yet UpsertShardProgress returned nil with task.ID=%d", task.ID)
+		assert.NotErrorIs(t, err, storage.ErrApplyLeaseLost, "a miss under a current lease is not a lease loss")
+		assert.ErrorContains(t, err, "matched no rows despite current lease")
+		assert.Zero(t, task.ID)
+	})
+
+	t.Run("operation lease", func(t *testing.T) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE apply_operations SET lease_owner = ?, lease_token = ? WHERE id = ?
+		`, "driver-a", "op-token", opID)
+		require.NoError(t, err)
+		ownerCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opID, Owner: "driver-a", Token: "op-token"})
+
+		task := shardTask()
+		err = store.Tasks().UpsertShardProgress(ownerCtx, task)
+		require.Error(t, err, "no shard row was written, yet UpsertShardProgress returned nil with task.ID=%d", task.ID)
+		assert.NotErrorIs(t, err, storage.ErrApplyLeaseLost, "a miss under a current lease is not a lease loss")
+		assert.ErrorContains(t, err, "matched no rows despite current lease")
+		assert.Zero(t, task.ID)
+	})
 }
 
 // The object-ownership lookup answers "which pull requests have changed this

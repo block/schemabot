@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/stretchr/testify/assert"
@@ -22,31 +24,19 @@ func TestProtoSchemaFilesToAPIIgnoresNilNamespaces(t *testing.T) {
 	assert.Equal(t, "CREATE TABLE `users` (`id` bigint);\n", result["users"].Files["users.sql"])
 }
 
-func TestChangeTypeRoundTrip(t *testing.T) {
-	// Proto → storage → proto should round-trip correctly
-	for _, ct := range []ternv1.ChangeType{
-		ternv1.ChangeType_CHANGE_TYPE_CREATE,
-		ternv1.ChangeType_CHANGE_TYPE_ALTER,
-		ternv1.ChangeType_CHANGE_TYPE_DROP,
-		ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX,
-		ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX,
-		ternv1.ChangeType_CHANGE_TYPE_RENAME,
-		ternv1.ChangeType_CHANGE_TYPE_TRUNCATE,
-		ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW,
-		ternv1.ChangeType_CHANGE_TYPE_VSCHEMA,
-		ternv1.ChangeType_CHANGE_TYPE_OTHER,
-	} {
+// A change type stored through the API boundary reads back as the same proto
+// value, and the one value without an operation is retained as "other" rather
+// than dropped.
+func TestProtoChangeTypeToOperationRoundTrips(t *testing.T) {
+	for value, name := range ternv1.ChangeType_name {
+		ct := ternv1.ChangeType(value)
+		if ct == ternv1.ChangeType_CHANGE_TYPE_OTHER {
+			continue
+		}
 		op := protoChangeTypeToOperation(ct)
-		result := changeTypeToProto(op)
-		assert.Equal(t, ct, result, "round-trip failed for %v (op=%q)", ct, op)
+		assert.Equal(t, ct, ternconv.OpToChangeType(op), "round-trip failed for %s (op=%q)", name, op)
 	}
-}
-
-func TestChangeTypeToProto_CaseInsensitive(t *testing.T) {
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, changeTypeToProto("alter"))
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_ALTER, changeTypeToProto("ALTER"))
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_CREATE, changeTypeToProto("Create"))
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_OTHER, changeTypeToProto("unknown"))
+	assert.Equal(t, "other", protoChangeTypeToOperation(ternv1.ChangeType_CHANGE_TYPE_OTHER))
 }
 
 func TestPlanResponseFromProto_ChangeType(t *testing.T) {
@@ -136,6 +126,34 @@ func TestProtoChangesToNamespacesPreservesBlockedVerdict(t *testing.T) {
 	plan := &storage.Plan{PlanIdentifier: "plan-x", Namespaces: namespaces}
 	require.EqualError(t, plan.BlockedApplyError(),
 		`stored plan plan-x contains a blocked change for table "users": `+reason)
+}
+
+// A remote data plane plans a Strata keyspace, payments, whose only work is a
+// finalize its engine asked for, next to commerce, which changes its VSchema.
+// The plan stored from that gRPC response records the finalize request on
+// payments, so the apply still schedules its group finalizer, and gives
+// commerce the VSchema artifact without inventing a finalize for it.
+func TestProtoChangesToNamespacesRecordsFinalizeRequest(t *testing.T) {
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{
+		{Namespace: "payments", Metadata: map[string]string{engine.MetadataNeedsFinalizer: "true", storage.PlanMetadataVSchemaChanged: "false"}},
+		{Namespace: "commerce", Metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true"}},
+	}, map[string]*ternv1.SchemaFiles{
+		"commerce": {Files: map[string]string{storage.VSchemaArtifactName: `{"tables":{"orders":{}}}`}},
+	})
+	require.NoError(t, err)
+
+	payments := namespaces["payments"]
+	require.NotNil(t, payments)
+	assert.True(t, payments.Finalize)
+	assert.False(t, payments.ChangesVSchema())
+	assert.True(t, payments.NeedsFinalizer())
+	commerce := namespaces["commerce"]
+	require.NotNil(t, commerce)
+	assert.False(t, commerce.Finalize)
+	assert.True(t, commerce.ChangesVSchema())
+
+	plan := &storage.Plan{Namespaces: namespaces}
+	assert.Equal(t, []string{"commerce", "payments"}, plan.FinalizerNamespaces())
 }
 
 func TestProtoShardPlansToStoragePreservesUnsafeMetadata(t *testing.T) {
@@ -413,4 +431,134 @@ func TestPlanResponseFromProto_NoExistingCopiesOnCleanTarget(t *testing.T) {
 	result := planResponseFromProto(&ternv1.PlanResponse{})
 
 	assert.Empty(t, result.ExistingCopies)
+}
+
+// Table-size estimates are copied field by field at each proto boundary. Each
+// field gets a distinct value, so a dropped or swapped field fails the test.
+const (
+	sizedRows        int64 = 48_200_000
+	sizedShards      int32 = 4
+	sizedLargest     int64 = 13_100_000
+	sizedBytes       int64 = 23_400_000_000
+	sizedTable             = "orders"
+	sizedNamespace         = "commerce"
+	sizedAlterOrders       = "ALTER TABLE `orders` ADD INDEX `created_at`(`created_at`)"
+)
+
+func sizedProtoTableChange() *ternv1.TableChange {
+	return &ternv1.TableChange{
+		Namespace:        sizedNamespace,
+		TableName:        sizedTable,
+		Ddl:              sizedAlterOrders,
+		ChangeType:       ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		EstimatedRows:    new(sizedRows),
+		ShardCount:       sizedShards,
+		LargestShardRows: new(sizedLargest),
+		EstimatedBytes:   new(sizedBytes),
+	}
+}
+
+func assertSizedStorageChange(t *testing.T, change storage.TableChange) {
+	t.Helper()
+	require.NotNil(t, change.EstimatedRows)
+	assert.Equal(t, sizedRows, *change.EstimatedRows)
+	assert.Equal(t, int(sizedShards), change.ShardCount)
+	require.NotNil(t, change.LargestShardRows)
+	assert.Equal(t, sizedLargest, *change.LargestShardRows)
+	require.NotNil(t, change.EstimatedBytes)
+	assert.Equal(t, sizedBytes, *change.EstimatedBytes)
+}
+
+// The plan response a data plane returns over gRPC reaches the API caller —
+// the plan comment among them — with its table-size estimates, on both the
+// namespace view and the per-shard view.
+func TestPlanResponseFromProtoPreservesSizeEstimates(t *testing.T) {
+	result := planResponseFromProto(&ternv1.PlanResponse{
+		Changes: []*ternv1.SchemaChange{{Namespace: sizedNamespace, TableChanges: []*ternv1.TableChange{sizedProtoTableChange()}}},
+		Shards:  []*ternv1.ShardPlan{{Namespace: sizedNamespace, Shard: "-80", Changes: []*ternv1.TableChange{sizedProtoTableChange()}}},
+	})
+
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	require.Len(t, result.Shards, 1)
+	require.Len(t, result.Shards[0].Changes, 1)
+	for view, change := range map[string]*apitypes.TableChangeResponse{
+		"namespace": result.Changes[0].TableChanges[0],
+		"shard":     result.Shards[0].Changes[0],
+	} {
+		require.NotNil(t, change.EstimatedRows, view)
+		assert.Equal(t, sizedRows, *change.EstimatedRows, view)
+		assert.Equal(t, int(sizedShards), change.ShardCount, view)
+		require.NotNil(t, change.LargestShardRows, view)
+		assert.Equal(t, sizedLargest, *change.LargestShardRows, view)
+		require.NotNil(t, change.EstimatedBytes, view)
+		assert.Equal(t, sizedBytes, *change.EstimatedBytes, view)
+	}
+}
+
+// A plan stored from a remote plan response keeps its table-size estimates,
+// so reading the stored plan back shows the sizes the plan was made with.
+func TestProtoChangesToNamespacesPreservesSizeEstimates(t *testing.T) {
+	namespaces, err := protoChangesToNamespaces([]*ternv1.SchemaChange{{
+		Namespace:    sizedNamespace,
+		TableChanges: []*ternv1.TableChange{sizedProtoTableChange()},
+	}}, nil)
+	require.NoError(t, err)
+
+	require.Contains(t, namespaces, sizedNamespace)
+	require.Len(t, namespaces[sizedNamespace].Tables, 1)
+	assertSizedStorageChange(t, namespaces[sizedNamespace].Tables[0])
+}
+
+func TestProtoShardPlansToStoragePreservesSizeEstimates(t *testing.T) {
+	shards, err := protoShardPlansToStorage([]*ternv1.ShardPlan{{
+		Namespace: sizedNamespace,
+		Shard:     "-80",
+		Changes:   []*ternv1.TableChange{sizedProtoTableChange()},
+	}})
+	require.NoError(t, err)
+
+	require.Len(t, shards, 1)
+	require.Len(t, shards[0].Changes, 1)
+	assertSizedStorageChange(t, shards[0].Changes[0])
+}
+
+// A plan's collation changes reach the API caller with every field, whether
+// the response comes over gRPC or from the stored plan.
+func TestTableChangeResponseCarriesCollationChanges(t *testing.T) {
+	want := []apitypes.CollationChange{{
+		Column:         "sku",
+		From:           "utf8mb4_general_ci",
+		To:             "utf8mb4_bin",
+		Case:           "becomes_sensitive",
+		TrailingSpaces: "unknown",
+		CanMergeValues: true,
+		UniqueIndexes:  []string{"uk_sku"},
+	}}
+	fromProto := tableChangeResponseFromProto(&ternv1.TableChange{
+		TableName: "products",
+		CollationChanges: []*ternv1.CollationChange{{
+			Column:                  "sku",
+			FromCollation:           "utf8mb4_general_ci",
+			ToCollation:             "utf8mb4_bin",
+			CaseComparison:          "becomes_sensitive",
+			TrailingSpaceComparison: "unknown",
+			CanMergeValues:          true,
+			UniqueIndexes:           []string{"uk_sku"},
+		}},
+	})
+	fromStorage := tableChangeResponseFromStorage(storage.TableChange{
+		Table: "products",
+		CollationChanges: []storage.CollationChange{{
+			Column:         "sku",
+			From:           "utf8mb4_general_ci",
+			To:             "utf8mb4_bin",
+			Case:           "becomes_sensitive",
+			TrailingSpaces: "unknown",
+			CanMergeValues: true,
+			UniqueIndexes:  []string{"uk_sku"},
+		}},
+	})
+	assert.Equal(t, want, fromProto.CollationChanges, "from proto")
+	assert.Equal(t, want, fromStorage.CollationChanges, "from storage")
 }

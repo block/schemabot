@@ -50,6 +50,18 @@ func (s *rollbackTestApplyStore) GetByApplyIdentifier(_ context.Context, _ strin
 	return s.apply, s.err
 }
 
+// GetByDatabase serves the lock-conflict comment's running-apply lookup with
+// the one apply this store holds.
+func (s *rollbackTestApplyStore) GetByDatabase(_ context.Context, _, _, _ string) ([]*storage.Apply, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.apply == nil {
+		return nil, nil
+	}
+	return []*storage.Apply{s.apply}, nil
+}
+
 type rollbackTestPlanStore struct {
 	storage.PlanStore
 	plan *storage.Plan
@@ -58,6 +70,12 @@ type rollbackTestPlanStore struct {
 
 func (s *rollbackTestPlanStore) GetByID(_ context.Context, _ int64) (*storage.Plan, error) {
 	return s.plan, s.err
+}
+
+// List answers the lookup of the source plan's review round. The source apply
+// ran one plan on its one target, so its round stored no member plans.
+func (s *rollbackTestPlanStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
+	return nil, nil
 }
 
 type rollbackTestTaskStore struct {
@@ -192,7 +210,8 @@ func completedSourceApply() *storage.Apply {
 // the artifact a rollback plan is generated from.
 func capturedSourcePlan() *storage.Plan {
 	return &storage.Plan{
-		ID: 10,
+		ID:             10,
+		PlanIdentifier: "plan-source",
 		Namespaces: map[string]*storage.NamespacePlanData{
 			"default": {OriginalFilesCaptured: true},
 		},

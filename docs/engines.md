@@ -53,7 +53,7 @@ stay put, where this page moves as engines gain features.
 |---|---|---|---|
 | **Cheap native path tried first** | yes, instant DDL | yes, instant DDL | yes, attempted under budgets that cancel a rewrite |
 | **Online DDL (copy and swap)** | yes, when instant is not possible | yes, when instant is not possible | planned; meanwhile a rewrite is refused above a size limit and cancelled by its budget below it |
-| **Escape hatch for refused statements** | direct execution: opt-in, size-bounded, separately confirmed | none, excluded by design | none, native execution is already the only path |
+| **Escape hatch for refused statements** | direct execution: opt-in and size-bounded | none, excluded by design | none, native execution is already the only path |
 | **`stop`** | yes | no | planned |
 | **`start`** | yes | deferred deploys only | planned |
 | **Deferred cutover** | yes | yes | planned |
@@ -93,7 +93,7 @@ Every row of the matrix, in a line each.
 | **Cutover** | The swap: moving traffic from the original table to the new one. It is the shortest phase of a copy, but it is a phase and not an instant, and it is the part that takes a lock. |
 | **Deferred cutover** | Holding a finished copy at that point until an operator asks for the swap, instead of swapping as soon as the copy is ready. |
 | **Revert window** | A period after cutover in which the original table still exists, so the change can be undone. |
-| **Direct execution** | Running a statement as ordinary DDL against the database, with no copy. Two separate bounds apply: a configured timeout caps how long it waits to acquire the lock, so a busy table fails fast instead of queueing behind an open transaction, and a table size limit in the policy is what bounds how long writes are blocked once it has the lock. |
+| **Direct execution** | Running a statement as ordinary DDL against the database, with no copy. Two separate bounds apply: a configured timeout caps how long it waits to acquire the lock, and the transactions blocking it are killed before that timeout runs out; a table size limit in the policy bounds how long writes are blocked once it has the lock. |
 | **Throttling** | Holding the copy back while the database is under pressure. |
 | **Adaptive pacing** | Continuously adjusting how hard the copy pushes based on how the database is responding, rather than only starting and stopping it. |
 | **Quarantine** | Renaming a dropped table aside and keeping it for a while instead of dropping it outright. |
@@ -229,16 +229,17 @@ This is a third path, MySQL only, and it is deliberately hard to turn on. Some s
 never run through a copy: dropping a primary key and adding a foreign key are the usual examples.
 By default they block the apply. An operator can enable a policy, per environment, that lets those
 statements run as ordinary MySQL DDL instead. The policy covers only tables under a configured row
-count, and the PR asks for a second, explicit confirmation before anything runs.
+count, and the plan comment discloses each statement that will run this way.
 
 What runs then is not an online change. It is synchronous, it blocks writes to the table for its
-full duration, nothing throttles it, nothing checkpoints it, and it cannot be reverted. The row
+full duration, nothing throttles it, and nothing checkpoints it. The row
 count in the policy is what bounds that outage, since how long the table is blocked scales with
 its size. The other bound is on the way in: native DDL queues on the table's metadata lock behind
 any open transaction that has touched it, and everything arriving after queues behind the DDL, so
 a statement that cannot take the lock quickly stalls all traffic to the table rather than just
-waiting. Direct statements run with a short lock acquisition timeout, so a busy table fails the
-apply fast instead. What the policy replaces is worse: someone running the same statement by hand
+waiting. Direct statements run with a short lock acquisition timeout and kill the transactions
+blocking the lock, as Spirit does for its own DDL; a blocker that is unsafe to kill (an explicit
+`LOCK TABLES`, or a very large transaction) fails the apply fast instead. What the policy replaces is worse: someone running the same statement by hand
 against the database, with no plan, no audit trail, and no size limit. Vitess is excluded by
 design, because raw DDL sent to vtgate would bypass the online DDL machinery that engine exists to
 use. [direct-execution.md](direct-execution.md) covers the gate in full.
@@ -410,6 +411,7 @@ place to keep data.
   guarantees deliberately do not cover.
 - [postgresql.md](postgresql.md) for the full PostgreSQL support envelope: which plans are
   blocked, which statements are admitted, and how each refusal is reported.
+- [vitess.md](vitess.md) for the PlanetScale service token permissions the Vitess engine needs.
 - [throttle.md](throttle.md) for what each throttle signal means when you see one.
 - [pending-drops.md](pending-drops.md) for the quarantine lifecycle.
 - [direct-execution.md](direct-execution.md) for when a change runs directly instead of through a

@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
 	"github.com/block/schemabot/pkg/engine/spirit"
@@ -1187,13 +1188,12 @@ func TestServerConfig_ValidateRejectsNonPositiveRevertWindowDuration(t *testing.
 	}
 }
 
-// Enabling direct_execution without a positive max_table_rows bound is a
-// startup config error: the size gate must never be accidentally unbounded.
+// Enabling direct_execution without a size bound is a startup config error:
+// the size gate must never be accidentally unbounded.
 func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
 	for name, direct := range map[string]*DirectExecutionConfig{
-		"missing bound":  {Enabled: true},
-		"zero bound":     {Enabled: true, MaxTableRows: 0},
-		"negative bound": {Enabled: true, MaxTableRows: -1},
+		"missing bound": {Enabled: true},
+		"zero bound":    {Enabled: true, MaxTableRows: 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := ServerConfig{
@@ -1209,8 +1209,61 @@ func TestServerConfig_ValidateRejectsDirectExecutionWithoutBound(t *testing.T) {
 
 			err := cfg.Validate()
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution`)
-			assert.Contains(t, err.Error(), "a positive bound is required")
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" enables direct_execution without a size bound (set max_table_rows or max_table_bytes)`)
+		})
+	}
+}
+
+// Setting both size bounds is a startup config error, even on a disabled
+// policy: the bounds differ in strength, and a second limit on a safety policy
+// reads as a ceiling whichever way the two would combine.
+func TestServerConfig_ValidateRejectsBothDirectExecutionBounds(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled":  {Enabled: true, MaxTableRows: 100000, MaxTableBytes: "100MiB"},
+		"disabled": {MaxTableRows: 100000, MaxTableBytes: "100MiB"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution sets both max_table_rows and max_table_bytes (set exactly one`)
+		})
+	}
+}
+
+// A negative row bound is malformed whether or not the policy is enabled,
+// and a byte bound beside it does not excuse it.
+func TestServerConfig_ValidateRejectsNegativeDirectExecutionRowBound(t *testing.T) {
+	for name, direct := range map[string]*DirectExecutionConfig{
+		"enabled":                  {Enabled: true, MaxTableRows: -1},
+		"enabled with bytes":       {Enabled: true, MaxTableRows: -1, MaxTableBytes: "100MiB"},
+		"malformed while disabled": {MaxTableRows: -1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution: max_table_rows is -1 (must be positive, or omitted to set no row bound)`)
 		})
 	}
 }
@@ -1349,11 +1402,91 @@ func TestServerConfig_ValidateRejectsBadDirectExecutionLockAcquisitionTimeout(t 
 	}
 }
 
+// A malformed max_table_bytes is a startup config error, even while the policy
+// is disabled, so it never surfaces for the first time when someone enables
+// direct execution. The value must be a positive whole number with a binary
+// unit: a decimal unit such as MB is rejected rather than guessed at, because
+// readers disagree on whether it means 1000² or 1024² bytes.
+func TestServerConfig_ValidateRejectsBadDirectExecutionMaxTableBytes(t *testing.T) {
+	for name, tc := range map[string]struct {
+		maxTableBytes string
+		enabled       bool
+		wantErr       string
+	}{
+		"no unit":                  {"104857600", true, "must be a whole number followed by a unit"},
+		"decimal unit":             {"100MB", true, `unit "MB" is not one of B, KiB, MiB, GiB, TiB`},
+		"lowercase binary unit":    {"100mib", true, `unit "mib" is not one of B, KiB, MiB, GiB, TiB`},
+		"fractional":               {"1.5GiB", true, "must be a whole number followed by a unit"},
+		"negative":                 {"-100MiB", true, "must be a whole number followed by a unit"},
+		"zero":                     {"0MiB", true, "must be positive"},
+		"overflow":                 {"9999999999TiB", true, "overflows a 64-bit byte count"},
+		"not a size":               {"lots", true, "must be a whole number followed by a unit"},
+		"malformed while disabled": {"100MB", false, `unit "MB" is not one of B, KiB, MiB, GiB, TiB`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			direct := &DirectExecutionConfig{Enabled: tc.enabled, MaxTableBytes: tc.maxTableBytes}
+			if tc.enabled {
+				direct.MaxTableRows = 175000
+			}
+			cfg := ServerConfig{
+				Databases: map[string]DatabaseConfig{
+					"mydb": {
+						Type: "mysql",
+						Environments: map[string]EnvironmentConfig{
+							"staging": {DSN: "root@tcp(localhost)/mydb", DirectExecution: direct},
+						},
+					},
+				},
+			}
+
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `database "mydb" environment "staging" direct_execution: max_table_bytes "`+tc.maxTableBytes+`"`)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// max_table_bytes accepts a whole number with any binary unit, with or
+// without a space, and resolves to bytes on the policy the rest of the system
+// carries.
+func TestDirectExecutionConfig_PolicyResolvesMaxTableBytes(t *testing.T) {
+	for raw, want := range map[string]int64{
+		"104857600B": 104857600,
+		"512KiB":     512 << 10,
+		"100MiB":     100 << 20,
+		"100 MiB":    100 << 20,
+		"2GiB":       2 << 30,
+		"1TiB":       1 << 40,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			direct := &DirectExecutionConfig{Enabled: true, MaxTableBytes: raw}
+			require.NoError(t, direct.Validate("test"))
+			policy, err := direct.Policy()
+			require.NoError(t, err)
+			assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: true, MaxTableBytes: want}, policy)
+		})
+	}
+
+	t.Run("unset", func(t *testing.T) {
+		policy, err := (&DirectExecutionConfig{Enabled: true, MaxTableRows: 175000}).Policy()
+		require.NoError(t, err)
+		assert.Zero(t, policy.MaxTableBytes, "a row-bound policy carries no byte bound")
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		policy, err := (&DirectExecutionConfig{Enabled: false, MaxTableBytes: "100MiB"}).Policy()
+		require.NoError(t, err)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, policy, "an opt-out carries no bounds")
+	})
+}
+
 // A well-formed direct_execution policy on a MySQL database validates, and a
 // disabled block (even without a bound) is accepted as the fail-closed default.
 func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 	for name, direct := range map[string]*DirectExecutionConfig{
 		"enabled with bound":        {Enabled: true, MaxTableRows: 500000},
+		"enabled with byte bound":   {Enabled: true, MaxTableBytes: "100MiB"},
 		"enabled with lock timeout": {Enabled: true, MaxTableRows: 500000, LockAcquisitionTimeout: "5s"},
 		"disabled":                  {Enabled: false},
 	} {
@@ -1375,15 +1508,15 @@ func TestServerConfig_ValidateAcceptsDirectExecution(t *testing.T) {
 }
 
 // The server-wide policy is held to the same shape rules as a per-database
-// block: enabling it without a row bound, or with a lock timeout that cannot
+// block: enabling it without a size bound, or with a lock timeout that cannot
 // be applied with second granularity, fails startup.
 func TestServerConfig_ValidateRejectsMalformedServerDirectExecution(t *testing.T) {
 	for name, tc := range map[string]struct {
 		direct  *DirectExecutionConfig
 		wantErr string
 	}{
-		"enabled without bound":    {&DirectExecutionConfig{Enabled: true}, "a positive bound is required"},
-		"negative bound":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: -1}, "a positive bound is required"},
+		"enabled without bound":    {&DirectExecutionConfig{Enabled: true}, "enables direct_execution without a size bound"},
+		"negative bound":           {&DirectExecutionConfig{Enabled: true, MaxTableRows: -1}, "max_table_rows is -1 (must be positive"},
 		"sub-second lock timeout":  {&DirectExecutionConfig{Enabled: true, MaxTableRows: 1000, LockAcquisitionTimeout: "500ms"}, "must be at least 1s"},
 		"malformed while disabled": {&DirectExecutionConfig{LockAcquisitionTimeout: "bogus"}, "is not a valid duration"},
 	} {
@@ -1433,7 +1566,7 @@ func TestServerConfig_ValidateAcceptsServerDirectExecutionAlongsideOtherEngines(
 // including one a data plane resolves per request with no registration of its
 // own, and reaches no engine that cannot honor it.
 func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
-	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}
+	serverPolicy := &DirectExecutionConfig{Enabled: true, MaxTableBytes: "100MiB", LockAcquisitionTimeout: "10s"}
 	cfg := ServerConfig{DirectExecution: serverPolicy}
 
 	t.Run("registered mysql database", func(t *testing.T) {
@@ -1453,14 +1586,14 @@ func TestServerConfig_ResolveDirectExecutionAppliesServerPolicy(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{
 			engine.MetadataDirectExecution:                              "true",
-			engine.MetadataDirectExecutionMaxTableRows:                  "10000",
+			engine.MetadataDirectExecutionMaxTableBytes:                 "104857600",
 			engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds: "10",
 		}, metadata)
 	})
 }
 
 // A database environment's own block replaces the server-wide policy whole
-// rather than merging into it, so an override can neither inherit a row bound
+// rather than merging into it, so an override can neither inherit a size bound
 // it does not state nor be overruled when it opts out.
 func TestServerConfig_ResolveDirectExecutionOverrideReplacesServerPolicy(t *testing.T) {
 	cfg := ServerConfig{DirectExecution: &DirectExecutionConfig{Enabled: true, MaxTableRows: 10000, LockAcquisitionTimeout: "10s"}}
@@ -2414,7 +2547,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 				CutoverPolicy: storage.CutoverPolicyBarrier,
 			},
 			tern:       baseTern,
-			wantErrSub: "sets cutover_policy without a deployments map",
+			wantErrSub: "sets cutover_policy without a deployments map or targets list",
 		},
 		{
 			name: "invalid cutover_policy value is rejected",
@@ -2458,6 +2591,18 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			tern: baseTern,
 		},
 		{
+			// A large fleet runs its targets in parallel, bounded by the
+			// server's max_drivers_per_apply, and keeps going past a failed one.
+			name: "cutover_policy parallel and on_failure continue with a targets list are accepted",
+			envConfig: EnvironmentConfig{
+				Deployment:    "payments-a",
+				Targets:       targetNames("payments-001", "payments-002"),
+				CutoverPolicy: storage.CutoverPolicyParallel,
+				OnFailure:     storage.OnFailureContinue,
+			},
+			tern: baseTern,
+		},
+		{
 			name: "on_failure without a deployments map is rejected",
 			envConfig: EnvironmentConfig{
 				Target:     "payments",
@@ -2465,7 +2610,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 				OnFailure:  storage.OnFailureContinue,
 			},
 			tern:       baseTern,
-			wantErrSub: "sets on_failure without a deployments map",
+			wantErrSub: "sets on_failure without a deployments map or targets list",
 		},
 		{
 			name: "on_failure halt with a deployments map is accepted",
@@ -2512,7 +2657,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "environment targets list is accepted",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001", "payments-002"},
+				Targets:    targetNames("payments-001", "payments-002"),
 			},
 			tern: baseTern,
 		},
@@ -2521,7 +2666,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
 				Target:     "payments-001",
-				Targets:    []string{"payments-001", "payments-002"},
+				Targets:    targetNames("payments-001", "payments-002"),
 			},
 			tern:       baseTern,
 			wantErrSub: "cannot configure both target and targets",
@@ -2531,7 +2676,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
 				Target:     "payments-001",
-				Targets:    []string{},
+				Targets:    targetNames(),
 			},
 			tern:       baseTern,
 			wantErrSub: "cannot configure both target and targets",
@@ -2540,7 +2685,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "empty environment targets list is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{},
+				Targets:    targetNames(),
 			},
 			tern:       baseTern,
 			wantErrSub: "targets list is empty",
@@ -2549,7 +2694,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "empty entry in environment targets is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001", ""},
+				Targets:    targetNames("payments-001", ""),
 			},
 			tern:       baseTern,
 			wantErrSub: "targets entry 1 is empty",
@@ -2558,7 +2703,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "repeated environment target is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001", "payments-001"},
+				Targets:    targetNames("payments-001", "payments-001"),
 			},
 			tern:       baseTern,
 			wantErrSub: `lists target "payments-001" more than once`,
@@ -2567,7 +2712,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "environment target containing the operation key delimiter is rejected",
 			envConfig: EnvironmentConfig{
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001", "payments/002"},
+				Targets:    targetNames("payments-001", "payments/002"),
 			},
 			tern:       baseTern,
 			wantErrSub: `targets entry 1 "payments/002" contains reserved delimiter "/"`,
@@ -2575,7 +2720,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 		{
 			name: "environment targets without a deployment is rejected",
 			envConfig: EnvironmentConfig{
-				Targets: []string{"payments-001", "payments-002"},
+				Targets: targetNames("payments-001", "payments-002"),
 			},
 			tern:       baseTern,
 			wantErrSub: "missing deployment",
@@ -2585,7 +2730,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			envConfig: EnvironmentConfig{
 				DSN:        "root@tcp(localhost)/payments",
 				Deployment: "payments-a",
-				Targets:    []string{"payments-001"},
+				Targets:    targetNames("payments-001"),
 			},
 			tern:       baseTern,
 			wantErrSub: "cannot configure both local DSN and target/deployment(s)",
@@ -2594,7 +2739,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "deployment targets list is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Targets: []string{"payments-001", "payments-002"}},
+					"payments-a": {Targets: targetNames("payments-001", "payments-002")},
 					"payments-b": {Target: "payments-003"},
 				},
 			},
@@ -2604,7 +2749,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "deployment target and targets together are rejected",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Target: "payments-001", Targets: []string{"payments-002"}},
+					"payments-a": {Target: "payments-001", Targets: targetNames("payments-002")},
 				},
 			},
 			tern:       baseTern,
@@ -2614,7 +2759,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "repeated target within one deployment is rejected",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Targets: []string{"payments-001", "payments-001"}},
+					"payments-a": {Targets: targetNames("payments-001", "payments-001")},
 				},
 			},
 			tern:       baseTern,
@@ -2624,7 +2769,7 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "deployment target containing the operation key delimiter is rejected",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Targets: []string{"payments/001", "payments-002"}},
+					"payments-a": {Targets: targetNames("payments/001", "payments-002")},
 				},
 			},
 			tern:       baseTern,
@@ -2634,8 +2779,8 @@ func TestServerConfig_DeploymentsMapValidation(t *testing.T) {
 			name: "the same target under different deployments is accepted",
 			envConfig: EnvironmentConfig{
 				Deployments: map[string]DeploymentTarget{
-					"payments-a": {Targets: []string{"payments-001", "payments-002"}},
-					"payments-b": {Targets: []string{"payments-001", "payments-002"}},
+					"payments-a": {Targets: targetNames("payments-001", "payments-002")},
+					"payments-b": {Targets: targetNames("payments-001", "payments-002")},
 				},
 			},
 			tern: baseTern,
@@ -3340,6 +3485,17 @@ func TestGitHubConfig_Configured(t *testing.T) {
 		assert.True(t, g.Configured())
 	})
 
+	t.Run("configured when app id carries a trailing newline", func(t *testing.T) {
+		t.Setenv("CONFIGURED_APP_ID_NEWLINE", "123\n")
+		g := GitHubConfig{AppID: "env:CONFIGURED_APP_ID_NEWLINE", PrivateKey: "some-key"}
+		assert.True(t, g.Configured())
+	})
+
+	t.Run("not configured when app id is malformed", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc", PrivateKey: "some-key"}
+		assert.False(t, g.Configured())
+	})
+
 	t.Run("not configured when file reference does not exist", func(t *testing.T) {
 		nonexistent := filepath.Join(t.TempDir(), "nonexistent-key.pem")
 		g := GitHubConfig{AppID: "123", PrivateKey: "file:" + nonexistent}
@@ -3347,32 +3503,176 @@ func TestGitHubConfig_Configured(t *testing.T) {
 	})
 }
 
+// The app ID resolves from config or the GITHUB_APP_ID fallback with
+// surrounding whitespace trimmed, so a mounted secret's trailing newline still
+// yields the ID. An unset or zero app ID is "not configured" (0, no error),
+// while a value that is not a non-negative integer is a configuration error
+// that names the setting and never echoes the value.
 func TestGitHubConfig_ResolveAppID(t *testing.T) {
 	t.Run("resolves numeric string", func(t *testing.T) {
 		g := GitHubConfig{AppID: "456789"}
-		assert.Equal(t, int64(456789), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(456789), id)
 	})
 
-	t.Run("returns 0 for empty", func(t *testing.T) {
+	t.Run("trims a trailing newline from an env reference", func(t *testing.T) {
+		t.Setenv("RESOLVE_APP_ID_NEWLINE", "12345\n")
+		g := GitHubConfig{AppID: "env:RESOLVE_APP_ID_NEWLINE"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(12345), id)
+	})
+
+	t.Run("trims surrounding whitespace from the env var fallback", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", " 12345\n")
 		g := GitHubConfig{}
-		assert.Equal(t, int64(0), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(12345), id)
 	})
 
-	t.Run("returns 0 for non-numeric", func(t *testing.T) {
-		g := GitHubConfig{AppID: "not-a-number"}
-		assert.Equal(t, int64(0), g.ResolveAppID())
+	t.Run("returns 0 without error when unset", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		g := GitHubConfig{}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("returns 0 without error when an env reference is unset", func(t *testing.T) {
+		t.Setenv("RESOLVE_APP_ID_UNSET", "")
+		g := GitHubConfig{AppID: "env:RESOLVE_APP_ID_UNSET"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("non-numeric value is an error naming the setting", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc"}
+		id, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Equal(t, int64(0), id)
+		assert.Contains(t, err.Error(), "app-id must be a positive integer")
+		assert.Contains(t, err.Error(), "invalid syntax")
+		assert.NotContains(t, err.Error(), "abc", "the resolved value must not appear in the error")
+	})
+
+	t.Run("non-numeric env var fallback is an error naming the env var", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "not-a-number")
+		g := GitHubConfig{}
+		_, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "GITHUB_APP_ID must be a positive integer")
+		assert.NotContains(t, err.Error(), "not-a-number", "the resolved value must not appear in the error")
+	})
+
+	t.Run("zero is not configured, as the deployment templates seed it", func(t *testing.T) {
+		g := GitHubConfig{AppID: "0"}
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), id)
+	})
+
+	t.Run("negative value is an error", func(t *testing.T) {
+		g := GitHubConfig{AppID: "-5"}
+		_, err := g.ResolveAppID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "app-id must be a positive integer")
+	})
+
+	t.Run("unresolvable secret reference is an error but not an invalid app ID", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
+		g := GitHubConfig{AppID: "file:" + nonexistent}
+		_, err := g.ResolveAppID()
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "resolve app-id")
 	})
 
 	t.Run("falls back to env var", func(t *testing.T) {
 		t.Setenv("GITHUB_APP_ID", "999")
 		g := GitHubConfig{}
-		assert.Equal(t, int64(999), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(999), id)
 	})
 
 	t.Run("config takes precedence over env var", func(t *testing.T) {
 		t.Setenv("GITHUB_APP_ID", "999")
 		g := GitHubConfig{AppID: "123"}
-		assert.Equal(t, int64(123), g.ResolveAppID())
+		id, err := g.ResolveAppID()
+		require.NoError(t, err)
+		assert.Equal(t, int64(123), id)
+	})
+}
+
+// ResolveCredentials tells the three unusable shapes apart so the server can
+// start with GitHub off for an App that is not configured or whose credentials
+// have not arrived, and refuse to start for one whose App ID is malformed.
+func TestGitHubConfig_ResolveCredentials(t *testing.T) {
+	t.Run("both resolve", func(t *testing.T) {
+		t.Setenv("RESOLVE_CREDS_PK", "private-key-bytes")
+		g := GitHubConfig{AppID: "123", PrivateKey: "env:RESOLVE_CREDS_PK"}
+		creds, err := g.ResolveCredentials()
+		require.NoError(t, err)
+		assert.Equal(t, GitHubAppCredentials{AppID: 123, PrivateKey: "private-key-bytes"}, creds)
+	})
+
+	t.Run("nothing set is not configured", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
+		g := GitHubConfig{}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppNotConfigured)
+		assert.NotErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+	})
+
+	t.Run("placeholder zero app-id with a key reference is unavailable, not malformed", func(t *testing.T) {
+		g := GitHubConfig{AppID: "0", PrivateKey: "file:/nonexistent/private-key.pem"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "private-key is set but app-id is empty")
+	})
+
+	t.Run("app-id without a private key is unavailable", func(t *testing.T) {
+		g := GitHubConfig{AppID: "123"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "app-id is set but private-key is missing")
+	})
+
+	t.Run("unresolvable app-id reference is unavailable", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-app-id")
+		g := GitHubConfig{AppID: "file:" + nonexistent, PrivateKey: "some-key"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), "resolve app-id")
+	})
+
+	t.Run("unresolvable private key reference is unavailable", func(t *testing.T) {
+		nonexistent := filepath.Join(t.TempDir(), "nonexistent-key.pem")
+		g := GitHubConfig{AppID: "123", PrivateKey: "file:" + nonexistent}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "resolve private-key")
+	})
+
+	t.Run("private key that resolves to empty is unavailable", func(t *testing.T) {
+		t.Setenv("RESOLVE_CREDS_EMPTY_PK", "")
+		g := GitHubConfig{AppID: "123", PrivateKey: "env:RESOLVE_CREDS_EMPTY_PK"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.Contains(t, err.Error(), "private-key resolved to empty")
+	})
+
+	t.Run("malformed app-id is invalid, not unavailable", func(t *testing.T) {
+		g := GitHubConfig{AppID: "abc", PrivateKey: "some-key"}
+		_, err := g.ResolveCredentials()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.NotErrorIs(t, err, ErrGitHubAppCredentialsUnavailable)
+		assert.NotErrorIs(t, err, ErrGitHubAppNotConfigured)
 	})
 }
 
@@ -3508,19 +3808,32 @@ func TestServerConfig_AreChecksEnabled(t *testing.T) {
 }
 
 func TestServerConfig_DeletesUnactionedPlanComments(t *testing.T) {
-	t.Run("nil config defaults to minimize policy", func(t *testing.T) {
+	t.Run("nil config defaults to delete policy", func(t *testing.T) {
 		var cfg *ServerConfig
-		assert.False(t, cfg.DeletesUnactionedPlanComments())
-	})
-
-	t.Run("unset defaults to minimize policy", func(t *testing.T) {
-		cfg := ServerConfig{}
-		assert.False(t, cfg.DeletesUnactionedPlanComments())
-	})
-
-	t.Run("explicit true opts into the delete policy", func(t *testing.T) {
-		cfg := ServerConfig{DeleteUnactionedPlanComments: true}
 		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("unset defaults to delete policy", func(t *testing.T) {
+		cfg := ServerConfig{}
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("unset in YAML defaults to delete policy", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("allowed_environments: [staging]\n"), &cfg))
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("explicit true keeps the delete policy", func(t *testing.T) {
+		deletes := true
+		cfg := ServerConfig{DeleteUnactionedPlanComments: &deletes}
+		assert.True(t, cfg.DeletesUnactionedPlanComments())
+	})
+
+	t.Run("explicit false opts out to the minimize policy", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("delete_unactioned_plan_comments: false\n"), &cfg))
+		assert.False(t, cfg.DeletesUnactionedPlanComments())
 	})
 }
 
@@ -4256,6 +4569,7 @@ func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 	})
 
 	t.Run("empty app-id fails closed", func(t *testing.T) {
+		t.Setenv("GITHUB_APP_ID", "")
 		cfg := &ServerConfig{
 			Apps: map[string]GitHubAppConfig{
 				"app-a": {AppID: "", PrivateKey: "x", WebhookSecret: "y"},
@@ -4263,7 +4577,31 @@ func TestServerConfig_ResolveGitHubAppsByID(t *testing.T) {
 		}
 		_, err := cfg.ResolveGitHubAppsByID()
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "empty or unparseable app-id")
+		assert.Contains(t, err.Error(), `app "app-a" has no app-id configured (empty or 0)`)
+	})
+
+	t.Run("placeholder zero app-id fails closed", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "0", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), `app "app-a" has no app-id configured (empty or 0)`)
+	})
+
+	t.Run("malformed app-id fails closed naming the App", func(t *testing.T) {
+		cfg := &ServerConfig{
+			Apps: map[string]GitHubAppConfig{
+				"app-a": {AppID: "12x45", PrivateKey: "x", WebhookSecret: "y"},
+			},
+		}
+		_, err := cfg.ResolveGitHubAppsByID()
+		require.ErrorIs(t, err, ErrInvalidGitHubAppID)
+		assert.Contains(t, err.Error(), `app "app-a": app-id must be a positive integer`)
+		assert.NotContains(t, err.Error(), "12x45", "the resolved value must not appear in the error")
 	})
 
 	t.Run("nil receiver errors", func(t *testing.T) {
@@ -4580,6 +4918,63 @@ func TestAgentHintConfig(t *testing.T) {
 	})
 }
 
+// cli_name starts every CLI command hint a PR comment renders, inside inline
+// code, so an unset name renders the CLI's own default and a name that could
+// not render as the start of a pasteable command is refused at startup.
+func TestCLINameConfig(t *testing.T) {
+	validConfig := func() ServerConfig {
+		return ServerConfig{
+			Databases: map[string]DatabaseConfig{
+				"mydb": {
+					Type: "mysql",
+					Environments: map[string]EnvironmentConfig{
+						"staging": {DSN: "root:pass@tcp(localhost:3306)/mydb"},
+					},
+				},
+			},
+		}
+	}
+
+	t.Run("defaults to the CLI's own name", func(t *testing.T) {
+		cfg := validConfig()
+		require.NoError(t, cfg.Validate())
+		assert.Equal(t, "schemabot", cfg.HintCLIName())
+		assert.Equal(t, cliname.DefaultName, cfg.HintCLIName())
+		assert.Equal(t, "schemabot", (*ServerConfig)(nil).HintCLIName(), "an unwired config renders the default")
+	})
+
+	t.Run("a wrapper name is rendered as configured", func(t *testing.T) {
+		var cfg ServerConfig
+		require.NoError(t, yaml.Unmarshal([]byte("cli_name: acme schemabot\n"), &cfg))
+		assert.Equal(t, "acme schemabot", cfg.HintCLIName())
+
+		valid := validConfig()
+		valid.CLIName = cfg.CLIName
+		require.NoError(t, valid.Validate())
+	})
+
+	for name, tc := range map[string]struct {
+		value string
+		error string
+	}{
+		"blank":               {"   ", "cli_name must not be blank"},
+		"padded":              {" acme schemabot", "cli_name contains leading or trailing whitespace"},
+		"multi-line":          {"acme\nschemabot", "cli_name must be a single line with no control characters"},
+		"line-separated":      {"acme\u2028schemabot", "cli_name must be a single line with no control characters"},
+		"paragraph-separated": {"acme\u2029schemabot", "cli_name must be a single line with no control characters"},
+		"bidi-overridden":     {"acme \u202eschemabot", "cli_name must not contain format character U+202E"},
+		"zero-width-spaced":   {"acme\u200bschemabot", "cli_name must not contain format character U+200B"},
+		"backtick":            {"acme` schemabot", "cli_name must not contain a backtick"},
+		"longer than the cap": {strings.Repeat("a", maxCLINameChars+1), "cli_name must be at most"},
+	} {
+		t.Run("refuses a "+name+" name", func(t *testing.T) {
+			cfg := validConfig()
+			cfg.CLIName = tc.value
+			assert.ErrorContains(t, cfg.Validate(), tc.error)
+		})
+	}
+}
+
 func TestPendingDropsTargetsResolveEachPass(t *testing.T) {
 	dsnPath := filepath.Join(t.TempDir(), "target.dsn")
 	cfg := &ServerConfig{
@@ -4792,34 +5187,36 @@ func TestServerConfig_SpiritMetadata(t *testing.T) {
 		var cfg ServerConfig
 		require.NoError(t, yaml.Unmarshal([]byte(`
 spirit:
-  enable_experimental_autoscaling: false
-  enable_experimental_lockless_checksum: true
   checkpoint_max_age: 24h
-  checksum_yield_timeout: 6h
 `), &cfg))
 		metadata, err := cfg.SpiritMetadata()
 		require.NoError(t, err)
 		assert.Equal(t, map[string]string{
-			spirit.MetadataEnableExperimentalAutoscaling:      "false",
-			spirit.MetadataEnableExperimentalLocklessChecksum: "true",
-			spirit.MetadataCheckpointMaxAge:                   "24h",
-			spirit.MetadataChecksumYieldTimeout:               "6h",
+			spirit.MetadataCheckpointMaxAge: "24h",
 		}, metadata)
 	})
 
-	// The lockless checksum is off by default, so a block that spells that out
-	// carries no override: the key would restate the default, and a database
-	// that enabled the checker in its own metadata outranks the server value
-	// regardless.
-	t.Run("lockless checksum false carries no override", func(t *testing.T) {
-		var cfg ServerConfig
-		require.NoError(t, yaml.Unmarshal([]byte(`
-spirit:
-  enable_experimental_lockless_checksum: false
-`), &cfg))
-		metadata, err := cfg.SpiritMetadata()
-		require.NoError(t, err)
-		assert.Empty(t, metadata)
+	// Autoscaling and the checksum algorithm are Spirit's own defaults and no
+	// longer configurable. A config that still sets one of the removed keys
+	// fails to load instead of silently running with a setting the operator
+	// believes they changed, and the error says the key was removed so the
+	// operator knows deleting it is the whole remedy.
+	t.Run("removed keys are rejected", func(t *testing.T) {
+		for key, value := range map[string]string{
+			"enable_experimental_autoscaling":       "false",
+			"enable_experimental_lockless_checksum": "true",
+			"checksum_yield_timeout":                "6h",
+		} {
+			_, err := ParseServerConfig([]byte("spirit:\n  " + key + ": " + value + "\n"))
+			require.ErrorContains(t, err, "spirit."+key+" was removed")
+		}
+	})
+
+	// The server config decodes strictly, so an unknown spirit key that was
+	// never a setting still fails to load.
+	t.Run("unknown keys are rejected", func(t *testing.T) {
+		_, err := ParseServerConfig([]byte("spirit:\n  copy_threads: 8\n"))
+		require.ErrorContains(t, err, "copy_threads")
 	})
 
 	t.Run("invalid duration errors", func(t *testing.T) {
@@ -4829,7 +5226,7 @@ spirit:
 	})
 
 	t.Run("non-positive duration errors", func(t *testing.T) {
-		cfg := ServerConfig{Spirit: SpiritConfig{ChecksumYieldTimeout: "-1h"}}
+		cfg := ServerConfig{Spirit: SpiritConfig{CheckpointMaxAge: "-1h"}}
 		_, err := cfg.SpiritMetadata()
 		require.ErrorContains(t, err, "must be positive")
 	})
@@ -5201,7 +5598,7 @@ func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
 				Environments: map[string]EnvironmentConfig{
 					"production": {
 						Deployment: "payments-a",
-						Targets:    []string{"payments-002", "payments-001"},
+						Targets:    targetNames("payments-002", "payments-001"),
 					},
 				},
 			},
@@ -5210,7 +5607,7 @@ func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
 				Environments: map[string]EnvironmentConfig{
 					"production": {
 						Deployments: map[string]DeploymentTarget{
-							"payments-b": {Targets: []string{"payments-003", "payments-004"}},
+							"payments-b": {Targets: targetNames("payments-003", "payments-004")},
 							"payments-a": {Target: "payments-001"},
 						},
 						DeploymentOrder: []string{"payments-a", "payments-b"},
@@ -5223,7 +5620,7 @@ func TestServerConfig_ResolveDatabaseTargets_MultiTarget(t *testing.T) {
 					"production": {
 						Deployment: "payments-a",
 						Target:     "payments-001",
-						Targets:    []string{"payments-002"},
+						Targets:    targetNames("payments-002"),
 					},
 				},
 			},
@@ -5292,9 +5689,9 @@ func TestServerConfig_MultiTargetIsMySQLOnly(t *testing.T) {
 			},
 		}
 	}
-	envTargets := EnvironmentConfig{Deployment: "payments-a", Targets: []string{"payments-001", "payments-002"}}
+	envTargets := EnvironmentConfig{Deployment: "payments-a", Targets: targetNames("payments-001", "payments-002")}
 	mapTargets := EnvironmentConfig{Deployments: map[string]DeploymentTarget{
-		"payments-a": {Targets: []string{"payments-001", "payments-002"}},
+		"payments-a": {Targets: targetNames("payments-001", "payments-002")},
 	}}
 	mirrored := EnvironmentConfig{Deployments: map[string]DeploymentTarget{
 		"payments-a": {Target: "payments"},
@@ -5340,9 +5737,9 @@ func TestEnvironmentConfig_UsesTargetsList(t *testing.T) {
 		{name: "deployments map of single targets", env: EnvironmentConfig{Deployments: map[string]DeploymentTarget{
 			"a": {Target: "payments"}, "b": {Target: "payments"},
 		}}},
-		{name: "environment targets", env: EnvironmentConfig{Deployment: "a", Targets: []string{"payments-001"}}, want: true},
+		{name: "environment targets", env: EnvironmentConfig{Deployment: "a", Targets: targetNames("payments-001")}, want: true},
 		{name: "deployments entry targets", env: EnvironmentConfig{Deployments: map[string]DeploymentTarget{
-			"a": {Target: "payments-001"}, "b": {Targets: []string{"payments-002"}},
+			"a": {Target: "payments-001"}, "b": {Targets: targetNames("payments-002")},
 		}}, want: true},
 	}
 	for _, tc := range cases {
@@ -5366,9 +5763,9 @@ func TestServerConfig_MemberPlanningFor(t *testing.T) {
 					"scalar":       {Deployment: "payments-a", Target: "payments-001"},
 					"local":        {DSN: "root@tcp(localhost)/payments"},
 					"mirrored":     {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments"}, "payments-b": {Target: "payments"}}},
-					"targets":      {Deployment: "payments-a", Targets: []string{"payments-001", "payments-002"}},
-					"map-targets":  {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: []string{"payments-001", "payments-002"}}}},
-					"mixed-shapes": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments-001"}, "payments-b": {Targets: []string{"payments-002"}}}},
+					"targets":      {Deployment: "payments-a", Targets: targetNames("payments-001", "payments-002")},
+					"map-targets":  {Deployments: map[string]DeploymentTarget{"payments-a": {Targets: targetNames("payments-001", "payments-002")}}},
+					"mixed-shapes": {Deployments: map[string]DeploymentTarget{"payments-a": {Target: "payments-001"}, "payments-b": {Targets: targetNames("payments-002")}}},
 				},
 			},
 		},
@@ -5533,4 +5930,14 @@ func TestServerConfig_DirectExecutionPolicyForResolvesByName(t *testing.T) {
 		require.NoError(t, err)
 		assert.Nil(t, policy)
 	})
+}
+
+// targetNames builds a targets list of bare target names, the spelling that
+// selects no namespaces.
+func targetNames(targets ...string) []TargetEntry {
+	entries := make([]TargetEntry, 0, len(targets))
+	for _, target := range targets {
+		entries = append(entries, TargetEntry{Target: target})
+	}
+	return entries
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -592,6 +593,33 @@ func TestFormatTableProgress_StartingCopy(t *testing.T) {
 	}
 }
 
+// A copying table shows its planned size beside the row counts, before the
+// ETA, and a stopped one keeps it. Without an estimate the row counts stand
+// alone.
+func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	base := TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
+		DDL:        "ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`)",
+		RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720,
+		EstimatedBytes: &bytes,
+	}
+
+	assert.Contains(t, FormatTableProgress(base), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n")
+
+	noETA := base
+	noETA.ETASeconds = 0
+	assert.Contains(t, FormatTableProgress(noETA), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
+
+	stopped := base
+	stopped.Status = state.Task.Stopped
+	assert.Contains(t, FormatTableProgress(stopped), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
+
+	unsized := base
+	unsized.EstimatedBytes = nil
+	assert.Contains(t, FormatTableProgress(unsized), "Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n")
+}
+
 // A table applying its accumulated changes names the catch-up phase rather
 // than rendering a bare full bar — its copy is done but the engine is still
 // draining the changes that piled up on the source, which can run for hours on
@@ -711,7 +739,9 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
 }
 
-// Interactive throttle hints use the same labeled terminal links as CLI lists.
+// Interactive throttle hints point at the throttle reference the way a PR
+// comment's docs line does: the docs glyph, a readable label, and the page's
+// short path as the hyperlink text.
 func TestFormatTableProgress_ThrottleHyperlink(t *testing.T) {
 	enableHyperlinks(t)
 	output := FormatThrottleReference([]TableProgress{{
@@ -719,7 +749,8 @@ func TestFormatTableProgress_ThrottleHyperlink(t *testing.T) {
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true, ThrottleReason: "commit-latency 120ms >= 100ms",
 	}})
-	assert.Contains(t, output, "Docs: "+ui.Link("Throttle reference", ui.ThrottleDocURL))
+	assert.Contains(t, output, glyph.Docs+" Docs: "+ANSIBlue+ui.Link("docs/throttle.md", ui.ThrottleDocURL)+ANSIReset)
+	assert.NotContains(t, output, ANSIDim, "the docs line is not dimmed")
 }
 
 func TestFormatTableProgress_InstantDDL(t *testing.T) {
@@ -945,6 +976,45 @@ func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
 	assert.NotContains(t, output, "145%")
 	assert.NotContains(t, output, "100%")
 	assert.NotContains(t, output, "100,000 / 100,000")
+}
+
+// A table whose copy has passed the engine's estimate is still an in-progress
+// block, so it ends like one: a blank line before the next table, and the
+// per-shard rows when the table is sharded. Without the blank line the next
+// table's header reads as a continuation of the finalizing table's notes.
+func TestFormatTableProgress_EstimateExceededEndsLikeEveryBlock(t *testing.T) {
+	finalizing := TableProgress{
+		TableName:       "customers",
+		ChangeType:      "alter",
+		Status:          state.Apply.Running,
+		DDL:             "ALTER TABLE `customers` MODIFY COLUMN `created_at` timestamp NOT NULL",
+		RowsCopied:      103150850,
+		RowsTotal:       100000000,
+		PercentComplete: 103,
+	}
+	queued := TableProgress{
+		TableName:  "deposits",
+		ChangeType: "alter",
+		Status:     state.Apply.Pending,
+		DDL:        "ALTER TABLE `deposits` ADD INDEX `idx_state`(`state`)",
+	}
+
+	output := FormatTableProgress(finalizing) + FormatTableProgress(queued)
+
+	tooltip := ui.EstimateExceededTooltip + ANSIReset + "\n"
+	require.Contains(t, output, tooltip)
+	assert.Contains(t, output, tooltip+"\n"+indentTable+progressSymbol("alter")+"deposits: ⏳ Queued",
+		"a blank line separates the finalizing table from the next one")
+
+	sharded := finalizing
+	sharded.Shards = []ShardProgress{
+		{Shard: "-80", Status: state.Apply.Running, RowsCopied: 51575425, RowsTotal: 50000000, PercentComplete: 103},
+		{Shard: "80-", Status: state.Apply.Running, RowsCopied: 51575425, RowsTotal: 50000000, PercentComplete: 103},
+	}
+	shardedOutput := FormatTableProgress(sharded)
+	assert.Contains(t, shardedOutput, "Shards: 2")
+	assert.Contains(t, shardedOutput, "-80")
+	assert.Contains(t, shardedOutput, "80-")
 }
 
 func TestFormatVSchemaStatus(t *testing.T) {

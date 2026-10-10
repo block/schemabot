@@ -76,6 +76,27 @@ func setupGitHubServer(t *testing.T) (*gh.Client, *http.ServeMux) {
 	return client, mux
 }
 
+// drainWebhookWorkOnCleanup waits for the handler's detached goSafe goroutines
+// to finish before the test's fake GitHub server closes. Register it after
+// setupGitHubServer: cleanups run last-in first-out, so the drain runs first.
+//
+// A command handler that acknowledges a delivery and finishes its work in a
+// goroutine keeps running after the test that dispatched it has returned. Once
+// that test's server has closed, the goroutine's comment POST dials a freed
+// port, and when a later test's server has been bound to that same port the
+// comment lands in the later test's channel instead of being refused.
+func drainWebhookWorkOnCleanup(t *testing.T, h *Handler) {
+	t.Helper()
+	t.Cleanup(func() {
+		// t.Context() is already cancelled when cleanup runs; detach so the
+		// drain waits for its own deadline.
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), durableWebhookTestDeadline)
+		defer cancel()
+		h.DrainInProcessWebhookWork(ctx)
+		require.NoError(t, ctx.Err(), "webhook work dispatched by the test was still running when it finished")
+	})
+}
+
 // prWebhookPayloadOpts configures how buildPRWebhookRequest constructs the payload.
 type prWebhookPayloadOpts struct {
 	action    string // "opened", "synchronize", "reopened", "closed", etc.

@@ -185,7 +185,7 @@ type: mysql
 | `database` | Yes | Must match a database name in your SchemaBot server config |
 | `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
-| `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
+| `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped. An entry wrapped in slashes, such as `/^relay_[0-9]+_feed$/`, is a regular expression matched against the whole name (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
 
@@ -343,6 +343,8 @@ Follow the [pre-merge workflow](pre-merge-workflow.md) to take your first schema
 **"Database Not Available to This Repository" comment**: A command's `-d` flag named a database whose `allowed_repos` in the server config does not include this repository. No `schemabot.yaml` in the repository can manage that database, so none was searched. Add the repository to the database's `allowed_repos` if it should manage the database.
 
 **"Database Not Configured" comment**: A command's `-d` flag named a database that has no key under `databases:` in your SchemaBot server config. The repository's `schemabot.yaml` may be correct; the database still has to be configured on the server before SchemaBot can plan or apply changes for it. On a repository shared by several SchemaBot deployments, only a deployment named with `-t`, or one that is not the aggregate leader, answers this way; the leader keeps searching the repository so a database no deployment serves is still reported.
+
+**"Database Not Registered" comment**: On a repository shared by several SchemaBot deployments, the PR's `schemabot.yaml` declares a database the aggregate leader has no key for under `databases:`, and its schema directory is under none of the paths the leader expects another deployment to report on. The comment speaks only for the deployment named in its header: a leader serving other environments keeps its own registry and may register the database. When several leaders split a repository's environments, only one answers: the leader serving the command's `-e` environment, or, for a command without `-e`, the leader serving the first environment in `environment_order`. The others log the decision and stay silent. When the PR carries several such configs, the one reply lists them all under "Databases Not Registered". If a database is new to SchemaBot, register it on that deployment with an `allowed_dirs` entry naming its schema directory; if it is already registered, move the `schemabot.yaml` and its schema files under the directory registered for it.
 
 **"Repository Too Large to Search" comment**: GitHub truncated the repository tree, and the server config gave SchemaBot no exhaustive set of directories to search instead. Give the database an `allowed_dirs` entry naming its schema directory so discovery can probe that directory alone.
 

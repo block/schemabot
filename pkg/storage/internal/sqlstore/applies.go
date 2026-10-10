@@ -168,6 +168,19 @@ func canonicalizeApplyIdentity(apply *storage.Apply) {
 	apply.Environment = storage.CanonicalKey(apply.Environment)
 }
 
+// canonicalizeApplyState stores the state in its canonical form. The state
+// guards compare the stored column against the canonical constants, and
+// PostgreSQL compares strings case-sensitively, so a non-canonical value such
+// as COMPLETED would read as unsettled there and take a settled write
+// unguarded. An empty state is left as it is rather than normalized to the
+// no-active-change sentinel, which is not an apply state.
+func canonicalizeApplyState(apply *storage.Apply) {
+	if apply.State == "" {
+		return
+	}
+	apply.State = state.NormalizeState(apply.State)
+}
+
 func placeholders(count int) string {
 	return strings.TrimSuffix(strings.Repeat("?,", count), ",")
 }
@@ -183,6 +196,90 @@ func stringArgs(values []string) []any {
 func nonTerminalApplyStatePredicate(column string) (string, []any) {
 	terminalStates := terminalApplyStates()
 	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(terminalStates))), stringArgs(terminalStates)
+}
+
+func unsettledApplyStatePredicate(column string) (string, []any) {
+	settled := settledApplyStates()
+	return fmt.Sprintf("%s NOT IN (%s)", column, placeholders(len(settled))), stringArgs(settled)
+}
+
+// wouldReopenFinishedApply reports whether writing newState over a row in
+// currentState would hand a finished apply back to a path that can drive it.
+// An active state reopens any terminal row. Stopped reopens a settled row,
+// because a stopped apply can be claimed to resume. Every other terminal write
+// leaves a finished apply finished, so cancelling a stopped apply is allowed.
+func wouldReopenFinishedApply(currentState, newState string) bool {
+	if isActiveApplyState(newState) {
+		return state.IsTerminalApplyState(currentState)
+	}
+	if state.IsState(newState, state.Apply.Stopped) {
+		return state.IsState(currentState, settledApplyStates()...)
+	}
+	return false
+}
+
+// wouldRewriteSettledOutcome reports whether writing newState over a row in
+// currentState would replace one settled outcome with a different one, such
+// as a late cancel recording a completed apply as cancelled. The settled row is
+// what happened on the database; rewriting the same outcome, for example to
+// refresh a failure message, changes nothing about it.
+func wouldRewriteSettledOutcome(currentState, newState string) bool {
+	if !state.IsState(newState, settledApplyStates()...) {
+		return false
+	}
+	return state.IsState(currentState, settledApplyStates()...) && !state.IsState(currentState, newState)
+}
+
+// finishedApplyGuardPredicate is the SQL form of wouldReopenFinishedApply and
+// wouldRewriteSettledOutcome: the WHERE predicate that lets a general update
+// land only on a row it neither reopens nor gives a different outcome. ok is
+// false when newState can do neither to any row, so the write is unguarded.
+func finishedApplyGuardPredicate(column, newState string) (predicate string, args []any, ok bool) {
+	if isActiveApplyState(newState) {
+		predicate, args = nonTerminalApplyStatePredicate(column)
+		return predicate, args, true
+	}
+	if state.IsState(newState, state.Apply.Stopped) {
+		predicate, args = unsettledApplyStatePredicate(column)
+		return predicate, args, true
+	}
+	if state.IsState(newState, settledApplyStates()...) {
+		unsettled, unsettledArgs := unsettledApplyStatePredicate(column)
+		predicate = fmt.Sprintf("(%s OR %s = ?)", unsettled, column)
+		return predicate, append(unsettledArgs, state.NormalizeState(newState)), true
+	}
+	return "", nil, false
+}
+
+// ensureFinishedApplyGuardHeld resolves a zero-rows result from an update that
+// carried the finished-apply guard. Zero rows is ambiguous: the write may have
+// changed nothing, the row may not exist, or the guard may have refused a
+// finished row. The row's current state tells these apart, so each surfaces as
+// its own cause.
+func ensureFinishedApplyGuardHeld(ctx context.Context, db queryRower, apply *storage.Apply) error {
+	// The two dialects reach the finished row by different routes. On MySQL,
+	// InnoDB's locking read returns the latest committed row whatever the
+	// transaction's snapshot, so a finishing write another writer committed
+	// mid-update is exactly what the guard refused. On PostgreSQL under
+	// REPEATABLE READ, a row another writer changed after this transaction's
+	// snapshot raises a serialization failure instead, from the guarded UPDATE
+	// or from this read. Update retries the whole attempt through
+	// withLockRetry, and the retry's fresh snapshot sees the finished row.
+	var currentState string
+	err := db.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&currentState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("apply %s does not exist for update to state %s: %w", apply.ApplyIdentifier, apply.State, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("re-read apply %s after guarded update to state %s: %w", apply.ApplyIdentifier, apply.State, err)
+	}
+	if wouldReopenFinishedApply(currentState, apply.State) {
+		return fmt.Errorf("apply %s is %s; update to %s would reopen it: %w", apply.ApplyIdentifier, currentState, apply.State, storage.ErrApplyReopenRefused)
+	}
+	if wouldRewriteSettledOutcome(currentState, apply.State) {
+		return fmt.Errorf("apply %s already settled as %s; update to %s would rewrite its outcome: %w", apply.ApplyIdentifier, currentState, apply.State, storage.ErrApplyOutcomeSettled)
+	}
+	return nil
 }
 
 func beginApplyWriteTx(ctx context.Context, beginner txBeginner, operation string) (*applyWriteTx, error) {
@@ -388,20 +485,130 @@ func operationDeploymentsForApply(ctx context.Context, tx *rebindTx, applyID int
 // is matched against both the parent applies.deployment (the primary) and the
 // apply_operations.deployment rows, so single-operation applies (where the two
 // are equal) behave exactly as before.
+//
+// A terminal parent keeps its whole target set reserved while any of its
+// operations is still in progress (checkNoInProgressRolloutForTargets).
 func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
 	deployments = dedupeDeployments(deployments)
 	if len(deployments) == 0 {
 		return fmt.Errorf("active apply target requires at least one deployment for %s/%s/%s", database, dbType, environment)
 	}
+	holders, err := activeApplyHoldersForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
+	if err != nil {
+		return err
+	}
+	if len(holders) > 0 {
+		return activeApplyExistsError(database, dbType, environment, deployments, holders[0].identifier)
+	}
+	return checkNoInProgressRolloutForTargets(ctx, tx, dialect, database, dbType, environment, deployments, excludeApplyID)
+}
 
+// checkNoActiveApplyForNewGeneration is checkNoActiveApplyForTargets for the
+// creation of an apply that carries a generation manifest: the first dispatch
+// of a deployment-keyed generation. It admits the new generation past one kind
+// of holder only, an earlier generation held open waiting for operations that
+// never attached (settledManifestHold), and returns the holders it admitted
+// past so the create can record the handoff on them (markAdmittedPast). The
+// dispatcher starts a new generation on a deployment only once it is done with
+// every earlier one there, so those operations can no longer arrive, and the
+// earlier generation has no work left to protect: everything that attached to
+// it has settled. Every other holder blocks exactly as it does for any apply.
+func checkNoActiveApplyForNewGeneration(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string) ([]activeApplyHolder, error) {
+	deployments = dedupeDeployments(deployments)
+	if len(deployments) == 0 {
+		return nil, fmt.Errorf("active apply target requires at least one deployment for %s/%s/%s", database, dbType, environment)
+	}
+	holders, err := activeApplyHoldersForTargets(ctx, tx, dialect, database, dbType, environment, deployments, 0)
+	if err != nil {
+		return nil, err
+	}
+	for _, holder := range holders {
+		held, err := settledManifestHold(ctx, tx, holder)
+		if err != nil {
+			return nil, err
+		}
+		if !held {
+			return nil, activeApplyExistsError(database, dbType, environment, deployments, holder.identifier)
+		}
+		slog.WarnContext(ctx, "admitting a new generation past an earlier one held open for operations that never attached; the new generation takes over its work and its driver settles it on its next pass",
+			"database", database, "database_type", dbType, "environment", environment, "deployments", deployments,
+			"held_apply_id", holder.identifier)
+	}
+	if err := checkNoInProgressRolloutForTargets(ctx, tx, dialect, database, dbType, environment, deployments, 0); err != nil {
+		return nil, err
+	}
+	return holders, nil
+}
+
+// checkNoActiveApplyForCreate runs the admission check for a new apply's
+// targets and returns the holders it was admitted past. An apply that declares
+// a generation manifest is the first dispatch of a new generation, which only
+// an earlier generation's manifest hold cannot block; every other apply is held
+// to the plain check and is never admitted past anything.
+func checkNoActiveApplyForCreate(ctx context.Context, tx *rebindTx, dialect Dialect, apply *storage.Apply, deployments []string) ([]activeApplyHolder, error) {
+	if len(apply.ExpectedOperationKeys) > 0 {
+		return checkNoActiveApplyForNewGeneration(ctx, tx, dialect, apply.Database, apply.DatabaseType, apply.Environment, deployments)
+	}
+	return nil, checkNoActiveApplyForTargets(ctx, tx, dialect, apply.Database, apply.DatabaseType, apply.Environment, deployments, 0)
+}
+
+// markAdmittedPast records successor as the apply that took over the work of
+// a held generation it was admitted past. It runs in the create's transaction,
+// under the apply target lock, so the newer apply and the handoff become
+// visible together: an attach to the held apply, which takes the same lock,
+// either lands before both or sees the marker and is refused. The marker is
+// the same write-once superseded_by that a dispatch records on a stopped apply
+// whose copy it takes over (MarkSuperseded): the held apply can never be
+// started again, it stops reserving its targets, and its driver settles it
+// over what attached.
+func markAdmittedPast(ctx context.Context, tx *rebindTx, holder activeApplyHolder, successor string) error {
+	result, err := tx.ExecContext(ctx,
+		`UPDATE applies SET superseded_by = ?, updated_at = updated_at WHERE id = ? AND superseded_by = ''`,
+		successor, holder.id)
+	if err != nil {
+		return fmt.Errorf("record apply %s taking over held apply %s: %w", successor, holder.identifier, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read rows affected recording apply %s taking over held apply %s: %w", successor, holder.identifier, err)
+	}
+	if rows != 1 {
+		return fmt.Errorf("record apply %s taking over held apply %s: the held apply already names a successor: %w", successor, holder.identifier, storage.ErrApplyAlreadySuperseded)
+	}
+	return nil
+}
+
+func activeApplyExistsError(database, dbType, environment string, deployments []string, holderIdentifier string) error {
+	return fmt.Errorf("active apply %s exists for %s/%s/%s deployments %v: %w", holderIdentifier, database, dbType, environment, deployments, storage.ErrActiveApplyExists)
+}
+
+// activeApplyHolder is a non-terminal apply reserving one of the deployments
+// an admission check asked about.
+type activeApplyHolder struct {
+	id         int64
+	identifier string
+	state      string
+}
+
+// activeApplyHoldersForTargets returns every non-terminal apply that reserves
+// one of the deployments, through its primary deployment or any of its
+// operations.
+//
+// An apply whose work another apply took over (superseded_by) reserves
+// nothing. Only a held generation that a newer one was admitted past is still
+// non-terminal when it carries the marker: it has no work in flight, no
+// operation can attach to it, and it can never be started again, so its
+// driver's remaining pass only settles it.
+func activeApplyHoldersForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) ([]activeApplyHolder, error) {
 	statePredicate, stateArgs := nonTerminalApplyStatePredicate("a.state")
 	deploymentPlaceholders := placeholders(len(deployments))
 	query := fmt.Sprintf(`
-		SELECT 1 FROM applies a%s
+		SELECT a.id, a.apply_identifier, a.state FROM applies a%s
 		WHERE a.database_name = ?
 		AND a.database_type = ?
 		AND a.environment = ?
 		AND %s
+		AND a.superseded_by = ''
 		AND (
 			a.deployment IN (%s)
 			OR EXISTS (
@@ -419,17 +626,180 @@ func checkNoActiveApplyForTargets(ctx context.Context, tx *rebindTx, dialect Dia
 		query += " AND a.id != ?"
 		args = append(args, excludeApplyID)
 	}
+	query += " ORDER BY a.id"
+
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+	}
+	defer utils.CloseAndLog(rows)
+	var holders []activeApplyHolder
+	for rows.Next() {
+		var holder activeApplyHolder
+		if err := rows.Scan(&holder.id, &holder.identifier, &holder.state); err != nil {
+			return nil, fmt.Errorf("scan active apply for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+		}
+		holders = append(holders, holder)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+	}
+	return holders, nil
+}
+
+// settledManifestHold reports whether an active apply is an earlier generation
+// held open only by its generation manifest: the operator's projection keeps it
+// running because declared operations never attached, while everything that
+// did attach has settled. It must be running, declare a manifest, have at
+// least one attached operation and at least one declared operation missing,
+// and carry no unsettled operation and no unfinished task, so it provably has
+// no engine work in flight. The verdict over what attached must also be one
+// the projection holds for the manifest (state.IsManifestGatedVerdict): a
+// generation whose attached operations failed or were cancelled settles on
+// its own and was never held. Anything else is a live apply.
+func settledManifestHold(ctx context.Context, tx *rebindTx, holder activeApplyHolder) (bool, error) {
+	if !state.IsState(holder.state, state.Apply.Running) {
+		return false, nil
+	}
+	var manifestJSON []byte
+	if err := tx.QueryRowContext(ctx, `SELECT expected_operation_keys FROM applies WHERE id = ?`, holder.id).Scan(&manifestJSON); err != nil {
+		return false, fmt.Errorf("load generation manifest of active apply %s: %w", holder.identifier, err)
+	}
+	if len(manifestJSON) == 0 {
+		return false, nil
+	}
+	held := &storage.Apply{ApplyIdentifier: holder.identifier}
+	if err := json.Unmarshal(manifestJSON, &held.ExpectedOperationKeys); err != nil {
+		return false, fmt.Errorf("unmarshal expected_operation_keys for apply %s: %w", holder.identifier, err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT operation_key, state FROM apply_operations WHERE apply_id = ?`, holder.id)
+	if err != nil {
+		return false, fmt.Errorf("list operations of active apply %s: %w", holder.identifier, err)
+	}
+	defer utils.CloseAndLog(rows)
+	var ops []*storage.ApplyOperation
+	for rows.Next() {
+		op := &storage.ApplyOperation{}
+		if err := rows.Scan(&op.OperationKey, &op.State); err != nil {
+			return false, fmt.Errorf("scan operation of active apply %s: %w", holder.identifier, err)
+		}
+		ops = append(ops, op)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate operations of active apply %s: %w", holder.identifier, err)
+	}
+	if len(ops) == 0 || len(held.MissingExpectedOperationKeys(ops)) == 0 {
+		return false, nil
+	}
+	opStates := make([]string, len(ops))
+	for i, op := range ops {
+		if !slices.Contains(settledApplyStates(), state.NormalizeState(op.State)) {
+			return false, nil
+		}
+		opStates[i] = op.State
+	}
+	if !state.IsManifestGatedVerdict(state.DeriveApplyState(opStates)) {
+		return false, nil
+	}
+
+	var unfinished int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM tasks WHERE apply_id = ? AND state NOT IN (`+terminalTaskStatesSQL+`)`, holder.id).Scan(&unfinished); err != nil {
+		return false, fmt.Errorf("count unfinished tasks of active apply %s: %w", holder.identifier, err)
+	}
+	return unfinished == 0, nil
+}
+
+// operationInProgressPredicate matches an operation row, under the given
+// alias, that is still in progress: one a driver has started and that has not
+// reached a terminal state.
+//
+// Two non-terminal states are not in progress, because no driver works them
+// while their parent's verdict stands:
+//   - pending: the claim refuses to start an operation whose parent is
+//     terminal, and the stranded reaper later settles the row.
+//   - failed_retryable: the retry claim resumes an operation only while its
+//     parent is retryable or active. A driver re-driving one leaves the state
+//     alone for the whole drive and clears its lease when the drive ends, so
+//     a fresh lease is what tells a retry in progress from an idle row.
+//
+// A running operation is in progress by state alone, not by lease. When its
+// driver dies, the stale-active claim re-leases it whatever the parent's state
+// and the drive settles it from the terminal parent, which is what ends it.
+// Gating on a fresh lease instead would end the reservation while a live
+// driver's heartbeat lags.
+//
+// An operation parked at a cutover barrier has no such release. The
+// stale-active claim leaves it to the cutover claim, and the cutover claim
+// will not start it behind a failed earlier sibling under halt. It keeps the
+// rollout's targets reserved anyway: the engine may still hold the run that
+// parked it, so releasing the targets on the row's state alone would admit a
+// second drive beside that run.
+func operationInProgressPredicate(dialect Dialect, alias string) (string, []any) {
+	notInProgress := terminalApplyStates()
+	notInProgress = append(notInProgress, state.ApplyOperation.Pending, state.ApplyOperation.FailedRetryable)
+	freshLeaseAfter := dialect.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(storage.ApplyLeaseStaleAfter.Microseconds())), IntervalMicrosecond)
+	clause := fmt.Sprintf(`(
+			%[1]s.state NOT IN (%[2]s)
+			OR (%[1]s.state = ? AND %[1]s.lease_owner <> '' AND %[1]s.updated_at >= %[3]s)
+		)`, alias, placeholders(len(notInProgress)), freshLeaseAfter)
+	args := stringArgs(notInProgress)
+	args = append(args, state.ApplyOperation.FailedRetryable)
+	return clause, args
+}
+
+// checkNoInProgressRolloutForTargets keeps a terminal parent's whole target set
+// reserved while any of its operations is in progress. A rollout's parent can
+// record a terminal verdict while an operation is still in progress: a
+// sibling's failure can terminalize the parent before the projection
+// re-derives it. Until that operation reaches a terminal state the rollout is
+// still live. Its drive can reopen the parent (ST-1), and the reopened rollout
+// can then start its pending operations, so its targets stay reserved exactly
+// as an active parent's would. The parent check above covers active parents.
+func checkNoInProgressRolloutForTargets(ctx context.Context, tx *rebindTx, dialect Dialect, database, dbType, environment string, deployments []string, excludeApplyID int64) error {
+	parentStates := terminalApplyStates()
+	inProgress, inProgressArgs := operationInProgressPredicate(dialect, "busy")
+	deploymentPlaceholders := placeholders(len(deployments))
+	query := fmt.Sprintf(`
+		SELECT a.apply_identifier, a.state, busy.deployment, busy.state
+		FROM applies a%s
+		JOIN apply_operations busy ON busy.apply_id = a.id
+		WHERE a.database_name = ?
+		AND a.database_type = ?
+		AND a.environment = ?
+		AND a.state IN (%s)
+		AND %s
+		AND (
+			a.deployment IN (%s)
+			OR EXISTS (
+				SELECT 1 FROM apply_operations o
+				WHERE o.apply_id = a.id
+				AND o.deployment IN (%s)
+			)
+		)
+	`, dialect.IndexHint("idx_database_env_deployment"), placeholders(len(parentStates)), inProgress, deploymentPlaceholders, deploymentPlaceholders)
+	args := []any{database, dbType, environment}
+	args = append(args, stringArgs(parentStates)...)
+	args = append(args, inProgressArgs...)
+	args = append(args, stringArgs(deployments)...)
+	args = append(args, stringArgs(deployments)...)
+	if excludeApplyID > 0 {
+		query += " AND a.id != ?"
+		args = append(args, excludeApplyID)
+	}
 	query += " LIMIT 1"
 
-	var exists int
-	err := tx.QueryRowContext(ctx, query, args...).Scan(&exists)
+	var holderIdentifier, holderState, busyDeployment, busyState string
+	err := tx.QueryRowContext(ctx, query, args...).Scan(&holderIdentifier, &holderState, &busyDeployment, &busyState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("check active applies for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
+		return fmt.Errorf("check in-progress rollouts for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, err)
 	}
-	return fmt.Errorf("active apply exists for %s/%s/%s deployments %v: %w", database, dbType, environment, deployments, storage.ErrActiveApplyExists)
+	return fmt.Errorf("apply %s (state %s) still has a %s operation on deployment %s and holds its targets among %v for %s/%s/%s: %w",
+		holderIdentifier, holderState, busyState, busyDeployment, deployments, database, dbType, environment, storage.ErrActiveApplyExists)
 }
 
 func applyLeaseFromContext(ctx context.Context, applyID int64) (storage.ApplyLease, bool, error) {
@@ -523,6 +893,7 @@ func applyTargetForUpdate(ctx context.Context, db queryRower, apply *storage.App
 // Create stores a new apply and returns its ID.
 func (s *applyStore) Create(ctx context.Context, apply *storage.Apply) (int64, error) {
 	canonicalizeApplyIdentity(apply)
+	canonicalizeApplyState(apply)
 
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
@@ -660,15 +1031,26 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 		}
 	}
 
+	// The target lock is taken before the transaction begins, as every write
+	// that checks the target reservation takes it, so the transaction's
+	// snapshot is taken under the lock and sees the handoff of any create
+	// admitted past this apply before it (markAdmittedPast).
 	const opName = "attach operation to apply"
-	writeTx, err := beginApplyWriteTx(ctx, s.db, opName)
+	database, dbType, environment, _, err := applyTargetForUpdate(ctx, s.db, apply)
+	if err != nil {
+		return err
+	}
+	if !hasApplyTarget(database, dbType, environment) {
+		return attachTargetMissingError(ctx, s.db, apply, operation)
+	}
+	writeTx, err := beginApplyTargetWriteTx(ctx, s.db, s.locker, opName, database, dbType, environment)
 	if err != nil {
 		return err
 	}
 	defer writeTx.close(ctx, opName)
 
-	var currentState string
-	err = writeTx.tx.QueryRowContext(ctx, `SELECT state FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&currentState)
+	var currentState, supersededBy string
+	err = writeTx.tx.QueryRowContext(ctx, `SELECT state, superseded_by FROM applies WHERE id = ? FOR UPDATE`, apply.ID).Scan(&currentState, &supersededBy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("attach operation %s to apply %s: %w", operation.OperationKey, apply.ApplyIdentifier, storage.ErrApplyNotFound)
 	}
@@ -677,6 +1059,17 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 	}
 	if !isActiveApplyState(currentState) {
 		return fmt.Errorf("attach operation %s to apply %s in state %s: %w", operation.OperationKey, apply.ApplyIdentifier, currentState, storage.ErrApplyNotActive)
+	}
+	// A newer generation admitted past this one took over its work
+	// (markAdmittedPast). A late operation of this generation must not join
+	// it, whatever state the newer apply has reached since: it would run work
+	// the newer apply now owns.
+	if supersededBy != "" {
+		return fmt.Errorf("attach operation %s to apply %s: apply %s took over its work: %w", operation.OperationKey, apply.ApplyIdentifier, supersededBy, storage.ErrApplyTakenOver)
+	}
+
+	if err := requireAttachKeyingMatches(ctx, writeTx.tx, apply, operation); err != nil {
+		return err
 	}
 
 	operation.ApplyID = apply.ID
@@ -699,8 +1092,81 @@ func (s *applyStore) AttachOperationWithTasks(ctx context.Context, apply *storag
 	return nil
 }
 
+// attachTargetMissingError explains why an attach found no target to lock:
+// the apply row is gone, or it exists without the target metadata the
+// exclusivity check needs.
+func attachTargetMissingError(ctx context.Context, db queryRower, apply *storage.Apply, operation *storage.ApplyOperation) error {
+	var exists int
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM applies WHERE id = ?`, apply.ID).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("attach operation %s to apply %s: %w", operation.OperationKey, apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return fmt.Errorf("check apply %s exists to attach operation %s: %w", apply.ApplyIdentifier, operation.OperationKey, err)
+	}
+	return fmt.Errorf("attach operation %s to apply %s: apply is missing target metadata for the exclusivity check", operation.OperationKey, apply.ApplyIdentifier)
+}
+
+// requireAttachKeyingMatches refuses an attach whose operation is keyed by
+// its target when the deployment's existing operations of the apply are not,
+// or the reverse. It runs under the apply's row lock, which serializes every
+// attach to the apply, so two attaches of different shapes cannot both pass.
+//
+// It compares work operations only. A group_finalizer's key cannot say on its
+// own whether it leads with a target ("orders/group_finalizer" is both target
+// orders' deployment-scoped finalizer and namespace orders' finalizer), so a
+// target-keyed finalizer attaches beside its target's work, and the apply's
+// recorded key shape (storage.ApplyOptions.OperationKeysLeadWithTarget), which
+// the dispatch checks before attaching, is what holds finalizers to one shape.
+func requireAttachKeyingMatches(ctx context.Context, tx *rebindTx, apply *storage.Apply, operation *storage.ApplyOperation) error {
+	if operation.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+		return nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, operation_key, operation_kind, target FROM apply_operations WHERE apply_id = ? AND deployment = ?`, apply.ID, operation.Deployment)
+	if err != nil {
+		return fmt.Errorf("list deployment %s operations of apply %s to attach operation %s: %w", operation.Deployment, apply.ApplyIdentifier, operation.OperationKey, err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	attachKeyedByTarget := operation.KeyedByTarget()
+	for rows.Next() {
+		existing := &storage.ApplyOperation{Deployment: operation.Deployment}
+		if err := rows.Scan(&existing.ID, &existing.OperationKey, &existing.OperationKind, &existing.Target); err != nil {
+			return fmt.Errorf("scan deployment %s operation of apply %s to attach operation %s: %w", operation.Deployment, apply.ApplyIdentifier, operation.OperationKey, err)
+		}
+		if existing.OperationKind == storage.ApplyOperationKindGroupFinalizer {
+			continue
+		}
+		if existing.KeyedByTarget() != attachKeyedByTarget {
+			return fmt.Errorf("attach operation %q (target %q) to apply %s: deployment %s already holds apply_operation %d keyed %q for target %q: %w",
+				operation.OperationKey, operation.Target, apply.ApplyIdentifier, operation.Deployment, existing.ID, existing.OperationKey, existing.Target, storage.ErrApplyOperationKeyingMismatch)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate deployment %s operations of apply %s to attach operation %s: %w", operation.Deployment, apply.ApplyIdentifier, operation.OperationKey, err)
+	}
+	return nil
+}
+
+// createWithRows creates an apply and its child rows in one transaction. The
+// whole create retries on a transient conflict: admission past a held
+// generation writes the held apply's row (markAdmittedPast), which its driver's
+// heartbeat can update concurrently, and on PostgreSQL that surfaces as a
+// serialization failure that a fresh snapshot resolves.
 func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, opName string, newDeployments []string, writeRows applyCreateWriter) (int64, error) {
+	var id int64
+	err := withLockRetry(ctx, s.classifier, fmt.Sprintf("%s %s", opName, apply.ApplyIdentifier), func() error {
+		var err error
+		id, err = s.createWithRowsOnce(ctx, apply, opName, newDeployments, writeRows)
+		return err
+	})
+	return id, err
+}
+
+// createWithRowsOnce runs one attempt of createWithRows in its own transaction.
+func (s *applyStore) createWithRowsOnce(ctx context.Context, apply *storage.Apply, opName string, newDeployments []string, writeRows applyCreateWriter) (int64, error) {
 	canonicalizeApplyIdentity(apply)
+	canonicalizeApplyState(apply)
 
 	// Ensure options has valid JSON (empty object if nil)
 	options := apply.Options
@@ -727,8 +1193,10 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 		return 0, err
 	}
 
+	var admittedPast []activeApplyHolder
 	if lockTarget {
-		if err := checkNoActiveApplyForTargets(ctx, writeTx.tx, s.dialect, apply.Database, apply.DatabaseType, apply.Environment, newDeployments, 0); err != nil {
+		admittedPast, err = checkNoActiveApplyForCreate(ctx, writeTx.tx, s.dialect, apply, newDeployments)
+		if err != nil {
 			return 0, err
 		}
 	}
@@ -757,6 +1225,11 @@ func (s *applyStore) createWithRows(ctx context.Context, apply *storage.Apply, o
 
 	if err := writeRows(ctx, writeTx.tx, apply, id); err != nil {
 		return 0, err
+	}
+	for _, holder := range admittedPast {
+		if err := markAdmittedPast(ctx, writeTx.tx, holder, apply.ApplyIdentifier); err != nil {
+			return 0, err
+		}
 	}
 
 	if err := writeTx.commit(); err != nil {
@@ -1002,6 +1475,7 @@ func (s *applyStore) GetByLock(ctx context.Context, lockID int64) ([]*storage.Ap
 // Update updates apply state and fields.
 func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	canonicalizeApplyIdentity(apply)
+	canonicalizeApplyState(apply)
 
 	// A drive that holds only an operation lease must never write the parent
 	// applies row directly: under fan-out the parent state is owned solely by
@@ -1019,6 +1493,18 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	if err != nil {
 		return err
 	}
+	// The whole write retries on a transient conflict. On PostgreSQL a writer
+	// that finishes the apply after this transaction's snapshot surfaces as a
+	// serialization failure rather than as a row the guard refused; the retry
+	// takes a fresh snapshot, sees the finished row, and refuses it as such.
+	return withLockRetry(ctx, s.classifier, fmt.Sprintf("update apply %d", apply.ID), func() error {
+		return s.updateOnce(ctx, apply, lease, hasLease)
+	})
+}
+
+// updateOnce runs one attempt of Update in its own transaction.
+func (s *applyStore) updateOnce(ctx context.Context, apply *storage.Apply, lease storage.ApplyLease, hasLease bool) error {
+	var err error
 	lockTarget := isActiveApplyState(apply.State)
 	database, dbType, environment, deployment := apply.Database, apply.DatabaseType, apply.Environment, apply.Deployment
 	if lockTarget && (!hasApplyTarget(database, dbType, environment) || deployment == "") {
@@ -1069,6 +1555,17 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		leasePredicate = " AND lease_token = ?"
 		args = append(args, lease.Token)
 	}
+	// A finished apply stays finished whoever writes it, and a settled outcome
+	// keeps the outcome it recorded. The guard is evaluated against the stored
+	// row, so a caller holding an in-memory copy from before another writer
+	// finished the apply can neither hand it back to a driver nor overwrite
+	// what it recorded.
+	finishedPredicate := ""
+	guardPredicate, guardArgs, finishedGuarded := finishedApplyGuardPredicate("state", apply.State)
+	if finishedGuarded {
+		finishedPredicate = " AND " + guardPredicate
+		args = append(args, guardArgs...)
+	}
 
 	// The recovery budget (attempt) is deliberately not written here. It is
 	// owned by the insert at create time and by the claim transition's atomic
@@ -1079,19 +1576,29 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 		UPDATE applies
 		SET state = ?, error_message = ?,
 		    external_id = ?%s, started_at = ?, completed_at = ?, updated_at = NOW()
-		WHERE id = ?%s
-	`, optionsUpdate, leasePredicate), args...)
+		WHERE id = ?%s%s
+	`, optionsUpdate, leasePredicate, finishedPredicate), args...)
 	if err != nil {
 		return fmt.Errorf("update apply %d: %w", apply.ID, err)
 	}
-	if hasLease {
+	if hasLease || finishedGuarded {
 		rows, err := result.RowsAffected()
 		if err != nil {
 			return fmt.Errorf("read apply update rows affected for apply %d: %w", apply.ID, err)
 		}
 		if rows == 0 {
-			if err := ensureApplyLeaseStillOwned(ctx, writeTx.tx, lease); err != nil {
-				return err
+			// A lost lease outranks a refusal from the finished-apply guard:
+			// the caller no longer owns the apply at all, which is the cause it
+			// needs to act on.
+			if hasLease {
+				if err := ensureApplyLeaseStillOwned(ctx, writeTx.tx, lease); err != nil {
+					return err
+				}
+			}
+			if finishedGuarded {
+				if err := ensureFinishedApplyGuardHeld(ctx, writeTx.tx, apply); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -1101,12 +1608,43 @@ func (s *applyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	return nil
 }
 
+// derivedStateUpdate renders the rollout projection's compare-and-swap over
+// applies for the store's dialect, with guardPredicate appended to the
+// id-and-expected-state match. The operation-lease guard joins the leased
+// operation row, so its statement goes through the dialect's joined-UPDATE
+// rendering; the other guards produce a portable single-table UPDATE. Both
+// shapes render one SET list and address applies through the "a" alias, so
+// guardPredicate qualifies apply columns with it. The four SET placeholders
+// bind newState, errorMessage, startedAt and completedAt ahead of the
+// predicate's. started_at is stamped only when it is still NULL so the
+// projection can move the parent into an active state without ever rewinding
+// a recorded start.
+func derivedStateUpdate(dialect Dialect, joinLeasedOperation bool, guardPredicate string) string {
+	assignments := []JoinedUpdateAssignment{
+		{Column: "state", Expr: "?"},
+		{Column: "error_message", Expr: "?"},
+		{Column: "started_at", Expr: "COALESCE(a.started_at, ?)"},
+		{Column: "completed_at", Expr: "?"},
+		{Column: "updated_at", Expr: "NOW()"},
+	}
+	predicate := "a.id = ? AND a.state = ?" + guardPredicate
+	if joinLeasedOperation {
+		return dialect.JoinedUpdate("applies", "a", "apply_operations", "ao", "ao.apply_id = a.id", assignments, predicate)
+	}
+	sets := make([]string, len(assignments))
+	for i, assignment := range assignments {
+		sets[i] = assignment.Column + " = " + assignment.Expr
+	}
+	return "UPDATE applies a SET " + strings.Join(sets, ", ") + " WHERE " + predicate
+}
+
 // derivedStateGuard is the lease authorization for a rollout-projection write.
-// predicate is appended to the CAS UPDATE's WHERE clause and predicateArgs holds
-// its bind values; ensureStillOwned re-checks ownership on a zero-rows result so
-// the caller can fail closed on a lost lease (nil for an unguarded write).
+// query is the complete CAS UPDATE; it binds the projected values, then applyID
+// and expectedState, then predicateArgs. ensureStillOwned re-checks ownership
+// on a zero-rows result so the caller can fail closed on a lost lease (nil for
+// an unguarded write).
 type derivedStateGuard struct {
-	predicate        string
+	query            string
 	predicateArgs    []any
 	ensureStillOwned func(ctx context.Context, db queryRower) error
 }
@@ -1116,7 +1654,16 @@ type derivedStateGuard struct {
 // mirroring taskStore.Update: a multi-operation drive advances the parent only
 // through the projection, scoped to an operation that still holds its token and
 // belongs to applyID. The apply-lease path keeps the single-operation behavior.
-func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedStateGuard, error) {
+//
+// The operation token lives on a different row from the one being written, so
+// the operation-lease statement joins that row and checks it through
+// LeaseTokenFence. A re-lease rotates the operation token and then writes the
+// parent apply in the same transaction; a token check that did not lock the
+// operation row would read it from the projection's snapshot, wait out the
+// re-lease on the parent row, and pass against the token it had just replaced.
+// The join binds the leased operation to the apply being written, so an
+// operation that belongs to another apply cannot authorize the projection.
+func derivedStateGuardForContext(ctx context.Context, dialect Dialect, applyID int64) (derivedStateGuard, error) {
 	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
 			return derivedStateGuard{}, fmt.Errorf("invalid operation lease for apply %d: %w", applyID, storage.ErrApplyLeaseLost)
@@ -1125,11 +1672,8 @@ func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedSta
 			return derivedStateGuard{}, fmt.Errorf("operation lease for apply %d cannot write derived state for apply %d: %w", opLease.ApplyID, applyID, storage.ErrApplyLeaseLost)
 		}
 		return derivedStateGuard{
-			predicate: ` AND EXISTS (
-				SELECT 1 FROM apply_operations ao
-				WHERE ao.id = ? AND ao.apply_id = ? AND ao.lease_token = ?
-			)`,
-			predicateArgs: []any{opLease.OperationID, applyID, opLease.Token},
+			query:         derivedStateUpdate(dialect, true, " AND ao.id = ? AND "+dialect.LeaseTokenFence("apply_operations", "ao", "id", "lease_token")),
+			predicateArgs: []any{opLease.OperationID, opLease.Token},
 			ensureStillOwned: func(ctx context.Context, db queryRower) error {
 				return ensureOperationLeaseOwnsApply(ctx, db, opLease, applyID)
 			},
@@ -1142,7 +1686,7 @@ func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedSta
 	}
 	if hasLease {
 		return derivedStateGuard{
-			predicate:     " AND lease_token = ?",
+			query:         derivedStateUpdate(dialect, false, " AND a.lease_token = ?"),
 			predicateArgs: []any{lease.Token},
 			ensureStillOwned: func(ctx context.Context, db queryRower) error {
 				return ensureApplyLeaseStillOwned(ctx, db, lease)
@@ -1150,7 +1694,7 @@ func derivedStateGuardForContext(ctx context.Context, applyID int64) (derivedSta
 		}, nil
 	}
 
-	return derivedStateGuard{}, nil
+	return derivedStateGuard{query: derivedStateUpdate(dialect, false, "")}, nil
 }
 
 // ensureOperationLeaseOwnsApply returns ErrApplyLeaseLost unless the operation
@@ -1180,21 +1724,15 @@ func ensureOperationLeaseOwnsApply(ctx context.Context, db queryRower, lease sto
 // miss (state no longer matches) returns swapped=false so the caller can skip
 // side-effects and reconcile on the next poll.
 func (s *applyStore) UpdateDerivedState(ctx context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
-	guard, err := derivedStateGuardForContext(ctx, applyID)
+	guard, err := derivedStateGuardForContext(ctx, s.dialect, applyID)
 	if err != nil {
 		return false, err
 	}
 
-	// started_at is stamped only when it is still NULL so the projection can move
-	// the parent into an active state without ever rewinding a recorded start.
 	args := []any{newState, errorMessage, startedAt, completedAt, applyID, expectedState}
 	args = append(args, guard.predicateArgs...)
 
-	result, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-		UPDATE applies
-		SET state = ?, error_message = ?, started_at = COALESCE(started_at, ?), completed_at = ?, updated_at = NOW()
-		WHERE id = ? AND state = ?%s
-	`, guard.predicate), args...)
+	result, err := s.db.ExecContext(ctx, guard.query, args...)
 	if err != nil {
 		return false, fmt.Errorf("compare-and-swap derived apply state for apply %d (%q -> %q): %w", applyID, expectedState, newState, err)
 	}
@@ -2252,6 +2790,19 @@ func (s *applyStore) MarkSuperseded(ctx context.Context, applyID int64, successo
 	return nil
 }
 
+// GetSupersededBy reads only the superseded_by column. See storage.ApplyStore.
+func (s *applyStore) GetSupersededBy(ctx context.Context, applyID int64) (string, error) {
+	var successor string
+	err := s.db.QueryRowContext(ctx, `SELECT superseded_by FROM applies WHERE id = ?`, applyID).Scan(&successor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("read superseded_by: %w", storage.ErrApplyNotFound)
+	}
+	if err != nil {
+		return "", fmt.Errorf("read superseded_by: %w", err)
+	}
+	return successor, nil
+}
+
 // ReleaseClaim clears the lease fields and backdates the heartbeat past the
 // staleness window, guarded on the lease token, so the row is re-claimable on
 // the next poll. State is intentionally untouched: a released apply is
@@ -2326,6 +2877,64 @@ func (s *applyStore) CheckLease(ctx context.Context, lease storage.ApplyLease) e
 		return fmt.Errorf("invalid apply lease for apply %d: %w", lease.ApplyID, storage.ErrApplyLeaseLost)
 	}
 	return ensureApplyLeaseStillOwned(ctx, s.db, lease)
+}
+
+// WithExclusiveTarget runs fn under the apply target's advisory lock, having
+// first refused to run it at all if another active apply owns the target. The
+// lock, held for the whole of fn, is what fn relies on; the re-check only
+// decides whether fn runs. It excludes SchemaBot's own applies and nothing
+// else, so fn stays responsible for anything a schema change run from outside
+// SchemaBot could own.
+func (s *applyStore) WithExclusiveTarget(ctx context.Context, apply *storage.Apply, fn func(context.Context) error) error {
+	if apply == nil {
+		return fmt.Errorf("apply is required to hold its target exclusively")
+	}
+	if fn == nil {
+		return fmt.Errorf("work function is required to hold apply %d's target exclusively", apply.ID)
+	}
+
+	database, dbType, environment, deployment, err := applyTargetForUpdate(ctx, s.db, apply)
+	if err != nil {
+		return err
+	}
+	if !hasApplyTarget(database, dbType, environment) {
+		return fmt.Errorf("apply %d (%s) is missing target metadata for an exclusive target hold", apply.ID, apply.ApplyIdentifier)
+	}
+
+	conn, lockName, err := acquireApplyTargetLockConn(ctx, s.db, s.locker, database, dbType, environment)
+	if err != nil {
+		return err
+	}
+	defer releaseApplyTargetLockConn(ctx, s.locker, conn, lockName, "hold apply target")
+
+	// The re-check runs in its own transaction, which is finished before fn
+	// starts: it only reads, so it ends by rollback and writes nothing to
+	// commit. The advisory lock, not an open transaction, is what keeps a
+	// competing apply out for the duration, and fn touches the target database
+	// rather than storage, so holding a storage transaction open across it
+	// would pin a connection for as long as the target work takes.
+	if err := s.checkTargetUnclaimed(ctx, conn, apply, database, dbType, environment, deployment); err != nil {
+		return err
+	}
+
+	return fn(ctx)
+}
+
+// checkTargetUnclaimed reports whether any active apply other than this one
+// owns the target, as ErrActiveApplyExists.
+func (s *applyStore) checkTargetUnclaimed(ctx context.Context, conn *rebindConn, apply *storage.Apply, database, dbType, environment, deployment string) error {
+	tx, err := conn.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return fmt.Errorf("begin exclusive target check for apply %d: %w", apply.ID, err)
+	}
+	defer rollbackTx(ctx, tx, "hold apply target")
+
+	deployments, err := operationDeploymentsForApply(ctx, tx, apply.ID)
+	if err != nil {
+		return err
+	}
+	deployments = append(deployments, deployment)
+	return checkNoActiveApplyForTargets(ctx, tx, s.dialect, database, dbType, environment, deployments, apply.ID)
 }
 
 // retryableExpiryLockName is the advisory lock that elects one instance to

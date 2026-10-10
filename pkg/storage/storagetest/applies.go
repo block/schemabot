@@ -1,6 +1,9 @@
 package storagetest
 
 import (
+	"context"
+	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -268,6 +271,226 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Nil(t, third, "a mismatched release leaves the current lease fresh")
 	})
 
+	// Every write a general update can make over a finished apply, across the
+	// whole state registry: the write is refused exactly when it would reopen
+	// the apply or rewrite its settled outcome, and every other write lands. An
+	// active state reopens any terminal row; stopped reopens a settled one,
+	// because a stopped apply can be claimed to resume. A settled outcome keeps
+	// its state, so only a same-state refresh lands over it. Cancelling a
+	// stopped apply is neither.
+	t.Run("Update_NeverReopensFinishedApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_reopen_matrix_db", storage.DatabaseTypeMySQL)
+
+		reopens := func(current, next string) bool {
+			if !state.IsTerminalApplyState(next) {
+				return true
+			}
+			return state.IsState(next, state.Apply.Stopped) && state.IsState(current, state.SettledApplyStates...)
+		}
+		rewritesOutcome := func(current, next string) bool {
+			return state.IsState(current, state.SettledApplyStates...) &&
+				state.IsState(next, state.SettledApplyStates...) &&
+				!state.IsState(current, next)
+		}
+
+		planID := int64(9100)
+		for _, current := range registeredApplyStates(t) {
+			if !state.IsTerminalApplyState(current) {
+				continue
+			}
+			for _, next := range registeredApplyStates(t) {
+				t.Run(current+"_to_"+next, func(t *testing.T) {
+					planID++
+					apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_reopen_"+current+"_"+next, planID, current, "staging")
+
+					apply.State = next
+					err := store.Applies().Update(ctx, apply)
+
+					persisted, getErr := store.Applies().Get(ctx, apply.ID)
+					require.NoError(t, getErr)
+					require.NotNil(t, persisted)
+					switch {
+					case reopens(current, next):
+						require.ErrorIsf(t, err, storage.ErrApplyReopenRefused, "writing %s over a %s apply reopens it", next, current)
+						assert.Equal(t, current, persisted.State, "a refused write leaves the stored verdict in place")
+					case rewritesOutcome(current, next):
+						require.ErrorIsf(t, err, storage.ErrApplyOutcomeSettled, "writing %s over a %s apply rewrites its outcome", next, current)
+						assert.Equal(t, current, persisted.State, "a refused write leaves the stored verdict in place")
+					default:
+						require.NoErrorf(t, err, "writing %s over a %s apply leaves it finished", next, current)
+						assert.Equal(t, next, persisted.State)
+					}
+				})
+			}
+		}
+	})
+
+	// A caller copies an apply while it runs; another writer completes it; the
+	// caller then writes its copy back. Whatever the copy says, the completed
+	// verdict stands: a running copy would hand the apply to a driver, a
+	// stopped copy would make it startable, and a cancelled or failed copy
+	// would record an outcome the database never had.
+	t.Run("Update_RefusesStaleCopyOfFinishedApply", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stale_copy_db", storage.DatabaseTypeMySQL)
+
+		for _, tc := range []struct {
+			staleState string
+			wantErr    error
+		}{
+			{staleState: state.Apply.Running, wantErr: storage.ErrApplyReopenRefused},
+			{staleState: state.Apply.Stopped, wantErr: storage.ErrApplyReopenRefused},
+			{staleState: state.Apply.Cancelled, wantErr: storage.ErrApplyOutcomeSettled},
+			{staleState: state.Apply.Failed, wantErr: storage.ErrApplyOutcomeSettled},
+		} {
+			t.Run(tc.staleState, func(t *testing.T) {
+				apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stale_copy_"+tc.staleState, 9001, state.Apply.Running, "staging")
+				staleCopy := *apply
+
+				finishedAt := time.Now()
+				apply.State = state.Apply.Completed
+				apply.CompletedAt = &finishedAt
+				require.NoError(t, store.Applies().Update(ctx, apply))
+
+				staleCopy.State = tc.staleState
+				staleCopy.CompletedAt = nil
+				staleCopy.ErrorMessage = "stale writer"
+				require.ErrorIs(t, store.Applies().Update(ctx, &staleCopy), tc.wantErr)
+
+				persisted, err := store.Applies().Get(ctx, apply.ID)
+				require.NoError(t, err)
+				require.NotNil(t, persisted)
+				assert.Equal(t, state.Apply.Completed, persisted.State)
+				assert.NotNil(t, persisted.CompletedAt, "the finished apply keeps its completion time")
+				assert.Empty(t, persisted.ErrorMessage, "a refused write lands none of its fields")
+			})
+		}
+	})
+
+	// A caller that writes a state in non-canonical form still gets it stored
+	// canonically, so the finished-apply guard, which compares the stored
+	// column against the canonical states, holds on every dialect. A completed
+	// apply written as COMPLETED must still refuse a later cancelled write.
+	t.Run("Update_StoresCanonicalStateSoTheGuardHolds", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_canonical_state_db", storage.DatabaseTypeMySQL)
+
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_canonical_state", 9002, "RUNNING", "staging")
+		created, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, created)
+		assert.Equal(t, state.Apply.Running, created.State, "create stores the canonical state")
+		staleCopy := *created
+
+		finishedAt := time.Now()
+		created.State = "COMPLETED"
+		created.CompletedAt = &finishedAt
+		require.NoError(t, store.Applies().Update(ctx, created))
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Completed, persisted.State, "update stores the canonical state")
+
+		staleCopy.State = state.Apply.Cancelled
+		staleCopy.ErrorMessage = "late cancel"
+		require.ErrorIs(t, store.Applies().Update(ctx, &staleCopy), storage.ErrApplyOutcomeSettled)
+
+		persisted, err = store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Completed, persisted.State, "the completed outcome stands")
+	})
+
+	// A stopped apply goes active again only through the start claim. A caller
+	// that writes running over it without one is refused and the apply stays
+	// stopped. Once an operator's start request is claimed, the claim moves the
+	// apply to resuming and the driver's running write lands.
+	t.Run("Update_ResumesStoppedApplyOnlyThroughStartClaim", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stopped_resume_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithTask(t, store, lock, "apply_stopped_resume", 9004)
+		apply.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, apply))
+
+		apply.State = state.Apply.Running
+		require.ErrorIs(t, store.Applies().Update(ctx, apply), storage.ErrApplyReopenRefused,
+			"running over a stopped apply without the start claim reopens it")
+		stillStopped, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stillStopped)
+		assert.Equal(t, state.Apply.Stopped, stillStopped.State)
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   apply.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		claimed, err := store.Applies().ClaimApplyByID(ctx, apply.ID, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a stopped apply with a pending start request is claimable")
+		resuming, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, resuming)
+		assert.Equal(t, state.Apply.Resuming, resuming.State, "the start claim moves the apply out of stopped")
+
+		claimed.State = state.Apply.Running
+		require.NoError(t, store.Applies().Update(storage.WithApplyLease(ctx, claimed.Lease()), claimed))
+		resumed, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, resumed)
+		assert.Equal(t, state.Apply.Running, resumed.State)
+	})
+
+	// Stopping is not a reopen: stop lands on a running apply, and a stopped
+	// apply can be rewritten as stopped, for example to record an error.
+	t.Run("Update_StopsActiveApplyAndRefreshesStopped", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_stop_write_db", storage.DatabaseTypeMySQL)
+		apply := CreateApplyWithStateAndEnv(t, store, lock, "apply_stop_write", 9002, state.Apply.Running, "staging")
+
+		apply.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, apply))
+		apply.ErrorMessage = "stopped by operator"
+		require.NoError(t, store.Applies().Update(ctx, apply))
+
+		persisted, err := store.Applies().Get(ctx, apply.ID)
+		require.NoError(t, err)
+		require.NotNil(t, persisted)
+		assert.Equal(t, state.Apply.Stopped, persisted.State)
+		assert.Equal(t, "stopped by operator", persisted.ErrorMessage)
+	})
+
+	// A driver that lost its lease and writes over a finished apply is told it
+	// lost the lease, the cause it has to act on, not that the write would
+	// have reopened an apply it no longer owns.
+	t.Run("Update_LostLeaseOutranksReopenRefusal", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_lease_reopen_db", storage.DatabaseTypeMySQL)
+		claimed := CreateClaimedApply(t, store, lock, "apply_lease_reopen", 9003, "driver-a")
+
+		ownedCtx := storage.WithApplyLease(ctx, claimed.Lease())
+		claimed.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ownedCtx, claimed))
+
+		staleCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: claimed.ID, Owner: "old-driver", Token: "stale-token"})
+		claimed.State = state.Apply.Running
+		require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost)
+		claimed.State = state.Apply.Cancelled
+		require.ErrorIs(t, store.Applies().Update(staleCtx, claimed), storage.ErrApplyLeaseLost,
+			"a lost lease also outranks the refusal to rewrite a settled outcome")
+	})
+
 	t.Run("LeaseGuardsWrites", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -429,6 +652,342 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, state.Apply.FailedRetryable, final.State, "the excluded apply keeps its state for an operator to reconcile")
 	})
 
+	// A rollout across region-a, region-b, and region-c records failed after
+	// region-a fails, while region-b's operation is still running and region-c's
+	// never started. Until region-b's operation reaches a terminal state the
+	// rollout is still live: its drive can reopen the parent and start region-c.
+	// So a second apply is refused on all three deployments, with or without a
+	// lease on the running operation, and each frees once nothing is in progress.
+	t.Run("Create_RefusesRolloutTargetsWhileAnOperationIsInProgress", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_started_operation_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_failed_early", 9300, state.Apply.Pending, "production", "region-a")
+
+		operationIDs := map[string]int64{}
+		for _, deployment := range []string{"region-a", "region-b", "region-c"} {
+			id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: deployment, OperationKey: "schema"})
+			require.NoError(t, err)
+			operationIDs[deployment] = id
+		}
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, operationIDs["region-a"], state.ApplyOperation.Failed))
+		require.NoError(t, store.ApplyOperations().UpdateState(ctx, operationIDs["region-b"], state.ApplyOperation.Running))
+		rollout.State = state.Apply.Failed
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		err := createApplyOnDeployment(t, store, lock, "apply_region_b_while_running", 9301, "region-b")
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "a running operation holds its deployment even with no lease on it")
+		assert.Contains(t, err.Error(), "apply_rollout_failed_early", "the refusal names the apply still in progress")
+		assert.Contains(t, err.Error(), "running operation on deployment region-b", "the refusal names the operation keeping it live")
+		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_a_while_running", 9302, "region-a"), storage.ErrActiveApplyExists,
+			"a deployment whose operation failed stays reserved while the rollout is live")
+		require.ErrorIs(t, createApplyOnDeployment(t, store, lock, "apply_region_c_while_running", 9303, "region-c"), storage.ErrActiveApplyExists,
+			"a never-started operation stays reserved while a reopen could still start it")
+		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_d_outside_rollout", 9304, "region-d"), "a deployment outside the rollout is free")
+
+		require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, operationIDs["region-b"]))
+		for i, deployment := range []string{"region-a", "region-b", "region-c"} {
+			require.NoErrorf(t, createApplyOnDeployment(t, store, lock, "apply_"+deployment+"_after_settle", int64(9305+i), deployment),
+				"%s frees once no operation of the rollout is in progress", deployment)
+		}
+	})
+
+	// A driver claims a rollout's operation and then loses it, so the operation
+	// is left running with its lease handed back and its heartbeat stale. Its
+	// parent records failed in the meantime. The deployment stays reserved: the
+	// work may still be in flight, and the stale-active claim re-leases the row
+	// and settles it from the finished parent, which is what frees it.
+	t.Run("Create_RefusesDeploymentWithRunningOperationWhoseLeaseLapsed", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_lapsed_operation_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_driver_lost", 9310, state.Apply.Pending, "production", "region-a")
+		operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: "region-a", OperationKey: "schema"})
+		require.NoError(t, err)
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-lost")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "the pending operation under an active parent must be claimable")
+		require.Equal(t, operationID, claimed.ID)
+		released, err := store.ApplyOperations().ReleaseClaim(ctx, storage.OperationLease{ApplyID: rollout.ID, OperationID: operationID, Owner: "driver-lost", Token: claimed.LeaseToken})
+		require.NoError(t, err)
+		require.True(t, released)
+		rollout.State = state.Apply.Failed
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		lapsed, err := store.ApplyOperations().Get(ctx, operationID)
+		require.NoError(t, err)
+		require.NotNil(t, lapsed)
+		require.Equal(t, state.ApplyOperation.Running, lapsed.State)
+		require.Empty(t, lapsed.LeaseOwner, "the scenario needs an operation no driver holds")
+
+		err = createApplyOnDeployment(t, store, lock, "apply_region_a_after_driver_lost", 9311, "region-a")
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "a running operation whose lease lapsed still holds its deployment")
+		assert.Contains(t, err.Error(), "apply_rollout_driver_lost")
+	})
+
+	// A failed_retryable operation keeps that state for the whole of a retry
+	// drive, so its lease is what says whether a driver is working it. A retry in
+	// progress holds the deployment after the parent records failed; once the
+	// drive hands its lease back, nothing can resume the row under the failed
+	// parent and the deployment is free.
+	t.Run("Create_FailedRetryableOperationHoldsDeploymentOnlyWhileDriven", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_retrying_operation_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_retrying", 9320, state.Apply.Pending, "production", "region-a")
+		operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: "region-a", OperationKey: "schema", State: state.ApplyOperation.FailedRetryable})
+		require.NoError(t, err)
+		rollout.State = state.Apply.FailedRetryable
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-retry")
+		require.NoError(t, err)
+		require.NotNil(t, claimed, "a failed_retryable operation under a retryable parent must be claimable")
+		require.Equal(t, operationID, claimed.ID)
+		require.Equal(t, state.ApplyOperation.FailedRetryable, claimed.State, "the retry claim leases the row without moving its state")
+		rollout.State = state.Apply.Failed
+		require.NoError(t, store.Applies().Update(ctx, rollout))
+
+		err = createApplyOnDeployment(t, store, lock, "apply_region_a_during_retry", 9321, "region-a")
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "a retry a driver is working holds its deployment")
+		assert.Contains(t, err.Error(), "apply_rollout_retrying")
+		assert.Contains(t, err.Error(), state.ApplyOperation.FailedRetryable)
+
+		released, err := store.ApplyOperations().ReleaseFinishedClaim(ctx, storage.OperationLease{ApplyID: rollout.ID, OperationID: operationID, Owner: "driver-retry", Token: claimed.LeaseToken})
+		require.NoError(t, err)
+		require.True(t, released)
+		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_region_a_after_retry", 9322, "region-a"), "a retry no driver holds reserves nothing")
+	})
+
+	// Moving an existing apply back into an active state runs the same check as
+	// creating one, so neither the general update nor the resume claim of a
+	// stopped apply can activate an apply on a target of a rollout whose parent
+	// recorded failed while one of its operations is still running. The rollout
+	// is keyed to region-a, runs on region-b, and has not started region-c, so
+	// neither apply being activated shares a deployment with the running
+	// operation: one is on the rollout's own deployment, which has no operation
+	// row, and the other is on the operation that never started.
+	t.Run("Activate_RefusesTargetsOfRolloutWithAnOperationInProgress", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_activate_started_operation_db", storage.DatabaseTypeMySQL)
+		rollout := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_rollout_failed_early", 9332, state.Apply.Failed, "production", "region-a")
+		waiting := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_pending_on_region_a", 9331, state.Apply.Pending, "production", "region-a")
+		stopped := CreateApplyWithStateEnvDeployment(t, store, lock, "apply_stopped_on_region_c", 9330, state.Apply.Stopped, "production", "region-c")
+		for deployment, operationState := range map[string]string{
+			"region-b": state.ApplyOperation.Running,
+			"region-c": state.ApplyOperation.Pending,
+		} {
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{ApplyID: rollout.ID, Deployment: deployment, OperationKey: "schema", State: operationState})
+			require.NoError(t, err)
+		}
+
+		waiting.State = state.Apply.Running
+		err := store.Applies().Update(ctx, waiting)
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "the update must not activate an apply on the deployment of a rollout still in progress")
+		assert.Contains(t, err.Error(), "apply_rollout_failed_early")
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   stopped.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		claimed, err := store.Applies().ClaimApplyByID(ctx, stopped.ID, "driver-a")
+		require.NoError(t, err)
+		assert.Nil(t, claimed, "the resume claim must not take a deployment of a rollout still in progress")
+		settled, err := store.ControlRequests().GetByOperation(ctx, stopped.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		require.NotNil(t, settled)
+		assert.Equal(t, storage.ControlRequestFailed, settled.Status, "the refusal resolves the start request instead of stranding it pending")
+		assert.Contains(t, settled.ErrorMessage, "another active apply exists")
+	})
+
+	// A deployment-keyed generation declared two targets, but only target-002
+	// ever attached: target-001 already held the change, so its operation was
+	// never dispatched, and the apply is held running for it. Everything that
+	// attached has finished. The dispatcher's next generation on the deployment
+	// is admitted past it and records that it took over the held apply's work.
+	// From then on a late operation of the old generation is refused whether or
+	// not the newer apply has finished, and the held apply reserves nothing, so
+	// the newer generation runs, stops, and starts again beside it before its
+	// driver settles it. An apply that declares no generation is still refused,
+	// so only a new generation from the dispatcher proves the missing operations
+	// will not come.
+	t.Run("Create_NewGenerationAdmittedPastSettledManifestHold", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_manifest_hold_db", storage.DatabaseTypeMySQL)
+		held := createManifestGeneration(t, store, lock, "apply_manifest_held", 9400, []string{"target-001", "target-002"},
+			state.ApplyOperation.Completed, state.Task.Completed)
+		held.State = state.Apply.Running
+		require.NoError(t, store.Applies().Update(ctx, held))
+
+		err := createApplyOnDeployment(t, store, lock, "apply_without_generation", 9401, "default")
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "an apply that declares no generation does not end another's")
+		assert.Contains(t, err.Error(), "apply_manifest_held", "the refusal names the apply holding the deployment")
+		stored, err := store.Applies().Get(ctx, held.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Empty(t, stored.SupersededBy, "a refused create takes nothing over")
+
+		next := createManifestGeneration(t, store, lock, "apply_next_generation", 9402, []string{"target-001", "target-002"},
+			state.ApplyOperation.Pending, state.Task.Pending)
+
+		stored, err = store.Applies().Get(ctx, held.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, next.ApplyIdentifier, stored.SupersededBy, "the admission records the generation that took over the held apply's work")
+		successor, err := store.Applies().GetSupersededBy(ctx, held.ID)
+		require.NoError(t, err)
+		assert.Equal(t, next.ApplyIdentifier, successor, "the narrow read returns the same marker the row carries")
+		assert.Equal(t, state.Apply.Running, stored.State, "the admission leaves the held apply's verdict to its driver")
+		storedNext, err := store.Applies().Get(ctx, next.ID)
+		require.NoError(t, err)
+		require.NotNil(t, storedNext)
+		assert.Empty(t, storedNext.SupersededBy)
+		successor, err = store.Applies().GetSupersededBy(ctx, next.ID)
+		require.NoError(t, err)
+		assert.Empty(t, successor, "nothing has taken over the admitted generation")
+		_, err = store.Applies().GetSupersededBy(ctx, next.ID+1000)
+		require.ErrorIs(t, err, storage.ErrApplyNotFound)
+
+		late := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-001", Target: "target-001", State: state.ApplyOperation.Pending}
+		lateTask := newTask(held, "task_manifest_held_late", "users", time.Now())
+		err = store.Applies().AttachOperationWithTasks(ctx, held, late, []*storage.Task{lateTask})
+		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "a late operation of the old generation must not run beside the newer apply")
+		assert.Contains(t, err.Error(), "apply_next_generation")
+
+		next.State = state.Apply.Running
+		require.NoError(t, store.Applies().Update(ctx, next), "the held apply no longer reserves the deployment, so the newer generation runs")
+		next.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, next))
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   next.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		resumed, err := store.Applies().ClaimApplyByID(ctx, next.ID, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, resumed, "the newer generation starts again beside the held apply")
+		storedNext, err = store.Applies().Get(ctx, next.ID)
+		require.NoError(t, err)
+		require.NotNil(t, storedNext)
+		assert.Equal(t, state.Apply.Resuming, storedNext.State)
+
+		err = createApplyOnDeployment(t, store, lock, "apply_without_generation_beside_next", 9403, "default")
+		require.ErrorIs(t, err, storage.ErrActiveApplyExists, "the newer generation reserves the deployment")
+		assert.Contains(t, err.Error(), "apply_next_generation")
+		assert.NotContains(t, err.Error(), "apply_manifest_held", "the held apply reserves nothing once its work was taken over")
+
+		resumed.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ctx, resumed))
+		lateTask = newTask(held, "task_manifest_held_late_after_next", "users", time.Now())
+		err = store.Applies().AttachOperationWithTasks(ctx, held, late, []*storage.Task{lateTask})
+		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "the newer apply finishing does not hand the work back to the old generation")
+
+		ops, err := store.ApplyOperations().ListByApply(ctx, held.ID)
+		require.NoError(t, err)
+		assert.Len(t, ops, 1, "the refused attaches leave no operation behind")
+		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_after_takeover", 9404, "default"),
+			"with the newer generation finished, the held apply still running does not reserve the deployment")
+	})
+
+	// A deployment-keyed generation is stopped after only target-002 attached
+	// and finished. An unrelated apply then runs and finishes on the same
+	// deployment, and the generation is started again. The unrelated apply was
+	// never admitted past the generation, so it took nothing over: target-001
+	// still attaches, and the generation carries no handoff that would let its
+	// driver settle it without target-001.
+	t.Run("Create_UnrelatedApplyDoesNotTakeOverAResumedGeneration", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_manifest_resumed_db", storage.DatabaseTypeMySQL)
+		generation := createManifestGeneration(t, store, lock, "apply_manifest_resumed", 9420, []string{"target-001", "target-002"},
+			state.ApplyOperation.Completed, state.Task.Completed)
+		generation.State = state.Apply.Stopped
+		require.NoError(t, store.Applies().Update(ctx, generation))
+
+		require.NoError(t, createApplyOnDeployment(t, store, lock, "apply_unrelated_between", 9421, "default"),
+			"a stopped generation reserves nothing")
+		unrelated, err := store.Applies().GetByApplyIdentifier(ctx, "apply_unrelated_between")
+		require.NoError(t, err)
+		require.NotNil(t, unrelated)
+		unrelated.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ctx, unrelated))
+
+		_, alreadyPending, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+			ApplyID:   generation.ID,
+			Operation: storage.ControlOperationStart,
+			Status:    storage.ControlRequestPending,
+			Metadata:  []byte(`{}`),
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		resumed, err := store.Applies().ClaimApplyByID(ctx, generation.ID, "driver-a")
+		require.NoError(t, err)
+		require.NotNil(t, resumed, "the stopped generation starts again")
+		resumed.State = state.Apply.Running
+		require.NoError(t, store.Applies().Update(ctx, resumed))
+
+		stored, err := store.Applies().Get(ctx, generation.ID)
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Empty(t, stored.SupersededBy, "an unrelated apply that ran in between takes nothing over")
+
+		late := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-001", Target: "target-001", State: state.ApplyOperation.Pending}
+		lateTask := newTask(generation, "task_manifest_resumed_late", "users", time.Now())
+		require.NoError(t, store.Applies().AttachOperationWithTasks(ctx, generation, late, []*storage.Task{lateTask}),
+			"the generation's own missing operation still attaches")
+		ops, err := store.ApplyOperations().ListByApply(ctx, generation.ID)
+		require.NoError(t, err)
+		assert.Len(t, ops, 2)
+	})
+
+	// A new generation is admitted only past an apply that provably has no work
+	// in flight and is waiting for nothing but operations that never attached.
+	// Anything short of that is a live apply and holds its deployment.
+	t.Run("Create_NewGenerationRefusedByLiveApply", func(t *testing.T) {
+		cases := []struct {
+			name       string
+			manifest   []string
+			applyState string
+			opState    string
+			taskState  string
+		}{
+			{"attached operation still running", []string{"target-001", "target-002"}, state.Apply.Running, state.ApplyOperation.Running, state.Task.Running},
+			{"attached operation stopped and resumable", []string{"target-001", "target-002"}, state.Apply.Running, state.ApplyOperation.Stopped, state.Task.Completed},
+			{"a task still unfinished", []string{"target-001", "target-002"}, state.Apply.Running, state.ApplyOperation.Completed, state.Task.Pending},
+			{"every declared operation attached", []string{"target-002"}, state.Apply.Running, state.ApplyOperation.Completed, state.Task.Completed},
+			{"apply not yet driven", []string{"target-001", "target-002"}, state.Apply.Pending, state.ApplyOperation.Completed, state.Task.Completed},
+			{"attached operation failed", []string{"target-001", "target-002"}, state.Apply.Running, state.ApplyOperation.Failed, state.Task.Failed},
+			{"attached operation cancelled", []string{"target-001", "target-002"}, state.Apply.Running, state.ApplyOperation.Cancelled, state.Task.Cancelled},
+		}
+		for i, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "apply_live_hold_db", storage.DatabaseTypeMySQL)
+				live := createManifestGeneration(t, store, lock, "apply_live_hold", int64(9410+2*i), tc.manifest, tc.opState, tc.taskState)
+				if !state.IsState(tc.applyState, state.Apply.Pending) {
+					live.State = tc.applyState
+					require.NoError(t, store.Applies().Update(ctx, live))
+				}
+
+				_, err := createManifestGenerationErr(t, store, lock, "apply_refused_generation", int64(9411+2*i), []string{"target-001", "target-002"},
+					state.ApplyOperation.Pending, state.Task.Pending)
+				require.ErrorIs(t, err, storage.ErrActiveApplyExists)
+				assert.Contains(t, err.Error(), "apply_live_hold")
+			})
+		}
+	})
+
 	t.Run("ConcurrentClaim_SingleWinner", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -473,7 +1032,71 @@ func TestApplies(t *testing.T, h Harness) {
 		assert.Equal(t, state.Apply.Running, persisted.State)
 	})
 
+	// Work that touches the target database itself runs only while no other
+	// active apply owns that target, so a cancel reclaiming its leftovers can
+	// never destroy a live apply's copy of the same tables.
+	t.Run("WithExclusiveTarget", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "apply_exclusive_target_db", storage.DatabaseTypeMySQL)
+		cancelled := CreateApplyWithStateEnvDeployment(t, store, lock,
+			"apply_exclusive_cancelled", 921, state.Apply.Stopped, "staging", "primary")
+
+		ran := 0
+		require.NoError(t, store.Applies().WithExclusiveTarget(ctx, cancelled, func(context.Context) error {
+			ran++
+			return nil
+		}))
+		assert.Equal(t, 1, ran, "an unclaimed target runs the work")
+
+		sentinel := errors.New("target work failed")
+		require.ErrorIs(t, store.Applies().WithExclusiveTarget(ctx, cancelled, func(context.Context) error {
+			return sentinel
+		}), sentinel, "the work's own error reaches the caller unchanged")
+
+		successor := CreateApplyWithStateEnvDeployment(t, store, lock,
+			"apply_exclusive_successor", 922, state.Apply.Running, "staging", "primary")
+		ran = 0
+		require.ErrorIs(t, store.Applies().WithExclusiveTarget(ctx, cancelled, func(context.Context) error {
+			ran++
+			return nil
+		}), storage.ErrActiveApplyExists)
+		assert.Zero(t, ran, "the work must not run while another apply owns the target")
+
+		successor.State = state.Apply.Completed
+		require.NoError(t, store.Applies().Update(ctx, successor))
+		require.NoError(t, store.Applies().WithExclusiveTarget(ctx, cancelled, func(context.Context) error {
+			ran++
+			return nil
+		}))
+		assert.Equal(t, 1, ran, "a settled successor frees the target again")
+
+		// The check is for other applies: an apply's own active state must not
+		// refuse its own hold, or a running apply could never touch its target.
+		selfLock := CreateLock(t, store, "apply_exclusive_self_db", storage.DatabaseTypeMySQL)
+		self := CreateApplyWithStateEnvDeployment(t, store, selfLock,
+			"apply_exclusive_self", 923, state.Apply.Running, "staging", "primary")
+		ran = 0
+		require.NoError(t, store.Applies().WithExclusiveTarget(ctx, self, func(context.Context) error {
+			ran++
+			return nil
+		}))
+		assert.Equal(t, 1, ran)
+
+		require.Error(t, store.Applies().WithExclusiveTarget(ctx, nil, func(context.Context) error { return nil }))
+		require.Error(t, store.Applies().WithExclusiveTarget(ctx, cancelled, nil))
+	})
+
 	dbErrorTests := map[string]func(t *testing.T, store storage.ApplyStore) error{
+		"WithExclusiveTarget_DBError": func(t *testing.T, store storage.ApplyStore) error {
+			return store.WithExclusiveTarget(t.Context(), &storage.Apply{
+				ID:           1,
+				Database:     "apply_exclusive_target_db",
+				DatabaseType: storage.DatabaseTypeMySQL,
+				Environment:  "staging",
+				Deployment:   "primary",
+			}, func(context.Context) error { return nil })
+		},
 		"Create_DBError": func(t *testing.T, store storage.ApplyStore) error {
 			_, err := store.Create(t.Context(), &storage.Apply{})
 			return err
@@ -596,4 +1219,77 @@ func TestApplies(t *testing.T, h Harness) {
 			require.Error(t, test(t, h.NewUnreachableStorage(t).Applies()))
 		})
 	}
+}
+
+// createApplyOnDeployment creates a pending production apply on one deployment of
+// the lock's database and returns the storage error, so a test can assert whether
+// the one-active-apply check admits it.
+func createApplyOnDeployment(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, deployment string) error {
+	t.Helper()
+	_, err := store.Applies().Create(t.Context(), &storage.Apply{
+		ApplyIdentifier: identifier,
+		LockID:          lock.ID,
+		PlanID:          planID,
+		Database:        lock.DatabaseName,
+		DatabaseType:    lock.DatabaseType,
+		Repository:      lock.Repository,
+		PullRequest:     lock.PullRequest,
+		Environment:     "production",
+		Deployment:      deployment,
+		Engine:          storage.EngineForType(lock.DatabaseType),
+		State:           state.Apply.Pending,
+	})
+	return err
+}
+
+// createManifestGeneration creates the first dispatch of a deployment-keyed
+// generation on the lock's "default" production deployment: an apply declaring
+// the manifest, with one attached operation for target-002 and one task, in
+// the given states.
+func createManifestGeneration(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, manifest []string, opState, taskState string) *storage.Apply {
+	t.Helper()
+	apply, err := createManifestGenerationErr(t, store, lock, identifier, planID, manifest, opState, taskState)
+	require.NoError(t, err)
+	return apply
+}
+
+func createManifestGenerationErr(t *testing.T, store storage.Storage, lock *storage.Lock, identifier string, planID int64, manifest []string, opState, taskState string) (*storage.Apply, error) {
+	t.Helper()
+	apply := &storage.Apply{
+		ApplyIdentifier:       identifier,
+		LockID:                lock.ID,
+		PlanID:                planID,
+		Database:              lock.DatabaseName,
+		DatabaseType:          lock.DatabaseType,
+		Repository:            lock.Repository,
+		PullRequest:           lock.PullRequest,
+		Environment:           "production",
+		Deployment:            "default",
+		Engine:                storage.EngineForType(lock.DatabaseType),
+		State:                 state.Apply.Pending,
+		ExpectedOperationKeys: manifest,
+	}
+	task := newTask(apply, "task_"+identifier, "users", time.Now())
+	task.State = taskState
+	op := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-002", Target: "target-002", State: opState}
+	id, err := store.Applies().CreateWithTasksAndOperations(t.Context(), apply, []*storage.Task{task}, []*storage.ApplyOperation{op})
+	if err != nil {
+		return nil, err
+	}
+	apply.ID = id
+	return apply, nil
+}
+
+// registeredApplyStates returns every state in the apply state registry, so a
+// test that sweeps it covers a state the moment it is added.
+func registeredApplyStates(t *testing.T) []string {
+	t.Helper()
+	v := reflect.ValueOf(state.Apply)
+	states := make([]string, 0, v.NumField())
+	for i := 0; i < v.NumField(); i++ {
+		value := v.Field(i).String()
+		require.NotEmptyf(t, value, "state.Apply.%s is empty", v.Type().Field(i).Name)
+		states = append(states, value)
+	}
+	return states
 }

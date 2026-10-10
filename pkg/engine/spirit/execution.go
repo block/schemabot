@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn"
+	spiritflags "github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
@@ -26,46 +28,58 @@ import (
 // write-thread autoscaler grow above its starting value.
 const maxCommitLatency = 100 * time.Millisecond
 
-// classifyRunnerError marks runner failures that reproduce after every
-// completed checksum attempt as permanent so operator retries are not spent
-// repeating a lossy schema change. Attempts that errored before establishing
-// row differences remain retryable.
+// classifyRunnerError marks runner failures that are verdicts about the data
+// as permanent, so operator retries are not spent repeating a lossy schema
+// change: the checksum had to repair row differences on every pass it ran
+// (checksum.ErrDifferencesExhausted). Everything else remains retryable:
+//   - attempts that errored before establishing row differences;
+//   - the checksum's pass budget running out without that verdict
+//     (checksum.ErrVerificationUnresolved alone), which proves no divergence,
+//     only that ranges were still changing too fast to verify;
+//   - a divergence found by the continuous checksum during the deferred
+//     cutover wait. That checksum never repairs, because a cutover may be
+//     imminent; the resumed run's initial checksum repairs the range.
+//
+// A run refused the table's advisory lock is marked ErrTargetHeld: another run
+// is still working on the table, so the refusal says nothing about this schema
+// change and it can start once that run lets go.
 func classifyRunnerError(err error) error {
 	if errors.Is(err, checksum.ErrDifferencesExhausted) {
 		return &engine.PermanentError{Err: err}
+	}
+	if errors.Is(err, dbconn.ErrLockHeld) {
+		return fmt.Errorf("%w: %w", engine.ErrTargetHeld, err)
 	}
 	return err
 }
 
 // newSpiritMigration builds the Spirit migration for a statement against the
 // target with the engine's copy, durability, and throttling settings.
-// Callers layer statement-specific fields (DeferCutOver, RespectSentinel)
-// onto the result.
+// Callers layer statement-specific fields (DeferCutOver) onto the result.
 //
-// Write threads start at the target-appropriate automatic size (on Aurora,
-// the instance vCPU count) and, when autoscaling is enabled, scale
-// dynamically from there on throttler feedback, so apply throughput tracks
-// the target instance rather than a fixed constant.
-//
-// The copy is verified under the snapshot checksum unless the lockless one is
-// enabled; cutover locking is the same either way.
+// On Aurora, Spirit sizes the thread pools from the instance and scales them
+// on throttler feedback, so apply throughput tracks the target instance rather
+// than a fixed constant. Other MySQL targets run at the configured copier
+// threads and Spirit's default write threads. The copy is verified with
+// Spirit's default (lockless) checksum.
 func (e *Engine) newSpiritMigration(host, username, password, database, stmt string) *spiritmigration.Migration {
 	threads, lockTimeout := e.threads, e.lockWaitTimeout
 	return &spiritmigration.Migration{
-		Host:                               host,
-		Username:                           username,
-		Password:                           &password,
-		Database:                           database,
-		Statement:                          stmt,
-		Threads:                            threads,
-		WriteThreads:                       0, // auto-size for the target
-		LockWaitTimeout:                    lockTimeout,
-		InterpolateParams:                  true,
-		CheckpointMaxAge:                   e.checkpointMaxAge,
-		ChecksumYieldTimeout:               e.checksumYieldTimeout,
-		MaxCommitLatency:                   maxCommitLatency,
-		EnableExperimentalAutoscaling:      e.autoscaling,
-		EnableExperimentalLocklessChecksum: e.locklessChecksum,
+		Host:      host,
+		Username:  username,
+		Password:  &password,
+		Database:  database,
+		Statement: stmt,
+		Common: spiritflags.Common{
+			Threads:           threads,
+			WriteThreads:      spiritflags.DefaultWriteThreads, // autoscaling sizes it on Aurora
+			InterpolateParams: true,
+			CheckpointMaxAge:  e.checkpointMaxAge,
+			MaxCommitLatency:  maxCommitLatency,
+		},
+		Cutover: spiritflags.Cutover{
+			LockWaitTimeout: lockTimeout,
+		},
 	}
 }
 
@@ -386,8 +400,11 @@ func (e *Engine) executeSpiritMigration(ctx context.Context, host, username, pas
 	e.reportExistingCopy(ctx, targetDSN(host, username, password, database), database, combinedStatement, tables)
 
 	migration := e.newSpiritMigration(host, username, password, database, combinedStatement)
+	// Only a deferred apply waits on the sentinel table. A sentinel left in
+	// the schema by an earlier cancelled or failed deferred apply never holds
+	// a non-deferred apply, whose cutover SchemaBot could neither surface nor
+	// release.
 	migration.DeferCutOver = deferCutover
-	migration.RespectSentinel = deferCutover // Only wait for sentinel when deferring cutover
 
 	runner, err := spiritmigration.NewRunner(migration)
 	if err != nil {
@@ -463,7 +480,9 @@ func (e *Engine) setSchemaChangeCompleted() {
 
 // setSchemaChangeFailed sets the state to failed with a reason an operator can
 // read. Every caller has already logged err with the target identifiers, so the
-// detail this drops is still available where it is safe to keep it.
+// detail this drops is still available where it is safe to keep it. An err
+// classified permanent (see classifyRunnerError) is recorded as such, so
+// progress tells the drive a retry would only repeat the same failure.
 func (e *Engine) setSchemaChangeFailed(err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -471,6 +490,8 @@ func (e *Engine) setSchemaChangeFailed(err error) {
 		e.runningSchemaChange.state = engine.StateFailed
 		if err != nil {
 			e.runningSchemaChange.errorMessage = failureReason(err)
+			e.runningSchemaChange.permanentFailure = !engine.IsRetryable(err)
+			e.runningSchemaChange.targetHeld = errors.Is(err, engine.ErrTargetHeld)
 		}
 	}
 }

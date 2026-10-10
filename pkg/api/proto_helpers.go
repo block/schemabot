@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
@@ -169,15 +169,39 @@ func protoSchemaFilesToAPI(sf map[string]*ternv1.SchemaFiles) map[string]*apityp
 // field crosses the boundary with one edit.
 func tableChangeResponseFromProto(t *ternv1.TableChange) *apitypes.TableChangeResponse {
 	return &apitypes.TableChangeResponse{
-		TableName:     t.TableName,
-		Namespace:     t.Namespace,
-		DDL:           t.Ddl,
-		ChangeType:    protoChangeTypeToOperation(t.ChangeType),
-		IsUnsafe:      t.IsUnsafe,
-		UnsafeReason:  t.UnsafeReason,
-		ExecutionMode: t.ExecutionMode,
-		ModeReason:    t.ModeReason,
+		TableName:        t.TableName,
+		Namespace:        t.Namespace,
+		DDL:              t.Ddl,
+		ChangeType:       protoChangeTypeToOperation(t.ChangeType),
+		IsUnsafe:         t.IsUnsafe,
+		UnsafeReason:     t.UnsafeReason,
+		ExecutionMode:    t.ExecutionMode,
+		ModeReason:       t.ModeReason,
+		EstimatedRows:    t.EstimatedRows,
+		ShardCount:       int(t.ShardCount),
+		LargestShardRows: t.LargestShardRows,
+		EstimatedBytes:   t.EstimatedBytes,
+		CollationChanges: collationChangesFromProto(t.CollationChanges),
 	}
+}
+
+func collationChangesFromProto(changes []*ternv1.CollationChange) []apitypes.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]apitypes.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = apitypes.CollationChange{
+			Column:         c.GetColumn(),
+			From:           c.GetFromCollation(),
+			To:             c.GetToCollation(),
+			Case:           c.GetCaseComparison(),
+			TrailingSpaces: c.GetTrailingSpaceComparison(),
+			CanMergeValues: c.GetCanMergeValues(),
+			UniqueIndexes:  c.GetUniqueIndexes(),
+		}
+	}
+	return out
 }
 
 // planResponseFromProto converts a protobuf PlanResponse to an HTTP PlanResponse.
@@ -276,30 +300,18 @@ func withheldTablesFromProto(groups []*ternv1.ExemptTables) []string {
 	return slices.Compact(tables)
 }
 
-// plannedDropsAmong returns the tables from names that the plan proposes
-// dropping, sorted. Callers use it to tell an exclusion that matched nothing
-// because the table is not there from one that matched nothing because the
-// planner was never shown the exclusion at all.
-func plannedDropsAmong(changes []*ternv1.SchemaChange, names []string) []string {
-	if len(names) == 0 {
+// plannedDropsWithheldBy returns the tables the plan proposes dropping, in its
+// namespace changes or its per-shard changes, that ignored withholds, sorted. A
+// planner that honored the config never sees those tables, so any such drop
+// comes from one that was never shown the exclusion, or could not read it.
+func plannedDropsWithheldBy(changes []*ternv1.SchemaChange, shards []*ternv1.ShardPlan, ignored engine.IgnoredTables) []string {
+	if ignored.Empty() {
 		return nil
 	}
-	wanted := make(map[string]bool, len(names))
-	for _, name := range names {
-		wanted[name] = true
-	}
 	var dropped []string
-	for _, change := range changes {
-		if change == nil {
-			continue
-		}
-		for _, tc := range change.TableChanges {
-			if tc == nil || tc.ChangeType != ternv1.ChangeType_CHANGE_TYPE_DROP {
-				continue
-			}
-			if wanted[tc.TableName] {
-				dropped = append(dropped, tc.TableName)
-			}
+	for _, drop := range plannedTableDrops(changes, shards) {
+		if ignored.Withholds(drop.table) {
+			dropped = append(dropped, drop.table)
 		}
 	}
 	slices.Sort(dropped)
@@ -358,6 +370,7 @@ func protoChangesToNamespaces(changes []*ternv1.SchemaChange, schemaFiles map[st
 			}
 		}
 		nsData.Metadata = storage.VSchemaPlanMetadata(sc.Metadata)
+		nsData.Finalize = sc.Metadata[engine.MetadataNeedsFinalizer] == "true"
 		if sc.Metadata[storage.PlanMetadataVSchemaChanged] == "true" {
 			if nsFiles := schemaFiles[ns]; nsFiles != nil {
 				if vschema := nsFiles.Files[storage.VSchemaArtifactName]; vschema != "" {
@@ -423,57 +436,13 @@ func protoShardPlansToStorage(shards []*ternv1.ShardPlan) ([]storage.ShardPlan, 
 	return out, nil
 }
 
-// protoChangeTypeToOperation converts a proto ChangeType enum to a storage operation string.
+// protoChangeTypeToOperation converts a proto change type to a storage operation.
+// Unmapped values use "other" because storage retains unsupported change types.
 func protoChangeTypeToOperation(ct ternv1.ChangeType) string {
-	switch ct {
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE:
-		return ddl.StatementTypeToOp(ddl.StatementCreateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_ALTER:
-		return ddl.StatementTypeToOp(ddl.StatementAlterTable)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP:
-		return ddl.StatementTypeToOp(ddl.StatementDropTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementCreateIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX:
-		return ddl.StatementTypeToOp(ddl.StatementDropIndex)
-	case ternv1.ChangeType_CHANGE_TYPE_RENAME:
-		return ddl.StatementTypeToOp(ddl.StatementRenameTable)
-	case ternv1.ChangeType_CHANGE_TYPE_TRUNCATE:
-		return ddl.StatementTypeToOp(ddl.StatementTruncateTable)
-	case ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW:
-		return ddl.StatementTypeToOp(ddl.StatementCreateView)
-	case ternv1.ChangeType_CHANGE_TYPE_VSCHEMA:
-		return "vschema_update"
-	default:
-		return "other"
+	if op, ok := ternconv.ChangeTypeToOp(ct); ok {
+		return op
 	}
-}
-
-// changeTypeToProto converts operation string to proto ChangeType enum.
-func changeTypeToProto(op string) ternv1.ChangeType {
-	if strings.EqualFold(op, "vschema_update") {
-		return ternv1.ChangeType_CHANGE_TYPE_VSCHEMA
-	}
-	switch ddl.OpToStatementType(op) {
-	case ddl.StatementCreateTable:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE
-	case ddl.StatementAlterTable:
-		return ternv1.ChangeType_CHANGE_TYPE_ALTER
-	case ddl.StatementDropTable:
-		return ternv1.ChangeType_CHANGE_TYPE_DROP
-	case ddl.StatementCreateIndex:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE_INDEX
-	case ddl.StatementDropIndex:
-		return ternv1.ChangeType_CHANGE_TYPE_DROP_INDEX
-	case ddl.StatementRenameTable:
-		return ternv1.ChangeType_CHANGE_TYPE_RENAME
-	case ddl.StatementTruncateTable:
-		return ternv1.ChangeType_CHANGE_TYPE_TRUNCATE
-	case ddl.StatementCreateView:
-		return ternv1.ChangeType_CHANGE_TYPE_CREATE_VIEW
-	default:
-		return ternv1.ChangeType_CHANGE_TYPE_OTHER
-	}
+	return "other"
 }
 
 // protoToSchemaFiles converts proto SchemaFiles to the engine's schema.SchemaFiles,

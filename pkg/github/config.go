@@ -44,9 +44,11 @@ type SchemabotConfig struct {
 	// the bookkeeping table of a versioned schema change tool, or a table
 	// another team owns in a shared schema. Without the exclusion a live table
 	// no schema file declares is planned as DROP TABLE, which blocks the merge.
-	// Entries are matched exactly and case-sensitively against the target's own
-	// catalog, in every namespace the plan covers, and every plan discloses
-	// what it withheld.
+	// Entries are matched against the target's own catalog, in every namespace
+	// the plan covers: a plain entry exactly and case-sensitively, and an entry
+	// wrapped in slashes, such as /^events_[0-9]+$/, as a regular expression
+	// over the whole name, for a family of tables created at runtime. Every
+	// plan discloses what it withheld.
 	IgnoreTables []string `yaml:"ignore_tables,omitempty" json:"ignore_tables,omitempty"`
 }
 

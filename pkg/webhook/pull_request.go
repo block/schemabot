@@ -466,7 +466,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	shouldPostComment := sync.OnceValue(func() bool {
 		return h.shouldPostAutoPlanComment(ctx, client, action, repo, pr, beforeSHA, headSHA, configs)
 	})
-	h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
+	unmanagedPlanNote := h.notifyUnmanagedDiscoveredConfigs(repo, pr, installationID, source, headSHA, shouldPostComment, discovered, configs)
 
 	// Config discovery and the managed-directory guard just re-verified this
 	// commit, and the clear re-checks allowed-environment coverage for every
@@ -474,17 +474,12 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	// an aggregate blocking reason, so a stored block can now be released.
 	h.clearAggregateBlocksForVerifiedPR(ctx, client, repo, pr, headSHA, configs)
 
-	// Collect database names from discovered configs
-	affectedDatabases := make(map[string]bool)
-	for _, cfg := range configs {
-		affectedDatabases[cfg.Config.Database] = true
-	}
+	affectedDatabases := checkDatabaseKeysForConfigs(configs)
 
-	// Clean up stale checks from databases no longer in the PR.
-	// Pass the new HEAD SHA so cleanup can create new check runs on the correct commit.
-	h.goSafe(repo, pr, installationID, deliveryID, func() {
-		h.cleanupStaleChecks(repo, pr, headSHA, installationID, affectedDatabases)
-	})
+	// Clean up stale checks from databases no longer in the PR, on the new HEAD
+	// SHA. This runs to completion before any plan below launches, so every
+	// plan's aggregate fold sees the rows cleanup settles.
+	h.cleanupStaleChecks(repo, pr, headSHA, installationID, affectedDatabases)
 
 	if len(configs) == 0 {
 		h.logger.Info("no schema files in PR, skipping auto-plan", "repo", repo, "pr", pr, "head_sha", headSHA, "source", source, "delivery_id", deliveryID)
@@ -540,6 +535,9 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 		// recreated on the new commit. If stale per-database check records exist,
 		// cleanupStaleChecks (above) also updates the aggregate — both converge
 		// to the same result (passing aggregate on new SHA) so the overlap is safe.
+		// Schema the PR changes under configs this deployment does not manage
+		// is named on the check, so its title does not claim no schema changed.
+		unmanaged := unmanagedSchemaConfigData(droppedDiscoveredConfigs(discovered, configs))
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -548,7 +546,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 				h.logger.Error("failed to create GitHub client for passing aggregate", "repo", repo, "pr", pr, "head_sha", headSHA, "delivery_id", deliveryID, "error", err)
 				return
 			}
-			h.postPassingAggregates(ctx, c, repo, pr, headSHA)
+			h.postPassingAggregates(ctx, c, repo, pr, headSHA, unmanaged)
 		})
 		return "no schema files in PR", nil
 	}
@@ -582,7 +580,7 @@ func (h *Handler) runAutoPlanForPR(ctx context.Context, client *ghclient.Install
 	for _, cfg := range configs {
 		database := cfg.Config.Database
 		h.goSafe(repo, pr, installationID, deliveryID, func() {
-			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0)
+			h.handleMultiEnvPlan(repo, pr, database, tenant, installationID, "", true, commandScopeDatabases, postPlanComment, 0, unmanagedPlanNote)
 		})
 	}
 
@@ -643,23 +641,47 @@ func (h *Handler) autoPlanInputsMoved(ctx context.Context, client *ghclient.Inst
 
 // notifyUnmanagedDiscoveredConfigs posts a PR-visible notice when auto-plan
 // discovery dropped schema configs this deployment is not configured to
-// manage. On a repo with no aggregate role this deployment is the only
-// responder, so without the notice the drop is invisible on the PR — no plan
-// comment and no check row cover the dropped config, and the author can merge
-// a schema change nothing will ever apply. On an aggregate-role repo (leader
-// or participant) a dropped config is routine cross-deployment fan-out — the
-// owning deployment plans it and posts its own comment and check — so the
-// notice stays a log line there.
-func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) {
+// manage. A deployment serving every environment on a repo with no aggregate
+// role is the only responder, so without the notice the drop is invisible on
+// the PR — no plan comment and no check row cover the dropped config, and the
+// author can merge a schema change nothing will ever apply. Two shapes leave
+// the dropped config to a deployment this one cannot see, so the notice stays
+// a log line there:
+//
+//   - an aggregate-role repo (leader or participant), where a dropped config is
+//     routine cross-deployment fan-out and the owning deployment plans it and
+//     posts its own comment and check
+//   - a deployment scoped to some environments (allowed_environments), where a
+//     sibling deployment serving another environment may register the
+//     database; a notice from this one would tell the author a schema change
+//     the sibling is planning will never be applied
+//
+// An environment-scoped deployment still shows the dropped configs on the PR,
+// scoped to the environments it serves: it returns them, and each plan comment
+// it posts for the PR names them. A PR that changes nothing this deployment
+// manages posts no plan comment, so its passing check names them instead.
+func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installationID int64, source, headSHA string, shouldPostComment func() bool, discovered, managed []ghclient.DiscoveredConfig) []templates.UnmanagedSchemaConfigNoticeData {
 	dropped := droppedDiscoveredConfigs(discovered, managed)
 	if len(dropped) == 0 {
-		return
+		return nil
 	}
-	if config, ok := h.serverConfig(); ok && config.AggregateRoleForRepo(repo) != "" {
+	config, ok := h.serverConfig()
+	if ok && config.AggregateRoleForRepo(repo) != "" {
 		h.logger.Info("unmanaged schema configs in PR left to their owning deployments on aggregate repo",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
 			"unmanaged_configs", len(dropped))
-		return
+		return nil
+	}
+	notice := unmanagedSchemaConfigData(dropped)
+	if ok && len(config.AllowedEnvironments) > 0 {
+		// A Warn rather than an Info: when no sibling registers the database
+		// either, nothing will ever apply this schema change, and this line is
+		// where an operator finds which directories were left out.
+		h.logger.Warn("schema configs in PR are not managed by this environment-scoped deployment; no notice posted because a deployment serving another environment may manage them, and the plan comment or passing check names them",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
+			"databases", unmanagedSchemaDatabases(notice), "schema_paths", unmanagedSchemaPaths(notice),
+			"allowed_environments", config.AllowedEnvironments)
+		return notice
 	}
 	// Match the plan-comment cadence: a synchronize push that changed no
 	// schema inputs re-verifies checks without re-posting comments, and the
@@ -668,16 +690,43 @@ func (h *Handler) notifyUnmanagedDiscoveredConfigs(repo string, pr int, installa
 		h.logger.Info("unmanaged schema config notice suppressed by comment cadence; PR was already noticed on an earlier commit",
 			"repo", repo, "pr", pr, "head_sha", headSHA, "source", source,
 			"unmanaged_configs", len(dropped))
-		return
+		return nil
 	}
-	notice := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))
+	var environments []string
+	if ok {
+		environments = config.OrderedEnvironments(config.KnownEnvironments())
+	}
+	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(environments, notice))
+	return nil
+}
+
+func unmanagedSchemaDatabases(configs []templates.UnmanagedSchemaConfigNoticeData) []string {
+	databases := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		databases = append(databases, cfg.Database)
+	}
+	return databases
+}
+
+func unmanagedSchemaPaths(configs []templates.UnmanagedSchemaConfigNoticeData) []string {
+	paths := make([]string, 0, len(configs))
+	for _, cfg := range configs {
+		paths = append(paths, cfg.SchemaPath)
+	}
+	return paths
+}
+
+// unmanagedSchemaConfigData identifies each dropped config by its database
+// and schema directory, for the notice and the passing check that report it.
+func unmanagedSchemaConfigData(dropped []ghclient.DiscoveredConfig) []templates.UnmanagedSchemaConfigNoticeData {
+	data := make([]templates.UnmanagedSchemaConfigNoticeData, 0, len(dropped))
 	for _, cfg := range dropped {
-		notice = append(notice, templates.UnmanagedSchemaConfigNoticeData{
+		data = append(data, templates.UnmanagedSchemaConfigNoticeData{
 			Database:   cfg.Config.Database,
 			SchemaPath: cfg.SchemaDir,
 		})
 	}
-	h.postComment(repo, pr, installationID, templates.RenderUnmanagedSchemaConfigsNotice(notice))
+	return data
 }
 
 // droppedDiscoveredConfigs returns the discovered configs the managed filter
@@ -967,7 +1016,47 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 	return errors.Join(releaseErrs...)
 }
 
-// cleanupStaleChecks updates checks for databases no longer in the PR.
+// checkDatabaseKey identifies the database a per-database stored check row
+// gates: its name and its type, the two database components of the stored
+// check state key. A database whose type changes while a PR is open (for
+// example a MySQL database converted to Strata) is planned under the new type,
+// so its row under the old type no longer belongs to anything the PR plans.
+type checkDatabaseKey struct {
+	databaseName string
+	databaseType string
+}
+
+// newCheckDatabaseKey folds both components the way stored check state folds
+// them, so a row and the config that planned it always produce the same key.
+func newCheckDatabaseKey(databaseName, databaseType string) checkDatabaseKey {
+	return checkDatabaseKey{
+		databaseName: storage.CanonicalKey(databaseName),
+		databaseType: storage.CanonicalKey(databaseType),
+	}
+}
+
+// checkDatabaseKeyForCheck returns the database a stored check row gates.
+func checkDatabaseKeyForCheck(check *storage.Check) checkDatabaseKey {
+	return newCheckDatabaseKey(check.DatabaseName, check.DatabaseType)
+}
+
+// checkDatabaseKeysForConfigs returns the databases the PR's discovered configs
+// plan, keyed by name and type.
+func checkDatabaseKeysForConfigs(configs []ghclient.DiscoveredConfig) map[checkDatabaseKey]bool {
+	keys := make(map[checkDatabaseKey]bool, len(configs))
+	for _, cfg := range configs {
+		keys[newCheckDatabaseKey(cfg.Config.Database, string(cfg.Config.GetType()))] = true
+	}
+	return keys
+}
+
+// cleanupStaleChecks updates checks for databases no longer in the PR. A row is
+// still affected only when the PR plans a database with the same name and type.
+// A row under a database's old type, for a database the PR now plans under a
+// new type, is left for that plan to settle (see settleChecksReplacedByNewType).
+// When the PR plans databases, cleanup leaves the aggregate to their plans, so a
+// caller passing affected databases must launch those plans only after this
+// returns.
 // Plan-only checks can be marked "success" because the current PR no longer asks
 // SchemaBot to apply anything. Checks that represent a started apply remain
 // blocking because the live database may already have changed or may still change.
@@ -975,7 +1064,7 @@ func (h *Handler) releaseLocksForClosedPR(ctx context.Context, repo string, pr i
 // On synchronize events, headSHA is the new commit SHA. Stale checks must be created
 // as new check runs on this SHA (not updated on the old SHA) so GitHub shows them
 // on the current commit.
-func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[string]bool) {
+func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, installationID int64, affectedDatabases map[checkDatabaseKey]bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -1023,6 +1112,10 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 		return
 	}
 
+	plannedDatabaseNames := make(map[string]bool, len(affectedDatabases))
+	for key := range affectedDatabases {
+		plannedDatabaseNames[key.databaseName] = true
+	}
 	cleaned := false
 
 	for _, check := range checks {
@@ -1033,7 +1126,7 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			continue
 		}
 
-		if affectedDatabases[check.DatabaseName] {
+		if affectedDatabases[checkDatabaseKeyForCheck(check)] {
 			h.logger.Debug("skipping check during stale cleanup because database is still affected",
 				"repo", repo, "pr", pr, "head_sha", headSHA,
 				"database", check.DatabaseName, "database_type", check.DatabaseType,
@@ -1041,7 +1134,18 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			continue
 		}
 
-		// This check's database is no longer in the PR.
+		if plannedDatabaseNames[storage.CanonicalKey(check.DatabaseName)] {
+			// The PR still plans this database, under a new type. The row stays
+			// on its earlier commit, where the aggregate reads it as blocking,
+			// until the new type's plan stores its own result and settles it.
+			h.logger.Info("stale cleanup leaves a check under a database's old type to the plan of its new type",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", check.DatabaseName, "database_type", check.DatabaseType,
+				"environment", check.Environment, "check_id", check.ID)
+			continue
+		}
+
+		// The PR no longer plans this check's database.
 		h.logger.Info("cleaning up stale check",
 			"repo", repo, "pr", pr,
 			"database", check.DatabaseName, "database_type", check.DatabaseType,
@@ -1049,28 +1153,148 @@ func (h *Handler) cleanupStaleChecks(repo string, pr int, headSHA string, instal
 			"previous_status", check.Status, "previous_conclusion", check.Conclusion,
 			"previous_blocking_reason", check.BlockingReason, "apply_id", check.ApplyID)
 
-		if checkHasStartedApply(check) {
-			if h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check) {
-				cleaned = true
-			}
-			continue
-		}
-
-		if h.markStalePlanOnlyCheckStateSuccessful(ctx, repo, pr, headSHA, check) {
+		if h.settleStaleCheckState(ctx, repo, pr, headSHA, check) {
 			cleaned = true
 		}
 	}
 
-	// Recompute aggregate on the new HEAD SHA after cleaning up stale checks
-	if cleaned {
-		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
-	} else {
+	if !cleaned {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:  "stale_check_cleanup",
 			Repository: repo,
 			Status:     "noop",
 		})
+		return
 	}
+
+	// Each plan the PR launches folds the aggregate after it stores its rows for
+	// every environment, and runAutoPlanForPR launches them only after this
+	// cleanup returns, so their folds see the rows settled here. Folding here
+	// instead could publish the aggregate before those plans store anything,
+	// with a plan-only row settled to success standing in for results that do
+	// not exist yet.
+	if len(affectedDatabases) > 0 {
+		h.logger.Info("stale cleanup leaves the aggregate to the plans of the databases the PR plans",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"planned_databases", checkDatabaseKeyStrings(affectedDatabases))
+		return
+	}
+	h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
+}
+
+// checkDatabaseKeyStrings renders database keys as name/type, sorted for logs.
+func checkDatabaseKeyStrings(keys map[checkDatabaseKey]bool) []string {
+	out := make([]string, 0, len(keys))
+	for key := range keys {
+		out = append(out, key.databaseName+"/"+key.databaseType)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// settleChecksReplacedByNewType settles the rows a database left under its old
+// type once the plan of its new type has stored results. A plan calls it after
+// storing its rows and before folding the aggregate, so the old row blocks the
+// aggregate, from its earlier commit, for as long as the result that replaces
+// it does not exist. That holds for every fold, not only the plan's own: a
+// second database still planning keeps the aggregate open through its own old
+// row.
+//
+// Whether a result replaces a row is read from stored check state, not from
+// what the calling plan stored, so a plan of one environment and a plan of
+// every environment settle the same rows. A row is settled in an environment
+// where a row under the new type is stored on headSHA, and in an environment
+// this deployment does not plan the database in, since nothing will replace it
+// there. Anywhere else the row keeps blocking until a later plan stores that
+// environment. Settling follows stale cleanup: a started apply keeps its row
+// blocking, and a plan-only row passes.
+//
+// A plan that finishes after the PR moved to a newer commit settles nothing,
+// because the newer commit's cleanup and plans own those rows. The PR head is
+// read only when there is an old-type row to settle, so a plan of a database
+// whose type never changed adds no GitHub call.
+func (h *Handler) settleChecksReplacedByNewType(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA, databaseName, databaseType string) error {
+	checks, err := h.service.Storage().Checks().GetByPR(ctx, repo, pr)
+	if err != nil {
+		return fmt.Errorf("load checks for %s#%d to settle %s rows under types other than %s: %w", repo, pr, databaseName, databaseType, err)
+	}
+	planned := newCheckDatabaseKey(databaseName, databaseType)
+	var oldTypeChecks []*storage.Check
+	replacedEnvironments := map[string]bool{}
+	for _, check := range checks {
+		if isAggregateCheck(check) {
+			continue
+		}
+		key := checkDatabaseKeyForCheck(check)
+		if key.databaseName != planned.databaseName {
+			continue
+		}
+		if key.databaseType == planned.databaseType {
+			if check.HeadSHA == headSHA {
+				replacedEnvironments[storage.CanonicalKey(check.Environment)] = true
+			}
+			continue
+		}
+		if check.HeadSHA == headSHA {
+			h.logger.Debug("check under a database's old type is already settled on this commit",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
+				"environment", check.Environment, "check_id", check.ID)
+			continue
+		}
+		oldTypeChecks = append(oldTypeChecks, check)
+	}
+	if len(oldTypeChecks) == 0 {
+		h.logger.Debug("plan of a database leaves no rows under an old type to settle",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "database", databaseName, "database_type", databaseType)
+		return nil
+	}
+
+	prInfo, err := client.FetchPullRequestNoCache(ctx, repo, pr)
+	if err != nil {
+		return fmt.Errorf("verify head of %s#%d before settling %s rows under types other than %s on %s: %w", repo, pr, databaseName, databaseType, headSHA, err)
+	}
+	if prInfo.HeadSHA != headSHA {
+		h.logger.Info("plan of a database's new type settles no rows because the PR moved to a newer commit",
+			"repo", repo, "pr", pr, "head_sha", headSHA, "current_head_sha", prInfo.HeadSHA,
+			"database", databaseName, "database_type", databaseType)
+		return nil
+	}
+	environments, err := h.allowedDatabaseEnvironments(databaseName)
+	if err != nil {
+		return fmt.Errorf("resolve environments of %s to settle its rows under types other than %s on %s#%d: %w", databaseName, databaseType, repo, pr, err)
+	}
+	plannedEnvironments := make(map[string]bool, len(environments))
+	for _, environment := range environments {
+		plannedEnvironments[storage.CanonicalKey(environment)] = true
+	}
+	for _, check := range oldTypeChecks {
+		environment := storage.CanonicalKey(check.Environment)
+		if plannedEnvironments[environment] && !replacedEnvironments[environment] {
+			h.logger.Warn("check under a database's old type keeps blocking because no result under its new type is stored for this environment on this commit",
+				"repo", repo, "pr", pr, "head_sha", headSHA,
+				"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
+				"environment", check.Environment, "check_id", check.ID)
+			continue
+		}
+		h.logger.Info("settling check under a database's old type after the plan of its new type",
+			"repo", repo, "pr", pr, "head_sha", headSHA,
+			"database", check.DatabaseName, "database_type", check.DatabaseType, "planned_database_type", databaseType,
+			"environment", check.Environment, "check_id", check.ID,
+			"previous_status", check.Status, "previous_conclusion", check.Conclusion, "apply_id", check.ApplyID)
+		h.settleStaleCheckState(ctx, repo, pr, headSHA, check)
+	}
+	return nil
+}
+
+// settleStaleCheckState moves a row nothing will replace onto headSHA. A row a
+// started apply owns keeps blocking, because the live database may already have
+// changed; a plan-only row passes. It reports whether the row was written.
+func (h *Handler) settleStaleCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {
+	if checkHasStartedApply(check) {
+		return h.blockStaleStartedApplyCheckState(ctx, repo, pr, headSHA, check)
+	}
+	return h.markStalePlanOnlyCheckStateSuccessful(ctx, repo, pr, headSHA, check)
 }
 
 func (h *Handler) blockStaleStartedApplyCheckState(ctx context.Context, repo string, pr int, headSHA string, check *storage.Check) bool {

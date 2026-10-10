@@ -63,7 +63,7 @@ func rollupMemberList(pairs ...[2]string) []routing.ExecutionTarget {
 	return members
 }
 
-// When every deployment would plan exactly the reviewed changes, the rollup is
+// When every deployment would plan exactly the primary plan's changes, the rollup is
 // clean and every entry classifies as a match.
 func TestRollupDeploymentDiffs_AllMatchIsClean(t *testing.T) {
 	change := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
@@ -238,11 +238,11 @@ func TestRollupDeploymentDiffs_ComparisonErrorBlocks(t *testing.T) {
 	require.Error(t, rollup.Entries[1].Err)
 }
 
-// If the reviewed primary baseline itself errored, no deployment can be
+// If the primary target baseline itself errored, no deployment can be
 // confirmed to match, so all non-primary deployments block.
 func TestRollupDeploymentDiffs_UnusablePrimaryBlocksAll(t *testing.T) {
 	primary := rollupDeployment("eu")
-	primary.Err = fmt.Errorf("reviewed primary plan reported errors")
+	primary.Err = fmt.Errorf("primary target's plan reported errors")
 	diffs := []DeploymentPlanDiff{
 		primary,
 		rollupDeployment("au", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")),
@@ -326,7 +326,7 @@ func TestRollupDeploymentDiffs_PostgresDialectClean(t *testing.T) {
 
 // A primary whose database type maps to no registered grammar cannot anchor
 // any comparison: the baseline self-comparison fails, so the rollup fails
-// closed rather than parsing the reviewed plan by a guess.
+// closed rather than parsing the primary plan by a guess.
 func TestRollupDeploymentDiffs_UnregisteredPrimaryDialectBlocks(t *testing.T) {
 	primary := rollupDeployment("eu", rollupAlterUsers("ALTER TABLE `users` ADD COLUMN `email` varchar(255)"))
 	primary.DatabaseType = "oracle"
@@ -360,7 +360,7 @@ func TestRollupDeploymentDiffs_MySQLFamilyTypesShareDialect(t *testing.T) {
 	}
 }
 
-// A deployment whose dialect differs from the reviewed primary's cannot be
+// A deployment whose dialect differs from the primary target's cannot be
 // compared meaningfully, so it classifies as errored and the rollup fails
 // closed rather than judging one dialect's DDL under another's grammar.
 func TestRollupDeploymentDiffs_MixedDialectBlocks(t *testing.T) {
@@ -537,8 +537,8 @@ func TestRollupDeploymentDiffs_MembersWithNothingToRunGroupTogether(t *testing.T
 }
 
 // Mirrored members carry their plans too, and a diverged member carries the plan
-// it would actually run rather than the reviewed one — the divergence is the
-// difference between them, so rendering the reviewed plan against a diverged
+// it would actually run rather than the primary plan — the divergence is the
+// difference between them, so rendering the primary plan against a diverged
 // member would show work that member will not do.
 func TestRollupDeploymentDiffs_DivergedMemberCarriesItsOwnPlan(t *testing.T) {
 	reviewed := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
@@ -614,6 +614,36 @@ func TestPersistMemberPlans_StoreFailureLeavesTheMemberCarryingNoPlan(t *testing
 	assert.ErrorContains(t, rollup.Entries[1].Err, "store plan for rollout member")
 }
 
+// The primary runs the primary plan, which is already stored, so member plans
+// are stored for every other member and the primary is left without an
+// identifier of its own. Every member's plan here fails to store, so a store
+// attempted for the primary would reclassify it as the second member is.
+func TestPersistMemberPlans_StoresNoPlanForThePrimary(t *testing.T) {
+	alter := "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+	diffs := []DeploymentPlanDiff{
+		rollupDeployment("eu", rollupAlterUsers(alter)),
+		rollupDeployment("au", rollupAlterUsers(alter)),
+	}
+	rollup, err := RollupDeploymentDiffs(diffs, rollupMembers(diffs), PlanIndependent)
+	require.NoError(t, err)
+	require.Len(t, rollup.Entries, 2)
+	require.Equal(t, DeploymentPlanned, rollup.Entries[0].Class)
+	require.Equal(t, DeploymentPlanned, rollup.Entries[1].Class)
+
+	for i := range diffs {
+		diffs[i].Changes = []*ternv1.SchemaChange{nil}
+	}
+
+	s := &Service{logger: slog.New(slog.DiscardHandler)}
+	require.NoError(t, s.persistMemberPlans(t.Context(),
+		PlanRequest{Database: "testdb", Environment: "production"}, PlanIndependent, "plan-primary", diffs, &rollup))
+
+	assert.Equal(t, DeploymentPlanned, rollup.Entries[0].Class, "no member plan is stored for the primary")
+	assert.NoError(t, rollup.Entries[0].Err)
+	assert.Empty(t, rollup.Entries[0].PlanIdentifier)
+	assert.Equal(t, DeploymentErrored, rollup.Entries[1].Class, "the second member's store was attempted")
+}
+
 // The member contract is enforced whatever the planning: independent planning
 // stops members being compared to each other, it does not stop a missing or
 // misidentified member from failing the rollup closed.
@@ -645,4 +675,20 @@ func TestDeploymentClassificationsAreKnownToTheDriftMetric(t *testing.T) {
 	// Naming them pins the walk itself: a String() that stopped early would
 	// otherwise pass by covering nothing.
 	assert.Equal(t, []string{"match", "diverged", "errored", "planned"}, walked)
+}
+
+// A planner can record the blocked verdict in any case. The rollup counts it
+// the way apply admission and the plan comment's per-target disclosure read it,
+// so a target whose apply is refused never folds as quiet.
+func TestCountBlockedChanges_ReadsTheVerdictInAnyCase(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		TableChanges: []*ternv1.TableChange{
+			{Namespace: "testapp", TableName: "users", ExecutionMode: "BLOCKED"},
+			{Namespace: "testapp", TableName: "orders", ExecutionMode: engine.ExecutionModeBlocked},
+			{Namespace: "testapp", TableName: "refunds", ExecutionMode: engine.ExecutionModeDirect},
+		},
+	}}}
+
+	assert.Equal(t, 2, countBlockedChanges(cs))
 }

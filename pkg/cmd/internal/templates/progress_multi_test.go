@@ -4,9 +4,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+
+	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
@@ -39,7 +42,9 @@ func TestWriteProgressMultiDeploymentRendersAggregateAndSections(t *testing.T) {
 	assert.Contains(t, output, "Deployments:")
 	assert.Contains(t, output, "1 completed · 1 halted · 1 failed")
 	assert.Contains(t, output, "First failure: region-b — duplicate column name 'region'")
-	assert.Contains(t, output, "Next: review failure in region-b")
+	assert.True(t, strings.HasSuffix(output, presentation.RetryLabel+":\n  "+ANSICyan+"schemabot apply -s <schema_dir> -e staging"+ANSIReset+"\n"),
+		"the one next command closes the output:\n%s", output)
+	assert.NotContains(t, output, "schemabot stop", "a failed apply refuses stop, so none is offered")
 	assertLess(t, output, "✅ region-a — completed", "❌ region-b — failed")
 	assert.Contains(t, output, "External operation ID: remote-region-a")
 	assert.Contains(t, output, "External apply ID: remote-apply-region-a")
@@ -79,7 +84,7 @@ func TestWriteProgressKeyedApplySectionsCarryOwnOperationIdentity(t *testing.T) 
 // Under on_failure continue a failed deployment with a still-running sibling
 // holds the rollout running_degraded: the aggregate shows "running (degraded)"
 // rather than a premature "failed", surfaces the first failure, and offers no
-// review-failure next action while the rollout is still in flight.
+// retry while the rollout is still in flight: stop is its one command.
 func TestWriteProgressMultiDeploymentContinueFailureShowsRunningDegraded(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteProgress(ProgressData{
@@ -101,7 +106,8 @@ func TestWriteProgressMultiDeploymentContinueFailureShowsRunningDegraded(t *test
 	assert.Contains(t, output, "running (degraded)")
 	assert.Contains(t, output, "1 running · 1 failed")
 	assert.Contains(t, output, "First failure: region-a — duplicate column name 'region'")
-	assert.NotContains(t, output, "Next: review failure")
+	assert.NotContains(t, output, "To retry")
+	assert.Contains(t, output, "schemabot stop apply-degraded -e production")
 }
 
 // Under on_failure pause a failed deployment with a held sibling renders the
@@ -165,10 +171,10 @@ func assertLess(t *testing.T, output, left, right string) {
 }
 
 // One deployment can address several targets, each running its own copy of the
-// change. Every member is named by its routing pair so no two sections carry the
-// same heading, while a sibling deployment that addresses a single target keeps
-// its plain name.
-func TestWriteProgressMultiTargetSectionsNameEachMember(t *testing.T) {
+// change. The deployment renders as one rollup section counting its targets,
+// while a sibling deployment that addresses a single target keeps a section of
+// its own under its plain name.
+func TestWriteProgressMultiTargetDeploymentRollsUpBesideASingleTargetSibling(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteProgress(ProgressData{
 			ApplyID:     "apply-multi-target",
@@ -182,14 +188,11 @@ func TestWriteProgressMultiTargetSectionsNameEachMember(t *testing.T) {
 		})
 	})
 
-	assert.Contains(t, output, "✅ primary/testapp-001 — completed")
-	assert.Contains(t, output, "🔄 primary/testapp-002 — running table copy")
+	assert.Contains(t, output, "Targets:", "the counts count targets once a deployment addresses several")
+	assert.Contains(t, output, "🔄 primary — 1 completed · 1 running (2 targets)")
 	assert.Contains(t, output, "⏳ eu-west — waiting for primary/testapp-002 (orders-eu)")
-
-	// A name that already carries the target does not repeat it in the
-	// trailing parenthetical.
-	assert.NotContains(t, output, "primary/testapp-001 — completed (testapp-001)")
-	assert.NotContains(t, output, "primary/testapp-002 — running table copy (testapp-002)")
+	assertLess(t, output, "primary — 1 completed", "eu-west — waiting")
+	assert.NotContains(t, output, "primary/testapp-001 —", "a rolled-up target has no section of its own")
 }
 
 // A keyed apply runs several operations of one deployment through one
@@ -251,17 +254,17 @@ func TestSectionExternalID_IgnoresOtherDeployments(t *testing.T) {
 }
 
 // Two targets of one deployment each run their own copy of the change against
-// their own schema. Each member's section shows only the tables its own target
-// copied and only its own data-plane identifiers — nothing is read off the
-// sibling member it shares a deployment with.
-func TestWriteProgressMultiTargetSectionsAreMemberScoped(t *testing.T) {
+// their own schema. The rollup reads each target's own table rows: each table
+// is shown once, naming the target that copied it, and no target is credited
+// with its sibling's copy.
+func TestWriteProgressMultiTargetRollupIsMemberScoped(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteProgress(ProgressData{
 			ApplyID:     "apply-multi-target",
 			Environment: "staging",
 			State:       state.Apply.Running,
 			Operations: []ProgressOperation{
-				{Deployment: "primary", Target: "testapp-001", ExternalID: "remote-apply-001", ExternalOperationID: "remote-op-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
+				{Deployment: "primary", Target: "testapp-001", ExternalID: "remote-apply-001", State: state.ApplyOperation.Completed, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 				{Deployment: "primary", Target: "testapp-002", State: state.ApplyOperation.Running, CutoverPolicy: storage.CutoverPolicyRolling, OnFailure: storage.OnFailureHalt},
 			},
 			Tables: []TableProgress{
@@ -271,18 +274,13 @@ func TestWriteProgressMultiTargetSectionsAreMemberScoped(t *testing.T) {
 		})
 	})
 
-	// The dispatched member's identifiers stay with it: the other member runs a
-	// separate data-plane apply, so it inherits neither.
-	assert.Equal(t, 1, strings.Count(output, "External apply ID: remote-apply-001"),
-		"a sibling target must not inherit another member's external apply ID")
-	assert.Equal(t, 1, strings.Count(output, "External operation ID: remote-op-001"))
-
-	// Each member lists only the tables its own target copied.
-	assertLess(t, output, "primary/testapp-001", "users_001")
-	assertLess(t, output, "users_001", "primary/testapp-002")
-	assertLess(t, output, "primary/testapp-002", "users_002")
-	assert.Equal(t, 1, strings.Count(output, "users_001"))
-	assert.Equal(t, 1, strings.Count(output, "users_002"))
+	// The copying table leads the one already complete.
+	assertLess(t, output, "users_002", ANSIBold+"target testapp-002"+ANSIReset+"\n")
+	assertLess(t, output, ANSIBold+"target testapp-002"+ANSIReset+"\n", "users_001")
+	assertLess(t, output, "users_001", ANSIBold+"target testapp-001"+ANSIReset+"\n")
+	assert.Equal(t, 1, strings.Count(output, "users_001:"))
+	assert.Equal(t, 1, strings.Count(output, "users_002:"))
+	assert.NotContains(t, output, "remote-apply-001", "a healthy target's apply ID is not lifted into the rollup")
 }
 
 // A keyed apply's operations share one target, and an operation that has not
@@ -314,4 +312,98 @@ func TestWriteProgressKeyedMemberListsTablesUnderAnInheritedTarget(t *testing.T)
 	assertLess(t, output, "shard-2", "orders_2")
 	assert.Equal(t, 1, strings.Count(output, "orders_1"))
 	assert.Equal(t, 1, strings.Count(output, "orders_2"))
+}
+
+// TestProgressOperationsForPresentation_SettlesLikeStoredState verifies that the
+// progress output and watch view read a rollout's state from the same facts the
+// stored derivation does. Under continue, shard -80 of payments-001 fails and
+// payments-002 completes, leaving payments-001's orders finalizer pending with
+// nothing that will start it: the header reads failed, as the stored apply
+// does. Under halt, region-a fails and a stop caught region-b before any driver
+// claimed it: the header reads failed, as it would with region-b still pending.
+// A failed shard of payments-002 orphans only payments-002's finalizer, so the
+// header stays running_degraded while payments-001's finalizer can still start.
+func TestProgressOperationsForPresentation_SettlesLikeStoredState(t *testing.T) {
+	const started = "2026-09-30T12:00:00Z"
+	shard := func(target, shardName, opState string) *apitypes.ProgressOperationResponse {
+		return &apitypes.ProgressOperationResponse{
+			Deployment:    "payments-a",
+			Target:        target,
+			OperationKey:  storage.TargetOperationKey(target, storage.ShardOperationKey("orders", shardName, "orders")),
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         opState,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureContinue,
+			StartedAt:     started,
+		}
+	}
+	finalizer := func(target, opState, startedAt string) *apitypes.ProgressOperationResponse {
+		return &apitypes.ProgressOperationResponse{
+			Deployment:    "payments-a",
+			Target:        target,
+			OperationKey:  storage.TargetOperationKey(target, "orders/group_finalizer"),
+			OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			State:         opState,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureContinue,
+			StartedAt:     startedAt,
+		}
+	}
+	region := func(deployment, opState, startedAt string) *apitypes.ProgressOperationResponse {
+		return &apitypes.ProgressOperationResponse{
+			Deployment:    deployment,
+			OperationKey:  "orders",
+			OperationKind: storage.ApplyOperationKindWork,
+			State:         opState,
+			CutoverPolicy: storage.CutoverPolicyRolling,
+			OnFailure:     storage.OnFailureHalt,
+			StartedAt:     startedAt,
+		}
+	}
+
+	cases := []struct {
+		name string
+		ops  []*apitypes.ProgressOperationResponse
+		want string
+	}{
+		{
+			name: "continue past a finalizer its own failed work orphaned",
+			want: state.Apply.Failed,
+			ops: []*apitypes.ProgressOperationResponse{
+				shard("payments-001", "-80", state.ApplyOperation.Failed),
+				shard("payments-001", "80-", state.ApplyOperation.Completed),
+				finalizer("payments-001", state.ApplyOperation.Pending, ""),
+				shard("payments-002", "-80", state.ApplyOperation.Completed),
+				shard("payments-002", "80-", state.ApplyOperation.Completed),
+				finalizer("payments-002", state.ApplyOperation.Completed, started),
+			},
+		},
+		{
+			name: "continue while another target's finalizer can still start",
+			want: state.Apply.RunningDegraded,
+			ops: []*apitypes.ProgressOperationResponse{
+				shard("payments-001", "-80", state.ApplyOperation.Completed),
+				shard("payments-001", "80-", state.ApplyOperation.Completed),
+				finalizer("payments-001", state.ApplyOperation.Pending, ""),
+				shard("payments-002", "-80", state.ApplyOperation.Failed),
+				shard("payments-002", "80-", state.ApplyOperation.Completed),
+				finalizer("payments-002", state.ApplyOperation.Pending, ""),
+			},
+		},
+		{
+			name: "halt past work stopped before it started",
+			want: state.Apply.Failed,
+			ops: []*apitypes.ProgressOperationResponse{
+				region("region-a", state.ApplyOperation.Failed, started),
+				region("region-b", state.ApplyOperation.Stopped, ""),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := ParseProgressResponse(&apitypes.ProgressResponse{State: state.Apply.Failed, Operations: tc.ops})
+			model := presentation.Derive(ProgressOperationsForPresentation(data.Operations, data.Released))
+			assert.Equal(t, tc.want, model.State)
+		})
+	}
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/block/schemabot/pkg/caller"
 	"github.com/block/schemabot/pkg/metrics"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
@@ -587,12 +588,38 @@ func (s *Service) executeCutoverForApply(ctx context.Context, client tern.Client
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
 		return nil, 0, err
 	}
-	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+	var turn cutoverTurn
+	if multiOp {
+		turn, err = s.cutoverTurnForRequest(ctx, apply)
+		if err != nil {
+			err := fmt.Errorf("check cutover order for apply %s: %w", apply.ApplyIdentifier, err)
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
+			return nil, 0, err
+		}
+		if hold := turn.hold; hold != nil {
+			s.logger.Info("cutover request rejected because no parked member is at its turn",
+				append(apply.LogAttrs(),
+					"requested_by", caller,
+					"parked_member", hold.parked,
+					"blocking_member", hold.blocker,
+					"blocking_state", hold.blockerState)...)
+			err := controlConflictf("%s", hold.message())
+			metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "rejected")
+			return nil, 0, err
+		}
+	}
+	cutoverReq := &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationCutover,
 		Status:      storage.ControlRequestPending,
 		RequestedBy: caller,
-	})
+	}
+	if turn.taker != nil {
+		// Bind the request to the member whose turn it is, so this one command
+		// cuts over that member and cannot pass on to the next one.
+		cutoverReq.Metadata = storage.CutoverRequestMetadata(turn.taker.ID)
+	}
+	_, alreadyPending, err := controlStore.RequestPending(ctx, cutoverReq)
 	if err != nil {
 		err := fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
 		metrics.RecordControlOperation(ctx, "cutover", apply.Database, apply.Deployment, apply.Environment, "error")
@@ -682,6 +709,128 @@ func (s *Service) cutoverRequestReadiness(ctx context.Context, client tern.Clien
 		return cutoverRequestReady, nil
 	}
 	return cutoverRequestNotReady, nil
+}
+
+// cutoverTurnHold names the members of an ordered rollout when a cutover
+// request has no member that could take it: the first parked member, and the
+// earlier member whose turn it still is.
+type cutoverTurnHold struct {
+	parked       string
+	blocker      string
+	blockerState string
+	// blockerFailed is set when the blocker ended without completing, so the
+	// rollout's on_failure policy (blockerOnFailure) is what holds later
+	// cutovers behind it.
+	blockerFailed    bool
+	blockerOnFailure string
+}
+
+// message is the refusal an operator reads: which member holds the turn, its
+// state, and what lets the rollout go on from there.
+func (h *cutoverTurnHold) message() string {
+	if h.blockerFailed {
+		next := "stop the schema change, or fix the failure and apply again"
+		if h.blockerOnFailure == storage.OnFailurePause {
+			next = "release the rollout to continue past it, or stop the schema change"
+		}
+		return fmt.Sprintf("cutover follows rollout order: %s is %s ahead of %s, and on_failure %s holds every later cutover; %s",
+			h.blocker, h.blockerState, h.parked, h.blockerOnFailure, next)
+	}
+	return fmt.Sprintf("cutover follows rollout order: %s is ahead of %s and is %s; run cutover again once %s has completed",
+		h.blocker, h.parked, h.blockerState, h.blocker)
+}
+
+// cutoverTurn is the intake's answer for a cutover request on a
+// multi-operation apply. taker is the parked operation whose turn it is, which
+// the request is bound to; hold is set instead when no parked member may take
+// the request now. Both are nil when the apply's cutover is unordered, or when
+// no member is parked by task evidence, which leaves the decision to the
+// caller's readiness check.
+type cutoverTurn struct {
+	taker *storage.ApplyOperation
+	hold  *cutoverTurnHold
+}
+
+// cutoverTurnForRequest decides which member of a multi-operation apply that
+// has a member parked at cutover may take a cutover request now. The request is
+// apply-level and only a parked member whose turn it is may take it (the
+// drive's own gate, operationCutoverRequestTurn in pkg/tern), so accepting one
+// while every parked member waits on an earlier member would queue it for a
+// consumer that is not there yet. A parked member under an unordered cutover
+// policy takes the request as it always has. The turn is decided by storage
+// CutoverBlocker, the rule the automatic cutover claim follows.
+func (s *Service) cutoverTurnForRequest(ctx context.Context, apply *storage.Apply) (cutoverTurn, error) {
+	opStore := s.storage.ApplyOperations()
+	ops, err := opStore.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return cutoverTurn{}, fmt.Errorf("list apply operations for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	taskStore := s.storage.Tasks()
+	if taskStore == nil {
+		return cutoverTurn{}, fmt.Errorf("task store is not available")
+	}
+	tasks, err := taskStore.GetByApplyID(ctx, apply.ID)
+	if err != nil {
+		return cutoverTurn{}, fmt.Errorf("load tasks for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	parked := make(map[int64]bool, len(ops))
+	for _, task := range tasks {
+		if task.ApplyOperationID == nil {
+			continue
+		}
+		if state.IsState(task.State, state.Task.WaitingForCutover, state.Task.CuttingOver) {
+			parked[*task.ApplyOperationID] = true
+		}
+	}
+	names := memberDisplayNames(ops)
+	var turn cutoverTurn
+	for i, op := range ops {
+		if !parked[op.ID] {
+			continue
+		}
+		if !storage.IsOrderedCutoverPolicy(op.CutoverPolicy) {
+			return cutoverTurn{}, nil
+		}
+		blocker, err := opStore.CutoverBlocker(ctx, op.ID)
+		if err != nil {
+			return cutoverTurn{}, fmt.Errorf("check cutover order for member %s of apply %s: %w", names[i], apply.ApplyIdentifier, err)
+		}
+		if blocker == nil {
+			return cutoverTurn{taker: op}, nil
+		}
+		if turn.hold == nil {
+			turn.hold = &cutoverTurnHold{
+				parked:           names[i],
+				blocker:          memberDisplayName(ops, names, blocker),
+				blockerState:     blocker.State,
+				blockerFailed:    state.IsApplyOperationTerminal(blocker.State) && !state.IsState(blocker.State, state.ApplyOperation.Completed),
+				blockerOnFailure: blocker.OnFailure,
+			}
+		}
+	}
+	return turn, nil
+}
+
+// memberDisplayNames resolves the operator-facing name of every operation of
+// an apply, naming a member by deployment/target only where its deployment
+// addresses several targets — the rule the PR comment labels members by.
+func memberDisplayNames(ops []*storage.ApplyOperation) []string {
+	members := make([]routing.ExecutionTarget, len(ops))
+	for i, op := range ops {
+		members[i] = routing.ExecutionTarget{Deployment: op.Deployment, Target: op.Target}
+	}
+	return routing.DisplayNames(members)
+}
+
+// memberDisplayName returns op's name from names, index-parallel to ops,
+// falling back to its deployment when op is not among them.
+func memberDisplayName(ops []*storage.ApplyOperation, names []string, op *storage.ApplyOperation) string {
+	for i, candidate := range ops {
+		if candidate.ID == op.ID {
+			return names[i]
+		}
+	}
+	return op.Deployment
 }
 
 // StopRequest is the HTTP request body for POST /api/stop.
@@ -1452,12 +1601,21 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 
 	now := time.Now()
 	oldState := apply.State
-	apply.State = state.Apply.Stopped
-	apply.CompletedAt = &now
-	apply.UpdatedAt = now
-	if err := s.storage.Applies().Update(ctx, apply); err != nil {
-		return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
+	synced := *apply
+	synced.State = state.Apply.Stopped
+	synced.CompletedAt = &now
+	synced.UpdatedAt = now
+	if err := s.storage.Applies().Update(ctx, &synced); err != nil {
+		if !errors.Is(err, storage.ErrApplyReopenRefused) {
+			return fmt.Errorf("sync remote stopped apply %s before start: %w", apply.ApplyIdentifier, err)
+		}
+		// The remote check takes real time, and the apply finished in storage
+		// while it ran. Writing stopped over that verdict would make a finished
+		// apply startable again, so the start proceeds from the stored row and
+		// the pending stop stays with whoever finished it.
+		return s.reloadApplyAfterRefusedStopSync(ctx, apply, oldState, stopCaller, caller)
 	}
+	*apply = synced
 	if err := controlStore.CompletePending(ctx, apply.ID, storage.ControlOperationStop); err != nil {
 		return fmt.Errorf("complete pending remote stop control request for apply %s before start: %w", apply.ApplyIdentifier, err)
 	}
@@ -1466,6 +1624,28 @@ func (s *Service) completeResolvedStopBeforeStart(ctx context.Context, client te
 			"requested_by", stopCaller, "start_requested_by", caller, "old_state", oldState, "new_state", apply.State)...)
 	s.logControlOperationForApply(ctx, apply, stopCaller, storage.LogEventStopRequested,
 		"Pending remote stop request completed before start")
+	return nil
+}
+
+// reloadApplyAfterRefusedStopSync replaces the handler's copy of the apply with
+// the stored row after storage refused to write stopped over a finished apply,
+// then validates the start against that row, so the operator is refused for
+// the verdict that won rather than for the stop request it left pending.
+func (s *Service) reloadApplyAfterRefusedStopSync(ctx context.Context, apply *storage.Apply, readState, stopCaller, caller string) error {
+	fresh, err := s.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("reload apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, err)
+	}
+	if fresh == nil {
+		return fmt.Errorf("reload apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	*apply = *fresh
+	s.logger.Info("apply finished while the remote stop check ran; stop request left pending and start revalidated against the stored state",
+		append(apply.LogAttrs(),
+			"requested_by", stopCaller, "start_requested_by", caller, "read_state", readState)...)
+	if err := validateStartRequestState(apply); err != nil {
+		return fmt.Errorf("start apply %s after it finished during the remote stop check: %w", apply.ApplyIdentifier, err)
+	}
 	return nil
 }
 

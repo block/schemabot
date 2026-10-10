@@ -298,11 +298,18 @@ func (s *listingApplyOperationStore) ListByApply(context.Context, int64) ([]*sto
 // recordingApplyStore captures the projection persisted by UpdateDerivedState so
 // the test can assert the derived state and completed_at stamping. swapped is
 // returned to model whether the compare-and-swap matched the expected state.
+// supersededBy is the handoff marker the stored row carries, which the
+// projection reads from storage whatever the caller's copy says.
 type recordingApplyStore struct {
 	storage.ApplyStore
 	updated       *storage.Apply
 	expectedState string
 	swapped       bool
+	supersededBy  string
+}
+
+func (s *recordingApplyStore) GetSupersededBy(context.Context, int64) (string, error) {
+	return s.supersededBy, nil
 }
 
 func (s *recordingApplyStore) UpdateDerivedState(_ context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
@@ -483,16 +490,20 @@ func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T)
 // read "all attached operations succeeded" (or "an attached operation
 // reverted") as the generation's outcome while declared siblings are still on
 // their way — it holds the apply running instead, for completed and reverted
-// alike. Failure verdicts pass through unheld, and an apply without a manifest
-// keeps the attached-rows-only semantics.
+// alike. Once a newer generation has taken over the apply's work, recorded on
+// the stored row, the missing siblings can no longer arrive, so the hold ends
+// and the verdict is the one over what attached.
+// Failure verdicts pass through unheld, and an apply without a manifest keeps
+// the attached-rows-only semantics.
 func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 	const shardA, shardB = "ns/-80/users", "ns/80-/users"
 	cases := []struct {
-		name      string
-		manifest  []string
-		ops       []*storage.ApplyOperation
-		wantState string
-		wantDone  bool
+		name         string
+		manifest     []string
+		ops          []*storage.ApplyOperation
+		supersededBy string
+		wantState    string
+		wantDone     bool
 	}{
 		{
 			name:     "completed attached subset holds the apply running",
@@ -502,6 +513,16 @@ func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 			},
 			wantState: state.Apply.Running,
 			wantDone:  false,
+		},
+		{
+			name:     "a newer generation taking over the work settles the completed attached subset",
+			manifest: []string{shardA, shardB},
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Completed},
+			},
+			supersededBy: "apply-newer",
+			wantState:    state.Apply.Completed,
+			wantDone:     true,
 		},
 		{
 			name:     "full manifest attached and completed completes the apply",
@@ -553,7 +574,7 @@ func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			applyStore := &recordingApplyStore{swapped: true}
+			applyStore := &recordingApplyStore{swapped: true, supersededBy: tc.supersededBy}
 			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
 
 			apply := &storage.Apply{
@@ -1421,19 +1442,29 @@ func (s *recoverOperationStore) MarkFailed(_ context.Context, _ int64, errMsg st
 	return nil
 }
 
+func (s *recoverOperationStore) MarkCompleted(_ context.Context, _ int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.op.State = state.ApplyOperation.Completed
+	return nil
+}
+
 func (s *recoverOperationStore) Heartbeat(context.Context, int64) error { return nil }
 
 // recoverTestStorage wires the stores the recover flow touches, including the
-// plan lookup the routing tern client requires to build.
+// plan lookup the routing tern client requires to build. tasks is nil unless a
+// test needs the operation's own task rows to be readable after the drive.
 type recoverTestStorage struct {
 	mockStorage
 	applies storage.ApplyStore
 	ops     storage.ApplyOperationStore
 	control storage.ControlRequestStore
+	tasks   storage.TaskStore
 }
 
 func (s *recoverTestStorage) Applies() storage.ApplyStore                  { return s.applies }
 func (s *recoverTestStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
+func (s *recoverTestStorage) Tasks() storage.TaskStore                     { return s.tasks }
 func (s *recoverTestStorage) Plans() storage.PlanStore                     { return &staticPlanStore{} }
 func (s *recoverTestStorage) ControlRequests() storage.ControlRequestStore { return s.control }
 
@@ -1481,6 +1512,57 @@ func TestRecoverMultiApplyOperation_FailsTaskLessOperationAgainstReloadedParent(
 		"the parent apply must be failed after the task-less operation is terminalized against the reloaded running state")
 	assert.Equal(t, state.ApplyOperation.Failed, opStore.op.State,
 		"the task-less operation row must be marked failed")
+}
+
+// When a multi-deployment operation's sequential drive finds one of its task
+// rows gone, the rows that remain would derive a verdict the vanished task never
+// earned: here the surviving task is completed, so deriving from it alone would
+// mark the operation completed with one table's DDL never run. The recover flow
+// must leave the operation row as found — running and claimable — and must not
+// touch the parent projection, so the apply stays visible as stuck rather than
+// settling to a false terminal state.
+func TestRecoverMultiApplyOperation_MissingTaskRowLeavesOperationUnprojected(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+
+	applyStore := &casApplyStore{
+		template: storage.Apply{
+			ID:              7,
+			ApplyIdentifier: "apply-multi-op-missing-task",
+			Database:        "testdb",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+		},
+		state: state.Apply.Running,
+	}
+	opStore := &recoverOperationStore{op: &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}}
+	survivingTasks := &stubTaskStore{tasks: []*storage.Task{
+		{ID: 1, ApplyID: 7, TaskIdentifier: "task-1", State: state.Task.Completed},
+	}}
+	deploymentClient := &mockTernClient{resumeErr: tern.ErrApplyTaskRowMissing}
+
+	svc := New(
+		&recoverTestStorage{applies: applyStore, ops: opStore, control: &fakeControlRequestStore{}, tasks: survivingTasks},
+		testServerConfig(),
+		map[string]tern.Client{"west/staging": deploymentClient},
+		logger,
+	)
+
+	svc.recoverMultiApplyOperation(t.Context(), 1, &storage.ApplyOperation{
+		ID:         42,
+		ApplyID:    7,
+		Deployment: "west",
+		State:      state.ApplyOperation.Running,
+	}, storage.OperationLease{})
+
+	assert.Equal(t, state.ApplyOperation.Running, opStore.op.State,
+		"the operation row must stay running and claimable; its surviving completed task must not be projected as the operation's verdict")
+	assert.Equal(t, state.Apply.Running, applyStore.currentState(),
+		"the parent apply must stay running; a vanished task row settles nothing")
 }
 
 // cutoverOpStore backs the cutover claim path: FindNextApplyOperationCutover
@@ -2068,8 +2150,8 @@ func TestDriveTick_ContainsOperationClaimPanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 2, ops.claims, "the driver must keep polling after each contained panic")
 }
 
@@ -2082,8 +2164,8 @@ func TestDriveTick_ContainsStopReconciliationProbePanic(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	svc := New(&mockStorageWithApplyStores{applies: applies, operations: ops}, testServerConfig(), nil, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 2, applies.stopProbes, "the driver must keep probing after each contained panic")
 	assert.Zero(t, ops.claims, "the panic consumed the tick before the operation claim")
 }
@@ -2125,7 +2207,7 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 		"east/staging": client,
 	}, logger)
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 1, ops.claims)
 	assert.True(t, state.IsState(op.State, state.ApplyOperation.Failed),
 		"the poisoned operation row must be failed so it is not re-claimed")
@@ -2133,7 +2215,7 @@ func TestDriveTick_ContainsDrivePanicUnderOperationClaimAndKeepsClaiming(t *test
 	assert.True(t, state.IsState(applies.apply.State, state.Apply.Failed),
 		"the parent apply must be failed under the dual-lease containment")
 
-	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0) })
+	require.NotPanics(t, func() { svc.driveTick(t.Context(), 0, openClaimGate()) })
 	assert.Equal(t, 2, ops.claims,
 		"the driver must keep claiming after containing the panic, and the failed operation must not be claimable")
 }

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -278,7 +280,7 @@ func TestAuthorizeDirectAdminWrite(t *testing.T) {
 // returns the response, for asserting on handler-level scoped-write denials.
 func scopedDenialRequest(t *testing.T, handler http.HandlerFunc, user *auth.User, method, target, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	ctx := auth.WithUser(t.Context(), user)
+	ctx := auth.WithVerifiedUser(t.Context(), user)
 	req := httptest.NewRequestWithContext(ctx, method, target, strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handler(rec, req)
@@ -323,7 +325,11 @@ func TestHandlersEnforceScopedWriteDenials(t *testing.T) {
 			`{"plan_id":"plan-1","environment":"staging"}`)
 
 		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-		assert.Contains(t, rec.Body.String(), "get plan plan-1")
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Contains(t, resp.Error, "failed to get plan plan-1")
+		assert.NotContains(t, resp.Error, assert.AnError.Error(), "the storage error stays in the server log")
 	})
 
 	t.Run("apply rejects a plan that does not exist at decision time", func(t *testing.T) {
@@ -332,8 +338,11 @@ func TestHandlersEnforceScopedWriteDenials(t *testing.T) {
 		rec := scopedDenialRequest(t, svc.handleApply, operator, http.MethodPost, "/api/apply",
 			`{"plan_id":"plan-missing","environment":"staging"}`)
 
-		assert.Equal(t, http.StatusInternalServerError, rec.Code)
-		assert.Contains(t, rec.Body.String(), "plan not found: plan-missing",
+		assert.Equal(t, http.StatusNotFound, rec.Code)
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(rec.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Contains(t, resp.Error, "plan not found: plan-missing",
 			"the authorization decision is bound to a plan that exists when it is made")
 	})
 
@@ -397,10 +406,10 @@ func (s *recordingLockStore) Release(context.Context, string, string, string) er
 }
 
 // Force lock release bypasses the ownership check, so it is an administrative
-// override: a database operator's grant covers releasing their own team's
-// locks, but never force-releasing someone else's — for example an admin's
-// incident lock holding applies off the database. Only deployment write-group
-// members may force.
+// override: a database operator's grant covers releasing locks their own
+// operator group took, but never force-releasing someone else's — for example
+// an admin's incident lock holding applies off the database. Only deployment
+// write-group members may force.
 func TestForceLockReleaseIsAdminOnly(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	body := `{"database":"payments","database_type":"mysql","force":true}`
@@ -414,6 +423,7 @@ func TestForceLockReleaseIsAdminOnly(t *testing.T) {
 		assert.Equal(t, http.StatusForbidden, rec.Code)
 		assert.Contains(t, rec.Body.String(), "schema-admins", "the denial names the write groups that may force")
 		assert.False(t, locks.forceReleased, "the handler must not reach storage on a denied force release")
+		assert.False(t, locks.released, "a denied force release must not fall through to a normal release")
 	})
 
 	t.Run("a deployment write-group member may force", func(t *testing.T) {
@@ -426,14 +436,15 @@ func TestForceLockReleaseIsAdminOnly(t *testing.T) {
 		assert.True(t, locks.forceReleased)
 	})
 
-	t.Run("a scoped operator's normal release on their granted database proceeds", func(t *testing.T) {
-		locks := &recordingLockStore{}
+	t.Run("a scoped operator's normal release of their group's lock proceeds", func(t *testing.T) {
+		locks := &memoryLockStore{lock: paymentsLock(1, "bob",
+			&storage.LockAcquirer{Subject: "bob", OperatorGroups: []string{"payments-team"}})}
 		svc := New(&mockStorageWithApplyStores{locks: locks}, scopedWriteConfig(), nil, logger)
 		operator := &auth.User{Subject: "bob", Groups: []string{"payments-team"}}
 		rec := scopedDenialRequest(t, svc.handleLockRelease, operator, http.MethodDelete, "/api/locks",
 			`{"database":"payments","database_type":"mysql","owner":"bob"}`)
 
-		assert.Equal(t, http.StatusOK, rec.Code)
-		assert.True(t, locks.released, "the ownership-checked release path serves the operator grant")
+		assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		assert.Nil(t, locks.lock, "the ownership-checked release path serves the operator grant")
 	})
 }

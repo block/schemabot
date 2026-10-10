@@ -42,14 +42,19 @@ type ProgressOperation struct {
 	OperationKey        string
 	ExternalID          string
 	ExternalOperationID string
+	OperationKind       string
 	Target              string
 	State               string
 	CutoverPolicy       string
 	OnFailure           string
 	ErrorMessage        string
 	ErrorCode           string
-	StartedAt           string
-	CompletedAt         string
+	AlreadyConverged    bool
+	// RolloutStep is the table step the operation runs when the rollout runs
+	// table by table, and 0 otherwise.
+	RolloutStep int
+	StartedAt   string
+	CompletedAt string
 }
 
 // TableProgress represents progress for a single table schema change.
@@ -69,6 +74,9 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// EstimatedBytes is the table's on-disk size when it was planned, shown
+	// beside the row counts. Nil when the plan had no estimate.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -79,7 +87,24 @@ type TableProgress struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
-	Shards         []ShardProgress
+	// Shards is the table's per-part progress: one entry per shard, or one per
+	// target when AcrossTargets is set.
+	Shards []ShardProgress
+	// AcrossTargets marks a table that stands for one change across a
+	// rollout's targets, rolled up the way a sharded table rolls up its shards.
+	AcrossTargets bool
+	// OnTargets names the targets a rolled-up table's DDL runs on when they
+	// are only some of the deployment's, shown above the DDL. Empty when the
+	// DDL runs on every target.
+	OnTargets string
+	// UnreportedTargets counts the targets a rolled-up table speaks for that
+	// are still to run and have reported no progress yet, so have not started
+	// it. A settled target is not among them.
+	UnreportedTargets int
+	// RolloutSettled marks a rolled-up table whose rollout has settled with no
+	// target left to run, so a target still pending on it never starts it and
+	// reads as not started rather than queued.
+	RolloutSettled bool
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -91,18 +116,6 @@ type ShardProgress struct {
 	ETASeconds      int64
 	PercentComplete int
 	CutoverAttempts int
-}
-
-// ShardCounts holds aggregated shard status counts.
-type ShardCounts struct {
-	Total             int
-	Complete          int
-	Running           int
-	WaitingForCutover int
-	CuttingOver       int
-	Queued            int
-	Failed            int
-	Cancelled         int
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -146,12 +159,15 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			OperationKey:        op.OperationKey,
 			ExternalID:          op.ExternalID,
 			ExternalOperationID: op.ExternalOperationID,
+			OperationKind:       op.OperationKind,
 			Target:              op.Target,
 			State:               state.NormalizeState(op.State),
 			CutoverPolicy:       op.CutoverPolicy,
 			OnFailure:           op.OnFailure,
 			ErrorMessage:        op.ErrorMessage,
 			ErrorCode:           op.ErrorCode,
+			AlreadyConverged:    op.AlreadyConverged,
+			RolloutStep:         op.RolloutStep,
 			StartedAt:           op.StartedAt,
 			CompletedAt:         op.CompletedAt,
 		})
@@ -169,6 +185,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
+			EstimatedBytes:      tbl.EstimatedBytes,
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,

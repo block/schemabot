@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
@@ -48,9 +49,11 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 		// goal state and reads as success; a deploy request that closed by
 		// completing means the schema change landed before the cancel arrived,
 		// so the caller must reconcile to the completed outcome rather than
-		// retry a rejection that can never succeed; every other state stays a
-		// plain error naming the live state, since reporting a successful
-		// cancel there would misrepresent what happened on the target.
+		// retry a rejection that can never succeed; a deploy request that has
+		// not been deployed is closed instead, since cancel only reaches a
+		// queued or running deploy; every other state stays a plain error
+		// naming the live state, since reporting a successful cancel there
+		// would misrepresent what happened on the target.
 		dr, getErr := client.GetDeployRequest(ctx, &ps.GetDeployRequestRequest{
 			Organization: credOrg(req.Credentials),
 			Database:     req.Database,
@@ -88,6 +91,8 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 			}, nil
 		case cancelRejectionAlreadyCompleted:
 			return nil, engine.NewAlreadyCompletedError("cancel deploy request #%d rejected: the deploy request completed before the cancel arrived (deployment state %q): %w", meta.DeployRequestID, dr.DeploymentState, err)
+		case cancelRejectionUndeployed:
+			return e.closeUndeployedDeployRequest(ctx, client, req, meta.DeployRequestID, dr, err)
 		default:
 			return nil, fmt.Errorf("cancel deploy request #%d rejected in deployment state %q: %w", meta.DeployRequestID, dr.DeploymentState, err)
 		}
@@ -98,6 +103,96 @@ func (e *Engine) cancelDeployRequest(ctx context.Context, operation engine.Contr
 		Message:     "Deploy request cancelled",
 		ResumeState: req.ResumeState,
 	}, nil
+}
+
+// deployRequestClosed is the deploy request state PlanetScale reports once a
+// deploy request is closed, whether by closing it or by its deploy finishing.
+const deployRequestClosed = "closed"
+
+// closeUndeployedDeployRequest retires a deploy request whose cancel was
+// rejected because it has not been deployed. PlanetScale's cancel only reaches
+// a deploy that is queued or running; a deploy request that is still pending
+// or ready — a deferred deploy waiting for its start — is retired by closing
+// it, which leaves nothing on the target to run. A deploy request a prior
+// attempt already closed reads as the goal state, so a retried cancel or stop
+// settles instead of closing twice.
+func (e *Engine) closeUndeployedDeployRequest(ctx context.Context, client psclient.PSClient, req *engine.ControlRequest, number uint64, dr *ps.DeployRequest, cancelErr error) (*engine.ControlResult, error) {
+	if dr.DeployedAt != nil {
+		// A deploy request that reports a deploy while its deployment state
+		// still reads undeployed is a backend surprise; closing it could race a
+		// deploy that has begun, so the rejection surfaces naming the state.
+		return nil, fmt.Errorf("cancel deploy request #%d rejected in deployment state %q after it reported a deploy: %w", number, dr.DeploymentState, cancelErr)
+	}
+	if dr.State == deployRequestClosed {
+		e.logger.Info("deploy request was already closed before it was deployed; the cancel settles",
+			"database", req.Database,
+			"deploy_request", number,
+			"deployment_state", dr.DeploymentState)
+		return &engine.ControlResult{
+			Accepted:    true,
+			Message:     fmt.Sprintf("Deploy request #%d already closed before it was deployed", number),
+			ResumeState: req.ResumeState,
+		}, nil
+	}
+	e.logger.Info("cancel rejected because the deploy request has not been deployed; closing it instead",
+		"database", req.Database,
+		"deploy_request", number,
+		"deployment_state", dr.DeploymentState)
+	closed, closeErr := client.CloseDeployRequest(ctx, &ps.CloseDeployRequestRequest{
+		Organization: credOrg(req.Credentials),
+		Database:     req.Database,
+		Number:       number,
+	})
+	if closeErr != nil {
+		return nil, fmt.Errorf("close undeployed deploy request #%d in deployment state %q after its cancel was rejected (%w): %w", number, dr.DeploymentState, cancelErr, closeErr)
+	}
+	// The state classified above is one round trip old. A deferred deploy
+	// request stays startable from the PlanetScale UI in that window, so the
+	// close response — not the backend's acceptance of the close alone — is
+	// what proves nothing deployed. A response that reports a deploy means
+	// the cancel has not taken effect; the plain error is retryable so the
+	// next attempt's cancel reaches the now-queued deploy.
+	if closed == nil {
+		return nil, fmt.Errorf("close undeployed deploy request #%d after its rejected cancel (%w): close returned no deploy request", number, cancelErr)
+	}
+	if deployRequestReportsDeploy(closed) {
+		return nil, fmt.Errorf("close of deploy request #%d after its rejected cancel (%w) reported a deploy (deployment state %q, deployed at %s); the cancel has not taken effect",
+			number, cancelErr, closed.DeploymentState, formatDeployedAt(closed.DeployedAt))
+	}
+	return &engine.ControlResult{
+		Accepted:    true,
+		Message:     fmt.Sprintf("Deploy request #%d closed before it was deployed", number),
+		ResumeState: req.ResumeState,
+	}, nil
+}
+
+// deployRequestReportsDeploy reports whether a deploy request carries any
+// evidence that its deploy began: a deploy timestamp, or a deployment state
+// past the undeployed ones. Either field alone is enough; the two are not
+// guaranteed to move together.
+func deployRequestReportsDeploy(dr *ps.DeployRequest) bool {
+	if dr.DeployedAt != nil {
+		return true
+	}
+	class, classified := classifyCancelRejection(dr.DeploymentState)
+	return !classified || class != cancelRejectionUndeployed
+}
+
+// deployRequestClosedUndeployed recognises a deploy request that was closed
+// before its deploy began — the outcome of a cancel on a deferred deploy
+// waiting for its start. Progress reports it as cancelled and resume
+// reattaches without deploying. A closed request whose deployment state or
+// deploy timestamp reports a deploy was closed by deploying, not by cancel,
+// and is not matched here.
+func deployRequestClosedUndeployed(dr *ps.DeployRequest) bool {
+	return dr.State == deployRequestClosed && !deployRequestReportsDeploy(dr)
+}
+
+func formatDeployedAt(t *time.Time) string {
+	if t == nil {
+		return "never"
+	}
+	return t.UTC().Format(time.RFC3339)
 }
 
 // cancelRejectionClass names how a rejected cancel must be reported, given the
@@ -114,6 +209,11 @@ const (
 	// so the caller reconciles stored state to the completed outcome instead
 	// of retrying a rejection that can never succeed.
 	cancelRejectionAlreadyCompleted
+	// cancelRejectionUndeployed: the deploy request has not been deployed, so
+	// there is no queued or running deploy for a cancel to reach. The deploy
+	// request is closed instead, which is how PlanetScale retires one that
+	// never deployed.
+	cancelRejectionUndeployed
 	// cancelRejectionStateError: the rejection stays a plain error naming the
 	// deploy request's live state — reporting a successful cancel or a
 	// completed change there would misrepresent what happened on the target.
@@ -139,8 +239,11 @@ func classifyCancelRejection(deploymentState string) (class cancelRejectionClass
 		// the window closes the deploy request settles to complete and a
 		// still-pending cancel reconciles then.
 		return cancelRejectionStateError, true
-	case deployState.Pending, deployState.Ready, deployState.Submitting, deployState.Queued,
-		deployState.InProgress, deployState.PendingCutover, deployState.InProgressCutover,
+	case deployState.Pending, deployState.Ready:
+		// Pending and ready precede the deploy: cancel has nothing to reach,
+		// and closing the deploy request is what retires it.
+		return cancelRejectionUndeployed, true
+	case deployState.Submitting, deployState.Queued, deployState.InProgress, deployState.PendingCutover, deployState.InProgressCutover,
 		deployState.InProgressVSchema:
 		// A cancel rejected while the deploy request is still live is a
 		// backend surprise — surface it as an error naming the state rather
@@ -189,7 +292,7 @@ func (e *Engine) Start(ctx context.Context, req *engine.ControlRequest) (*engine
 	// apply, resume, recovered deploy request) records the already-gated decision
 	// — an unsafe or cutover-deferred change is stored with IsInstant=false, so
 	// starting from stored state cannot widen the decision.
-	dr, deployErr := e.deployDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID, meta.IsInstant)
+	dr, deployErr := e.deployDeployRequest(ctx, client, credOrg(req.Credentials), req.Database, meta.DeployRequestID, meta.IsInstant, nil)
 	if deployErr != nil {
 		return nil, deployErr
 	}
