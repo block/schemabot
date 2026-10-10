@@ -456,3 +456,13 @@ func TestBuildResolverRejectsNeitherConfigured(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither etre nor static")
 }
+
+// A MySQL resolver always carries the writer probe, so a lookup matching both
+// sides of a replicated pair resolves to the writer. Every other engine has no
+// probe and keeps refusing a lookup that matches more than one entity.
+func TestEtreWriterProbe(t *testing.T) {
+	assert.Equal(t, inventory.MySQLWriterProbe{ConnectTimeout: writerProbeConnectTimeout}, etreWriterProbe(EtreConfig{DatabaseType: storage.DatabaseTypeMySQL}))
+	for _, dbType := range []string{storage.DatabaseTypeStrata, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres} {
+		assert.Nil(t, etreWriterProbe(EtreConfig{DatabaseType: dbType}), dbType)
+	}
+}
