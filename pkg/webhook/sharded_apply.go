@@ -88,7 +88,7 @@ func buildShardedApplyData(apply *storage.Apply, ops []*storage.ApplyOperation, 
 			if !isFinalizer {
 				continue
 			}
-			status := vschemaStatusForOperationState(apply.State, op.State)
+			status := presentation.FinalizerVSchemaStatus(apply.State, op.State)
 			if view.finalizesOnly(finalizerNS) {
 				finalizes = append(finalizes, templates.ShardedFinalize{Keyspace: finalizerNS, Status: status})
 			} else {
@@ -366,40 +366,6 @@ func (c *shardedPlanCache) store(apply *storage.Apply, plan *shardedPlanView) *s
 	return plan
 }
 
-// vschemaStatusForOperationState projects a finalizer operation's state onto
-// the VSchema display status vocabulary the single-deployment comment uses, so
-// both comment shapes describe VSchema application identically: applied when
-// the finalizer completed, applying while it runs, failed on a failure
-// (terminal or auto-retrying), and pending (empty) before it starts. A
-// finalizer whose rollout ended without running it reads as cancelled rather
-// than pending, so the terminal summary never promises VSchema work that no
-// claim arm will run. That covers both routes to a dead row: the operation
-// itself holds cancelled or reverted (written by the cancel path or mirrored
-// from the settled parent by the stranded-operation reaper), and the row
-// still pending under a parent whose verdict is already final — a halted
-// rollout terminalizes the apply immediately, while the reaper only settles
-// the stranded row minutes later, well after the summary posted. Stopped —
-// on the operation or the parent — stays its own status: a stopped apply is
-// resumable, so its finalizer may yet run, but "pending" would overpromise.
-func vschemaStatusForOperationState(applyState, opState string) string {
-	switch {
-	case state.IsState(opState, state.ApplyOperation.Completed):
-		return "applied"
-	case state.IsState(opState, state.ApplyOperation.Running):
-		return "applying"
-	case isOperationFailureState(opState):
-		return "failed"
-	case state.IsState(opState, state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted):
-		return "cancelled"
-	case state.IsState(opState, state.ApplyOperation.Stopped) || state.IsState(applyState, state.Apply.Stopped):
-		return "stopped"
-	case state.IsTerminalApplyState(applyState):
-		return "cancelled"
-	default:
-		return ""
-	}
-}
-
 // isOperationFailureState reports whether an operation's state carries
 // an operator-facing error — a terminal failure or an automatic retry after
 // one, mirroring the shard-failure vocabulary.
@@ -478,15 +444,9 @@ func shardStatusesByKeyspace(groups []shardWorkGroup, qualifyIdentity bool, rele
 // siblings copy. Each table carries its planned size from the stored plan.
 func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, view *shardedPlanView) map[string][]templates.ShardedTableStatus {
 	type keyspaceTable struct{ namespace, table string }
-	type tableRollup struct {
-		shards          []templates.ShardProgressData
-		rowsCopied      int64
-		rowsTotal       int64
-		etaSeconds      int64
-		shardsReporting int
-	}
 	var order []keyspaceTable
-	rollups := make(map[keyspaceTable]*tableRollup)
+	shardsByTable := make(map[keyspaceTable][]templates.ShardProgressData)
+	copiesByTable := make(map[keyspaceTable][]presentation.ShardCopy)
 	for _, op := range ops {
 		ns, shard, table, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
@@ -494,154 +454,50 @@ func shardedTableStatusesByKeyspace(ops []*storage.ApplyOperation, tasksByOp map
 			continue
 		}
 		key := keyspaceTable{namespace: ns, table: table}
-		r := rollups[key]
-		if r == nil {
-			r = &tableRollup{}
-			rollups[key] = r
+		if _, seen := copiesByTable[key]; !seen {
 			order = append(order, key)
 		}
-		sp := shardTaskProgress(op, tasksByOp[op.ID])
-		r.shards = append(r.shards, templates.ShardProgressData{
+		sp := shardOperationCopy(op, tasksByOp[op.ID])
+		copiesByTable[key] = append(copiesByTable[key], sp)
+		shardsByTable[key] = append(shardsByTable[key], templates.ShardProgressData{
 			Shard:           shard,
-			Status:          sp.status,
-			PercentComplete: sp.percent,
+			Status:          sp.Status,
+			PercentComplete: sp.PercentComplete,
 		})
-		// Rows sum across the shards that have reported; the ETA is the slowest
-		// reporting shard's. A shard counts as reporting only once it carries a
-		// row total, and all of its figures are gated on that together — the
-		// numerator, denominator, ETA, and coverage count always describe the
-		// same set of shards, so a shard with copied rows but no total yet
-		// cannot inflate the fraction's numerator alone. Shards whose dispatch
-		// wave has not started contribute nothing, and the renderer discloses
-		// the coverage instead of presenting a wave's figures as the table's.
-		if sp.rowsTotal > 0 {
-			r.shardsReporting++
-			r.rowsCopied += sp.rowsCopied
-			r.rowsTotal += sp.rowsTotal
-			if sp.etaSeconds > r.etaSeconds {
-				r.etaSeconds = sp.etaSeconds
-			}
-		}
 	}
 	out := make(map[string][]templates.ShardedTableStatus, len(order))
 	for _, key := range order {
-		r := rollups[key]
+		rollup := presentation.RollUpShardedTable(copiesByTable[key])
 		estimatedBytes, plannedShards := view.plannedSize(key.namespace, key.table)
 		out[key.namespace] = append(out[key.namespace], templates.ShardedTableStatus{
 			Table:           key.table,
-			Status:          aggregateTableStatus(r.shards),
-			RowsCopied:      r.rowsCopied,
-			RowsTotal:       r.rowsTotal,
-			ETASeconds:      r.etaSeconds,
-			ShardsReporting: r.shardsReporting,
+			Status:          rollup.Status,
+			RowsCopied:      rollup.RowsCopied,
+			RowsTotal:       rollup.RowsTotal,
+			ETASeconds:      rollup.ETASeconds,
+			ShardsReporting: rollup.ShardsReporting,
 			EstimatedBytes:  estimatedBytes,
 			PlannedShards:   plannedShards,
-			Shards:          r.shards,
+			Shards:          shardsByTable[key],
 		})
 	}
 	return out
 }
 
-// shardProgress is one (shard, table) operation's display projection: the
-// state and copy figures of its most attention-worthy task.
-type shardProgress struct {
-	status     string
-	percent    int
-	rowsCopied int64
-	rowsTotal  int64
-	etaSeconds int64
-}
-
-// shardTaskProgress resolves one (shard, table) operation's display status and
-// copy figures from its most attention-worthy task — the task is where the
-// engine reports live shard state. The operation state stands in when the
-// operation has no tasks yet (dispatch creates them when its wave starts) or a
-// task has not reported state; it normalizes into the same vocabulary.
-func shardTaskProgress(op *storage.ApplyOperation, tasks []*storage.Task) shardProgress {
-	best := shardProgress{}
+// shardOperationCopy resolves one (shard, table) operation's display progress
+// from its stored tasks (presentation.ShardOperationCopy).
+func shardOperationCopy(op *storage.ApplyOperation, tasks []*storage.Task) presentation.ShardCopy {
+	copies := make([]presentation.ShardCopy, 0, len(tasks))
 	for _, t := range tasks {
-		status := t.State
-		if status == "" {
-			status = op.State
-		}
-		if best.status == "" || taskStateRank(status) > taskStateRank(best.status) {
-			best = shardProgress{
-				status:     status,
-				percent:    t.ProgressPercent,
-				rowsCopied: t.RowsCopied,
-				rowsTotal:  t.RowsTotal,
-				etaSeconds: int64(t.ETASeconds),
-			}
-		}
+		copies = append(copies, presentation.ShardCopy{
+			Status:          t.State,
+			PercentComplete: t.ProgressPercent,
+			RowsCopied:      t.RowsCopied,
+			RowsTotal:       t.RowsTotal,
+			ETASeconds:      int64(t.ETASeconds),
+		})
 	}
-	if best.status == "" {
-		return shardProgress{status: op.State}
-	}
-	return best
-}
-
-// aggregateTableStatus reduces a table's per-shard states to the one an
-// operator should act on first: failure over active work, active work over
-// waiting, waiting over done.
-func aggregateTableStatus(shards []templates.ShardProgressData) string {
-	best := shards[0].Status
-	for _, sh := range shards[1:] {
-		if taskStateRank(sh.Status) > taskStateRank(best) {
-			best = sh.Status
-		}
-	}
-	return best
-}
-
-// taskStateRank orders task states by how much they demand attention — the
-// task-vocabulary analogue of shardStateRank, normalizing first so operation
-// states fed through the no-task fallback rank the same way. Failure ranks
-// highest, then active work, then paused and queued work, then the settled
-// states. Pending outranks the revert window, matching deriveOverallState's
-// precedence: a table with undispatched shards still has work ahead of it,
-// however its landed shards hold, so the aggregate must not read as complete.
-func taskStateRank(s string) int {
-	switch state.NormalizeTaskStatus(s) {
-	case state.Task.Failed:
-		return 17
-	case state.Task.FailedRetryable:
-		return 16
-	case state.Task.CuttingOver:
-		return 15
-	case state.Task.Running:
-		return 14
-	case state.Task.PostChecksum:
-		return 13
-	case state.Task.Checksumming:
-		return 12
-	case state.Task.CatchingUp:
-		return 11
-	case state.Task.Reverting:
-		return 10
-	case state.Task.WaitingForCutover:
-		return 9
-	case state.Task.Recovering:
-		return 8
-	case state.Task.WaitingForDeploy:
-		return 7
-	case state.Task.Stopped:
-		return 6
-	case state.Task.Pending:
-		return 5
-	case state.Task.RevertWindow:
-		return 4
-	case state.Task.Cancelled:
-		return 2
-	case state.Task.Reverted:
-		return 1
-	case state.Task.Completed:
-		return 0
-	default:
-		// NormalizeTaskStatus maps unrecognized statuses to Task.Running, so
-		// this arm is reachable only if that mapping changes; rank it the same
-		// way so an unknown state still reads as active work.
-		return 14
-	}
+	return presentation.ShardOperationCopy(op.State, copies)
 }
 
 // aggregateShardState reduces a shard's operations to its most significant
@@ -713,13 +569,40 @@ func shardStateRank(s string) int {
 }
 
 // rendersAsSingleShard reports whether a sharded apply reads as one change on
-// one database (presentation.ReadsAsSingleShard), so its comments take the
-// single-deployment layout, with its progress bars and DDL, instead of the
-// shard rollup. A stored plan that could not be read (a nil view) keeps the
-// shard layout. The decision reads every operation the apply declared, not
-// only those attached so far.
+// one database, so its comments take the single-deployment layout, with its
+// progress bars and DDL, instead of the shard rollup. That holds when every
+// keyspace with shard work runs on the shard covering its whole keyrange and
+// every finalizer only finalizes a keyspace beside its DDL, with no VSchema
+// change to show. The shard is judged by its keyrange, not by how many shards
+// the apply touches: operations exist only for the shards that change, so one
+// changing shard of a keyspace with several is still a sharded change and
+// keeps the shard layout, which names it. So do a VSchema change, a keyspace
+// whose only work is its finalize, and a stored plan that could not be read
+// (a nil view). The decision reads every operation the apply declared, not
+// only those attached so far, so an apply whose operations attach over time
+// takes one layout from its first comment rather than switching as its
+// siblings appear.
 func rendersAsSingleShard(apply *storage.Apply, ops []*storage.ApplyOperation, view *shardedPlanView) bool {
-	return presentation.ReadsAsSingleShard(apply.DeclaredOperationKeys(ops), view.finalizesOnly)
+	keyspacesWithWork := make(map[string]bool)
+	var finalizerKeyspaces []string
+	for _, key := range applyOperationKeys(apply, ops) {
+		if ns, shard, _, ok := state.ShardWorkKey(key); ok {
+			if shard != state.FullKeyRangeShard {
+				return false
+			}
+			keyspacesWithWork[ns] = true
+			continue
+		}
+		if ns, ok := state.NamespaceFinalizerKey(key); ok {
+			finalizerKeyspaces = append(finalizerKeyspaces, ns)
+		}
+	}
+	for _, ns := range finalizerKeyspaces {
+		if !keyspacesWithWork[ns] || !view.finalizesOnly(ns) {
+			return false
+		}
+	}
+	return len(keyspacesWithWork) > 0
 }
 
 // buildSingleShardApplyCommentData maps a sharded apply that rendersAsSingleShard
@@ -755,4 +638,19 @@ func buildSingleShardApplyCommentData(apply *storage.Apply, ops []*storage.Apply
 		}
 	}
 	return data
+}
+
+// applyOperationKeys returns the keys of every operation the apply is made of:
+// the manifest the dispatcher declared when the apply carries one, since its
+// operations may still be attaching, and the attached operations' keys
+// otherwise.
+func applyOperationKeys(apply *storage.Apply, ops []*storage.ApplyOperation) []string {
+	if apply != nil && len(apply.ExpectedOperationKeys) > 0 {
+		return apply.ExpectedOperationKeys
+	}
+	keys := make([]string, 0, len(ops))
+	for _, op := range ops {
+		keys = append(keys, op.OperationKey)
+	}
+	return keys
 }

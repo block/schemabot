@@ -73,7 +73,7 @@ func WriteProgress(data ProgressData) {
 		fmt.Println("No active schema change")
 		return
 	}
-	if RendersOperationSections(data.Operations, data.SingleShard) {
+	if RendersOperationSections(data.Operations, data.Sharded) {
 		writeMultiDeploymentProgress(data)
 		return
 	}
@@ -733,8 +733,8 @@ func FormatTableProgressWithActivity(t TableProgress, activityBar, activityLabel
 		// Row copy in progress — show progress bar with structured fields
 		displayPercent := ui.RowCopyDisplayPercent(t.PercentComplete, t.RowsCopied)
 		bar := ui.ProgressBarRowCopy(displayPercent)
-		writeTableLine(&b, t, "%s %s%s", bar,
-			ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), throttledSuffix(t))
+		writeTableLine(&b, t, "%s %s%s%s", bar,
+			ui.FormatRowCopyPercent(t.PercentComplete, t.RowsCopied, t.RowsTotal), shardCoverageSuffix(t), throttledSuffix(t))
 
 		if t.DDL != "" {
 			b.WriteString(formatTableDDL(t))
@@ -832,11 +832,45 @@ func recoveringIsCopyingRows(t TableProgress) bool {
 
 func writeStructuredRowsAndETA(b *strings.Builder, t TableProgress) {
 	size := ui.FormatTableSizeClause(t.EstimatedBytes)
+	coverage, eta := "", ui.FormatETA(t.ETASeconds)
+	if reporting, ok := partialShardCoverage(t); ok {
+		// The unreported shards can only add rows and time, so the figures
+		// cover the shards named and the ETA is a floor.
+		coverage = fmt.Sprintf(" across %d of %d shards", reporting, len(t.Shards))
+		eta = "≥ " + eta
+	}
 	if t.ETASeconds > 0 {
-		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), size, ui.FormatETA(t.ETASeconds))
+		fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s · ETA: %s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size, eta)
 		return
 	}
-	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), size)
+	fmt.Fprintf(b, indentDetail+"Rows: %s / %s%s%s\n", ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)), ui.FormatNumber(t.RowsTotal), coverage, size)
+}
+
+// partialShardCoverage returns how many of a sharded table's shards have
+// reported a row total, and whether that is only some of them: while later
+// shards have not started, the table's row figures cover the started ones
+// alone, so the bar and the rows line say so rather than passing those
+// shards' fraction off as the table's, as the PR comment does.
+func partialShardCoverage(t TableProgress) (int, bool) {
+	if t.AcrossTargets || len(t.Shards) < 2 {
+		return 0, false
+	}
+	reporting := 0
+	for _, sh := range t.Shards {
+		if sh.RowsTotal > 0 {
+			reporting++
+		}
+	}
+	return reporting, reporting > 0 && reporting < len(t.Shards)
+}
+
+// shardCoverageSuffix annotates a sharded table's copy percentage with the
+// shards it covers when only some have reported (partialShardCoverage).
+func shardCoverageSuffix(t TableProgress) string {
+	if reporting, ok := partialShardCoverage(t); ok {
+		return fmt.Sprintf(" (%d of %d shards)", reporting, len(t.Shards))
+	}
+	return ""
 }
 
 // writeEstimateExceededTable writes the header and detail lines of a table

@@ -10081,6 +10081,77 @@ To resume from where it stopped:
      ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-copying-across-four-shards"></a><strong>Sharded Apply Copying Across Four Shards</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Running                                │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     4m                                     │
+└───────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38% (1 of 4 shards)
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+       • Rows: 914,707 / 1,466,232 across 1 of 4 shards · ETA: ≥ 3m 15s
+       • Shards: 4 (1 copying, 3 queued)
+           ◉ -40: 62.38% · 914,707 / 1,466,232 rows · ETA: 3m 15s
+           ○ 40-80: queued
+           ○ 80-c0: queued
+           ○ c0-: queued
+    ~ VSchema (shop_001): Pending
+
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-with-a-failed-shard"></a><strong>Sharded Apply With A Failed Shard</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Failed                                 │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     1m                                     │
+└───────────────────────────────────────────────────────┘
+
+  shard -40: resolve shard primary for -40: context deadline exceeded
+
+
+  ── shop_001 ──
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+
+       • Shards: 4 (1 failed, 3 cancelled)
+           ✗ -40: failed
+           ○ 40-80: cancelled
+           ○ 80-c0: cancelled
+           ○ c0-: cancelled
+    ~ VSchema (shop_001): Cancelled
+
+
+To recover: Fix the issue above, then run a new apply.
+The new apply will only process tables that haven't completed.
 ```
 </details>
 

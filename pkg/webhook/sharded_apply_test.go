@@ -249,32 +249,6 @@ func TestBuildShardedApplyData_FinalizeOnlyKeyspaceIsNotAVSchemaChange(t *testin
 	assert.Contains(t, summary, "### VSchema\n\n**`payments`**: Applied\n")
 }
 
-// A finalizer whose rollout ended without running it must not read as
-// pending, whichever record says so: a cancelled/reverted operation row
-// (written by the cancel path or mirrored by the stranded-operation reaper)
-// reads as cancelled, and so does a row still pending under a parent whose
-// verdict is final — a halted rollout terminalizes the apply immediately,
-// while the reaper only settles the stranded row minutes after the summary
-// posted. Stopped — on the operation or the parent — reads as stopped: a
-// stopped apply is resumable, so its finalizer may yet run.
-func TestVSchemaStatusForOperationState_TerminalInertStates(t *testing.T) {
-	running := state.Apply.Running
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(running, state.ApplyOperation.Cancelled))
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(running, state.ApplyOperation.Reverted))
-	assert.Equal(t, "stopped", vschemaStatusForOperationState(running, state.ApplyOperation.Stopped))
-	assert.Equal(t, "", vschemaStatusForOperationState(running, state.ApplyOperation.Pending),
-		"a pending finalizer under a live apply still reads as pending")
-
-	pending := state.ApplyOperation.Pending
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.Apply.Failed, pending),
-		"a halted rollout's terminal summary must not promise VSchema work no claim arm will run")
-	assert.Equal(t, "cancelled", vschemaStatusForOperationState(state.Apply.Cancelled, pending))
-	assert.Equal(t, "stopped", vschemaStatusForOperationState(state.Apply.Stopped, pending),
-		"a stopped apply's pending finalizer may yet run on resume")
-	assert.Equal(t, "failed", vschemaStatusForOperationState(state.Apply.Failed, state.ApplyOperation.Failed),
-		"the operation's own failure outranks the parent verdict")
-}
-
 // stubPlanStorage serves one stored plan (or a load error) for resolver tests.
 // Every store other than Plans() panics if touched, so a test that must not
 // read storage can pass a zero-valued stub and rely on the panic.

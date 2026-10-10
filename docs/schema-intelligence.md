@@ -624,12 +624,17 @@ target. The pair is read from the stored task's operation row, so a
 single-target apply reports its one member the same way, and a row the server
 cannot match to a stored task carries neither field.
 A sharded apply lists one operation per shard and table it changes, plus each
-keyspace's finalizer. When every keyspace it changes has a single shard
-covering its whole keyrange, and no finalizer has a VSchema change to show, the
-response sets `single_shard: true`. The apply is then one change on one
-database: the CLI and the PR comments render it as an apply with one operation,
-showing its tables under their keyspace, with no section per shard or
-finalizer. `operations` still lists every row.
+keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
+then rolled up across the shards: one entry per keyspace table, with `status`
+the shard state that needs attention first, `rows_copied` and `rows_total`
+summed over the shards that have reported a total, and `shards` listing each
+shard's own state and rows. A shard whose wave has not started reports its
+operation's state and no rows. A table on its keyspace's only shard keeps its
+task's entry, with its `task_id`, and lists no shards. Each finalizer that
+changes its keyspace's VSchema appears in `metadata.vschema_changes` with its
+status and the diff from the stored plan. The CLI and the PR comments render
+the apply as one change, its tables under their keyspace. `operations` still
+lists every row.
 `task_id`, when present, identifies the individual task, including repeated
 statements against the same member and table. It names the control plane's
 task and stays the same on every poll, whether the server answers from its

@@ -1754,12 +1754,13 @@ type ProgressResponse struct {
 	// on_failure=pause no longer holds later deployments — the rollout proceeds
 	// like continue. Apply-level: it applies to every operation of the apply.
 	Released bool `json:"released,omitempty"`
-	// SingleShard is true when a sharded apply reads as one change on one
-	// database: each keyspace's work runs on the one shard covering its whole
-	// keyrange, and no finalizer has a VSchema change to show. Its operations
-	// still list every shard and finalizer row, but a client renders it as an
-	// apply with one operation, the way its PR comments do.
-	SingleShard bool `json:"single_shard,omitempty"`
+	// Sharded is true when the apply is one change fanned out across its
+	// keyspaces' shards. Tables then carries one row per keyspace table with
+	// its shards listed under it (a table on its keyspace's only shard keeps
+	// its own row and names no shard), and Metadata carries each finalizer's
+	// VSchema change. Operations still lists every shard and finalizer row,
+	// but a client renders the apply as one change, the way its PR comments do.
+	Sharded bool `json:"sharded,omitempty"`
 }
 
 // ProgressOperationResponse represents progress for one deployment operation.

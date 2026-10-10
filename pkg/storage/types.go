@@ -1264,21 +1264,6 @@ func (a *Apply) AllowsOperationKey(key string) bool {
 	return slices.Contains(a.ExpectedOperationKeys, key)
 }
 
-// DeclaredOperationKeys returns the keys of every operation the apply is made
-// of: the manifest the dispatcher declared when the apply carries one, since
-// its operations may still be attaching, and the attached operations' keys
-// otherwise.
-func (a *Apply) DeclaredOperationKeys(ops []*ApplyOperation) []string {
-	if a != nil && len(a.ExpectedOperationKeys) > 0 {
-		return a.ExpectedOperationKeys
-	}
-	keys := make([]string, 0, len(ops))
-	for _, op := range ops {
-		keys = append(keys, op.OperationKey)
-	}
-	return keys
-}
-
 // MissingExpectedOperationKeys returns the manifest keys with no attached
 // operation row, in the manifest's stored order. An apply without a manifest
 // is missing nothing. The state projection holds an apply's success verdict

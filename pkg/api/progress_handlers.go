@@ -14,7 +14,6 @@ import (
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/caller"
-	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/routing"
@@ -262,51 +261,6 @@ func (s *Service) resolveReleaseLatch(ctx context.Context, apply *storage.Apply,
 	return released
 }
 
-// readsAsSingleShard reports whether a sharded apply reads as one change on
-// one database (presentation.ReadsAsSingleShard), the judgment its PR
-// comments make, so the CLI renders the apply the way the comments do. The
-// stored plan says whether each finalizer has a VSchema change to show, and it
-// is read only when the operation keys leave the answer to the finalizers. A
-// plan that cannot be read keeps the shard layout, as it does for the comments.
-func (s *Service) readsAsSingleShard(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation) bool {
-	keyed := make([]presentation.KeyedOperation, 0, len(ops))
-	for _, op := range ops {
-		keyed = append(keyed, presentation.KeyedOperation{Deployment: op.Deployment, OperationKey: op.OperationKey})
-	}
-	if !presentation.IsShardedApply(keyed) {
-		return false
-	}
-	var plan *storage.Plan
-	planRead := false
-	finalizesWithoutVSchemaChange := func(namespace string) bool {
-		if !planRead {
-			planRead = true
-			plan = s.storedPlanForLayout(ctx, apply)
-		}
-		return plan != nil && plan.Namespaces[namespace].FinalizesWithoutVSchemaChange()
-	}
-	return presentation.ReadsAsSingleShard(apply.DeclaredOperationKeys(ops), finalizesWithoutVSchemaChange)
-}
-
-// storedPlanForLayout loads the apply's stored plan for the sharded layout
-// decision, or nil when it cannot be read. The layout is display only, so a
-// failed read is logged and the progress response keeps the shard layout
-// rather than failing.
-func (s *Service) storedPlanForLayout(ctx context.Context, apply *storage.Apply) *storage.Plan {
-	plan, err := s.storage.Plans().GetByID(ctx, apply.PlanID)
-	if err != nil {
-		s.logger.Warn("progress response will render the sharded apply shard by shard: failed to load stored plan",
-			append(apply.LogAttrs(), "plan_id", apply.PlanID, "error", err)...)
-		return nil
-	}
-	if plan == nil {
-		s.logger.Warn("progress response will render the sharded apply shard by shard: stored plan row not found",
-			append(apply.LogAttrs(), "plan_id", apply.PlanID)...)
-		return nil
-	}
-	return plan
-}
-
 // progressOperationsFromRows projects// progressOperationsFromRows projects already-fetched operation rows into the
 // API response shape and the operation-id→member map. Keeping the
 // transformation separate from the storage read lets a single ListByApply
@@ -466,7 +420,6 @@ func (s *Service) handleProgressByApplyID(w http.ResponseWriter, r *http.Request
 	if opsErr == nil {
 		httpResp.Operations, memberByOperationID = progressOperationsFromRows(ops)
 		httpResp.Released = s.resolveReleaseLatch(r.Context(), apply, ops)
-		httpResp.SingleShard = s.readsAsSingleShard(r.Context(), apply, ops)
 	}
 	httpResp.ApplyID = apply.ApplyIdentifier
 	httpResp.Database = apply.Database
@@ -1230,9 +1183,9 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 	operations, memberByOperationID, ops, released := s.bestEffortProgressOperations(ctx, apply)
 	httpResp.Operations = operations
 	httpResp.Released = released
-	httpResp.SingleShard = s.readsAsSingleShard(ctx, apply, ops)
 	overlayStoredDisplayMetadata(httpResp, apply, ops)
 
+	rows := make([]*apitypes.TableProgressResponse, 0, len(tasks))
 	for _, task := range tasks {
 		tpr := &apitypes.TableProgressResponse{
 			TableName:           task.TableName,
@@ -1257,8 +1210,9 @@ func (s *Service) progressFromLocalStorage(ctx context.Context, apply *storage.A
 		if task.CompletedAt != nil {
 			tpr.CompletedAt = task.CompletedAt.Format(time.RFC3339)
 		}
-		httpResp.Tables = append(httpResp.Tables, tpr)
+		rows = append(rows, tpr)
 	}
+	s.rollUpShardedProgress(ctx, httpResp, apply, ops, tasks, rows)
 
 	return httpResp, nil
 }
