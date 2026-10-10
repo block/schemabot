@@ -15,7 +15,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/localstack"
 
 	"github.com/block/schemabot/pkg/testutil"
 )
@@ -68,10 +67,11 @@ func TestResolve_CustomResolver(t *testing.T) {
 }
 
 func TestResolve_SecretsManager_Integration(t *testing.T) {
-	// Start LocalStack container
-	container, err := localstack.Run(t.Context(),
-		"localstack/localstack:3.0",
-	)
+	// Start MiniStack container
+	container, err := testcontainers.GenericContainer(t.Context(), testcontainers.GenericContainerRequest{
+		ContainerRequest: testutil.MiniStackContainerRequest(),
+		Started:          true,
+	})
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		if err := testcontainers.TerminateContainer(container); err != nil {
@@ -79,20 +79,20 @@ func TestResolve_SecretsManager_Integration(t *testing.T) {
 		}
 	})
 
-	// Get LocalStack endpoint (port 4566 is the gateway for all services)
+	// Get MiniStack endpoint (port 4566 is the gateway for all services)
 	host, err := testutil.ContainerHost(t.Context(), container)
 	require.NoError(t, err)
 	port, err := testutil.ContainerPort(t.Context(), container, "4566/tcp")
 	require.NoError(t, err)
 	endpoint := fmt.Sprintf("http://%s:%d", host, port)
 
-	// Set environment for AWS SDK to use LocalStack
+	// Set environment for AWS SDK to use MiniStack
 	t.Setenv("AWS_ENDPOINT_URL", endpoint)
 	t.Setenv("AWS_ACCESS_KEY_ID", "test")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_REGION", "us-east-1")
 
-	// Create a Secrets Manager client pointing to LocalStack
+	// Create a Secrets Manager client pointing to MiniStack
 	cfg, err := config.LoadDefaultConfig(t.Context(),
 		config.WithRegion("us-east-1"),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),

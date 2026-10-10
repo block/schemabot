@@ -3,9 +3,11 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/block/schemabot/pkg/state"
 )
@@ -28,11 +30,14 @@ func FormatNumber(n int64) string {
 	return string(result)
 }
 
-// FormatBytes formats a byte count with binary units, one decimal place above
-// the byte range. Storage engines report sizes in bytes, and an operator
-// reading a table's footprint wants the magnitude, not the digits.
+// FormatBytesBinary formats a byte count with binary units (KiB/MiB), one
+// decimal place above the byte range. Storage engines report sizes in bytes,
+// and an operator reading a table's footprint wants the magnitude, not the
+// digits. Use this for a measured allocation figure; use FormatApproxBytes for
+// an estimate, which renders decimal units — the two disagree by 7% at a
+// gibibyte and diverge further up the scale.
 // Example: 1536 → "1.5 KiB", 1048576 → "1.0 MiB"
-func FormatBytes(b int64) string {
+func FormatBytesBinary(b int64) string {
 	const unit = 1024
 	if b < unit {
 		return fmt.Sprintf("%d B", b)
@@ -45,6 +50,89 @@ func FormatBytes(b int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f EiB", value/unit)
+}
+
+// FormatApproxRows renders an approximate row-count estimate compactly with a
+// leading tilde: 842 → "~842", 15_200 → "~15.2k", 2_340_000 → "~2.3M",
+// 5_100_000_000 → "~5.1B". Row estimates come from engine statistics and are
+// never exact, so the tilde is part of the format. Each unit's threshold sits
+// where the one-decimal rendering would round to 1000 of the smaller unit, so
+// a value rolls over to "~1M" rather than rendering as "~1000k".
+func FormatApproxRows(n int64) string {
+	if n < 0 {
+		n = 0
+	}
+	switch {
+	case n >= 999_950_000_000:
+		return "~" + trimTrailingZero(float64(n)/1e12) + "T"
+	case n >= 999_950_000:
+		return "~" + trimTrailingZero(float64(n)/1e9) + "B"
+	case n >= 999_950:
+		return "~" + trimTrailingZero(float64(n)/1e6) + "M"
+	case n >= 1_000:
+		return "~" + trimTrailingZero(float64(n)/1e3) + "k"
+	default:
+		return fmt.Sprintf("~%d", n)
+	}
+}
+
+// trimTrailingZero renders a scaled magnitude with one decimal, dropping a
+// trailing ".0" so round values stay short ("2.3", "12").
+func trimTrailingZero(v float64) string {
+	return strings.TrimSuffix(fmt.Sprintf("%.1f", v), ".0")
+}
+
+// oneDecimal renders a scaled magnitude with one decimal below 100 ("4.0",
+// "48.2") and none from 100 up ("186"), where the integer already carries
+// three significant figures. A size below 100 keeps its ".0" so a value that
+// happens to be round reads at the same precision as its neighbours instead
+// of looking rounded off.
+func oneDecimal(v float64) string {
+	if v >= 99.95 {
+		return fmt.Sprintf("%.0f", v)
+	}
+	return fmt.Sprintf("%.1f", v)
+}
+
+// FormatApproxBytes renders an approximate byte-size estimate compactly with a
+// leading tilde, decimal units, and one decimal: 812 → "~812 B",
+// 4_000_000_000 → "~4.0 GB", 48_200_000_000 → "~48.2 GB".
+// Byte estimates come from engine statistics and are never exact, so the tilde
+// is part of the format. Decimal units (not binary) because the value is an
+// order-of-magnitude signal, not an allocation figure — a measured allocation
+// belongs in FormatBytesBinary instead. Each unit's threshold
+// sits where the integer rendering would round to 1000 of the smaller unit,
+// so a value rolls over to "~1.0 GB" rather than rendering as "~1000 MB".
+func FormatApproxBytes(b int64) string {
+	if b < 0 {
+		b = 0
+	}
+	switch {
+	case b >= 999_500_000_000_000:
+		return "~" + oneDecimal(float64(b)/1e15) + " PB"
+	case b >= 999_500_000_000:
+		return "~" + oneDecimal(float64(b)/1e12) + " TB"
+	case b >= 999_500_000:
+		return "~" + oneDecimal(float64(b)/1e9) + " GB"
+	case b >= 999_500:
+		return "~" + oneDecimal(float64(b)/1e6) + " MB"
+	case b >= 1_000:
+		return "~" + oneDecimal(float64(b)/1e3) + " KB"
+	default:
+		return fmt.Sprintf("~%d B", b)
+	}
+}
+
+// FormatTableSizeClause renders the " · ~23.4 GB" clause a copy progress line
+// carries after its row counts: the table's on-disk size when it was planned,
+// so the operator sees the scale of the copy beside how far it has come. It is
+// the whole table's size, not a measure of bytes copied. Empty when no
+// estimate is known.
+func FormatTableSizeClause(estimatedBytes *int64) string {
+	if estimatedBytes == nil {
+		return ""
+	}
+	return " \u00b7 " + FormatApproxBytes(*estimatedBytes)
 }
 
 // VSchemaStatusLabel maps an engine's vschema_status display value to a human
@@ -90,6 +178,30 @@ func FormatETA(seconds int64) string {
 	}
 }
 
+// MaxStatementRunes bounds an engine-reported statement rendered as a
+// progress position so a pathological DDL text cannot flood a terminal line
+// or a PR comment. Both surfaces share the bound so the operator reads the
+// same excerpt in the CLI and on the PR.
+const MaxStatementRunes = 160
+
+// ClampStatement folds an engine-supplied statement onto one bounded line:
+// every run of whitespace or control characters — newlines, tabs, ANSI escape
+// bytes — collapses to a single space, and text past MaxStatementRunes is cut
+// with an ellipsis so the result is at most MaxStatementRunes runes. The
+// statement is untrusted input as far as rendering is concerned, so this is
+// the single place its line and width discipline live for both the CLI and
+// the PR comment.
+func ClampStatement(text string) string {
+	text = strings.Join(strings.FieldsFunc(text, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}), " ")
+	runes := []rune(text)
+	if len(runes) <= MaxStatementRunes {
+		return text
+	}
+	return string(runes[:MaxStatementRunes-1]) + "…"
+}
+
 // ClampRows returns rows clamped to total for display purposes.
 // Spirit can report rows copied > rows total when rows are inserted during copy.
 func ClampRows(copied, total int64) int64 {
@@ -115,15 +227,56 @@ func ClampPercent(pct int) int {
 	return pct
 }
 
-// RowCopyDisplayPercent returns the percentage to show for row-copy progress.
-// A non-zero copied row count means copying has begun, so display at least 1%
-// even when integer progress rounds down to 0%.
+// RowCopyDisplayPercent returns the whole-number percentage for row-copy
+// progress bars and threshold comparisons. A non-zero copied row count means
+// copying has begun, so it reports at least 1% even when integer progress
+// rounds down to 0%. Textual percents render through FormatRowCopyPercent,
+// which shows the exact row-derived fraction instead of the bump.
 func RowCopyDisplayPercent(pct int, rowsCopied int64) int {
 	displayPercent := ClampPercent(pct)
 	if displayPercent == 0 && rowsCopied > 0 {
 		return 1
 	}
 	return displayPercent
+}
+
+// RowCopyFraction returns row-copy progress as a float percent in [0, 100],
+// preferring the exact fraction computed from the row counts over the
+// engine's whole-number percent, which has already lost the precision. With
+// no row counts to compute from, it falls back to the clamped whole-number
+// percent. Renderers comparing tables or shards by progress should compare
+// this value so the selection agrees with what FormatRowCopyPercent displays.
+func RowCopyFraction(pct int, rowsCopied, rowsTotal int64) float64 {
+	if rowsCopied > 0 && rowsTotal > 0 {
+		return math.Min(float64(rowsCopied)/float64(rowsTotal)*100, 100)
+	}
+	return float64(ClampPercent(pct))
+}
+
+// FormatRowCopyPercent renders row-copy progress as a percent string at its
+// true precision. When the row counts are known the percent is recomputed
+// from them and rendered with two decimals (e.g. "0.03%", "45.37%"), so
+// progress on a huge table reads as the fraction it is instead of a rounded
+// whole number. The rendering is bounded on both ends by what the counts say:
+// floored at 0.01% so an in-flight copy never reads as 0.00%, and capped at
+// 99.99% while copied rows still trail the total, so a copy never reads as
+// finished before it is — an operator deciding whether to keep waiting takes
+// "100.00%" as done. Without row counts it falls back to the engine's
+// whole-number percent, or "<1%" when copying has begun but there is no
+// total to compute a fraction from.
+func FormatRowCopyPercent(pct int, rowsCopied, rowsTotal int64) string {
+	if rowsCopied > 0 && rowsTotal > 0 {
+		frac := math.Max(RowCopyFraction(pct, rowsCopied, rowsTotal), 0.01)
+		if rowsCopied < rowsTotal {
+			frac = math.Min(frac, 99.99)
+		}
+		return fmt.Sprintf("%.2f%%", frac)
+	}
+	display := ClampPercent(pct)
+	if display == 0 && rowsCopied > 0 {
+		return "<1%"
+	}
+	return fmt.Sprintf("%d%%", display)
 }
 
 // NowFunc returns the current time. Override in previews for deterministic output.

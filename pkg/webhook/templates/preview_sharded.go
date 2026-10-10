@@ -24,10 +24,17 @@ func previewShardStatuses(ops []presentation.Operation) []ShardStatus {
 const (
 	previewMutesIndex      = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);"
 	previewMutesIndexDrift = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);"
+
+	// Copy figures for the mutes fixture's reporting shard. The shard percent
+	// is derived from the row figures so the summary line and the rows line
+	// cannot drift apart when either is edited.
+	previewMutesRowsCopied  = int64(914707)
+	previewMutesRowsTotal   = int64(1466232)
+	previewMutesCopyPercent = int(previewMutesRowsCopied * 100 / previewMutesRowsTotal)
 )
 
 func previewMutesCell(shard string) ShardCell {
-	return ShardCell{Shard: shard, Table: "mutes", DDL: previewMutesIndex}
+	return ShardCell{Shard: shard, Table: "mutes", Statements: []string{previewMutesIndex}}
 }
 
 // PreviewCommentShardedApplyInProgress renders a sharded apply mid-rollout: the
@@ -40,8 +47,12 @@ func PreviewCommentShardedApplyInProgress() string {
 			Keyspace: "cdb_resolute_sharded",
 			Tables: []ShardedTableStatus{{
 				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: previewMutesRowsCopied, RowsTotal: previewMutesRowsTotal, ETASeconds: 195,
+				ShardsReporting: 1,
+				EstimatedBytes:  new(int64(23_400_000_000)),
+				PlannedShards:   4,
 				Shards: []ShardProgressData{
-					{Shard: "-40", Status: state.Task.Running, PercentComplete: 45},
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: previewMutesCopyPercent},
 					{Shard: "40-80", Status: state.Task.Pending},
 					{Shard: "80-c0", Status: state.Task.Pending},
 					{Shard: "c0-", Status: state.Task.Pending},
@@ -134,6 +145,36 @@ func PreviewCommentShardedSummaryCompleted() string {
 	})
 }
 
+// PreviewCommentShardedSummaryFinalized renders the terminal summary for a
+// sharded apply whose engine finalized the keyspace once every shard's DDL
+// landed, with no VSchema change in the plan: the finalizer is listed in its
+// own Finalize section rather than as a VSchema change.
+func PreviewCommentShardedSummaryFinalized() string {
+	return RenderShardedApplySummaryComment(ShardedApplyData{
+		State: state.Apply.Completed, Environment: "production", Database: "cdb_resolute",
+		ApplyID:     "apply-a1b2c3d4e5f6",
+		RequestedBy: previewRequestedBy,
+		StartedAt:   sampleTime().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+		CompletedAt: sampleTime().Add(-2 * time.Minute).UTC().Format(time.RFC3339),
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Completed,
+				Shards: []ShardProgressData{
+					{Shard: "-80", Status: state.Task.Completed},
+					{Shard: "80-", Status: state.Task.Completed},
+				},
+			}},
+			Shards: previewShardStatuses([]presentation.Operation{
+				{Deployment: "-80", State: state.ApplyOperation.Completed},
+				{Deployment: "80-", State: state.ApplyOperation.Completed},
+			}),
+			Cells: []ShardCell{previewMutesCell("-80"), previewMutesCell("80-")},
+		}},
+		Finalizes: []ShardedFinalize{{Keyspace: "cdb_resolute_sharded", Status: "applied"}},
+	})
+}
+
 // PreviewCommentShardedSummaryFailed renders the terminal summary for a sharded
 // apply where one shard failed and the rest halted behind it: the failed
 // verdict header, the surfaced error, the final per-shard results, the
@@ -214,7 +255,7 @@ func PreviewCommentShardedApplyDivergent() string {
 			Tables: []ShardedTableStatus{{
 				Table: "mutes", Status: state.Task.Running,
 				Shards: []ShardProgressData{
-					{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: previewMutesCopyPercent},
 					{Shard: "40-80", Status: state.Task.Pending},
 					{Shard: "80-c0", Status: state.Task.Pending},
 				},
@@ -226,7 +267,7 @@ func PreviewCommentShardedApplyDivergent() string {
 			}),
 			Cells: []ShardCell{
 				previewMutesCell("-40"),
-				{Shard: "40-80", Table: "mutes", DDL: previewMutesIndexDrift},
+				{Shard: "40-80", Table: "mutes", Statements: []string{previewMutesIndexDrift}},
 				previewMutesCell("80-c0"),
 			},
 		}},
@@ -263,16 +304,20 @@ func PreviewCommentShardedApplyMultiKeyspace() string {
 					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Completed}},
 				}},
 				Shards: []ShardStatus{unshard(shards[0], "-")},
-				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", Statements: []string{"ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}}},
 			},
 			{
 				Keyspace: "cdb_resolute_lookup",
 				Tables: []ShardedTableStatus{{
 					Table: "outcomes_lookup", Status: state.Task.Running,
-					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
+					RowsCopied: 540211, RowsTotal: 2000780, ETASeconds: 480,
+					ShardsReporting: 1,
+					EstimatedBytes:  new(int64(612_000_000)),
+					PlannedShards:   1,
+					Shards:          []ShardProgressData{{Shard: "-", Status: state.Task.Running, PercentComplete: 27}},
 				}},
 				Shards: []ShardStatus{unshard(shards[1], "-")},
-				Cells:  []ShardCell{{Shard: "-", Table: "outcomes_lookup", DDL: "ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes_lookup", Statements: []string{"ALTER TABLE `outcomes_lookup` ADD COLUMN `verdict` varchar(32);"}}},
 			},
 			{
 				Keyspace: "cdb_resolute_sharded",
@@ -309,6 +354,9 @@ func PreviewCommentShardedPlanDivergent() string {
 		Changes: []KeyspaceChangeData{{
 			Keyspace:   "cdb_resolute_sharded",
 			Statements: []string{idx},
+			TableSizes: []TableSizeData{
+				{Table: "mutes", EstimatedBytes: previewBytes(22_800_000_000), ShardCount: 4},
+			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Statements: []string{idx}},
 				{Shard: "80-c0", Statements: []string{idx}},
@@ -361,16 +409,25 @@ func previewShardRange(i, n int) string {
 // so the partially-applied keyspace shows its divergent state.
 func PreviewCommentShardedPlanPartiallyApplied() string {
 	idx := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	outcomesIdx := "ALTER TABLE `outcomes` ADD INDEX `status`(`status`)"
 	return RenderPlanComment(PlanCommentData{
 		Database: "cdb_resolute", Environment: "production", DatabaseType: "strata",
 		HeadSHA: previewHeadSHA, Repository: previewRepository, RequestedBy: previewRequestedBy,
 		Changes: []KeyspaceChangeData{{
 			Keyspace: "cdb_resolute_sharded",
+			// A table without a byte estimate beside one that has it renders
+			// as explicitly unavailable, so a failed size probe never reads as
+			// a small table. The satisfied shard needs no change, so the
+			// change spans three shards.
+			TableSizes: []TableSizeData{
+				{Table: "mutes", ShardCount: 3},
+				{Table: "outcomes", EstimatedBytes: previewBytes(4_210_000_000), ShardCount: 3},
+			},
 			Shards: []KeyspaceShardChange{
 				{Shard: "-40", Satisfied: true},
-				{Shard: "40-80", Statements: []string{idx}},
-				{Shard: "80-c0", Statements: []string{idx}},
-				{Shard: "c0-", Statements: []string{idx}},
+				{Shard: "40-80", Statements: []string{idx, outcomesIdx}},
+				{Shard: "80-c0", Statements: []string{idx, outcomesIdx}},
+				{Shard: "c0-", Statements: []string{idx, outcomesIdx}},
 			},
 		}},
 	})

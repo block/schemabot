@@ -387,7 +387,7 @@ import (
 	"sync"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/utils"
@@ -407,12 +407,6 @@ const (
 	// maxRetries is the number of retry attempts per keyspace when applying DDL.
 	maxRetries = 3
 
-	// maxSnapshotRetries is used when a schema snapshot is in progress
-	// (e.g., after RefreshSchema or VSchema updates). With exponential
-	// backoff (20s, 40s, 60s, 60s) this gives ~3 minutes of total
-	// wait time before failing.
-	maxSnapshotRetries = 5
-
 	// deployRequestPollInterval is how long to wait between polls while a deploy
 	// request is pending PlanetScale's asynchronous schema diff computation.
 	deployRequestPollInterval = 500 * time.Millisecond
@@ -429,11 +423,40 @@ var (
 	deployValidationPollInterval = 5 * time.Second
 )
 
+// deployRequestPendingWait bounds how long an apply waits for PlanetScale to
+// finish computing a deploy request's schema diff. A variable so tests can
+// compress the wait.
+var deployRequestPendingWait = 30 * time.Minute
+
+// snapshotRetryWait bounds how long a keyspace keeps retrying while PlanetScale
+// rejects its changes because a schema snapshot of the branch is in progress,
+// measured from the first such rejection. It is a variable so tests can
+// shorten it.
+var snapshotRetryWait = 10 * time.Minute
+
+// branchPasswordHeadroom is the part of a branch password's lifetime that is
+// not spent waiting out schema snapshots: the transient retries, the DDL and
+// VSchema writes themselves, and the branch validation after them.
+const branchPasswordHeadroom = 30 * time.Minute
+
+// branchPasswordTTL is how long, in seconds, the branch password an apply
+// creates stays valid. One password carries every keyspace's changes and the
+// branch validation after them, keyspaces run maxConcurrentKeyspaces at a
+// time, and each can wait out a schema snapshot for snapshotRetryWait. A
+// password that expired partway would fail a late keyspace with an
+// authentication error on a branch that is otherwise fine, so the TTL covers
+// every batch's snapshot window plus headroom, and never drops below an hour.
+func branchPasswordTTL(keyspaces int) int {
+	batches := max((keyspaces+maxConcurrentKeyspaces-1)/maxConcurrentKeyspaces, 1)
+	ttl := max(time.Duration(batches)*snapshotRetryWait+branchPasswordHeadroom, time.Hour)
+	return int(ttl / time.Second)
+}
+
 // deployState is a shorthand alias for PlanetScale deploy request state constants.
 var deployState = state.DeployRequest
 
 // formatDeployRequestError builds a detailed error message for a failed deploy request,
-// including any lint errors from PlanetScale's validation.
+// including any lint errors from PlanetScale's validation. sadscan:disable kingfisher.planetscale.2
 func formatDeployRequestError(dr *ps.DeployRequest) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "deploy request #%d failed during preparation (state: %s)", dr.Number, dr.DeploymentState)
@@ -607,12 +630,10 @@ func New(logger *slog.Logger) *Engine {
 		logger = slog.Default()
 	}
 	return &Engine{
-		clientFunc: func(tokenName, tokenValue string) (psclient.PSClient, error) {
-			return psclient.NewPSClient(tokenName, tokenValue)
-		},
-		linter:    lint.New(),
-		logger:    logger,
-		vtgateDBs: make(map[string]*sql.DB),
+		clientFunc: psclient.NewPSClient,
+		linter:     lint.New(),
+		logger:     logger,
+		vtgateDBs:  make(map[string]*sql.DB),
 	}
 }
 
@@ -666,7 +687,7 @@ func (e *Engine) getVtgateDB(ctx context.Context, dsn string) (*sql.DB, error) {
 		return db, nil
 	}
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open vtgate: %w", err)
 	}
@@ -791,8 +812,9 @@ func isRetryablePSError(err error) bool {
 
 // retryDelay returns the backoff duration for a retry attempt using
 // exponential backoff with full jitter. When a schema snapshot is in
-// progress the base delay is longer since snapshots can take 30-60s.
-func retryDelay(attempt int, lastErr error) time.Duration {
+// progress the base delay is longer since snapshots can take 30-60s. A
+// variable so tests can retry without waiting out the backoff.
+var retryDelay = func(attempt int, lastErr error) time.Duration {
 	if isSnapshotInProgress(lastErr) {
 		// Snapshot: 10s, 20s, 40s, 60s, 60s + up to 5s jitter
 		base := min(10*time.Second*(1<<min(attempt, 3)), 60*time.Second)

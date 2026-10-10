@@ -16,6 +16,7 @@ import (
 
 	"github.com/block/schemabot/pkg/clock"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/ratelimit"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/secrets"
 	"github.com/block/schemabot/pkg/storage"
@@ -123,6 +124,22 @@ type pendingObserverKey struct {
 	environment string
 }
 
+// pendingObserverEntry is one registration in the pending-observer slot. Its
+// address is the registration's identity, so the slot never compares observer
+// values: a ProgressObserver implementation need not be comparable.
+type pendingObserverEntry struct {
+	observer tern.ProgressObserver
+}
+
+// PendingObserverHandle names one SetPendingObserver registration so the
+// command that made it can withdraw exactly that registration. The zero
+// handle names nothing and is what SetPendingObserver returns when the
+// target cannot be resolved; clearing it is a no-op.
+type PendingObserverHandle struct {
+	key   pendingObserverKey
+	entry *pendingObserverEntry
+}
+
 type Service struct {
 	storage           storage.Storage
 	config            *ServerConfig
@@ -137,19 +154,45 @@ type Service struct {
 	checkRunBackfiller CheckRunBackfiller
 	clock              clock.Clock
 
+	// pullPerCallerLimiter and pullPerTargetLimiter bound POST /api/pull. Both
+	// are nil when the endpoint's rate limiting is disabled, which a nil
+	// limiter reads as "admit everything". They are built from the config in
+	// New and rebuilt by SetClock, so a test's fake clock drives them too.
+	pullPerCallerLimiter *ratelimit.Limiter
+	pullPerTargetLimiter *ratelimit.Limiter
+
+	// checksInspectLimiter bounds GET /api/checks/inspect per caller. Nil when
+	// the endpoint's rate limiting is disabled; built and rebuilt alongside
+	// the pull limiters.
+	checksInspectLimiter *ratelimit.Limiter
+
+	// checksInspectClientFor resolves the GitHub client an inspection reads
+	// through. Nil means the repository's App installation; tests replace it
+	// to count the GitHub calls an inspection makes.
+	checksInspectClientFor checksInspectClientResolver
+
 	// engineFactories holds engine implementations for database types this build
 	// does not provide natively, registered by an embedding service via
 	// RegisterEngine. Local clients the service builds receive them.
 	engineFactories map[string]tern.EngineFactory
 
 	// Operator loop management.
-	operatorMu           sync.Mutex
-	stopRecovery         chan struct{}
-	cancelRecovery       context.CancelFunc
-	operatorWake         chan struct{}
-	recoveryWg           sync.WaitGroup
+	operatorMu     sync.Mutex
+	stopRecovery   chan struct{}
+	cancelRecovery context.CancelFunc
+	operatorWake   chan struct{}
+	// claimingStopped records that stopRecovery has been closed, so the claim
+	// gate can be closed ahead of StopOperator and closed at most once.
+	claimingStopped bool
+	recoveryWg      sync.WaitGroup
+	// maintenanceWg holds the reaper passes, which share the driver lifecycle
+	// but claim nothing and drive nothing. They are waited on apart from the
+	// drivers so that a reaper which does not return cannot decide whether the
+	// stages that bring this process's own drives down get to run.
+	maintenanceWg        sync.WaitGroup
 	operatorPollInterval time.Duration
 	strandedReaperEvery  time.Duration
+	retryableExpiryEvery time.Duration
 	// driversBusy counts this process's operator drivers that currently hold
 	// claimed work; it backs the drivers-busy gauge.
 	driversBusy atomic.Int64
@@ -207,7 +250,15 @@ type Service struct {
 	OnApplyTerminalSummary ApplyTerminalSummaryCallback
 
 	pendingObserverMu sync.Mutex
-	pendingObservers  map[pendingObserverKey]tern.ProgressObserver
+	pendingObservers  map[pendingObserverKey]*pendingObserverEntry
+
+	// storageSchemaService answers the storage schema routes for this server's
+	// own storage database. An embedder registers it with
+	// SetStorageSchemaService once it has resolved the storage DSN and dialect
+	// it booted with; it is nil in builds that never resolve one, and the
+	// routes refuse rather than guess at a database.
+	storageSchemaMu      sync.RWMutex
+	storageSchemaService tern.StorageSchemaService
 }
 
 // SetApplyObserver sets a progress observer on the tern client for an apply.
@@ -240,26 +291,57 @@ func (s *Service) SetApplyObserver(database, deployment, environment string, app
 
 // SetPendingObserver stores an observer for the next apply request for this
 // target. ExecuteApply registers it on the durable apply before operator
-// dispatch can start.
-func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) {
+// dispatch can start. The returned handle names this registration; a command
+// whose apply request fails withdraws it with ClearPendingObserver. When the
+// target cannot be resolved nothing is stored and the zero handle is returned.
+func (s *Service) SetPendingObserver(database, deployment, environment string, observer tern.ProgressObserver) PendingObserverHandle {
 	deployment, err := s.deploymentForDatabaseEnvironment(database, deployment, environment)
 	if err != nil {
 		s.logger.Error("failed to resolve tern deployment for pending observer",
 			"database", database, "deployment", deployment, "environment", environment, "error", err)
-		return
+		return PendingObserverHandle{}
 	}
 
 	key := pendingObserverKey{database: database, deployment: deployment, environment: environment}
+	entry := &pendingObserverEntry{observer: observer}
 	s.pendingObserverMu.Lock()
 	defer s.pendingObserverMu.Unlock()
 	if s.pendingObservers == nil {
-		s.pendingObservers = make(map[pendingObserverKey]tern.ProgressObserver)
+		s.pendingObservers = make(map[pendingObserverKey]*pendingObserverEntry)
 	}
-	if observer == nil {
-		delete(s.pendingObservers, key)
-	} else {
-		s.pendingObservers[key] = observer
+	s.pendingObservers[key] = entry
+	return PendingObserverHandle{key: key, entry: entry}
+}
+
+// ClearPendingObserver withdraws the registration named by handle when its
+// apply request will not produce an apply. The slot is keyed by target, so a
+// competing command on the same target may have registered its own observer
+// since; only the caller's registration is removed, never a later one whose
+// apply has yet to consume it, and a registration ExecuteApply already
+// consumed is left alone. The zero handle clears nothing.
+func (s *Service) ClearPendingObserver(handle PendingObserverHandle) {
+	if handle.entry == nil {
+		return
 	}
+	s.pendingObserverMu.Lock()
+	defer s.pendingObserverMu.Unlock()
+	if s.pendingObservers[handle.key] == handle.entry {
+		delete(s.pendingObservers, handle.key)
+	}
+}
+
+// HasPendingObserver reports whether an observer is registered for the next
+// apply on this target, without consuming it. A command that withdrew its
+// observer after a failed apply request leaves the slot empty; callers use
+// this to check that nothing stale is waiting to attach to an apply the failed
+// command did not create.
+func (s *Service) HasPendingObserver(database, deployment, environment string) bool {
+	key := pendingObserverKey{database: database, deployment: deployment, environment: environment}
+
+	s.pendingObserverMu.Lock()
+	defer s.pendingObserverMu.Unlock()
+	_, ok := s.pendingObservers[key]
+	return ok
 }
 
 func (s *Service) consumePendingObserver(database, deployment, environment string) tern.ProgressObserver {
@@ -267,9 +349,12 @@ func (s *Service) consumePendingObserver(database, deployment, environment strin
 
 	s.pendingObserverMu.Lock()
 	defer s.pendingObserverMu.Unlock()
-	observer := s.pendingObservers[key]
+	entry := s.pendingObservers[key]
 	delete(s.pendingObservers, key)
-	return observer
+	if entry == nil {
+		return nil
+	}
+	return entry.observer
 }
 
 // New creates a new SchemaBot service.
@@ -283,7 +368,7 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 	if ternClients == nil {
 		ternClients = make(map[string]tern.Client)
 	}
-	return &Service{
+	s := &Service{
 		storage:              st,
 		config:               config,
 		ternClients:          ternClients,
@@ -292,12 +377,62 @@ func New(st storage.Storage, config *ServerConfig, ternClients map[string]tern.C
 		clock:                clock.Real{},
 		operatorPollInterval: OperatorPollInterval,
 		strandedReaperEvery:  StrandedReaperInterval,
+		retryableExpiryEvery: RetryableExpiryInterval,
 		remoteHealthInterval: RemoteDeploymentHealthCheckInterval,
 		webhookInboxInterval: WebhookInboxMetricsInterval,
-		pendingObservers:     make(map[pendingObserverKey]tern.ProgressObserver),
+		pendingObservers:     make(map[pendingObserverKey]*pendingObserverEntry),
 		heldClaims:           make(map[int64]heldClaim),
 		heldOperationClaims:  make(map[int64]heldOperationClaim),
 	}
+	s.buildRateLimiters()
+	return s
+}
+
+// buildRateLimiters (re)builds the endpoint limiters from the current config
+// and clock. An endpoint's limiters are left nil when its rate limiting is
+// disabled, which the request path reads as "not enforced" and returns on
+// before it spends or records anything.
+//
+// Enforcement being off is worth one line at startup: an unbounded endpoint is
+// a deliberate choice, and an operator watching a target or a GitHub quota
+// absorb traffic should be able to tell from the server's own logs whether a
+// budget was ever in play.
+func (s *Service) buildRateLimiters() {
+	s.buildPullRateLimiters()
+	s.buildChecksInspectRateLimiter()
+}
+
+func (s *Service) buildPullRateLimiters() {
+	if s.config == nil || !s.config.PullRateLimitEnabled() {
+		s.pullPerCallerLimiter = nil
+		s.pullPerTargetLimiter = nil
+		s.logger.Info("pull endpoint rate limiting is disabled; pull requests will not be bounded by a request budget")
+		return
+	}
+	perCaller := s.config.PullPerCallerRateLimit()
+	perTarget := s.config.PullPerTargetRateLimit()
+	s.pullPerCallerLimiter = ratelimit.New(perCaller, s.clock)
+	s.pullPerTargetLimiter = ratelimit.New(perTarget, s.clock)
+	s.logger.Info("pull endpoint rate limiting is enabled",
+		"per_caller_requests_per_minute", perCaller.RequestsPerMinute,
+		"per_caller_burst", perCaller.Burst,
+		"per_target_requests_per_minute", perTarget.RequestsPerMinute,
+		"per_target_burst", perTarget.Burst,
+	)
+}
+
+func (s *Service) buildChecksInspectRateLimiter() {
+	if s.config == nil || !s.config.ChecksInspectRateLimitEnabled() {
+		s.checksInspectLimiter = nil
+		s.logger.Info("check inspection rate limiting is disabled; inspections will not be bounded by a request budget")
+		return
+	}
+	perCaller := s.config.ChecksInspectPerCallerRateLimit()
+	s.checksInspectLimiter = ratelimit.New(perCaller, s.clock)
+	s.logger.Info("check inspection rate limiting is enabled",
+		"per_caller_requests_per_minute", perCaller.RequestsPerMinute,
+		"per_caller_burst", perCaller.Burst,
+	)
 }
 
 // RegisterEngine registers an Engine implementation for a database type this
@@ -342,6 +477,12 @@ func (s *Service) RegisterEngine(databaseType string, factory tern.EngineFactory
 // Production callers should leave the default clock.Real{} in place; tests
 // use clock.NewFake to make timing observable. A nil or typed-nil c is
 // coalesced to clock.Real{} via clock.Default.
+//
+// The endpoint rate limiters are rebuilt on the new clock, which also discards
+// whatever budget they had already spent. That is intentional: swapping the
+// time source out from under a running token bucket would leave it refilling
+// against a clock that no longer moves the way it did when the tokens were
+// taken.
 func (s *Service) SetClock(c clock.Clock) error {
 	s.operatorMu.Lock()
 	defer s.operatorMu.Unlock()
@@ -349,6 +490,7 @@ func (s *Service) SetClock(c clock.Clock) error {
 		return fmt.Errorf("cannot change clock while operator is running")
 	}
 	s.clock = clock.Default(c)
+	s.buildRateLimiters()
 	return nil
 }
 
@@ -607,7 +749,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		return nil, fmt.Errorf("resolve spirit config for %s: %w", key, err)
 	}
 	maps.Copy(metadata, spiritMetadata)
-	directMetadata, err := envConfig.DirectExecution.EngineMetadata()
+	directMetadata, err := s.config.DirectExecutionMetadata(&envConfig, dbType)
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct_execution metadata for %s: %w", key, err)
 	}
@@ -618,6 +760,7 @@ func (s *Service) newLocalTernClient(key, database, dbType string, envConfig Env
 		TargetDSN:                             targetDSN,
 		Metadata:                              metadata,
 		PostgresNativeSafeTableSizeLimitBytes: s.config.Postgres.NativeSafeTableSizeLimit(),
+		PostgresConcurrentIndexMaxDuration:    s.config.Postgres.ConcurrentIndexMaxDurationOrDefault(),
 		WakeOperator:                          s.wakeOperator,
 		EngineFactories:                       s.engineFactories,
 	}, s.storage, s.logger)
@@ -781,6 +924,7 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"GET /api/logs", s.handleLogsWithoutDatabase},
 		{"POST /api/webhooks/redrive", s.handleWebhookRedrive},
 		{"POST /api/checks/scan", s.handleChecksScan},
+		{"GET /api/checks/inspect", s.handleChecksInspect},
 		{"POST /api/checks/synthesize", s.handleChecksSynthesize},
 		{"POST /api/checks/repos", s.handleChecksRepos},
 
@@ -789,6 +933,14 @@ func (s *Service) apiRoutes() []apiRoute {
 		{"DELETE /api/locks", s.handleLockRelease},
 		{"GET /api/locks/{database}/{dbtype}", s.handleLockGet},
 		{"GET /api/locks", s.handleLockList},
+
+		// Storage schema API (SchemaBot's own bookkeeping database). Both
+		// routes are admin-only, and both are POSTs so both are admitted at the
+		// write tier by auth.TierForRequest's default rule. The diff reads and
+		// nothing else; it carries a body because the schema to diff against
+		// can come from the caller.
+		{"POST /api/storage/schema/plan", s.handleStorageSchemaPlan},
+		{"POST /api/storage/schema/apply", s.handleStorageSchemaApply},
 
 		// Settings API
 		{"GET /api/settings", s.handleSettingsList},

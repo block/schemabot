@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	gomysql "github.com/go-sql-driver/mysql"
+	gomysql "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -89,7 +89,22 @@ func TestWithLockRetry_RespectsContextCancellation(t *testing.T) {
 		return &gomysql.MySQLError{Number: mysqlErrDeadlock, Message: "Deadlock found"}
 	})
 	require.ErrorIs(t, err, context.Canceled)
+	assert.Contains(t, err.Error(), "op: stopped retrying after 1 attempts")
+	assert.Contains(t, err.Error(), "Deadlock found")
+	var mysqlErr *gomysql.MySQLError
+	assert.NotErrorAs(t, err, &mysqlErr, "a cancelled retry is not itself a retryable lock conflict")
 	// First attempt runs (no pre-attempt wait); the cancelled context stops the
 	// backoff before a second attempt.
 	assert.Equal(t, 1, calls)
+}
+
+// The delay ceiling doubles per attempt from the base backoff and stops at the
+// cap, so adding attempts never stretches one wait past lockRetryMaxBackoff.
+func TestLockRetryBackoffCeiling(t *testing.T) {
+	assert.Equal(t, lockRetryBaseBackoff, lockRetryBackoffCeiling(1))
+	assert.Equal(t, 2*lockRetryBaseBackoff, lockRetryBackoffCeiling(2))
+	assert.Equal(t, 8*lockRetryBaseBackoff, lockRetryBackoffCeiling(4))
+	for _, attempt := range []int{6, 12, 64, 1000} {
+		assert.Equal(t, lockRetryMaxBackoff, lockRetryBackoffCeiling(attempt), "attempt %d", attempt)
+	}
 }

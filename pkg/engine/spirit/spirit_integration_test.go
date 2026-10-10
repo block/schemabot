@@ -5,6 +5,7 @@ package spirit
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -15,22 +16,24 @@ import (
 	"time"
 
 	"github.com/block/spirit/pkg/checksum"
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
+	spiritflags "github.com/block/spirit/pkg/flags"
 	spiritmigration "github.com/block/spirit/pkg/migration"
 	"github.com/block/spirit/pkg/migration/check"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/block/schemabot/pkg/pendingdrops"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 
-	drivermysql "github.com/go-sql-driver/mysql"
+	drivermysql "github.com/block/mysql"
 )
 
 // Shared test infrastructure
@@ -74,27 +77,9 @@ func waitForCopyProgress(t *testing.T, eng *Engine, wantRowsCopied int64) int64 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
-	// Start shared MySQL container. The MySQL entrypoint runs a throwaway
-	// init server that also logs "ready for connections" and binds nothing
-	// on TCP, so log- and port-based waits can be satisfied before the
-	// final server accepts clients. Gate readiness on a real query through
-	// the mapped port instead — the same handshake the tests themselves
-	// perform.
-	req := testcontainers.ContainerRequest{
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      "testdb",
-		},
-		WaitingFor: wait.ForSQL("3306/tcp", "mysql", func(host string, port network.Port) string {
-			return fmt.Sprintf("root:testpassword@tcp(%s:%s)/testdb", host, port.Port())
-		}).WithStartupTimeout(30 * time.Second),
-	}
-
 	var err error
 	sharedContainer, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
+		ContainerRequest: testutil.MySQLContainerRequest("mysql:8.0", testDatabase),
 		Started:          true,
 		Reuse:            os.Getenv("DEBUG") != "",
 	})
@@ -102,15 +87,10 @@ func TestMain(m *testing.M) {
 		log.Fatalf("start mysql container: %v", err)
 	}
 
-	host, err := testutil.ContainerHost(ctx, sharedContainer)
+	sharedDSN, err = testutil.MySQLDSN(ctx, sharedContainer, testDatabase, "parseTime=true", "multiStatements=true")
 	if err != nil {
-		log.Fatalf("get container host: %v", err)
+		log.Fatalf("build mysql dsn: %v", err)
 	}
-	port, err := testutil.ContainerPort(ctx, sharedContainer, "3306")
-	if err != nil {
-		log.Fatalf("get container port: %v", err)
-	}
-	sharedDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/testdb?parseTime=true&multiStatements=true", host, port)
 
 	code := m.Run()
 
@@ -141,7 +121,7 @@ func tableSchemaNames(schemas []table.TableSchema) []string {
 func setupTestMySQL(t *testing.T) (string, *sql.DB) {
 	t.Helper()
 
-	db, err := sql.Open("mysql", sharedDSN)
+	db, err := sql.Open("block-mysql", sharedDSN)
 	require.NoError(t, err, "connect to mysql")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 
@@ -636,6 +616,144 @@ func TestEngine_Plan_NoChanges(t *testing.T) {
 	assert.True(t, result.NoChanges, "expected NoChanges, got DDL: %v", result.FlatDDL())
 }
 
+// The live database has `orders (id, status)`. Two schema files both declare
+// `orders`: orders.sql matches the live table and orders_extras.sql replaces
+// `status` with `note`. The differ keeps one definition per table, so planning
+// either one would silently discard the other and could drop `status`. The
+// plan is refused with an error naming the table and both files, on every
+// run, and the same holds when the two files sit in different namespaces,
+// since every namespace is diffed against the one database together.
+func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create table")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	liveOrders := `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+	withNote := `CREATE TABLE orders (
+		id INT NOT NULL,
+		note VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`
+
+	t.Run("two files in one namespace", func(t *testing.T) {
+		// Map iteration order varies between runs, so plan repeatedly: every
+		// run must refuse with the same, fully named error.
+		for range 10 {
+			result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+				Database: "testdb",
+				SchemaFiles: testSchemaFiles(map[string]string{
+					"orders.sql":        liveOrders,
+					"orders_extras.sql": withNote,
+				}),
+				Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.EqualError(t, err, `table "orders" is declared by both schema files "testdb/orders.sql" and "testdb/orders_extras.sql". Declare each table in exactly one schema file`)
+			assert.Nil(t, result)
+		}
+	})
+
+	t.Run("two files in different namespaces", func(t *testing.T) {
+		result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+			Database: "testdb",
+			SchemaFiles: schema.SchemaFiles{
+				"billing": &schema.Namespace{Files: map[string]string{"orders.sql": withNote}},
+				"testdb":  &schema.Namespace{Files: map[string]string{"orders.sql": liveOrders}},
+			},
+			Credentials: &engine.Credentials{DSN: dsn},
+		})
+		require.EqualError(t, err, `table "orders" is declared by both schema files "billing/orders.sql" and "testdb/orders.sql". Declare each table in exactly one schema file`)
+		assert.Nil(t, result)
+	})
+}
+
+// The live database has `orders (id, status)`. In a two-namespace request,
+// billing/orders.sql declares a new `invoices` table and testdb/tables.sql
+// declares `orders` with an added `note` column. Each change is grouped under
+// the namespace whose file declares its table, not one whose file happens to
+// be named after it: the ALTER on `orders` belongs to testdb and the CREATE
+// of `invoices` to billing, on every run.
+func TestEngine_Plan_GroupsChangesByDeclaringNamespace(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create table")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	req := &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: schema.SchemaFiles{
+			"billing": &schema.Namespace{Files: map[string]string{"orders.sql": `CREATE TABLE invoices (
+				id INT NOT NULL,
+				PRIMARY KEY (id)
+			)`}},
+			"testdb": &schema.Namespace{Files: map[string]string{"tables.sql": `CREATE TABLE orders (
+				id INT NOT NULL,
+				status VARCHAR(50) NOT NULL,
+				note VARCHAR(50),
+				PRIMARY KEY (id)
+			)`}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	for range 20 {
+		result, err := eng.Plan(t.Context(), req)
+		require.NoError(t, err, "Plan()")
+		tablesByNamespace := make(map[string][]string)
+		var namespaces []string
+		for _, sc := range result.Changes {
+			namespaces = append(namespaces, sc.Namespace)
+			for _, tc := range sc.TableChanges {
+				tablesByNamespace[sc.Namespace] = append(tablesByNamespace[sc.Namespace], tc.Table)
+			}
+		}
+		require.Equal(t, []string{"billing", "testdb"}, namespaces)
+		require.Equal(t, map[string][]string{"billing": {"invoices"}, "testdb": {"orders"}}, tablesByNamespace)
+	}
+}
+
+// The live database has `orders` and `invoices`. In a two-namespace request,
+// billing/orders.sql has been emptied and testdb/invoices.sql still declares
+// `invoices`, so the only change would be dropping `orders`. An empty file
+// declares nothing and a file's name is not a declaration, so no namespace
+// owns `orders` and the plan fails rather than guessing where the drop runs.
+func TestEngine_Plan_DropByEmptiedFileInMultiNamespaceFails(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE orders (id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE invoices (id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err)
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: schema.SchemaFiles{
+			"billing": &schema.Namespace{Files: map[string]string{"orders.sql": ""}},
+			"testdb":  &schema.Namespace{Files: map[string]string{"invoices.sql": "CREATE TABLE `invoices` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.EqualError(t, err, `namespace lookup for table "orders": no namespace defines table "orders" among 2 schema namespaces [billing testdb]`)
+	assert.Nil(t, result)
+}
+
 func TestEngine_Plan_NewTable(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 
@@ -671,6 +789,38 @@ func TestEngine_Plan_NewTable(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected CREATE TABLE statement, got: %v", result.FlatDDL())
+}
+
+// One schema file declares two tables against an empty database. The plan
+// creates both of them, each from its own statement, so a multi-table file
+// plans every table it declares rather than only the first.
+func TestEngine_Plan_MultipleTablesInOneFile(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db) // Start with clean database
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"tables.sql": "CREATE TABLE `orders` (`id` bigint NOT NULL, PRIMARY KEY (`id`));\n" +
+				"CREATE TABLE `events` (`id` bigint NOT NULL, PRIMARY KEY (`id`));\n",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges)
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 2, "DDL: %v", result.FlatDDL())
+	planned := make(map[string]string, len(changes))
+	for _, tc := range changes {
+		assert.Equal(t, ddl.StatementCreateTable, tc.Operation, "DDL: %s", tc.DDL)
+		planned[tc.Table] = tc.DDL
+	}
+	assert.Contains(t, planned["orders"], "CREATE TABLE `orders`")
+	assert.Contains(t, planned["events"], "CREATE TABLE `events`")
 }
 
 func TestEngine_Plan_LintViolationMapping(t *testing.T) {
@@ -987,32 +1137,39 @@ func TestEngine_FetchCurrentSchema(t *testing.T) {
 	require.NoError(t, err, "create internal table")
 
 	eng := New(Config{})
-	schemas, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb")
+	schemas, _, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{})
 	require.NoError(t, err, "fetchCurrentSchema()")
 
 	assert.Len(t, schemas, 2)
 	assert.ElementsMatch(t, []string{"t1", "t2"}, tableSchemaNames(schemas))
 }
 
-// A cancelled Spirit schema change must remove resumability artifacts so a
-// later apply starts cleanly, while preserving the user's live base table.
+// A cancel that reaches a still-running schema change must clear the
+// resumability artifacts so a later apply starts cleanly, while preserving the
+// user's live base table. It disposes of them under the same policy as a cancel
+// that finds no runner alive: the copies are preserved in the quarantine, the
+// metadata describing them is dropped.
 func TestEngine_CancelledArtifactCleanup(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
+	cleanupPendingDropsDB(t, db)
 
 	baseTable := "customers"
-	artifacts := []string{
-		utils.AuxTableName(baseTable, "_new"),
-		utils.AuxTableName(baseTable, "_old"),
+	releaseTestCleanup(t, db, baseTable)
+	copies := []string{
+		utils.NewTableName(baseTable),
+		utils.OldTableName(baseTable),
+	}
+	metadata := []string{
 		utils.CheckpointTableName(baseTable),
 		"_spirit_sentinel",
 		"_spirit_checkpoint",
 	}
 
-	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", quoteIdentifier(baseTable)))
+	_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", sqlescape.EscapeIdentifier(baseTable)))
 	require.NoError(t, err)
-	for _, artifact := range artifacts {
-		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", quoteIdentifier(artifact)))
+	for _, artifact := range append(copies, metadata...) {
+		_, err := db.ExecContext(t.Context(), fmt.Sprintf("CREATE TABLE %s (id INT PRIMARY KEY)", sqlescape.EscapeIdentifier(artifact)))
 		require.NoError(t, err, "create artifact %s", artifact)
 	}
 
@@ -1029,9 +1186,11 @@ func TestEngine_CancelledArtifactCleanup(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.True(t, tableExists(t, db, baseTable))
-	for _, artifact := range artifacts {
-		assert.False(t, tableExists(t, db, artifact), "artifact should be dropped: %s", artifact)
+	for _, artifact := range append(copies, metadata...) {
+		assert.False(t, tableExists(t, db, artifact), "artifact should leave the target: %s", artifact)
 	}
+	assert.Len(t, listQuarantinedTables(t, db), len(copies),
+		"the copies must be preserved rather than dropped")
 }
 
 // Archive tables are maintained outside declarative schema files, so a plan
@@ -1238,7 +1397,7 @@ func TestEngine_FetchCurrentSchema_EmptyDatabase(t *testing.T) {
 	cleanupTables(t, db) // Start with clean database
 
 	eng := New(Config{})
-	schemas, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb")
+	schemas, _, err := eng.fetchCurrentSchema(t.Context(), dsn, "testdb", engine.IgnoredTables{})
 	require.NoError(t, err, "fetchCurrentSchema()")
 
 	assert.Empty(t, schemas, "expected 0 tables for empty database")
@@ -1522,7 +1681,8 @@ func TestEngine_ExecuteMigration_InvalidSQL(t *testing.T) {
 }
 
 // A UNIQUE index over duplicate values fails checksum consistently, so the
-// engine reports the runner failure as permanent instead of retrying it.
+// engine reports the runner failure as permanent instead of retrying it, and
+// progress tells the drive the failure is not retryable.
 func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 	dsn, db := setupTestMySQL(t)
 	cleanupTables(t, db)
@@ -1539,7 +1699,13 @@ func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 	host, username, password, database, err := parseDSN(dsn)
 	require.NoError(t, err, "parseDSN")
 	eng := New(Config{Logger: discardLogger()})
+	eng.installRunningSchemaChange(&runningSchemaChange{
+		database: database,
+		state:    engine.StateRunning,
+		started:  time.Now(),
+	})
 
+	shortenLocklessRetryDelay(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	err = eng.executeSpiritMigration(ctx, host, username, password, database,
@@ -1548,6 +1714,24 @@ func TestEngine_ChecksumDifferencesArePermanent(t *testing.T) {
 	require.Error(t, err)
 	assert.False(t, engine.IsRetryable(err))
 	assert.ErrorIs(t, err, checksum.ErrDifferencesExhausted)
+
+	result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
+	require.NoError(t, err, "Progress()")
+	assert.Equal(t, engine.StateFailed, result.State)
+	assert.False(t, result.Retryable)
+}
+
+// shortenLocklessRetryDelay paces the lockless checksum's passes 100ms apart
+// for the rest of the test. A lossy ALTER fails only once the checksum has run
+// its full pass budget (checksum.DefaultLocklessMaxPasses), and at the
+// production pacing (5s) that alone exceeds a test's 30-second bound. The
+// override is a package global, so a test that uses it must not run in
+// parallel.
+func shortenLocklessRetryDelay(t *testing.T) {
+	t.Helper()
+	prev := checksum.DefaultLocklessRetryDelay
+	checksum.DefaultLocklessRetryDelay = 100 * time.Millisecond
+	t.Cleanup(func() { checksum.DefaultLocklessRetryDelay = prev })
 }
 
 // TestEngine_Progress_FailingApplyNeverReportsCompleted verifies that a
@@ -1608,8 +1792,10 @@ func TestEngine_Progress_FailingApplyNeverReportsCompleted(t *testing.T) {
 	result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
 	require.NoError(t, err, "Progress()")
 	assert.Equal(t, engine.StateFailed, result.State)
-	assert.Contains(t, result.ErrorMessage, "schema change failed")
-	assert.Contains(t, result.ErrorMessage, "nonexistent_column")
+	// The target says which column is missing by quoting the statement, and
+	// what reaches the pull request is SchemaBot's account of the error code.
+	assert.Equal(t, mysqlerr.ReasonFromText("(errno 1091)"), result.ErrorMessage)
+	assert.NotContains(t, result.ErrorMessage, "nonexistent_column")
 	assert.True(t, result.Retryable)
 }
 
@@ -1960,7 +2146,7 @@ func TestEngine_FetchCurrentSchema_ConnectionError(t *testing.T) {
 	eng := New(Config{})
 
 	// Use invalid DSN
-	_, err := eng.fetchCurrentSchema(t.Context(), "invalid:invalid@tcp(localhost:9999)/nonexistent", "testdb")
+	_, _, err := eng.fetchCurrentSchema(t.Context(), "invalid:invalid@tcp(localhost:9999)/nonexistent", "testdb", engine.IgnoredTables{})
 	assert.Error(t, err, "expected error for invalid DSN")
 }
 
@@ -2213,7 +2399,7 @@ func containsHelper(s, substr string) bool {
 // and report the deferred-cutover signal as absent.
 func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
 	ctx := t.Context()
-	db, err := sql.Open("mysql", sharedDSN)
+	db, err := sql.Open("block-mysql", sharedDSN)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -2227,7 +2413,7 @@ func TestEngine_StatelessControlAddressesDSNSchema(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", sharedDSN)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", sharedDSN)
 		require.NoError(t, cleanupErr, "open database for stateless control cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP DATABASE IF EXISTS `"+physicalSchema+"`")
@@ -2287,22 +2473,252 @@ func TestNewSpiritMigrationRunSettings(t *testing.T) {
 	eng := New(Config{})
 	m := eng.newSpiritMigration(host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.Equal(t, DefaultCheckpointMaxAge, m.CheckpointMaxAge)
-	assert.Equal(t, DefaultChecksumYieldTimeout, m.ChecksumYieldTimeout)
-	assert.True(t, m.EnableExperimentalAutoscaling, "autoscaling defaults to enabled")
+	assert.False(t, m.SkipAutoscaling, "autoscaling is Spirit's default and stays on")
+	assert.False(t, m.LegacyChecksum, "the copy is verified under Spirit's default lockless checksum")
 	assert.True(t, m.InterpolateParams)
-	assert.Zero(t, m.WriteThreads, "write threads auto-size for the target")
+	assert.Equal(t, DefaultThreads, m.Threads, "copier threads carry the engine setting")
+	assert.Equal(t, DefaultLockWaitTimeout, m.LockWaitTimeout, "the cutover lock wait carries the engine setting")
+	assert.Equal(t, spiritflags.DefaultWriteThreads, m.WriteThreads,
+		"write threads start at Spirit's default; autoscaling sizes them on Aurora")
 	assert.Equal(t, maxCommitLatency, m.MaxCommitLatency,
 		"commit-latency throttle must be set explicitly; Spirit disables the throttler on zero")
 
 	settings, err := SettingsFromMetadata(map[string]string{
-		MetadataEnableExperimentalAutoscaling: "false",
-		MetadataCheckpointMaxAge:              "24h",
-		MetadataChecksumYieldTimeout:          "6h",
+		MetadataCheckpointMaxAge: "24h",
 	})
 	require.NoError(t, err, "SettingsFromMetadata")
 	eng = New(Config{Settings: settings})
 	m = eng.newSpiritMigration(host, username, password, database, "ALTER TABLE t1 ADD COLUMN c1 INT")
 	assert.Equal(t, 24*time.Hour, m.CheckpointMaxAge)
-	assert.Equal(t, 6*time.Hour, m.ChecksumYieldTimeout)
-	assert.False(t, m.EnableExperimentalAutoscaling, "autoscaling override disables it")
+}
+
+// A plan that touches existing tables reports each table's approximate row
+// count, so the plan comment can show the scale of what the change touches.
+// Estimates are display-only and best-effort: a table being created does not
+// exist yet and gets none.
+func TestEngine_Plan_TableRowEstimates(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `sized_items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  `name` varchar(255) NOT NULL,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create table")
+
+	// Seed rows and refresh statistics so information_schema reports a
+	// meaningful estimate.
+	var values strings.Builder
+	for i := range 1200 {
+		if i > 0 {
+			values.WriteString(",")
+		}
+		fmt.Fprintf(&values, "('name-%d')", i)
+	}
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `sized_items` (`name`) VALUES "+values.String())
+	require.NoError(t, err, "seed rows")
+	_, err = db.ExecContext(t.Context(), "ANALYZE TABLE `sized_items`")
+	require.NoError(t, err, "analyze table")
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	eng := New(Config{Logger: logger})
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"sized_items.sql": "CREATE TABLE `sized_items` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  `name` varchar(255) NOT NULL,\n" +
+				"  `quantity` int DEFAULT NULL,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+			"sized_gadgets.sql": "CREATE TABLE `sized_gadgets` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "Plan()")
+	require.False(t, result.NoChanges)
+
+	byTable := make(map[string]engine.TableChange)
+	for _, tc := range result.FlatTableChanges() {
+		byTable[tc.Table] = tc
+	}
+
+	altered, ok := byTable["sized_items"]
+	require.True(t, ok, "expected an ALTER for sized_items, got: %v", result.FlatDDL())
+	require.NotNil(t, altered.EstimatedRows, "an existing table carries a row estimate")
+	// TABLE_ROWS is an estimate; allow statistics slop around the seeded count.
+	assert.InDelta(t, 1200, float64(*altered.EstimatedRows), 300)
+	require.NotNil(t, altered.EstimatedBytes, "an existing table carries a byte estimate")
+	assert.Positive(t, *altered.EstimatedBytes, "data plus index bytes of a seeded table")
+	assert.Zero(t, altered.ShardCount, "a single MySQL target is not sharded")
+	assert.Nil(t, altered.LargestShardRows)
+
+	created, ok := byTable["sized_gadgets"]
+	require.True(t, ok, "expected a CREATE for sized_gadgets, got: %v", result.FlatDDL())
+	assert.Nil(t, created.EstimatedRows, "a table being created has no estimate")
+	assert.Nil(t, created.EstimatedBytes, "a table being created has no byte estimate")
+}
+
+// planSizeProbeFixture creates one table and returns the engine, DSN, and schema
+// files for a plan that alters it, so a test can fault the size probe.
+func planSizeProbeFixture(t *testing.T) (*Engine, string, schema.SchemaFiles) {
+	t.Helper()
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE `probed_items` (\n"+
+		"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n"+
+		"  PRIMARY KEY (`id`)\n"+
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
+	require.NoError(t, err, "create table")
+	files := testSchemaFiles(map[string]string{
+		"probed_items.sql": "CREATE TABLE `probed_items` (\n" +
+			"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+			"  `label` varchar(64) DEFAULT NULL,\n" +
+			"  PRIMARY KEY (`id`)\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+	})
+	return New(Config{}), dsn, files
+}
+
+// Table sizes are display-only plan context, so a size probe that fails still
+// yields the full plan: the ALTER is planned and simply carries no size.
+func TestEngine_Plan_SizeProbeFailureStillPlans(t *testing.T) {
+	eng, dsn, files := planSizeProbeFixture(t)
+	eng.sizeProbeFault = func(context.Context) error {
+		return errors.New("statistics unreadable")
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: files,
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "a failed size probe must not fail the plan")
+
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "probed_items", changes[0].Table)
+	assert.Contains(t, changes[0].DDL, "ADD COLUMN `label`")
+	assert.Nil(t, changes[0].EstimatedRows)
+	assert.Nil(t, changes[0].EstimatedBytes)
+}
+
+// The size probe runs under its own budget, never the plan's, so a probe that
+// hangs gives up after engine.TableSizeProbeTimeout and the plan goes on
+// without sizes instead of waiting out the caller's deadline.
+func TestEngine_Plan_SizeProbeIsBounded(t *testing.T) {
+	eng, dsn, files := planSizeProbeFixture(t)
+	var budget time.Duration
+	var hasDeadline bool
+	eng.sizeProbeFault = func(ctx context.Context) error {
+		var deadline time.Time
+		deadline, hasDeadline = ctx.Deadline()
+		budget = time.Until(deadline)
+		return context.DeadlineExceeded
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database:    "testdb",
+		SchemaFiles: files,
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err, "a timed-out size probe must not fail the plan")
+	require.True(t, hasDeadline, "the size probe must run under a deadline")
+	assert.LessOrEqual(t, budget, engine.TableSizeProbeTimeout)
+	assert.Positive(t, budget)
+	require.Len(t, result.FlatTableChanges(), 1)
+}
+
+// Every statement the size probe sends runs under the probe's budget, so a
+// server that is slow to answer either one is abandoned after
+// engine.TableSizeProbeTimeout and the plan returns without sizes, well before
+// the stalled statement would have finished on its own. The plan returning
+// only after the probe's deadline proves the stalled statement was sent and
+// ran until the deadline cancelled it, rather than failing on its own.
+func TestEngine_Plan_SlowSizeProbeStatementIsAbandoned(t *testing.T) {
+	const stall = 20 * time.Second
+	stalls := map[string]func(stmt string) string{
+		// SLEEP returns 0, so the stalled SET still sets the value the probe wants.
+		"session setting": func(stmt string) string {
+			if !strings.HasPrefix(stmt, "SET SESSION") {
+				return stmt
+			}
+			return fmt.Sprintf("SET SESSION information_schema_stats_expiry = (SELECT SLEEP(%d))", int(stall.Seconds()))
+		},
+		"statistics query": func(stmt string) string {
+			if !strings.Contains(stmt, "information_schema.tables") {
+				return stmt
+			}
+			return fmt.Sprintf("SELECT probe.* FROM (%s) AS probe, (SELECT SLEEP(%d)) AS stall", stmt, int(stall.Seconds()))
+		},
+	}
+	for name, rewrite := range stalls {
+		t.Run(name, func(t *testing.T) {
+			eng, dsn, files := planSizeProbeFixture(t)
+			var stalledUntil time.Time
+			eng.sizeProbeSQL = func(ctx context.Context, stmt string) string {
+				out := rewrite(stmt)
+				if out != stmt {
+					stalledUntil, _ = ctx.Deadline()
+				}
+				return out
+			}
+
+			start := time.Now()
+			result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+				Database:    "testdb",
+				SchemaFiles: files,
+				Credentials: &engine.Credentials{DSN: dsn},
+			})
+			returned := time.Now()
+
+			require.NoError(t, err, "a stalled size probe must not fail the plan")
+			require.False(t, stalledUntil.IsZero(), "the stall must reach a statement the probe sends, under a deadline")
+			assert.True(t, returned.After(stalledUntil), "the stalled statement must hold the probe until its deadline, not fail on its own")
+			assert.Less(t, returned.Sub(start), stall/2, "the plan must abandon the stalled statement at the probe's budget, not wait it out")
+			changes := result.FlatTableChanges()
+			require.Len(t, changes, 1)
+			assert.Equal(t, "probed_items", changes[0].Table)
+			assert.Nil(t, changes[0].EstimatedRows)
+			assert.Nil(t, changes[0].EstimatedBytes)
+		})
+	}
+}
+
+// A plan that only creates tables has no existing table to size, so it never
+// runs the size probe and never connects to the target for sizes; the created
+// table carries no estimate.
+func TestEngine_Plan_CreateOnlyPlanSkipsSizeProbe(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	eng := New(Config{})
+	probed := false
+	eng.sizeProbeFault = func(context.Context) error {
+		probed = true
+		return nil
+	}
+
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: testSchemaFiles(map[string]string{
+			"fresh_items.sql": "CREATE TABLE `fresh_items` (\n" +
+				"  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (`id`)\n" +
+				") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
+		}),
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+
+	assert.False(t, probed, "a create-only plan must not run the size probe")
+	changes := result.FlatTableChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "fresh_items", changes[0].Table)
+	assert.Nil(t, changes[0].EstimatedRows)
+	assert.Nil(t, changes[0].EstimatedBytes)
 }

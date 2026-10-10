@@ -8,13 +8,19 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 )
 
-// The reaper is the operator's cleanup component: it settles rows that nothing
-// will ever act on again, so dead rows cannot masquerade as live work. Each
-// kind of dead row is its own independent sweep within a shared per-tick pass;
-// new cleanup responsibilities belong here as additional sweeps.
+// The reaper is the operator's cleanup component: it settles rows no driver
+// will ever take, so they cannot masquerade as live work. Each kind of row is
+// its own independent sweep, and sweeps that want the same cadence share a
+// per-tick pass; new cleanup responsibilities belong here.
+//
+// Every sweep is a maintenance writer rather than a driver: it writes rows it
+// holds no lease on, so what keeps it off a driver's rows is reading that
+// driver's lease and declining. That is the property to preserve when adding
+// one — see the note on lease exclusion below.
 //
 // The stranded-operation sweep settles apply_operations rows that nothing will
 // ever claim.
@@ -63,6 +69,14 @@ import (
 // guarded and idempotent, so concurrent reapers would be correct; they would just
 // each pay the full scan to settle rows the first one already handled.
 //
+// What keeps a reaper off a driver's rows is the lease, not the election and not
+// the quiescence windows. Every sweep takes only rows whose lease is absent or
+// stale by the claim path's own reckoning, which is the same test a driver
+// applies before taking work from a peer — so the two writer classes exclude each
+// other by one mechanism rather than by two that have to be kept in agreement.
+// The windows sit on top of that, deciding when a row is worth looking at rather
+// than whether it is safe to write.
+//
 // The retryable-task sweep reaps dead retryable tasks: failed_retryable task
 // rows under a settled parent apply. A failed_retryable task promises a retry that
 // only the parent's recovery path can dispatch, so once the parent settles the
@@ -73,6 +87,17 @@ import (
 // the storage layer's contract — see storage.TaskStore.ReapStrandedRetryable.
 // The sweep shape is the same as above, with its own election lock and a longer
 // parent-quiescence window sized past the retryable-recovery freshness window.
+//
+// The retryable-expiry pass settles the other direction: the parent apply
+// itself, when a failed_retryable apply has spent its retry budget or gone
+// stale, together with the operation and task rows underneath it. It is the one
+// sweep whose subject is an apply rather than the residue of one, and it runs on
+// its own short cadence rather than in the shared pass — see
+// RetryableExpiryInterval. Because it writes a whole apply's tree at once it
+// cannot decide row by row: it excludes a live driver by taking only applies
+// with no operation a driver is part-way through driving, and then takes the
+// tree whole. It locks every operation and rechecks leases before writing;
+// a fresh retryable lease is protected too. See storage.ApplyStore.ExpireRetryable.
 
 // StrandedReaperInterval is how often the reaper runs a pass. Override with
 // SetStrandedReaperInterval.
@@ -83,59 +108,99 @@ const StrandedReaperInterval = 1 * time.Minute
 // this is the fleet-wide drain rate per interval, not a per-driver rate.
 const strandedReaperBatch = 200
 
-// SetStrandedReaperInterval sets how often the reaper runs a pass. Call before
+// RetryableExpiryInterval is how often the expiry pass runs. Override with
+// SetRetryableExpiryInterval.
+//
+// It is far shorter than StrandedReaperInterval because the two passes wait on
+// different things. Every row the stranded sweeps can settle has already sat out
+// a quiescence window, so a faster pass finds nothing new. Expiry's budget arm
+// has no such window: an apply qualifies the moment its last redispatch consumes
+// the budget, and until it settles it holds the one-active-apply guard against
+// every new apply for that database. A pass that costs one elected scan is worth
+// running at the cadence a driver notices.
+const RetryableExpiryInterval = OperatorPollInterval
+
+// retryableExpiryBatch bounds how many applies one expiry pass settles. Sized
+// like strandedReaperBatch and for the same reason: one instance expires per
+// pass, so this is the fleet-wide drain rate per interval.
+const retryableExpiryBatch = 200
+
+// SetStrandedReaperInterval sets how often the stranded sweeps run. Call before
 // StartOperator so the reaper creates its ticker with the intended interval.
 func (s *Service) SetStrandedReaperInterval(interval time.Duration) error {
+	return s.setReaperInterval(interval, "stranded reaper", &s.strandedReaperEvery)
+}
+
+// SetRetryableExpiryInterval sets how often the expiry pass runs. Call before
+// StartOperator so the reaper creates its ticker with the intended interval.
+func (s *Service) SetRetryableExpiryInterval(interval time.Duration) error {
+	return s.setReaperInterval(interval, "retryable expiry", &s.retryableExpiryEvery)
+}
+
+func (s *Service) setReaperInterval(interval time.Duration, name string, into *time.Duration) error {
 	if interval <= 0 {
-		return fmt.Errorf("stranded reaper interval must be positive")
+		return fmt.Errorf("%s interval must be positive", name)
 	}
 	s.operatorMu.Lock()
 	defer s.operatorMu.Unlock()
 	if s.stopRecovery != nil {
 		return fmt.Errorf("operator already running")
 	}
-	s.strandedReaperEvery = interval
+	*into = interval
 	return nil
 }
 
-// strandedReaperLoop runs a pass on every tick until the operator stops. It
-// shares the driver lifecycle rather than having its own: the rows it settles are
-// the residue of driving applies, so a process that does not run the operator has
-// nothing to reap.
-func (s *Service) strandedReaperLoop(ctx context.Context, stop <-chan struct{}, interval time.Duration) {
+// reaperLoop runs one named pass on every tick until the operator stops. It
+// shares the driver lifecycle rather than having its own: the rows these passes
+// settle are the residue of driving applies, so a process that does not run the
+// operator has nothing to reap.
+//
+// Each cadence gets its own loop rather than a shared ticker that skips passes,
+// so the slow sweeps are not woken on every fast tick only to decide they have
+// nothing to do.
+func (s *Service) reaperLoop(ctx context.Context, stop <-chan struct{}, interval time.Duration, name string, pass func(context.Context)) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	s.runStrandedReaperPass(ctx)
+	if claimGateClosed(stop) {
+		s.logger.Debug("operator: reaper stopping before its first pass", "pass", name)
+		return
+	}
+	pass(ctx)
 
 	for {
 		select {
 		case <-stop:
-			s.logger.Debug("operator: reaper stopping")
+			s.logger.Debug("operator: reaper stopping", "pass", name)
 			return
 		case <-ctx.Done():
-			s.logger.Debug("operator: reaper stopping", "error", ctx.Err())
+			s.logger.Debug("operator: reaper stopping", "pass", name, "error", ctx.Err())
 			return
 		case <-ticker.C:
-			s.runStrandedReaperPass(ctx)
+			if claimGateClosed(stop) {
+				s.logger.Debug("operator: reaper stopping instead of a polled pass", "pass", name)
+				return
+			}
+			pass(ctx)
 		}
 	}
 }
 
-// runStrandedReaperPass runs one pass over both kinds of dead row. It is
+// runStrandedReaperPass runs one pass over the three kinds of dead row. It is
 // best-effort maintenance: a storage error is logged and recorded, and the next
 // pass retries. Losing the election is the expected outcome on every instance
 // but one, so it is not an error.
 //
-// The two sweeps run concurrently. They share nothing — separate election
-// locks, separate connections, no row in common — and neither may wait behind
-// the other: the retryable-task sweep is what frees a remote drive waiting out
-// a dead pause, so a slow scan of the pending-operation set must not defer it
-// to the next tick. A failure in one likewise cannot starve the other.
+// The sweeps run concurrently. They share nothing — separate election locks,
+// separate connections, no row in common — and none may wait behind another: the
+// retryable-task sweep is what frees a remote drive waiting out a dead pause, so
+// a slow scan of the pending-operation set must not defer it to the next tick. A
+// failure in one likewise cannot starve the others.
 func (s *Service) runStrandedReaperPass(ctx context.Context) {
 	var sweeps sync.WaitGroup
 	sweeps.Go(func() { s.reapStrandedOperations(ctx) })
 	sweeps.Go(func() { s.reapStrandedRetryableTasks(ctx) })
+	sweeps.Go(func() { s.reapStrandedActiveTasks(ctx) })
 	sweeps.Wait()
 }
 
@@ -160,6 +225,16 @@ var (
 		subject:       "stranded retryable tasks",
 		failureReason: "stranded_task_reaper_error",
 	}
+	strandedActiveTaskSweep = reapSweep{
+		busy:          storage.ErrStrandedActiveTaskReaperBusy,
+		subject:       "stranded active tasks",
+		failureReason: "stranded_active_task_reaper_error",
+	}
+	retryableExpirySweep = reapSweep{
+		busy:          storage.ErrRetryableExpiryBusy,
+		subject:       "expired retryable applies",
+		failureReason: "expire_retryable_error",
+	}
 )
 
 // recordSweepOutcome handles how a sweep ended, after its settlements have
@@ -182,6 +257,56 @@ func (s *Service) recordSweepOutcome(ctx context.Context, sweep reapSweep, reape
 			"reaped_before_failure", reaped, "error", err)
 		metrics.RecordOperatorClaimFailure(ctx, sweep.failureReason)
 	}
+}
+
+// runRetryableExpiryPass settles failed_retryable applies that have exhausted
+// their retry budget or freshness window, along with the task and operation rows
+// underneath them. It is best-effort maintenance on the same terms as the
+// stranded sweeps: a storage error is logged and recorded, and the next pass
+// retries.
+//
+// It is a pass of its own rather than a fourth sweep in runStrandedReaperPass
+// because it wants a much shorter interval than the stranded sweeps do; see
+// RetryableExpiryInterval.
+func (s *Service) runRetryableExpiryPass(ctx context.Context) {
+	expired, err := s.storage.Applies().ExpireRetryable(ctx, retryableExpiryBatch)
+
+	// A pass settles its whole batch in one transaction, so this is all of what
+	// it expired or none of it — an error means nothing committed and there is
+	// nothing here to report. Each apply still gets its own line and its own
+	// durable log entry, because "why did this apply stop retrying" is asked one
+	// apply at a time.
+	for _, expiration := range expired {
+		apply := expiration.Apply
+		s.logger.Error("operator: retryable apply expired",
+			append(apply.LogAttrs(),
+				"attempt", apply.Attempt,
+				"reason", expiration.Reason)...)
+		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
+		s.logApplyExpiration(ctx, apply, expiration.Reason)
+	}
+
+	s.recordSweepOutcome(ctx, retryableExpirySweep, len(expired), err)
+}
+
+// logApplyExpiration appends a durable apply log entry recording that operator
+// recovery gave up on the apply. Expiry is what makes a retryable failure
+// permanent, so without it the apply log ends on the last paused attempt and an
+// operator reading the CLI or the PR summary sees the apply reach a terminal
+// state with nothing stating why. Best-effort: a failed append must not stop the
+// pass from expiring the remaining applies.
+func (s *Service) logApplyExpiration(ctx context.Context, apply *storage.Apply, reason storage.RetryableExpirationReason) {
+	s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
+		ApplyID:   apply.ID,
+		Level:     storage.LogLevelError,
+		EventType: storage.LogEventError,
+		Source:    storage.LogSourceSchemaBot,
+		Message: fmt.Sprintf("Operator recovery gave up on the apply after %d of %d attempts (%s); it will not be retried automatically",
+			apply.Attempt, storage.MaxRecoveryAttempts, reason),
+		OldState:  state.Apply.FailedRetryable,
+		NewState:  state.Apply.Failed,
+		CreatedAt: s.clock.Now(),
+	}, "why recovery stopped", apply.LogAttrs()...)
 }
 
 // reapStrandedOperations settles pending operation rows under settled parent
@@ -230,4 +355,34 @@ func (s *Service) reapStrandedRetryableTasks(ctx context.Context) {
 	}
 
 	s.recordSweepOutcome(ctx, strandedRetryableTaskSweep, len(reaped), err)
+}
+
+// reapStrandedActiveTasks settles task rows left in an active state under a
+// settled, quiescent parent apply, mirroring the parent's outcome onto them.
+// These are the rows that make a completed apply render a table still copying:
+// their driver recorded the verdict on the parent and exited without closing
+// them. Only a lease-class writer can correct them — a reader cannot, because
+// correcting them is a write, and because a reader cannot tell a stranded row
+// from a sibling still copying under an apply that a failed task already
+// settled. The operation lease is what tells those apart.
+//
+// Settlements are logged, not counted, for the same reason as the retryable
+// sweep's: they are the rare residue of a driver that stopped mid-write, so a
+// rate would read zero for weeks.
+func (s *Service) reapStrandedActiveTasks(ctx context.Context) {
+	reaped, err := s.storage.Tasks().ReapStrandedActive(ctx, strandedReaperBatch)
+
+	// Report what landed before handling the error. A failed pass still returns
+	// the rows it settled before failing, and those writes are committed — an
+	// operator asking who changed a settled apply's task rows must find them.
+	for _, settled := range reaped {
+		parent, task := settled.Parent, settled.Task
+		s.logger.Info("operator: reaped a stranded active task to its parent apply's recorded outcome",
+			append(parent.LogAttrs(),
+				"task_id", task.TaskIdentifier,
+				"table", task.TableName,
+				"task_state", task.State)...)
+	}
+
+	s.recordSweepOutcome(ctx, strandedActiveTaskSweep, len(reaped), err)
 }

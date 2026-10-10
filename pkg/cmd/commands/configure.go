@@ -2,8 +2,12 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -18,7 +22,9 @@ type ConfigureCmd struct {
 }
 
 // ConfigureSetupCmd is the default configure command (interactive profile setup).
-type ConfigureSetupCmd struct{}
+type ConfigureSetupCmd struct {
+	input io.Reader
+}
 
 // Run executes the configure command (interactive profile setup).
 func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
@@ -34,9 +40,13 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 	}
 
 	// Get existing profile values for defaults
-	existingProfile := cfg.Profiles[profileName]
+	existingProfile, existed := cfg.Profiles[profileName]
 
-	reader := bufio.NewReader(os.Stdin)
+	input := cmd.input
+	if input == nil {
+		input = os.Stdin
+	}
+	reader := bufio.NewReader(input)
 
 	// Prompt for endpoint
 	defaultEndpoint := existingProfile.Endpoint
@@ -50,19 +60,25 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 		endpoint = defaultEndpoint
 	}
 
-	// Update profile
-	cfg.Profiles[profileName] = client.Profile{
-		Endpoint: endpoint,
-	}
-
-	// If this is the first profile or named "default", set as default
-	if cfg.DefaultProfile == "" || profileName == "default" {
-		cfg.DefaultProfile = profileName
-	}
-
-	// Save config
-	if err := client.SaveConfig(cfg); err != nil {
+	var loginCleared bool
+	if err := client.UpdateConfig(context.Background(), func(latest *client.Config) error {
+		current, exists := latest.Profiles[profileName]
+		if exists != existed || !sameEndpoint(current.Endpoint, existingProfile.Endpoint) || current.LocalRuntime != existingProfile.LocalRuntime || !reflect.DeepEqual(current.OIDC, existingProfile.OIDC) {
+			return fmt.Errorf("profile %q changed its connection while configure was open; your newer settings were preserved. Run `%s configure` again to review them", profileName, cliname.Name())
+		}
+		var profile client.Profile
+		profile, loginCleared = reconfiguredProfile(current, endpoint)
+		latest.Profiles[profileName] = profile
+		if latest.DefaultProfile == "" || profileName == "default" {
+			latest.DefaultProfile = profileName
+		}
+		cfg = latest
+		return nil
+	}); err != nil {
 		return fmt.Errorf("save config: %w", err)
+	}
+	if loginCleared {
+		fmt.Printf("\nEndpoint changed; the cached login was cleared. Run `%s login` to sign in to the new endpoint.\n", cliname.Name())
 	}
 
 	configPath, _ := client.ConfigPath()
@@ -81,6 +97,66 @@ func (cmd *ConfigureSetupCmd) Run(g *Globals) error {
 	return nil
 }
 
+// reconfiguredProfile returns the profile to save once the operator has chosen
+// an endpoint, and reports whether a cached login was dropped. Everything
+// `login` wrote survives an unchanged endpoint. A changed endpoint drops the
+// cached token, its refresh token, its expiry, and the issuer and client ID it
+// came from: a token is bound to the server that issued it and must never be
+// sent to a different one. The oidc
+// settings are kept either way, since `login` can still use or override them.
+func reconfiguredProfile(existing client.Profile, endpoint string) (profile client.Profile, loginCleared bool) {
+	profile = existing
+	profile.Endpoint = endpoint
+	hasLogin := existing.Token != "" || existing.RefreshToken != ""
+	if hasLogin && !sameEndpoint(existing.Endpoint, endpoint) {
+		profile.Token = ""
+		profile.RefreshToken = ""
+		profile.TokenExpiry = 0
+		profile.TokenIssuer = ""
+		profile.TokenClientID = ""
+		loginCleared = true
+	}
+	return profile, loginCleared
+}
+
+// sameEndpoint reports whether two configured endpoints address the same
+// server. It exists because the operator retypes the endpoint at the prompt,
+// so the same server routinely arrives spelled differently — with or without a
+// trailing slash, with the host in a different case — and an exact string
+// compare would read those as a move and sign the operator out of a server
+// they never left.
+//
+// It only collapses differences the URL grammar says are not part of the
+// address: the scheme and host are case-insensitive, and a trailing slash is
+// not a path segment. Everything else, including the port, still counts as a
+// different server. An endpoint that will not parse falls back to exact
+// equality, which errs toward clearing a login rather than carrying a token to
+// a server that did not issue it.
+func sameEndpoint(a, b string) bool {
+	if a == b {
+		return true
+	}
+	normalizedA, okA := normalizeEndpoint(a)
+	normalizedB, okB := normalizeEndpoint(b)
+	if !okA || !okB {
+		return false
+	}
+	return normalizedA == normalizedB
+}
+
+// normalizeEndpoint rewrites an endpoint into the form sameEndpoint compares,
+// reporting false when it cannot be parsed as a URL.
+func normalizeEndpoint(raw string) (string, bool) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", false
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	return parsed.String(), true
+}
+
 // ConfigureShowCmd displays the current configuration.
 type ConfigureShowCmd struct{}
 
@@ -93,21 +169,7 @@ func (cmd *ConfigureShowCmd) Run(g *Globals) error {
 
 	configPath, _ := client.ConfigPath()
 
-	// Determine active profile name
-	activeProfileName := g.Profile
-	activeSource := "flag"
-	if activeProfileName == "" {
-		activeProfileName = os.Getenv("SCHEMABOT_PROFILE")
-		activeSource = "env"
-	}
-	if activeProfileName == "" {
-		activeProfileName = cfg.DefaultProfile
-		activeSource = "config"
-	}
-	if activeProfileName == "" {
-		activeProfileName = "default"
-		activeSource = "default"
-	}
+	selection := client.ResolveProfile(cfg, g.Profile)
 
 	fmt.Println("SchemaBot Configuration")
 	fmt.Println()
@@ -115,13 +177,13 @@ func (cmd *ConfigureShowCmd) Run(g *Globals) error {
 	fmt.Println()
 
 	// Show how profile was determined
-	fmt.Printf("  Active profile: %s", activeProfileName)
-	switch activeSource {
-	case "flag":
+	fmt.Printf("  Active profile: %s", selection.Name)
+	switch selection.Source {
+	case client.ProfileSourceFlag:
 		fmt.Printf(" (from --profile flag)\n")
-	case "env":
+	case client.ProfileSourceEnvironment:
 		fmt.Printf(" (from SCHEMABOT_PROFILE env)\n")
-	case "config":
+	case client.ProfileSourceConfig:
 		fmt.Printf(" (from config default_profile)\n")
 	default:
 		fmt.Printf(" (default)\n")
@@ -153,10 +215,16 @@ func (cmd *ConfigureShowCmd) Run(g *Globals) error {
 		for _, name := range names {
 			profile := cfg.Profiles[name]
 			marker := "  "
-			if name == activeProfileName {
+			if name == selection.Name {
 				marker = "* "
 			}
 			fmt.Printf("    %s%s: %s\n", marker, name, profile.Endpoint)
+			// The recorded pair, not the oidc settings, is where refresh goes,
+			// so show it: otherwise an edit to oidc that has no effect on the
+			// session is visible only by reading the config file.
+			if profile.TokenIssuer != "" || profile.TokenClientID != "" {
+				fmt.Printf("        refreshes at %s as client %s (recorded at login)\n", profile.TokenIssuer, profile.TokenClientID)
+			}
 		}
 	}
 

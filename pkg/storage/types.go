@@ -2,12 +2,17 @@ package storage
 
 import (
 	"encoding/json"
+	"fmt"
+	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
 )
 
 // MaxRecoveryAttempts is the operator retry budget for failed_retryable
@@ -16,6 +21,18 @@ import (
 // in operator-facing progress (the PR comment's retry counter) and enforced by
 // the storage claim/expiry paths.
 const MaxRecoveryAttempts = 10
+
+// ApplyTargetLockWait is how long a claim blocks waiting for another instance
+// to release an apply target's advisory lock. It is the longest a statement on
+// the storage pool legitimately blocks, which makes it the floor any
+// statement budget configured for that pool must stay above: the wait blocks
+// inside a lock acquisition, and statement_timeout bounds a blocked statement
+// as readily as a computing one. A budget below this wait cancels the
+// acquisition with SQLSTATE 57014 before the lock timeout can report the
+// ordinary 55P03 "someone else holds it", turning routine contention into a
+// failure that looks nothing like a lock conflict. Exported so config
+// validation can enforce that floor.
+const ApplyTargetLockWait = 10 * time.Second
 
 // MaxWebhookEventAttempts is the claim budget for webhook inbox rows: how many
 // times FindNext will hand out a given delivery (each claim increments
@@ -26,8 +43,9 @@ const MaxRecoveryAttempts = 10
 // a terminal state are left for reconciliation/monitoring to surface.
 const MaxWebhookEventAttempts = 5
 
-// Cutover policies control how a multi-deployment rollout sequences the copy
-// and cutover phases of its deployments. The value is resolved from the
+// Cutover policies control how a multi-member rollout sequences the copy and
+// cutover phases of its members: the deployments of a deployments map, or the
+// targets of a targets list, each ordered the same way. The value is resolved from the
 // environment config at apply-create time and persisted on each apply_operations
 // row so the policy in force when the apply was created travels with it.
 const (
@@ -40,11 +58,11 @@ const (
 	// earlier siblings reach the cutover barrier, while cutover stays ordered.
 	CutoverPolicyBarrier = "barrier"
 
-	// CutoverPolicyParallel drops copy-phase ordering entirely: every deployment
-	// copies concurrently from the start, with no earlier-sibling gate on copy
-	// start. Only the cutover phase stays deployment-ordered, exactly like
-	// barrier. This collapses copy wall-clock toward "longest copy" for rollouts
-	// whose hours-long copy dominates, while preserving the ordered, one-at-a-time
+	// CutoverPolicyParallel drops copy-phase ordering: deployments copy
+	// concurrently, bounded by the driver cap and on_failure admission. Only
+	// the cutover phase stays deployment-ordered, exactly like barrier. This
+	// collapses copy wall-clock toward "longest copy" for rollouts whose
+	// hours-long copy dominates, while preserving the ordered, one-at-a-time
 	// cutover swaps.
 	CutoverPolicyParallel = "parallel"
 )
@@ -93,7 +111,7 @@ type Lock struct {
 	// DatabaseName is the name of the database being locked.
 	DatabaseName string
 
-	// DatabaseType is the type of database: "vitess" or "mysql".
+	// DatabaseType is the type of database (one of the DatabaseType* constants).
 	DatabaseType string
 
 	// Repository is the GitHub repository (owner/repo format).
@@ -142,11 +160,40 @@ type Lock struct {
 	// rather than assuming consent.
 	DisclosedCopyDiscard bool
 
+	// Acquirer records the verified caller that created this lock row, for
+	// deciding whose operator grant the lock falls under. Owner cannot answer
+	// that: it is a caller-supplied match token, readable by anyone who can
+	// list locks.
+	//
+	// Nil when nobody verified was behind the acquire: locks taken server-side
+	// (a PR's apply), locks acquired on a deployment with no scoped operator
+	// grants configured, and rows written before this was recorded. Readers
+	// must treat nil as "shares a grant with nobody", never as "shares a grant
+	// with everybody".
+	//
+	// Only the insert that creates the row writes it. A same-owner re-acquire
+	// leaves it untouched, so for a given lock ID the recorded acquirer never
+	// changes.
+	Acquirer *LockAcquirer
+
 	// CreatedAt is when the lock was acquired.
 	CreatedAt time.Time
 
 	// UpdatedAt is when the lock was last updated.
 	UpdatedAt time.Time
+}
+
+// LockAcquirer is the verified caller behind a lock acquire.
+type LockAcquirer struct {
+	// Subject is the caller's verified identity from the auth layer, never
+	// a client-supplied string.
+	Subject string
+
+	// OperatorGroups are the configured operator groups of the locked database
+	// the caller was a member of when they acquired the lock, by their
+	// configured names, sorted. Empty when the caller held none of them (for
+	// example a deployment admin acting through a write group alone).
+	OperatorGroups []string
 }
 
 // Check terminology:
@@ -183,7 +230,7 @@ const (
 	// safe: an existing drift block is preserved, never silently cleared.
 	PlanDriftNotEvaluated PlanDriftState = iota
 	// PlanDriftClean means the rollup ran and every deployment matched the
-	// reviewed plan, so a stale drift block may be cleared.
+	// primary plan, so a stale drift block may be cleared.
 	PlanDriftClean
 	// PlanDriftBlocked means the rollup ran and a deployment diverged or could
 	// not be confirmed, so the write records the drift block.
@@ -196,6 +243,14 @@ const (
 // truth: UpsertPlanResult preserves a row carrying this reason on a
 // not-evaluated write instead of clearing it.
 const ReviewTimeDeploymentDriftBlockingReason = "review_time_deployment_drift"
+
+// NamespacePlacementRefusedBlockingReason is the stable Check.BlockingReason
+// value for an environment whose plan was refused because its targets entries
+// and the schema files disagree on where a namespace lives. It is written with
+// the review-time write intent (PlanDriftBlocked) and preserved on a
+// not-evaluated write exactly like a drift block, since only a plan that
+// re-evaluates placement can lift it.
+const NamespacePlacementRefusedBlockingReason = "namespace_placement_refused"
 
 type Check struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
@@ -213,7 +268,7 @@ type Check struct {
 	// Environment is the target environment: "staging" or "production".
 	Environment string
 
-	// DatabaseType is the database type: "vitess" or "mysql".
+	// DatabaseType is the database type (one of the DatabaseType* constants).
 	DatabaseType string
 
 	// DatabaseName is the name of the database.
@@ -285,6 +340,22 @@ type Setting struct {
 	UpdatedAt time.Time
 }
 
+// WebhookReconcileScanCursorSettingKeyPrefix namespaces the settings rows in
+// which the webhook reconciler persists each repository's scan cursor. The
+// reconciler owns and derives those rows; they are component state that
+// shares the settings table, not configuration an operator chooses.
+const WebhookReconcileScanCursorSettingKeyPrefix = "webhook_reconcile_scan_cursor:"
+
+// IsComponentStateSettingKey reports whether key names a row a component
+// keeps for its own state rather than an operator setting. The settings
+// listing leaves such rows out so it shows only what an operator can act on;
+// fetching one by key still works, for inspection. Component-state keys carry
+// a repository name, so they contain a slash and travel percent-encoded on
+// the settings path.
+func IsComponentStateSettingKey(key string) bool {
+	return strings.HasPrefix(key, WebhookReconcileScanCursorSettingKeyPrefix)
+}
+
 // DatabaseType constants.
 const (
 	DatabaseTypeVitess   = "vitess"
@@ -307,6 +378,13 @@ const (
 	ApplyOperationKindGroupFinalizer = "group_finalizer"
 )
 
+// OperationKeyDelimiter separates the components of an operation key. A
+// component containing it would make the key ambiguous to split, so producers
+// refuse the delimiter inside a component rather than escaping it. It is the
+// rollout projection's delimiter, which reads a finalizer's scope back out of
+// the key (see state.FinalizerFinalizesWork).
+const OperationKeyDelimiter = state.OperationKeyDelimiter
+
 // ShardOperationKey builds the operation key for one shard's work on one table
 // ("<namespace>/<shard>/<table>"). It is the canonical key for shard-scoped
 // work operations: the control plane's sharded fan-out stamps it on each
@@ -314,7 +392,73 @@ const (
 // plane's operation row, and the task loaders match shard-tagged task rows
 // against it to distinguish drive tasks from reflected per-shard progress rows.
 func ShardOperationKey(namespace, shard, table string) string {
-	return namespace + "/" + shard + "/" + table
+	return namespace + OperationKeyDelimiter + shard + OperationKeyDelimiter + table
+}
+
+// TargetOperationKey builds the operation key for one target's work when a
+// single apply addresses several targets. The target leads the key because it
+// is the coarsest scope: an apply's members are its targets, and any narrower
+// division of one target's work hangs off it.
+//
+// scopedKey is the narrower key within that target, or empty for work that
+// covers the whole target. Passing a ShardOperationKey composes the two, so a
+// sharded target yields one key per (target, namespace, shard, table):
+//
+//	TargetOperationKey("orders-002", "")                                 -> "orders-002"
+//	TargetOperationKey("orders-002", ShardOperationKey("main", "-80", "t")) -> "orders-002/main/-80/t"
+func TargetOperationKey(target, scopedKey string) string {
+	if scopedKey == "" {
+		return target
+	}
+	return target + OperationKeyDelimiter + scopedKey
+}
+
+// RolloutStepOperationKey is the key within a target for its work on one table
+// step of a rollout run table by table ("step-2"). Behind TargetOperationKey it
+// names one target's rows of one step ("orders-002/step-2"). It carries the
+// step's number rather than its tables, so the key stays one component however
+// many statements the step runs and no reader mistakes it for a shard key.
+func RolloutStepOperationKey(step int) string {
+	return fmt.Sprintf("step-%d", step)
+}
+
+// KeyedByTarget reports whether the operation is whole-target work keyed by
+// its target alone (TargetOperationKey(target, "")), the key each target of a
+// deployment addressing several attaches its own work under. Within one apply,
+// a deployment's work operations are either all keyed this way or none are:
+// the same target's work under a second key shape would run its DDL twice. A
+// group_finalizer is never reported as keyed this way, because its key alone
+// cannot say whether it leads with a target; ApplyOptions.OperationKeysLeadWithTarget
+// records that for the apply.
+func (op *ApplyOperation) KeyedByTarget() bool {
+	if op == nil || op.Target == "" || op.OperationKind == ApplyOperationKindGroupFinalizer {
+		return false
+	}
+	return op.OperationKey == TargetOperationKey(op.Target, "")
+}
+
+// PlanIDForOperation resolves which plan an operation executes: its own when it
+// has one, and its parent apply's otherwise. Members of one apply share the
+// apply's plan when they are planned together, and carry their own plan when
+// each was planned against its own live schema.
+//
+// An operation with no plan on either row is not executable — a dispatch would
+// have no DDL to run — so that case is an error rather than a zero return the
+// caller might mistake for a valid plan.
+func PlanIDForOperation(apply *Apply, op *ApplyOperation) (int64, error) {
+	if op == nil {
+		return 0, fmt.Errorf("resolve plan for operation: no operation")
+	}
+	if op.PlanID != 0 {
+		return op.PlanID, nil
+	}
+	if apply == nil {
+		return 0, fmt.Errorf("resolve plan for operation on deployment %q (operation key %q): operation has no plan and its apply was not loaded", op.Deployment, op.OperationKey)
+	}
+	if apply.PlanID == 0 {
+		return 0, fmt.Errorf("resolve plan for operation on deployment %q (operation key %q): neither the operation nor apply %s names a plan", op.Deployment, op.OperationKey, apply.ApplyIdentifier)
+	}
+	return apply.PlanID, nil
 }
 
 // EngineForType returns the engine name for a database type.
@@ -361,6 +505,68 @@ type TableChange struct {
 	// ModeReason records the engine's reason for any non-empty ExecutionMode
 	// verdict.
 	ModeReason string `json:"mode_reason,omitempty"`
+
+	// EstimatedRows is the planner's approximate row count for the table,
+	// summed across shards for sharded targets. Display only — estimates come
+	// from engine statistics and may be stale. Nil when no estimate was
+	// available at plan time.
+	EstimatedRows *int64 `json:"estimated_rows,omitempty"`
+
+	// ShardCount is the number of shards this table change spans. Zero when
+	// the target is not sharded or the shard topology is unknown.
+	ShardCount int `json:"shard_count,omitempty"`
+
+	// LargestShardRows is the approximate row count of the largest single
+	// shard. Nil when the target is not sharded or no estimate was available.
+	LargestShardRows *int64 `json:"largest_shard_rows,omitempty"`
+
+	// EstimatedBytes is the planner's approximate on-disk footprint for the
+	// table (data plus indexes), summed across shards for sharded targets.
+	// Display only, like EstimatedRows. Nil when no estimate was available.
+	EstimatedBytes *int64 `json:"estimated_bytes,omitempty"`
+
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, with how each move changes the way values compare. Empty when
+	// the change re-collates no column, or the engine does not report it.
+	CollationChanges []CollationChange `json:"collation_changes,omitempty"`
+}
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string `json:"column"`
+	// From is the collation the column compares under now; To is the one it
+	// compares under once the change applies, empty when the change leaves it
+	// to a server default the plan cannot read.
+	From string `json:"from"`
+	To   string `json:"to,omitempty"`
+	// Case and TrailingSpaces say how the comparison of values differing only
+	// in letter case, and only in trailing spaces, moves: "unchanged",
+	// "becomes_sensitive", "becomes_insensitive", or "unknown" when either
+	// collation's properties are not known. "unknown" is a possible change.
+	Case           string `json:"case"`
+	TrailingSpaces string `json:"trailing_spaces"`
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool `json:"can_merge_values"`
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
+	UniqueIndexes []string `json:"unique_indexes,omitempty"`
+}
+
+// TaskEstimatedBytes returns the byte estimate a task created from this change
+// carries. The plan's estimate covers every shard of the table, so a task that
+// spans the whole table carries it, and a task scoped to one shard carries
+// none rather than a figure that would read as that shard's size.
+func (tc TableChange) TaskEstimatedBytes(shard string) *int64 {
+	if shard != "" || tc.EstimatedBytes == nil {
+		return nil
+	}
+	bytes := *tc.EstimatedBytes
+	return &bytes
 }
 
 // RequiresUnsafeOptIn reports whether applying this change requires explicit
@@ -376,6 +582,12 @@ func (tc TableChange) RequiresUnsafeOptIn() bool {
 // it is guaranteed to fail.
 func (tc TableChange) EngineBlocked() bool {
 	return strings.EqualFold(tc.ExecutionMode, "blocked")
+}
+
+// DirectExecution reports whether the planner routed this change to direct
+// execution: native DDL on the target instead of the schema change engine.
+func (tc TableChange) DirectExecution() bool {
+	return strings.EqualFold(tc.ExecutionMode, "direct")
 }
 
 // UnsafeOptInReason returns the planner-provided unsafe reason, or a generic
@@ -410,6 +622,37 @@ type NamespacePlanData struct {
 	// apply-time consumers read (see VSchemaPlanMetadata): the safety-gate
 	// keys and the rendered VSchema diff apply-time display shows.
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// IgnoreTables is the ignore_tables config the plan was reviewed under: the
+	// entries the planner was asked to withhold, not the subset that matched a
+	// live table here. A re-plan of a stored plan — a rollback, a resume, a
+	// member's drift check — must be asked to withhold the same entries, or a
+	// table this plan never captured comes back as a DROP TABLE proposal, the
+	// inverse of the exclusion the repository asked for.
+	//
+	// The whole list is kept rather than the matched subset because the plan
+	// travels to targets this one never read. An entry that matches nothing on
+	// the deployment that planned still names a table a member holds, and a
+	// member re-planning under the narrower subset would propose dropping it
+	// and then fail its own drift check against a plan that can never match.
+	//
+	// It is the plan's record and not the repository's live config, so editing
+	// schemabot.yaml between plan and apply cannot move an apply-time verdict.
+	//
+	// The exclusions are the plan's, not the namespace's: ignore_tables applies
+	// to every namespace a plan covers, and plan_data is namespace-keyed with
+	// no plan-level slot, so every stored namespace carries the same list and
+	// Plan.IgnoreTables reads their union. A re-plan that rebuilds only some
+	// of the plan's namespaces therefore still withholds all of them.
+	IgnoreTables []string `json:"ignore_tables,omitempty"`
+
+	// Finalize records that the engine asked for this namespace's group
+	// finalizer to run once every shard's DDL has landed, independent of a
+	// VSchema change (engine.MetadataNeedsFinalizer). It is a typed field
+	// rather than a Metadata key because Metadata is the VSchema safety gate's
+	// record: a namespace carrying Metadata without a VSchema document is one
+	// the gate treats as divergent and fails closed on.
+	Finalize bool `json:"finalize,omitempty"`
 }
 
 // ChangesVSchema reports whether this namespace carries a VSchema change.
@@ -418,6 +661,40 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 		return false
 	}
 	return n.Artifacts[VSchemaArtifactName] != ""
+}
+
+// ShowsVSchemaChange reports whether plan and apply surfaces show this
+// namespace's VSchema change as one. It is the stored-plan counterpart of
+// apitypes.SchemaChangeResponse.ShowsVSchemaChange: a change the engine
+// generated entirely from the plan's DDL, with no diff to review, no recorded
+// deletion or mutation, and a finalize to write it, is left to the DDL and
+// that finalize.
+func (n *NamespacePlanData) ShowsVSchemaChange() bool {
+	if !n.ChangesVSchema() {
+		return false
+	}
+	return !n.vschemaChangeGeneratedFromDDL()
+}
+
+// vschemaChangeGeneratedFromDDL reports whether the stored plan marks this
+// namespace's VSchema change generated from the DDL, with no diff and no
+// deletion or mutation record, and finalizes the namespace.
+func (n *NamespacePlanData) vschemaChangeGeneratedFromDDL() bool {
+	meta := n.Metadata
+	generatedOnly := meta[PlanMetadataVSchemaGeneratedOnly] == "true"
+	noDiff := meta[PlanMetadataVSchemaDiff] == ""
+	noUnsafeRecord := meta[PlanMetadataVSchemaDeletions] == "" && meta[PlanMetadataVSchemaMutations] == ""
+	return generatedOnly && noDiff && noUnsafeRecord && n.Finalize
+}
+
+// NeedsFinalizer reports whether an apply of this namespace ends with a group
+// finalizer: its VSchema changes, which only the finalizer applies, or the
+// engine asked for one.
+func (n *NamespacePlanData) NeedsFinalizer() bool {
+	if n == nil {
+		return false
+	}
+	return n.ChangesVSchema() || n.Finalize
 }
 
 // ShardPlan records per-shard membership and drift captured at plan time for a
@@ -447,7 +724,7 @@ type Plan struct {
 	// Database is the target database name.
 	Database string
 
-	// DatabaseType is "vitess" or "mysql".
+	// DatabaseType is one of the DatabaseType* constants.
 	DatabaseType string
 
 	// Deployment is the Tern deployment selected by server config at plan time.
@@ -495,8 +772,93 @@ type Plan struct {
 	// invariant cannot be evaluated) rather than fail closed.
 	HeadSHA string
 
+	// PrimaryPlanIdentifier names the primary plan this one was produced
+	// alongside, for a rollout member planned against its own live schema. It is
+	// the durable link between a member's plan and the review round the operator
+	// approved: an apply created from the primary plan selects its members'
+	// plans by this identifier, so a plan from a later re-plan of the same commit
+	// is a different round and is never substituted for the one approved.
+	//
+	// Empty on the primary plan itself, and on every plan of an environment
+	// whose members all run the primary plan.
+	PrimaryPlanIdentifier string
+
+	// DirectExecution is the direct execution policy this plan's execution
+	// verdicts were computed under. An apply created from the plan runs under
+	// it rather than under a policy resolved again at admission, so the
+	// verdict the operator reviewed and the policy the statement runs under
+	// are the same one even when the configuration changes in between — which
+	// it routinely has by the time a rollback reverses a change.
+	//
+	// A plan judged under no grant records a disabled policy rather than
+	// nothing, so nil distinguishes exactly one case: a plan created before
+	// this column existed, whose policy is resolved from configuration at
+	// admission the way it always was.
+	DirectExecution *DirectExecutionPolicy
+
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed plan was made for, in an environment of several members.
+	// Empty for a plan of the whole rollout. A narrowed plan says nothing
+	// about the other members, so an apply of it runs on that member alone.
+	NarrowedTo string
+
 	// CreatedAt is when the plan was generated.
 	CreatedAt time.Time
+}
+
+// HasWork reports whether applying the plan would change anything: a table
+// change, a namespace to finalize (a VSchema document or an engine-requested
+// finalize), or a shard with changes of its own. A plan without work is the plan
+// of a target already at the desired schema.
+func (p *Plan) HasWork() bool {
+	if p == nil {
+		return false
+	}
+	if len(p.FlatDDLChanges()) > 0 || len(p.FinalizerNamespaces()) > 0 {
+		return true
+	}
+	for _, shard := range p.Shards {
+		if len(shard.Changes) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// AllChangesDirect reports whether every change in the plan runs as direct
+// execution, and at least one exists. A namespace to finalize is work for the
+// schema change engine, so a plan with one is not all-direct. A namespace whose
+// shards carry changes of their own runs as those shard changes, so its
+// namespace-level rows, a collapsed view of them, are not consulted.
+func (p *Plan) AllChangesDirect() bool {
+	if p == nil || len(p.FinalizerNamespaces()) > 0 {
+		return false
+	}
+	carriedByShards := map[string]bool{}
+	for _, shard := range p.Shards {
+		if len(shard.Changes) > 0 {
+			carriedByShards[shard.Namespace] = true
+		}
+	}
+	total := 0
+	for _, change := range p.FlatDDLChanges() {
+		if carriedByShards[change.Namespace] {
+			continue
+		}
+		if !change.DirectExecution() {
+			return false
+		}
+		total++
+	}
+	for _, shard := range p.Shards {
+		for _, change := range shard.Changes {
+			if !change.DirectExecution() {
+				return false
+			}
+			total++
+		}
+	}
+	return total > 0
 }
 
 // FlatDDLChanges returns all DDL changes across namespaces, sorted by namespace key.
@@ -521,6 +883,47 @@ func (p *Plan) FlatDDLChanges() []TableChange {
 	return result
 }
 
+// RecordIgnoreTables stores the ignore_tables config the plan was reviewed
+// under on every namespace it carries, so a re-plan of this plan — a rollback,
+// a resume, a member's drift check — is asked to withhold the same entries
+// instead of proposing to drop the tables the plan never captured. plan_data is
+// namespace-keyed with no plan-level slot, which is why every namespace carries
+// the whole list; IgnoreTables reads it back.
+func (p *Plan) RecordIgnoreTables(tables []string) {
+	if p == nil || len(tables) == 0 {
+		return
+	}
+	normalized := slices.Clone(tables)
+	sort.Strings(normalized)
+	normalized = slices.Compact(normalized)
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		nsData.IgnoreTables = slices.Clone(normalized)
+	}
+}
+
+// IgnoreTables returns, in sorted order, the ignore_tables entries the plan was
+// reviewed under, across all namespaces. A re-plan of a stored plan passes
+// these back so the tables this plan withheld stay withheld: they were never
+// captured in the plan's original files, so a re-plan that saw them would
+// propose dropping them.
+func (p *Plan) IgnoreTables() []string {
+	if p == nil {
+		return nil
+	}
+	var tables []string
+	for _, nsData := range p.Namespaces {
+		if nsData == nil {
+			continue
+		}
+		tables = append(tables, nsData.IgnoreTables...)
+	}
+	sort.Strings(tables)
+	return slices.Compact(tables)
+}
+
 // VSchemaNamespaces returns, in sorted order, every namespace in the plan that
 // changes its VSchema.
 func (p *Plan) VSchemaNamespaces() []string {
@@ -530,6 +933,41 @@ func (p *Plan) VSchemaNamespaces() []string {
 	var namespaces []string
 	for namespace, nsData := range p.Namespaces {
 		if nsData.ChangesVSchema() {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// FinalizerNamespaces returns, in sorted order, every namespace in the plan
+// whose apply ends with a group finalizer (see NamespacePlanData.NeedsFinalizer).
+// It is the set the finalizer is scheduled and driven from; VSchemaNamespaces
+// is the subset whose finalizer applies a VSchema document.
+func (p *Plan) FinalizerNamespaces() []string {
+	if p == nil {
+		return nil
+	}
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData.NeedsFinalizer() {
+			namespaces = append(namespaces, namespace)
+		}
+	}
+	sort.Strings(namespaces)
+	return namespaces
+}
+
+// EngineFinalizedNamespaces returns, in sorted order, every namespace the
+// engine asked to finalize (NamespacePlanData.Finalize), whether or not its
+// VSchema also changes.
+func (p *Plan) EngineFinalizedNamespaces() []string {
+	if p == nil {
+		return nil
+	}
+	var namespaces []string
+	for namespace, nsData := range p.Namespaces {
+		if nsData != nil && nsData.Finalize {
 			namespaces = append(namespaces, namespace)
 		}
 	}
@@ -595,6 +1033,27 @@ func (p *Plan) BlockedChanges() []TableChange {
 	return result
 }
 
+// BlockedApplyError returns the operator-facing refusal for a plan containing
+// a blocked change. Keeping this with the whole-plan verdict ensures every
+// admission path gives the same remedy.
+func (p *Plan) BlockedApplyError() error {
+	blocked := p.BlockedChanges()
+	if len(blocked) == 0 {
+		return nil
+	}
+	change := blocked[0]
+	reason := change.ModeReason
+	if reason == "" {
+		reason = "the engine refuses this statement"
+	}
+	// Independent causes are listed one per line so an operator fixing the
+	// first is not surprised by the second on the next attempt.
+	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
+		return fmt.Errorf("stored plan %s contains a blocked change for table %q:\n- %s", p.PlanIdentifier, change.Table, strings.Join(causes, "\n- "))
+	}
+	return fmt.Errorf("stored plan %s contains a blocked change for table %q: %s", p.PlanIdentifier, change.Table, reason)
+}
+
 // HasOriginalFilesCapture reports whether every stored namespace has an
 // explicit original-files capture, including intentionally empty captures.
 func (p *Plan) HasOriginalFilesCapture() bool {
@@ -639,7 +1098,7 @@ type Apply struct {
 	// Database is the target database name (denormalized from lock for queries).
 	Database string
 
-	// DatabaseType is "vitess" or "mysql" (denormalized from lock for queries).
+	// DatabaseType is one of the DatabaseType* constants (denormalized from lock for queries).
 	DatabaseType string
 
 	// Repository is the GitHub repository (denormalized from lock for GetByPR).
@@ -748,8 +1207,12 @@ type Apply struct {
 	// automatic retry. The remaining claim paths cannot encounter the marker: a
 	// pending dispatch starts work that has never run, and work must have run
 	// before a successor can take it over; an active apply (including one
-	// waiting for a deploy) cannot gain a successor at all, because creation
-	// refuses a second apply for a target that already has a non-terminal one.
+	// waiting for a deploy) gains a successor only when a new generation is
+	// admitted past it while it is held open for operations that never
+	// attached, with everything that did attach settled. Creation refuses a
+	// second apply beside any other non-terminal one. A held apply carrying the
+	// marker reserves no targets, refuses every late attach, and is settled by
+	// its driver over what attached.
 	SupersededBy string
 
 	// UpdatedAt is when the apply was last updated.
@@ -846,6 +1309,17 @@ type ApplyOperation struct {
 	// OperationKey.
 	ApplyID int64
 
+	// PlanID points to the plans.id this operation executes, when the operation
+	// has a plan of its own. Zero means the operation executes its parent
+	// apply's plan; resolve it with PlanIDForOperation rather than reading this
+	// field directly, so the fallback is applied consistently.
+	//
+	// An operation carries its own plan when the members of one apply do not
+	// share a single desired-vs-live diff — each member is planned against its
+	// own live schema, so each gets its own persisted plan row. Members that do
+	// share the parent's plan leave this zero.
+	PlanID int64
+
 	// Deployment is the Tern deployment name this child row targets
 	// (e.g. "region-a", "payments-eu"). Drawn from the resolved
 	// environment-level deployments map in server config.
@@ -916,6 +1390,20 @@ type ApplyOperation struct {
 	// retry.
 	Attempt int
 
+	// AlreadyConverged is true for an operation recorded completed when its
+	// apply was created, because its target already held the change and had
+	// nothing left to run. It is set only at creation, on a completed row no
+	// driver started. A row a reaper later settled to its parent's outcome is
+	// also completed and never started, so this flag, not the missing start, is
+	// what says the target already had the change.
+	AlreadyConverged bool
+
+	// RolloutStep is the table step of a rollout that runs table by table:
+	// each of a target's tables is a step, numbered from 1 in rollout order,
+	// and one operation runs one target's step. Zero is an operation that runs
+	// a member's whole change.
+	RolloutStep int
+
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time
 
@@ -939,6 +1427,10 @@ type ApplyOperation struct {
 	// replays them but does not interpret them for control/progress calls.
 	EngineResumeContext  string
 	EngineResumeMetadata string
+	// ProgressMetadata is the latest engine progress display metadata encoded as
+	// JSON. It is durable read-model state and is not replayed into the engine.
+	// A new attempt can display the prior attempt's position until its first progress save.
+	ProgressMetadata string
 
 	// CreatedAt is when the child row was inserted (typically at apply create).
 	CreatedAt time.Time
@@ -956,6 +1448,19 @@ func (op *ApplyOperation) IsTasklessVSchemaOnlyWork(plan *Plan) bool {
 		return false
 	}
 	return plan.IsVSchemaOnly()
+}
+
+// HasFreshLease reports whether a driver holds this apply_operation's lease
+// with a heartbeat newer than ApplyLeaseStaleAfter according to the supplied
+// clock. A drive heartbeats its operation row, so the row's last write is the
+// liveness signal. Under a multi-operation drive this
+// is the only live lease — the parent apply row's heartbeat can be stale, or
+// carry a leftover owner, while the operation's drive is running.
+func (op *ApplyOperation) HasFreshLease(now time.Time) bool {
+	if op == nil || op.LeaseOwner == "" {
+		return false
+	}
+	return now.Sub(op.UpdatedAt) < ApplyLeaseStaleAfter
 }
 
 // Lease returns the ownership token for this apply_operation.
@@ -979,7 +1484,10 @@ type ApplyOptions struct {
 
 	// Branch is the name of an existing PlanetScale branch to reuse.
 	// When set, the engine refreshes the branch schema from main instead
-	// of creating a new branch.
+	// of creating a new branch. The engine reads it back from the stored
+	// apply on every resume, through Map, to decide whether the deploy
+	// request it creates deletes the branch: it must survive the round trip,
+	// or a resumed drive deletes a branch the operator owns.
 	Branch string `json:"branch,omitempty"`
 
 	// DeferCutover pauses at cutover and waits for explicit trigger.
@@ -997,12 +1505,71 @@ type ApplyOptions struct {
 	// Defaults to the apply database when empty.
 	Target string `json:"target,omitempty"`
 
+	// DirectExecution is the direct execution policy this apply was admitted
+	// under, recorded at creation from the dispatching caller. It is durable
+	// because the drive that acts on it can be a later one on another pod:
+	// the caller's policy arrives once, with the dispatch, while routing a
+	// refused statement is decided every time a drive reaches it. Nil means
+	// the caller stated no policy and the executing server's own
+	// configuration decides.
+	DirectExecution *DirectExecutionPolicy `json:"direct_execution,omitempty"`
+
 	// Rollback marks an apply that reverts a previously applied schema change
 	// (executed from a rollback plan). It is durable so any terminal path can
 	// distinguish a rollback from an ordinary apply: a completed rollback must
 	// leave the required check action_required (the PR's change has been reverted
 	// and must not merge as-is), not success.
 	Rollback bool `json:"rollback,omitempty"`
+
+	// NarrowedTo is the MemberID (deployment/target) of the one rollout member
+	// a narrowed apply ran on. Empty for an apply of the whole rollout. It is
+	// recorded at creation and never read from caller options, so a rollback
+	// can tell an apply that changed one member from one that changed them all.
+	NarrowedTo string `json:"narrowed_to,omitempty"`
+
+	// OperationKeysLeadWithTarget marks an apply whose operations are each
+	// keyed behind their own target (storage.TargetOperationKey): a data-plane
+	// apply that the targets of one deployment share, one operation each. It is
+	// recorded when the apply is created, from the dispatch that names its
+	// rollout member target, and never read from caller options. Without it a
+	// reader could not tell "orders/group_finalizer" apart as target orders'
+	// deployment-scoped finalizer or namespace orders' finalizer until a sibling
+	// target's operation had attached.
+	OperationKeysLeadWithTarget bool `json:"operation_keys_lead_with_target,omitempty"`
+}
+
+// DirectExecutionPolicy is an apply's durable record of the direct execution
+// policy its dispatch was admitted under. It mirrors the policy the caller
+// sent rather than restating the rules: the engine reading it back off the
+// metadata keys is what enforces them, including refusing an enabled policy
+// that carries no size bound, or both.
+type DirectExecutionPolicy struct {
+	Enabled bool `json:"enabled"`
+	// MaxTableRows is the optional bound on the table's row count. Zero
+	// states no row bound.
+	MaxTableRows int64 `json:"max_table_rows,omitempty"`
+	// MaxTableBytes is the optional bound on the table's data plus index
+	// footprint, in bytes. Zero states no byte bound.
+	MaxTableBytes                 int64 `json:"max_table_bytes,omitempty"`
+	LockAcquisitionTimeoutSeconds int64 `json:"lock_acquisition_timeout_seconds,omitempty"`
+}
+
+// EngineMetadata renders the policy into the engine metadata keys that carry
+// it to the engine. A nil policy renders nothing: the apply recorded no
+// policy and the executing server's own configuration decides. A disabled
+// policy renders the enabled key as false, because an apply that recorded one
+// stated its opt-out and a surface that cannot read that back would overlay
+// its own grant onto it.
+func (p *DirectExecutionPolicy) EngineMetadata() map[string]string {
+	if p == nil {
+		return nil
+	}
+	return engine.DirectExecutionMetadata(engine.DirectExecutionSettings{
+		Enabled:                       p.Enabled,
+		MaxTableRows:                  p.MaxTableRows,
+		MaxTableBytes:                 p.MaxTableBytes,
+		LockAcquisitionTimeoutSeconds: p.LockAcquisitionTimeoutSeconds,
+	})
 }
 
 // ControlOperation identifies a user-requested control operation.
@@ -1087,6 +1654,35 @@ func MirroredControlRequestMetadata() []byte {
 	return []byte(`{"` + mirroredControlRequestMetadataKey + `":true}`)
 }
 
+// cutoverRequestOperationMetadataKey binds a cutover request to the one
+// operation that is to take it. A cutover request is apply-level, so under an
+// ordered cutover policy the binding is what keeps one operator command on the
+// member whose turn it was when the command was accepted, rather than letting
+// it pass on to the next member once that one has finished.
+const cutoverRequestOperationMetadataKey = "apply_operation_id"
+
+// CutoverRequestMetadata returns the metadata that binds a cutover request to
+// the operation that is to take it.
+func CutoverRequestMetadata(applyOperationID int64) []byte {
+	return []byte(`{"` + cutoverRequestOperationMetadataKey + `":` + strconv.FormatInt(applyOperationID, 10) + `}`)
+}
+
+// CutoverOperationID returns the operation a cutover request is bound to, or 0
+// when the request names none. Metadata that does not parse is an error rather
+// than an unbound request, so a drive never takes a request it cannot read.
+func (r *ApplyControlRequest) CutoverOperationID() (int64, error) {
+	if r == nil || len(r.Metadata) == 0 {
+		return 0, nil
+	}
+	var payload struct {
+		ApplyOperationID int64 `json:"apply_operation_id"`
+	}
+	if err := json.Unmarshal(r.Metadata, &payload); err != nil {
+		return 0, fmt.Errorf("parse metadata of %s control request %d: %w", r.Operation, r.ID, err)
+	}
+	return payload.ApplyOperationID, nil
+}
+
 // ForwardingControlRequestCaller is the requester recorded for a control
 // request that reached this plane over the data-plane RPC boundary. The control
 // RPCs carry no operator identity, so this names the path the request arrived
@@ -1165,7 +1761,47 @@ func ApplyOptionsFromMap(options map[string]string) ApplyOptions {
 		Target:       options["target"],
 		Rollback:     options["rollback"] == "true",
 	}
+	opts.DirectExecution = directExecutionPolicyFromMap(options)
 	return opts
+}
+
+// directExecutionPolicyFromMap reads the direct execution policy back out of
+// an options map. A map carrying none of the keys states no policy, which is
+// distinct from one that states the policy disabled: the first defers to the
+// executing server's configuration, the second overrides it.
+//
+// A malformed number does not fail here; it reads as a value the engine
+// refuses, so a garbled bound blocks the statement instead of changing the
+// policy — the one direction this is allowed to fail in. Both size bounds are
+// optional, so zero would mean "no such bound" and silently drop it; a bound
+// that is present but not a positive integer reads as -1 instead, which
+// renders back onto the metadata and the engine refuses.
+func directExecutionPolicyFromMap(options map[string]string) *DirectExecutionPolicy {
+	raw, ok := options[engine.MetadataDirectExecution]
+	if !ok {
+		return nil
+	}
+	lockWait, _ := strconv.ParseInt(options[engine.MetadataDirectExecutionLockAcquisitionTimeoutSeconds], 10, 64)
+	return &DirectExecutionPolicy{
+		Enabled:                       raw == "true",
+		MaxTableRows:                  storedSizeBound(options, engine.MetadataDirectExecutionMaxTableRows),
+		MaxTableBytes:                 storedSizeBound(options, engine.MetadataDirectExecutionMaxTableBytes),
+		LockAcquisitionTimeoutSeconds: lockWait,
+	}
+}
+
+// storedSizeBound reads an optional size bound back out of an options map:
+// zero when absent, -1 when present but not a positive integer.
+func storedSizeBound(options map[string]string, key string) int64 {
+	raw, ok := options[key]
+	if !ok {
+		return 0
+	}
+	bound, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || bound <= 0 {
+		return -1
+	}
+	return bound
 }
 
 // GroupsEngineExecution reports whether an apply against databaseType hands the
@@ -1219,7 +1855,34 @@ func (opts ApplyOptions) Map() map[string]string {
 	if opts.Rollback {
 		options["rollback"] = "true"
 	}
+	if policy := opts.DirectExecution; policy != nil {
+		// A disabled policy still states itself, so the drive can tell "the
+		// caller turned direct execution off for this apply" from "the caller
+		// said nothing"; the engine reads the same absent-or-false as blocked
+		// either way.
+		options[engine.MetadataDirectExecution] = strconv.FormatBool(policy.Enabled)
+		maps.Copy(options, policy.EngineMetadata())
+	}
 	return options
+}
+
+// ParseProgressMetadata decodes the operation's persisted progress display
+// metadata. An operation that has never persisted metadata, or whose stored
+// value is a JSON null, yields an empty non-nil map so callers can overlay
+// into it directly; malformed JSON is an error, because a row that cannot be
+// decoded is worth a log line rather than a silently empty progress view.
+func (op *ApplyOperation) ParseProgressMetadata() (map[string]string, error) {
+	metadata := make(map[string]string)
+	if op.ProgressMetadata == "" {
+		return metadata, nil
+	}
+	if err := json.Unmarshal([]byte(op.ProgressMetadata), &metadata); err != nil {
+		return nil, fmt.Errorf("decode apply operation progress metadata: %w", err)
+	}
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	return metadata, nil
 }
 
 // ParseApplyOptions parses the JSON options into ApplyOptions.
@@ -1280,7 +1943,7 @@ type Task struct {
 	// Database is the target database name.
 	Database string
 
-	// DatabaseType is "vitess" or "mysql".
+	// DatabaseType is one of the DatabaseType* constants.
 	DatabaseType string
 
 	// Engine is the schema change engine: "spirit", "planetscale", etc.
@@ -1332,6 +1995,13 @@ type Task struct {
 	RowsTotal       int64 // Total rows to copy
 	ProgressPercent int   // 0-100
 	ETASeconds      int   // Estimated seconds remaining
+	// EstimatedBytes is the planner's approximate on-disk footprint of the
+	// table (data plus indexes), copied from the plan change this task was
+	// created from so progress can show the table's scale beside its row
+	// counts. Display only and written once: progress updates never change
+	// it. Nil when the plan had no estimate, and for per-shard rows, since a
+	// plan's estimate covers the whole table.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the task is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -1342,7 +2012,12 @@ type Task struct {
 	Throttled bool
 	// ThrottleReason names the signal pausing the work, for display (e.g.
 	// "replica-lag 5s >= 2s"). Empty when Throttled is false.
-	ThrottleReason  string
+	ThrottleReason string
+	// ExecutionMode is the admitting deployment's execution verdict, copied
+	// from the plan change that deployment judged when this task was created.
+	ExecutionMode string
+	// ModeReason is the admitting deployment's reason for ExecutionMode.
+	ModeReason      string
 	CutoverAttempts int // Number of cutover attempts for this shard
 
 	// Execution flags
@@ -1354,6 +2029,12 @@ type Task struct {
 	UpdatedAt   time.Time
 	StartedAt   *time.Time
 	CompletedAt *time.Time
+}
+
+// EngineBlocked reports whether the admitting deployment marked this task's
+// statement blocked by the engine.
+func (t Task) EngineBlocked() bool {
+	return strings.EqualFold(t.ExecutionMode, "blocked")
 }
 
 // TaskFilter specifies criteria for listing tasks.
@@ -1416,11 +2097,14 @@ type ApplyComment struct {
 }
 
 // PlanComment tracks a plan comment posted on a PR so a newer plan comment for
-// the same database can minimize it on GitHub. Rows are written only when a
+// the same database can retire it on GitHub. Rows are written only when a
 // comment is actually posted — a plan whose comment was suppressed leaves no
-// row. The GitHub comment itself is never edited or deleted through this
-// record; minimizing collapses it in the PR timeline while keeping it
-// expandable as the record of what was shown.
+// row. Retirement takes one of two forms: a comment whose head an apply owns
+// is minimized (collapsed in the PR timeline but still expandable as the
+// record of what was planned for that apply), while a comment no apply ever
+// acted on is deleted from the timeline entirely. The row itself is never
+// deleted, so the identifiers of a deleted comment remain available for
+// triage.
 type PlanComment struct {
 	// ID is the unique identifier (BIGINT AUTO_INCREMENT).
 	ID int64
@@ -1452,10 +2136,26 @@ type PlanComment struct {
 	// mutation.
 	GitHubNodeID string
 
+	// UpToDate records that the comment showed nothing to act on: no changes,
+	// rollout work, errors, or drift. A later plan that flips between nothing
+	// to act on and something to act on replaces the comment even when the
+	// schema inputs did not change. The bit does not compare the DDL itself:
+	// two plans that both have work count as the same outcome. False is the
+	// safe default: a comment not known to be up to date is replaced by an
+	// up-to-date plan.
+	UpToDate bool
+
 	// MinimizedAt is set only after the GitHub minimize call succeeded. Nil
-	// means the comment is still expanded on the PR — including after a failed
+	// means the comment was not minimized — including after a failed
 	// minimize, so the next supersede retries it.
 	MinimizedAt *time.Time
+
+	// DeletedAt is set only after the GitHub delete call succeeded (or
+	// confirmed the comment already gone). Nil means the comment was not
+	// deleted — including after a failed delete, so the next supersede
+	// retries it. A row with both MinimizedAt and DeletedAt nil is still
+	// fully visible on the PR.
+	DeletedAt *time.Time
 
 	// CreatedAt is when the comment was posted.
 	CreatedAt time.Time

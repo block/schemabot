@@ -135,6 +135,57 @@ func TestFilterPullSchemaTablesKeepsSubstringMatches(t *testing.T) {
 	assert.Equal(t, int32(2), resp.TableCount)
 }
 
+// A table filter narrows what the pull describes, so the divergence report has
+// to be narrowed with it. Left alone it would name divergence in tables the
+// operator did not ask about, beside a schema that no longer contains them, and
+// each target's count would describe a different table set than the header.
+func TestFilterPullSchemaTablesNarrowsTargetDivergence(t *testing.T) {
+	resp := &apitypes.PullSchemaResponse{
+		Database:    "orders",
+		Environment: "production",
+		Namespaces: map[string]*apitypes.PulledNamespace{
+			"orders": {
+				Tables: map[string]string{
+					"users":         "CREATE TABLE `users` (`id` bigint NOT NULL);",
+					"user_settings": "CREATE TABLE `user_settings` (`id` bigint NOT NULL);",
+					"payments":      "CREATE TABLE `payments` (`id` bigint NOT NULL);",
+				},
+			},
+		},
+		TableCount: 3,
+		Targets: []*apitypes.TargetDivergence{
+			{Deployment: "eu", Target: "orders-001", TableCount: 3, Primary: true},
+			{Deployment: "eu", Target: "orders-002", TableCount: 3, DivergedTables: []apitypes.DivergedTable{
+				{Namespace: "orders", Table: "users", Difference: apitypes.DivergenceDiffers},
+				{Namespace: "orders", Table: "user_settings", Difference: apitypes.DivergenceOnlyOnPrimary},
+				{Namespace: "orders", Table: "receipts", Difference: apitypes.DivergenceOnlyOnTarget},
+				{Namespace: "orders", Table: "payments", Difference: apitypes.DivergenceDiffers},
+			}},
+			{Deployment: "eu", Target: "orders-003", TableCount: 3, DivergedTables: []apitypes.DivergedTable{
+				{Namespace: "orders", Table: "payments", Difference: apitypes.DivergenceDiffers},
+			}},
+		},
+	}
+
+	require.NoError(t, filterPullSchemaTables(resp, "user"))
+
+	require.Len(t, resp.Targets, 3)
+	assert.Equal(t, int32(2), resp.Targets[0].TableCount, "the primary's count is the filtered schema's")
+
+	diverged := resp.Targets[1]
+	assert.Equal(t, []apitypes.DivergedTable{
+		{Namespace: "orders", Table: "users", Difference: apitypes.DivergenceDiffers},
+		{Namespace: "orders", Table: "user_settings", Difference: apitypes.DivergenceOnlyOnPrimary},
+	}, diverged.DivergedTables, "divergence in tables the filter excluded must not be reported")
+	assert.Equal(t, int32(1), diverged.TableCount,
+		"the target holds the filtered tables the primary holds, less the one only the primary has")
+
+	converged := resp.Targets[2]
+	assert.Nil(t, converged.DivergedTables,
+		"a target whose only divergence was filtered out holds the same filtered schema as the primary")
+	assert.Equal(t, int32(2), converged.TableCount)
+}
+
 // A filtered pull that requested lint keeps the explicit empty audit when the
 // selected tables are clean, so "no violations" stays distinguishable from
 // lint not being requested.

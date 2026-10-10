@@ -79,6 +79,7 @@ func (h *Handler) handleCheckSuite(ctx context.Context, metricApp string, w http
 		h.writeError(w, http.StatusBadRequest, "invalid check_suite payload")
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	repo := payload.Repository.FullName
 	headSHA := payload.CheckSuite.HeadSHA
 
@@ -210,7 +211,7 @@ func (h *Handler) processDurableCheckSuite(ctx context.Context, event *storage.W
 			"delivery_id", event.DeliveryID, "repo", event.Repository, "head_sha", event.HeadSHA)
 		return false, nil
 	}
-	repo := event.Repository
+	repo := storage.CanonicalKey(event.Repository)
 	headSHA := event.HeadSHA
 	if repo == "" || headSHA == "" {
 		return false, fmt.Errorf("durable check_suite delivery %s missing repo or head SHA", event.DeliveryID)

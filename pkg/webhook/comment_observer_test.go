@@ -42,14 +42,20 @@ func (s *stubApplyOperationStore) GetEngineResumeState(_ context.Context, opID i
 // other store would panic, keeping the test honest about the path it covers.
 type stubStorage struct {
 	storage.Storage
-	ops     storage.ApplyOperationStore
-	applies storage.ApplyStore
-	settled []*storage.ApplyControlRequest
+	ops       storage.ApplyOperationStore
+	applies   storage.ApplyStore
+	applyLogs storage.ApplyLogStore
+	settled   []*storage.ApplyControlRequest
+	// settledReads counts the settled-control-request reads, so a test can
+	// pin that rendering a comment body twice still reads storage once.
+	settledReads *int
 }
 
 func (s *stubStorage) ApplyOperations() storage.ApplyOperationStore { return s.ops }
 
 func (s *stubStorage) Applies() storage.ApplyStore { return s.applies }
+
+func (s *stubStorage) ApplyLogs() storage.ApplyLogStore { return s.applyLogs }
 
 // stubApplyStore serves the authority gate's fresh re-read of the apply row
 // from a fixed result.
@@ -66,7 +72,7 @@ func (s *stubApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 func (s *stubStorage) Tasks() storage.TaskStore { return stubTaskStore{} }
 
 func (s *stubStorage) ControlRequests() storage.ControlRequestStore {
-	return stubControlRequestStore{settled: s.settled}
+	return stubControlRequestStore{settled: s.settled, reads: s.settledReads}
 }
 
 // stubControlRequestStore supplies the settled-control-request read the comment
@@ -74,9 +80,13 @@ func (s *stubStorage) ControlRequests() storage.ControlRequestStore {
 type stubControlRequestStore struct {
 	storage.ControlRequestStore
 	settled []*storage.ApplyControlRequest
+	reads   *int
 }
 
 func (s stubControlRequestStore) ListSettled(context.Context, int64) ([]*storage.ApplyControlRequest, error) {
+	if s.reads != nil {
+		*s.reads++
+	}
 	return s.settled, nil
 }
 
@@ -165,8 +175,8 @@ func TestFormatStatusCommentRoutesMultiDeployment(t *testing.T) {
 	body := o.formatStatusComment(runningApply(), nil)
 
 	assert.Contains(t, body, "**Deployments**: 1 completed, 1 running")
-	assert.Contains(t, body, "- ✅ eu — completed")
-	assert.Contains(t, body, "- 🔄 us — running table copy")
+	assert.Contains(t, body, "- ✅ `eu` — completed")
+	assert.Contains(t, body, "- 🔄 `us` — running table copy")
 }
 
 // A single-operation apply (every apply today, until fan-out lands) renders the
@@ -206,8 +216,8 @@ func TestFormatTerminalSummaryCommentRoutesMultiDeployment(t *testing.T) {
 
 	assert.Contains(t, body, "## ✅ Schema Change Applied")
 	assert.Contains(t, body, "**Deployments**: 2 completed")
-	assert.Contains(t, body, "- ✅ eu — completed")
-	assert.Contains(t, body, "- ✅ us — completed")
+	assert.Contains(t, body, "- ✅ `eu` — completed")
+	assert.Contains(t, body, "- ✅ `us` — completed")
 }
 
 // A single-operation terminal apply renders the single-deployment summary
@@ -242,10 +252,10 @@ type capturedLog struct {
 }
 
 type capturingLogger struct {
-	debugs   []capturedLog
-	infos    []capturedLog
-	warnings []capturedLog
-	errors   []capturedLog
+	debugs []capturedLog
+	infos  []capturedLog
+	warns  []capturedLog
+	errors []capturedLog
 }
 
 func (l *capturingLogger) Debug(msg string, args ...any) {
@@ -257,7 +267,7 @@ func (l *capturingLogger) Info(msg string, args ...any) {
 }
 
 func (l *capturingLogger) Warn(msg string, args ...any) {
-	l.warnings = append(l.warnings, capturedLog{msg: msg, args: args})
+	l.warns = append(l.warns, capturedLog{msg: msg, args: args})
 }
 
 func (l *capturingLogger) Error(msg string, args ...any) {
@@ -655,16 +665,16 @@ func TestObserverSupersededByNewerOwnerWarnsOnceAndLatches(t *testing.T) {
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"),
 		"a superseded lease must fail the side-effect check")
 	assert.True(t, observer.Superseded())
-	require.Len(t, logger.warnings, 1, "the takeover warns exactly once")
+	require.Len(t, logger.warns, 1, "the takeover warns exactly once")
 	assert.Empty(t, logger.errors, "an expected handover is not an error")
-	fields := fieldsOf(t, logger.warnings[0].args)
+	fields := fieldsOf(t, logger.warns[0].args)
 	assert.Equal(t, "apply-abc123", fields["apply_id"])
 	assert.Equal(t, "host-a/1/driver-0", fields["lease_owner"])
 
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "terminal"))
 	assert.Equal(t, 1, store.calls, "latched supersession must not re-read storage")
-	assert.Len(t, logger.warnings, 1, "later checks stay quiet")
+	assert.Len(t, logger.warns, 1, "later checks stay quiet")
 	assert.Len(t, logger.debugs, 2, "later checks demote to debug")
 }
 
@@ -700,7 +710,7 @@ func TestObserverReleasedBackLeaseDefersToAuthorityWithoutLatch(t *testing.T) {
 
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
 	assert.False(t, observer.Superseded(), "a released-back lease is not a takeover and must not latch")
-	assert.Empty(t, logger.warnings)
+	assert.Empty(t, logger.warns)
 	assert.Empty(t, logger.errors)
 	require.NotEmpty(t, logger.debugs)
 	assert.Contains(t, logger.debugs[len(logger.debugs)-1].msg, "parent apply lease re-claimed")
@@ -723,7 +733,7 @@ func TestObserverFallbackLeaseLossDoesNotLatch(t *testing.T) {
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
 	assert.False(t, observer.Superseded(), "a fallback-lease race must not latch supersession")
 	assert.Equal(t, 2, store.calls, "each check re-reads storage so the next tick can recover")
-	assert.Len(t, logger.warnings, 2)
+	assert.Len(t, logger.warns, 2)
 	assert.Empty(t, logger.errors)
 }
 
@@ -747,7 +757,7 @@ func TestObserverLeaseCheckStorageFailureFailsClosedWithoutLatch(t *testing.T) {
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
 	assert.False(t, observer.Superseded(), "storage uncertainty must not latch supersession")
 	require.Len(t, logger.errors, 1, "a storage failure is a real error")
-	assert.Empty(t, logger.warnings)
+	assert.Empty(t, logger.warns)
 
 	assert.False(t, observer.leaseStillOwnsObserver(apply, "progress"))
 	assert.Equal(t, 2, store.calls, "each check retries the read")
@@ -766,6 +776,6 @@ func TestObserverLeaseCheckPassesWhileOwned(t *testing.T) {
 	assert.True(t, observer.leaseStillOwnsObserver(apply, "progress"))
 	assert.False(t, observer.Superseded())
 	assert.Equal(t, 1, store.calls)
-	assert.Empty(t, logger.warnings)
+	assert.Empty(t, logger.warns)
 	assert.Empty(t, logger.errors)
 }

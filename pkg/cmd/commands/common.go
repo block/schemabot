@@ -22,6 +22,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/ui"
 )
 
@@ -71,13 +72,29 @@ func (cf *ControlFlags) RequireApplyID() error {
 var ErrSilent = errors.New("silent error")
 
 // CLIConfig represents the schemabot.yaml configuration file for CLI commands.
+// Database and Type are row-identity keys: LoadCLIConfig folds them with
+// storage.CanonicalKey so the CLI names the same identity the server stores,
+// whatever case the file was written in.
 type CLIConfig struct {
 	Database string `yaml:"database"`
 	Type     string `yaml:"type"`
 	// IgnoreNamespaces lists namespace subdirectories of the schema root that
 	// SchemaBot must not reconcile against the live database.
 	IgnoreNamespaces []string `yaml:"ignore_namespaces"`
-	SchemaDir        string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+	// IgnoreTables lists live tables SchemaBot must not reconcile, by name or,
+	// wrapped in slashes, by a regular expression over the whole name. Without
+	// the exclusion a live table no schema file declares is planned as DROP
+	// TABLE, which blocks the merge.
+	IgnoreTables []string `yaml:"ignore_tables"`
+	SchemaDir    string   `yaml:"-"` // Set by LoadCLIConfig, not from YAML
+}
+
+// PlanExclusions returns the config's declared exclusions in the form the plan
+// API takes them. Both lists are exclusions the repository recorded, and they
+// are passed as one value so a caller cannot hand the plan its tables as its
+// namespaces.
+func (c *CLIConfig) PlanExclusions() client.PlanExclusions {
+	return client.PlanExclusions{Namespaces: c.IgnoreNamespaces, Tables: c.IgnoreTables}
 }
 
 // LoadCLIConfig loads configuration from schemabot.yaml in the given directory.
@@ -103,11 +120,16 @@ func LoadCLIConfig(dir string) (*CLIConfig, error) {
 	if err := decoder.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
+	cfg.Database = storage.CanonicalKey(cfg.Database)
+	cfg.Type = storage.CanonicalKey(cfg.Type)
 
 	if cfg.Database == "" {
 		return nil, fmt.Errorf("schemabot.yaml: database is required")
 	}
 	if err := schema.ValidateIgnoreNamespaces(cfg.IgnoreNamespaces); err != nil {
+		return nil, fmt.Errorf("schemabot.yaml: %w", err)
+	}
+	if err := schema.ValidateIgnoreTables(cfg.IgnoreTables); err != nil {
 		return nil, fmt.Errorf("schemabot.yaml: %w", err)
 	}
 	// Schema files are in the same directory as schemabot.yaml
@@ -133,7 +155,45 @@ func resolveEndpoint(endpoint, profile string) (string, error) {
 
 // confirmAction prompts the user for "yes" confirmation. Returns true if confirmed.
 func confirmAction(prompt, cancelMsg string) (bool, error) {
-	fmt.Print(prompt)
+	return confirmActionOn(os.Stdout, prompt, cancelMsg)
+}
+
+// writeToTerminal runs fn with the human-facing renderers writing to stderr
+// instead of stdout, when the command was asked for machine-readable output.
+// With divert false it just runs fn, so a caller can wrap unconditionally.
+//
+// A command under --json owes stdout to the program reading it, and still owes
+// a person at the terminal everything they are being asked to approve. Those
+// are two audiences, not a choice between them: the plan goes to one and the
+// response to the other. The renderers print through fmt.Print, which resolves
+// os.Stdout per call, so pointing it at stderr for the duration is what moves
+// them; nothing writes the response until after it is restored.
+func writeToTerminal(divert bool, fn func() error) error {
+	if !divert {
+		return fn()
+	}
+	restore := os.Stdout
+	os.Stdout = os.Stderr
+	defer func() { os.Stdout = restore }()
+	return fn()
+}
+
+// confirmActionOn is confirmAction with the prompt written somewhere other than
+// stdout. A command asked for machine-readable output owes stdout to the
+// program reading it, and still has to ask a person before it converges, so the
+// conversation goes to stderr and the answer stays parseable.
+func confirmActionOn(out io.Writer, prompt, cancelMsg string) (bool, error) {
+	// A prompt nobody can be shown is not a prompt, so a write that fails is
+	// an error rather than an unanswered question read from stdin anyway.
+	if _, err := fmt.Fprint(out, prompt); err != nil {
+		return false, fmt.Errorf("write confirmation prompt: %w", err)
+	}
+	cancelled := func() error {
+		if _, err := fmt.Fprintln(out, cancelMsg); err != nil {
+			return fmt.Errorf("write cancellation notice: %w", err)
+		}
+		return nil
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt)
@@ -152,8 +212,7 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 
 	select {
 	case <-sigCh:
-		fmt.Println(cancelMsg)
-		return false, nil
+		return false, cancelled()
 	case r := <-resultCh:
 		// EOF with data is valid (e.g., echo -n yes | schemabot apply)
 		if r.err != nil && !errors.Is(r.err, io.EOF) {
@@ -161,12 +220,10 @@ func confirmAction(prompt, cancelMsg string) (bool, error) {
 		}
 		response := strings.TrimSpace(strings.ToLower(r.response))
 		if errors.Is(r.err, io.EOF) && response == "" {
-			fmt.Println(cancelMsg)
-			return false, nil
+			return false, cancelled()
 		}
 		if response != "yes" {
-			fmt.Println(cancelMsg)
-			return false, nil
+			return false, cancelled()
 		}
 		return true, nil
 	}
@@ -400,13 +457,30 @@ func resolveControlFlags(endpoint, profile, applyID, environment string) (string
 	return ep, nil
 }
 
+// writeNarrowedTo tells the operator a plan covers one rollout member, so a
+// plan with no changes is not read as the whole environment being up to date.
+func writeNarrowedTo(planResult *apitypes.PlanResponse) {
+	if planResult == nil || planResult.NarrowedTo == "" {
+		return
+	}
+	fmt.Printf("Target: %s (this plan covers only this rollout member)\n", planResult.NarrowedTo)
+}
+
 // applyAndWatch extracts a plan ID, calls the apply API, prints status, and
-// optionally watches progress. Used by both RunApply and RunRollback.
-func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, environment, caller, operation string,
-	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) error {
+// optionally watches progress. It returns the apply ID the server assigned,
+// which is empty when the server accepted the apply without naming one. Used by
+// both RunApply and RunRollback.
+//
+// rendersRollout says whether this caller shows the operator the plan every
+// rollout member runs, the client capability the server checks before a
+// rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
+// decides it for its own output, so a new caller has to decide it rather than
+// inherit it.
+func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
+	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
-		return fmt.Errorf("no plan_id in response")
+		return "", fmt.Errorf("no plan_id in response")
 	}
 
 	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, allowUnsafe, branch, watch, format)
@@ -414,15 +488,17 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 	var applyResult *apitypes.ApplyResponse
 	err := withLoading("Submitting schema change...", format != OutputFormatJSON, func() error {
 		var applyErr error
-		applyResult, applyErr = client.CallApplyAPI(ep, planResult.PlanID, environment, caller, options)
+		// A narrowed plan is applied to the member it was made for and nowhere
+		// else; the server refuses to run it rollout-wide.
+		applyResult, applyErr = client.CallApplyAPIForTarget(ep, planResult.PlanID, environment, caller, planResult.NarrowedTo, rendersRollout, options)
 		return applyErr
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if err := checkAccepted(applyResponseWrapper{applyResult}, operation); err != nil {
-		return err
+		return "", err
 	}
 
 	applyID := applyResult.ApplyID
@@ -435,7 +511,7 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 		}
 		enc := json.NewEncoder(os.Stdout)
 		_ = enc.Encode(result)
-		return nil
+		return applyID, nil
 	}
 
 	label := strings.ToUpper(operation[:1]) + operation[1:]
@@ -447,15 +523,15 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, database, envir
 
 	if !watch {
 		printWatchInstructions(applyID, database, environment)
-		return nil
+		return applyID, nil
 	}
 
 	fmt.Println("Watching progress...")
 	if err := WatchApplyProgressWithFormat(ep, applyID, environment, true, format, logHeartbeat); err != nil {
-		return err
+		return applyID, err
 	}
 
-	return nil
+	return applyID, nil
 }
 
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {
@@ -490,10 +566,20 @@ func printWatchInstructions(applyID, database, environment string) {
 	}
 }
 
+// applyChangeCounts tallies the apply's tasks by change type for the
+// completion summary. Index builds and drops are counted in their own buckets,
+// matching the plan summary, so an apply made only of index tasks does not
+// complete with an empty summary and an index task is never reported as a
+// table alteration. Every task lands in some bucket: a change type outside the
+// named ones — including an empty one — counts as other DDL, so the summary
+// never omits work the apply ran.
 type applyChangeCounts struct {
 	created        int
 	altered        int
 	dropped        int
+	indexesCreated int
+	indexesDropped int
+	other          int
 	vschemaUpdates int
 }
 
@@ -521,8 +607,14 @@ func (c *applyChangeCounts) add(changeType string) {
 		c.altered++
 	case "DROP", "CHANGE_TYPE_DROP":
 		c.dropped++
+	case "CREATE_INDEX", "CHANGE_TYPE_CREATE_INDEX":
+		c.indexesCreated++
+	case "DROP_INDEX", "CHANGE_TYPE_DROP_INDEX":
+		c.indexesDropped++
 	case "VSCHEMA", "VSCHEMA_UPDATE", "CHANGE_TYPE_VSCHEMA":
 		c.vschemaUpdates++
+	default:
+		c.other++
 	}
 }
 
@@ -536,6 +628,15 @@ func (c applyChangeCounts) summary() string {
 	}
 	if c.dropped > 0 {
 		parts = append(parts, fmt.Sprintf("%d dropped", c.dropped))
+	}
+	if c.indexesCreated > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s created", c.indexesCreated, ui.PluralizeNoun("index", c.indexesCreated)))
+	}
+	if c.indexesDropped > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s dropped", c.indexesDropped, ui.PluralizeNoun("index", c.indexesDropped)))
+	}
+	if c.other > 0 {
+		parts = append(parts, fmt.Sprintf("%d other DDL %s", c.other, ui.PluralizeNoun("statement", c.other)))
 	}
 	if c.vschemaUpdates > 0 {
 		word := "updates"

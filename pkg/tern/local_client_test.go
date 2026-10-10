@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
+	"github.com/block/schemabot/pkg/inventory"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
@@ -51,6 +54,19 @@ func TestMaterializedTableChangeOperation(t *testing.T) {
 		assert.Equal(t, "create", op)
 	})
 
+	t.Run("Postgres create set fallback", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+		require.NoError(t, err)
+
+		op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{
+			TableName: "t",
+			Ddl:       "CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v)",
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, ddl.StatementTypeToOp(ddl.StatementCreateTable), op)
+	})
+
 	t.Run("MySQL fallback", func(t *testing.T) {
 		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
 		require.NoError(t, err)
@@ -62,6 +78,24 @@ func TestMaterializedTableChangeOperation(t *testing.T) {
 
 		require.NoError(t, err)
 		assert.Equal(t, "create", op)
+	})
+
+	t.Run("MySQL single-statement fallbacks retain their operations", func(t *testing.T) {
+		parser, err := ddl.ParserForDialect(schema.DialectMySQL)
+		require.NoError(t, err)
+
+		tests := []struct {
+			ddl    string
+			wantOp string
+		}{
+			{ddl: "TRUNCATE TABLE `t`", wantOp: "truncate"},
+			{ddl: "CREATE INDEX `i` ON `t` (`v`)", wantOp: "create_index"},
+		}
+		for _, tc := range tests {
+			op, err := materializedTableChangeOperation(parser, &ternv1.TableChange{TableName: "t", Ddl: tc.ddl})
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantOp, op)
+		}
 	})
 
 	t.Run("proto change type is authoritative", func(t *testing.T) {
@@ -385,6 +419,16 @@ func (s *exactProgressApplyStore) Update(_ context.Context, apply *storage.Apply
 	return nil
 }
 
+// WithExclusiveTarget runs the work with the target uncontended, the case these
+// fixtures exercise. Contention is a storage decision, covered where the real
+// store enforces it.
+func (s *exactProgressApplyStore) WithExclusiveTarget(ctx context.Context, _ *storage.Apply, fn func(context.Context) error) error {
+	if s.err != nil {
+		return s.err
+	}
+	return fn(ctx)
+}
+
 func (s *exactProgressApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
 	if s.err != nil {
 		return false, s.err
@@ -435,6 +479,14 @@ func (s *snapshotApplyStore) Update(_ context.Context, apply *storage.Apply) err
 	return nil
 }
 
+func (s *snapshotApplyStore) SetRevertSkipped(_ context.Context, _ int64, at time.Time) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.stored.RevertSkippedAt = &at
+	return nil
+}
+
 func (s *snapshotApplyStore) UpdateDerivedState(_ context.Context, _ int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
 	if s.err != nil {
 		return false, s.err
@@ -456,6 +508,7 @@ type exactProgressTaskStore struct {
 	tasks     []*storage.Task
 	shardRows []*storage.Task
 	err       error
+	updateErr func(context.Context, *storage.Task) error
 }
 
 func (s *exactProgressTaskStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
@@ -478,7 +531,10 @@ func (s *exactProgressTaskStore) GetByDatabase(context.Context, string) ([]*stor
 	return s.tasks, s.err
 }
 
-func (s *exactProgressTaskStore) Update(context.Context, *storage.Task) error {
+func (s *exactProgressTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if s.updateErr != nil {
+		return s.updateErr(ctx, task)
+	}
 	return s.err
 }
 
@@ -514,6 +570,12 @@ type fakeControlEngine struct {
 	planResult              *engine.PlanResult
 	applyResult             *engine.ApplyResult
 	applyErr                error
+	revertCount             int
+	revertErr               error
+	revertAccepted          *bool
+	skipRevertCount         int
+	skipRevertErr           error
+	skipRevertAccepted      *bool
 	externallyAuthoritative bool
 }
 
@@ -578,10 +640,24 @@ func (e *fakeControlEngine) Cutover(context.Context, *engine.ControlRequest) (*e
 }
 
 func (e *fakeControlEngine) Revert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.revertCount++
+	if e.revertErr != nil {
+		return nil, e.revertErr
+	}
+	if e.revertAccepted != nil {
+		return &engine.ControlResult{Accepted: *e.revertAccepted}, nil
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
 func (e *fakeControlEngine) SkipRevert(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	e.skipRevertCount++
+	if e.skipRevertErr != nil {
+		return nil, e.skipRevertErr
+	}
+	if e.skipRevertAccepted != nil {
+		return &engine.ControlResult{Accepted: *e.skipRevertAccepted}, nil
+	}
 	return &engine.ControlResult{Accepted: true}, nil
 }
 
@@ -616,11 +692,45 @@ func (s *exactProgressStorage) ApplyOperations() storage.ApplyOperationStore {
 
 type exactProgressApplyOperationStore struct {
 	storage.ApplyOperationStore
-	data    *storage.EngineResumeState
-	ops     []*storage.ApplyOperation
-	err     error
-	saveErr error
-	saved   *storage.EngineResumeState
+	data            *storage.EngineResumeState
+	ops             []*storage.ApplyOperation
+	err             error
+	saveErr         error
+	progressSaveErr error
+	saved           *storage.EngineResumeState
+	progressWrites  int
+}
+
+func (s *exactProgressApplyOperationStore) Get(_ context.Context, operationID int64) (*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, op := range s.ops {
+		if op.ID == operationID {
+			return op, nil
+		}
+	}
+	if s.data != nil && s.data.ApplyOperationID == operationID {
+		return &storage.ApplyOperation{ID: operationID, EngineResumeContext: s.data.MigrationContext, EngineResumeMetadata: s.data.Metadata}, nil
+	}
+	return nil, nil
+}
+
+func (s *exactProgressApplyOperationStore) SaveProgressMetadata(_ context.Context, operationID int64, metadata map[string]string) error {
+	s.progressWrites++
+	if s.progressSaveErr != nil {
+		return s.progressSaveErr
+	}
+	for _, op := range s.ops {
+		if op.ID == operationID {
+			encoded, err := json.Marshal(metadata)
+			if err != nil {
+				return fmt.Errorf("encode progress metadata: %w", err)
+			}
+			op.ProgressMetadata = string(encoded)
+		}
+	}
+	return nil
 }
 
 func (s *exactProgressApplyOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
@@ -652,6 +762,99 @@ func (s *exactProgressApplyOperationStore) GetEngineResumeState(context.Context,
 		return nil, storage.ErrEngineResumeStateNotFound
 	}
 	return s.data, nil
+}
+
+func TestPersistProgressMetadataOnlyWhenChanged(t *testing.T) {
+	operationID := int64(17)
+	store := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{ID: operationID}}}
+	client := &LocalClient{
+		storage: &exactProgressStorage{applyOperations: store},
+		logger:  slog.Default(),
+	}
+	task := &storage.Task{TaskIdentifier: "task-progress", ApplyOperationID: &operationID}
+	metadata := map[string]string{"phase": "copying", "step": "2"}
+	leaseLost := false
+
+	save := func(metadata map[string]string) error {
+		return client.saveProgressMetadata(t.Context(), task, metadata)
+	}
+	previous, err := client.persistProgressMetadataIfChanged(nil, metadata, &leaseLost, save)
+	require.NoError(t, err)
+	assert.Equal(t, 1, store.progressWrites)
+	previous, err = client.persistProgressMetadataIfChanged(previous, maps.Clone(metadata), &leaseLost, save)
+	require.NoError(t, err)
+	assert.Equal(t, 1, store.progressWrites)
+	metadata["step"] = "3"
+	_, err = client.persistProgressMetadataIfChanged(previous, metadata, &leaseLost, save)
+	require.NoError(t, err)
+	assert.Equal(t, 2, store.progressWrites)
+}
+
+func TestPersistProgressMetadataKeepsPreviousAndRetriesAfterError(t *testing.T) {
+	previous := map[string]string{"step": "1"}
+	current := map[string]string{"step": "2"}
+	store := &exactProgressApplyOperationStore{progressSaveErr: errors.New("storage unavailable")}
+	save := func(metadata map[string]string) error { return store.SaveProgressMetadata(t.Context(), 17, metadata) }
+	leaseLost := false
+
+	got, err := (&LocalClient{}).persistProgressMetadataIfChanged(previous, current, &leaseLost, save)
+	require.Error(t, err)
+	assert.Equal(t, previous, got)
+	store.progressSaveErr = nil
+	got, err = (&LocalClient{}).persistProgressMetadataIfChanged(got, current, &leaseLost, save)
+	require.NoError(t, err)
+	assert.Equal(t, current, got)
+	assert.Equal(t, 2, store.progressWrites)
+}
+
+func TestPersistProgressMetadataStopsAfterLeaseLoss(t *testing.T) {
+	store := &exactProgressApplyOperationStore{progressSaveErr: storage.ErrApplyLeaseLost}
+	save := func(metadata map[string]string) error { return store.SaveProgressMetadata(t.Context(), 17, metadata) }
+	leaseLost := false
+
+	previous, err := (&LocalClient{}).persistProgressMetadataIfChanged(nil, map[string]string{"step": "1"}, &leaseLost, save)
+	require.ErrorIs(t, err, storage.ErrApplyLeaseLost)
+	assert.True(t, leaseLost)
+	_, err = (&LocalClient{}).persistProgressMetadataIfChanged(previous, map[string]string{"step": "2"}, &leaseLost, save)
+	require.NoError(t, err)
+	assert.Equal(t, 1, store.progressWrites)
+}
+
+func TestLoadStoredProgressMetadataMergesVitessResumeFieldsLast(t *testing.T) {
+	operationID := int64(18)
+	store := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{
+		ID:                   operationID,
+		ProgressMetadata:     `{"phase":"copying","branch_name":"progress-branch"}`,
+		EngineResumeMetadata: `{"branch_name":"resume-branch","deploy_request_url":"https://example.com/request"}`,
+	}}}
+	client := &LocalClient{
+		config:  LocalConfig{Type: storage.DatabaseTypeVitess},
+		storage: &exactProgressStorage{applyOperations: store},
+		logger:  slog.Default(),
+	}
+	task := &storage.Task{TaskIdentifier: "task-read-progress", ApplyOperationID: &operationID}
+
+	metadata := client.loadStoredProgressMetadata(t.Context(), task)
+	assert.Equal(t, "copying", metadata["phase"])
+	assert.Equal(t, "resume-branch", metadata["branch_name"])
+	assert.Equal(t, "https://example.com/request", metadata["deploy_request_url"])
+}
+
+func TestLoadStoredProgressMetadataReturnsEmptyMapForNull(t *testing.T) {
+	operationID := int64(19)
+	store := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{
+		ID:               operationID,
+		ProgressMetadata: "null",
+	}}}
+	client := &LocalClient{
+		storage: &exactProgressStorage{applyOperations: store},
+		logger:  slog.Default(),
+	}
+	task := &storage.Task{TaskIdentifier: "task-read-null-progress", ApplyOperationID: &operationID}
+
+	metadata := client.loadStoredProgressMetadata(t.Context(), task)
+	assert.NotNil(t, metadata)
+	assert.Empty(t, metadata)
 }
 
 func TestApplyCancelHandleDoesNotCancelNewerOwner(t *testing.T) {
@@ -693,7 +896,8 @@ func (s *errControlRequestStore) GetByOperation(context.Context, int64, storage.
 
 type testControlRequestStore struct {
 	storage.ControlRequestStore
-	requests []*storage.ApplyControlRequest
+	requests          []*storage.ApplyControlRequest
+	getByOperationErr error
 }
 
 func (s *testControlRequestStore) RequestPending(_ context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {
@@ -727,6 +931,9 @@ func (s *testControlRequestStore) GetPending(_ context.Context, applyID int64, o
 }
 
 func (s *testControlRequestStore) GetByOperation(_ context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if s.getByOperationErr != nil {
+		return nil, s.getByOperationErr
+	}
 	for _, v := range slices.Backward(s.requests) {
 		req := v
 		if req.ApplyID == applyID && req.Operation == operation {
@@ -841,6 +1048,27 @@ func TestPlanWithEngine_RefusesIgnoredNamespacesOnDatabaseScopedMySQLDSN(t *test
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ignore_namespaces is not supported for MySQL targets whose DSN names a database")
 	assert.Contains(t, err.Error(), "local_fixtures")
+}
+
+// A targets entry that selects namespaces withholds the rest the same way
+// ignore_namespaces does: they live on another target, or are still on this one
+// until moved. On a database-scoped DSN their live tables would have no
+// declaring file, so the plan refuses rather than proposing to drop them.
+func TestPlanWithEngine_RefusesUnselectedNamespacesOnDatabaseScopedMySQLDSN(t *testing.T) {
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "orders",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: "user:pass@tcp(localhost:3306)/orders",
+	}, nil, slog.Default())
+	require.NoError(t, err)
+
+	_, err = client.planWithEngine(t.Context(), &ternv1.PlanRequest{
+		Database:             "orders",
+		UnselectedNamespaces: []string{"ns_1"},
+	}, "orders", schema.SchemaFiles{"ns_0": {Files: map[string]string{"orders.sql": "CREATE TABLE orders (id INT)"}}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "a targets entry that selects namespaces is not supported for MySQL targets whose DSN names a database")
+	assert.Contains(t, err.Error(), "unselected namespaces [ns_1] would have their live tables planned as DROP TABLE")
 }
 
 func TestRejectUnsafeDDLChangesWithoutOptIn(t *testing.T) {
@@ -969,6 +1197,29 @@ func TestLocalClient_ProgressServesTaskLessApplyFromOperations(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.True(t, isTerminalProtoState(resp.State), "task-less completed apply should report a terminal state, got %v", resp.State)
+}
+
+func TestLocalClient_ProgressCarriesStoredProgressMetadata(t *testing.T) {
+	operationID := int64(20)
+	apply := &storage.Apply{ID: 8, ApplyIdentifier: "apply-postgres-progress", Engine: storage.EnginePostgres, State: state.Apply.Running}
+	client := &LocalClient{
+		config: LocalConfig{Type: storage.DatabaseTypePostgres},
+		storage: &exactProgressStorage{
+			applies: &exactProgressApplyStore{apply: apply},
+			tasks: &exactProgressTaskStore{tasks: []*storage.Task{{
+				ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-postgres-progress", Engine: storage.EnginePostgres, State: state.Task.Running,
+			}}},
+			applyOperations: &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{
+				ID: operationID, ProgressMetadata: `{"phase":"preflight","step":"2","steps_total":"2"}`,
+			}}},
+		},
+		logger: slog.Default(),
+	}
+
+	resp, err := client.Progress(t.Context(), &ternv1.ProgressRequest{ApplyId: apply.ApplyIdentifier})
+	require.NoError(t, err)
+	assert.Equal(t, "preflight", resp.Metadata["phase"])
+	assert.Equal(t, "2", resp.Metadata["step"])
 }
 
 func groupedResumeStateClient(databaseType string, applyOperations storage.ApplyOperationStore) *LocalClient {
@@ -1264,7 +1515,7 @@ func TestExecuteGroupedApplySaveFailureAfterAcceptPausesForRetry(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false)
+	require.NoError(t, client.executeGroupedApply(t.Context(), apply, tasks, plan, nil, false))
 
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.FailedRetryable),
 		"apply must pause for operator retry, got %s", applyStore.apply.State)
@@ -1401,9 +1652,9 @@ func TestLocalClient_ProcessPendingStopControlRequest(t *testing.T) {
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, 1, fakeEngine.stopCount)
 	assert.Equal(t, state.Task.Stopped, task.State)
 	assert.Equal(t, state.Apply.Stopped, apply.State)
@@ -1455,9 +1706,9 @@ func TestLocalClient_ProcessPendingCancelControlRequest(t *testing.T) {
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, 1, fakeEngine.cancelCount)
 	assert.Equal(t, 0, fakeEngine.stopCount)
 	assert.Equal(t, state.Task.Cancelled, task.State)
@@ -1520,9 +1771,9 @@ func TestLocalClient_ProcessPendingCancelSettlesCompletedEngineChange(t *testing
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, 1, fakeEngine.cancelCount)
 	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not cancelled")
 	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
@@ -1531,8 +1782,16 @@ func TestLocalClient_ProcessPendingCancelSettlesCompletedEngineChange(t *testing
 	require.NotNil(t, apply.CompletedAt)
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
 	require.NoError(t, err)
-	assert.Nil(t, controlReq, "the durable cancel request must complete so the operator stops re-running the cancel")
+	assert.Nil(t, controlReq, "the durable cancel request must settle so the operator stops re-running the cancel")
+	settled, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Equal(t, storage.ControlRequestFailed, settled.Status,
+		"the change landed, so the cancel did not take effect and must resolve as a rejection the PR comment can surface")
+	assert.Equal(t, "the schema change completed before the cancel could take effect; the change is live on the target",
+		settled.ErrorMessage)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel arrived after the schema change completed on the engine; apply recorded as completed (1 tasks completed, 0 already terminal) (caller: github:alice)"))
+	assert.True(t, hasLogMessageContaining(logs.logs, "Cancel did not take effect: the schema change completed before the cancel could take effect; the change is live on the target (caller: github:alice)"))
 }
 
 // The stop counterpart: a pending stop consumed after the engine's schema
@@ -1583,9 +1842,9 @@ func TestLocalClient_ProcessPendingStopSettlesCompletedEngineChange(t *testing.T
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 	assert.Equal(t, 1, fakeEngine.stopCount)
 	assert.Equal(t, state.Task.Completed, task.State, "the task must adopt the engine's completed outcome, not stopped")
 	assert.Equal(t, 100, task.ProgressPercent, "a completed task reports full progress")
@@ -1668,7 +1927,7 @@ func TestLocalClient_ProcessPendingCancelFailsClosedWhenSettleWriteRefused(t *te
 func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *testing.T) {
 	// A stop and a start can race into the same operator claim: the apply is
 	// already stopped while a stop request is still pending, and a start request
-	// arrives alongside it. Completing the stop must report not-handled so the
+	// arrives alongside it. Completing the stop must report not-standDown so the
 	// resume continues to the queued start in the same claim, instead of leaving
 	// the apply stopped with a pending start the claim lease-freshness gate
 	// cannot re-claim until the lease goes stale.
@@ -1719,9 +1978,9 @@ func TestLocalClient_ProcessPendingStopControlRequestContinuesToQueuedStart(t *t
 		logger:       slog.Default(),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.False(t, handled, "a queued start must keep the claim resuming instead of exiting after the stop")
+	assert.False(t, standDown, "a queued start must keep the claim resuming instead of exiting after the stop")
 
 	stopReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
@@ -1903,7 +2162,9 @@ func TestLocalClient_StartQueuesOwnerRequest(t *testing.T) {
 // it is a permanent rejection. Processing it must resolve the request terminally
 // (failed) with the operator-facing reason instead of bubbling a retryable error
 // that keeps the request pending and spins the operator-owned retry loop forever.
-// The apply stays in the revert window for the operator to revert or skip-revert.
+// The apply stays in the revert window for the operator to revert or skip-revert,
+// and the drive is told the stop did not take effect: resolving the request and
+// pausing the change are separate facts, and only the request was resolved.
 func TestLocalClient_ProcessPendingStopControlRequestRejectsRevertWindow(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              321,
@@ -1945,10 +2206,10 @@ func TestLocalClient_ProcessPendingStopControlRequestRejectsRevertWindow(t *test
 		logger:            slog.Default(),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 
 	require.NoError(t, err, "a permanent rejection must not bubble a retryable error")
-	assert.True(t, handled, "the durable request is resolved, so the owner must not retry")
+	assert.False(t, standDown, "nothing was paused, so the drive must keep driving rather than settle the apply stopped")
 	assert.Equal(t, 0, fakeEngine.stopCount, "stop must not touch the engine for a revert-window apply")
 	assert.Equal(t, state.Apply.RevertWindow, apply.State, "revert-window apply must not be recorded as cancelled or stopped")
 	assert.Equal(t, state.Task.RevertWindow, task.State, "revert-window task must be preserved")
@@ -2006,7 +2267,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequest(t *testing.T) {
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.NoError(t, err)
 	assert.Equal(t, 1, fakeEngine.cutoverCount)
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2056,7 +2317,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestUsesCompletedTaskForCuto
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.NoError(t, err)
 	assert.Equal(t, 1, fakeEngine.cutoverCount)
 	controlReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2104,7 +2365,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhenNotReady(t *tes
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.NoError(t, err)
 	assert.Equal(t, 0, fakeEngine.cutoverCount)
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2153,7 +2414,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestWaitsWhileRecovering(t *
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.NoError(t, err)
 	assert.Equal(t, 0, fakeEngine.cutoverCount)
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2202,7 +2463,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestFailsRejectedRequest(t *
 		logger:       slog.Default(),
 	}
 
-	err := client.processPendingCutoverControlRequest(t.Context(), apply)
+	err := client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not ready for cutover")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
@@ -2260,7 +2521,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 		logger:       slog.Default(),
 	}
 
-	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply))
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
 	assert.Equal(t, 1, fakeEngine.cutoverCount)
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
 	require.NoError(t, err)
@@ -2272,7 +2533,7 @@ func TestLocalClient_ProcessPendingCutoverControlRequestRetriesWhenCutoverNotRea
 	// The backend finishes staging: the still-pending request is accepted on
 	// the next tick and completes.
 	fakeEngine.cutoverErr = nil
-	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply))
+	require.NoError(t, client.processPendingCutoverControlRequest(t.Context(), apply, []*storage.Task{task}))
 	assert.Equal(t, 2, fakeEngine.cutoverCount)
 	pending, err = controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCutover)
 	require.NoError(t, err)
@@ -2568,7 +2829,7 @@ func TestPrepareStoppedTasksForResumeQueuesOnlyStoppedTasks(t *testing.T) {
 
 			controlReq, err := pendingControlRequest(t.Context(), client.storage, apply, storage.ControlOperationStart)
 			require.NoError(t, err)
-			client.prepareStoppedTasksForResume(t.Context(), apply, []*storage.Task{stoppedTask, completedTask}, controlReq != nil)
+			require.NoError(t, client.prepareStoppedTasksForResume(t.Context(), apply, []*storage.Task{stoppedTask, completedTask}, controlReq != nil))
 
 			assert.Equal(t, state.Task.Pending, stoppedTask.State)
 			assert.Nil(t, stoppedTask.CompletedAt)
@@ -2593,7 +2854,7 @@ func TestPrepareStoppedTasksForResumeIgnoresApplyWithoutStartRequest(t *testing.
 		logger: slog.Default(),
 	}
 
-	client.prepareStoppedTasksForResume(t.Context(), &storage.Apply{ID: 123, State: state.Apply.Running}, []*storage.Task{task}, false)
+	require.NoError(t, client.prepareStoppedTasksForResume(t.Context(), &storage.Apply{ID: 123, State: state.Apply.Running}, []*storage.Task{task}, false))
 
 	assert.Equal(t, state.Task.Stopped, task.State)
 	assert.Equal(t, &completedAt, task.CompletedAt)
@@ -2924,6 +3185,45 @@ func TestDeriveAggregateApplyState(t *testing.T) {
 		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
 		assert.True(t, ok, "current op row present, projection must be determined")
 		assert.Equal(t, state.Apply.RunningDegraded, got, "continue policy must hold the apply degraded until the pending sibling settles")
+	})
+
+	// In a targets-list rollout under continue, this drive's shard -80 of
+	// payments-001 has just failed while its stored row still reads running.
+	// That failure orphans payments-001's pending finalizer, and payments-002
+	// has completed, so the apply settles failed, exactly as the operator's
+	// stored derivation settles it.
+	t.Run("continue settles failed past a finalizer this drive's failure orphans", func(t *testing.T) {
+		tasks := []*storage.Task{taskWith(state.Task.Failed)}
+		started := time.Now()
+		op := func(id int64, target, key, kind, opState string) *storage.ApplyOperation {
+			return &storage.ApplyOperation{
+				ID: id, Deployment: "payments-a", Target: target,
+				OperationKey: storage.TargetOperationKey(target, key), OperationKind: kind,
+				State: opState, OnFailure: storage.OnFailureContinue, StartedAt: &started,
+			}
+		}
+		pendingFinalizer := op(3, "payments-001", "orders/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Pending)
+		pendingFinalizer.StartedAt = nil
+		client := &LocalClient{
+			storage: &exactProgressStorage{
+				applyOperations: &listApplyOperationStore{
+					ops: []*storage.ApplyOperation{
+						op(currentOpID, "payments-001", storage.ShardOperationKey("orders", "-80", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Running),
+						op(2, "payments-001", storage.ShardOperationKey("orders", "80-", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						pendingFinalizer,
+						op(4, "payments-002", storage.ShardOperationKey("orders", "-80", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						op(5, "payments-002", storage.ShardOperationKey("orders", "80-", "orders"), storage.ApplyOperationKindWork, state.ApplyOperation.Completed),
+						op(6, "payments-002", "orders/group_finalizer", storage.ApplyOperationKindGroupFinalizer, state.ApplyOperation.Completed),
+					},
+				},
+			},
+			logger: slog.Default(),
+		}
+		apply := &storage.Apply{ID: 7, ApplyIdentifier: "apply-orphaned-finalizer"}
+
+		got, ok := client.deriveAggregateApplyState(t.Context(), apply, tasks)
+		assert.True(t, ok, "current op row present, projection must be determined")
+		assert.Equal(t, state.Apply.Failed, got, "no row left can move, so the continue rollout takes its failed verdict")
 	})
 
 	// Under on_failure "pause" a terminally failed deployment holds the apply
@@ -3311,6 +3611,481 @@ func TestHandleAtomicProgressTickOperationGate(t *testing.T) {
 	})
 }
 
+// A grouped apply holding its revert window is where an operator's cancel meets
+// a change that has already cut over. The drive refuses the command — only
+// revert or skip-revert can act from there — and then has to keep polling: the
+// engine is still working underneath, and a drive that exited on the refusal
+// would abandon a live revert window with nobody watching it expire (CO-5).
+func TestHandleAtomicProgressTickRefusedCancelInRevertWindowKeepsPolling(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              11,
+		ApplyIdentifier: "apply-revert-window-refusal",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		State:           state.Apply.Running,
+	}
+	opID := int64(1)
+	tasks := []*storage.Task{{
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		State:            state.Task.RevertWindow,
+		TableName:        "users",
+		Namespace:        "testdb",
+	}}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	stor := &exactProgressStorage{
+		applies:         &snapshotApplyStore{stored: *apply},
+		tasks:           &exactProgressTaskStore{tasks: tasks},
+		controlRequests: controlRequests,
+		applyOperations: &listApplyOperationStore{ops: []*storage.ApplyOperation{{ID: opID, State: state.ApplyOperation.Running}}},
+	}
+	client := &LocalClient{storage: stor, logger: slog.Default()}
+	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+		State:  engine.StateRevertWindow,
+		Tables: []engine.TableProgress{{Namespace: "testdb", Table: "users", State: state.Task.RevertWindow, Progress: 100}},
+	}}
+	ps := &atomicPollState{lastProgressLog: time.Now(), stateEnteredAt: time.Now()}
+
+	done := client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, apply.GetOptions().Map(), false)
+
+	assert.False(t, done, "a refused cancel is not an operator cancel, so the drive must keep polling the revert window")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State,
+		"the apply tracks the phase the engine reported, not the command that was refused")
+	assert.Equal(t, state.Task.RevertWindow, tasks[0].State, "the cut-over task keeps its revert window")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status,
+		"the refusal is permanent, so the request resolves rather than being re-collected every tick")
+}
+
+// revertWindowTickFixture drives progress ticks for a grouped apply whose
+// engine reports an open revert window that the drive first saw long enough
+// ago for it to have expired.
+type revertWindowTickFixture struct {
+	client          *LocalClient
+	eng             *fakeControlEngine
+	apply           *storage.Apply
+	tasks           []*storage.Task
+	applies         *snapshotApplyStore
+	controlRequests *testControlRequestStore
+	logs            *mockApplyLogStore
+	ps              *atomicPollState
+}
+
+func newRevertWindowTickFixture(opts storage.ApplyOptions) *revertWindowTickFixture {
+	apply := &storage.Apply{
+		ID:              12,
+		ApplyIdentifier: "apply-auto-skip-revert",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		State:           state.Apply.Running,
+		Options:         storage.MarshalApplyOptions(opts),
+	}
+	opID := int64(1)
+	tasks := []*storage.Task{{
+		TaskIdentifier:   "task-users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		State:            state.Task.RevertWindow,
+		TableName:        "users",
+		Namespace:        "testdb",
+	}}
+	progress := &engine.ProgressResult{
+		State:  engine.StateRevertWindow,
+		Tables: []engine.TableProgress{{Namespace: "testdb", Table: "users", State: state.Task.RevertWindow, Progress: 100}},
+	}
+	f := &revertWindowTickFixture{
+		eng:             &fakeControlEngine{progressResult: progress},
+		apply:           apply,
+		tasks:           tasks,
+		applies:         &snapshotApplyStore{stored: *apply},
+		controlRequests: &testControlRequestStore{},
+		logs:            &mockApplyLogStore{},
+		ps: &atomicPollState{
+			lastProgressLog: time.Now(),
+			lastTaskState:   taskStateFromProgressResult(progress),
+			stateEnteredAt:  time.Now().Add(-2 * defaultRevertWindowDuration),
+		},
+	}
+	f.client = &LocalClient{
+		storage: &exactProgressStorage{
+			applies:         f.applies,
+			tasks:           &exactProgressTaskStore{tasks: tasks},
+			logs:            f.logs,
+			controlRequests: f.controlRequests,
+			applyOperations: &listApplyOperationStore{ops: []*storage.ApplyOperation{{ID: opID, State: state.ApplyOperation.Running}}},
+		},
+		logger: slog.Default(),
+	}
+	return f
+}
+
+func (f *revertWindowTickFixture) tick(t *testing.T) bool {
+	t.Helper()
+	return f.client.handleAtomicProgressTick(t.Context(), f.eng, f.apply, f.tasks, &engine.Credentials{}, nil, f.ps, f.apply.GetOptions().Map(), false)
+}
+
+func (f *revertWindowTickFixture) eventCount(eventType, message string) int {
+	n := 0
+	for _, entry := range f.logs.logs {
+		if entry.EventType == eventType && entry.Message == message {
+			n++
+		}
+	}
+	return n
+}
+
+func (f *revertWindowTickFixture) eventTypeCount(eventType string) int {
+	n := 0
+	for _, entry := range f.logs.logs {
+		if entry.EventType == eventType {
+			n++
+		}
+	}
+	return n
+}
+
+// recordControlRequest seeds the durable control request row of the given
+// operation for the apply, in the given status, as the API leaves it behind.
+func (f *revertWindowTickFixture) recordControlRequest(operation storage.ControlOperation, status storage.ControlRequestStatus) {
+	f.controlRequests.requests = append(f.controlRequests.requests, &storage.ApplyControlRequest{
+		ApplyID:     f.apply.ID,
+		Operation:   operation,
+		Status:      status,
+		RequestedBy: "operator",
+	})
+}
+
+func (f *revertWindowTickFixture) controlRequestStatus(t *testing.T, operation storage.ControlOperation) storage.ControlRequestStatus {
+	t.Helper()
+	req, err := f.controlRequests.GetByOperation(t.Context(), f.apply.ID, operation)
+	require.NoError(t, err)
+	require.NotNil(t, req)
+	return req.Status
+}
+
+// The drive closes a revert window on its own when the window expires or when
+// the apply was started with --skip-revert. When the engine rejects that skip,
+// the window is still open: the apply keeps showing its revert window rather
+// than skipping_revert, the next progress tick retries the skip, and only an
+// accepted skip records the window as skipped. The trigger lands on the
+// timeline once however many ticks the retry takes.
+func TestHandleAtomicProgressTickRetriesRejectedAutoSkipRevert(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		options        storage.ApplyOptions
+		triggerMessage string
+		skipMessage    string
+	}{
+		{
+			name:           "revert window expired",
+			triggerMessage: "Revert window expired, skipping revert",
+			skipMessage:    "Revert window expired, skip-revert triggered",
+		},
+		{
+			name:           "skip-revert option",
+			options:        storage.ApplyOptions{SkipRevert: true},
+			triggerMessage: "Auto-skipping revert window (--skip-revert)",
+			skipMessage:    "Skip-revert triggered (--skip-revert)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(tc.options)
+			f.eng.skipRevertErr = errors.New("deploy request is busy")
+
+			assert.False(t, f.tick(t), "a rejected skip keeps the drive polling the revert window")
+			assert.Equal(t, 1, f.eng.skipRevertCount)
+			assert.False(t, f.ps.revertSkipped, "a rejected skip must not be recorded as done")
+			assert.Equal(t, state.Apply.RevertWindow, f.apply.State, "the window is still open, so the apply is not shown as skipping_revert")
+			assert.Nil(t, f.applies.stored.RevertSkippedAt, "a rejected skip must not persist the skip-revert signal")
+			assert.Zero(t, f.eventCount(storage.LogEventSkipRevertTriggered, tc.skipMessage), "a rejected skip must not be reported as triggered")
+
+			f.eng.skipRevertErr = nil
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 2, f.eng.skipRevertCount, "the next tick retries the rejected skip")
+			assert.True(t, f.ps.revertSkipped)
+			assert.Equal(t, state.Apply.SkippingRevert, f.apply.State)
+			assert.NotNil(t, f.applies.stored.RevertSkippedAt, "an accepted skip persists the skip-revert signal")
+
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 2, f.eng.skipRevertCount, "an accepted skip is not re-sent")
+			assert.Equal(t, 1, f.eventCount(storage.LogEventStateTransition, tc.triggerMessage), "the trigger is recorded once across retries")
+			assert.Equal(t, 1, f.eventCount(storage.LogEventSkipRevertTriggered, tc.skipMessage), "the accepted skip is recorded once")
+		})
+	}
+}
+
+// While the engine keeps rejecting the automatic skip of an expired revert
+// window, the window is still open, so an operator's revert queued in the
+// meantime is carried out on the next tick instead of being stranded behind a
+// skip that never happened. The revert takes precedence over retrying the skip.
+func TestHandleAtomicProgressTickHonorsQueuedRevertWhileAutoSkipRevertFails(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.eng.skipRevertErr = errors.New("deploy request is busy")
+
+	assert.False(t, f.tick(t))
+	require.Equal(t, 1, f.eng.skipRevertCount)
+	require.False(t, f.ps.revertSkipped)
+
+	f.recordControlRequest(storage.ControlOperationRevert, storage.ControlRequestPending)
+	assert.False(t, f.tick(t))
+
+	assert.Equal(t, 1, f.eng.revertCount, "the queued revert reaches the engine")
+	assert.Equal(t, 1, f.eng.skipRevertCount, "a revert this tick takes precedence over retrying the skip")
+	assert.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, storage.ControlOperationRevert), "the carried-out revert resolves its request")
+	assert.Nil(t, f.applies.stored.RevertSkippedAt, "the window was reverted, never skipped")
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.eng.skipRevertCount, "a lagging revert-window state cannot trigger a skip after revert")
+}
+
+// An engine can answer a skip-revert with a result it did not accept rather
+// than an error. On both automatic paths that answer leaves the window open
+// exactly like an error does: nothing is recorded as skipped and the next tick
+// retries.
+func TestHandleAtomicProgressTickRetriesUnacceptedAutoSkipRevert(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		options     storage.ApplyOptions
+		skipMessage string
+	}{
+		{name: "revert window expired", skipMessage: "Revert window expired, skip-revert triggered"},
+		{name: "skip-revert option", options: storage.ApplyOptions{SkipRevert: true}, skipMessage: "Skip-revert triggered (--skip-revert)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(tc.options)
+			accepted := false
+			f.eng.skipRevertAccepted = &accepted
+
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 1, f.eng.skipRevertCount)
+			assert.False(t, f.ps.revertSkipped, "an unaccepted skip must not be recorded as done")
+			assert.Equal(t, state.Apply.RevertWindow, f.apply.State)
+			assert.Nil(t, f.applies.stored.RevertSkippedAt)
+			assert.Zero(t, f.eventCount(storage.LogEventSkipRevertTriggered, tc.skipMessage))
+
+			accepted = true
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 2, f.eng.skipRevertCount, "the next tick retries the unaccepted skip")
+			assert.True(t, f.ps.revertSkipped)
+			assert.NotNil(t, f.applies.stored.RevertSkippedAt)
+			assert.Equal(t, 1, f.eventCount(storage.LogEventSkipRevertTriggered, tc.skipMessage))
+		})
+	}
+}
+
+// An operator's queued skip-revert the engine answers without accepting is not
+// carried out: the request stays pending for the next tick to retry, nothing is
+// recorded as skipped, and only the accepted retry completes the request.
+func TestHandleAtomicProgressTickRetriesUnacceptedQueuedSkipRevert(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.ps.stateEnteredAt = time.Now() // the window is still open, so only the queued request skips
+	f.recordControlRequest(storage.ControlOperationSkipRevert, storage.ControlRequestPending)
+	accepted := false
+	f.eng.skipRevertAccepted = &accepted
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.eng.skipRevertCount)
+	assert.Equal(t, storage.ControlRequestPending, f.controlRequestStatus(t, storage.ControlOperationSkipRevert), "an unaccepted skip leaves the request for the next tick")
+	assert.False(t, f.ps.revertSkipped)
+	assert.Nil(t, f.applies.stored.RevertSkippedAt)
+	assert.Equal(t, state.Apply.RevertWindow, f.apply.State)
+
+	accepted = true
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 2, f.eng.skipRevertCount, "the next tick retries the unaccepted skip")
+	assert.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, storage.ControlOperationSkipRevert))
+	assert.True(t, f.ps.revertSkipped)
+	assert.NotNil(t, f.applies.stored.RevertSkippedAt)
+}
+
+// An operator's queued revert the engine answers without accepting is not a
+// revert: the request stays pending for the next tick to retry and the window
+// is not treated as reverted, so a later accepted attempt still completes it.
+func TestHandleAtomicProgressTickRetriesUnacceptedQueuedRevert(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.ps.stateEnteredAt = time.Now() // the window is still open, so no expiry skip competes with the revert
+	f.recordControlRequest(storage.ControlOperationRevert, storage.ControlRequestPending)
+	accepted := false
+	f.eng.revertAccepted = &accepted
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.eng.revertCount)
+	assert.Equal(t, storage.ControlRequestPending, f.controlRequestStatus(t, storage.ControlOperationRevert), "an unaccepted revert leaves the request for the next tick")
+	assert.False(t, f.ps.revertTriggered, "an unaccepted revert must not fence the window as reverted")
+	assert.Zero(t, f.eventCount(storage.LogEventRevertTriggered, "Revert triggered by user (operator)"))
+
+	accepted = true
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 2, f.eng.revertCount, "the next tick retries the unaccepted revert")
+	assert.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, storage.ControlOperationRevert))
+	assert.True(t, f.ps.revertTriggered)
+}
+
+// Most reverts are carried out by the API, which completes the durable revert
+// request itself; the drive only sees progress still reporting the revert
+// window. Every path that could skip that window — the --skip-revert option,
+// the window's expiry, and an operator's queued skip-revert — reads the
+// completed revert request and sends nothing to the engine, so the skip cannot
+// race a revert the drive never saw accepted.
+func TestHandleAtomicProgressTickSendsNoSkipAfterAPIAcceptedRevert(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		options   storage.ApplyOptions
+		queueSkip bool
+	}{
+		{name: "revert window expired"},
+		{name: "skip-revert option", options: storage.ApplyOptions{SkipRevert: true}},
+		{name: "queued skip-revert", queueSkip: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(tc.options)
+			f.recordControlRequest(storage.ControlOperationRevert, storage.ControlRequestCompleted)
+			if tc.queueSkip {
+				f.recordControlRequest(storage.ControlOperationSkipRevert, storage.ControlRequestPending)
+			}
+
+			assert.False(t, f.tick(t), "the drive keeps polling until the engine reports the revert")
+			assert.Zero(t, f.eng.skipRevertCount, "no skip may follow an accepted revert")
+			assert.Zero(t, f.eng.revertCount, "the completed request is not re-sent")
+			assert.True(t, f.ps.revertTriggered, "the drive adopts the durable acceptance")
+			assert.False(t, f.ps.revertSkipped)
+			assert.Nil(t, f.applies.stored.RevertSkippedAt)
+			assert.Equal(t, state.Apply.RevertWindow, f.apply.State)
+			assert.Zero(t, f.eventTypeCount(storage.LogEventSkipRevertTriggered))
+			if tc.queueSkip {
+				assert.Equal(t, storage.ControlRequestPending, f.controlRequestStatus(t, storage.ControlOperationSkipRevert),
+					"the skip request is left for the terminal settlement to resolve")
+			}
+
+			assert.False(t, f.tick(t))
+			assert.Zero(t, f.eng.skipRevertCount, "later ticks stay fenced")
+		})
+	}
+}
+
+// A drive that carries out a queued revert and then loses its lease hands the
+// apply to a fresh drive with no in-memory state. The fresh drive reads the
+// completed revert request and does not skip the still-reported window.
+func TestHandleAtomicProgressTickFreshDriveSendsNoSkipAfterAcceptedRevert(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.recordControlRequest(storage.ControlOperationRevert, storage.ControlRequestPending)
+
+	assert.False(t, f.tick(t))
+	require.Equal(t, 1, f.eng.revertCount)
+	require.Equal(t, storage.ControlRequestCompleted, f.controlRequestStatus(t, storage.ControlOperationRevert))
+	require.Zero(t, f.eng.skipRevertCount)
+
+	f.ps = &atomicPollState{
+		lastProgressLog: time.Now(),
+		lastTaskState:   f.ps.lastTaskState,
+		stateEnteredAt:  f.ps.stateEnteredAt,
+		revertSkipped:   f.applies.stored.RevertSkippedAt != nil,
+	}
+	assert.False(t, f.tick(t))
+	assert.Zero(t, f.eng.skipRevertCount, "the fresh drive must not skip a window that was reverted before it claimed the apply")
+	assert.Equal(t, 1, f.eng.revertCount, "the completed request is not re-sent")
+	assert.True(t, f.ps.revertTriggered)
+}
+
+// When storage cannot say whether a revert was accepted, the drive sends no
+// skip that tick rather than guessing; the next tick asks again and skips once
+// storage answers.
+func TestHandleAtomicProgressTickSendsNoSkipWhileRevertAcceptanceIsUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		options storage.ApplyOptions
+	}{
+		{name: "revert window expired"},
+		{name: "skip-revert option", options: storage.ApplyOptions{SkipRevert: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRevertWindowTickFixture(tc.options)
+			f.controlRequests.getByOperationErr = errors.New("storage unavailable")
+
+			assert.False(t, f.tick(t))
+			assert.Zero(t, f.eng.skipRevertCount, "an unknown revert outcome fails closed")
+			assert.False(t, f.ps.revertTriggered)
+			assert.False(t, f.ps.revertSkipped)
+
+			f.controlRequests.getByOperationErr = nil
+			assert.False(t, f.tick(t))
+			assert.Equal(t, 1, f.eng.skipRevertCount, "the next tick asks storage again and skips")
+			assert.True(t, f.ps.revertSkipped)
+		})
+	}
+}
+
+// A skip the engine keeps failing is retried at every progress tick. The first
+// failures are routine and stay at Warn; once the failure has outlived the
+// escalation window the apply timeline records it once and the retries keep
+// going, and an accepted skip still closes the window.
+func TestHandleAtomicProgressTickEscalatesPersistentAutoSkipRevertFailure(t *testing.T) {
+	f := newRevertWindowTickFixture(storage.ApplyOptions{})
+	f.eng.skipRevertErr = errors.New("deploy request is busy")
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 1, f.eng.skipRevertCount)
+	assert.False(t, f.ps.autoSkipRevertFailingSince.IsZero(), "the first failure starts the escalation clock")
+	assert.Zero(t, f.eventTypeCount(storage.LogEventError), "a recent failure is not escalated")
+
+	f.ps.autoSkipRevertFailingSince = time.Now().Add(-autoSkipRevertEscalationAfter)
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 2, f.eng.skipRevertCount, "the drive keeps retrying past the escalation window")
+	assert.Equal(t, 1, f.eventTypeCount(storage.LogEventError), "the persisting failure lands on the timeline")
+
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 3, f.eng.skipRevertCount)
+	assert.Equal(t, 1, f.eventTypeCount(storage.LogEventError), "the timeline records the escalation once")
+
+	f.eng.skipRevertErr = nil
+	assert.False(t, f.tick(t))
+	assert.Equal(t, 4, f.eng.skipRevertCount)
+	assert.True(t, f.ps.revertSkipped, "an accepted skip after escalation still closes the window")
+	assert.Equal(t, 1, f.eventCount(storage.LogEventSkipRevertTriggered, "Revert window expired, skip-revert triggered"))
+}
+
+func TestHandleAtomicProgressTickPersistsMetadataOnceAndStopsAfterLeaseLoss(t *testing.T) {
+	operationID := int64(91)
+	apply := &storage.Apply{ID: 91, ApplyIdentifier: "apply-progress-metadata", Database: "testdb", State: state.Apply.Running}
+	tasks := []*storage.Task{{
+		ApplyID: apply.ID, ApplyOperationID: &operationID, TaskIdentifier: "task-progress-metadata", State: state.Task.Running, TableName: "users",
+	}}
+	store := &exactProgressApplyOperationStore{ops: []*storage.ApplyOperation{{ID: operationID, State: state.ApplyOperation.Running}}}
+	client := &LocalClient{
+		storage: &exactProgressStorage{
+			applies: &snapshotApplyStore{stored: *apply}, tasks: &exactProgressTaskStore{tasks: tasks},
+			controlRequests: &testControlRequestStore{}, applyOperations: store,
+		},
+		logger: slog.Default(),
+	}
+	eng := &fakeControlEngine{progressResult: &engine.ProgressResult{
+		State: engine.StateRunning, Metadata: map[string]string{"phase": "preflight", "step": "1"},
+		Tables: []engine.TableProgress{{Table: "users", State: state.Task.Running}},
+	}}
+	ps := &atomicPollState{lastProgressLog: time.Now()}
+
+	assert.False(t, client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, nil, false))
+	assert.Equal(t, 1, store.progressWrites)
+	assert.False(t, client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, nil, false))
+	assert.Equal(t, 1, store.progressWrites)
+
+	store.progressSaveErr = storage.ErrApplyLeaseLost
+	eng.progressResult.Metadata["step"] = "2"
+	assert.False(t, client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, nil, false))
+	assert.Equal(t, 2, store.progressWrites)
+	eng.progressResult.Metadata["step"] = "3"
+	assert.False(t, client.handleAtomicProgressTick(t.Context(), eng, apply, tasks, &engine.Credentials{}, nil, ps, nil, false))
+	assert.Equal(t, 2, store.progressWrites)
+}
+
 // Under an ordered-cutover policy a multi-deployment operation runs its copy
 // phase and then parks at the barrier: the copy drive must exit (release the
 // claim) so the operator can persist the operation row at waiting_for_cutover
@@ -3376,7 +4151,7 @@ func TestHandleAtomicProgressTickReleasesAtCutoverBarrier(t *testing.T) {
 // resolved without a vtgate DSN), the drive surfaces it once per apply at Warn —
 // always visible in Datadog without enabling debug logging. It fires once (not
 // per poll), stays silent during setup states, and stays silent for transient
-// reasons (schema-change context still being discovered, shard rows not yet
+// reasons (schema change context still being discovered, shard rows not yet
 // registered) that can self-heal on a later poll.
 func TestHandleAtomicProgressTickPerShardUnavailableWarn(t *testing.T) {
 	newApply := func() *storage.Apply {
@@ -3460,6 +4235,7 @@ type capturedLog struct {
 	level slog.Level
 	msg   string
 	attrs map[string]any
+	keys  []string
 }
 
 // captureHandler is a minimal slog.Handler that records every emitted record so
@@ -3474,14 +4250,17 @@ func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true 
 
 func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
 	attrs := make(map[string]any, len(h.bound)+r.NumAttrs())
+	keys := make([]string, 0, len(h.bound)+r.NumAttrs())
 	for _, a := range h.bound {
 		attrs[a.Key] = a.Value.Any()
+		keys = append(keys, a.Key)
 	}
 	r.Attrs(func(a slog.Attr) bool {
 		attrs[a.Key] = a.Value.Any()
+		keys = append(keys, a.Key)
 		return true
 	})
-	*h.records = append(*h.records, capturedLog{level: r.Level, msg: r.Message, attrs: attrs})
+	*h.records = append(*h.records, capturedLog{level: r.Level, msg: r.Message, attrs: attrs, keys: keys})
 	return nil
 }
 
@@ -3788,13 +4567,13 @@ func TestLocalClient_SchemaOverrides(t *testing.T) {
 		assert.Equal(t, "root@tcp(localhost:3306)/bikeshare_eu_qa", checker.req.Credentials.DSN)
 	})
 
-	t.Run("NewLocalClient rejects overrides for non-MySQL targets", func(t *testing.T) {
+	t.Run("NewLocalClient rejects overrides for Vitess targets", func(t *testing.T) {
 		_, err := NewLocalClient(LocalConfig{
 			Database:        "bikeshare",
 			Type:            storage.DatabaseTypeVitess,
 			SchemaOverrides: overrides,
 		}, nil, slog.Default())
-		require.ErrorContains(t, err, "only supported for mysql")
+		require.ErrorContains(t, err, `only supported for mysql and postgres, not "vitess"`)
 	})
 
 	t.Run("NewLocalClient rejects more than one mapping", func(t *testing.T) {
@@ -3863,6 +4642,16 @@ func TestLocalClient_PlanNamespaceUsesConfiguredDatabase(t *testing.T) {
 	assert.Equal(t, "analytics", client.planNamespace("analytics"))
 }
 
+func TestNewLocalClientTableOwnerValidation(t *testing.T) {
+	_, err := NewLocalClient(LocalConfig{Database: "bikeshare", Type: storage.DatabaseTypeMySQL, TableOwner: "app_owner"}, nil, slog.Default())
+	require.ErrorContains(t, err, `table_owner is only supported for postgres, not "mysql"`)
+
+	client, err := NewLocalClient(LocalConfig{Database: "bikeshare", Type: storage.DatabaseTypePostgres, TableOwner: "app_owner"}, nil, slog.Default())
+	require.NoError(t, err)
+	require.NotNil(t, client)
+	assert.Equal(t, "app_owner", client.config.TableOwner)
+}
+
 // A database type without a built-in engine is served by a registered factory,
 // so an embedding service can supply an engine this build does not include.
 func TestNewLocalClientUsesRegisteredEngine(t *testing.T) {
@@ -3911,6 +4700,21 @@ func TestNewLocalClientConfiguresPostgresTableSizeLimit(t *testing.T) {
 	eng, ok := c.getEngine().(*postgresengine.Engine)
 	require.True(t, ok)
 	assert.Equal(t, int64(4<<30), eng.TableSizeLimit())
+}
+
+// The configured concurrent index bound reaches the PostgreSQL engine the
+// local client builds, so a configured value governs every concurrent build
+// instead of silently reverting to the default.
+func TestNewLocalClientConfiguresPostgresConcurrentIndexMaxDuration(t *testing.T) {
+	c, err := NewLocalClient(LocalConfig{
+		Database:                           "orders",
+		Type:                               storage.DatabaseTypePostgres,
+		PostgresConcurrentIndexMaxDuration: 36 * time.Hour,
+	}, nil, slog.Default())
+	require.NoError(t, err)
+	eng, ok := c.getEngine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
 }
 
 // A type with no built-in engine and no registered factory fails closed.
@@ -4038,19 +4842,20 @@ func TestLocalClient_PullSchemaEngineWithoutCapabilityUnsupported(t *testing.T) 
 	assert.Contains(t, err.Error(), "engine does not support schema pull")
 }
 
-// The built-in PostgreSQL engine has no pull path, so a postgres client
-// reports pull as unsupported rather than attempting a MySQL-shaped pull.
-func TestLocalClient_PullSchemaPostgresUnsupported(t *testing.T) {
+// A PostgreSQL pull reaches the built-in engine rather than the MySQL-shaped
+// pull path or the unsupported-capability fallback.
+func TestLocalClient_PullSchemaPostgresReachesEngine(t *testing.T) {
 	client, err := NewLocalClient(LocalConfig{
-		Database:  "orders",
-		Type:      storage.DatabaseTypePostgres,
-		TargetDSN: "postgres://localhost:5432/orders",
+		Database: "orders",
+		Type:     storage.DatabaseTypePostgres,
 	}, nil, slog.Default())
 	require.NoError(t, err)
 
 	_, err = client.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Database: "orders"})
 
-	require.ErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrPullSchemaUnsupportedType)
+	assert.Contains(t, err.Error(), "DSN credentials are required")
 }
 
 // A request whose type disagrees with the client's configured type is a
@@ -4324,4 +5129,11 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
 	assert.Empty(t, byTable["payments"].ErrorMessage,
 		"a table cancelled because an earlier table's failure ended the apply has no error of its own, so the root-cause table stays identifiable")
+}
+
+// A database configured locally without an api_url and one resolved through
+// inventory without one both address the public PlanetScale API. The two
+// paths default in different packages, so the defaults are held equal here.
+func TestPlanetScaleDefaultAPIURLsAgree(t *testing.T) {
+	assert.Equal(t, inventory.DefaultPlanetScaleAPIURL, psclient.DefaultBaseURL)
 }

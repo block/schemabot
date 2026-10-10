@@ -9,28 +9,28 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
 func TestEnsureSchema(t *testing.T) {
-	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	defer func() { _ = container.Terminate(ctx) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
 
 	// First call should create all tables using Spirit
 	require.NoError(t, EnsureSchema(dsn, logger), "First EnsureSchema failed")
@@ -38,25 +38,76 @@ func TestEnsureSchema(t *testing.T) {
 	// Verify tables exist
 	tables := []string{"tasks", "plans", "locks", "checks", "settings", "apply_operations"}
 	for _, table := range tables {
-		assert.True(t, testutil.TableExists(t, db, "schemabot", table), "Table %s not found", table)
+		assert.True(t, testutil.TableExists(t, db, sdb.Name, table), "Table %s not found", table)
 	}
 
 	// tasks gains a nullable apply_operation_id column that is not
 	// written by any caller yet. Verify the column landed so future PRs can
 	// rely on it.
-	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", "apply_operation_id"),
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", "apply_operation_id"),
 		"tasks.apply_operation_id column not found")
 }
 
-func TestEnsureSchema_Idempotent(t *testing.T) {
+// A storage database converged by a binary that did not record lock acquirers
+// gains the nullable acquirer columns on the next startup, without disturbing
+// the locks already held: they read back with no acquirer recorded.
+func TestEnsureSchema_AddsLockAcquirerColumns(t *testing.T) {
 	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	defer func() { _ = container.Terminate(ctx) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+	_, err := db.ExecContext(ctx, "ALTER TABLE `locks` DROP COLUMN `acquired_by`, DROP COLUMN `acquired_by_operator_groups`")
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx, "INSERT INTO `locks` (`database_name`, `database_type`, `repository`, `pull_request`, `owner`) VALUES ('orders', 'mysql', 'org/repo', 7, 'org/repo#7')")
+	require.NoError(t, err)
 
-	// First call (tables may or may not exist from previous test)
+	require.NoError(t, EnsureSchema(sdb.DSN, logger))
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "locks", "acquired_by"))
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "locks", "acquired_by_operator_groups"))
+	var acquiredBy, acquiredByGroups sql.NullString
+	require.NoError(t, db.QueryRowContext(ctx,
+		"SELECT `acquired_by`, `acquired_by_operator_groups` FROM `locks` WHERE `database_name` = 'orders'").Scan(&acquiredBy, &acquiredByGroups))
+	assert.False(t, acquiredBy.Valid, "a lock held across the schema change records no acquirer")
+	assert.False(t, acquiredByGroups.Valid)
+}
+
+// A cold bootstrap must refuse nothing. The refusal gate reads the plan's
+// unsafe verdict, which the engine sets when any of its linters reports an
+// error against a statement — not only the removals this gate exists to stop.
+// So a new embedded schema file that trips any other error-level rule would be
+// refused rather than created, and because refusing is deliberately not a
+// startup failure, the table would simply never exist while every pod reported
+// a healthy boot. Walking the embedded schema rather than a hand-listed set of
+// tables is what makes that fail here, at the point the file is added.
+func TestEnsureSchema_ColdBootstrapCreatesEveryEmbeddedTable(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+
+	require.NoError(t, EnsureSchema(sdb.DSN, logger), "cold EnsureSchema failed")
+
+	entries, err := schema.MySQLFS.ReadDir("mysql")
+	require.NoError(t, err)
+	require.NotEmpty(t, entries, "the embedded MySQL schema must not be empty")
+	for _, entry := range entries {
+		table := strings.TrimSuffix(entry.Name(), ".sql")
+		assert.True(t, testutil.TableExists(t, db, sdb.Name, table),
+			"embedded schema declares %s, so a cold bootstrap must create it", table)
+	}
+
+	assert.NotContains(t, logBuf.String(), "refusing destructive storage-schema change",
+		"nothing in the embedded schema may be refused against an empty database")
+}
+
+func TestEnsureSchema_Idempotent(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	dsn := newStorageDatabase(t).DSN
+
+	// First call creates the tables.
 	require.NoError(t, EnsureSchema(dsn, logger), "First EnsureSchema failed")
 
 	// Second call should succeed without error (idempotent - no changes needed)
@@ -70,9 +121,8 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	defer func() { _ = container.Terminate(ctx) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
 
 	// Bootstrap the schema first so real tables exist.
 	require.NoError(t, EnsureSchema(dsn, logger))
@@ -95,21 +145,21 @@ func TestEnsureSchema_CleansStaleSpiritTables(t *testing.T) {
 
 	// Verify all stale tables were dropped.
 	for _, tbl := range staleTables {
-		assert.False(t, testutil.TableExists(t, db, "schemabot", tbl),
+		assert.False(t, testutil.TableExists(t, db, sdb.Name, tbl),
 			"stale Spirit table %s should have been dropped", tbl)
 	}
 
 	// Verify real tables still exist.
-	assert.True(t, testutil.TableExists(t, db, "schemabot", "tasks"),
+	assert.True(t, testutil.TableExists(t, db, sdb.Name, "tasks"),
 		"real tasks table should still exist")
 
-	assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(t, ctx, dsn, db, logger)
+	assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(t, ctx, sdb, db, logger)
 }
 
 func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
 	t *testing.T,
 	ctx context.Context,
-	dsn string,
+	sdb storageDatabase,
 	db *sql.DB,
 	logger *slog.Logger,
 ) {
@@ -117,7 +167,7 @@ func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
 	// Simulate pod A actively running EnsureSchema. The lock is the production
 	// coordination mechanism, and the shadow table represents Spirit work that
 	// must not be cleaned up by a second pod before it acquires the lock.
-	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, dsn, logger, namedlock.MySQL{})
+	lockConn, err := acquireMySQLEnsureSchemaLock(ctx, sdb.DSN, logger, namedlock.MySQL{}, EnsureSchemaTimeout)
 	require.NoError(t, err)
 	lockReleased := false
 	defer func() {
@@ -130,13 +180,10 @@ func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
 	_, err = db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE `%s` (id INT PRIMARY KEY)", shadowTable))
 	require.NoError(t, err)
 
-	errs := make(chan error, 1)
-	go func() {
-		errs <- EnsureSchema(dsn, logger)
-	}()
+	errs := startEnsureSchema(t, sdb.DSN, logger)
 
-	waitForEnsureSchemaLockWaiter(t, db)
-	assert.True(t, testutil.TableExists(t, db, "schemabot", shadowTable),
+	waitForEnsureSchemaLockWaiter(t, db, sdb.Name)
+	assert.True(t, testutil.TableExists(t, db, sdb.Name, shadowTable),
 		"Spirit shadow table should not be cleaned while another pod holds the EnsureSchema lock")
 
 	utils.CloseAndLog(lockConn)
@@ -145,94 +192,91 @@ func assertEnsureSchemaDoesNotCleanSpiritTablesWhileWaitingForLock(
 	select {
 	case err := <-errs:
 		require.NoError(t, err)
-	case <-time.After(30 * time.Second):
+	case <-time.After(ensureSchemaFinishDeadline):
 		t.Fatal("timed out waiting for EnsureSchema to finish after releasing lock")
 	}
 
-	assert.False(t, testutil.TableExists(t, db, "schemabot", shadowTable),
+	assert.False(t, testutil.TableExists(t, db, sdb.Name, shadowTable),
 		"stale Spirit shadow table should be cleaned after EnsureSchema acquires the lock")
 }
 
 func TestEnsureSchema_ConcurrentPods(t *testing.T) {
-	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	defer func() { _ = container.Terminate(ctx) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
 
 	// Simulate two pods starting simultaneously, both calling EnsureSchema.
 	// The advisory lock should serialize them — both should succeed without
 	// colliding on Spirit's shadow tables.
-	errs := make(chan error, 2)
-	for range 2 {
-		go func() {
-			errs <- EnsureSchema(dsn, logger)
-		}()
-	}
+	podA := startEnsureSchema(t, dsn, logger)
+	podB := startEnsureSchema(t, dsn, logger)
 
-	for range 2 {
-		require.NoError(t, <-errs, "concurrent EnsureSchema failed")
-	}
+	// Collect both outcomes before asserting so a failure in one pod never
+	// leaves the other running past the end of the test.
+	errA, errB := <-podA, <-podB
+	require.NoError(t, errA, "concurrent EnsureSchema failed")
+	require.NoError(t, errB, "concurrent EnsureSchema failed")
 
 	// Verify tables exist after concurrent execution.
-	assert.True(t, testutil.TableExists(t, db, "schemabot", "tasks"),
+	assert.True(t, testutil.TableExists(t, db, sdb.Name, "tasks"),
 		"tasks table should exist after concurrent EnsureSchema")
 }
 
-func waitForEnsureSchemaLockWaiter(t *testing.T, db *sql.DB) {
+// ensureSchemaFinishDeadline bounds how long a test waits for a background
+// EnsureSchema to return once nothing is holding it back.
+const ensureSchemaFinishDeadline = 30 * time.Second
+
+// startEnsureSchema runs EnsureSchema in the background and returns the channel
+// its result arrives on. The advisory lock EnsureSchema takes is server-wide,
+// so the test always waits for the goroutine to finish before it ends: a
+// straggler left running after a failed assertion would hold the lock against
+// every later test in the package and stall them until it completed.
+func startEnsureSchema(t *testing.T, dsn string, logger *slog.Logger) <-chan error {
+	t.Helper()
+	errs := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		errs <- EnsureSchema(dsn, logger)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		case <-time.After(ensureSchemaFinishDeadline):
+			t.Error("background EnsureSchema still running at test end; it holds the ensure-schema lock against later tests")
+		}
+	})
+	return errs
+}
+
+// waitForEnsureSchemaLockWaiter blocks until a session connected to database
+// is waiting on an advisory lock. The database predicate matters: PROCESSLIST
+// is server-wide, so without it a waiter from any other test on the shared
+// server would satisfy the check.
+func waitForEnsureSchemaLockWaiter(t *testing.T, db *sql.DB, database string) {
 	t.Helper()
 	var count int
 	require.Eventually(t, func() bool {
 		err := db.QueryRowContext(t.Context(),
 			`SELECT COUNT(*) FROM information_schema.PROCESSLIST
 			 WHERE ID <> CONNECTION_ID()
+			   AND DB = ?
 			   AND INFO LIKE '%GET_LOCK%'`,
+			database,
 		).Scan(&count)
 		require.NoError(t, err)
 		return count > 0
 	}, 10*time.Second, 100*time.Millisecond,
-		"expected EnsureSchema to wait for the advisory lock, waiter count: %d", count)
+		"expected EnsureSchema to wait for the advisory lock in %s, waiter count: %d", database, count)
 }
 
-// startEnsureSchemaContainer starts a MySQL container and returns the container, DSN, and DB.
-func startEnsureSchemaContainer(t *testing.T, ctx context.Context) (testcontainers.Container, string, *sql.DB) {
+// openEnsureSchemaDatabase gives the test an empty database on the shared
+// MySQL server with an open handle; running EnsureSchema is left to the test.
+func openEnsureSchemaDatabase(t *testing.T) (storageDatabase, *sql.DB) {
 	t.Helper()
-
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "mysql:8.0",
-			ExposedPorts: []string{"3306/tcp"},
-			Env: map[string]string{
-				"MYSQL_ROOT_PASSWORD": "testpassword",
-				"MYSQL_DATABASE":      "schemabot",
-			},
-			WaitingFor: wait.ForAll(
-				wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(120*time.Second),
-				wait.ForListeningPort("3306/tcp"),
-			),
-		},
-		Started: true,
-	})
-	require.NoError(t, err, "Failed to start MySQL container")
-
-	host, err := testutil.ContainerHost(ctx, container)
-	require.NoError(t, err, "Failed to get container host")
-
-	port, err := testutil.ContainerPort(ctx, container, "3306")
-	require.NoError(t, err, "Failed to get container port")
-
-	dsn := fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot?parseTime=true", host, port)
-
-	db, err := sql.Open("mysql", dsn)
-	require.NoError(t, err, "Failed to connect to MySQL")
-
-	// Wait for MySQL to be ready
-	require.Eventually(t, func() bool {
-		return db.PingContext(ctx) == nil
-	}, 30*time.Second, time.Second, "MySQL did not become ready")
-
-	return container, dsn, db
+	sdb := newStorageDatabase(t)
+	return sdb, openStorageDB(t, sdb.DSN)
 }
 
 // A deployment that predates this change still has a live vitess_tasks table.
@@ -244,10 +288,8 @@ func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
 	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	// Cleanup runs after the test, when t.Context() is already cancelled.
-	defer func() { _ = container.Terminate(t.Context()) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
 
 	// Bring the schema up to date, then simulate a pre-existing deployment by
 	// recreating the obsolete table the embedded schema no longer declares.
@@ -255,15 +297,15 @@ func TestEnsureSchema_RemovesObsoleteVitessTasks(t *testing.T) {
 	_, err := db.ExecContext(ctx,
 		"CREATE TABLE `vitess_tasks` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
-	require.True(t, testutil.TableExists(t, db, "schemabot", "vitess_tasks"))
+	require.True(t, testutil.TableExists(t, db, sdb.Name, "vitess_tasks"))
 
 	// EnsureSchema reconciles the obsolete table away without error...
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"EnsureSchema with an obsolete vitess_tasks table failed")
-	assert.False(t, testutil.TableExists(t, db, "schemabot", "vitess_tasks"), "obsolete vitess_tasks should be removed")
+	assert.False(t, testutil.TableExists(t, db, sdb.Name, "vitess_tasks"), "obsolete vitess_tasks should be removed")
 
 	// ...and the next run is a clean no-op.
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"second EnsureSchema not idempotent")
 }
 
@@ -297,9 +339,8 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 	var logBuf syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	defer func() { _ = container.Terminate(t.Context()) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
 
 	require.NoError(t, EnsureSchema(dsn, logger))
 	surplusColumn, surplusTable := seedSurplusStorageState(t, db)
@@ -313,11 +354,11 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 		"EnsureSchema with a destructive diff must not fail startup")
 
 	// The additive change applied; the surplus state survived.
-	assert.True(t, testutil.TableExists(t, db, "schemabot", "locks"),
+	assert.True(t, testutil.TableExists(t, db, sdb.Name, "locks"),
 		"additive CREATE TABLE should still be applied when destructive changes are refused")
-	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn),
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn),
 		"surplus column from the newer schema must not be dropped by default")
-	assert.True(t, testutil.TableExists(t, db, "schemabot", surplusTable),
+	assert.True(t, testutil.TableExists(t, db, sdb.Name, surplusTable),
 		"surplus table from the newer schema must not be dropped by default")
 
 	// Each refusal is logged with the exact DDL so an operator can see what was
@@ -332,24 +373,23 @@ func TestEnsureSchema_RefusesDestructiveChangesByDefault(t *testing.T) {
 
 	// A repeat run keeps refusing without error or changes.
 	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with refused changes failed")
-	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn))
-	assert.True(t, testutil.TableExists(t, db, "schemabot", surplusTable))
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn))
+	assert.True(t, testutil.TableExists(t, db, sdb.Name, surplusTable))
 }
 
 // When the live storage database drifts from the embedded schema on the same
 // table in both directions — it misses a column the starting binary requires
 // and holds a surplus column a newer binary wrote — Spirit's diff emits one
-// combined ALTER mixing an ADD COLUMN with a DROP COLUMN. EnsureSchema must
-// split that statement: the required column is added so the binary can run,
-// while the destructive clause is refused and the surplus column survives.
-func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
+// combined ALTER mixing an ADD COLUMN with a DROP COLUMN. The ADD executes and
+// the DROP does not: the starting binary gets the column its own queries name,
+// the surplus column survives for the newer binary, and startup continues.
+func TestEnsureSchema_RunsTheAdditiveClausesOfAMixedAlter(t *testing.T) {
 	ctx := t.Context()
 	var logBuf syncBuffer
 	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	defer func() { _ = container.Terminate(t.Context()) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
 
 	require.NoError(t, EnsureSchema(dsn, logger))
 
@@ -359,29 +399,30 @@ func TestEnsureSchema_MixedAlterAppliesSafeClauses(t *testing.T) {
 	surplusColumn, _ := seedSurplusStorageState(t, db)
 	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
 	require.NoError(t, err)
-	require.False(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn))
+	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
 
 	require.NoError(t, EnsureSchema(dsn, logger),
-		"EnsureSchema with a mixed additive/destructive ALTER must not fail startup")
+		"a mixed ALTER with withheld clauses must not fail startup")
 
-	// The required column was added; the surplus column survived.
-	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn),
-		"missing embedded column must be added even when the same ALTER carries destructive clauses")
-	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn),
+	// The addition ran and the removal did not.
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column the starting binary requires must be added, not withheld because a drop rode along with it")
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn),
 		"surplus column from the newer schema must not be dropped by default")
 
-	// The refusal names only the destructive clauses, not the additive ones,
-	// and carries the combined ALTER it was split from.
+	// The warning names the clauses that did not run and the opt-in that would
+	// run them, and says the additions did run so an operator is not left
+	// looking for a column that is already there.
 	logs := logBuf.String()
-	assert.Contains(t, logs, "refusing destructive clauses of a mixed storage-schema ALTER")
-	assert.Contains(t, logs, "split_from_ddl")
+	assert.Contains(t, logs, "withholding the destructive clauses of a storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
 	assert.Contains(t, logs, surplusColumn)
 
-	// A repeat run converges: the additive work is done, the destructive
-	// remainder keeps being refused without error.
-	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema after mixed split failed")
-	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", missingColumn))
-	assert.True(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn))
+	// A repeat run withholds the same clause without error or changes, and the
+	// converged column stays converged.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with a withheld clause failed")
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn))
 }
 
 // A live storage table whose primary key is wider than the embedded schema's
@@ -392,9 +433,8 @@ func TestEnsureSchema_RefusesPrimaryKeyChangeWhole(t *testing.T) {
 	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	defer func() { _ = container.Terminate(t.Context()) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
 
 	require.NoError(t, EnsureSchema(dsn, logger))
 
@@ -406,7 +446,7 @@ func TestEnsureSchema_RefusesPrimaryKeyChangeWhole(t *testing.T) {
 	primaryKeyColumns := func() int {
 		var n int
 		require.NoError(t, db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'schemabot' AND TABLE_NAME = 'tasks' AND INDEX_NAME = 'PRIMARY'").Scan(&n))
+			"SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'tasks' AND INDEX_NAME = 'PRIMARY'", sdb.Name).Scan(&n))
 		return n
 	}
 	require.Equal(t, 2, primaryKeyColumns())
@@ -417,30 +457,522 @@ func TestEnsureSchema_RefusesPrimaryKeyChangeWhole(t *testing.T) {
 		"the wider live primary key must survive: an ADD PRIMARY KEY cannot execute without the refused DROP PRIMARY KEY")
 }
 
+// surplusIndexName and surplusIndexColumns describe an index that exists in
+// the live storage database but that the starting binary's embedded schema does
+// not declare — the shape a newer binary's index takes to an older one during a
+// rolling deploy or rollback.
+const surplusIndexName = "idx_newer_binary"
+
+var surplusIndexColumns = []string{"environment", "created_at"}
+
+// seedSurplusIndex adds the surplus index to the live `tasks` table. The Spirit
+// diff turns it into an ALTER ... DROP INDEX, which loses no data and so is
+// invisible to Spirit's unsafe vocabulary.
+func seedSurplusIndex(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(),
+		fmt.Sprintf("ALTER TABLE `tasks` ADD INDEX `%s` (`%s`)", surplusIndexName, strings.Join(surplusIndexColumns, "`,`")))
+	require.NoError(t, err)
+}
+
+// During a rolling deploy or rollback, an older binary's pod starts against a
+// storage database holding an index its embedded schema does not declare. The
+// drop the diff emits loses no data, completes in milliseconds because it is
+// metadata-only, and can still take the database down by regressing the plan of
+// a query the rest of the fleet is running. EnsureSchema must refuse it by
+// default, leave the index intact, and let startup proceed.
+func TestEnsureSchema_RefusesIndexDropByDefault(t *testing.T) {
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+	seedSurplusIndex(t, db)
+	require.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"EnsureSchema with an index drop in the diff must not fail startup")
+
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"a surplus index from the newer schema must survive intact: dropping it loses no data but can regress the fleet's query plans")
+
+	// The refusal names the index and the opt-in, so an operator who removed it
+	// on purpose can see how to proceed.
+	logs := logBuf.String()
+	assert.Contains(t, logs, "refusing destructive storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
+	assert.Contains(t, logs, "DROP INDEX")
+	assert.Contains(t, logs, surplusIndexName)
+
+	// A repeat run keeps refusing without error or changes.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with a refused index drop failed")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+}
+
+// insertTask writes the smallest `tasks` row MySQL accepts, with the two
+// columns the unique-index tests collide on set explicitly. Everything else
+// takes a placeholder or the column default.
+func insertTask(ctx context.Context, db *sql.DB, taskIdentifier string, planID int64, databaseName string) error {
+	_, err := db.ExecContext(ctx,
+		"INSERT INTO `tasks` (`task_identifier`, `apply_id`, `plan_id`, `database_name`, `database_type`, `engine`, `repository`, `pull_request`, `environment`, `state`)"+
+			" VALUES (?, 1, ?, ?, 'mysql', 'spirit', 'example/repo', 1, 'production', 'pending')",
+		taskIdentifier, planID, databaseName)
+	return err
+}
+
+// requireDuplicateEntry asserts MySQL rejected a write for colliding with a
+// unique index (error 1062), rather than for any other reason.
+func requireDuplicateEntry(t *testing.T, err error, msgAndArgs ...any) {
+	t.Helper()
+	require.Error(t, err, msgAndArgs...)
+	var mysqlErr *mysql.MySQLError
+	require.ErrorAs(t, err, &mysqlErr, msgAndArgs...)
+	require.EqualValues(t, 1062, mysqlErr.Number, msgAndArgs...)
+}
+
+// The refusal protects a visible index because the fleet's queries may plan
+// around it. An operator who has already made a surplus index invisible has
+// taken it out of planning, so its drop regresses nothing and is not
+// destructive: the next boot removes it under the default policy, with no
+// opt-in. This is the second half of the two-step removal the refusal's own
+// reason describes.
+//
+// For a unique index the two halves differ in what they guarantee. Refused or
+// hidden, the index still rejects a colliding row; MySQL enforces an invisible
+// unique index as strictly as a visible one. Dropped, it enforces nothing, and
+// the collision it would have rejected is written. That is the check the docs
+// tell operators to make before hiding one, so the test pins both sides of the
+// drop with a real collision on columns no other key covers.
+func TestEnsureSchema_DropsAnInvisibleSurplusIndexByDefault(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// (plan_id, database_name) is covered by no key the embedded schema
+	// declares, so only the surplus index can make the pair unique.
+	const surplusUniqueIndex = "uq_newer_binary"
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ADD UNIQUE INDEX `%s` (`plan_id`, `database_name`)", surplusUniqueIndex))
+	require.NoError(t, err)
+
+	require.NoError(t, insertTask(ctx, db, "task-1", 7, "shard_a"))
+	requireDuplicateEntry(t, insertTask(ctx, db, "task-2", 7, "shard_a"),
+		"the visible surplus unique index must reject a colliding row")
+
+	// Visible, the unique surplus is refused like any other index, and keeps
+	// enforcing while it stands refused.
+	require.NoError(t, EnsureSchema(dsn, logger))
+	require.True(t, testutil.IndexExists(t, db, sdb.Name, "tasks", surplusUniqueIndex),
+		"a visible surplus unique index must be refused, not dropped")
+	assert.Contains(t, logBuf.String(), "refusing destructive storage-schema change")
+	assert.Contains(t, logBuf.String(), surplusUniqueIndex)
+	requireDuplicateEntry(t, insertTask(ctx, db, "task-2", 7, "shard_a"),
+		"a refused unique index must still reject a colliding row")
+
+	// Hidden, it is no longer a plan the fleet depends on, but it is still a
+	// constraint: MySQL enforces an invisible unique index.
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ALTER INDEX `%s` INVISIBLE", surplusUniqueIndex))
+	require.NoError(t, err)
+	requireDuplicateEntry(t, insertTask(ctx, db, "task-2", 7, "shard_a"),
+		"an invisible unique index must still reject a colliding row")
+
+	// The next default-policy boot drops it.
+	var dropBuf syncBuffer
+	dropLogger := slog.New(slog.NewTextHandler(&dropBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, dropLogger))
+
+	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "tasks", surplusUniqueIndex),
+		"an invisible surplus index must be dropped by the default policy: hidden, it regresses no query plan")
+	logs := dropBuf.String()
+	assert.NotContains(t, logs, "refusing destructive storage-schema change",
+		"dropping an invisible index is not a destructive refusal")
+	assert.Contains(t, logs, "DROP INDEX")
+	assert.Contains(t, logs, surplusUniqueIndex)
+
+	// Gone, the index guarantees nothing: the row it rejected three times is
+	// now written. This is the state a rollback to a binary declaring the index
+	// would meet, and TestEnsureSchema_RollbackFailsWhenADroppedUniqueIndexHasDuplicates
+	// shows what that rollback does with it.
+	require.NoError(t, insertTask(ctx, db, "task-2", 7, "shard_a"),
+		"once the unique index is dropped, the colliding row must be accepted")
+}
+
+// Hiding an index is only the first half of removing it while every running
+// pod is on a binary that no longer declares it. A binary that still declares
+// the index declares it visible, and its differ treats the visibility as part
+// of the definition: its next boot makes the index visible again. That is a
+// metadata change that loses nothing and removes nothing, so it runs under the
+// default policy with no refusal and no warning, and the operator's first half
+// is undone before any pod reaches the second.
+func TestEnsureSchema_MakesAHiddenDeclaredIndexVisibleAgain(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// The embedded schema declares this index, so hiding it stands in for an
+	// operator starting a removal while a declaring binary is still running.
+	const declaredIndex = "idx_task_identifier"
+	_, err := db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ALTER INDEX `%s` INVISIBLE", declaredIndex))
+	require.NoError(t, err)
+	require.Equal(t, "NO", indexVisibility(t, db, sdb.Name, "tasks", declaredIndex))
+
+	require.NoError(t, EnsureSchema(dsn, logger), "restoring an index's visibility must not fail startup")
+
+	assert.Equal(t, "YES", indexVisibility(t, db, sdb.Name, "tasks", declaredIndex),
+		"a declaring binary must make its hidden index visible again")
+	logs := logBuf.String()
+	assert.Contains(t, logs, "ALTER INDEX `"+declaredIndex+"` VISIBLE")
+	assert.NotContains(t, logs, "refusing destructive storage-schema change",
+		"a visibility change removes nothing and is not a destructive refusal")
+}
+
+// indexVisibility reports MySQL's IS_VISIBLE flag ("YES" or "NO") for one index.
+func indexVisibility(t *testing.T, db *sql.DB, schemaName, tableName, indexName string) string {
+	t.Helper()
+	var visible string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		"SELECT IS_VISIBLE FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1",
+		schemaName, tableName, indexName).Scan(&visible))
+	return visible
+}
+
+// Once a unique index is gone and a collision has been written, rolling back
+// to a binary whose embedded schema declares the index cannot succeed: its
+// diff re-adds the index as ADD UNIQUE INDEX, the duplicate rows cannot both
+// satisfy it, and EnsureSchema fails the boot with the index still missing.
+// The embedded schema declares `idx_task_identifier` UNIQUE on `tasks`, so a
+// live table missing it stands in for the deployment that removed a unique
+// index, and the booting binary stands in for the release being rolled back
+// to.
+func TestEnsureSchema_RollbackFailsWhenADroppedUniqueIndexHasDuplicates(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// The deployment removed the unique index, then wrote rows that collide
+	// on it. Nothing stops the second write once the index is gone.
+	const droppedUniqueIndex = "idx_task_identifier"
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP INDEX `%s`", droppedUniqueIndex))
+	require.NoError(t, err)
+	require.NoError(t, insertTask(ctx, db, "same-identifier", 1, "shard_a"))
+	require.NoError(t, insertTask(ctx, db, "same-identifier", 2, "shard_b"),
+		"with the unique index gone, the colliding row must be accepted")
+
+	// The rolled-back binary declares the index, so its boot tries to re-add it
+	// and cannot: the duplicate it would have prevented is already there.
+	err = EnsureSchema(dsn, logger)
+	require.ErrorContains(t, err, `storage schema change to table "tasks" failed`,
+		"re-adding a unique index over duplicate rows must fail the boot, not be skipped")
+	assert.False(t, testutil.IndexExists(t, db, sdb.Name, "tasks", droppedUniqueIndex),
+		"the unique index cannot be re-added while the duplicate rows remain")
+	logs := logBuf.String()
+	assert.Contains(t, logs, "ADD UNIQUE INDEX `"+droppedUniqueIndex+"`",
+		"the boot must have attempted the re-add the rolled-back schema declares")
+	assert.Contains(t, logs, "storage schema change failed; SchemaBot storage will not initialize")
+	assert.NotContains(t, logs, "refusing destructive storage-schema change",
+		"an ADD UNIQUE INDEX is additive: it is attempted, not refused")
+}
+
+// Spirit's diff emits one combined ALTER per table, so an index drop reaches
+// the bootstrap bundled with whatever else that table drifted by — here a
+// column the starting binary requires. The index drop is withheld and the
+// column is added: the index survives intact, which is the refusal's whole
+// purpose, and the binary still gets the column it needs to serve.
+func TestEnsureSchema_RunsTheAdditiveClausesBesideAnIndexDrop(t *testing.T) {
+	ctx := t.Context()
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// Same-table drift in both directions: `tasks` misses an embedded column
+	// the binary requires and holds a surplus index it does not declare.
+	const missingColumn = "throttle_reason"
+	seedSurplusIndex(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"a mixed ALTER with withheld clauses must not fail startup")
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column the starting binary requires must be added, not withheld because an index drop rode along with it")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"a surplus index must survive intact: dropping it loses no data but can regress the fleet's query plans")
+
+	// The warning names the index that was protected, so an operator who
+	// removed it on purpose can see how to proceed.
+	logs := logBuf.String()
+	assert.Contains(t, logs, "withholding the destructive clauses of a storage-schema change")
+	assert.Contains(t, logs, "allow_destructive_schema_changes")
+	assert.Contains(t, logs, surplusIndexName)
+
+	// A repeat run withholds the same clause without error or changes.
+	require.NoError(t, EnsureSchema(dsn, logger), "repeat EnsureSchema with a withheld clause failed")
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+}
+
+// MySQL keeps column names and index names in separate namespaces, so a table
+// can carry an index named the same as one of its columns. When the surplus
+// index a newer binary left behind shares its name with a column the starting
+// binary requires, nothing collides: the column is added while the index drop
+// is withheld. Reading the two names as one namespace would withhold the
+// addition too, and the pod would report a healthy boot and then serve against
+// storage missing a column its own queries name.
+func TestEnsureSchema_AddsAColumnNamedLikeAWithheldIndex(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	// The column the starting binary requires is missing, and a surplus index
+	// stands under that same name.
+	const missingColumn = "throttle_reason"
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf("ALTER TABLE `tasks` ADD INDEX `%s` (`%s`)", missingColumn, strings.Join(surplusIndexColumns, "`,`")))
+	require.NoError(t, err)
+	require.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+
+	require.NoError(t, EnsureSchema(dsn, logger),
+		"a withheld index drop sharing a name with a required column must not fail startup")
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column the starting binary requires must be added: an index of the same name occupies a different namespace and collides with nothing")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", missingColumn),
+		"the surplus index must survive intact, whatever it shares its name with")
+}
+
+// A withheld clause stays in the diff for as long as the drift stands, and pods
+// restart for reasons that have nothing to do with a deploy: a node drain, an
+// OOM kill, a scale-up. So the boot after a split must recognize that the
+// additions already landed and reach Spirit with nothing at all. Re-running the
+// additions would put SchemaBot's own tables through a copy on every pod start,
+// against the database the whole fleet reads, which is a worse outage than the
+// drop being refused.
+func TestEnsureSchema_WithheldClauseConvergesWithoutFurtherDDL(t *testing.T) {
+	ctx := t.Context()
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	var boot syncBuffer
+	bootLogger := slog.New(slog.NewTextHandler(&boot, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, bootLogger))
+
+	const missingColumn = "throttle_reason"
+	seedSurplusIndex(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+
+	var first syncBuffer
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.NewTextHandler(&first, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	require.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn))
+	require.Contains(t, first.String(), "applying storage schema changes",
+		"the first boot after the drift must apply the additions it partitioned out")
+
+	var second syncBuffer
+	require.NoError(t, EnsureSchema(dsn, slog.New(slog.NewTextHandler(&second, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+
+	logs := second.String()
+	assert.Contains(t, logs, "all planned storage schema changes are destructive and refused",
+		"the withheld drop is still outstanding, so every later boot must still refuse it")
+	assert.NotContains(t, logs, "applying storage schema changes",
+		"a converged split must reach Spirit with no DDL on later boots, or every pod restart copies SchemaBot's own tables")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+}
+
+// A rollback starts many pods at once, each running the bootstrap against the
+// same storage database. With a mixed statement in the diff, whichever pod wins
+// the advisory lock partitions it and applies the additions; the others re-plan
+// once the lock frees and find only the refusal left. Every pod must start, the
+// column they all need must exist, and none of them may take the surplus index
+// the rest of the fleet plans around.
+func TestEnsureSchema_ConcurrentPodsDuringRollbackWithholdTheSameDrop(t *testing.T) {
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+	require.NoError(t, EnsureSchema(dsn, logger))
+
+	const missingColumn = "throttle_reason"
+	seedSurplusIndex(t, db)
+	_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `tasks` DROP COLUMN `%s`", missingColumn))
+	require.NoError(t, err)
+
+	podA := startEnsureSchema(t, dsn, logger)
+	podB := startEnsureSchema(t, dsn, logger)
+	podC := startEnsureSchema(t, dsn, logger)
+
+	// Collect every outcome before asserting so a failure in one pod never
+	// leaves another holding the server-wide advisory lock past the test.
+	errA, errB, errC := <-podA, <-podB, <-podC
+	require.NoError(t, errA, "a pod must start while a mixed statement is being partitioned")
+	require.NoError(t, errB, "a pod must start while a mixed statement is being partitioned")
+	require.NoError(t, errC, "a pod must start while a mixed statement is being partitioned")
+
+	assert.True(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", missingColumn),
+		"the column every one of these binaries requires must exist once they have all started")
+	assert.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"no pod may drop the surplus index, however many of them raced to converge")
+}
+
+// An operator who intentionally removed an index from the embedded schema opts
+// in to destructive storage-schema changes; EnsureSchema then executes the drop
+// and converges the database to the embedded schema. Without this the flag
+// would be unreachable for indexes and a deliberate removal would have no
+// supported path.
+func TestEnsureSchema_AllowDestructiveExecutesIndexDrop(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	require.NoError(t, EnsureSchema(dsn, logger))
+	seedSurplusIndex(t, db)
+	require.Equal(t, surplusIndexColumns, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName))
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
+		"EnsureSchema with destructive changes allowed failed")
+
+	assert.Empty(t, testutil.IndexColumns(t, db, sdb.Name, "tasks", surplusIndexName),
+		"surplus index should be dropped when destructive changes are allowed")
+
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
+		"second EnsureSchema not idempotent")
+}
+
 // An operator who intentionally removed a storage table and column opts in to
 // destructive storage-schema changes; EnsureSchema then executes the DROP
 // statements and converges the database to the embedded schema.
 func TestEnsureSchema_AllowDestructiveExecutesDrops(t *testing.T) {
-	ctx := t.Context()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	container, dsn, db := startEnsureSchemaContainer(t, ctx)
-	defer func() { _ = container.Terminate(t.Context()) }()
-	defer utils.CloseAndLog(db)
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
 
 	require.NoError(t, EnsureSchema(dsn, logger))
 	surplusColumn, surplusTable := seedSurplusStorageState(t, db)
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"EnsureSchema with destructive changes allowed failed")
 
-	assert.False(t, testutil.ColumnExists(t, db, "schemabot", "tasks", surplusColumn),
+	assert.False(t, testutil.ColumnExists(t, db, sdb.Name, "tasks", surplusColumn),
 		"surplus column should be dropped when destructive changes are allowed")
-	assert.False(t, testutil.TableExists(t, db, "schemabot", surplusTable),
+	assert.False(t, testutil.TableExists(t, db, sdb.Name, surplusTable),
 		"surplus table should be dropped when destructive changes are allowed")
 
-	require.NoError(t, EnsureSchema(dsn, logger, WithAllowDestructiveSchemaChanges(true)),
+	require.NoError(t, EnsureSchema(dsn, logger, WithDestructiveSchemaChangePolicy(DestructivePolicyPermits, false)),
 		"second EnsureSchema not idempotent")
+}
+
+// A convergence changes the shape of SchemaBot's storage and nothing else in
+// it: it records no row about itself in the database it is converging. That is
+// what lets one implementation serve both a boot against a database with no
+// schema at all — where a table to record into does not exist yet — and a
+// deliberate convergence against tables Spirit is copying under live traffic,
+// where a write about the convergence would land in a table mid-copy.
+//
+// The census reads the live catalog rather than a list of tables, so a table
+// added to the embedded schema is covered the day it lands rather than when
+// someone remembers this test.
+func TestEnsureSchema_RecordsNothingInTheStorageItConverges(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	sdb, db := openEnsureSchemaDatabase(t)
+	require.NoError(t, EnsureSchema(sdb.DSN, logger), "first EnsureSchema")
+
+	// Rows for a spurious write to be visible against, on the table the
+	// convergence below copies — so the census also proves the copy carried
+	// them across rather than merely that nothing new appeared.
+	seedStorageSettings(t, db, 3)
+	before := storageRowCensus(t, db, sdb.Name)
+
+	// Drift that makes the convergence do real DDL. Re-adding the column is a
+	// Spirit table copy of a seeded table, which is the case that would show a
+	// row gained or lost.
+	_, err := db.ExecContext(t.Context(), "ALTER TABLE `settings` DROP COLUMN `updated_at`")
+	require.NoError(t, err, "introduce drift on settings")
+
+	require.NoError(t, EnsureSchema(sdb.DSN, logger), "second EnsureSchema")
+	require.True(t, testutil.ColumnExists(t, db, sdb.Name, "settings", "updated_at"),
+		"the convergence must have run the DDL whose side effects this test measures")
+
+	assert.Equal(t, before, storageRowCensus(t, db, sdb.Name),
+		"a convergence must not add, remove, or lose a row in the storage it converges")
+}
+
+// seedStorageSettings writes count rows a convergence has to carry across a
+// table copy untouched.
+func seedStorageSettings(t *testing.T, db *sql.DB, count int) {
+	t.Helper()
+	for i := range count {
+		_, err := db.ExecContext(t.Context(),
+			"INSERT INTO `settings` (`setting_key`, `setting_value`) VALUES (?, ?)",
+			fmt.Sprintf("census-key-%d", i), fmt.Sprintf("census-value-%d", i))
+		require.NoError(t, err, "seed settings row %d", i)
+	}
+}
+
+// storageRowCensus counts the rows in every table the storage database holds,
+// Spirit's own internal tables aside — those are the convergence's scaffolding
+// and come and go with it.
+func storageRowCensus(t *testing.T, db *sql.DB, database string) map[string]int64 {
+	t.Helper()
+
+	rows, err := db.QueryContext(t.Context(),
+		"SELECT table_name FROM information_schema.tables WHERE table_schema = ?", database)
+	require.NoError(t, err, "list tables in %s", database)
+	var tables []string
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name), "scan table name")
+		if ddl.IsSpiritInternalTable(name) {
+			continue
+		}
+		tables = append(tables, name)
+	}
+	require.NoError(t, rows.Err(), "iterate tables in %s", database)
+	require.NoError(t, rows.Close(), "close table listing")
+	require.NotEmpty(t, tables, "a converged storage database has tables to count")
+
+	census := make(map[string]int64, len(tables))
+	for _, table := range tables {
+		var count int64
+		require.NoError(t, db.QueryRowContext(t.Context(),
+			fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table)).Scan(&count),
+			"count rows in %s", table)
+		census[table] = count
+	}
+	return census
 }
 
 // syncBuffer is an io.Writer safe for concurrent log writes from EnsureSchema
@@ -460,4 +992,106 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// A convergence spanning several tables hands the engine one table at a time.
+// The engine attempts native DDL — the algorithm MySQL picks, metadata-only
+// where the clause shape and server version allow it — only for a change
+// confined to a single table; given several it declines the attempt and copies
+// every one of them. On the startup path that copy is synchronous, bounded by a
+// budget a boot cannot extend, and throttled by whatever the target is doing,
+// so a release adding a nullable column to three tables must not turn into
+// three full copies.
+//
+// What this pins is that each table is asked on its own, not that the server
+// answers yes: whether any given add is metadata-only is MySQL's decision, and
+// a copy is still what runs when it says no.
+func TestEnsureSchema_ConvergesOneTablePerEngineRun(t *testing.T) {
+	ctx := t.Context()
+	sdb, db := openEnsureSchemaDatabase(t)
+	dsn := sdb.DSN
+
+	bootstrapLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	require.NoError(t, EnsureSchema(dsn, bootstrapLogger))
+
+	// Drift three tables in the additive direction: each is missing one
+	// nullable column the embedded schema declares, and no index covers any of
+	// them, so the outstanding delta is exactly one ADD COLUMN per table.
+	drifted := map[string]string{
+		"applies": "revert_skipped_at",
+		"checks":  "change_summary",
+		"plans":   "direct_execution",
+	}
+	for table, column := range drifted {
+		_, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE `%s` DROP COLUMN `%s`", table, column))
+		require.NoError(t, err, "drop %s.%s", table, column)
+		require.False(t, testutil.ColumnExists(t, db, sdb.Name, table, column))
+	}
+
+	// The observer runs inline on the convergence's own goroutine, which here
+	// is this one, so the recorded observations need no synchronization.
+	var observations []StorageConvergenceProgress
+	var logBuf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, logger, WithConvergenceProgress(func(o StorageConvergenceProgress) {
+		observations = append(observations, o)
+	})))
+
+	for table, column := range drifted {
+		assert.True(t, testutil.ColumnExists(t, db, sdb.Name, table, column),
+			"%s.%s must converge", table, column)
+	}
+
+	// Every run reports its own table as it finishes, so each table has to
+	// appear — and no observation may ever carry two, which is exactly the
+	// condition under which the engine declines the native-DDL attempt.
+	observed := map[string]bool{}
+	for _, o := range observations {
+		assert.LessOrEqual(t, len(o.Tables), 1,
+			"an observation carrying several tables means the engine was handed several at once")
+		for _, tp := range o.Tables {
+			if tp.State == string(engine.StateCompleted) {
+				observed[tp.Table] = true
+			}
+		}
+	}
+	// Each table has to be reported finished. A statement taken natively
+	// copies nothing, so the engine never marks its table done on its own —
+	// an operator watching this pass would otherwise see three tables start
+	// and none of them finish.
+	for table := range drifted {
+		assert.True(t, observedTable(observed, table),
+			"%s must converge under a run of its own and be reported finished; observed %v", table, observed)
+	}
+
+	logs := logBuf.String()
+	assert.Equal(t, len(drifted), strings.Count(logs, `msg="converging storage table"`),
+		"a convergence of three tables is three engine runs")
+	assert.Contains(t, logs, fmt.Sprintf("run_count=%d", len(drifted)))
+
+	// The next boot finds nothing left to do, so the split converged the whole
+	// delta rather than a prefix of it. It logs to a buffer of its own: the
+	// converging boot's lines are already in logBuf, so reading that buffer
+	// would pass even if this boot had to finish what the last one left.
+	var nextBootBuf syncBuffer
+	nextBootLogger := slog.New(slog.NewTextHandler(&nextBootBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	require.NoError(t, EnsureSchema(dsn, nextBootLogger))
+	nextBoot := nextBootBuf.String()
+	assert.Contains(t, nextBoot, `msg="storage schema up-to-date"`)
+	assert.NotContains(t, nextBoot, "schema change detected",
+		"a boot after a complete convergence plans nothing")
+	assert.Zero(t, strings.Count(nextBoot, `msg="converging storage table"`),
+		"a boot after a complete convergence runs nothing")
+}
+
+// observedTable reports whether any observed subject is the named table. The
+// engine qualifies a table it reports on with the database it is in, so the
+// name an observation carries is not always the bare one the schema declares.
+func observedTable(observed map[string]bool, table string) bool {
+	for name := range observed {
+		if name == table || strings.HasSuffix(name, "."+table) {
+			return true
+		}
+	}
+	return false
 }

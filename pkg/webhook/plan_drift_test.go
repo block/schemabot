@@ -5,11 +5,15 @@ import (
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/tern"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // The drift summary names diverged deployments so the check's Change column
@@ -61,7 +65,7 @@ func TestSummarizeReviewDrift_BoundedAndSanitized(t *testing.T) {
 	assert.NotContains(t, summary, "|")
 }
 
-// Review-time drift fails the plan check closed even when the reviewed primary
+// Review-time drift fails the plan check closed even when the primary target
 // plan is a clean no-op, taking precedence over the plan's own outcome.
 func TestPlanCheckConclusion_DriftFailsClosed(t *testing.T) {
 	assert.Equal(t, checkConclusionFailure, planCheckConclusion(false, false, false, true),
@@ -133,7 +137,7 @@ func TestDeploymentDriftPreview_CleanMultiDeployment(t *testing.T) {
 	rollup := api.PlanRollup{
 		Entries: []api.DeploymentRollupEntry{
 			{Deployment: "eu", Class: api.DeploymentMatch},
-			{Deployment: "au", Class: api.DeploymentMatch},
+			{Deployment: "au", Class: api.DeploymentMatch, Blocked: 2},
 		},
 		Clean: true,
 	}
@@ -145,6 +149,8 @@ func TestDeploymentDriftPreview_CleanMultiDeployment(t *testing.T) {
 	assert.True(t, preview.Deployments[0].Primary)
 	assert.False(t, preview.Deployments[1].Primary)
 	assert.Equal(t, "match", preview.Deployments[1].Class)
+	assert.Equal(t, 0, preview.Deployments[0].Blocked)
+	assert.Equal(t, 2, preview.Deployments[1].Blocked)
 }
 
 // A diverged deployment carries a compact change-count detail; an errored
@@ -172,4 +178,683 @@ func TestDeploymentDriftPreview_DivergedAndErroredDetails(t *testing.T) {
 	// the sanitized detail, and the underlying error text is not leaked.
 	assert.Equal(t, erroredDriftDetail, preview.Deployments[2].Detail)
 	assert.NotContains(t, preview.Deployments[2].Detail, assert.AnError.Error())
+}
+
+// A rollup where one deployment addresses several targets names each failing
+// member by its routing pair, so the check's Change column identifies exactly
+// which member to reconcile rather than a deployment with two of them.
+func TestSummarizeReviewDrift_NamesMultiTargetMembers(t *testing.T) {
+	rollup := api.PlanRollup{
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			{Deployment: "primary", Target: "testapp-001", Class: api.DeploymentPlanned},
+			{Deployment: "primary", Target: "testapp-002", Class: api.DeploymentErrored},
+			{Deployment: "eu-west", Target: "orders-eu", Class: api.DeploymentErrored},
+		},
+	}
+	summary := summarizeReviewDrift(rollup)
+	// Independent targets are never expected to agree, so an unplannable one is
+	// not drift between them.
+	assert.Contains(t, summary, "could not plan: primary/testapp-002, eu-west")
+	assert.NotContains(t, summary, "drift blocks apply")
+}
+
+// plannedMember builds a clean, independently-planned rollup member running the
+// given DDL. A member with no DDL is already at the desired schema.
+func plannedMember(deployment, target string, ddl ...string) api.DeploymentRollupEntry {
+	cs := tern.ChangeSet{}
+	if len(ddl) > 0 {
+		change := &ternv1.SchemaChange{Namespace: "testapp"}
+		for _, stmt := range ddl {
+			change.TableChanges = append(change.TableChanges, &ternv1.TableChange{
+				TableName:  "users",
+				Ddl:        stmt,
+				ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER,
+				Namespace:  "testapp",
+			})
+		}
+		cs.Changes = []*ternv1.SchemaChange{change}
+	}
+	fp, err := tern.ChangeSetFingerprint(schema.DialectMySQL, cs)
+	if err != nil {
+		panic(err)
+	}
+	return api.DeploymentRollupEntry{
+		DatabaseType:    "vitess",
+		Deployment:      deployment,
+		Target:          target,
+		Class:           api.DeploymentPlanned,
+		ChangeSet:       cs,
+		PlanFingerprint: fp,
+	}
+}
+
+// groupMembers flattens the grouped members for assertions.
+func groupMembers(groups []templates.DeploymentPlanGroup) [][]string {
+	out := make([][]string, len(groups))
+	for i, g := range groups {
+		out[i] = g.Members
+	}
+	return out
+}
+
+// Targets running the same work are described once and attributed to all of
+// them, so a converged fleet does not repeat one plan per target.
+func TestDeploymentPlanGroups_SameWorkGroupsTogether(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("primary", "testapp_1", email),
+			plannedMember("primary", "testapp_2", email),
+			plannedMember("primary", "testapp_3", email),
+		},
+	}
+
+	groups := deploymentPlanGroups(rollup)
+	assert.Equal(t, [][]string{{"primary/testapp_1", "primary/testapp_2", "primary/testapp_3"}}, groupMembers(groups))
+	assert.True(t, groups[0].Primary)
+	assert.Equal(t, []string{email}, groups[0].Changes[0].Statements)
+	assert.False(t, groups[0].Empty())
+}
+
+// Targets that hold their own schemas can need different work. Each distinct
+// plan is its own group, so the comment describes every plan the apply would
+// run rather than the primary plan alone.
+func TestDeploymentPlanGroups_DifferentWorkSplits(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	phone := "ALTER TABLE users ADD COLUMN phone VARCHAR(32)"
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("primary", "testapp_1", email),
+			plannedMember("primary", "testapp_2", phone, email),
+			plannedMember("primary", "testapp_3", email),
+		},
+	}
+
+	groups := deploymentPlanGroups(rollup)
+	assert.Equal(t, [][]string{
+		{"primary/testapp_1", "primary/testapp_3"},
+		{"primary/testapp_2"},
+	}, groupMembers(groups))
+	assert.Equal(t, []string{email}, groups[0].Changes[0].Statements)
+	assert.Equal(t, []string{phone, email}, groups[1].Changes[0].Statements,
+		"a group carries the plan its own members would run, not the primary plan")
+}
+
+// Targets already at the desired schema form a group of their own, which the
+// comment can name. Folding them into the changing targets would tell an
+// operator the apply runs DDL on targets it will not touch.
+func TestDeploymentPlanGroups_ConvergedTargetsAreTheirOwnGroup(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("primary", "testapp_1", email),
+			plannedMember("primary", "testapp_2"),
+			plannedMember("primary", "testapp_3", email),
+			plannedMember("primary", "testapp_4"),
+		},
+	}
+
+	groups := deploymentPlanGroups(rollup)
+	assert.Equal(t, [][]string{
+		{"primary/testapp_1", "primary/testapp_3"},
+		{"primary/testapp_2", "primary/testapp_4"},
+	}, groupMembers(groups))
+	assert.False(t, groups[0].Empty())
+	assert.True(t, groups[1].Empty(), "targets with nothing to apply are named, not dropped")
+}
+
+// The primary's group comes first whatever the primary's own plan, because the
+// primary plan is the one the operator has already read.
+func TestDeploymentPlanGroups_PrimaryGroupComesFirst(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("primary", "testapp_1"),
+			plannedMember("primary", "testapp_2", email),
+			plannedMember("primary", "testapp_3", email),
+		},
+	}
+
+	groups := deploymentPlanGroups(rollup)
+	assert.True(t, groups[0].Primary)
+	assert.Equal(t, []string{"primary/testapp_1"}, groups[0].Members)
+	assert.True(t, groups[0].Empty(), "the primary having nothing to apply does not move its group")
+}
+
+// Grouping describes targets that were planned, so a rollup that blocked
+// carries none: the operator's next step is the target that could not be
+// planned, not the plans of an apply that cannot run.
+func TestDeploymentDriftPreview_BlockedRollupIsNotGrouped(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	blocked := plannedMember("primary", "testapp_2")
+	blocked.Class = api.DeploymentErrored
+	blocked.PlanFingerprint = ""
+	blocked.ChangeSet = tern.ChangeSet{}
+	rollup := api.PlanRollup{
+		Clean:    false,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("primary", "testapp_1", email),
+			blocked,
+		},
+	}
+
+	preview := deploymentDriftPreview(rollup)
+	assert.Empty(t, preview.Plans)
+	assert.Len(t, preview.Deployments, 2)
+}
+
+// Members required to match each other are not grouped: a clean mirrored rollup
+// has already proved they are one group, and re-reporting that in the vocabulary
+// of a fleet free to diverge would read as an outcome rather than the
+// requirement that let the check pass.
+func TestDeploymentDriftPreview_MirroredMembersAreNotGrouped(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	eu := plannedMember("eu", "eu", email)
+	eu.Class = api.DeploymentMatch
+	au := plannedMember("au", "au", email)
+	au.Class = api.DeploymentMatch
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanMirrored,
+		Entries:  []api.DeploymentRollupEntry{eu, au},
+	}
+
+	preview := deploymentDriftPreview(rollup)
+	assert.Empty(t, preview.Plans)
+}
+
+// A clean independent rollup reaches the comment already grouped, so the
+// rendering never has to fall back to describing the contract instead of this
+// round's plans.
+func TestDeploymentDriftPreview_CleanIndependentRollupCarriesGroups(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("primary", "testapp_1", email),
+			plannedMember("primary", "testapp_2"),
+		},
+	}
+
+	preview := deploymentDriftPreview(rollup)
+	assert.Len(t, preview.Plans, 2)
+}
+
+// A member's plan reaches the comment in the same shape the primary plan does,
+// so a group's changes render through the code that renders the plan a reviewer
+// has already read.
+func TestMemberPlanChanges_CarriesNamespaceStatements(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		TableChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE users ADD COLUMN email VARCHAR(255)"},
+			{TableName: "orders", Ddl: "ALTER TABLE orders ADD COLUMN total BIGINT"},
+		},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	assert.Equal(t, []templates.KeyspaceChangeData{{
+		Keyspace: "testapp",
+		Statements: []string{
+			"ALTER TABLE users ADD COLUMN email VARCHAR(255)",
+			"ALTER TABLE orders ADD COLUMN total BIGINT",
+		},
+	}}, changes)
+}
+
+// A sharded namespace keeps both views of its changes, so the comment can show
+// what applies to which shard rather than a namespace-level view that hides a
+// shard.
+func TestMemberPlanChanges_KeepsPerShardChanges(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	cs := tern.ChangeSet{
+		Changes: []*ternv1.SchemaChange{{
+			Namespace:    "testapp",
+			TableChanges: []*ternv1.TableChange{{TableName: "users", Ddl: email}},
+		}},
+		Shards: []*ternv1.ShardPlan{
+			{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{{TableName: "users", Ddl: email}}},
+			{Namespace: "testapp", Shard: "80-", Changes: []*ternv1.TableChange{{TableName: "users", Ddl: email}}},
+		},
+	}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.Equal(t, []string{email}, changes[0].Statements)
+	assert.Equal(t, []templates.KeyspaceShardChange{
+		{Shard: "-80", Statements: []string{email}},
+		{Shard: "80-", Statements: []string{email}},
+	}, changes[0].Shards)
+}
+
+// A shard already at the desired schema while its siblings change is carried as
+// satisfied rather than dropped, so a partially-applied namespace shows its
+// divergent state instead of looking uniform.
+func TestMemberPlanChanges_MarksSatisfiedShards(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	cs := tern.ChangeSet{
+		Changes: []*ternv1.SchemaChange{{
+			Namespace:    "testapp",
+			TableChanges: []*ternv1.TableChange{{TableName: "users", Ddl: email}},
+		}},
+		Shards: []*ternv1.ShardPlan{
+			{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{{TableName: "users", Ddl: email}}},
+			{Namespace: "testapp", Shard: "80-"},
+		},
+	}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes[0].Shards, 2)
+	assert.False(t, changes[0].Shards[0].Satisfied)
+	assert.True(t, changes[0].Shards[1].Satisfied)
+}
+
+// A namespace carried only by shard rows still reaches the comment. Dropping it
+// would remove work from a plan the comment claims to describe in full.
+func TestMemberPlanChanges_KeepsShardOnlyNamespace(t *testing.T) {
+	email := "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	cs := tern.ChangeSet{Shards: []*ternv1.ShardPlan{
+		{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{{TableName: "users", Ddl: email}}},
+	}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.Equal(t, "testapp", changes[0].Keyspace)
+	assert.Equal(t, []string{email}, changes[0].Shards[0].Statements)
+}
+
+// A vschema rewrite carries no table DDL. It reaches the comment as a change the
+// namespace needs, so a plan that only rewrites the vschema is not mistaken for
+// a namespace with nothing to apply.
+func TestMemberPlanChanges_CarriesVSchemaChange(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		Metadata: map[string]string{
+			apitypes.VSchemaChangedMetadataKey: "true",
+			apitypes.VSchemaDiffMetadataKey:    "+ table users",
+		},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.True(t, changes[0].VSchemaChanged)
+	assert.Equal(t, "+ table users", changes[0].VSchemaDiff)
+	assert.Empty(t, changes[0].Statements)
+	assert.False(t, templates.DeploymentPlanGroup{Changes: changes}.Empty())
+}
+
+// A rendered VSchema diff marks the namespace as carrying work on its own. The
+// two metadata keys annotate the same thing, so a renderer that recognized only
+// the flag would call a member with work "already at this schema" — and, since
+// the grouping key reads the other annotation too, group it with members that
+// genuinely have nothing to run.
+func TestMemberPlanChanges_DiffAloneIsVSchemaWork(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "testapp",
+		Metadata:  map[string]string{apitypes.VSchemaDiffMetadataKey: "+ table users"},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.True(t, changes[0].VSchemaChanged)
+	assert.False(t, templates.DeploymentPlanGroup{Changes: changes}.Empty())
+
+	// The grouping key agrees, so this member is not folded in with one that has
+	// nothing to run.
+	withDiff, err := tern.ChangeSetFingerprint(schema.DialectMySQL, cs)
+	require.NoError(t, err)
+	empty, err := tern.ChangeSetFingerprint(schema.DialectMySQL, tern.ChangeSet{})
+	require.NoError(t, err)
+	assert.NotEqual(t, empty, withDiff)
+}
+
+// A member's keyspace adds a table whose VSchema entry the engine generates
+// from the DDL, and the engine finalizes the keyspace. The member's plan shows
+// the keyspace by its DDL alone, the way the primary plan shows it.
+func TestMemberPlanChanges_GeneratedVSchemaChangeShowsOnlyTheDDL(t *testing.T) {
+	create := "CREATE TABLE `refund_notes` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace:    "payments",
+		TableChanges: []*ternv1.TableChange{{TableName: "refund_notes", Ddl: create}},
+		Metadata: map[string]string{
+			apitypes.VSchemaChangedMetadataKey:       "true",
+			apitypes.VSchemaGeneratedOnlyMetadataKey: "true",
+			apitypes.NeedsFinalizerMetadataKey:       "true",
+		},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.Equal(t, []string{create}, changes[0].Statements)
+	assert.False(t, changes[0].VSchemaChanged)
+	assert.True(t, changes[0].Finalize)
+}
+
+// A member's keyspace has nothing to run but a finalize the engine asked for.
+// That finalize is work, so the member is not shown as already at the schema.
+func TestMemberPlanChanges_FinalizeAloneIsWork(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{
+		Namespace: "payments",
+		Metadata:  map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"},
+	}}}
+
+	changes := memberPlanChanges(cs)
+	require.Len(t, changes, 1)
+	assert.True(t, changes[0].Finalize)
+	assert.False(t, templates.DeploymentPlanGroup{Changes: changes}.Empty())
+}
+
+// A member already at the desired schema produces no changes at all, which is
+// the group the comment names as having nothing to apply.
+func TestMemberPlanChanges_EmptyPlanHasNoChanges(t *testing.T) {
+	assert.Empty(t, memberPlanChanges(tern.ChangeSet{}))
+	assert.True(t, templates.DeploymentPlanGroup{}.Empty())
+}
+
+// sizedMember is a planned rollout member whose plan changes the given tables
+// of the testapp namespace, each with the given statement and size estimate.
+func sizedMember(target string, changes ...*ternv1.TableChange) api.DeploymentRollupEntry {
+	return api.DeploymentRollupEntry{
+		DatabaseType: "mysql",
+		Deployment:   "primary",
+		Target:       target,
+		Class:        api.DeploymentPlanned,
+		ChangeSet:    tern.ChangeSet{Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: changes}}},
+	}
+}
+
+func sizedChange(table, ddl string, rows, bytes int64) *ternv1.TableChange {
+	return &ternv1.TableChange{
+		Namespace:      "testapp",
+		TableName:      table,
+		Ddl:            ddl,
+		ChangeType:     ternv1.ChangeType_CHANGE_TYPE_ALTER,
+		EstimatedRows:  new(rows),
+		EstimatedBytes: new(bytes),
+	}
+}
+
+// Each target's sizes are read from its own plan, in rollout order, so the
+// size section can total a table across the targets that change it. A table is
+// listed once per target however many statements change it, and a statement
+// whose cost does not grow with the table gets no size.
+func TestTargetTableSizes(t *testing.T) {
+	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+	addIndex2 := "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`)"
+	dropIndex := "ALTER TABLE `users` DROP INDEX `idx_email`"
+	rollup := api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{
+		sizedMember("testapp_1", sizedChange("orders", addIndex, 1_000, 100_000)),
+		sizedMember("testapp_2",
+			sizedChange("orders", addIndex, 48_200_000, 23_400_000_000),
+			sizedChange("orders", addIndex2, 48_200_000, 23_400_000_000),
+			sizedChange("users", dropIndex, 9_000, 900_000)),
+	}}
+
+	sizes := targetTableSizes(rollup)
+
+	require.Len(t, sizes, 2)
+	assert.Equal(t, "primary/testapp_1", sizes[0].Target)
+	assert.Equal(t, "testapp", sizes[0].Keyspace)
+	assert.Equal(t, "orders", sizes[0].Size.Table)
+	require.NotNil(t, sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, int64(100_000), *sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, "primary/testapp_2", sizes[1].Target)
+	assert.Equal(t, "orders", sizes[1].Size.Table)
+	require.NotNil(t, sizes[1].Size.EstimatedBytes)
+	assert.Equal(t, int64(23_400_000_000), *sizes[1].Size.EstimatedBytes)
+}
+
+// A table a target creates has no data to size, and a sharded namespace
+// decides a table's size line from every shard's DDL rather than the one
+// statement its namespace view keeps.
+func TestTargetTableSizes_SkipsCreatedTablesAndReadsEveryShard(t *testing.T) {
+	addColumn := "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255)"
+	addIndex := "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)"
+	created := sizedChange("widgets", "CREATE TABLE `widgets` (`id` bigint NOT NULL, PRIMARY KEY (`id`), KEY `k` (`id`))", 0, 0)
+	created.ChangeType = ternv1.ChangeType_CHANGE_TYPE_CREATE
+	sharded := sizedMember("testapp_2", sizedChange("mutes", addColumn, 48_200_000, 23_400_000_000))
+	sharded.ChangeSet.Shards = []*ternv1.ShardPlan{
+		{Namespace: "testapp", Shard: "-80", Changes: []*ternv1.TableChange{{TableName: "mutes", Ddl: addColumn}}},
+		{Namespace: "testapp", Shard: "80-", Changes: []*ternv1.TableChange{{TableName: "mutes", Ddl: addIndex}}},
+	}
+	rollup := api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{
+		sizedMember("testapp_1", created),
+		sharded,
+	}}
+
+	sizes := targetTableSizes(rollup)
+
+	require.Len(t, sizes, 1)
+	assert.Equal(t, "primary/testapp_2", sizes[0].Target)
+	assert.Equal(t, "mutes", sizes[0].Size.Table)
+	require.NotNil(t, sizes[0].Size.EstimatedBytes)
+	assert.Equal(t, int64(23_400_000_000), *sizes[0].Size.EstimatedBytes)
+}
+
+// A clean multi-target rollup carries each target's table sizes into the
+// preview, so the plan comment totals a table across targets. A blocked
+// rollup carries none, and the size section falls back to the primary plan.
+func TestReviewDriftPreview_TableSizesOnlyForCleanRollup(t *testing.T) {
+	addIndex := "ALTER TABLE `orders` ADD INDEX `idx_created_at` (`created_at`)"
+	entries := func() []api.DeploymentRollupEntry {
+		return []api.DeploymentRollupEntry{
+			sizedMember("testapp_1", sizedChange("orders", addIndex, 1_000, 100_000)),
+			sizedMember("testapp_2", sizedChange("orders", addIndex, 48_200_000, 23_400_000_000)),
+		}
+	}
+
+	clean := reviewDriftPreview(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: entries()})
+	require.NotNil(t, clean)
+	require.Len(t, clean.TableSizes, 2)
+	assert.Equal(t, "primary/testapp_1", clean.TableSizes[0].Target)
+	assert.Equal(t, "primary/testapp_2", clean.TableSizes[1].Target)
+
+	blocked := reviewDriftPreview(api.PlanRollup{Clean: false, Planning: api.PlanIndependent, Entries: entries()})
+	require.NotNil(t, blocked)
+	assert.Empty(t, blocked.TableSizes)
+
+	single := reviewDriftPreview(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: entries()[:1]})
+	assert.Nil(t, single, "a single-target plan has no rollup preview")
+}
+
+// Each target's unsafe change is read from its own plan and disclosed under
+// the targets that carry it, so the comment names every unsafe change the
+// apply would run and the --allow-unsafe gate can count them. A change every
+// target in the group carries names no targets, since the heading lists them;
+// one only some carry names those. A created table's lint verdict makes it
+// unsafe, and so does a drop, by the same rule the primary plan uses.
+func TestDeploymentPlanGroups_DiscloseEachTargetsUnsafeChanges(t *testing.T) {
+	create := "CREATE TABLE `bikes` (`id` bigint NOT NULL, `created_at` timestamp NULL, PRIMARY KEY (`id`))"
+	unsafeCreate := func(target string) api.DeploymentRollupEntry {
+		e := plannedMember("ski", target, create)
+		tc := e.ChangeSet.Changes[0].TableChanges[0]
+		tc.TableName = "bikes"
+		tc.ChangeType = ternv1.ChangeType_CHANGE_TYPE_CREATE
+		tc.IsUnsafe = true
+		tc.UnsafeReason = "has_timestamp: column created_at uses TIMESTAMP"
+		return e
+	}
+	reviewed := plannedMember("ski", "bikeshare-001")
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries:  []api.DeploymentRollupEntry{reviewed, unsafeCreate("bikeshare-002"), unsafeCreate("bikeshare-003")},
+	}
+
+	groups := deploymentPlanGroups(rollup)
+	require.Len(t, groups, 2)
+	assert.True(t, groups[0].Primary)
+	assert.Empty(t, groups[0].UnsafeChanges, "the primary target has nothing to run")
+	assert.Equal(t, []templates.UnsafeChangeData{{
+		Table:      "bikes",
+		Reason:     "has_timestamp: column created_at uses TIMESTAMP",
+		DDL:        create,
+		ChangeType: "create",
+	}}, groups[1].UnsafeChanges, "every target in the group carries it, so it names none")
+
+	drift := &templates.DeploymentDriftData{Computed: true, Clean: true, Independent: true, Plans: groups,
+		Deployments: []templates.DeploymentDriftEntry{{Deployment: "ski", Target: "bikeshare-001"}, {Deployment: "ski", Target: "bikeshare-002"}, {Deployment: "ski", Target: "bikeshare-003"}}}
+	listed := templates.TargetPlanUnsafeChanges(drift)
+	require.Len(t, listed, 1)
+	assert.Equal(t, []string{"ski/bikeshare-002", "ski/bikeshare-003"}, listed[0].Targets,
+		"the gate's list names the targets, since it renders beside the primary plan's changes")
+}
+
+// A table's findings can reach the comment joined into one unsafe reason in
+// different orders on different targets: a plan stored before its engine
+// normalized reasons, or an engine that does not normalize, keeps the order
+// its linters reported. Targets whose findings are the same set share one
+// unsafe change, so
+// the comment lists each finding once rather than once per order. A target
+// with a different set of findings keeps a change of its own.
+func TestDeploymentPlanGroups_TargetsWithTheSameFindingsInAnotherOrderShareOneUnsafeChange(t *testing.T) {
+	create := "CREATE TABLE `bikes` (`id` bigint NOT NULL, `created_at` timestamp NULL, `updated_at` timestamp NULL, PRIMARY KEY (`id`))"
+	const createdAt = "Column `created_at` uses `TIMESTAMP`"
+	const updatedAt = "Column `updated_at` uses `TIMESTAMP`"
+	unsafeCreate := func(target, reason string) api.DeploymentRollupEntry {
+		e := plannedMember("ski", target, create)
+		tc := e.ChangeSet.Changes[0].TableChanges[0]
+		tc.TableName = "bikes"
+		tc.ChangeType = ternv1.ChangeType_CHANGE_TYPE_CREATE
+		tc.IsUnsafe = true
+		tc.UnsafeReason = reason
+		return e
+	}
+	rollup := api.PlanRollup{
+		Clean:    true,
+		Planning: api.PlanIndependent,
+		Entries: []api.DeploymentRollupEntry{
+			plannedMember("ski", "bikeshare-001"),
+			unsafeCreate("bikeshare-002", createdAt+"; "+updatedAt),
+			unsafeCreate("bikeshare-003", updatedAt+"; "+createdAt),
+			unsafeCreate("bikeshare-004", createdAt),
+		},
+	}
+
+	groups := deploymentPlanGroups(rollup)
+	require.Len(t, groups, 2)
+	require.Len(t, groups[1].UnsafeChanges, 2, "one change for the targets that share a set of findings, one for the target with a different set")
+	assert.Equal(t, createdAt+"; "+updatedAt, groups[1].UnsafeChanges[0].Reason)
+	assert.Equal(t, []string{"ski/bikeshare-002", "ski/bikeshare-003"}, groups[1].UnsafeChanges[0].Targets)
+	assert.Equal(t, createdAt, groups[1].UnsafeChanges[1].Reason)
+	assert.Equal(t, []string{"ski/bikeshare-004"}, groups[1].UnsafeChanges[1].Targets)
+}
+
+// Shards of one target can report a table's findings in different orders too,
+// and the shards whose findings are the same set share one unsafe change.
+func TestMemberUnsafeChanges_ShardsWithTheSameFindingsInAnotherOrderShareOneChange(t *testing.T) {
+	const dropCol = "ALTER TABLE `users` DROP COLUMN `nickname`, DROP INDEX `idx_nickname`"
+	shard := func(name, reason string) *ternv1.ShardPlan {
+		return &ternv1.ShardPlan{Shard: name, Changes: []*ternv1.TableChange{{
+			TableName: "users", Ddl: dropCol, ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, IsUnsafe: true, UnsafeReason: reason,
+		}}}
+	}
+	const column = "DROP COLUMN `nickname` discards the column's data"
+	const index = "DROP INDEX `idx_nickname` is visible"
+	cs := tern.ChangeSet{Shards: []*ternv1.ShardPlan{
+		shard("-80", column+"; "+index),
+		shard("80-", index+"; "+column),
+	}}
+
+	assert.Equal(t, []templates.UnsafeChangeData{{
+		Table: "users", Reason: column + "; " + index, DDL: dropCol, ChangeType: "alter",
+		Shards: []string{"-80", "80-"}, TotalShards: 2,
+	}}, memberUnsafeChanges(cs))
+}
+
+// Targets that run the same DDL share a group, but each target's unsafe
+// verdict is read from its own schema: dropping an index is unsafe only where
+// the index is visible. A sibling that finds the primary target's statement
+// unsafe when the primary target does not is disclosed under the primary
+// target's group, naming the sibling, and the unsafe gate counts it, so
+// --allow-unsafe never consents to a consequence the comment left out. A
+// verdict the primary target shares is already disclosed plan-wide.
+func TestDeploymentPlanGroups_DisclosesASiblingsUnsafeVerdictInThePrimaryGroup(t *testing.T) {
+	dropIndex := "ALTER TABLE `users` DROP INDEX `idx_email`"
+	const visible = "drop_index: index idx_email is visible"
+	reviewed := plannedMember("ski", "users-001", dropIndex)
+	sibling := plannedMember("ski", "users-002", dropIndex)
+	sibling.ChangeSet.Changes[0].TableChanges[0].IsUnsafe = true
+	sibling.ChangeSet.Changes[0].TableChanges[0].UnsafeReason = visible
+
+	groups := deploymentPlanGroups(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{reviewed, sibling}})
+	require.Len(t, groups, 1, "the targets run the same DDL")
+	drift := &templates.DeploymentDriftData{Computed: true, Clean: true, Independent: true, Plans: groups,
+		Deployments: []templates.DeploymentDriftEntry{{Deployment: "ski", Target: "users-001", Primary: true}, {Deployment: "ski", Target: "users-002"}}}
+
+	listed := templates.TargetPlanUnsafeChanges(drift)
+	require.Len(t, listed, 1)
+	assert.Equal(t, "users", listed[0].Table)
+	assert.Equal(t, visible, listed[0].Reason)
+	assert.Equal(t, []string{"ski/users-002"}, listed[0].Targets)
+
+	out := templates.RenderPlanComment(templates.PlanCommentData{
+		Database: "users", Environment: "production", DatabaseType: "vitess",
+		Changes:         groups[0].Changes,
+		DeploymentDrift: drift,
+	})
+	assert.Contains(t, out, "1. `users` on target `ski/users-002`: "+visible+"\n", out)
+
+	shared := plannedMember("ski", "users-001", dropIndex)
+	shared.ChangeSet.Changes[0].TableChanges[0].IsUnsafe = true
+	shared.ChangeSet.Changes[0].TableChanges[0].UnsafeReason = visible
+	drift.Plans = deploymentPlanGroups(api.PlanRollup{Clean: true, Planning: api.PlanIndependent, Entries: []api.DeploymentRollupEntry{shared, sibling}})
+	assert.Empty(t, templates.TargetPlanUnsafeChanges(drift), "a verdict the primary target carries is the primary plan's own")
+}
+
+// A drop is unsafe on a target whose engine left the verdict unset, the same
+// fallback the primary plan's changes get, and a change only some of a
+// group's targets carry names them.
+func TestMemberUnsafeChanges_DropIsUnsafeWithoutAVerdict(t *testing.T) {
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{{Namespace: "testapp", TableChanges: []*ternv1.TableChange{
+		{TableName: "legacy", Ddl: "DROP TABLE `legacy`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP},
+		{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER},
+	}}}}
+	assert.Equal(t, []templates.UnsafeChangeData{{
+		Table: "legacy", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `legacy`", ChangeType: "drop",
+	}}, memberUnsafeChanges(cs))
+
+	var list []templates.UnsafeChangeData
+	for _, target := range []string{"eu", "us", "us"} {
+		for _, uc := range memberUnsafeChanges(cs) {
+			addUnsafeTarget(&list, uc, target)
+		}
+	}
+	require.Len(t, list, 1)
+	assert.Equal(t, []string{"eu", "us"}, list[0].Targets, "a target is listed once")
+	trimModeTargets(&list[0].Targets, &list[0].TotalTargets, 3)
+	assert.Equal(t, []string{"eu", "us"}, list[0].Targets)
+	assert.Equal(t, 3, list[0].TotalTargets)
+}
+
+// A member's VSchema deletion is unsafe the way the primary plan's is, so it
+// is listed beside the member's table changes, and a record that cannot be
+// decoded is listed as unsafe rather than dropped.
+func TestMemberUnsafeChanges_ListsVSchemaChanges(t *testing.T) {
+	deletions, err := apitypes.EncodeVSchemaDeletions([]apitypes.VSchemaDeletion{
+		{Kind: "vindex", Name: "orders_lookup", Reason: "removes vindex orders_lookup, which routes queries on orders"},
+	})
+	require.NoError(t, err)
+	cs := tern.ChangeSet{Changes: []*ternv1.SchemaChange{
+		{Namespace: "commerce", Metadata: map[string]string{apitypes.VSchemaDeletionsMetadataKey: deletions},
+			TableChanges: []*ternv1.TableChange{{TableName: "legacy", Ddl: "DROP TABLE `legacy`", ChangeType: ternv1.ChangeType_CHANGE_TYPE_DROP}}},
+		{Namespace: "customers", Metadata: map[string]string{apitypes.VSchemaDeletionsMetadataKey: "{not json"}},
+	}}
+
+	assert.Equal(t, []templates.UnsafeChangeData{
+		{Table: "legacy", Reason: "DROP TABLE removes all data", DDL: "DROP TABLE `legacy`", ChangeType: "drop"},
+		{Table: "commerce/vschema.json", Reason: "removes vindex orders_lookup, which routes queries on orders", ChangeType: apitypes.VSchemaChangeType},
+		{Table: "customers/vschema.json", Reason: "VSchema deletions were recorded on this plan but could not be decoded, so the VSchema change is treated as unsafe", ChangeType: apitypes.VSchemaChangeType},
+	}, memberUnsafeChanges(cs))
 }

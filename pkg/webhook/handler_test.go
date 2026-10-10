@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
@@ -105,10 +107,31 @@ func TestWebhookIgnoresUnknownEvents(t *testing.T) {
 	assert.Contains(t, rr.Body.String(), "ignored")
 }
 
+// A body larger than GitHub accepts is posted as the oversized-comment notice,
+// which keeps the comment's heading and, like any error comment, carries the
+// support footer.
+func TestRenderPRCommentReplacesAnOversizedBody(t *testing.T) {
+	cfg := &api.ServerConfig{
+		SupportChannel: api.SupportChannelConfig{
+			Name: "#schema-help",
+			URL:  "https://example.com/schema-help",
+		},
+	}
+	h := &Handler{service: api.New(nil, cfg, nil, testLogger()), logger: testLogger()}
+	body := "## Schema Change Apply — Production\n\n" + strings.Repeat("x", 2*templates.GitHubIssueCommentMaxChars)
+
+	posted := h.renderPRComment("octo/repo", 7, "", body)
+
+	assert.LessOrEqual(t, len(posted), templates.GitHubIssueCommentMaxChars)
+	assert.True(t, strings.HasPrefix(posted, "## Schema Change Apply — Production\n"), posted)
+	assert.Contains(t, posted, "too large to post")
+	assert.Contains(t, posted, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
+}
+
 func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 	t.Run("disabled without service config", func(t *testing.T) {
 		h := &Handler{}
-		assert.Equal(t, "hello", h.renderPRComment("hello"))
+		assert.Equal(t, "hello", h.renderPRComment("octo/repo", 7, "", "hello"))
 	})
 
 	t.Run("does not append to normal comments", func(t *testing.T) {
@@ -120,7 +143,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("hello\n")
+		body := h.renderPRComment("octo/repo", 7, "", "hello\n")
 
 		assert.Equal(t, "hello\n", body)
 	})
@@ -134,7 +157,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderHelpComment())
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderHelpComment())
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -148,7 +171,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderInvalidCommand())
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderInvalidCommand())
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -162,7 +185,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.PreviewCommentApplyFailed())
+		body := h.renderPRComment("octo/repo", 7, "", templates.PreviewCommentApplyFailed())
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -176,7 +199,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderSchemaChangeReconciliationRequired(templates.SchemaChangeReconciliationData{
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderSchemaChangeReconciliationRequired(templates.SchemaChangeReconciliationData{
 			RequestedBy: "alice",
 			Timestamp:   "2026-06-14 12:34:56",
 			Items: []templates.SchemaChangeReconciliationItem{{
@@ -199,7 +222,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderHelpComment())
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderHelpComment())
 
 		assert.Contains(t, body, `[team\]ops\\help](https://example.com/support)`)
 	})
@@ -213,8 +236,8 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		once := h.renderPRComment(templates.RenderHelpComment())
-		twice := h.renderPRComment(once)
+		once := h.renderPRComment("octo/repo", 7, "", templates.RenderHelpComment())
+		twice := h.renderPRComment("octo/repo", 7, "", once)
 
 		assert.Equal(t, once, twice)
 	})
@@ -228,7 +251,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment("## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply** all schema changes from this PR, comment:\n```\nschemabot apply -e staging\n```")
+		body := h.renderPRComment("octo/repo", 7, "", "## MySQL Schema Change Plan\n\nplan summary\n\n---\n\n▶️ **To apply**, comment:\n```\nschemabot apply -e staging\n```")
 
 		assert.NotContains(t, body, "Support:")
 	})
@@ -242,7 +265,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.PreviewCommentUnsafeBlocked())
+		body := h.renderPRComment("octo/repo", 7, "", templates.PreviewCommentUnsafeBlocked())
 
 		assert.Contains(t, body, "> 💬 Support: [#schema-help](https://example.com/schema-help).")
 	})
@@ -256,7 +279,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderUnmanagedSchemaConfigsNotice([]templates.UnmanagedSchemaConfigNoticeData{
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderUnmanagedSchemaConfigsNotice(nil, []templates.UnmanagedSchemaConfigNoticeData{
 			{SchemaPath: "services/orders/schema", Database: "orders"},
 		}))
 
@@ -272,7 +295,7 @@ func TestRenderPRCommentSupportChannelFooter(t *testing.T) {
 		}
 		h := &Handler{service: api.New(nil, cfg, nil, testLogger())}
 
-		body := h.renderPRComment(templates.RenderPlanComment(templates.PlanCommentData{
+		body := h.renderPRComment("octo/repo", 7, "", templates.RenderPlanComment(templates.PlanCommentData{
 			Database:    "orders",
 			SchemaName:  "orders",
 			Environment: "staging",
@@ -301,7 +324,7 @@ func TestBuildPlanCommentDataCarriesTheAgentHint(t *testing.T) {
 	t.Run("no hint configured", func(t *testing.T) {
 		h := &Handler{service: api.New(nil, &api.ServerConfig{}, nil, testLogger())}
 
-		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint())
+		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint(), h.cliName())
 
 		assert.Empty(t, data.AgentHint)
 		assert.NotContains(t, templates.RenderPlanComment(data), "<!-- 💡 ")
@@ -311,36 +334,111 @@ func TestBuildPlanCommentDataCarriesTheAgentHint(t *testing.T) {
 		hint := "Agents: comment `schemabot help` for the command reference."
 		h := &Handler{service: api.New(nil, &api.ServerConfig{AgentHint: hint}, nil, testLogger())}
 
-		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint())
+		data := buildPlanCommentData(schema, planResp, "staging", "", "octocat", h.agentHint(), h.cliName())
 
 		assert.Equal(t, hint, data.AgentHint)
 		assert.Contains(t, templates.RenderPlanComment(data), "<!-- 💡 "+hint+" -->")
 	})
 }
 
-func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
-	client, mux := setupGitHubServer(t)
-	comments := make(chan string, 1)
-	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+// A deployment's cli_name reaches the CLI hints in the comments the handler
+// posts: the plan data it builds carries it for the stored-plan pointer, and
+// the oversized-comment notice starts its status hint with it. A deployment
+// that configures none renders the CLI's own name.
+func TestHandlerRendersCLIHintsWithTheConfiguredCLIName(t *testing.T) {
+	schema := &ghclient.SchemaRequestResult{Database: "orders", Type: "mysql"}
+	oversized := "## Schema Change Plan\n\n" + strings.Repeat("x", 2*templates.GitHubIssueCommentMaxChars)
+	for _, tc := range []struct{ name, configured, want string }{
+		{"no cli_name configured", "", "schemabot"},
+		{"cli_name configured", "acme schemabot", "acme schemabot"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handler{logger: testLogger(), service: api.New(nil, &api.ServerConfig{CLIName: tc.configured}, nil, testLogger())}
 
-	installClient := ghclient.NewInstallationClient(client, testLogger())
-	h := &Handler{
-		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
-		logger:    testLogger(),
+			data := buildPlanCommentData(schema, &apitypes.PlanResponse{PlanID: "plan_7c41f9"}, "staging", "", "octocat", h.agentHint(), h.cliName())
+			assert.Equal(t, tc.want, data.CLIName)
+			assert.Contains(t, h.renderPRComment("octo/repo", 7, "staging", oversized), "`"+tc.want+" status -e staging`")
+		})
 	}
+}
 
-	h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "production", "", "hubot", "apply", &schemaConfigOutsideAllowedDirsError{
-		Database:     "orders",
-		DatabaseType: "mysql",
-		SchemaPath:   "services/orders/schema",
-	}, false)
+// Every comment observer the handler builds starts from
+// commentObserverConfig, so the deployment's cli_name reaches the comments the
+// observer posts for an apply: an apply comment too large for GitHub is
+// replaced by the oversized notice, whose status hint starts with the
+// configured name and is scoped to the apply's environment, runnable as
+// printed. Both observer kinds, the per-driver one and the one-shot aggregate
+// terminal-summary publisher, render the same hint.
+func TestCommentObserverRendersOversizedNoticeWithTheConfiguredCLIName(t *testing.T) {
+	h := &Handler{logger: testLogger(), service: api.New(nil, &api.ServerConfig{CLIName: "acme schemabot"}, nil, testLogger()), shardedPlans: newShardedPlanCache()}
+	cfg := h.commentObserverConfig(nil, "octo/repo", 7, 42)
+	assert.Equal(t, "acme schemabot", cfg.CLIName)
+	assert.Same(t, h.shardedPlans, cfg.shardedPlans, "every observer shares the handler's sharded plan cache")
 
-	body := requireComment(t, comments, "config-not-authorized comment")
-	assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
-	assert.Contains(t, body, "SchemaBot found a `schemabot.yaml` configuration")
-	assert.Contains(t, body, "`services/orders/schema`")
-	assert.Contains(t, body, "`databases.orders.allowed_dirs`")
-	assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found")
+	oversized := "## Schema Change Apply — Staging\n\n" + strings.Repeat("x", 2*templates.GitHubIssueCommentMaxChars)
+	apply := &storage.Apply{ApplyIdentifier: "apply-7c41f9", Database: "orders", Environment: "staging"}
+	for name, observer := range map[string]*CommentObserver{
+		"driver observer":             NewCommentObserver(cfg),
+		"aggregate terminal observer": NewAggregateTerminalCommentObserver(cfg),
+	} {
+		t.Run(name, func(t *testing.T) {
+			body := observer.renderPRComment(apply, oversized)
+			assert.Contains(t, body, "too large to post")
+			assert.Contains(t, body, "available from the CLI with `acme schemabot status -e staging`.")
+		})
+	}
+}
+
+// A command answered with Configuration Not Authorized names the deployment
+// making the claim, since a deployment serving another environment may manage
+// the directory: by its environment when it serves one, and by the
+// environments it serves, in promotion order, when it serves several but not
+// every one. A deployment serving every environment speaks for itself without
+// a name.
+func TestHandleSchemaRequestErrorRendersConfigNotAuthorized(t *testing.T) {
+	cases := []struct {
+		name    string
+		config  *api.ServerConfig
+		subject string
+	}{
+		{name: "deployment serving every environment", config: &api.ServerConfig{}, subject: "this SchemaBot deployment is not configured to manage its schema directory"},
+		{name: "staging-scoped deployment", config: &api.ServerConfig{AllowedEnvironments: []string{"staging"}}, subject: "the staging SchemaBot deployment is not configured to manage its schema directory"},
+		{
+			name: "deployment serving two of three environments",
+			config: &api.ServerConfig{
+				EnvironmentOrder:    []string{"sandbox", "staging", "production"},
+				AllowedEnvironments: []string{"production", "staging"},
+			},
+			subject: "the SchemaBot deployment serving `staging` and `production` is not configured to manage its schema directory",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 1)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			h := &Handler{
+				service:   api.New(nil, tc.config, nil, testLogger()),
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:    testLogger(),
+			}
+
+			h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "apply", &schemaConfigOutsideAllowedDirsError{
+				Database:     "orders",
+				DatabaseType: "mysql",
+				SchemaPath:   "services/orders/schema",
+			}, false)
+
+			body := requireComment(t, comments, "config-not-authorized comment")
+			assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
+			assert.Contains(t, body, "SchemaBot found a `schemabot.yaml` configuration, but "+tc.subject+".")
+			assert.Contains(t, body, "`services/orders/schema`")
+			assert.Contains(t, body, "`databases.orders.allowed_dirs`")
+			assert.NotContains(t, body, "No `schemabot.yaml` configuration file was found")
+		})
+	}
 }
 
 func TestCheckRunRerequestIgnoresNonSchemaBotCheck(t *testing.T) {
@@ -435,11 +533,36 @@ func newTestHandler(t *testing.T) (*Handler, chan string, chan string) {
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, factory),
 		logger:    testLogger(),
 	}
+	drainWebhookWorkOnCleanup(t, h)
 	return h, comments, reactions
 }
 
+// A test that dispatches a rollback and returns as soon as the handler responds
+// still has that rollback's comment delivered to its own fake GitHub server.
+// The subtest stands in for such a test: its handler is built and torn down
+// inside it, and the parent then reads the comment its server captured, which
+// is only there if the dispatched work finished before the server closed.
+func TestNewTestHandlerDeliversDispatchedWorkBeforeTheServerCloses(t *testing.T) {
+	var comments chan string
+	t.Run("dispatch", func(t *testing.T) {
+		h, c, _ := newTestHandler(t)
+		comments = c
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot rollback apply_abc123 -e staging", isPR: true}, nil))
+		require.Equal(t, http.StatusOK, rr.Code)
+	})
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "apply_abc123")
+	default:
+		t.Fatal("the dispatched rollback's comment never reached the dispatching test's server")
+	}
+}
+
+// A help command is answered like any other command: the help comment is
+// posted and the comment carries the eyes acknowledgment.
 func TestWebhookHelpCommand(t *testing.T) {
-	h, comments, _ := newTestHandler(t)
+	h, comments, reactions := newTestHandler(t)
 
 	req := buildWebhookRequest(t, webhookPayloadOpts{
 		comment: "schemabot help",
@@ -458,6 +581,13 @@ func TestWebhookHelpCommand(t *testing.T) {
 		assert.Contains(t, body, "schemabot plan")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
 	}
 }
 
@@ -531,6 +661,40 @@ func TestWebhookInvalidEnvValue(t *testing.T) {
 		assert.Contains(t, body, "schemabot apply -e <environment>")
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the invalid environment comment")
+	}
+
+	select {
+	case reaction := <-reactions:
+		assert.Equal(t, "eyes", reaction)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the acknowledgment reaction")
+	}
+}
+
+// A `schemabot` mention that names no known command is answered with the
+// Invalid Command usage comment, and the answer carries the eyes
+// acknowledgment like every other reply: a reaction-less comment would leave
+// the user unsure which deployment spoke, and a comment-less reaction would
+// promise work nobody does.
+func TestWebhookInvalidCommandAcknowledged(t *testing.T) {
+	h, comments, reactions := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid command")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Command")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the invalid command comment")
 	}
 
 	select {
@@ -736,6 +900,204 @@ func TestWebhookNoMention(t *testing.T) {
 	case <-comments:
 		t.Fatal("should not post a comment when not mentioned")
 	default:
+	}
+}
+
+// A status update that reports an apply in command words ("SchemaBot apply -e
+// staging succeeded") is a sentence, not a request: SchemaBot starts nothing
+// and posts nothing.
+func TestWebhookSentenceReportingAnApplyDoesNotApply(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "SchemaBot apply -e staging succeeded, and the check passes.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+	select {
+	case body := <-comments:
+		require.Failf(t, "unexpected comment posted", "%s", body)
+	default:
+	}
+}
+
+// A comment that explains itself in a sentence opening with the product name
+// and then issues a command on its own line runs that command.
+func TestWebhookSentenceThenCommandRunsTheCommand(t *testing.T) {
+	h, _, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "SchemaBot planned this earlier and the plan looks right.\n\nschemabot rollback-confirm -e staging",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "rollback-confirm started")
+}
+
+// A CLI-only flag named in a sentence does not trip the usage gate for the
+// command on the next line, and the same flag on the command line does.
+func TestWebhookFlagInSentenceDoesNotReachTheCommand(t *testing.T) {
+	t.Run("flag in the sentence", func(t *testing.T) {
+		h, _, _ := newTestHandler(t)
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "SchemaBot apply -e staging --yes is a CLI habit.\n\nschemabot rollback-confirm -e staging",
+			isPR:    true,
+		}, nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "rollback-confirm started")
+	})
+	t.Run("flag on the command line", func(t *testing.T) {
+		h, comments, _ := newTestHandler(t)
+		req := buildWebhookRequest(t, webhookPayloadOpts{
+			comment: "SchemaBot apply is a PR comment.\n\nschemabot rollback-confirm -e staging --yes",
+			isPR:    true,
+		}, nil)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, req)
+
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Contains(t, rr.Body.String(), "unsupported flag")
+		select {
+		case body := <-comments:
+			assert.Contains(t, body, "is not supported for `rollback-confirm`")
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, "timed out waiting for comment")
+		}
+	})
+}
+
+// A quote-reply to an apply command is a response to it, not a new request:
+// SchemaBot runs nothing and posts nothing.
+func TestWebhookQuoteReplyToCommandIsNotRun(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "> schemabot apply -e production\n\nShould this go to staging first?",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+	select {
+	case body := <-comments:
+		require.Failf(t, "unexpected comment posted", "%s", body)
+	default:
+	}
+}
+
+// A command line with a token SchemaBot does not accept exactly, here an
+// unsafe flag with a full stop typed after it, is a botched command rather
+// than a sentence. SchemaBot runs nothing and answers with the invalid-command
+// help, so the commenter learns the apply did not start.
+func TestWebhookMalformedCommandIsRejected(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply -e staging --allow-unsafe.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "invalid command")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "Invalid Command")
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "timed out waiting for comment")
+	}
+}
+
+// An agent's status update that opens a paragraph with the product name is a
+// sentence about SchemaBot, not a command. SchemaBot leaves it unanswered
+// rather than replying with the invalid-command help.
+func TestWebhookProseMentionIsNotAnswered(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "Rebased onto main.\n\nSchemaBot applied the `orders` table in staging from commit `abc1234`; the staging check passes.",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+	// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+	select {
+	case body := <-comments:
+		require.Failf(t, "unexpected comment posted", "%s", body)
+	default:
+	}
+}
+
+// An agent's explanation of how to land a schema change closes with a line
+// that opens with the product name, in any case, and mentions apply commands
+// only inline. SchemaBot leaves it unanswered rather than replying with the
+// invalid-command help.
+func TestWebhookExplanationOpeningWithTheProductNameIsNotAnswered(t *testing.T) {
+	const onThisPR = " will then comment the exact DDL it plans for staging and production on this PR."
+	tests := []struct {
+		name     string
+		lastLine string
+	}{
+		{
+			name: "inline apply commands",
+			lastLine: "SchemaBot will then comment the exact DDL it plans for staging and production, " +
+				"and you apply it with `schemabot apply -e staging`, then `schemabot apply -e production`.",
+		},
+		{name: "mixed case", lastLine: "SchemaBot" + onThisPR},
+		{name: "title case", lastLine: "Schemabot" + onThisPR},
+		{name: "upper case", lastLine: "SCHEMABOT" + onThisPR},
+		{name: "lower case", lastLine: "schemabot" + onThisPR},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, comments, _ := newTestHandler(t)
+
+			req := buildWebhookRequest(t, webhookPayloadOpts{
+				comment: agentExplanationBody(tt.lastLine),
+				isPR:    true,
+			}, nil)
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			require.Equal(t, http.StatusOK, rr.Code)
+			assert.Contains(t, rr.Body.String(), "no SchemaBot command")
+
+			// The no-command path returns before launching any goroutines, so the channel is guaranteed empty.
+			select {
+			case body := <-comments:
+				require.Failf(t, "unexpected comment posted", "%s", body)
+			default:
+			}
+		})
 	}
 }
 
@@ -1230,4 +1592,80 @@ func TestGoSafeOmitsEmptyDeliveryIDFromPanicLog(t *testing.T) {
 	logged := logBuf.String()
 	assert.Contains(t, logged, "goroutine panic")
 	assert.NotContains(t, logged, "delivery_id=")
+}
+
+// Setup comments offer experimental types only when the server opts in.
+func TestSchemaErrorGuidanceUsesServerStrataSetting(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			client, mux := setupGitHubServer(t)
+			comments := make(chan string, 1)
+			mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+			installClient := ghclient.NewInstallationClient(client, testLogger())
+			h := &Handler{
+				service:   api.New(nil, &api.ServerConfig{ExperimentalStrataEnabled: enabled}, nil, testLogger()),
+				ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
+				logger:    testLogger(),
+			}
+			for _, requestErr := range []error{ghclient.ErrNoConfig, ghclient.ErrInvalidConfig} {
+				h.handleSchemaRequestError("octocat/hello-world", 1, 12345, "staging", "", "hubot", "plan", requestErr, false)
+				body := requireComment(t, comments, "setup guidance")
+				assert.Contains(t, body, "`mysql`")
+				assert.Contains(t, body, "`postgres`")
+				assert.Contains(t, body, "`vitess`")
+				assert.Equal(t, enabled, strings.Contains(body, "`strata` (experimental)"))
+			}
+		})
+	}
+}
+
+// Only plan and apply can be narrowed to one target. apply-confirm confirms
+// the target its apply already named, so a --target on it is answered with a
+// usage comment instead of being ignored or applied to the whole rollout.
+func TestWebhookTargetFlagRejectedOnApplyConfirm(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging --target payments-002",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+	select {
+	case body := <-comments:
+		assert.Equal(t, "The `--target` flag is not supported for `apply-confirm`. Only `plan` and `apply` take it.", body)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+}
+
+// A target is a member of one environment's rollout, so a narrowed plan
+// without -e is a usage error that keeps the target the caller typed. It
+// never falls back to planning every environment.
+func TestWebhookNarrowedPlanWithoutEnvironmentAsksForIt(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan --target payments-002",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "missing environment flag")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "needs `-e` too")
+		assert.Contains(t, body, "`schemabot plan -e <environment> --target payments-002`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
 }

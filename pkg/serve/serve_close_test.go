@@ -8,8 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -37,7 +37,7 @@ func TestServerCloseSucceedsWhenTelemetryFlushFails(t *testing.T) {
 
 	// A lazily-opened handle: never connected, so svc.Close can close it
 	// without a reachable database.
-	db, err := sql.Open("mysql", "schemabot@tcp(127.0.0.1:1)/schemabot")
+	db, err := sql.Open("block-mysql", "schemabot@tcp(127.0.0.1:1)/schemabot")
 	require.NoError(t, err)
 	// srv.Close (via svc.Close) owns the handle; this cleanup only prevents a
 	// leak when the test fails before Close runs.

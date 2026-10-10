@@ -46,6 +46,12 @@ func TestRepoAllowed(t *testing.T) {
 			want:         true,
 		},
 		{
+			name:         "uppercase allow-list entry matches canonical request",
+			allowedRepos: []string{"Octocat/Hello-World"},
+			repository:   "octocat/hello-world",
+			want:         true,
+		},
+		{
 			name:         "similar repo name is blocked",
 			allowedRepos: []string{"octocat/hello-world"},
 			repository:   "octocat/hello-world-archive",
@@ -113,6 +119,18 @@ func TestSchemaPathAllowed(t *testing.T) {
 			name:        "absolute path is blocked",
 			allowedDirs: []string{"schema/payments"},
 			schemaPath:  "/schema/payments",
+			want:        false,
+		},
+		{
+			name:        "an invalid entry does not hide a later valid one",
+			allowedDirs: []string{"/services/payments/schema", "", "services/orders/schema"},
+			schemaPath:  "services/orders/schema",
+			want:        true,
+		},
+		{
+			name:        "an invalid entry matches nothing",
+			allowedDirs: []string{"/services/payments/schema"},
+			schemaPath:  "services/payments/schema",
 			want:        false,
 		},
 		{

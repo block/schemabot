@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 	"github.com/stretchr/testify/assert"
@@ -592,6 +593,33 @@ func TestFormatTableProgress_StartingCopy(t *testing.T) {
 	}
 }
 
+// A copying table shows its planned size beside the row counts, before the
+// ETA, and a stopped one keeps it. Without an estimate the row counts stand
+// alone.
+func TestFormatTableProgress_TableSizeBesideRows(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	base := TableProgress{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
+		DDL:        "ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`)",
+		RowsCopied: 1_234_567, RowsTotal: 48_200_000, PercentComplete: 2, ETASeconds: 720,
+		EstimatedBytes: &bytes,
+	}
+
+	assert.Contains(t, FormatTableProgress(base), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB · ETA: 12m 0s\n")
+
+	noETA := base
+	noETA.ETASeconds = 0
+	assert.Contains(t, FormatTableProgress(noETA), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
+
+	stopped := base
+	stopped.Status = state.Task.Stopped
+	assert.Contains(t, FormatTableProgress(stopped), "Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
+
+	unsized := base
+	unsized.EstimatedBytes = nil
+	assert.Contains(t, FormatTableProgress(unsized), "Rows: 1,234,567 / 48,200,000 · ETA: 12m 0s\n")
+}
+
 // A table applying its accumulated changes names the catch-up phase rather
 // than rendering a bare full bar — its copy is done but the engine is still
 // draining the changes that piled up on the source, which can run for hours on
@@ -635,17 +663,18 @@ func TestFormatTableProgress_Checksumming(t *testing.T) {
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
 	})
-	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (22%)")
+	assert.Contains(t, withProgress, "🔍 Checksumming to verify data (21.92%)")
 	assert.Contains(t, withProgress, "Rows verified: 321,450 / 1,466,232")
 
-	// A verify that has only just begun still renders as visibly started: a
-	// non-zero checked count floors the display at 1% instead of showing an
-	// empty "not started" bar while verification is actively running.
+	// A verify that has only just begun still renders as visibly started: the
+	// bar shows a first segment, and the percent shows the true sub-1% fraction
+	// (floored away from 0.00%) instead of an empty "not started" display while
+	// verification is actively running.
 	justStarted := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Task.Checksumming,
 		ChecksumRowsChecked: 1, ChecksumRowsTotal: 1000000,
 	})
-	assert.Contains(t, justStarted, "🔍 Checksumming to verify data (1%)")
+	assert.Contains(t, justStarted, "🔍 Checksumming to verify data (0.01%)")
 	assert.Contains(t, justStarted, "🟦")
 }
 
@@ -661,7 +690,7 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true, ThrottleReason: "redo-aware 4 > 3",
 	})
-	assert.Contains(t, copying, "45% (throttled)",
+	assert.Contains(t, copying, "45.00% (throttled)",
 		"the annotation lands on the header line next to the percent")
 	assert.Contains(t, copying, "ℹ️ Throttled: redo-aware 4 > 3 · backing off while the database's active threads exceed its budget")
 
@@ -670,7 +699,8 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
 		Throttled: true,
 	})
-	assert.Contains(t, noReason, "45% (throttled)")
+	assert.Contains(t, noReason, "45.00% (throttled)")
+	assert.NotContains(t, noReason, ui.ThrottleDocURL)
 	assert.NotContains(t, noReason, "ℹ️ Throttled", "no tooltip without a reason")
 
 	unknownSignal := FormatTableProgress(TableProgress{
@@ -687,8 +717,10 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		ChecksumRowsChecked: 321450, ChecksumRowsTotal: 1466232,
 		Throttled: true, ThrottleReason: "threads-running 21 > 18",
 	})
-	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (22%) (throttled)")
+	assert.Contains(t, checksumming, "🔍 Checksumming to verify data (21.92%) (throttled)")
 	assert.Contains(t, checksumming, "ℹ️ Throttled: threads-running 21 > 18 · backing off while the database's active threads exceed its budget")
+
+	assert.NotContains(t, unknownSignal, ui.ThrottleDocURL)
 
 	notThrottled := FormatTableProgress(TableProgress{
 		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
@@ -702,7 +734,23 @@ func TestFormatTableProgress_Throttled(t *testing.T) {
 		RowsCopied: 100000, RowsTotal: 100000, PercentComplete: 100,
 		Throttled: true, ThrottleReason: "replica-lag 12s > 10s",
 	})
+	assert.NotContains(t, completed, ui.ThrottleDocURL)
+	assert.NotContains(t, notThrottled, ui.ThrottleDocURL)
 	assert.NotContains(t, completed, "Throttled", "a terminal table never renders a stale throttle flag")
+}
+
+// Interactive throttle hints point at the throttle reference the way a PR
+// comment's docs line does: the docs glyph, a readable label, and the page's
+// short path as the hyperlink text.
+func TestFormatTableProgress_ThrottleHyperlink(t *testing.T) {
+	enableHyperlinks(t)
+	output := FormatThrottleReference([]TableProgress{{
+		TableName: "orders", ChangeType: "alter", Status: state.Apply.Running,
+		RowsCopied: 45000, RowsTotal: 100000, PercentComplete: 45,
+		Throttled: true, ThrottleReason: "commit-latency 120ms >= 100ms",
+	}})
+	assert.Contains(t, output, glyph.Docs+" Docs: "+ANSIBlue+ui.Link("docs/throttle.md", ui.ThrottleDocURL)+ANSIReset)
+	assert.NotContains(t, output, ANSIDim, "the docs line is not dimmed")
 }
 
 func TestFormatTableProgress_InstantDDL(t *testing.T) {
@@ -789,7 +837,7 @@ func TestFormatTableProgress_InstantAlterRendering(t *testing.T) {
 		PercentComplete: 25,
 	}
 	output := FormatTableProgress(copying)
-	assert.Contains(t, output, "25%", "a copying instant-flagged ALTER shows its real percent")
+	assert.Contains(t, output, "25.00%", "a copying instant-flagged ALTER shows its real percent")
 	assert.NotContains(t, output, "Applying instantly", "the instant label must not mask copy progress")
 
 	instant := TableProgress{
@@ -834,16 +882,22 @@ func TestFormatTableProgress_CreateDropLabels(t *testing.T) {
 	assert.Contains(t, output, ui.ProgressBarRowCopy(45))
 	assert.NotContains(t, output, ui.ProgressBarRowCopy(100))
 
+	// Once row counts arrive, the displayed percent is computed from them
+	// rather than the engine's stale whole-number percent.
 	tp.RowsCopied = 420
 	tp.RowsTotal = 1000
 	tp.ETASeconds = 120
 	output = FormatTableProgress(tp)
-	assert.Contains(t, output, "Row copy in progress (45%)")
+	assert.Contains(t, output, "Row copy in progress (42.00%)")
 	assert.Contains(t, output, "Rows: 420 / 1,000 · ETA: 2m")
 	assert.NotContains(t, output, "Recovering state...")
 }
 
-func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copy that has begun but not yet reached 1% shows the true fraction
+// computed from the row counts, with the bar's first segment lit so the
+// operator sees both that copying started and how little of a huge table has
+// actually copied.
+func TestFormatTableProgress_SubPercentRowCopyShowsFraction(t *testing.T) {
 	tp := TableProgress{
 		TableName:       "orders",
 		ChangeType:      "alter",
@@ -855,15 +909,14 @@ func TestFormatTableProgress_RowCopyDisplaysOnePercentAfterCopyStarts(t *testing
 
 	output := FormatTableProgress(tp)
 
-	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, output, "orders: "+ui.ProgressBarRowCopy(1)+" 0.19%")
 	assert.Contains(t, output, "Rows: 3,000 / 1,604,159")
 	assert.NotContains(t, output, " 0%")
 }
 
-// A Spirit row-copy reports its detail string and a structured ETA. The CLI
-// renders the ETA from the structured field (the same source and FormatETA the
-// PR comment uses), so the two surfaces show an identical "Rows … · ETA …" line
-// even though the detail string itself no longer carries the ETA.
+// A row copy renders its ETA from the structured field (the same source and
+// FormatETA the PR comment uses), so the two surfaces show an identical
+// "Rows … · ETA …" line.
 func TestFormatTableProgress_RowCopyShowsStructuredETA(t *testing.T) {
 	tp := TableProgress{
 		TableName:       "users",
@@ -873,7 +926,6 @@ func TestFormatTableProgress_RowCopyShowsStructuredETA(t *testing.T) {
 		RowsTotal:       100_000,
 		PercentComplete: 45,
 		ETASeconds:      340,
-		ProgressDetail:  "45000/100000 45% copyRows",
 	}
 
 	output := FormatTableProgress(tp)
@@ -908,38 +960,61 @@ func TestFormatTableProgress_FailedRetryableKeepsProgress(t *testing.T) {
 }
 
 func TestFormatTableProgress_EstimateExceeded(t *testing.T) {
-	t.Run("structured progress", func(t *testing.T) {
-		tp := TableProgress{
-			TableName:       "users",
-			ChangeType:      "alter",
-			Status:          state.Apply.Running,
-			RowsCopied:      145000,
-			RowsTotal:       100000,
-			PercentComplete: 145,
-		}
+	tp := TableProgress{
+		TableName:       "users",
+		ChangeType:      "alter",
+		Status:          state.Apply.Running,
+		RowsCopied:      145000,
+		RowsTotal:       100000,
+		PercentComplete: 145,
+	}
 
-		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
-		assert.Contains(t, output, "Rows copied: 145,000 so far")
-		assert.Contains(t, output, ui.EstimateExceededTooltip)
-		assert.NotContains(t, output, "145%")
-		assert.NotContains(t, output, "100%")
-		assert.NotContains(t, output, "100,000 / 100,000")
-	})
+	output := FormatTableProgress(tp)
+	assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
+	assert.Contains(t, output, "Rows copied: 145,000 so far")
+	assert.Contains(t, output, ui.EstimateExceededTooltip)
+	assert.NotContains(t, output, "145%")
+	assert.NotContains(t, output, "100%")
+	assert.NotContains(t, output, "100,000 / 100,000")
+}
 
-	t.Run("parsed Spirit progress", func(t *testing.T) {
-		tp := TableProgress{
-			TableName:      "users",
-			ChangeType:     "alter",
-			Status:         state.Apply.Running,
-			ProgressDetail: "145000/100000 100% copyRows ETA TBD",
-		}
+// A table whose copy has passed the engine's estimate is still an in-progress
+// block, so it ends like one: a blank line before the next table, and the
+// per-shard rows when the table is sharded. Without the blank line the next
+// table's header reads as a continuation of the finalizing table's notes.
+func TestFormatTableProgress_EstimateExceededEndsLikeEveryBlock(t *testing.T) {
+	finalizing := TableProgress{
+		TableName:       "customers",
+		ChangeType:      "alter",
+		Status:          state.Apply.Running,
+		DDL:             "ALTER TABLE `customers` MODIFY COLUMN `created_at` timestamp NOT NULL",
+		RowsCopied:      103150850,
+		RowsTotal:       100000000,
+		PercentComplete: 103,
+	}
+	queued := TableProgress{
+		TableName:  "deposits",
+		ChangeType: "alter",
+		Status:     state.Apply.Pending,
+		DDL:        "ALTER TABLE `deposits` ADD INDEX `idx_state`(`state`)",
+	}
 
-		output := FormatTableProgress(tp)
-		assert.Contains(t, output, ui.ProgressBarActivity()+" Finalizing copy")
-		assert.Contains(t, output, "Rows copied: 145,000 so far")
-		assert.NotContains(t, output, "100%")
-	})
+	output := FormatTableProgress(finalizing) + FormatTableProgress(queued)
+
+	tooltip := ui.EstimateExceededTooltip + ANSIReset + "\n"
+	require.Contains(t, output, tooltip)
+	assert.Contains(t, output, tooltip+"\n"+indentTable+progressSymbol("alter")+"deposits: ⏳ Queued",
+		"a blank line separates the finalizing table from the next one")
+
+	sharded := finalizing
+	sharded.Shards = []ShardProgress{
+		{Shard: "-80", Status: state.Apply.Running, RowsCopied: 51575425, RowsTotal: 50000000, PercentComplete: 103},
+		{Shard: "80-", Status: state.Apply.Running, RowsCopied: 51575425, RowsTotal: 50000000, PercentComplete: 103},
+	}
+	shardedOutput := FormatTableProgress(sharded)
+	assert.Contains(t, shardedOutput, "Shards: 2")
+	assert.Contains(t, shardedOutput, "-80")
+	assert.Contains(t, shardedOutput, "80-")
 }
 
 func TestFormatVSchemaStatus(t *testing.T) {
@@ -1053,7 +1128,7 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 		RowsCopied:      300,
 		RowsTotal:       1000,
 	})
-	assert.Contains(t, cancelled, "🚫 Cancelled at 30%")
+	assert.Contains(t, cancelled, "🚫 Cancelled at 30.00%")
 	assert.Contains(t, cancelled, ui.ColorOrange)
 	assert.NotContains(t, cancelled, ui.ColorRed)
 
@@ -1067,4 +1142,23 @@ func TestFormatTableProgressOperatorHaltedBars(t *testing.T) {
 	})
 	assert.Contains(t, failed, "❌ Failed")
 	assert.Contains(t, failed, ui.ColorRed)
+}
+
+func TestThrottleReferenceRequiresActiveRecognizedSignal(t *testing.T) {
+	for _, status := range []string{state.Task.Running, state.Task.Checksumming} {
+		t.Run(status, func(t *testing.T) {
+			table := TableProgress{Status: status, Throttled: true, ThrottleReason: "redo-aware 4 > 3"}
+			assert.Contains(t, FormatThrottleReference([]TableProgress{table}), ui.ThrottleDocURL)
+		})
+	}
+
+	for _, table := range []TableProgress{
+		{Status: state.Task.Running, ThrottleReason: "redo-aware 4 > 3"},
+		{Status: state.Task.Running, Throttled: true, ThrottleReason: "unknown"},
+		{Status: state.Task.Running, Throttled: true},
+		{Status: state.Task.Completed, Throttled: true, ThrottleReason: "redo-aware 4 > 3"},
+		{Status: state.Task.Stopped, Throttled: true, ThrottleReason: "redo-aware 4 > 3"},
+	} {
+		assert.Empty(t, FormatThrottleReference([]TableProgress{table}))
+	}
 }

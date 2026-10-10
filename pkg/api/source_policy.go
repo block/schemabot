@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 const (
@@ -122,7 +124,7 @@ func (c *ServerConfig) RepoHasSchemaDirAllowlist(repo string) bool {
 	if c == nil {
 		return false
 	}
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		if len(dbConfig.AllowedDirs) == 0 {
 			continue
 		}
@@ -140,7 +142,7 @@ func (c *ServerConfig) SchemaPathAllowedForRepo(repo, schemaPath string) bool {
 	if c == nil {
 		return false
 	}
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		if len(dbConfig.AllowedDirs) == 0 {
 			continue
 		}
@@ -163,7 +165,7 @@ func (c *ServerConfig) DatabaseForSchemaPath(repo, schemaPath string) (string, b
 	if c == nil {
 		return "", false
 	}
-	for name, dbConfig := range c.Databases {
+	for name, dbConfig := range c.DatabaseConfigs() {
 		if len(dbConfig.AllowedDirs) == 0 || !databaseAllowsRepo(dbConfig, repo) {
 			continue
 		}
@@ -217,9 +219,11 @@ func validateAllowedRepos(field string, repos []string) error {
 }
 
 func repoAllowed(allowedRepos []string, repo string) bool {
-	repo = strings.TrimSpace(repo)
+	repo = storage.CanonicalKey(strings.TrimSpace(repo))
 	for _, allowed := range allowedRepos {
-		switch strings.TrimSpace(allowed) {
+		// Entries loaded through config are already canonical; folding here
+		// too keeps the match correct for allow-lists built any other way.
+		switch storage.CanonicalKey(strings.TrimSpace(allowed)) {
 		case "*":
 			return true
 		case repo:
@@ -239,10 +243,13 @@ func schemaPathAllowed(allowedDirs []string, schemaPath string) bool {
 		return false
 	}
 
+	// Each entry is judged on its own: an entry that does not normalize matches
+	// nothing, and the entries after it are still consulted. Config load
+	// rejects such entries, so this only matters for lists built any other way.
 	for _, allowedDir := range allowedDirs {
 		cleanAllowedDir, err := normalizeSchemaPath(allowedDir)
 		if err != nil {
-			return false
+			continue
 		}
 		if cleanAllowedDir == "*" {
 			return true

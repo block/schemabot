@@ -8,97 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestCountShardsByStatus(t *testing.T) {
-	shards := []ShardProgress{
-		{Shard: "-80", Status: state.Task.Running},
-		{Shard: "80-c0", Status: state.Task.Running},
-		{Shard: "c0-", Status: state.Task.WaitingForCutover},
-	}
-	c := CountShardsByStatus(shards)
-	assert.Equal(t, 3, c.Total)
-	assert.Equal(t, 2, c.Running)
-	assert.Equal(t, 1, c.WaitingForCutover)
-	assert.Equal(t, 0, c.Complete)
-	assert.Equal(t, 0, c.CuttingOver)
-}
-
-func TestCountShardsByStatus_AllComplete(t *testing.T) {
-	shards := []ShardProgress{
-		{Shard: "-80", Status: state.Task.Completed},
-		{Shard: "80-", Status: state.Task.Completed},
-	}
-	c := CountShardsByStatus(shards)
-	assert.Equal(t, 2, c.Complete)
-	assert.Equal(t, 0, c.Running)
-	assert.Equal(t, 0, c.WaitingForCutover)
-}
-
-func TestCountShardsByStatus_CuttingOverSeparateFromComplete(t *testing.T) {
-	shards := []ShardProgress{
-		{Shard: "-80", Status: state.Task.CuttingOver},
-		{Shard: "80-", Status: state.Task.CuttingOver},
-	}
-	c := CountShardsByStatus(shards)
-	assert.Equal(t, 2, c.CuttingOver)
-	assert.Equal(t, 0, c.Complete)
-}
-
-func TestCountShardsByStatus_WaitingForCutoverSeparateFromComplete(t *testing.T) {
-	shards := []ShardProgress{
-		{Shard: "-80", Status: state.Task.WaitingForCutover},
-		{Shard: "80-", Status: state.Task.WaitingForCutover},
-	}
-	c := CountShardsByStatus(shards)
-	assert.Equal(t, 2, c.WaitingForCutover)
-	assert.Equal(t, 0, c.Complete)
-}
-
-func TestCountShardsByStatus_Cancelled(t *testing.T) {
-	shards := []ShardProgress{
-		{Shard: "-80", Status: state.Task.Cancelled},
-		{Shard: "80-", Status: state.Task.Cancelled},
-	}
-	c := CountShardsByStatus(shards)
-	assert.Equal(t, 2, c.Cancelled)
-	assert.Equal(t, 0, c.Failed)
-}
-
-func TestFormatShardSummaryParts_CopyingNotRunning(t *testing.T) {
-	c := ShardCounts{Running: 3}
-	parts := FormatShardSummaryParts(c, false)
-	assert.Contains(t, parts, "3 copying")
-	for _, p := range parts {
-		assert.NotContains(t, p, "running")
-	}
-}
-
-func TestFormatShardSummaryParts_WaitingForCutover(t *testing.T) {
-	c := ShardCounts{WaitingForCutover: 5}
-	parts := FormatShardSummaryParts(c, false)
-	assert.Contains(t, parts, "5 waiting for cutover")
-}
-
-func TestFormatShardSummaryParts_CuttingOver(t *testing.T) {
-	c := ShardCounts{CuttingOver: 2}
-	parts := FormatShardSummaryParts(c, false)
-	assert.Contains(t, parts, "2 cutting over")
-}
-
-func TestFormatShardSummaryParts_Mixed(t *testing.T) {
-	c := ShardCounts{Complete: 10, Running: 20, WaitingForCutover: 2}
-	parts := FormatShardSummaryParts(c, false)
-	assert.Equal(t, 3, len(parts))
-	assert.Equal(t, "10 complete", parts[0])
-	assert.Equal(t, "2 waiting for cutover", parts[1])
-	assert.Equal(t, "20 copying", parts[2])
-}
-
-func TestFormatShardSummaryParts_Empty(t *testing.T) {
-	c := ShardCounts{}
-	parts := FormatShardSummaryParts(c, false)
-	assert.Equal(t, []string{"none"}, parts)
-}
-
 func TestFormatDurationSeconds(t *testing.T) {
 	tests := []struct {
 		seconds  int64
@@ -118,17 +27,20 @@ func TestFormatDurationSeconds(t *testing.T) {
 	}
 }
 
-func TestFormatShardLineDisplaysOnePercentAfterCopyStarts(t *testing.T) {
+// A copying shard that hasn't reached 1% shows the true fraction computed
+// from its row counts, so a shard's early progress on a huge table reads as
+// the small fraction it is instead of a rounded-up 1%.
+func TestFormatShardLineShowsSubPercentFraction(t *testing.T) {
 	line := formatShardLine(ShardProgress{
 		Shard:           "-80",
 		Status:          state.Task.Running,
 		RowsCopied:      3_000,
 		RowsTotal:       1_604_159,
 		PercentComplete: 0,
-	})
+	}, "queued")
 
-	assert.Contains(t, line, "1% (3,000/1,604,159 rows)")
-	assert.NotContains(t, line, "0%")
+	assert.Contains(t, line, "0.19% · 3,000 / 1,604,159 rows")
+	assert.NotContains(t, line, " 0%")
 }
 
 func TestIsPlanetScaleEngine(t *testing.T) {
@@ -158,9 +70,9 @@ func TestFormatShardProgressShowsMostBehindCopyingShardsFirst(t *testing.T) {
 	}
 	out := FormatShardProgress(shards)
 
-	// The five furthest-behind copying shards render individually, in
+	// The three furthest-behind copying shards render individually, in
 	// ascending percent order.
-	shown := []string{"s10", "s20", "s30", "s50", "s70"}
+	shown := []string{"s10", "s20", "s30"}
 	lastIdx := -1
 	for _, shard := range shown {
 		idx := strings.Index(out, shard)
@@ -168,8 +80,7 @@ func TestFormatShardProgressShowsMostBehindCopyingShardsFirst(t *testing.T) {
 		lastIdx = idx
 	}
 
-	// The two furthest-ahead copying shards collapse into the summary line.
-	assert.NotContains(t, out, "s80")
-	assert.NotContains(t, out, "s90")
-	assert.Contains(t, out, "... 2 more copying shards")
+	// The rest are counted in the heading.
+	assert.Contains(t, out, "Shards: 9 (7 copying, 2 complete)")
+	assert.NotContains(t, out, "s50")
 }

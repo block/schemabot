@@ -5,6 +5,8 @@ package sqlstore
 import (
 	"context"
 	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +97,68 @@ func TestTaskStore_OperationLeaseGuardsUpdate(t *testing.T) {
 	reloaded, err = store.Tasks().Get(ctx, "task_oplease_users")
 	require.NoError(t, err)
 	assert.Equal(t, state.Task.Completed, reloaded.State)
+}
+
+// An operation lease absence guard is the conflict check's settlement write: it
+// holds no lease of its own and lands only while no drive holds the task's
+// operation. A heartbeated operation lease refuses the write and leaves the row
+// untouched; once the lease has aged past the reclaim window the write lands.
+func TestTaskStore_OperationLeaseAbsenceGuardsUpdate(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApply(t, store, lock, "apply_task_opabsence", 1)
+
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	stampOperationLease(t, opID, "driver", "op-token")
+
+	now := time.Now()
+	taskID, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier:   "task_opabsence_users",
+		ApplyID:          apply.ID,
+		ApplyOperationID: &opID,
+		PlanID:           apply.PlanID,
+		Database:         apply.Database,
+		DatabaseType:     apply.DatabaseType,
+		Engine:           storage.EngineSpirit,
+		Environment:      apply.Environment,
+		State:            state.Task.Running,
+		TableName:        "users",
+		DDL:              "ALTER TABLE `users` ADD COLUMN email VARCHAR(255)",
+		DDLAction:        "ALTER",
+		Options:          []byte("{}"),
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	task.ID = taskID
+	guarded := storage.WithOperationLeaseAbsent(ctx, storage.OperationLeaseAbsence{ApplyID: apply.ID, OperationID: opID})
+
+	task.State = state.Task.Failed
+	require.ErrorIs(t, store.Tasks().Update(guarded, task), storage.ErrOperationLeaseActive,
+		"a drive heartbeating the operation keeps the task")
+	reloaded, err := store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Running, reloaded.State)
+
+	_, err = testDB.ExecContext(ctx,
+		`UPDATE apply_operations SET updated_at = DATE_SUB(NOW(), INTERVAL ? SECOND) WHERE id = ?`,
+		int64((storage.ApplyLeaseStaleAfter + time.Minute).Seconds()), opID)
+	require.NoError(t, err)
+
+	require.NoError(t, store.Tasks().Update(guarded, task), "a stale operation lease no longer holds the task")
+	reloaded, err = store.Tasks().Get(ctx, "task_opabsence_users")
+	require.NoError(t, err)
+	assert.Equal(t, state.Task.Failed, reloaded.State)
 }
 
 // CountByApplyID reports every task row an apply owns — unsharded drive rows
@@ -340,6 +404,8 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 		DDLAction:      "ALTER",
 		Throttled:      true,
 		ThrottleReason: "replica-lag 12s > 10s",
+		ExecutionMode:  "blocked",
+		ModeReason:     "requires privileges unavailable to the engine",
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	})
@@ -350,6 +416,8 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 	require.NotNil(t, got)
 	assert.True(t, got.Throttled)
 	assert.Equal(t, "replica-lag 12s > 10s", got.ThrottleReason)
+	assert.Equal(t, "blocked", got.ExecutionMode)
+	assert.Equal(t, "requires privileges unavailable to the engine", got.ModeReason)
 
 	got.Throttled = false
 	got.ThrottleReason = ""
@@ -358,6 +426,71 @@ func TestTaskStore_ThrottleRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, cleared.Throttled, "the pause clears when the throttler releases")
 	assert.Empty(t, cleared.ThrottleReason)
+	assert.Equal(t, "blocked", cleared.ExecutionMode, "the admitting verdict survives an update that touched other columns")
+	assert.Equal(t, "requires privileges unavailable to the engine", cleared.ModeReason)
+}
+
+// An engine's ETA and throttle reason are display values it may report past
+// what their columns hold, as a copy over a sparse primary key can. The
+// progress write fits them to the columns instead of being refused, so the row
+// keeps updating, and the caller's task carries the values the row holds.
+// A value storage refuses outright comes back as storage.ErrValueRejected, so
+// the drive can tell it apart from a write a retry would land.
+func TestTaskStore_UpdateBoundsEngineReportedValuesAndReportsRejectedValues(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testapp", "mysql")
+	apply := createTestApply(t, store, lock, "apply_eta", 1)
+	now := time.Now()
+	_, err := store.Tasks().Create(ctx, &storage.Task{
+		TaskIdentifier: "task_eta",
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         storage.EngineSpirit,
+		Environment:    apply.Environment,
+		State:          state.Task.Running,
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD INDEX `idx_email` (`email`)",
+		DDLAction:      "ALTER",
+		ETASeconds:     -1,
+		ThrottleReason: strings.Repeat("x", 300),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	})
+	require.NoError(t, err)
+
+	task, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	require.NotNil(t, task)
+	assert.Zero(t, task.ETASeconds, "a negative estimate is stored as no estimate")
+	assert.Equal(t, strings.Repeat("x", 254)+"…", task.ThrottleReason, "the insert fits the reason to its column")
+	task.ETASeconds = math.MaxInt32 + 1_000_000
+	task.ThrottleReason = strings.Repeat("é", 300)
+	task.RowsCopied = 42
+	require.NoError(t, store.Tasks().Update(ctx, task), "engine values past their columns do not refuse the progress write")
+
+	stored, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Equal(t, math.MaxInt32, stored.ETASeconds)
+	assert.Equal(t, strings.Repeat("é", 254)+"…", stored.ThrottleReason, "the reason is cut on a character boundary")
+	assert.Equal(t, int64(42), stored.RowsCopied, "the rest of the progress lands with it")
+	assert.Equal(t, stored.ETASeconds, task.ETASeconds, "the caller's task holds what the row holds")
+	assert.Equal(t, stored.ThrottleReason, task.ThrottleReason)
+
+	stored.ETASeconds = -5
+	require.NoError(t, store.Tasks().Update(ctx, stored))
+	reread, err := store.Tasks().Get(ctx, "task_eta")
+	require.NoError(t, err)
+	assert.Zero(t, reread.ETASeconds, "a negative estimate is stored as no estimate")
+
+	reread.ExecutionMode = strings.Repeat("x", 60)
+	err = store.Tasks().Update(ctx, reread)
+	require.ErrorIs(t, err, storage.ErrValueRejected, "a value the column cannot hold is reported as rejected")
 }
 
 // A sharded work operation's operation key identifies which shard task is real
@@ -673,11 +806,22 @@ func TestTaskStore_UpsertShardProgress(t *testing.T) {
 	assert.Equal(t, state.Task.Completed, got[0].State, "a lost lease must not overwrite the shard row")
 	assert.Equal(t, 100, got[0].ProgressPercent)
 
-	// A different shard under the same operation is a separate row.
-	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), shardTask("80-")))
+	// A different shard under the same operation is a separate row. The insert
+	// fits the engine's display values to their columns rather than being
+	// refused over them.
+	second := shardTask("80-")
+	second.ETASeconds = math.MaxInt32 + 1_000_000
+	second.ThrottleReason = strings.Repeat("x", 300)
+	require.NoError(t, store.Tasks().UpsertShardProgress(opCtx("op-token"), second))
 	got, err = store.Tasks().GetShardProgressByApplyOperationID(ctx, opID)
 	require.NoError(t, err)
-	assert.Len(t, got, 2, "a different shard is its own per-shard task row")
+	require.Len(t, got, 2, "a different shard is its own per-shard task row")
+	for _, row := range got {
+		if row.Shard == "80-" {
+			assert.Equal(t, math.MaxInt32, row.ETASeconds)
+			assert.Equal(t, strings.Repeat("x", 254)+"…", row.ThrottleReason)
+		}
+	}
 
 	// A row targeting a different operation than the held lease is refused, so
 	// the lease cannot gate a write that points at another operation.
@@ -801,6 +945,76 @@ func TestTaskStore_UpsertShardProgressUnderApplyLease(t *testing.T) {
 	crossApply := shardTask("a0-")
 	crossApply.ApplyOperationID = &otherOpID // belongs to otherApply, not the leased apply
 	require.ErrorContains(t, store.Tasks().UpsertShardProgress(applyCtx("apply-token"), crossApply), "belongs to apply")
+}
+
+// missingInsert reports every guarded insert as a miss without running it, so
+// a test can reach the branch where the fence let nothing through while the
+// lease still reads as current — a path real SQL cannot produce today.
+type missingInsert struct{ identityInserter }
+
+func (missingInsert) InsertGuardedID(context.Context, queryExecer, string, ...any) (int64, bool, error) {
+	return 0, false, nil
+}
+
+// A guarded shard insert that writes nothing while the lease is still current
+// must not report success: no row exists and task.ID is still zero, so the
+// caller would carry on as if its progress row were stored. Both lease paths
+// match ApplyLogs().Append and return an error that is not a lease loss.
+func TestTaskStore_UpsertShardProgressReportsMissUnderCurrentLease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+	lock := createTestLock(t, store, "probe_shard_miss_db", "vitess")
+	apply := createTestApply(t, store, lock, "apply_probe_shard_miss", 939)
+	opID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", Target: "payments",
+	})
+	require.NoError(t, err)
+	realInserter := store.tasks.identity
+	store.tasks.identity = missingInsert{realInserter}
+	t.Cleanup(func() { store.tasks.identity = realInserter })
+
+	shardTask := func() *storage.Task {
+		now := time.Now()
+		return &storage.Task{
+			TaskIdentifier: "task_shard_miss", ApplyID: apply.ID, ApplyOperationID: &opID,
+			PlanID: apply.PlanID, Database: apply.Database, DatabaseType: apply.DatabaseType,
+			Engine: storage.EnginePlanetScale, Environment: apply.Environment,
+			State: state.Task.Running, Namespace: "payments", TableName: "users", Shard: "-80",
+			DDL: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", DDLAction: "ALTER",
+			ProgressPercent: 20, CreatedAt: now, UpdatedAt: now,
+		}
+	}
+
+	t.Run("apply lease", func(t *testing.T) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE applies SET lease_owner = ?, lease_token = ?, lease_acquired_at = NOW() WHERE id = ?
+		`, "driver-a", "apply-token", apply.ID)
+		require.NoError(t, err)
+		ownerCtx := storage.WithApplyLease(ctx, storage.ApplyLease{ApplyID: apply.ID, Owner: "driver-a", Token: "apply-token"})
+
+		task := shardTask()
+		err = store.Tasks().UpsertShardProgress(ownerCtx, task)
+		require.Error(t, err, "no shard row was written, yet UpsertShardProgress returned nil with task.ID=%d", task.ID)
+		assert.NotErrorIs(t, err, storage.ErrApplyLeaseLost, "a miss under a current lease is not a lease loss")
+		assert.ErrorContains(t, err, "matched no rows despite current lease")
+		assert.Zero(t, task.ID)
+	})
+
+	t.Run("operation lease", func(t *testing.T) {
+		_, err := testDB.ExecContext(ctx, `
+			UPDATE apply_operations SET lease_owner = ?, lease_token = ? WHERE id = ?
+		`, "driver-a", "op-token", opID)
+		require.NoError(t, err)
+		ownerCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: opID, Owner: "driver-a", Token: "op-token"})
+
+		task := shardTask()
+		err = store.Tasks().UpsertShardProgress(ownerCtx, task)
+		require.Error(t, err, "no shard row was written, yet UpsertShardProgress returned nil with task.ID=%d", task.ID)
+		assert.NotErrorIs(t, err, storage.ErrApplyLeaseLost, "a miss under a current lease is not a lease loss")
+		assert.ErrorContains(t, err, "matched no rows despite current lease")
+		assert.Zero(t, task.ID)
+	})
 }
 
 // The object-ownership lookup answers "which pull requests have changed this
@@ -1098,6 +1312,60 @@ func backdateTaskCreatedAt(t *testing.T, identifier string, ageSeconds int64) {
 	require.NoError(t, err)
 }
 
+// backdateTaskUpdatedAt ages a task row's liveness signal, standing in for a
+// drive that stopped mirroring it that long ago.
+func backdateTaskUpdatedAt(t *testing.T, identifier string, age time.Duration) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE tasks SET updated_at = NOW() - INTERVAL ? SECOND WHERE task_identifier = ?",
+		int64(age.Seconds()), identifier)
+	require.NoError(t, err)
+}
+
+// leasedOperationFor creates an operation under the apply carrying a driver's
+// lease, heartbeated as of now, and returns its row ID.
+func leasedOperationFor(t *testing.T, store *Storage, apply *storage.Apply, deployment string) int64 {
+	t.Helper()
+	id, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: deployment,
+		Target:     apply.Database,
+		State:      state.ApplyOperation.Running,
+	})
+	require.NoError(t, err)
+	stampOperationLease(t, id, "driver-"+deployment, "token-"+deployment)
+	return id
+}
+
+// attachTaskToOperation puts the task under the operation, the way a drive's
+// own task rows are created.
+func attachTaskToOperation(t *testing.T, identifier string, operationID int64) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE tasks SET apply_operation_id = ? WHERE task_identifier = ?", operationID, identifier)
+	require.NoError(t, err)
+}
+
+// backdateOperationHeartbeat ages the operation's lease heartbeat, which is what
+// the claim path reads to decide the lease is re-claimable.
+func backdateOperationHeartbeat(t *testing.T, operationID int64, age time.Duration) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE apply_operations SET updated_at = NOW() - INTERVAL ? SECOND WHERE id = ?",
+		int64(age.Seconds()), operationID)
+	require.NoError(t, err)
+}
+
+// clearOperationLeaseOwner leaves the operation owned by nobody while stamping
+// it as of now, the shape the operation reaper's own guarded write produces.
+func clearOperationLeaseOwner(t *testing.T, operationID int64) {
+	t.Helper()
+	_, err := testDB.ExecContext(t.Context(),
+		"UPDATE apply_operations SET lease_owner = '', lease_token = '', updated_at = NOW() WHERE id = ?",
+		operationID)
+	require.NoError(t, err)
+}
+
 // Selection and the write are separate statements, so a concurrent writer can
 // advance the row in between. The write is guarded on the row still being
 // failed_retryable, so the sweep skips it rather than overwriting a newer state.
@@ -1202,4 +1470,470 @@ func TestTaskStore_ReapStrandedRetryable_ElectsOneReaperPerPass(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, settled, 1, "the task reaper lock is released after each pass")
 	assert.Equal(t, next.TaskIdentifier, settled[0].Task.TaskIdentifier)
+}
+
+// A driver that records its apply's verdict and exits before closing its task
+// rows leaves them in an active state under a settled parent. Nothing revisits
+// them — the verdict is final — so the rows read as live work forever, which is
+// what makes a completed apply render a table still copying. The reaper settles
+// them to the parent's recorded outcome. Parents that are merely paused, and
+// live parents, keep their rows for the driver or resume path.
+func TestTaskStore_ReapStrandedActive_SettlesTasksUnderSettledParents(t *testing.T) {
+	const parentError = "target rejected the schema change"
+
+	tests := []struct {
+		name        string
+		parentState string
+		wantState   string
+		settles     bool
+	}{
+		{"completed parent settles its stranded task", state.Apply.Completed, state.Task.Completed, true},
+		{"failed parent settles its stranded task", state.Apply.Failed, state.Task.Failed, true},
+		{"cancelled parent settles its stranded task", state.Apply.Cancelled, state.Task.Cancelled, true},
+		{"reverted parent settles its stranded task", state.Apply.Reverted, state.Task.Reverted, true},
+		{"stopped parent keeps its task for the resume path", state.Apply.Stopped, state.Task.Running, false},
+		{"failed_retryable parent keeps its task for the retry path", state.Apply.FailedRetryable, state.Task.Running, false},
+		{"running parent keeps its task for its driver", state.Apply.Running, state.Task.Running, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "reap_active_db", "mysql")
+			parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_"+tt.parentState, 1, tt.parentState, "staging")
+			setApplyErrorMessage(t, parent.ID, parentError)
+			backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+			stranded := createRetryableReapTask(t, store, parent, "task_reap_active_users", "users", state.Task.Running, "")
+			// A failed_retryable sibling belongs to the retryable sweep, which
+			// waits out a far longer window because the parent's recovery path
+			// may still dispatch its retry. This sweep must not take it.
+			retryableSibling := createRetryableReapTask(t, store, parent, "task_reap_active_orders", "orders", state.Task.FailedRetryable, "copy failed")
+			// No drive has mirrored either row for longer than a stalled drive
+			// would be allowed to run, so nothing is coming back for them.
+			backdateTaskUpdatedAt(t, stranded.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+			backdateTaskUpdatedAt(t, retryableSibling.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+			settled, err := store.tasks.reapStrandedActive(ctx, 10)
+			require.NoError(t, err)
+
+			reloaded, err := store.Tasks().Get(ctx, stranded.TaskIdentifier)
+			require.NoError(t, err)
+			require.NotNil(t, reloaded)
+			assertTaskState(t, store, retryableSibling.TaskIdentifier, state.Task.FailedRetryable)
+
+			if !tt.settles {
+				assert.Empty(t, settled, "a %s parent may still write its task rows, so they are left alone", tt.parentState)
+				assert.Equal(t, tt.wantState, reloaded.State)
+				assert.Nil(t, reloaded.CompletedAt, "an untouched active task has no completion time")
+				return
+			}
+
+			require.Len(t, settled, 1, "the stranded task under a %s parent settles", tt.parentState)
+			assert.Equal(t, stranded.TaskIdentifier, settled[0].Task.TaskIdentifier)
+			assert.Equal(t, tt.wantState, settled[0].Task.State, "the returned row carries the state it was written to")
+			assert.Equal(t, parent.ApplyIdentifier, settled[0].Parent.ApplyIdentifier, "the parent travels with the settlement for triage logging")
+
+			assert.Equal(t, tt.wantState, reloaded.State, "the task takes the parent's recorded verdict")
+			assert.NotNil(t, reloaded.CompletedAt, "every settled parent state is non-resumable, so the row is stamped complete")
+			if tt.wantState == state.Task.Failed {
+				assert.Equal(t, parentError, reloaded.ErrorMessage, "a task with no explanation of its own inherits the parent's")
+			}
+
+			again, err := store.tasks.reapStrandedActive(ctx, 10)
+			require.NoError(t, err)
+			assert.Empty(t, again, "a settled row is no longer active, so a later sweep finds nothing to do")
+		})
+	}
+}
+
+// The guarded write re-verifies the row's state, so a task a driver advanced
+// between the sweep's scan and its write belongs to that driver, not the reaper.
+func TestTaskStore_ReapStrandedActive_SkipsRowThatLeftTheStateItWasReadIn(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_race_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_race", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_race", "users", state.Task.Running, "")
+
+	// Read the row as the sweep would, then let a driver move it before the
+	// guarded write runs.
+	task.State = state.Task.CuttingOver
+	require.NoError(t, store.Tasks().Update(ctx, task))
+	task.State = state.Task.Running
+	// Age the row again so the quiescence gate admits it: the state guard alone
+	// must be enough to refuse the write.
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	settled, err := store.tasks.reapStrandedActiveTask(ctx, task, parent)
+	require.NoError(t, err)
+	assert.False(t, settled, "the row moved after the scan, so it belongs to whoever moved it")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.CuttingOver)
+}
+
+// A settled parent does not mean every task under it is dead. Under a fan-out
+// rollout a halt-policy deployment that fails projects the apply to failed while
+// its siblings keep driving, and a sibling drive holding only an operation lease
+// may not bump the parent applies row — so the parent can read settled and
+// quiescent while real work continues. The task row is what that drive still
+// touches, so its own freshness is what keeps the sweep off it.
+func TestTaskStore_ReapStrandedActive_KeepsTaskADriveIsStillMirroring(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_live_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_live", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+	// The failed deployment's task, untouched since its drive exited.
+	dead := createRetryableReapTask(t, store, parent, "task_reap_active_dead", "users", state.Task.Running, "")
+	backdateTaskUpdatedAt(t, dead.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+	// A sibling deployment still copying: its drive mirrored the row just now.
+	live := createRetryableReapTask(t, store, parent, "task_reap_active_live", "orders", state.Task.Running, "")
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+
+	require.Len(t, settled, 1, "only the row no drive is mirroring settles")
+	assert.Equal(t, dead.TaskIdentifier, settled[0].Task.TaskIdentifier)
+	assertTaskState(t, store, live.TaskIdentifier, state.Task.Running)
+
+	reloaded, err := store.Tasks().Get(ctx, live.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, reloaded)
+	assert.Nil(t, reloaded.CompletedAt, "a table still copying is not stamped complete")
+	assert.Empty(t, reloaded.ErrorMessage, "a live table does not inherit the failed parent's explanation")
+}
+
+// The guarded write re-asserts quiescence, so a drive that mirrors the row
+// between the sweep's scan and its write keeps it.
+func TestTaskStore_ReapStrandedActive_SkipsRowADriveMirroredAfterTheScan(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_mirror_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_mirror", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_mirror", "users", state.Task.Running, "")
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	// The scan selected the row; before the write lands, its drive mirrors a
+	// progress tick, refreshing updated_at without changing state.
+	require.NoError(t, store.Tasks().Update(ctx, task))
+
+	settled, err := store.tasks.reapStrandedActiveTask(ctx, task, parent)
+	require.NoError(t, err)
+	assert.False(t, settled, "a drive spoke for the row after the scan, so it is not stranded")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
+}
+
+// A parent settled only moments ago may still be writing its own task rows
+// through terminal derivation or stop reconciliation, so the reaper waits out a
+// quiescence window before treating a row underneath it as abandoned.
+func TestTaskStore_ReapStrandedActive_WaitsOutParentQuiescence(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_quiet_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_quiet", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence-time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_quiet", "users", state.Task.Running, "")
+	// Age the task past its own window so the parent's is the only gate under
+	// test; otherwise this would pass on the task gate and prove nothing.
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, settled, "a parent that only just settled may still be writing its own task rows")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
+}
+
+// A driver holding the task's operation is the authority over that row, and the
+// sweep defers to the lease rather than to any timing argument. The row here is
+// stale by every window the sweep applies — its parent settled long ago and no
+// drive has mirrored it for longer than a stalled drive would survive — so the
+// lease is the only thing that can keep it, and it does. Once the lease stops
+// being heartbeated it becomes re-claimable by the claim path's own reckoning,
+// and from that moment the row is the reaper's.
+func TestTaskStore_ReapStrandedActive_KeepsTaskWhoseOperationADriverHolds(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_lease_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_lease", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+	held := leasedOperationFor(t, store, parent, "region-a")
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_lease", "users", state.Task.Running, "")
+	attachTaskToOperation(t, task.TaskIdentifier, held)
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, settled, "a driver holds the operation, so the row is not the reaper's to write")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
+
+	// The driver goes away without releasing: its heartbeat ages past the point
+	// where a peer would take the operation from it.
+	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	settled, err = store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "a lease a peer could reclaim no longer speaks for the row")
+	assert.Equal(t, task.TaskIdentifier, settled[0].Task.TaskIdentifier)
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Failed)
+}
+
+// The guarded write re-reads the lease, so a driver that claims the operation
+// between the sweep's scan and its write keeps the row.
+func TestTaskStore_ReapStrandedActive_SkipsRowWhoseOperationWasClaimedAfterTheScan(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_reclaim_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_reclaim", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+	unheld := leasedOperationFor(t, store, parent, "region-a")
+	backdateOperationHeartbeat(t, unheld, storage.ApplyLeaseStaleAfter+time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_reclaim", "users", state.Task.Running, "")
+	attachTaskToOperation(t, task.TaskIdentifier, unheld)
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	// The scan selected the row; before the write lands, a peer reclaims the
+	// stale operation and starts heartbeating it.
+	stampOperationLease(t, unheld, "peer-driver", "peer-token")
+
+	settled, err := store.tasks.reapStrandedActiveTask(ctx, task, parent)
+	require.NoError(t, err)
+	assert.False(t, settled, "a driver took the operation after the scan, so the row is theirs")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
+}
+
+// The retryable sweep defers to the same lease. A failed_retryable row under a
+// settled parent is dead only if no driver holds the operation it belongs to.
+func TestTaskStore_ReapStrandedRetryable_KeepsTaskWhoseOperationADriverHolds(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_retryable_lease_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_retryable_lease", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+	held := leasedOperationFor(t, store, parent, "region-a")
+	task := createRetryableReapTask(t, store, parent, "task_reap_retryable_lease", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, task.TaskIdentifier, held)
+
+	settled, err := store.tasks.reapStrandedRetryable(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, settled, "a driver holds the operation, so the retry promise is not the reaper's to retire")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.FailedRetryable)
+
+	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	settled, err = store.tasks.reapStrandedRetryable(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "a lease a peer could reclaim no longer speaks for the row")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Failed)
+}
+
+// The retryable sweep's guarded write re-reads the lease too. A peer that claims
+// the operation between the scan and the write keeps the row: a redispatched
+// drive holds its task at failed_retryable for its whole run, so hardening the
+// row to failed underneath it would retire a retry that is executing.
+func TestTaskStore_ReapStrandedRetryable_SkipsRowWhoseOperationWasClaimedAfterTheScan(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_retryable_reclaim_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_retryable_reclaim", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+	unheld := leasedOperationFor(t, store, parent, "region-a")
+	backdateOperationHeartbeat(t, unheld, storage.ApplyLeaseStaleAfter+time.Minute)
+	task := createRetryableReapTask(t, store, parent, "task_reap_retryable_reclaim", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, task.TaskIdentifier, unheld)
+
+	// The scan selected the row; before the write lands, a peer reclaims the
+	// stale operation and starts heartbeating it.
+	stampOperationLease(t, unheld, "peer-driver", "peer-token")
+
+	settled, err := store.tasks.reapStrandedRetryableTask(ctx, task)
+	require.NoError(t, err)
+	assert.False(t, settled, "a driver took the operation after the scan, so the retry is theirs to finish")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.FailedRetryable)
+}
+
+// The lease is read per operation, not per apply, which is the whole point of
+// reading it under fan-out: one deployment's drive can be live while another
+// deployment's rows are genuinely stranded under the same parent. A lease keeps
+// its own operation's rows and must not shield a sibling's, or the reaper would
+// stop repairing an abandoned deployment for as long as any sibling lives.
+func TestTaskStore_ReapStrandedActive_LeaseCoversOnlyItsOwnOperationsRows(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_fanout_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_fanout", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+	held := leasedOperationFor(t, store, parent, "region-a")
+	abandoned := leasedOperationFor(t, store, parent, "region-b")
+	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	// Both rows are stale by every window the sweep applies, so the only thing
+	// that can tell them apart is which operation each one belongs to.
+	live := createRetryableReapTask(t, store, parent, "task_reap_fanout_live", "users", state.Task.Running, "")
+	attachTaskToOperation(t, live.TaskIdentifier, held)
+	backdateTaskUpdatedAt(t, live.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	stranded := createRetryableReapTask(t, store, parent, "task_reap_fanout_stranded", "orders", state.Task.Running, "")
+	attachTaskToOperation(t, stranded.TaskIdentifier, abandoned)
+	backdateTaskUpdatedAt(t, stranded.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the live deployment's lease speaks for its own rows and no others")
+	assert.Equal(t, stranded.TaskIdentifier, settled[0].Task.TaskIdentifier)
+	assertTaskState(t, store, stranded.TaskIdentifier, state.Task.Failed)
+	assertTaskState(t, store, live.TaskIdentifier, state.Task.Running)
+}
+
+// The gate reads the lease with the claim path's own staleness window, so a
+// heartbeat anywhere inside that window still holds the row. A driver
+// heartbeats several times over the window's length, so a shorter window here
+// would read a healthy driver as gone on nearly every pass; a longer one would
+// hold rows a peer is already free to take.
+func TestTaskStore_ReapStrandedActive_KeepsTaskWhoseHeartbeatIsInsideTheStalenessWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_window_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_window", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+	held := leasedOperationFor(t, store, parent, "region-a")
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_window", "users", state.Task.Running, "")
+	attachTaskToOperation(t, task.TaskIdentifier, held)
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	// A heartbeat old enough to look idle, but well inside the window a peer
+	// would have to wait out before taking the operation.
+	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter/2)
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	assert.Empty(t, settled, "a heartbeat inside the claim path's window still holds the operation")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Running)
+
+	// One second past the window is where the claim path would let a peer take
+	// it, and that is where the row becomes the reaper's.
+	backdateOperationHeartbeat(t, held, storage.ApplyLeaseStaleAfter+time.Second)
+
+	settled, err = store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "past the window the lease no longer speaks for the row")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Failed)
+}
+
+// An operation with no lease owner is nobody's, however recently it was written.
+// The operation reaper settles a released operation with its own NOW() stamp, so
+// a fresh timestamp on an unowned row is routine, and reading it as a live lease
+// would strand that operation's task rows behind a driver that does not exist.
+func TestTaskStore_ReapStrandedActive_ReapsTaskWhoseOperationHasNoLeaseOwner(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_unowned_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_unowned", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+	unowned := leasedOperationFor(t, store, parent, "region-a")
+	clearOperationLeaseOwner(t, unowned)
+	task := createRetryableReapTask(t, store, parent, "task_reap_active_unowned", "users", state.Task.Running, "")
+	attachTaskToOperation(t, task.TaskIdentifier, unowned)
+	backdateTaskUpdatedAt(t, task.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "an unowned operation holds nothing, whatever its timestamp says")
+	assertTaskState(t, store, task.TaskIdentifier, state.Task.Failed)
+}
+
+// The gate is asserted on the scan as well as on the guarded write, so a leased
+// row never spends the sweep's limit. Asserting it only on the write would
+// produce the same outcome per row and hide that: the scan would fill its budget
+// with rows the write then refuses, leaving a genuinely stranded row behind them
+// for a later pass.
+func TestTaskStore_ReapStrandedActive_LeasedRowDoesNotSpendTheScanLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_active_budget_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_active_budget", 1, state.Apply.Failed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedActiveParentQuiescence+time.Minute)
+
+	held := leasedOperationFor(t, store, parent, "region-a")
+	abandoned := leasedOperationFor(t, store, parent, "region-b")
+	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	// The leased row is created first, so the sweep's created_at, id ordering
+	// offers it before the stranded one.
+	live := createRetryableReapTask(t, store, parent, "task_reap_budget_live", "users", state.Task.Running, "")
+	attachTaskToOperation(t, live.TaskIdentifier, held)
+	backdateTaskUpdatedAt(t, live.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	stranded := createRetryableReapTask(t, store, parent, "task_reap_budget_stranded", "orders", state.Task.Running, "")
+	attachTaskToOperation(t, stranded.TaskIdentifier, abandoned)
+	backdateTaskUpdatedAt(t, stranded.TaskIdentifier, strandedActiveTaskQuiescence+time.Minute)
+
+	settled, err := store.tasks.reapStrandedActive(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the scan skips the leased row rather than spending its one slot on it")
+	assert.Equal(t, stranded.TaskIdentifier, settled[0].Task.TaskIdentifier)
+	assertTaskState(t, store, live.TaskIdentifier, state.Task.Running)
+}
+
+// The retryable sweep's scan carries the gate for the same reason.
+func TestTaskStore_ReapStrandedRetryable_LeasedRowDoesNotSpendTheScanLimit(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "reap_retryable_budget_db", "mysql")
+	parent := createTestApplyWithStateAndEnv(t, store, lock, "apply_reap_retryable_budget", 1, state.Apply.Completed, "staging")
+	backdateApplyUpdatedAt(t, parent.ID, strandedRetryableQuiescence+time.Minute)
+
+	held := leasedOperationFor(t, store, parent, "region-a")
+	abandoned := leasedOperationFor(t, store, parent, "region-b")
+	backdateOperationHeartbeat(t, abandoned, storage.ApplyLeaseStaleAfter+time.Minute)
+
+	live := createRetryableReapTask(t, store, parent, "task_reap_rbudget_live", "users", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, live.TaskIdentifier, held)
+
+	stranded := createRetryableReapTask(t, store, parent, "task_reap_rbudget_stranded", "orders", state.Task.FailedRetryable, "copy failed")
+	attachTaskToOperation(t, stranded.TaskIdentifier, abandoned)
+
+	settled, err := store.tasks.reapStrandedRetryable(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, settled, 1, "the scan skips the leased row rather than spending its one slot on it")
+	assert.Equal(t, stranded.TaskIdentifier, settled[0].Task.TaskIdentifier)
+	assertTaskState(t, store, live.TaskIdentifier, state.Task.FailedRetryable)
 }

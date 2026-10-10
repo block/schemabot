@@ -3,13 +3,8 @@ package enginetest
 import (
 	"context"
 	"go/ast"
-	"go/parser"
-	"go/token"
-	"os"
-	"path/filepath"
 	"reflect"
 	"sort"
-	"strings"
 	"sync"
 	"testing"
 
@@ -108,15 +103,17 @@ func TestContractCaseCoverage(t *testing.T) {
 var optionalCapabilityDecisions = map[reflect.Type]string{
 	reflect.TypeFor[engine.Drainer]():                         "lifecycle cleanup is outside the error-typing contract",
 	reflect.TypeFor[engine.ShutdownHalter]():                  "shutdown behavior has engine-specific tests",
+	reflect.TypeFor[engine.OwnedWorkHalter]():                 "drive-exit halt behavior has engine-specific tests",
 	reflect.TypeFor[engine.DeferredCutoverSignalChecker]():    "recovery signaling has engine-specific tests",
 	reflect.TypeFor[engine.ExternallyAuthoritativeProgress](): "routing policy is outside the conformance suite",
 	reflect.TypeFor[engine.SynchronousWorkRegistration]():     "registration timing is outside the conformance suite",
 	reflect.TypeFor[engine.ControlResumeValidator]():          "resume metadata is engine-specific",
+	reflect.TypeFor[engine.CancelledArtifactReleaser]():       "artifact naming and disposal are engine-specific",
+	reflect.TypeFor[engine.ShardKeyedPlanning]():              "plan shape is judged by the resume re-plan tests",
 }
 
 func TestOptionalCapabilityCoverage(t *testing.T) {
-	interfaces := exportedInterfaces(t, "..")
-	delete(interfaces, "Engine")
+	interfaces := OptionalCapabilities(t)
 	for typ, reason := range optionalCapabilityDecisions {
 		assert.NotEmpty(t, reason, "optional engine capability %s has no conformance decision", typ.Name())
 		assert.True(t, interfaces[typ.Name()], "classified optional engine capability %s does not exist", typ.Name())
@@ -131,25 +128,6 @@ func TestCaseConstantCoverage(t *testing.T) {
 		delete(constants, c.name)
 	}
 	assert.Empty(t, constants, "Case constants missing from contractCases")
-}
-
-// exportedInterfaces detects exported interface declarations written as named
-// type definitions. Interface type aliases are outside its syntactic scope.
-func exportedInterfaces(t *testing.T, dir string) map[string]bool {
-	t.Helper()
-	interfaces := make(map[string]bool)
-	for _, file := range parsePackageFiles(t, dir, "engine", false) {
-		ast.Inspect(file, func(node ast.Node) bool {
-			spec, ok := node.(*ast.TypeSpec)
-			if ok && spec.Name.IsExported() {
-				if _, ok := spec.Type.(*ast.InterfaceType); ok {
-					interfaces[spec.Name.Name] = true
-				}
-			}
-			return true
-		})
-	}
-	return interfaces
 }
 
 // caseConstants detects constants whose ValueSpec explicitly names Case and
@@ -178,25 +156,6 @@ func caseConstants(t *testing.T) map[Case]bool {
 		})
 	}
 	return constants
-}
-
-func parsePackageFiles(t *testing.T, dir, packageName string, includeTests bool) []*ast.File {
-	t.Helper()
-	entries, err := os.ReadDir(dir)
-	require.NoError(t, err)
-	files := make([]*ast.File, 0, len(entries))
-	fileSet := token.NewFileSet()
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || (!includeTests && strings.HasSuffix(entry.Name(), "_test.go")) {
-			continue
-		}
-		file, err := parser.ParseFile(fileSet, filepath.Join(dir, entry.Name()), nil, 0)
-		require.NoError(t, err)
-		if file.Name.Name == packageName {
-			files = append(files, file)
-		}
-	}
-	return files
 }
 
 func TestRunExecutesEveryRegisteredCase(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
@@ -46,6 +47,13 @@ type ChangeSetDiff struct {
 	// UnexpectedVSchema are namespaces the candidate changes the vschema for that
 	// the baseline does not.
 	UnexpectedVSchema []string
+	// MissingFinalize are namespaces the baseline's engine asks to finalize
+	// that the candidate's does not.
+	MissingFinalize []string
+	// UnexpectedFinalize are namespaces the candidate's engine asks to finalize
+	// that the baseline's does not. A candidate that mirrors the baseline would
+	// skip that finalize, so it is drift like any other unexpected change.
+	UnexpectedFinalize []string
 }
 
 // Empty reports whether the candidate matches the baseline exactly.
@@ -53,11 +61,14 @@ func (d ChangeSetDiff) Empty() bool {
 	return len(d.MissingFromCandidate) == 0 &&
 		len(d.UnexpectedInCandidate) == 0 &&
 		len(d.MissingVSchema) == 0 &&
-		len(d.UnexpectedVSchema) == 0
+		len(d.UnexpectedVSchema) == 0 &&
+		len(d.MissingFinalize) == 0 &&
+		len(d.UnexpectedFinalize) == 0
 }
 
 // CompareChangeSets reports how candidate differs from baseline, comparing table
-// DDL by canonicalized form and vschema by per-namespace parity. The dialect
+// DDL by canonicalized form, and vschema and engine-requested finalizes by
+// per-namespace parity. The dialect
 // selects the grammar both change sets are classified and canonicalized with,
 // so a PostgreSQL deployment's DDL is never judged by the MySQL parser; both
 // sides of a comparison are always the same dialect, since comparing DDL
@@ -105,11 +116,25 @@ func CompareChangeSets(dialect schema.Dialect, baseline, candidate ChangeSet) (C
 		}
 	}
 
+	diff.MissingFinalize, diff.UnexpectedFinalize = namespaceSetDifference(changeSetFinalizeNamespaces(candidate), changeSetFinalizeNamespaces(baseline))
+
 	sortDiffItems(diff.MissingFromCandidate)
 	sortDiffItems(diff.UnexpectedInCandidate)
 	sort.Strings(diff.MissingVSchema)
 	sort.Strings(diff.UnexpectedVSchema)
 	return diff, nil
+}
+
+// changeSetFinalizeNamespaces returns the namespaces a change set's engine asks
+// to finalize.
+func changeSetFinalizeNamespaces(cs ChangeSet) map[string]bool {
+	out := map[string]bool{}
+	for _, sc := range cs.Changes {
+		if sc != nil && sc.Metadata[apitypes.NeedsFinalizerMetadataKey] == "true" {
+			out[sc.Namespace] = true
+		}
+	}
+	return out
 }
 
 // changeSetMultiset builds the table DDL multiset and the set of vschema-changed
@@ -129,7 +154,7 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 	// nsShardChanges: namespace has a shard row carrying table changes, so the
 	// shard rows are the authoritative representation for it.
 	nsInShards := map[string]bool{}
-	nsShardChanges := map[string]bool{}
+	nsShardChanges := namespacesCarriedByShards(cs.Shards)
 	for _, sp := range cs.Shards {
 		if sp == nil {
 			return nil, nil, fmt.Errorf("nil shard plan")
@@ -139,9 +164,6 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 			return nil, nil, fmt.Errorf("shard plan for namespace %q has an empty shard name", sp.Namespace)
 		}
 		nsInShards[sp.Namespace] = true
-		if len(sp.Changes) > 0 {
-			nsShardChanges[sp.Namespace] = true
-		}
 		for _, tc := range sp.Changes {
 			key, err := driftKeyForTableChange(parser, sp.Namespace, shard, tc)
 			if err != nil {
@@ -156,7 +178,7 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 			return nil, nil, fmt.Errorf("nil schema change")
 		}
 		ns := sc.Namespace
-		if sc.Metadata["vschema_changed"] == "true" {
+		if apitypes.HasVSchemaWork(sc.Metadata) {
 			vschema[ns] = true
 		}
 		hasTableChanges := false
@@ -164,8 +186,9 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 			if tc == nil {
 				return nil, nil, fmt.Errorf("nil table change in namespace %q", ns)
 			}
-			// In the plan/proto representation a vschema change is signalled via
-			// Metadata["vschema_changed"] and carries no table DDL. A vschema table
+			// In the plan/proto representation a vschema change is signalled by the
+			// metadata keys HasVSchemaWork reads — a rendered diff, the changed
+			// flag, or both — and carries no table DDL. A vschema table
 			// change indicates malformed input (e.g. a change set built from an
 			// apply request's DdlChanges), so fail closed rather than skip it and
 			// risk a false match. Checked before the shard skip so a sharded
@@ -193,6 +216,69 @@ func changeSetMultiset(parser ddl.StatementParser, cs ChangeSet) (driftChangeMul
 		}
 	}
 	return ms, vschema, nil
+}
+
+// namespacesCarriedByShards reports the namespaces with at least one shard row
+// carrying table changes. For those namespaces the shard rows are the
+// authoritative representation and the namespace-collapsed Changes view is a
+// lossy duplicate of them, so any walk over a change set that must count each
+// change once skips the collapsed view for exactly this set.
+func namespacesCarriedByShards(shards []*ternv1.ShardPlan) map[string]bool {
+	carried := map[string]bool{}
+	for _, sp := range shards {
+		if sp != nil && len(sp.Changes) > 0 {
+			carried[sp.Namespace] = true
+		}
+	}
+	return carried
+}
+
+// AuthoritativeTableChanges returns every table change in the change set once,
+// read from its authoritative representation: the shard rows for a namespace
+// they carry, the collapsed Changes view for every other namespace. This is
+// the same representation rule the drift comparison counts by, so a total
+// derived from this walk agrees with the change count drift reports. Nil rows
+// are skipped; malformed shapes are the comparison's concern and fail there.
+func (cs ChangeSet) AuthoritativeTableChanges() []*ternv1.TableChange {
+	carried := namespacesCarriedByShards(cs.Shards)
+	var out []*ternv1.TableChange
+	for _, sp := range cs.Shards {
+		if sp == nil {
+			continue
+		}
+		out = append(out, sp.Changes...)
+	}
+	for _, sc := range cs.Changes {
+		if sc == nil || carried[sc.Namespace] {
+			continue
+		}
+		out = append(out, sc.TableChanges...)
+	}
+	return out
+}
+
+// HasWork reports whether applying the change set would change anything: a
+// table change in any representation, a namespace whose VSchema changes, or a
+// namespace the engine asks to finalize. It reads VSchema work through the same
+// predicate the comparison and the comment do, so the check cannot count a
+// namespace as changing that the comment shows as already at this schema, or
+// the reverse.
+func (cs ChangeSet) HasWork() bool {
+	if len(cs.AuthoritativeTableChanges()) > 0 {
+		return true
+	}
+	for _, sc := range cs.Changes {
+		if sc == nil {
+			continue
+		}
+		if apitypes.HasVSchemaWork(sc.Metadata) {
+			return true
+		}
+		if sc.Metadata[apitypes.NeedsFinalizerMetadataKey] == "true" {
+			return true
+		}
+	}
+	return false
 }
 
 // driftKeyForTableChange builds the multiset key for a proto table change,

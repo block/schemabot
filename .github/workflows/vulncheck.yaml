@@ -1,0 +1,89 @@
+# Kept out of lint.yaml deliberately. This check fails for a reason that has
+# nothing to do with the diff in front of it: the advisory database moves on
+# its own, so a graph that scanned clean yesterday goes red today with no
+# commit in between. Folding that into the lint rollup would make a red `Lint`
+# stop meaning "this change has a problem".
+name: Vulnerability Scan
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - master
+      - main
+  pull_request:
+  # Required status checks must also report on the merge queue, or the queue
+  # waits forever. Inert until a repo admin enables the merge queue.
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  # See test.yaml for the rationale of this docs-only skip pattern.
+  changes:
+    name: "Detect changes"
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.out.outputs.code }}
+    steps:
+      - name: "Detect non-docs changes"
+        if: github.event_name == 'pull_request'
+        id: filter
+        continue-on-error: true
+        uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!**/*.md'
+              - '!docs/.toc-manifest'
+              - '!{docs,assets}/**/*.{svg,png,jpg,jpeg,gif,webp,ico}'
+      - name: "Resolve code-change flag"
+        id: out
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FILTER_OUTCOME: ${{ steps.filter.outcome }}
+          FILTER_CODE: ${{ steps.filter.outputs.code }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif [ "$FILTER_OUTCOME" != "success" ]; then
+            echo "::warning::paths-filter failed; running CI instead of skipping"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=$FILTER_CODE" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The steps skip themselves rather than the job skipping, so the check name
+  # is present on a docs-only PR and can be required without stalling a merge.
+  govulncheck:
+    name: "Vulnerability Scan"
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Docs-only PR: the dependency graph cannot have changed"
+        if: needs.changes.outputs.code != 'true'
+        run: echo "No non-markdown files changed; reporting success so the required check resolves."
+      - name: Checkout code
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # actions/setup-go@v6.1
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: "Restore Go cache"
+        if: needs.changes.outputs.code == 'true'
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-
+      - name: govulncheck
+        if: needs.changes.outputs.code == 'true'
+        run: make check-vulnerabilities

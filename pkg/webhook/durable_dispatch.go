@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/drain"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
@@ -87,8 +88,20 @@ func (h *Handler) StartDurableWebhookDispatch(ctx context.Context) {
 	h.logger.Info("durable webhook dispatch started", "drivers", driverCount, "interval", h.durableWebhookPollInterval)
 }
 
-// StopDurableWebhookDispatch stops the durable webhook driver pool and waits for
-// in-flight claimed deliveries to finish their current drive.
+// durableWebhookDrainTimeout bounds how long StopDurableWebhookDispatch waits
+// for the cancelled deliveries to finish their current drive. A delivery that
+// is between HTTP calls returns as soon as its context ends; the bound is for
+// one that does not return at all.
+//
+// A delivery abandoned here is not lost. Its inbox row stays claimed until the
+// claim goes stale, at which point the next process to run the pool picks it up
+// and delivers it — so the cost of stopping the wait is a delivery that arrives
+// late, against the cost of a process that cannot exit.
+const durableWebhookDrainTimeout = 10 * time.Second
+
+// StopDurableWebhookDispatch stops the durable webhook driver pool and waits up
+// to durableWebhookDrainTimeout for in-flight claimed deliveries to finish
+// their current drive.
 func (h *Handler) StopDurableWebhookDispatch() {
 	h.durableWebhookMu.Lock()
 	if h.durableWebhookStop == nil {
@@ -107,7 +120,16 @@ func (h *Handler) StopDurableWebhookDispatch() {
 	if cancel != nil {
 		cancel()
 	}
-	h.durableWebhookWg.Wait()
+	if !drain.Wait(&h.durableWebhookWg, durableWebhookDrainTimeout) {
+		abandoned := h.durableWebhookClaimsSnapshot()
+		h.logger.Error("durable webhook deliveries did not return within the shutdown drain; their inbox rows stay claimed until the claim goes stale and the next process to run the pool redelivers them",
+			"drain_timeout", durableWebhookDrainTimeout,
+			"abandoned_deliveries", len(abandoned))
+		for _, attrs := range abandoned {
+			h.logger.Error("abandoned a claimed webhook delivery whose driver did not return", attrs...)
+		}
+		return
+	}
 	h.logger.Info("durable webhook dispatch stopped")
 }
 
@@ -200,8 +222,56 @@ func (h *Handler) driveNextDurableWebhook(ctx context.Context, driverID int, own
 		"head_sha", event.HeadSHA,
 		"attempts", event.Attempts)
 
+	release := h.registerDurableWebhookClaim(driverID, event)
+	defer release()
+
 	h.driveClaimedDurableWebhook(ctx, driverID, store, event)
 	return true
+}
+
+// registerDurableWebhookClaim records a delivery this process is driving, and
+// returns the function that drops it when the drive returns. What is left in
+// the map when the shutdown drain expires is exactly the set of inbox rows this
+// process walked away from still claimed.
+func (h *Handler) registerDurableWebhookClaim(driverID int, event *storage.WebhookEvent) (release func()) {
+	key := event.Provider + "/" + event.DeliveryID
+	attrs := []any{
+		"driver", driverID,
+		"provider", event.Provider,
+		"delivery_id", event.DeliveryID,
+		"event", event.Event,
+		"action", event.Action,
+		"repo", event.Repository,
+		"pr", event.PullRequest,
+		"head_sha", event.HeadSHA,
+		"attempts", event.Attempts,
+	}
+
+	h.durableWebhookClaimMu.Lock()
+	if h.durableWebhookClaims == nil {
+		h.durableWebhookClaims = make(map[string][]any)
+	}
+	h.durableWebhookClaims[key] = attrs
+	h.durableWebhookClaimMu.Unlock()
+
+	return func() {
+		h.durableWebhookClaimMu.Lock()
+		delete(h.durableWebhookClaims, key)
+		h.durableWebhookClaimMu.Unlock()
+	}
+}
+
+// durableWebhookClaimsSnapshot returns the log attributes of every delivery
+// this process is currently driving.
+func (h *Handler) durableWebhookClaimsSnapshot() [][]any {
+	h.durableWebhookClaimMu.Lock()
+	defer h.durableWebhookClaimMu.Unlock()
+
+	snapshot := make([][]any, 0, len(h.durableWebhookClaims))
+	for _, attrs := range h.durableWebhookClaims {
+		snapshot = append(snapshot, attrs)
+	}
+	return snapshot
 }
 
 // driveClaimedDurableWebhook runs the process → heartbeat → finish lifecycle for
@@ -675,7 +745,7 @@ func (h *Handler) processDurablePullRequest(ctx context.Context, event *storage.
 // delivery under the delivery lease. runPRCloseCleanup is idempotent, so a
 // retry after a partial cleanup reconciles rather than double-acts.
 func (h *Handler) processDurablePullRequestClosed(ctx context.Context, event *storage.WebhookEvent, payload pullRequestPayload) (retry bool, err error) {
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	pr := payload.PullRequest.Number
 	if repo == "" || pr == 0 {
 		return false, fmt.Errorf("durable pull_request closed delivery %s missing repo or PR", event.DeliveryID)
@@ -700,7 +770,7 @@ func (h *Handler) processDurablePullRequestAutoPlan(ctx context.Context, event *
 		return false, err
 	}
 
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	pr := payload.PullRequest.Number
 	headSHA := payload.PullRequest.Head.SHA
 	if repo == "" || pr == 0 || headSHA == "" {
@@ -792,7 +862,7 @@ func (h *Handler) processDurableCheckRun(ctx context.Context, event *storage.Web
 // participant convergence returns no error and is handed to the in-memory
 // re-fold budget through the shared follow-up, exactly as the wrapper does.
 func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	if h.service == nil || !h.service.Config().IsAggregateLeaderForRepo(repo) {
 		h.logger.Info("durable check_run completion ignored because deployment is not the aggregate leader",
 			"delivery_id", event.DeliveryID, "repo", repo, "pr", event.PullRequest,
@@ -877,7 +947,7 @@ func (h *Handler) processDurableCheckRunCompleted(ctx context.Context, event *st
 // delivery. A GitHub failure verifying the head keeps the delivery retryable
 // rather than completing it, so a transient outage cannot drop the re-plan.
 func (h *Handler) processDurableCheckRunRerequest(ctx context.Context, event *storage.WebhookEvent, payload checkRunPayload) (retry bool, err error) {
-	repo := payload.Repository.FullName
+	repo := storage.CanonicalKey(payload.Repository.FullName)
 	pr, ok := checkRunPullRequestNumber(payload)
 	if !ok {
 		h.logger.Info("durable check_run rerequest ignored without pull request",
@@ -970,7 +1040,7 @@ func (h *Handler) enqueueDurablePullRequest(ctx context.Context, payload pullReq
 		DeliveryID:  deliveryID,
 		Event:       "pull_request",
 		Action:      payload.Action,
-		Repository:  payload.Repository.FullName,
+		Repository:  storage.CanonicalKey(payload.Repository.FullName),
 		PullRequest: payload.PullRequest.Number,
 		HeadSHA:     payload.PullRequest.Head.SHA,
 		TenantID:    strconv.FormatInt(installationID, 10),
@@ -984,7 +1054,7 @@ func (h *Handler) enqueueDurableCheckRun(ctx context.Context, payload checkRunPa
 		DeliveryID:  deliveryID,
 		Event:       "check_run",
 		Action:      payload.Action,
-		Repository:  payload.Repository.FullName,
+		Repository:  storage.CanonicalKey(payload.Repository.FullName),
 		PullRequest: pr,
 		HeadSHA:     payload.CheckRun.HeadSHA,
 		TenantID:    strconv.FormatInt(installationID, 10),

@@ -1,11 +1,16 @@
 package ddl
 
 import (
+	"io/fs"
 	"strings"
 	"testing"
 
+	pgproto "github.com/pganalyze/pg_query_go/v6"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	pgquery "github.com/wasilibs/go-pgquery"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/block/schemabot/pkg/schema"
 )
@@ -78,6 +83,146 @@ CREATE TABLE t (id INT);`
 		_, err := p.Split(longGarbage)
 		require.ErrorContains(t, err, "failed to parse SQL statements")
 		assert.Less(t, len(err.Error()), 250, "parse errors must not embed unbounded statement text")
+	})
+}
+
+func TestCreateSetStatements(t *testing.T) {
+	postgresParser, err := ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	mysqlParser, err := ParserForDialect(schema.DialectMySQL)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name       string
+		parser     StatementParser
+		script     string
+		want       []string
+		wantErrMsg string
+	}{
+		{
+			name:   "single Postgres statement",
+			parser: postgresParser,
+			script: "ALTER TABLE t ADD COLUMN v text;",
+			want:   []string{"ALTER TABLE t ADD COLUMN v text"},
+		},
+		{
+			name:   "Postgres create set",
+			parser: postgresParser,
+			script: "CREATE TABLE t (id bigint, v text); CREATE INDEX t_v_idx ON t (v); CREATE UNIQUE INDEX t_id_idx ON t (id);",
+			want: []string{
+				"CREATE TABLE t (id bigint, v text)",
+				"CREATE INDEX t_v_idx ON t (v)",
+				"CREATE UNIQUE INDEX t_id_idx ON t (id)",
+			},
+		},
+		{
+			name:       "index targets another table",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); CREATE INDEX other_id_idx ON other (id);",
+			wantErrMsg: `statement 2 creates an index on table "other", not CREATE TABLE target "t"`,
+		},
+		{
+			name:   "schema-qualified targets match",
+			parser: postgresParser,
+			script: "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON a.t (id);",
+			want: []string{
+				"CREATE TABLE a.t (id bigint)",
+				"CREATE INDEX t_id_idx ON a.t (id)",
+			},
+		},
+		{
+			name:       "schema-qualified targets differ",
+			parser:     postgresParser,
+			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON b.t (id);",
+			wantErrMsg: `statement 2 creates an index on table "b"."t", not CREATE TABLE target "a"."t"`,
+		},
+		{
+			name:       "qualified table with unqualified index is refused as mixed qualification",
+			parser:     postgresParser,
+			script:     "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON t (id);",
+			wantErrMsg: `statement 2 creates an index on "t" while CREATE TABLE targets "a"."t"; a create set cannot resolve an unqualified name against a search_path`,
+		},
+		{
+			name:       "unqualified table with qualified index is refused as mixed qualification",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); CREATE INDEX t_id_idx ON a.t (id);",
+			wantErrMsg: `statement 2 creates an index on "a"."t" while CREATE TABLE targets "t"; a create set cannot resolve an unqualified name against a search_path`,
+		},
+		{
+			name:       "a dot inside a bare table name is not a schema qualifier",
+			parser:     postgresParser,
+			script:     `CREATE TABLE "a.t" (id bigint); CREATE INDEX t_id_idx ON a.t (id);`,
+			wantErrMsg: `statement 2 creates an index on "a"."t" while CREATE TABLE targets "a.t"`,
+		},
+		{
+			name:       "a dot inside a qualified name is not a schema boundary",
+			parser:     postgresParser,
+			script:     `CREATE TABLE a."b.t" (id bigint); CREATE INDEX i ON "a.b".t (id);`,
+			wantErrMsg: `statement 2 creates an index on table "a.b"."t", not CREATE TABLE target "a"."b.t"`,
+		},
+		{
+			name:       "alter follows create table",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); ALTER TABLE t ADD COLUMN v text;",
+			wantErrMsg: "statement 2 is ALTER TABLE",
+		},
+		{
+			name:       "two create tables",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); CREATE TABLE u (id bigint);",
+			wantErrMsg: "statement 2 is CREATE TABLE",
+		},
+		{
+			name:       "index first",
+			parser:     postgresParser,
+			script:     "CREATE INDEX t_id_idx ON t (id); CREATE INDEX t_v_idx ON t (v);",
+			wantErrMsg: "statement 1 is CREATE INDEX",
+		},
+		{
+			name:       "DML follows create table",
+			parser:     postgresParser,
+			script:     "CREATE TABLE t (id bigint); INSERT INTO t (id) VALUES (1);",
+			wantErrMsg: "statement 2 is INSERT",
+		},
+		{
+			name:       "empty",
+			parser:     postgresParser,
+			script:     "  ",
+			wantErrMsg: "DDL script contains no statements",
+		},
+		{
+			name:   "single MySQL statement is unchanged",
+			parser: mysqlParser,
+			script: "  ALTER TABLE `t` ADD COLUMN `v` varchar(20)  ",
+			want:   []string{"ALTER TABLE `t` ADD COLUMN `v` varchar(20)"},
+		},
+		{
+			name:       "MySQL multi-statement create set is unsupported",
+			parser:     mysqlParser,
+			script:     "CREATE TABLE `t` (`id` bigint); CREATE INDEX `t_id_idx` ON `t` (`id`)",
+			wantErrMsg: "statement 2 is ALTER TABLE",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := CreateSetStatements(tc.parser, tc.script)
+			if tc.wantErrMsg != "" {
+				require.ErrorContains(t, err, tc.wantErrMsg)
+				assert.Nil(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("returns the first statement classification", func(t *testing.T) {
+		got, err := ParseCreateSet(postgresParser, "CREATE TABLE a.t (id bigint); CREATE INDEX t_id_idx ON a.t (id)")
+		require.NoError(t, err)
+		assert.Equal(t, StatementCreateTable, got.Type)
+		assert.Equal(t, "t", got.Table)
+		assert.Len(t, got.Statements, 2)
 	})
 }
 
@@ -188,6 +333,120 @@ func TestPostgresParserCanonicalize(t *testing.T) {
 	})
 }
 
+// The unqualified canonical form is what two targets that map one namespace
+// to differently named physical schemas must agree on, so every relation
+// reference the engine qualifies — including the ones nested inside
+// constraints and the name lists of DROP — renders without its schema, while
+// the statement's meaning is otherwise untouched.
+func TestPostgresParserCanonicalizeUnqualified(t *testing.T) {
+	p := postgresStatementParser{}
+
+	t.Run("create table drops the qualifier on its relation and foreign key targets", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`CREATE TABLE "app-region-a".orders (
+			id bigserial NOT NULL,
+			customer_id bigint REFERENCES "app-region-a".customers (id),
+			CONSTRAINT orders_pkey PRIMARY KEY (id),
+			CONSTRAINT orders_agency_fkey FOREIGN KEY (customer_id) REFERENCES "app-region-a".agency (id)
+		)`)
+		regionB := p.CanonicalizeUnqualified(`CREATE TABLE "app-region-b".orders (
+			id bigserial NOT NULL,
+			customer_id bigint REFERENCES "app-region-b".customers (id),
+			CONSTRAINT orders_pkey PRIMARY KEY (id),
+			CONSTRAINT orders_agency_fkey FOREIGN KEY (customer_id) REFERENCES "app-region-b".agency (id)
+		)`)
+		assert.Equal(t, regionA, regionB)
+		assert.NotContains(t, regionA, "app-region")
+		assert.Contains(t, regionA, "CREATE TABLE orders")
+		assert.Contains(t, regionA, "REFERENCES customers (id)")
+		assert.Contains(t, regionA, "REFERENCES agency (id)")
+	})
+
+	t.Run("create index drops the qualifier on its table", func(t *testing.T) {
+		got := p.CanonicalizeUnqualified(`CREATE UNIQUE INDEX uk_orders_customer ON "app-region-a".orders USING btree (customer_id, placed_at)`)
+		assert.Equal(t, "CREATE UNIQUE INDEX uk_orders_customer ON orders USING btree (customer_id, placed_at)", got)
+	})
+
+	t.Run("alter table drops the qualifier on its relation and on an added foreign key", func(t *testing.T) {
+		got := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".orders ADD COLUMN export_prefix text, ADD CONSTRAINT orders_customer_fkey FOREIGN KEY (customer_id) REFERENCES "app-region-a".customers (id)`)
+		assert.Equal(t, "ALTER TABLE orders ADD COLUMN export_prefix text, ADD CONSTRAINT orders_customer_fkey FOREIGN KEY (customer_id) REFERENCES customers (id)", got)
+	})
+
+	t.Run("drop table and drop index reduce to the bare object name", func(t *testing.T) {
+		assert.Equal(t, "DROP TABLE orders", p.CanonicalizeUnqualified(`DROP TABLE "app-region-a".orders`))
+		assert.Equal(t, "DROP INDEX uk_orders_customer", p.CanonicalizeUnqualified(`DROP INDEX "app-region-a".uk_orders_customer`))
+	})
+
+	t.Run("drop column keeps the explicit COLUMN keyword", func(t *testing.T) {
+		got := p.CanonicalizeUnqualified(`alter table "app-region-a".orders drop column legacy`)
+		assert.Equal(t, "ALTER TABLE orders DROP COLUMN legacy", got)
+	})
+
+	t.Run("unqualified input canonicalizes exactly like Canonicalize", func(t *testing.T) {
+		in := "create table orders(id bigint primary key, note text not null)"
+		assert.Equal(t, p.Canonicalize(in), p.CanonicalizeUnqualified(in))
+	})
+
+	t.Run("different relations stay different", func(t *testing.T) {
+		assert.NotEqual(t,
+			p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".orders ADD COLUMN note text`),
+			p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".payments ADD COLUMN note text`))
+	})
+
+	t.Run("unparseable and multi-statement input are returned unchanged", func(t *testing.T) {
+		assert.Equal(t, "THIS IS NOT SQL", p.CanonicalizeUnqualified("THIS IS NOT SQL"))
+		in := `DROP TABLE "app-region-a".a; DROP TABLE "app-region-a".b`
+		assert.Equal(t, in, p.CanonicalizeUnqualified(in))
+	})
+
+	t.Run("a catalog-qualified name reduces to the bare relation, not a two-part one", func(t *testing.T) {
+		assert.Equal(t, "ALTER TABLE orders ADD COLUMN c text",
+			p.CanonicalizeUnqualified(`ALTER TABLE cat."app-region-a".orders ADD COLUMN c text`))
+		assert.Equal(t, "CREATE INDEX i ON orders USING btree (c)",
+			p.CanonicalizeUnqualified(`CREATE INDEX i ON cat."app-region-a".orders (c)`))
+		assert.Equal(t, "DROP TABLE orders",
+			p.CanonicalizeUnqualified(`DROP TABLE cat."app-region-a".orders`))
+	})
+}
+
+// A relation the statement names in a schema that is not the statement's own
+// is not the physical rendering of this namespace's mapping, so two targets
+// that name different schemas there are genuinely diverged and the
+// unqualified form must keep them apart.
+func TestPostgresParserCanonicalizeUnqualifiedKeepsForeignSchemas(t *testing.T) {
+	p := postgresStatementParser{}
+
+	t.Run("a view body pointing at a different schema stays distinguishable", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`CREATE VIEW "app-region-a".orders_enriched AS SELECT o.id FROM "app-region-a".orders o JOIN "reference-east".currency c ON c.code = o.currency`)
+		regionB := p.CanonicalizeUnqualified(`CREATE VIEW "app-region-b".orders_enriched AS SELECT o.id FROM "app-region-b".orders o JOIN "reference-west".currency c ON c.code = o.currency`)
+		assert.NotEqual(t, regionA, regionB, "a view reading a different foreign schema is drift, not noise")
+		assert.Contains(t, regionA, `FROM orders o JOIN "reference-east".currency c`)
+	})
+
+	t.Run("a foreign key into a different schema stays distinguishable", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".orders ADD CONSTRAINT fk FOREIGN KEY (code) REFERENCES "reference-east".currency (code)`)
+		regionB := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-b".orders ADD CONSTRAINT fk FOREIGN KEY (code) REFERENCES "reference-west".currency (code)`)
+		assert.NotEqual(t, regionA, regionB, "a foreign key into a different foreign schema is drift, not noise")
+		assert.Equal(t, `ALTER TABLE orders ADD CONSTRAINT fk FOREIGN KEY (code) REFERENCES "reference-east".currency (code)`, regionA)
+	})
+
+	t.Run("a drop of an object in a different schema keeps its qualifier", func(t *testing.T) {
+		assert.Equal(t, `DROP TABLE orders, "reference-east".currency`,
+			p.CanonicalizeUnqualified(`DROP TABLE "app-region-a".orders, "reference-east".currency`))
+	})
+
+	t.Run("the statement's own schema is still cleared everywhere", func(t *testing.T) {
+		regionA := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-a".orders ADD CONSTRAINT fk FOREIGN KEY (customer_id) REFERENCES "app-region-a".customers (id)`)
+		regionB := p.CanonicalizeUnqualified(`ALTER TABLE "app-region-b".orders ADD CONSTRAINT fk FOREIGN KEY (customer_id) REFERENCES "app-region-b".customers (id)`)
+		assert.Equal(t, regionA, regionB)
+		assert.NotContains(t, regionA, "app-region")
+	})
+
+	t.Run("an unqualified statement leaves every reference as written", func(t *testing.T) {
+		in := `ALTER TABLE orders ADD CONSTRAINT fk FOREIGN KEY (code) REFERENCES "reference-east".currency (code)`
+		assert.Equal(t, in, p.CanonicalizeUnqualified(in))
+	})
+}
+
 func TestPostgresParserCreateTableColumns(t *testing.T) {
 	p := postgresStatementParser{}
 
@@ -206,6 +465,379 @@ func TestPostgresParserCreateTableColumns(t *testing.T) {
 
 	_, err = p.CreateTableColumns("ALTER TABLE example ADD COLUMN value text")
 	require.ErrorContains(t, err, "expected CREATE TABLE statement")
+}
+
+func TestPostgresParserSynthesizeAddColumn(t *testing.T) {
+	p := postgresStatementParser{}
+
+	tests := []struct {
+		name       string
+		createDDL  string
+		columnName string
+		want       string
+	}{
+		{"plain column", "CREATE TABLE users (id bigint, email text)", "email", "ALTER TABLE users ADD COLUMN email text"},
+		{"not null and default", "CREATE TABLE users (id bigint, enabled boolean NOT NULL DEFAULT true)", "enabled", "ALTER TABLE users ADD COLUMN enabled boolean NOT NULL DEFAULT true"},
+		{"type modifier", "CREATE TABLE users (name varchar(255))", "name", "ALTER TABLE users ADD COLUMN name varchar(255)"},
+		{"timestamp function default", "CREATE TABLE users (updated_at timestamptz DEFAULT now())", "updated_at", "ALTER TABLE users ADD COLUMN updated_at timestamptz DEFAULT now()"},
+		{"schema-qualified table", "CREATE TABLE app.users (id bigint)", "id", "ALTER TABLE app.users ADD COLUMN id bigint"},
+		{"quoted identifiers", `CREATE TABLE "App"."UserProfiles" ("DisplayName" varchar(255) NOT NULL)`, "DisplayName", `ALTER TABLE "App"."UserProfiles" ADD COLUMN "DisplayName" varchar(255) NOT NULL`},
+		{"collation", `CREATE TABLE users (name text COLLATE "C")`, "name", `ALTER TABLE users ADD COLUMN name text COLLATE "C"`},
+		{"identity", "CREATE TABLE users (id bigint GENERATED BY DEFAULT AS IDENTITY)", "id", "ALTER TABLE users ADD COLUMN id bigint GENERATED BY DEFAULT AS IDENTITY"},
+		{"generated stored", "CREATE TABLE items (qty integer, price numeric, total numeric GENERATED ALWAYS AS (qty * price) STORED)", "total", "ALTER TABLE items ADD COLUMN total numeric GENERATED ALWAYS AS (qty * price) STORED"},
+		{"array type", "CREATE TABLE users (tags text[])", "tags", "ALTER TABLE users ADD COLUMN tags text[]"},
+		{"storage mode", "CREATE TABLE users (payload bytea STORAGE EXTERNAL)", "payload", "ALTER TABLE users ADD COLUMN payload bytea STORAGE external"},
+		{"compression method", "CREATE TABLE users (document text COMPRESSION lz4)", "document", "ALTER TABLE users ADD COLUMN document text COMPRESSION lz4"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := p.SynthesizeAddColumn(tc.createDDL, tc.columnName)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+
+	t.Run("table-level constraints are not carried", func(t *testing.T) {
+		got, err := p.SynthesizeAddColumn("CREATE TABLE users (id bigint, email text, PRIMARY KEY (id), UNIQUE (email), CHECK (id > 0))", "id")
+		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE users ADD COLUMN id bigint", got)
+	})
+
+	t.Run("column not found", func(t *testing.T) {
+		_, err := p.SynthesizeAddColumn("CREATE TABLE users (id bigint)", "email")
+		require.ErrorContains(t, err, `column "email" not found`)
+	})
+
+	t.Run("multiple statements", func(t *testing.T) {
+		_, err := p.SynthesizeAddColumn("CREATE TABLE users (id bigint); CREATE TABLE teams (id bigint)", "id")
+		require.ErrorContains(t, err, "expected one CREATE TABLE statement, got 2")
+	})
+
+	t.Run("not a CREATE TABLE", func(t *testing.T) {
+		_, err := p.SynthesizeAddColumn("ALTER TABLE users ADD COLUMN email text", "email")
+		require.ErrorContains(t, err, "expected CREATE TABLE statement")
+	})
+
+	t.Run("parse failure", func(t *testing.T) {
+		_, err := p.SynthesizeAddColumn("CREATE TABLE users (", "email")
+		require.ErrorContains(t, err, "parse CREATE TABLE")
+	})
+}
+
+// Every column of every CREATE TABLE in the embedded storage schema must
+// round-trip through synthesis with its declaration intact: the ColumnDef
+// carried by the synthesized ALTER must equal the ColumnDef declared in the
+// CREATE TABLE, node for node, so no type, default, NOT NULL, identity, or
+// collation clause can be silently dropped. This proves faithfulness only; it
+// says nothing about whether PostgreSQL would accept the statement on a
+// populated table, which is the caller's judgment.
+func TestPostgresParserSynthesizeAddColumn_EmbeddedSchemaRoundTrips(t *testing.T) {
+	files, err := fs.Glob(schema.PostgresFS, "postgres/*.sql")
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+	p := postgresStatementParser{}
+
+	for _, file := range files {
+		content, err := schema.PostgresFS.ReadFile(file)
+		require.NoError(t, err, "read %s", file)
+		statements, err := p.Split(string(content))
+		require.NoError(t, err, "split %s", file)
+		require.NotEmpty(t, statements, "schema file %s", file)
+
+		createTables := 0
+		for _, stmt := range statements {
+			kind, _, err := p.Classify(stmt)
+			require.NoError(t, err, "classify in %s", file)
+			if kind != StatementCreateTable {
+				continue
+			}
+			createTables++
+			columns, err := p.CreateTableColumns(stmt)
+			require.NoError(t, err, "columns in %s", file)
+
+			for _, column := range columns {
+				ddl, err := p.SynthesizeAddColumn(stmt, column)
+				require.NoError(t, err, "%s column %s", file, column)
+				want := columnDefFromCreateTable(t, stmt, column)
+				got := columnDefFromAddColumn(t, ddl)
+				clearParseLocations(want.ProtoReflect())
+				clearParseLocations(got.ProtoReflect())
+				assert.True(t, proto.Equal(want, got),
+					"%s column %s: synthesized ColumnDef diverges from the CREATE TABLE declaration\nsynthesized: %s\nwant: %v\ngot:  %v",
+					file, column, ddl, want, got)
+			}
+		}
+		require.Positive(t, createTables, "schema file %s declares no CREATE TABLE", file)
+	}
+}
+
+// columnDefFromCreateTable returns the named column's ColumnDef parse node
+// from a single CREATE TABLE statement.
+func columnDefFromCreateTable(t *testing.T, createDDL, column string) *pgproto.ColumnDef {
+	t.Helper()
+	parsed, err := pgquery.Parse(createDDL)
+	require.NoError(t, err)
+	require.Len(t, parsed.GetStmts(), 1)
+	create, ok := parsed.GetStmts()[0].GetStmt().GetNode().(*pgproto.Node_CreateStmt)
+	require.True(t, ok, "expected CREATE TABLE, got %q", createDDL)
+	for _, element := range create.CreateStmt.GetTableElts() {
+		def, ok := element.GetNode().(*pgproto.Node_ColumnDef)
+		if ok && def.ColumnDef.GetColname() == column {
+			return def.ColumnDef
+		}
+	}
+	t.Fatalf("column %q not found in %q", column, createDDL)
+	return nil
+}
+
+// columnDefFromAddColumn returns the ColumnDef parse node carried by a
+// single-command ALTER TABLE ... ADD COLUMN statement.
+func columnDefFromAddColumn(t *testing.T, alterDDL string) *pgproto.ColumnDef {
+	t.Helper()
+	parsed, err := pgquery.Parse(alterDDL)
+	require.NoError(t, err, "parse %q", alterDDL)
+	require.Len(t, parsed.GetStmts(), 1, "statement %q", alterDDL)
+	alter, ok := parsed.GetStmts()[0].GetStmt().GetNode().(*pgproto.Node_AlterTableStmt)
+	require.True(t, ok, "expected ALTER TABLE, got %q", alterDDL)
+	require.Len(t, alter.AlterTableStmt.GetCmds(), 1, "statement %q", alterDDL)
+	cmd, ok := alter.AlterTableStmt.GetCmds()[0].GetNode().(*pgproto.Node_AlterTableCmd)
+	require.True(t, ok, "expected ALTER TABLE command in %q", alterDDL)
+	require.Equal(t, pgproto.AlterTableType_AT_AddColumn, cmd.AlterTableCmd.GetSubtype(), "statement %q", alterDDL)
+	def, ok := cmd.AlterTableCmd.GetDef().GetNode().(*pgproto.Node_ColumnDef)
+	require.True(t, ok, "expected a ColumnDef in %q", alterDDL)
+	return def.ColumnDef
+}
+
+// clearParseLocations recursively zeroes every source-text offset field in a
+// parse tree, so trees parsed from different statement texts compare equal on
+// structure alone.
+func clearParseLocations(m protoreflect.Message) {
+	m.Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		switch {
+		case fd.IsList():
+			if fd.Kind() == protoreflect.MessageKind {
+				list := v.List()
+				for i := 0; i < list.Len(); i++ {
+					clearParseLocations(list.Get(i).Message())
+				}
+			}
+		case fd.Kind() == protoreflect.MessageKind:
+			clearParseLocations(v.Message())
+		case strings.Contains(string(fd.Name()), "location"):
+			m.Clear(fd)
+		}
+		return true
+	})
+}
+
+// The manual-remediation classifier reads the column's parsed type and
+// constraints. Generated, identity, serial, and unrecognized constraint shapes
+// fail closed — serial by its type name, since it carries no constraint in the
+// parse tree — while a plain integer type stays metadata-only. Quoted
+// identifiers cannot mask a missing DEFAULT, and a function-call DEFAULT fails
+// closed because its volatility cannot be proven from the statement alone.
+// UNIQUE builds an index over the whole table so it is never automatic;
+// REFERENCES is metadata-only until a DEFAULT makes the server validate every
+// existing row.
+func TestPostgresAddColumnManualReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		createDDL  string
+		columnName string
+		wantReason string
+	}{
+		{
+			name:       "not null without default",
+			createDDL:  "CREATE TABLE settings (id bigint, setting_value text NOT NULL)",
+			columnName: "setting_value",
+			wantReason: "NOT NULL without a DEFAULT",
+		},
+		{
+			name:       "not null with constant default",
+			createDDL:  "CREATE TABLE applies (id bigint, caller varchar(255) DEFAULT '' NOT NULL)",
+			columnName: "caller",
+		},
+		{
+			name:       "nullable",
+			createDDL:  "CREATE TABLE applies (id bigint, expected_operation_keys jsonb)",
+			columnName: "expected_operation_keys",
+		},
+		{
+			name:       "generated stored not null",
+			createDDL:  "CREATE TABLE metrics (a bigint, doubled bigint GENERATED ALWAYS AS (a * 2) STORED NOT NULL)",
+			columnName: "doubled",
+			wantReason: "generated or identity, which rewrites the whole table under an exclusive lock",
+		},
+		{
+			name:       "identity not null",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq bigint GENERATED ALWAYS AS IDENTITY NOT NULL)",
+			columnName: "seq",
+			wantReason: "generated or identity, which rewrites the whole table under an exclusive lock",
+		},
+		{
+			name:       "identity nullable",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq bigint GENERATED BY DEFAULT AS IDENTITY)",
+			columnName: "seq",
+			wantReason: "generated or identity, which rewrites the whole table under an exclusive lock",
+		},
+		{
+			name:       "serial",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq serial)",
+			columnName: "seq",
+			wantReason: "serial, which fills every existing row from a sequence",
+		},
+		{
+			name:       "bigserial",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq bigserial)",
+			columnName: "seq",
+			wantReason: "serial, which fills every existing row from a sequence",
+		},
+		{
+			name:       "smallserial",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq smallserial)",
+			columnName: "seq",
+			wantReason: "serial, which fills every existing row from a sequence",
+		},
+		{
+			name:       "serial2",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq serial2)",
+			columnName: "seq",
+			wantReason: "serial, which fills every existing row from a sequence",
+		},
+		{
+			name:       "serial4",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq serial4)",
+			columnName: "seq",
+			wantReason: "serial, which fills every existing row from a sequence",
+		},
+		{
+			name:       "serial8",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq serial8)",
+			columnName: "seq",
+			wantReason: "serial, which fills every existing row from a sequence",
+		},
+		{
+			name:       "uppercase bigserial",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq BIGSERIAL)",
+			columnName: "seq",
+			wantReason: "serial, which fills every existing row from a sequence",
+		},
+		{
+			name:       "bigserial not null",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq bigserial NOT NULL)",
+			columnName: "seq",
+			wantReason: "serial, which fills every existing row from a sequence",
+		},
+		{
+			name:       "plain bigint",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq bigint)",
+			columnName: "seq",
+		},
+		{
+			name:       "plain integer with constant default",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq integer DEFAULT 0 NOT NULL)",
+			columnName: "seq",
+		},
+		{
+			name:       "primary key",
+			createDDL:  "CREATE TABLE metrics (a bigint, seq bigint PRIMARY KEY)",
+			columnName: "seq",
+			wantReason: "constraint CONSTR_PRIMARY",
+		},
+		{
+			name:       "nullable unique",
+			createDDL:  "CREATE TABLE metrics (a bigint, external_id bigint UNIQUE)",
+			columnName: "external_id",
+			wantReason: "UNIQUE, which builds a unique index over the whole table",
+		},
+		{
+			name:       "nullable references",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint REFERENCES parents (id))",
+			columnName: "parent_id",
+		},
+		{
+			name:       "references with default",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint DEFAULT 1 REFERENCES parents (id))",
+			columnName: "parent_id",
+			wantReason: "FOREIGN KEY with a DEFAULT, which validates every existing row",
+		},
+		{
+			name:       "not null references with default",
+			createDDL:  "CREATE TABLE metrics (a bigint, parent_id bigint NOT NULL DEFAULT 1 REFERENCES parents (id))",
+			columnName: "parent_id",
+			wantReason: "FOREIGN KEY with a DEFAULT, which validates every existing row",
+		},
+		{
+			name:       "quoted identifier containing default",
+			createDDL:  `CREATE TABLE odd (id bigint, " default " text NOT NULL)`,
+			columnName: " default ",
+			wantReason: "NOT NULL without a DEFAULT",
+		},
+		{
+			name:       "sql value function default",
+			createDDL:  "CREATE TABLE applies (id bigint, created_at timestamp DEFAULT CURRENT_TIMESTAMP NOT NULL)",
+			columnName: "created_at",
+		},
+		{
+			name:       "typecast constant default",
+			createDDL:  "CREATE TABLE applies (id bigint, options jsonb DEFAULT '{}'::jsonb NOT NULL)",
+			columnName: "options",
+		},
+		{
+			name:       "volatile function default",
+			createDDL:  "CREATE TABLE applies (id bigint, external_id uuid DEFAULT gen_random_uuid() NOT NULL)",
+			columnName: "external_id",
+			wantReason: "volatility cannot be proven",
+		},
+		{
+			name:       "nullable volatile function default",
+			createDDL:  "CREATE TABLE applies (id bigint, external_id uuid DEFAULT gen_random_uuid())",
+			columnName: "external_id",
+			wantReason: "volatility cannot be proven",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, err := PostgresAddColumnManualReason(tc.createDDL, tc.columnName)
+			require.NoError(t, err)
+			if tc.wantReason == "" {
+				assert.Empty(t, reason)
+			} else {
+				assert.Contains(t, reason, tc.wantReason)
+			}
+		})
+	}
+
+	t.Run("column not found", func(t *testing.T) {
+		_, err := PostgresAddColumnManualReason("CREATE TABLE users (id bigint)", "email")
+		require.ErrorContains(t, err, `column "email" not found`)
+	})
+}
+
+// The serial verdict mirrors the server's transformColumnDefinition: a single
+// name that reaches the parser as one of the six serial spellings. A quoted
+// name keeps its case, so "BIGSERIAL" is an ordinary (nonexistent) type to the
+// server and is not refused here; a schema-qualified name is an ordinary type
+// lookup, so public.serial is not refused either.
+func TestPostgresAddColumnManualReasonSerialFollowsServerRule(t *testing.T) {
+	for _, tc := range []struct {
+		name, createDDL string
+		serial          bool
+	}{
+		{"quoted lowercase is serial", `CREATE TABLE metrics (a bigint, seq "bigserial")`, true},
+		{"quoted uppercase is not serial", `CREATE TABLE metrics (a bigint, seq "BIGSERIAL")`, false},
+		{"schema-qualified is not serial", `CREATE TABLE metrics (a bigint, seq public.serial)`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reason, err := PostgresAddColumnManualReason(tc.createDDL, "seq")
+			require.NoError(t, err)
+			if tc.serial {
+				assert.Contains(t, reason, "definition is serial")
+			} else {
+				assert.Empty(t, reason)
+			}
+		})
+	}
 }
 
 func TestPostgresParserCreateIndex(t *testing.T) {
@@ -227,6 +859,36 @@ func TestPostgresParserCreateIndex(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, unique)
 	assert.Empty(t, indexName, "a non-index statement is not an index expectation")
+}
+
+func TestPostgresDropTargets(t *testing.T) {
+	p := postgresStatementParser{}
+	tests := []struct {
+		name string
+		stmt string
+		want DropTargets
+		err  bool
+	}{
+		{"drop tables", "DROP TABLE a, b", DropTargets{Tables: 2}, false},
+		{"drop index", "DROP INDEX idx", DropTargets{Indexes: 1}, false},
+		{"drop indexes", "DROP INDEX a, b", DropTargets{Indexes: 2}, false},
+		{"drop column", "ALTER TABLE t DROP COLUMN IF EXISTS c", DropTargets{Columns: 1}, false},
+		{"drop primary key", "ALTER TABLE t DROP CONSTRAINT t_pkey", DropTargets{}, false},
+		{"create table", "CREATE TABLE t (id bigint)", DropTargets{}, false},
+		{"multiple statements", "DROP TABLE a; DROP TABLE b", DropTargets{}, true},
+		{"garbage", "this is not SQL", DropTargets{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.DropTargets(tt.stmt)
+			if tt.err {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 // The two parser implementations must diverge where the grammars genuinely
@@ -266,5 +928,71 @@ func TestParsersDivergeOnDialectSpecificSyntax(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, tidbType, pgType)
 		assert.Equal(t, tidbTable, pgTable)
+	})
+}
+
+// CostScalesWithTableSize scopes the plan comment's table-size section: a
+// statement reports true when it builds an index, rewrites the table, or
+// scans it to validate a constraint or NOT NULL, so a size line renders
+// exactly for the changes whose cost grows with the table. Provably
+// metadata-only commands stay quiet.
+func TestPostgresCostScalesWithTableSize(t *testing.T) {
+	p := postgresStatementParser{}
+
+	tests := []struct {
+		name string
+		stmt string
+		want bool
+	}{
+		{"create index", `CREATE INDEX idx_created_at ON mutes (created_at)`, true},
+		{"create unique index", `CREATE UNIQUE INDEX uniq_slug ON mutes (slug)`, true},
+		{"add primary key", `ALTER TABLE mutes ADD PRIMARY KEY (id)`, true},
+		{"add unique constraint", `ALTER TABLE mutes ADD CONSTRAINT uniq_slug UNIQUE (slug)`, true},
+		{"add exclusion constraint", `ALTER TABLE mutes ADD CONSTRAINT excl_range EXCLUDE USING gist (during WITH &&)`, true},
+		{"alter column type", `ALTER TABLE mutes ALTER COLUMN count TYPE bigint`, true},
+		{"widen varchar", `ALTER TABLE mutes ALTER COLUMN reason TYPE varchar(500)`, true},
+		{"set not null", `ALTER TABLE mutes ALTER COLUMN reason SET NOT NULL`, true},
+		{"add foreign key", `ALTER TABLE mutes ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id)`, true},
+		{"add check constraint", `ALTER TABLE mutes ADD CONSTRAINT chk_positive CHECK (count > 0)`, true},
+		{"add column with volatile default", `ALTER TABLE mutes ADD COLUMN token uuid DEFAULT gen_random_uuid()`, true},
+		{"add column with inline unique", `ALTER TABLE mutes ADD COLUMN slug varchar(64) UNIQUE`, true},
+		{"add generated column", `ALTER TABLE mutes ADD COLUMN total int GENERATED ALWAYS AS (a + b) STORED`, true},
+		{"add column references with default", `ALTER TABLE mutes ADD COLUMN parent_id bigint DEFAULT 1 REFERENCES parents (id)`, true},
+		{"add column with inline check", `ALTER TABLE mutes ADD COLUMN c int CHECK (c > 0)`, true},
+		{"add serial column", `ALTER TABLE mutes ADD COLUMN seq serial`, true},
+		{"add bigserial column", `ALTER TABLE mutes ADD COLUMN seq BIGSERIAL`, true},
+		{"add smallserial column", `ALTER TABLE mutes ADD COLUMN seq smallserial`, true},
+		{"add serial8 column", `ALTER TABLE mutes ADD COLUMN seq serial8`, true},
+		{"add identity column", `ALTER TABLE mutes ADD COLUMN seq bigint GENERATED BY DEFAULT AS IDENTITY`, true},
+		{"add plain bigint column", `ALTER TABLE mutes ADD COLUMN seq bigint`, false},
+		{"add column references without default", `ALTER TABLE mutes ADD COLUMN parent_id bigint REFERENCES parents (id)`, false},
+		{"add foreign key not valid", `ALTER TABLE mutes ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id) NOT VALID`, false},
+		{"add check constraint not valid", `ALTER TABLE mutes ADD CONSTRAINT chk_positive CHECK (count > 0) NOT VALID`, false},
+		{"add column only", `ALTER TABLE mutes ADD COLUMN reason varchar(255)`, false},
+		{"add column with constant default", `ALTER TABLE mutes ADD COLUMN state text DEFAULT 'active'`, false},
+		{"add column with cast constant default", `ALTER TABLE mutes ADD COLUMN payload jsonb DEFAULT '{}'::jsonb`, false},
+		{"drop column", `ALTER TABLE mutes DROP COLUMN reason`, false},
+		{"set default", `ALTER TABLE mutes ALTER COLUMN count SET DEFAULT 0`, false},
+		{"drop not null", `ALTER TABLE mutes ALTER COLUMN reason DROP NOT NULL`, false},
+		{"drop constraint", `ALTER TABLE mutes DROP CONSTRAINT chk_positive`, false},
+		{"create table with primary key", `CREATE TABLE mutes (id BIGINT PRIMARY KEY)`, false},
+		{"drop index", `DROP INDEX idx_created_at`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.CostScalesWithTableSize(tt.stmt)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("unparseable statement is an error", func(t *testing.T) {
+		_, err := p.CostScalesWithTableSize("ALTER TABLE ADD INDEX WHAT")
+		assert.Error(t, err)
+	})
+
+	t.Run("multi-statement input is an error", func(t *testing.T) {
+		_, err := p.CostScalesWithTableSize("CREATE INDEX i ON a (c); DROP TABLE b")
+		assert.Error(t, err)
 	})
 }

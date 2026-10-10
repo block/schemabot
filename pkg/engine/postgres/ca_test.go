@@ -1,11 +1,13 @@
 package postgres
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -126,7 +128,18 @@ func TestSpritePoolConfig(t *testing.T) {
 	t.Run("unparseable DSN is refused", func(t *testing.T) {
 		_, err := spritePoolConfig("postgres://schemabot@:not-a-port/app", "")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "normalize PostgreSQL DSN for pg-sprite pool")
+		assert.Contains(t, err.Error(), "judge PostgreSQL DSN for pg-sprite pool")
+	})
+
+	t.Run("non-verifying RDS pool posture is announced", func(t *testing.T) {
+		var logs bytes.Buffer
+		originalLogger := slog.Default()
+		slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+		t.Cleanup(func() { slog.SetDefault(originalLogger) })
+
+		_, err := spritePoolConfig("postgres://schemabot:secret@apply-only.cluster-abc123.us-west-2.rds.amazonaws.com:5432/app", "")
+		require.NoError(t, err)
+		assert.Contains(t, logs.String(), "does not authenticate the server")
 	})
 }
 
@@ -160,6 +173,41 @@ func TestValidationRootCAs(t *testing.T) {
 		opts, err := validationRootCAs(path)
 		require.NoError(t, err)
 		assert.Len(t, opts, 1)
+	})
+}
+
+// ConnectionOptions is the trust policy a caller outside the engine dials
+// under: it follows the CA reference exactly as the engine's own dial sites
+// do, so a reference the engine refuses is refused here, a readable pinned
+// bundle yields the pinning option, and the embedded RDS trust needs none.
+func TestConnectionOptions(t *testing.T) {
+	verifyFullDSN := "postgres://user:pw@db.example.com:5432/app?sslmode=verify-full"
+
+	t.Run("embedded RDS trust needs no options", func(t *testing.T) {
+		opts, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefEmbeddedRDSGlobal}})
+		require.NoError(t, err)
+		assert.Empty(t, opts)
+	})
+
+	t.Run("pinned bundle yields the pinning option", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "ca.pem")
+		require.NoError(t, os.WriteFile(path, testCAPEM(t), 0o600))
+		opts, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefFilePrefix + path}})
+		require.NoError(t, err)
+		assert.Len(t, opts, 1)
+	})
+
+	t.Run("missing bundle fails closed", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "absent.pem")
+		_, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: caRefFilePrefix + path}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "read PostgreSQL CA bundle")
+	})
+
+	t.Run("unsupported reference fails closed", func(t *testing.T) {
+		_, err := ConnectionOptions(&engine.Credentials{DSN: verifyFullDSN, Metadata: map[string]string{metadataCARef: "vault:corp-ca"}})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported reference")
 	})
 }
 

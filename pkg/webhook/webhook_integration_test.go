@@ -81,11 +81,10 @@ import (
 	"testing"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
@@ -115,30 +114,20 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to start target MySQL: %v", err)
 	}
 
-	host, err := testutil.ContainerHost(ctx, targetContainer)
+	e2eTargetDSN, err = testutil.MySQLDSN(ctx, targetContainer, "target_test", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get target host: %v", err)
+		log.Fatalf("Failed to build target DSN: %v", err)
 	}
-	port, err := testutil.ContainerPort(ctx, targetContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get target port: %v", err)
-	}
-	e2eTargetDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/target_test?parseTime=true", host, port)
 
 	sbContainer, err := startE2EMySQLContainer(ctx, "webhook-schemabot-mysql", "schemabot_test", &schema.MySQLFS)
 	if err != nil {
 		log.Fatalf("Failed to start SchemaBot MySQL: %v", err)
 	}
 
-	sbHost, err := testutil.ContainerHost(ctx, sbContainer)
+	e2eSchemabotDSN, err = testutil.MySQLDSN(ctx, sbContainer, "schemabot_test", "parseTime=true")
 	if err != nil {
-		log.Fatalf("Failed to get schemabot host: %v", err)
+		log.Fatalf("Failed to build SchemaBot storage DSN: %v", err)
 	}
-	sbPort, err := testutil.ContainerPort(ctx, sbContainer, "3306")
-	if err != nil {
-		log.Fatalf("Failed to get schemabot port: %v", err)
-	}
-	e2eSchemabotDSN = fmt.Sprintf("root:testpassword@tcp(%s:%d)/schemabot_test?parseTime=true", sbHost, sbPort)
 
 	code := m.Run()
 
@@ -216,14 +205,14 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 
 	if databaseType == storage.DatabaseTypeMySQL {
 		// Create the app database on the target.
-		targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 		require.NoError(t, err)
 		_, err = targetDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+appDBName+"`")
 		require.NoError(t, err)
 		_ = targetDB.Close()
 
 		t.Cleanup(func() {
-			db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+			db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 			if err == nil {
 				_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+appDBName+"`")
 				_ = db.Close()
@@ -240,7 +229,7 @@ func setupE2EServiceOpts(t *testing.T, appDBName string, opts e2eServiceOpts) *a
 	require.NotEmpty(t, appDSN, "target DSN is required for database type %s", databaseType)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
@@ -762,6 +751,21 @@ func schemaFixturePath(ns, name string) string {
 func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, schemabotConfig, ns string, prFiles []*gh.CommitFile) *planFlowResult {
 	t.Helper()
 
+	configs := map[string]string{}
+	if schemabotConfig != "" {
+		configs["schema/schemabot.yaml"] = schemabotConfig
+	}
+	return setupFakeGitHubForPlanWithConfigs(t, mux, schemaSQL, configs, ns, prFiles)
+}
+
+// setupFakeGitHubForPlanWithConfigs is setupFakeGitHubForPlanWithPRFiles with
+// the repository's schemabot.yaml files given by repository path rather than as
+// one config at the schema root, so a test can lay out a repository whose
+// directories are managed by different configs — and so a pull request can
+// touch more than one database.
+func setupFakeGitHubForPlanWithConfigs(t *testing.T, mux *http.ServeMux, schemaSQL map[string]string, configs map[string]string, ns string, prFiles []*gh.CommitFile) *planFlowResult {
+	t.Helper()
+
 	result := &planFlowResult{
 		comments:  make(chan string, 10),
 		reactions: make(chan string, 10),
@@ -836,16 +840,17 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	blobIndex := 0
 	blobContents := make(map[string]string) // sha -> content
 
-	// schemabot.yaml config
-	if schemabotConfig != "" {
-		configSHA := "configsha001"
-		blobContents[configSHA] = schemabotConfig
+	// schemabot.yaml configs, in path order so blob identifiers are stable
+	for configIndex, path := range slices.Sorted(maps.Keys(configs)) {
+		content := configs[path]
+		configSHA := fmt.Sprintf("configsha%03d", configIndex+1)
+		blobContents[configSHA] = content
 		treeEntries = append(treeEntries, &gh.TreeEntry{
-			Path: new("schema/schemabot.yaml"),
+			Path: new(path),
 			Mode: new("100644"),
 			Type: new("blob"),
 			SHA:  new(configSHA),
-			Size: new(len(schemabotConfig)),
+			Size: new(len(content)),
 		})
 	}
 
@@ -868,8 +873,12 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// branch tip then descends the directory levels a real repository has instead
 	// of stopping at an empty root, and still finds none of the PR's own files
 	// there — so every changed file remains the PR's own proposal.
-	if schemabotConfig != "" {
-		result.baseFiles.Store(&map[string]string{"schema/schemabot.yaml": "baseconfigsha001"})
+	if len(configs) > 0 {
+		held := make(map[string]string, len(configs))
+		for path := range configs {
+			held[path] = "baseconfigsha~" + path
+		}
+		result.baseFiles.Store(&held)
 	}
 
 	// The repository at both commits a plan flow reads. By default the default
@@ -903,13 +912,10 @@ func setupFakeGitHubForPlanWithPRFiles(t *testing.T, mux *http.ServeMux, schemaS
 	// Contents API (used by FetchConfig -> FetchFileContent)
 	mux.HandleFunc("GET /repos/octocat/hello-world/contents/", func(w http.ResponseWriter, r *http.Request) {
 		filePath := r.URL.Path[len("/repos/octocat/hello-world/contents/"):]
-		if filePath == "schema/schemabot.yaml" && schemabotConfig != "" {
-			_ = json.NewEncoder(w).Encode(gh.RepositoryContent{
-				Name:     new("schemabot.yaml"),
-				Path:     new("schema/schemabot.yaml"),
-				Content:  new(base64.StdEncoding.EncodeToString([]byte(schemabotConfig))),
-				Encoding: new("base64"),
-			})
+		if content, ok := configs[filePath]; ok {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"name":"schemabot.yaml","path":%q,"content":%q,"encoding":"base64"}`,
+				filePath, base64.StdEncoding.EncodeToString([]byte(content)))
 			return
 		}
 		http.NotFound(w, r)
@@ -1012,7 +1018,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	t.Helper()
 	ctx := t.Context()
 
-	targetDB, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 	require.NoError(t, err)
 
 	stagingDB := appDBName + "_staging"
@@ -1025,7 +1031,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	_ = targetDB.Close()
 
 	t.Cleanup(func() {
-		db, err := sql.Open("mysql", e2eTargetDSN+"&multiStatements=true")
+		db, err := sql.Open("block-mysql", e2eTargetDSN+"&multiStatements=true")
 		if err == nil {
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+stagingDB+"`")
 			_, _ = db.ExecContext(t.Context(), "DROP DATABASE IF EXISTS `"+productionDB+"`")
@@ -1037,7 +1043,7 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 	productionDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+productionDB, 1)
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 
@@ -1087,19 +1093,8 @@ func setupE2EServiceMultiEnv(t *testing.T, appDBName string) *api.Service {
 }
 
 func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schemaFS *embed.FS) (testcontainers.Container, error) {
-	req := testcontainers.ContainerRequest{
-		Name:         e2eContainerName(baseName),
-		Image:        "mysql:8.0",
-		ExposedPorts: []string{"3306/tcp"},
-		Env: map[string]string{
-			"MYSQL_ROOT_PASSWORD": "testpassword",
-			"MYSQL_DATABASE":      dbName,
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("ready for connections").WithOccurrence(2).WithStartupTimeout(60*time.Second),
-			wait.ForListeningPort("3306/tcp"),
-		),
-	}
+	req := testutil.MySQLContainerRequest("mysql:8.0", dbName)
+	req.Name = e2eContainerName(baseName)
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
@@ -1111,35 +1106,21 @@ func startE2EMySQLContainer(ctx context.Context, baseName, dbName string, schema
 	}
 
 	if schemaFS != nil {
-		host, err := testutil.ContainerHost(ctx, container)
+		dsn, err := testutil.MySQLDSN(ctx, container, dbName, "parseTime=true", "multiStatements=true")
 		if err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("get container host: %w", err)
+			return nil, fmt.Errorf("build mysql dsn: %w", err)
 		}
-		port, err := testutil.ContainerPort(ctx, container, "3306")
-		if err != nil {
-			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("get container port: %w", err)
-		}
-		dsn := fmt.Sprintf("root:testpassword@tcp(%s:%d)/%s?parseTime=true&multiStatements=true", host, port, dbName)
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			_ = container.Terminate(ctx)
 			return nil, fmt.Errorf("open db: %w", err)
 		}
 		defer func() { _ = db.Close() }()
 
-		// Wait for MySQL to be ready to accept connections
-		var pingErr error
-		for range 30 {
-			if pingErr = db.PingContext(ctx); pingErr == nil {
-				break
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-		if pingErr != nil {
+		if err := testutil.PingMySQL(ctx, db); err != nil {
 			_ = container.Terminate(ctx)
-			return nil, fmt.Errorf("MySQL not ready after 15s: %w", pingErr)
+			return nil, err
 		}
 
 		if err := applyEmbeddedSchema(db, *schemaFS); err != nil {
@@ -1209,7 +1190,7 @@ func setupE2EServiceWithAllowedEnvs(t *testing.T, allowedEnvs []string) *api.Ser
 func setupE2EServiceWithConfig(t *testing.T, serverConfig *api.ServerConfig) *api.Service {
 	t.Helper()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = schemabotDB.Close() })
 

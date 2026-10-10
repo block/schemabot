@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -21,7 +22,6 @@ import (
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -31,7 +31,7 @@ import (
 // and preserves each caller in apply logs for incident triage.
 func TestE2EStopCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -144,7 +144,7 @@ func TestE2EStopCommandRecordsDurableRequest(t *testing.T) {
 // command records permanent cancel intent and preserves the caller in apply logs.
 func TestE2ECancelCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -210,7 +210,7 @@ func TestE2ECancelCommandRecordsDurableRequest(t *testing.T) {
 // active local schema change but this process does not own the Spirit runner.
 func TestE2EStopCommandQueuesDeferredCutoverLocalApplyWithoutRunner(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -302,7 +302,7 @@ func TestE2EStopCommandQueuesDeferredCutoverLocalApplyWithoutRunner(t *testing.T
 // claiming execution from the webhook process.
 func TestE2EStartCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -390,7 +390,7 @@ func TestE2EStartCommandRecordsDurableRequest(t *testing.T) {
 // does not record a durable start request.
 func TestE2EStartCommandRejectsCompletedApply(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -457,7 +457,7 @@ func TestE2EStartCommandRejectsCompletedApply(t *testing.T) {
 // environment, then leaves the operator owner to perform the data-plane action.
 func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -539,7 +539,7 @@ func TestE2ECutoverCommandRecordsDurableRequest(t *testing.T) {
 // PlanetScale apply in its revert window.
 func TestE2ESkipRevertCommandAcceptsApplyID(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -613,7 +613,7 @@ func TestE2ESkipRevertCommandAcceptsApplyID(t *testing.T) {
 // immediate attempt cannot land.
 func TestE2ERevertCommandRevertsApply(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 
@@ -697,7 +697,7 @@ func TestE2ERevertCommandRevertsApply(t *testing.T) {
 // operator's stop intent and surfacing the rejection back to the PR.
 func TestE2ECutoverCommandRejectsPendingStop(t *testing.T) {
 	ctx := t.Context()
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, schemabotDB.PingContext(ctx))
 

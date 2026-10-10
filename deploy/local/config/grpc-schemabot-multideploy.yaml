@@ -11,19 +11,18 @@
 # rollout-failure policy:
 #   - production           -> on_failure: halt (default): a failed deployment
 #                             halts the rollout; healthy siblings do not cut over.
-#   - production-continue  -> on_failure: continue: a failed deployment should
-#                             be treated as settled so healthy siblings still cut
+#   - production-continue  -> on_failure: continue: a failed deployment is
+#                             treated as settled, so healthy siblings still cut
 #                             over and complete while the apply settles to failed.
-#                             This env encodes that intended behavior; until the
-#                             barrier-release semantics for a continue-failed
-#                             predecessor land (OC-5), the healthy sibling parks
-#                             at waiting_for_cutover and the scenario is expected
-#                             to fail.
 #   - production-pause     -> on_failure: pause: a failed deployment holds the
 #                             rollout in the non-terminal paused state until an
 #                             operator releases it (`schemabot release`) so the
 #                             remaining deployments proceed, or aborts it with
 #                             `schemabot stop`.
+#   - production-targets   -> each deployment spells its routing as a targets
+#                             list, which makes the environment multi-target:
+#                             every member is planned against its own live
+#                             schema and applies its own plan.
 # All use cutover_policy: barrier and deployment_order [eu, us].
 
 # SchemaBot's own storage database
@@ -66,6 +65,16 @@ databases:
             target: testapp
           us:
             target: testapp
+      production-targets:
+        cutover_policy: barrier
+        deployment_order:
+          - eu
+          - us
+        deployments:
+          eu:
+            targets: [testapp]
+          us:
+            targets: [testapp]
 
 # Per-deployment Tern gRPC endpoints. All environments reuse the same Terns.
 tern_deployments:
@@ -73,7 +82,9 @@ tern_deployments:
     production: "tern-eu:9090"
     production-continue: "tern-eu:9090"
     production-pause: "tern-eu:9090"
+    production-targets: "tern-eu:9090"
   us:
     production: "tern-us:9090"
     production-continue: "tern-us:9090"
     production-pause: "tern-us:9090"
+    production-targets: "tern-us:9090"

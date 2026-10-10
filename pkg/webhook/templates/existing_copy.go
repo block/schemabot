@@ -169,7 +169,7 @@ func writeExistingCopyEntries(sb *strings.Builder, copies []ExistingCopyData) {
 	for _, c := range copies {
 		line := existingCopyTableList(c.Tables)
 		if c.Namespace != "" {
-			line += " in " + markdownInlineCode(c.Namespace)
+			line += " in " + inlineCode(c.Namespace)
 		}
 		switch {
 		case c.Running && c.Age != "" && c.Reason == engine.DiscardCheckpointExpired:
@@ -198,7 +198,7 @@ func existingCopyTableList(tables []string) string {
 	}
 	quoted := make([]string, len(tables))
 	for i, t := range tables {
-		quoted[i] = markdownInlineCode(t)
+		quoted[i] = inlineCode(t)
 	}
 	return strings.Join(quoted, ", ")
 }
@@ -230,7 +230,7 @@ func existingCopyReason(c ExistingCopyData) string {
 	case engine.DiscardCopyIncomplete:
 		return "it covers only some of the tables this schema change alters"
 	default:
-		return markdownInlineCode(c.Reason)
+		return inlineCode(c.Reason)
 	}
 }
 
@@ -245,9 +245,9 @@ const maxExistingCopyStatementLen = 200
 //
 // The statement comes off a live target, so it is stripped of control text and
 // clamped before it is wrapped: an entry in this section has to survive a value
-// that is long, multi-line, or hostile. The shared inline-code helper drops the
-// backticks around identifiers, which costs nothing here because the statement
-// is being shown for comparison rather than to be copied.
+// that is long, multi-line, or hostile. The clamp runs on the statement itself,
+// so the code span's delimiter grows around whatever identifier quoting the
+// clamped text still carries.
 func existingCopyStatement(statement string) string {
 	s := strings.Join(strings.Fields(stripControlText(statement)), " ")
 	if s == "" {
@@ -256,5 +256,5 @@ func existingCopyStatement(statement string) string {
 	if runes := []rune(s); len(runes) > maxExistingCopyStatementLen {
 		s = string(runes[:maxExistingCopyStatementLen-1]) + "…"
 	}
-	return "which was " + markdownInlineCode(s)
+	return "which was " + inlineCode(s)
 }

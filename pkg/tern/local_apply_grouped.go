@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -17,7 +18,7 @@ import (
 
 // executeGroupedApply runs all DDLs in one engine operation. For Spirit with
 // defer_cutover, this is atomic cutover; for Vitess, this is one deploy request.
-func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) {
+func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan, options map[string]string, releaseAtCutoverBarrier bool) error {
 	// Bind stable apply identity for every grouped-drive emission; mutable attrs remain per-call snapshots.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	ctx, cancelApply := context.WithCancel(ctx)
@@ -48,51 +49,50 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 	// every task, while operation-scoped drives pass only one operation's tasks.
 	logger.Info("building changes from scoped tasks", "task_count", len(tasks), "plan_id", plan.PlanIdentifier)
 	if len(plan.Namespaces) == 0 {
-		c.failApplyWithTasks(ctx, apply, tasks, "plan has no namespace data")
-		return
+		return c.failApplyAndNotify(ctx, apply, tasks, "plan has no namespace data")
 	}
 	if c.config.Type == storage.DatabaseTypeMySQL && len(plan.Namespaces) > 1 {
 		var names []string
 		for ns := range plan.Namespaces {
 			names = append(names, ns)
 		}
-		c.failApplyWithTasks(ctx, apply, tasks,
+		return c.failApplyAndNotify(ctx, apply, tasks,
 			fmt.Sprintf("MySQL applies support one namespace per apply, but plan has %d: %v", len(plan.Namespaces), names))
-		return
 	}
 	creds, err := c.credentialsForGroupedApply(plan)
 	if err != nil {
-		c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		return
+		return c.failApplyAndNotify(ctx, apply, tasks, err.Error())
 	}
 	changes := groupedResumeChanges(tasks, plan)
 
 	// Mark the apply as started before calling the engine. The engine may run
 	// for a long time (branch creation, DDL application, deploy request) and
 	// started_at should reflect when work actually began, not when it finished.
-	now := time.Now()
-	apply.State = state.Apply.Running
-	apply.StartedAt = &now
-	apply.UpdatedAt = now
-	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		logger.Error("failed to set started_at", append(apply.MutableLogAttrs(), "error", err)...)
+	if !c.recordDriveStarted(ctx, apply, logger) {
+		return nil
 	}
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed before grouped engine apply; current apply owner will exit for operator retry",
 			append(apply.MutableLogAttrs(), "error", err)...)
-		return
-	} else if handled {
-		return
+		return nil
+	} else if standDown {
+		return nil
 	}
+
+	// The engine can hold the target from inside Apply on, so every exit
+	// before the poll takes the work over halts it.
+	work := c.trackAcceptedEngineWork(ctx, logger)
+	defer work.haltUnlessPolled()
 
 	// Grouped mode: all DDLs in one engine call. Use the apply identifier so all
 	// table work shares one context for progress tracking.
-	result, err := eng.Apply(ctx, &engine.ApplyRequest{
+	result, err := c.applyWithEngine(ctx, eng, &engine.ApplyRequest{
 		Database:     apply.Database,
 		PlanID:       plan.PlanIdentifier,
 		Changes:      changes,
 		TargetShards: taskTargetShards(tasks),
 		SchemaFiles:  plan.SchemaFiles,
+		IgnoreTables: plan.IgnoreTables(),
 		Options:      options,
 		ResumeState:  &engine.ResumeState{MigrationContext: apply.ApplyIdentifier},
 		Credentials:  creds,
@@ -105,44 +105,50 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			applyEventStateTransition(apply, event, func(a *storage.Apply) error {
 				return c.storage.Applies().Update(ctx, a)
 			}, logger)
+			c.mirrorEngineEventLiveness(ctx, logger, tasks)
 		},
-		OnStateChange: func(rs *engine.ResumeState) {
+		OnStateChange: func(rs *engine.ResumeState) error {
 			if rs == nil {
 				logger.Debug("OnStateChange: nil resume state")
-				return
+				return nil
 			}
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, rs); saveErr != nil {
 				logger.Warn("OnStateChange: failed to persist opaque resume state", append(apply.MutableLogAttrs(), "error", saveErr)...)
+				return fmt.Errorf("persist engine resume state for apply %s: %w", apply.ApplyIdentifier, saveErr)
 			}
+			return nil
 		},
 	})
 
 	if err != nil {
-		newState := state.Apply.Failed
+		// A cancelled drive is why the engine call returned, so the error
+		// describes the driver and not the change the engine already accepted.
+		if c.driveCancelled(ctx, apply, "while the engine was applying") {
+			return nil
+		}
 		if c.shouldRetryEngineError(err) {
-			c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error())
-			newState = state.Apply.FailedRetryable
-		} else {
-			c.failApplyWithTasks(ctx, apply, tasks, err.Error())
-		}
-		if newState == state.Apply.FailedRetryable {
+			if pauseErr := c.markApplyRetryableWithTasks(ctx, apply, tasks, err.Error()); pauseErr != nil {
+				return pauseErr
+			}
 			logger.Warn("apply paused for operator retry", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
-		} else {
-			logger.Error("apply failed", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
+			return nil
 		}
-		return
+		if failErr := c.failApplyAndNotify(ctx, apply, tasks, err.Error()); failErr != nil {
+			return failErr
+		}
+		logger.Error("apply failed", append(apply.MutableLogAttrs(), "mode", mode, "error", err)...)
+		return nil
 	}
 
 	if !result.Accepted {
-		c.failApplyWithTasks(ctx, apply, tasks, result.Message)
-		return
+		return c.failApplyAndNotify(ctx, apply, tasks, result.Message)
 	}
 
 	if isTasklessVSchemaOnlyPlan(tasks, plan) {
 		if completeErr := c.completeTasklessGroupedApply(ctx, apply, result.Message); completeErr != nil {
 			logger.Error("failed to complete task-less grouped apply", append(apply.MutableLogAttrs(), "error", completeErr)...)
 		}
-		return
+		return nil
 	}
 
 	// Persist the engine resume state and set IsInstant on tasks before marking
@@ -159,16 +165,17 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 			// retry so the resume path reattaches to the in-flight work instead
 			// of abandoning it as terminal.
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
+				if c.driveCancelled(ctx, apply, "while saving the engine resume state") {
+					return nil
+				}
 				logger.Warn("failed to save engine resume state after accepted apply; pausing apply for operator retry",
 					append(apply.MutableLogAttrs(), "error", saveErr)...)
-				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
-				return
+				return c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state: %v", saveErr))
 			}
 		}
 	}
 	if c.config.Type == storage.DatabaseTypeVitess && resumeState == nil {
-		c.failApplyWithTasks(ctx, apply, tasks, "engine accepted Vitess apply without resume state")
-		return
+		return c.failApplyAndNotify(ctx, apply, tasks, "engine accepted Vitess apply without resume state")
 	}
 
 	if result.ResumeState != nil {
@@ -193,7 +200,31 @@ func (c *LocalClient) executeGroupedApply(ctx context.Context, apply *storage.Ap
 		fmt.Sprintf("All %d tables started copying in parallel", len(tasks)), state.Apply.Pending, apply.State)
 
 	// Poll for completion - all tasks share the same state
-	c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+	work.handToPoll()
+	return c.pollForCompletionAtomic(ctx, apply, tasks, creds, resumeState, options, releaseAtCutoverBarrier)
+}
+
+// mirrorEngineEventLiveness persists every task row when the engine reports an
+// event during its Apply call. The operator reads tasks.updated_at as the
+// drive's liveness signal (ApplyDriveStallAfter), and no poll loop mirrors the
+// tasks until the engine call returns, so an engine phase that legitimately
+// runs past the stall window — preparing a branch for a large sharded
+// database — would otherwise read as a wedged drive and be cancelled over and
+// over. An event is the engine speaking from inside the call, which is the
+// evidence of life the check asks for; an engine call that is truly blocked
+// emits nothing and is still cancelled.
+func (c *LocalClient) mirrorEngineEventLiveness(ctx context.Context, logger *slog.Logger, tasks []*storage.Task) {
+	for _, task := range tasks {
+		if err := c.storage.Tasks().Update(ctx, task); err != nil {
+			if errors.Is(err, storage.ErrApplyLeaseLost) {
+				logger.Warn("engine event liveness write was refused because the drive's lease was lost; the drive stops at its next lease check",
+					append(task.LogAttrs(), "error", err)...)
+				return
+			}
+			logger.Warn("failed to persist engine event liveness for task; the operator cancels the drive if no task write lands within the stall window",
+				append(task.LogAttrs(), "error", err)...)
+		}
+	}
 }
 
 func (c *LocalClient) saveEngineResumeState(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, resumeState *engine.ResumeState) error {
@@ -341,6 +372,44 @@ func applyOperationIDForTask(task *storage.Task) (int64, error) {
 	return *task.ApplyOperationID, nil
 }
 
+func (c *LocalClient) saveProgressMetadata(ctx context.Context, task *storage.Task, metadata map[string]string) error {
+	operationID, err := applyOperationIDForTask(task)
+	if err != nil {
+		return fmt.Errorf("resolve apply operation for task %s: %w", task.TaskIdentifier, err)
+	}
+	if err := c.storage.ApplyOperations().SaveProgressMetadata(ctx, operationID, metadata); err != nil {
+		return fmt.Errorf("save progress metadata for task %s: %w", task.TaskIdentifier, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) saveApplyProgressMetadata(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, metadata map[string]string) error {
+	operationID, err := c.applyOperationIDForApplyTasks(ctx, apply, tasks)
+	if err != nil {
+		return fmt.Errorf("resolve apply operation for progress metadata: %w", err)
+	}
+	if err := c.storage.ApplyOperations().SaveProgressMetadata(ctx, operationID, metadata); err != nil {
+		return fmt.Errorf("save progress metadata for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	return nil
+}
+
+func (c *LocalClient) persistProgressMetadataIfChanged(previous, current map[string]string, leaseLost *bool, save func(map[string]string) error) (map[string]string, error) {
+	if *leaseLost {
+		return previous, nil
+	}
+	if maps.Equal(previous, current) {
+		return previous, nil
+	}
+	if err := save(current); err != nil {
+		if errors.Is(err, storage.ErrApplyLeaseLost) {
+			*leaseLost = true
+		}
+		return previous, err
+	}
+	return maps.Clone(current), nil
+}
+
 // tasksForOperation returns the subset of tasks belonging to the given
 // apply_operation. It is nil-safe: a nil task or one without an
 // apply_operation_id is skipped. Callers use it to scope an apply-wide task set
@@ -413,7 +482,9 @@ func classifyOperationTasks(tasks []*storage.Task) (operationID int64, usesModel
 // Under on_failure "continue" a terminal-failed sibling does not terminalize the
 // apply while other siblings are still in flight: the apply is held running until
 // the rollout settles, then takes the failed verdict. Every other policy fails
-// closed and a failed sibling terminalizes the apply immediately.
+// closed on the verdict, and still holds the apply while a sibling that a driver
+// already started still holds its target, since refusing new claims does not
+// stop it.
 //
 // Invariant: applies.state is the rollout projection over all operations of the
 // apply, not only the operation this drive is executing. The current
@@ -530,54 +601,106 @@ func (c *LocalClient) deriveAggregateApplyState(ctx context.Context, apply *stor
 		}
 	}
 
-	children := make([]state.RolloutChild, len(ops))
+	rolloutOps := make([]state.RolloutOperation, len(ops))
 	foundCurrent := false
 	for i, op := range ops {
-		isContinue := op.OnFailure == storage.OnFailureContinue
-		isPause := op.OnFailure == storage.OnFailurePause
-		child := state.RolloutChild{
-			State:             op.State,
-			ContinueOnFailure: isContinue || (isPause && released),
-			PauseOnFailure:    isPause && !released,
-		}
+		rolloutOp := op.RolloutOperation(released)
 		if op.ID == operationID {
-			child.State = currentOpState
+			// The current operation is the one this drive is running, so it
+			// has started whatever its stored row says.
+			rolloutOp.State = currentOpState
+			rolloutOp.NeverStarted = false
 			foundCurrent = true
 		}
-		children[i] = child
+		rolloutOps[i] = rolloutOp
 	}
 	if !foundCurrent {
 		logger.Warn("cannot determine aggregate apply state: current operation row missing from sibling set",
 			"apply_operation_id", operationID)
 		return failClosed()
 	}
-	return state.DeriveRolloutApplyState(children), true
+	return state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps)), true
 }
 
 // executeApplySequential runs each DDL as a separate Spirit call (independent mode).
 // Each table copies and cuts over independently.
 
+// acceptedEngineWork covers a grouped drive from the moment it hands work to
+// the engine until pollForCompletionAtomic takes that work over. The poll
+// halts the work on its own exit, except at the cutover barrier; before the
+// handoff a drive can still return — a storage write after acceptance fails,
+// the lease is lost — and every such exit halts the work here instead, so it
+// never outlives the drive that started it (OW-3).
+type acceptedEngineWork struct {
+	client    *LocalClient
+	ctx       context.Context
+	logger    *slog.Logger
+	handedOff bool
+}
+
+func (c *LocalClient) trackAcceptedEngineWork(ctx context.Context, logger *slog.Logger) *acceptedEngineWork {
+	return &acceptedEngineWork{client: c, ctx: ctx, logger: logger}
+}
+
+// handToPoll records that pollForCompletionAtomic owns the work's halt from
+// here on, whether it polls in this goroutine or a detached one.
+func (w *acceptedEngineWork) handToPoll() {
+	w.handedOff = true
+}
+
+// haltUnlessPolled halts the drive's engine work when the drive returns before
+// handing it to a poll.
+func (w *acceptedEngineWork) haltUnlessPolled() {
+	if w.handedOff {
+		return
+	}
+	w.client.haltEngineWorkLeftByDrive(w.ctx, w.logger)
+}
+
 // pollForCompletionAtomic polls the engine for progress in atomic mode (all tasks share state).
-func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) {
+//
+// It returns an error only when the drive settled the apply's outcome but could
+// not record it, so the caller knows the stored apply is still active and no
+// side effect of the outcome has run. Once the outcome is stored the poll
+// returns nil whatever happens to the side effects: a failed request
+// settlement is logged and left for the operator's post-drive settlement, and
+// the summary still posts. A drive context that ends — an operator's
+// stop cancelling the drive, a lost lease, the operator shutting down — is a
+// hand-back rather than a failure: the poll returns nil and the caller reads
+// its own context to learn why it stopped.
+func (c *LocalClient) pollForCompletionAtomic(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, options map[string]string, releaseAtCutoverBarrier bool) error {
 	eng := c.getEngine()
-	ticker := time.NewTicker(defaultTaskPollInterval)
+	ticker := time.NewTicker(c.taskPollInterval())
 	defer ticker.Stop()
 
 	// Seed revertSkipped from the durable signal so a driver that picks this apply
 	// up after a restart treats skip-revert as already accepted: it won't re-attempt
 	// SkipRevert, and it keeps surfacing skipping_revert while finalization is in
 	// flight rather than falling back to revert_window.
-	ps := &atomicPollState{lastProgressLog: time.Now(), revertSkipped: apply.RevertSkippedAt != nil}
+	ps := &atomicPollState{
+		lastProgressLog: time.Now(),
+		revertSkipped:   apply.RevertSkippedAt != nil,
+		lostWork:        lostEngineWorkTracker{budget: c.lostEngineWorkPendingBudget(eng)},
+	}
+
+	// Every exit but the cutover barrier's leaves no engine work running behind
+	// the drive (OW-3).
+	defer func() {
+		if ps.parkedAtCutoverBarrier {
+			return
+		}
+		c.haltEngineWorkLeftByDrive(ctx, c.logger.With(apply.IdentityLogAttrs()...))
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
 			c.logger.Info("drive context cancelled while polling; handing the apply back for another driver to claim",
 				apply.IdentityLogAttrs()...)
-			return
+			return nil
 		case <-ticker.C:
 			if done := c.handleAtomicProgressTick(ctx, eng, apply, tasks, creds, resumeState, ps, options, releaseAtCutoverBarrier); done {
-				return
+				return ps.terminalErr
 			}
 		}
 	}
@@ -613,26 +736,37 @@ func applyQuiesceDecision(projectedApplyState string) (quiesce, retryablePause, 
 func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.Engine, apply *storage.Apply, tasks []*storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, ps *atomicPollState, options map[string]string, releaseAtCutoverBarrier bool) bool {
 	// Bind identity once for all decisions and state transitions in this progress tick.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	// The poll loop's select can pick a ready ticker over an equally ready
+	// ctx.Done(), so a tick can begin after the drive has been cancelled. Every
+	// engine call and storage write it made would fail on that context.
+	if c.driveCancelled(ctx, apply, "before a progress tick") {
+		return true
+	}
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed; current apply owner will exit for operator retry",
 			"error", err)
 		return true
-	} else if handled {
+	} else if standDown {
 		return true
 	}
 
-	result, err := eng.Progress(ctx, &engine.ProgressRequest{
+	result, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    apply.Database,
 		Credentials: creds,
 		ResumeState: resumeState,
 	})
 	if err != nil {
+		// A cancelled drive is why the engine call failed, so the error says
+		// nothing about the deployment and must not be classified as one.
+		if c.driveCancelled(ctx, apply, "during a progress check") {
+			return true
+		}
 		// Permanent errors (e.g., deploy request not found) fail immediately.
 		var permanent *engine.PermanentError
 		if errors.As(err, &permanent) {
 			logger.Error("progress check failed with permanent error",
 				append(apply.MutableLogAttrs(), "error", err)...)
-			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed: %v", err))
+			ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("progress polling failed: %v", err))
 			return true
 		}
 		ps.consecutiveErrors++
@@ -642,16 +776,94 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			if c.shouldRetryEngineError(err) {
 				logger.Warn("progress polling failed repeatedly, pausing apply for operator retry",
 					"consecutive_errors", ps.consecutiveErrors)
-				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
+				ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
 				return true
 			}
 			logger.Error("progress polling failed repeatedly, failing apply",
 				"consecutive_errors", ps.consecutiveErrors)
-			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
+			ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("progress polling failed after %d consecutive errors: %v", ps.consecutiveErrors, err))
 			return true
 		}
 		return false
 	}
+	if engineRefusedTheTarget(result) {
+		// Another run of a schema change holds the target, so the refused
+		// start is not this schema change failing and must not spend the
+		// retry budget. The drive hands the apply back with every row as it
+		// stands; the driver that claims it once the lease goes stale starts
+		// the work again, by which time the holder has had the window to let go.
+		c.observeTargetHeld(ctx, logger, apply, "")
+		logger.Warn("engine was refused the target because another run of a schema change holds it; this driver hands the apply back without recording a failure",
+			append(apply.MutableLogAttrs(), "engine_error", result.ErrorMessage)...)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventInfo, storage.LogSourceSchemaBot,
+			"The target is held by another run of a schema change; the apply is handed back to start again once it lets go", "", "")
+		return true
+	}
+	if engineGotPastTheRefusal(result) {
+		// The work started and holds the target itself, so any earlier hold
+		// is over; a later refusal is measured as a new one.
+		c.targetHeld.clear(apply.ID)
+	}
+	var saveErr error
+	ps.lastProgressMetadata, saveErr = c.persistProgressMetadataIfChanged(ps.lastProgressMetadata, result.Metadata, &ps.progressMetadataLeaseLost, func(metadata map[string]string) error {
+		return c.saveApplyProgressMetadata(ctx, apply, tasks, metadata)
+	})
+	if errors.Is(saveErr, storage.ErrApplyLeaseLost) {
+		logger.Debug("progress metadata persistence stopped because the operation lease was lost during failover",
+			append(apply.MutableLogAttrs(), "error", saveErr)...)
+	} else if saveErr != nil {
+		logger.Warn("failed to persist engine progress metadata; the drive will retry on the next poll",
+			append(apply.MutableLogAttrs(), "error", saveErr)...)
+	}
+	now := time.Now()
+	newState := taskStateFromProgressResult(result)
+
+	settled := settledTaskSet{}
+	if engineReportsLostApplyWork(newState, tasks) {
+		pendingFor, exhausted := ps.lostWork.observePending(now)
+		if exhausted {
+			var settleErr error
+			if settled, settleErr = c.settleLostEngineWorkForTasks(ctx, apply, tasks, result.State); settleErr != nil {
+				if errors.Is(settleErr, storage.ErrApplyLeaseLost) {
+					// The target answered; only a settlement write was refused,
+					// because a peer now holds the lease. That peer settles the
+					// tasks, so this driver exits rather than counting the
+					// refusal as a failed verification and going on to pause an
+					// apply it no longer owns.
+					logger.Warn("settling lost engine work was refused because the drive's lease was lost; this driver exits",
+						append(apply.MutableLogAttrs(), "engine_state", result.State, "error", settleErr)...)
+					return true
+				}
+				// Neither the engine nor the target has answered what happened
+				// to the work, so count the failed verification against the
+				// same bounded error budget as a failed poll — this must never
+				// become an unbounded loop. Return before the reset below so
+				// the healthy poll that carried the pending report cannot
+				// clear the count.
+				ps.consecutiveErrors++
+				logger.Warn("engine reports no active schema change for an in-flight apply and target verification failed; the drive re-verifies at the next poll",
+					append(apply.MutableLogAttrs(), "engine_state", result.State, "consecutive_errors", ps.consecutiveErrors, "error", settleErr)...)
+				if ps.consecutiveErrors >= maxConsecutiveProgressPollErrors {
+					ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("engine reports no active schema change for an in-flight apply and the target could not be verified; %d consecutive errors across progress polls and target verification; see server logs", ps.consecutiveErrors))
+					return true
+				}
+				return false
+			}
+			// The settled tasks are terminal or resting now, and the progress
+			// sync below leaves them out, so the tick falls through and the
+			// apply-state derivation quiesces the apply from the settled task
+			// states.
+		} else {
+			// Inside the budget the engine is still trusted: it may be
+			// serving a stale snapshot after a restart, or reporting
+			// pending for real work it has not begun executing yet.
+			logger.Debug("engine reports no active schema change for an in-flight apply; still inside the trust budget",
+				append(apply.MutableLogAttrs(), "engine_state", result.State, "pending_for", pendingFor.Round(time.Second))...)
+		}
+	} else {
+		ps.lostWork.reset()
+	}
+
 	ps.consecutiveErrors = 0
 	c.logEngineResumeOnce(ctx, logger, apply, result.ResumedFromCheckpoint, &ps.resumeEventLogged)
 
@@ -675,16 +887,16 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 		if c.config.Type == storage.DatabaseTypeVitess {
 			if saveErr := c.saveEngineResumeState(ctx, apply, tasks, resumeState); saveErr != nil {
+				if c.driveCancelled(ctx, apply, "while saving the engine resume state") {
+					return true
+				}
 				logger.Error("failed to save Vitess engine resume state from progress polling",
 					append(apply.MutableLogAttrs(), "error", saveErr)...)
-				c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state from progress polling: %v", saveErr))
+				ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("failed to save engine resume state from progress polling: %v", saveErr))
 				return true
 			}
 		}
 	}
-
-	now := time.Now()
-	newState := taskStateFromProgressResult(result)
 
 	// Log state transitions and track when waiting states are entered (for timeouts)
 	if newState != ps.lastTaskState {
@@ -701,7 +913,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// Surface once, at Warn, when a sharded engine reached an active state but
 	// could not report per-shard/row-copy progress for a reason that persists for
 	// the whole apply (a missing vtgate DSN). Only the persistent reason warns:
-	// the transient reasons (schema-change context still being discovered, shard
+	// the transient reasons (schema change context still being discovered, shard
 	// rows not yet registered at copy start) can self-heal on a later poll, so a
 	// one-shot warning for them would be a false alarm that latches forever; they
 	// stay visible in the engine's per-poll Debug. Warn (not Debug) so the
@@ -717,15 +929,33 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	c.logAtomicProgress(ctx, apply, result, ps, now)
 
 	// Update all tasks with engine progress
-	c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now)
-	if handled, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
+	if syncErr := c.syncAtomicTaskProgress(ctx, logger, tasks, result, newState, now, settled); syncErr != nil {
+		if errors.Is(syncErr, storage.ErrApplyLeaseLost) {
+			logger.Warn("task progress write was refused because the drive's lease was lost; this driver exits",
+				append(apply.MutableLogAttrs(), "error", syncErr)...)
+			return true
+		}
+		ps.progressWriteFailures++
+		if progressWriteRejectedForGood(syncErr, ps.progressWriteFailures) {
+			logger.Error("task progress could not be persisted; this driver halts the engine and exits, leaving the apply for a later drive",
+				append(apply.MutableLogAttrs(), "consecutive_write_failures", ps.progressWriteFailures, "value_rejected", errors.Is(syncErr, storage.ErrValueRejected), "error", syncErr)...)
+			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventInfo, storage.LogSourceSchemaBot,
+				"Task progress could not be recorded; the drive stopped the schema change and handed the apply back. See server logs.", "", "")
+			return true
+		}
+		logger.Warn("failed to persist task progress; the drive retries the write at the next poll",
+			append(apply.MutableLogAttrs(), "consecutive_write_failures", ps.progressWriteFailures, "error", syncErr)...)
+	} else {
+		ps.progressWriteFailures = 0
+	}
+	if standDown, err := c.processPendingCancelOrStopControlRequest(ctx, apply); err != nil {
 		logger.Warn("pending stop request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
 		return true
-	} else if handled {
+	} else if standDown {
 		return true
 	}
-	if err := c.processPendingCutoverControlRequest(ctx, apply); err != nil {
+	if err := c.processPendingCutoverControlRequest(ctx, apply, tasks); err != nil {
 		logger.Warn("pending cutover request processing failed after progress sync; current apply owner will exit for operator retry",
 			"error", err)
 		return true
@@ -742,7 +972,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		logger.Info("auto-triggering deploy (not in defer-deploy mode)")
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventDeployTriggered, storage.LogSourceSchemaBot,
 			"Auto-triggering deploy (defer_deploy not set)", "", "")
-		if _, err := eng.Start(ctx, controlReq); err != nil {
+		if _, err := eng.Start(withDriveWorkOwner(ctx), controlReq); err != nil {
 			logger.Error("auto-deploy failed", append(apply.MutableLogAttrs(), "error", err)...)
 		}
 	}
@@ -781,36 +1011,35 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		}
 	}
 
-	// If --skip-revert was set, auto-skip the revert window immediately.
-	if result.State == engine.StateRevertWindow && opts.SkipRevert && !ps.revertSkipped {
-		logger.Info("auto-skipping revert window (--skip-revert)")
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-			"Auto-skipping revert window (--skip-revert)", "", "")
-		_, err := eng.SkipRevert(ctx, controlReq)
-		if err != nil {
-			logger.Error("auto-skip revert failed", append(apply.MutableLogAttrs(), "error", err)...)
-		} else {
-			logger.Info("skip-revert triggered", "reason", "--skip-revert")
-			c.markRevertSkipped(ctx, apply)
-		}
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-			"Skip-revert triggered (--skip-revert)", state.Apply.RevertWindow, state.Apply.SkippingRevert)
-		ps.revertSkipped = true
+	// If --skip-revert was set, auto-skip the revert window immediately. Only an
+	// accepted skip marks the window skipped: a failed attempt is retried on the
+	// next progress tick, and until then the window stays open to the queued
+	// revert and skip-revert requests below.
+	if result.State == engine.StateRevertWindow && opts.SkipRevert && !ps.revertSkipped && !ps.revertTriggered {
+		c.autoSkipRevert(ctx, logger, eng, apply, controlReq, ps, now, autoSkipRevertTrigger{
+			reason:       "--skip-revert",
+			triggerEvent: "Auto-skipping revert window (--skip-revert)",
+			skippedEvent: "Skip-revert triggered (--skip-revert)",
+		})
 	}
 
 	// A durable skip-revert control request (the interactive "skip now" command,
 	// vs the upfront --skip-revert flag above) was queued; honor it. This is the
 	// apply owner's retry path: the API's immediate skip attempt may have failed
 	// or its process may have died, leaving the request pending for the drive.
-	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered {
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
 			logger.Warn("could not load pending skip-revert control request", "error", err)
-		} else if pending != nil {
+		} else if pending != nil && c.skipRevertAllowed(ctx, logger, apply, ps) {
 			logger.Info("skip-revert requested by user; closing revert window", "requested_by", controlRequestCaller(pending))
-			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
-				// Leave the request pending so the next drive tick retries.
-				logger.Error("skip-revert (control request) failed; will retry", "error", err)
-			} else {
+			skipResult, err := eng.SkipRevert(ctx, controlReq)
+			switch {
+			case err != nil:
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationSkipRevert, storage.LogEventSkipRevertTriggered, pending, err)
+			case skipResult == nil || !skipResult.Accepted:
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationSkipRevert,
+					storage.LogEventSkipRevertTriggered, pending, errors.New("engine rejected skip-revert request"))
+			default:
 				c.markRevertSkipped(ctx, apply)
 				ps.revertSkipped = true
 				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationSkipRevert); err != nil {
@@ -827,16 +1056,21 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	// revert attempt may have failed or its process may have died, leaving the
 	// request pending for the drive.
 	revertedByControlRequest := false
-	if result.State == engine.StateRevertWindow && !ps.revertSkipped {
+	if result.State == engine.StateRevertWindow && !ps.revertSkipped && !ps.revertTriggered {
 		if pending, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
 			logger.Warn("could not load pending revert control request", "error", err)
 		} else if pending != nil {
 			logger.Info("revert requested by user; reverting schema change", "requested_by", controlRequestCaller(pending))
-			if _, err := eng.Revert(ctx, controlReq); err != nil {
-				// Leave the request pending so the next drive tick retries.
-				logger.Error("revert (control request) failed; will retry", "error", err)
-			} else {
+			revertResult, err := eng.Revert(ctx, controlReq)
+			switch {
+			case err != nil:
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending, err)
+			case revertResult == nil || !revertResult.Accepted:
+				c.resolveOrRetryRevertPhaseRequest(ctx, logger, apply, storage.ControlOperationRevert,
+					storage.LogEventRevertTriggered, pending, errors.New("engine rejected revert request"))
+			default:
 				revertedByControlRequest = true
+				ps.revertTriggered = true
 				if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationRevert); err != nil {
 					logger.Warn("failed to complete revert control request", "error", err)
 				}
@@ -848,21 +1082,17 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 
 	// Revert window enabled (default): auto-skip based on deployed_at + configured duration.
 	// Falls back to stateEnteredAt if deployed_at is unavailable. A user revert
-	// this tick takes precedence — do not also auto-skip the window shut.
-	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !revertedByControlRequest {
+	// this tick takes precedence — do not also auto-skip the window shut. As with
+	// --skip-revert, only an accepted skip marks the window skipped; a failed one
+	// is retried on the next progress tick.
+	if result.State == engine.StateRevertWindow && !opts.SkipRevert && !ps.revertSkipped && !ps.revertTriggered && !revertedByControlRequest {
 		revertDeadline := c.revertWindowDeadline(logger, result.ResumeState, ps.stateEnteredAt)
 		if !revertDeadline.IsZero() && now.After(revertDeadline) {
-			logger.Info("revert window expired, skipping", "deadline", revertDeadline)
-			c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
-				"Revert window expired, finalizing", "", "")
-			if _, err := eng.SkipRevert(ctx, controlReq); err != nil {
-				logger.Error("revert window timeout skip failed", append(apply.MutableLogAttrs(), "error", err)...)
-			} else {
-				c.markRevertSkipped(ctx, apply)
-				c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
-					"Revert window expired, skip-revert triggered", state.Apply.RevertWindow, state.Apply.SkippingRevert)
-			}
-			ps.revertSkipped = true
+			c.autoSkipRevert(ctx, logger.With("deadline", revertDeadline), eng, apply, controlReq, ps, now, autoSkipRevertTrigger{
+				reason:       "revert window expired",
+				triggerEvent: "Revert window expired, skipping revert",
+				skippedEvent: "Revert window expired, skip-revert triggered",
+			})
 		}
 	}
 
@@ -889,6 +1119,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
 			logger.Info("operation parked at cutover barrier; exiting operation drive",
 				"mode", groupedApplyMode(apply, options), "operation_state", opState)
+			ps.parkedAtCutoverBarrier = true
 			return true
 		}
 		if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
@@ -931,8 +1162,8 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			"stored_state", freshApply.State,
 			"progress_state", apply.State)
 		*apply = *freshApply
-		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
-			logger.Warn("failed to complete pending control requests for terminal apply; current apply owner will exit for operator retry",
+		if err := settlePendingRequestsForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+			logger.Warn("failed to settle pending control requests for terminal apply; current apply owner will exit for operator retry",
 				"error", err)
 			return true
 		}
@@ -970,19 +1201,29 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		ensureApplyFailureMessage(apply, tasks)
 		swapped, err := c.storage.Applies().UpdateDerivedState(ctx, apply.ID, expectedState, apply.State, apply.ErrorMessage, apply.StartedAt, apply.CompletedAt)
 		if err != nil {
-			logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
-		} else if !swapped {
+			// A cancelled drive is why the write failed, so the error describes
+			// the driver and not the outcome; the drive hands the apply back.
+			if c.driveCancelled(ctx, apply, "while persisting the apply's settled state") {
+				return true
+			}
+			// The stored apply is still active, so nothing that answers for its
+			// outcome may run: completing a pending control request here would
+			// resolve an operator's command against an apply storage still
+			// reports active, and the observer would post a terminal summary for
+			// it. The drive exits and a later claim finalizes the apply.
+			logger.Error("failed to persist the apply's settled state; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
+				"deployment", apply.Deployment, "stored_state", expectedState, "settled_state", apply.State, "error", err)
+			ps.terminalErr = fmt.Errorf("persist grouped outcome for apply %s: %w", apply.ApplyIdentifier, err)
+			return true
+		}
+		if !swapped {
 			// Another drive advanced the apply between our reload and write; it
 			// owns the terminal transition and its side-effects. Skip ours.
 			logger.Info("apply terminal-state write lost a race; yielding to the owning drive",
 				"expected_state", expectedState, "derived_state", apply.State)
 			return true
 		}
-		if err := completePendingRequestsForTerminalApply(ctx, c.storage, apply); err != nil {
-			logger.Warn("failed to complete pending control requests after terminal progress reconciliation; current apply owner will exit for operator retry",
-				"error", err)
-			return true
-		}
+		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		switch {
 		case retryableFailure:
@@ -1056,6 +1297,7 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 	if releaseAtCutoverBarrier && state.IsState(opState, state.Apply.WaitingForCutover) {
 		logger.Info("operation parked at cutover barrier; exiting copy drive",
 			"mode", groupedApplyMode(apply, options), "operation_state", opState, "apply_state", apply.State)
+		ps.parkedAtCutoverBarrier = true
 		return true
 	}
 	if state.IsTerminalApplyState(opState) || state.IsState(opState, state.Apply.FailedRetryable) {
@@ -1064,6 +1306,102 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 		return true
 	}
 	return false
+}
+
+// engineReportsLostApplyWork reports whether a grouped progress poll came back
+// with no active schema change (a state that maps to pending) while durable
+// storage says at least one of the apply's tasks is in flight. A grouped apply
+// is a single engine operation, so the engine-vs-storage divergence is
+// detected at the apply level and one trust budget covers all of its tasks;
+// the per-task stored states still decide which tasks a settlement touches.
+// Like the sequential detection, this shape is ambiguous on its own — the
+// caller treats it as the start of a timed trust budget, not as evidence (see
+// engineReportsLostWork).
+func engineReportsLostApplyWork(engineTaskState string, tasks []*storage.Task) bool {
+	for _, task := range tasks {
+		if engineReportsLostWork(task.State, engineTaskState) {
+			return true
+		}
+	}
+	return false
+}
+
+// settleLostEngineWorkForTasks resolves a grouped apply's in-flight tasks after
+// the engine has stopped reporting on them, by verifying the target schema
+// directly — the grouped counterpart of settleLostEngineWork. The engine says
+// no schema change is active while durable storage says the apply's work is in
+// flight, and that divergence outlasted the tolerated staleness window, so
+// engine progress can never terminalize these tasks and the target itself is
+// the only remaining authority.
+//
+// Revert-phase tasks rest retryable without a target read — a schema read
+// cannot settle a revert — so they settle even when the re-plan below fails.
+// Every other in-flight task settles from one shared re-plan of the reviewed
+// schema set: completed when its (namespace, shard, table) no longer needs a
+// change, retryable when it still does. Tasks already at rest or terminal are
+// left untouched, so a settlement retried after a verification error never
+// re-settles what an earlier pass already decided. A verification error is
+// returned for the caller's consecutive-error budget to count.
+//
+// Returns the tasks it settled, so the caller can keep the same tick's engine
+// report from claiming a state for work the target already answered for.
+func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, engineState engine.State) (settledTaskSet, error) {
+	settled := settledTaskSet{}
+	var unverified []*storage.Task
+	for _, task := range tasks {
+		if !state.IsInFlightTaskState(task.State) {
+			c.logger.Debug("leaving task out of lost-work settlement; its stored state has no active engine work",
+				append(task.LogAttrs(), "apply_id", apply.ApplyIdentifier, "engine_state", engineState)...)
+			continue
+		}
+		if taskInRevertPhase(task) {
+			if err := c.settleLostRevertPhaseTask(ctx, apply, task, engineState); err != nil {
+				return settled, err
+			}
+			settled.add(task)
+			continue
+		}
+		unverified = append(unverified, task)
+	}
+	if len(unverified) == 0 {
+		return settled, nil
+	}
+	planID, err := planIDForTasks(apply, unverified)
+	if err != nil {
+		return settled, fmt.Errorf("resolve plan to verify target schema: %w", err)
+	}
+	plan, err := c.storage.Plans().GetByID(ctx, planID)
+	if err != nil {
+		return settled, fmt.Errorf("load plan %d for apply %s to verify target schema: %w", planID, apply.ApplyIdentifier, err)
+	}
+	if plan == nil {
+		return settled, fmt.Errorf("plan not found for apply %s while verifying target schema", apply.ApplyIdentifier)
+	}
+	replanDDL, err := c.replanTargetSchema(ctx, apply, plan)
+	if err != nil {
+		return settled, fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	for _, task := range unverified {
+		verdict, _ := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
+		if err := c.settleLostVerifiedTask(ctx, apply, task, verdict, engineState); err != nil {
+			return settled, err
+		}
+		settled.add(task)
+	}
+	return settled, nil
+}
+
+// settledTaskSet holds the tasks a drive resolved from a more authoritative
+// source than the engine during a single tick — here, the live target schema.
+// Their state is decided and persisted, so the same tick's engine report is no
+// longer entitled to claim one for them.
+type settledTaskSet map[*storage.Task]struct{}
+
+func (s settledTaskSet) add(task *storage.Task) { s[task] = struct{}{} }
+
+func (s settledTaskSet) contains(task *storage.Task) bool {
+	_, ok := s[task]
+	return ok
 }
 
 // autoTriggerCutover fires the engine cutover for a drive that is not
@@ -1089,7 +1427,14 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 			"Auto-triggering cutover (defer_cutover not set)", "", "")
 		ps.cutoverTriggerLogged = true
 	}
-	switch _, err := eng.Cutover(ctx, controlReq); {
+	_, err := eng.Cutover(ctx, controlReq)
+	// A cancelled drive is why the cutover call returned, so the error says
+	// nothing about the backend's willingness to cut over. The driver that
+	// reclaims the apply reattempts it from the stored state.
+	if err != nil && c.driveCancelled(ctx, apply, "while triggering cutover") {
+		return true
+	}
+	switch {
 	case err == nil:
 		ps.cutoverNotReadySince = time.Time{}
 		ps.cutoverNotReadyEscalated = false
@@ -1125,7 +1470,7 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 		if errors.As(err, &permanent) {
 			logger.Error("auto-cutover failed with permanent error",
 				append(apply.MutableLogAttrs(), "error", err)...)
-			c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed: %v", err))
+			ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("cutover failed: %v", err))
 			return true
 		}
 		ps.consecutiveCutoverFailures++
@@ -1137,12 +1482,12 @@ func (c *LocalClient) autoTriggerCutover(ctx context.Context, eng engine.Engine,
 		if c.shouldRetryEngineError(err) {
 			logger.Warn("auto-cutover failed repeatedly, pausing apply for operator retry",
 				append(apply.MutableLogAttrs(), "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
-			c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
+			ps.terminalErr = c.markApplyRetryableWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
 			return true
 		}
 		logger.Error("auto-cutover failed repeatedly, failing apply",
 			append(apply.MutableLogAttrs(), "consecutive_cutover_failures", ps.consecutiveCutoverFailures)...)
-		c.failApplyWithTasks(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
+		ps.terminalErr = c.failApplyAndNotify(ctx, apply, tasks, fmt.Sprintf("cutover failed after %d consecutive attempts: %v", ps.consecutiveCutoverFailures, err))
 		return true
 	}
 	return false
@@ -1156,6 +1501,136 @@ func (c *LocalClient) markRevertSkipped(ctx context.Context, apply *storage.Appl
 	if err := c.storage.Applies().SetRevertSkipped(ctx, apply.ID, time.Now()); err != nil {
 		logger.Warn("failed to record skip-revert on apply", append(apply.MutableLogAttrs(), "error", err)...)
 	}
+}
+
+// revertAccepted reports whether the engine has accepted an operator revert for
+// this apply. The durable completed revert request is the source of truth: the
+// API carries most reverts out itself and completes the request without the
+// drive seeing the acceptance, and a drive that claims the apply after a lease
+// handover starts with no in-memory state at all. Progress keeps reporting the
+// revert window for a while after an accepted revert, so a skip sent on the
+// strength of that lagging state would race the revert. The in-memory flag is
+// a shortcut that saves the read once either path has seen the acceptance.
+func (c *LocalClient) revertAccepted(ctx context.Context, apply *storage.Apply, ps *atomicPollState) (bool, error) {
+	if ps.revertTriggered {
+		return true, nil
+	}
+	accepted, err := controlRequestAccepted(ctx, c.storage, apply, storage.ControlOperationRevert)
+	if err != nil {
+		return false, err
+	}
+	if accepted {
+		ps.revertTriggered = true
+	}
+	return accepted, nil
+}
+
+// skipRevertAllowed reports whether the drive may send a skip-revert to the
+// engine this tick: no revert has been accepted for the apply. It fails
+// closed: when storage cannot say whether a revert was accepted, no skip is
+// sent this tick and the next progress tick asks again.
+func (c *LocalClient) skipRevertAllowed(ctx context.Context, logger *slog.Logger, apply *storage.Apply, ps *atomicPollState) bool {
+	accepted, err := c.revertAccepted(ctx, apply, ps)
+	if err != nil {
+		logger.Warn("could not determine whether a revert was accepted; no skip-revert is sent this tick and the next progress tick asks again",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return false
+	}
+	if accepted {
+		logger.Info("revert already accepted; the revert window is not skipped", apply.MutableLogAttrs()...)
+		return false
+	}
+	return true
+}
+
+// autoSkipRevertTrigger names why the drive is closing a revert window on its
+// own, for the logs and the apply timeline.
+type autoSkipRevertTrigger struct {
+	reason       string
+	triggerEvent string
+	skippedEvent string
+}
+
+// autoSkipRevert closes the revert window without an operator command, either
+// because the apply was started with --skip-revert or because the window
+// expired. The trigger lands on the timeline once, however many ticks the skip
+// takes. Only an accepted skip marks the window skipped; a failed or rejected
+// one is retried on the next progress tick, at Warn while the failure is
+// recent and escalating to Error logging plus a one-time timeline event once
+// it has outlived autoSkipRevertEscalationAfter, so a window the engine will
+// not close pages instead of filling the logs at every tick.
+func (c *LocalClient) autoSkipRevert(ctx context.Context, logger *slog.Logger, eng engine.Engine, apply *storage.Apply, controlReq *engine.ControlRequest, ps *atomicPollState, now time.Time, trigger autoSkipRevertTrigger) {
+	if !c.skipRevertAllowed(ctx, logger, apply, ps) {
+		return
+	}
+	if !ps.autoSkipRevertLogged {
+		logger.Info("auto-skipping revert window", "reason", trigger.reason)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+			trigger.triggerEvent, "", "")
+		ps.autoSkipRevertLogged = true
+	}
+	skipResult, err := eng.SkipRevert(ctx, controlReq)
+	switch {
+	case err != nil:
+		c.reportAutoSkipRevertFailure(ctx, logger, apply, ps, now, err)
+	case skipResult == nil || !skipResult.Accepted:
+		c.reportAutoSkipRevertFailure(ctx, logger, apply, ps, now, errors.New("engine rejected skip-revert request"))
+	default:
+		logger.Info("skip-revert triggered", "reason", trigger.reason)
+		c.markRevertSkipped(ctx, apply)
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventSkipRevertTriggered, storage.LogSourceSchemaBot,
+			trigger.skippedEvent, state.Apply.RevertWindow, state.Apply.SkippingRevert)
+		ps.revertSkipped = true
+	}
+}
+
+// reportAutoSkipRevertFailure logs a failed automatic skip-revert that the
+// drive retries at the next progress tick, escalating once the failure has
+// persisted past autoSkipRevertEscalationAfter.
+func (c *LocalClient) reportAutoSkipRevertFailure(ctx context.Context, logger *slog.Logger, apply *storage.Apply, ps *atomicPollState, now time.Time, skipErr error) {
+	if ps.autoSkipRevertFailingSince.IsZero() {
+		ps.autoSkipRevertFailingSince = now
+	}
+	failingFor := now.Sub(ps.autoSkipRevertFailingSince)
+	if failingFor < autoSkipRevertEscalationAfter {
+		logger.Warn("auto-skip revert failed; the drive retries it at the next progress tick",
+			append(apply.MutableLogAttrs(), "failing_for", failingFor, "error", skipErr)...)
+		return
+	}
+	if !ps.autoSkipRevertEscalated {
+		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelError, storage.LogEventError, storage.LogSourceSchemaBot,
+			fmt.Sprintf("The engine has not accepted the skip-revert for %s; the revert window stays open and SchemaBot keeps retrying every progress tick", failingFor.Round(time.Second)), "", "")
+		ps.autoSkipRevertEscalated = true
+	}
+	logger.Error("auto-skip revert has been failing beyond the escalation window; the revert window stays open and the drive keeps retrying",
+		append(apply.MutableLogAttrs(), "failing_for", failingFor, "error", skipErr)...)
+}
+
+// resolveOrRetryRevertPhaseRequest disposes of a revert-phase control operation
+// the engine refused. A refusal the engine issues for its whole database type is
+// issued identically on every later claim, so the request is resolved with the
+// engine's reason; any other failure leaves it pending for the next drive tick
+// to retry. Neither outcome advances the revert window: a refusal declines the
+// operator's command rather than carrying it out, so the window runs to its own
+// deadline either way.
+func (c *LocalClient) resolveOrRetryRevertPhaseRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) {
+	declined, declineErr := c.failPendingRequestForUnsupportedOperation(ctx, logger, apply, operation, eventType, controlReq, opErr)
+	if declineErr != nil {
+		logger.Error("could not resolve an engine-declined control request; it stays pending and the next drive claim collects the same decline",
+			"operation", string(operation),
+			"requested_by", controlRequestCaller(controlReq),
+			"error", declineErr)
+		return
+	}
+	if declined {
+		// failPendingRequestForUnsupportedOperation logs the rejection and
+		// records it on the apply's timeline for the operator who asked.
+		return
+	}
+	logger.Error("control request failed; the next drive claim retries it",
+		"operation", string(operation),
+		"requested_by", controlRequestCaller(controlReq),
+		"error", opErr)
 }
 
 // revertWindowDuration returns the configured revert window duration, falling
@@ -1222,76 +1697,195 @@ func (c *LocalClient) logAtomicProgress(ctx context.Context, apply *storage.Appl
 	ps.lastProgressLog = now
 }
 
-// syncAtomicTaskProgress updates all tasks with engine state and per-table
-// progress. Every task ends its tick with a persisted write, even when no
-// field moved: the operator reads tasks.updated_at as the drive's liveness
-// signal (ApplyDriveStallAfter) and cancels a drive whose rows stop advancing,
-// so the write must stay unconditional — including through parked states such
-// as deferred cutovers and revert windows, where nothing changes tick to tick.
-func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time) {
+// enginePoll is one grouped progress poll, decoded once for the whole apply:
+// the engine's report, the apply-wide task state the poll mapped to, the
+// instant classification its resume metadata carried, and the tick's clock.
+// Both halves of the projection read the same value, so a task can never be
+// refreshed against one poll and advanced against another.
+type enginePoll struct {
+	result   *engine.ProgressResult
+	newState string
+	// instantFromMetadata is the engine's own instant classification, decoded
+	// from the poll's resume metadata. It stands in for the per-table report an
+	// instant DDL never produces, having copied no rows.
+	instantFromMetadata bool
+	now                 time.Time
+}
+
+// retryableFailure reports whether the state this poll claims is a failure the
+// drive will retry, which leaves the task short of a finished outcome: no
+// completion stamp, and no finished progress bar.
+func (p enginePoll) retryableFailure() bool {
+	return state.IsState(p.newState, state.Task.FailedRetryable)
+}
+
+// syncAtomicTaskProgress projects one grouped progress poll onto every task of
+// the apply. A poll carries two separable things, and each task takes them
+// through a separate helper: the fields the operator sees, which a poll may
+// always refresh, and the state the poll claims for the task, which is a
+// correctness decision.
+//
+// Every task the poll speaks for ends its tick with a persisted write, even
+// when no field moved: the operator reads tasks.updated_at as the drive's
+// liveness signal (ApplyDriveStallAfter) and cancels a drive whose rows stop
+// advancing, so the write must stay unconditional — including through parked
+// states such as deferred cutovers and revert windows, where nothing changes
+// tick to tick. A task the poll does not speak for is one already settled from
+// a more authoritative source earlier in the tick, and it took its persisted
+// write from that settlement.
+//
+// It returns the writes that did not land, joined, after attempting every
+// task, so one refused row does not keep the others from updating.
+func (c *LocalClient) syncAtomicTaskProgress(ctx context.Context, logger *slog.Logger, tasks []*storage.Task, result *engine.ProgressResult, newState string, now time.Time, settled settledTaskSet) error {
 	tableProgress := indexEngineTableProgress(result.Tables)
-	retryableFailure := state.IsState(newState, state.Task.FailedRetryable)
-	instantFromMetadata := false
+	poll := enginePoll{result: result, newState: newState, now: now}
+	var writeErrs []error
 	if result.ResumeState != nil && result.ResumeState.Metadata != "" {
 		if meta, err := decodePSMetadataForStorage(result.ResumeState.Metadata); err == nil && meta != nil {
-			instantFromMetadata = meta.IsInstant
+			poll.instantFromMetadata = meta.IsInstant
 		}
 	}
 
 	for _, task := range tasks {
-		if retryableFailure && state.IsTerminalTaskState(task.State) {
+		if poll.retryableFailure() && state.IsTerminalTaskState(task.State) {
 			continue
 		}
-		engineTaskState := newState
-		if tp, ok := engineProgressForTask(tableProgress, task); ok {
-			task.RowsCopied = tp.RowsCopied
-			task.RowsTotal = tp.RowsTotal
-			task.ProgressPercent = tp.Progress
-			task.ETASeconds = int(tp.ETASeconds)
-			task.ChecksumRowsChecked = tp.ChecksumRowsChecked
-			task.ChecksumRowsTotal = tp.ChecksumRowsTotal
-			task.Throttled = tp.Throttled
-			task.ThrottleReason = tp.ThrottleReason
-			task.IsInstant = tp.IsInstant
-			if tp.StartedAt != nil && task.StartedAt == nil {
-				task.StartedAt = tp.StartedAt
-			}
-			if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
-				task.CompletedAt = tp.CompletedAt
-			}
-			// A generic running apply refines into the table's post-copy phase
-			// when the engine reports one, so a table catching up on accumulated
-			// changes, checksumming, or cutting over is stored — and rendered —
-			// as that phase rather than as a serene fully-copied bar.
-			if phase, isPhase := tablePhaseTaskState(tp.State); isPhase && state.IsState(newState, state.Task.Running) {
-				engineTaskState = phase
-			}
-			// Persist the per-shard breakdown as per-shard tasks so the renderer
-			// can show per-shard state from storage. No-op outside the lease-held
-			// operator drive (read-path callers carry no operation lease).
-			c.writeShardProgress(ctx, logger, task, tp, now)
-		} else if instantFromMetadata {
-			task.IsInstant = true
-			if result.State.IsTerminal() && !retryableFailure {
-				task.ProgressPercent = 100
-			}
+		if settled.contains(task) {
+			// The target schema answered for this task earlier in the tick and
+			// settlement persisted the result. The poll that sent the drive to
+			// the target reports no active schema change, so it carries neither
+			// progress to display nor a state this task may take.
+			logger.Debug("leaving settled task out of the engine progress projection",
+				append(task.LogAttrs(), "engine_state", result.State)...)
+			continue
 		}
-		if task.StartedAt == nil && newState != state.Task.Pending {
-			task.StartedAt = &now
+		tp, _ := tableProgress.ForTask(task)
+		if tp != nil {
+			c.unrecognizedStatuses.observeTaskStatus(ctx, logger, task, tp.State)
 		}
-		if result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
-			task.CompletedAt = &now
+		c.refreshTaskDisplayFromEngine(ctx, logger, task, tp, poll)
+		if err := c.advanceTaskFromEngineProgress(ctx, task, tp, poll); err != nil {
+			logger.Warn("failed to persist task progress", append(task.LogAttrs(), "error", err)...)
+			writeErrs = append(writeErrs, err)
 		}
-		if result.State == engine.StateFailed && task.ErrorMessage == "" {
-			if msg := progressFailureMessage(result); msg != "" {
-				task.ErrorMessage = msg
-			}
-		}
-		if result.State == engine.StateCompleted {
+	}
+	return errors.Join(writeErrs...)
+}
+
+// refreshTaskDisplayFromEngine projects a progress poll onto the fields the
+// operator sees: row counts, percentage, ETA, checksum progress, throttle
+// state, instant classification, and the per-shard breakdown. None of them
+// decides what state a task is in, so this is always safe to run — a stale or
+// absent engine snapshot degrades the display and nothing else. The per-shard
+// breakdown does carry a state per shard, but it lands on rows of its own
+// (shard != "") that only the per-shard renderer loads; the task state machine
+// never reads them.
+//
+// Those shard rows are the only write made here: the task's own refreshed
+// fields are mutated in memory and reach storage on the write
+// advanceTaskFromEngineProgress makes, which is why the refresh runs first — a
+// transition rolled back by a storage failure keeps the display fields the
+// caller refreshed before it. A caller that refreshes the display and then
+// declines the advance still owes the task a persisted write. The operator
+// reads tasks.updated_at as the drive's liveness signal
+// (ApplyDriveStallAfter), so a tick that ends without one reads as a drive
+// that stopped making progress, however fresh the fields left in memory are.
+func (c *LocalClient) refreshTaskDisplayFromEngine(ctx context.Context, logger *slog.Logger, task *storage.Task, tp *engine.TableProgress, poll enginePoll) {
+	switch {
+	case tp != nil:
+		applyEngineTableDisplayFields(task, tp)
+		// Persist the per-shard breakdown as per-shard tasks so the read path
+		// serves per-shard state out of tasks storage rather than re-querying
+		// the engine. Only a driver writes it, under the lease its claim holds.
+		c.writeShardProgress(ctx, logger, task, tp, poll.now)
+	case poll.instantFromMetadata:
+		// An instant DDL copies no rows, so no per-table report arrives to
+		// fill the bar: any terminal outcome it reaches other than a retryable
+		// failure leaves the change made, and the bar full.
+		task.IsInstant = true
+		if poll.result.State.IsTerminal() && !poll.retryableFailure() {
 			task.ProgressPercent = 100
 		}
-		c.transitionTaskState(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskState), "")
 	}
+	// A completed poll ends the bar at 100 whatever the table's last sample
+	// read: row counts are estimates, and a finished copy can land a fraction
+	// short of its own total.
+	if poll.result.State == engine.StateCompleted {
+		task.ProgressPercent = 100
+	}
+}
+
+// advanceTaskFromEngineProgress applies the part of a progress poll that is a
+// correctness decision: the state the poll claims for the task, and the
+// start/completion/error stamps that belong to that outcome.
+//
+// It is separate from the display refresh so a drive that has already settled a
+// task from a more authoritative source — a durable record, or the target
+// schema itself — can keep showing live engine progress without letting the
+// poll re-open what was settled. taskStateWithNoBackwardProgress remains the
+// policy for whether the claim is allowed to move the stored state.
+//
+// This is also where the tick reaches storage, for the task's stamps and for
+// the display fields the refresh left in memory. A write that does not land is
+// returned with the task's state left as it arrived.
+func (c *LocalClient) advanceTaskFromEngineProgress(ctx context.Context, task *storage.Task, tp *engine.TableProgress, poll enginePoll) error {
+	retryableFailure := poll.retryableFailure()
+	if tp != nil {
+		if tp.StartedAt != nil && task.StartedAt == nil {
+			task.StartedAt = tp.StartedAt
+		}
+		if tp.CompletedAt != nil && !retryableFailure && task.CompletedAt == nil {
+			task.CompletedAt = tp.CompletedAt
+		}
+	}
+	if task.StartedAt == nil && poll.newState != state.Task.Pending {
+		task.StartedAt = &poll.now
+	}
+	if poll.result.State.IsTerminal() && !retryableFailure && task.CompletedAt == nil {
+		task.CompletedAt = &poll.now
+	}
+	if poll.result.State == engine.StateFailed && task.ErrorMessage == "" {
+		if msg := progressFailureMessage(poll.result); msg != "" {
+			task.ErrorMessage = msg
+		}
+	}
+	return c.persistTaskStateTransition(ctx, task, 0, taskStateWithNoBackwardProgress(task.State, engineTaskStateClaim(poll.newState, tp)), "")
+}
+
+// engineTaskStateClaim is the state a progress poll claims for one task: the
+// apply-wide state the poll mapped to, refined into the table's own post-copy
+// phase when the engine reported one. A table catching up on accumulated
+// changes, checksumming, or cutting over is then stored — and rendered — as
+// that phase rather than as a serene fully-copied bar.
+//
+// It is only a claim. Whether the stored state may move to it is decided by
+// taskStateWithNoBackwardProgress.
+func engineTaskStateClaim(newState string, tp *engine.TableProgress) string {
+	if tp == nil {
+		return newState
+	}
+	if phase, isPhase := tablePhaseTaskState(tp.State); isPhase && state.IsState(newState, state.Task.Running) {
+		return phase
+	}
+	return newState
+}
+
+// applyEngineTableDisplayFields copies a poll's per-table progress onto the
+// task's display fields. Shared by the grouped and sequential drives so both
+// render from the same projection of an engine report. The throttle reason is
+// bounded here whatever engine reported it: a reason too long for its column
+// would refuse every progress write for the task, and the drive would hand
+// the apply back on a value that only ever served display.
+func applyEngineTableDisplayFields(task *storage.Task, tp *engine.TableProgress) {
+	task.RowsCopied = tp.RowsCopied
+	task.RowsTotal = tp.RowsTotal
+	task.ProgressPercent = tp.Progress
+	task.ETASeconds = int(tp.ETASeconds)
+	task.ChecksumRowsChecked = tp.ChecksumRowsChecked
+	task.ChecksumRowsTotal = tp.ChecksumRowsTotal
+	task.Throttled = tp.Throttled
+	task.ThrottleReason = engine.SanitizeThrottleReason(tp.ThrottleReason)
+	task.IsInstant = tp.IsInstant
 }
 
 // tablePhaseTaskState maps a per-table engine state to the refined task state
@@ -1335,6 +1929,7 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, logger *slog.Logge
 		operationID = *table.ApplyOperationID
 	}
 	for _, sh := range tp.Shards {
+		c.unrecognizedStatuses.observeShardStatus(ctx, logger, table, sh.Shard, sh.State)
 		shardTask := &storage.Task{
 			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          table.ApplyID,
@@ -1351,6 +1946,8 @@ func (c *LocalClient) writeShardProgress(ctx context.Context, logger *slog.Logge
 			Shard:            sh.Shard,
 			DDL:              table.DDL,
 			DDLAction:        table.DDLAction,
+			ExecutionMode:    table.ExecutionMode,
+			ModeReason:       table.ModeReason,
 			State:            state.NormalizeShardStatus(sh.State),
 			RowsCopied:       sh.RowsCopied,
 			RowsTotal:        sh.RowsTotal,

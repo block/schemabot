@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 type checkRunPayload struct {
@@ -34,6 +35,7 @@ func (h *Handler) handleCheckRun(ctx context.Context, metricApp string, w http.R
 		h.writeError(w, http.StatusBadRequest, "invalid check_run payload")
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	switch payload.Action {
 	case "rerequested":

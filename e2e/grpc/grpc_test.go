@@ -48,10 +48,10 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -61,7 +61,7 @@ func TestMain(m *testing.M) {
 	// Clean up SchemaBot's state tables to ensure fresh state
 	dsn := os.Getenv("E2E_SCHEMABOT_MYSQL_DSN")
 	if dsn != "" {
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err == nil {
 			rows, err := db.QueryContext(context.Background(), "SHOW TABLES")
 			if err == nil {
@@ -86,7 +86,7 @@ func TestMain(m *testing.M) {
 		if ternDSN == "" {
 			continue
 		}
-		db, err := sql.Open("mysql", ternDSN)
+		db, err := sql.Open("block-mysql", ternDSN)
 		if err != nil {
 			continue
 		}

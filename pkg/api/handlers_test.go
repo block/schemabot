@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -68,6 +69,9 @@ func (m *mockPlanLookupStore) GetByPR(context.Context, string, int) ([]*storage.
 func (m *mockPlanLookupStore) List(context.Context, storage.ListPlansOptions) ([]*storage.Plan, error) {
 	return nil, nil
 }
+func (m *mockPlanLookupStore) UpdateRoute(context.Context, string, string, string, string) error {
+	return nil
+}
 func (m *mockPlanLookupStore) Delete(context.Context, int64) error           { return nil }
 func (m *mockPlanLookupStore) DeleteByPR(context.Context, string, int) error { return nil }
 
@@ -75,6 +79,18 @@ type capturingPlanStore struct {
 	mockPlanLookupStore
 	created   *storage.Plan
 	createErr error
+	// routed records each UpdateRoute call as "plan_id deployment/target",
+	// followed by " narrowed to <member>" for a narrowed plan.
+	routed []string
+}
+
+func (s *capturingPlanStore) UpdateRoute(_ context.Context, planIdentifier, deployment, target, narrowedTo string) error {
+	call := planIdentifier + " " + deployment + "/" + target
+	if narrowedTo != "" {
+		call += " narrowed to " + narrowedTo
+	}
+	s.routed = append(s.routed, call)
+	return nil
 }
 
 func (s *capturingPlanStore) Create(_ context.Context, plan *storage.Plan) (int64, error) {
@@ -118,14 +134,43 @@ func (m *mockStorageWithApplyStores) ApplyOperations() storage.ApplyOperationSto
 	return m.operations
 }
 
-type staticApplyOperationStore struct {
+// stubApplyOperationStore is what an operation-store double embeds instead of
+// the bare interface. Embedding the interface alone leaves every method a double
+// does not implement as a nil call, which is the behavior wanted for a method
+// the scenario never reaches — it fails loudly. The handback a drive performs on
+// its way out is the exception: every drive makes that call, so with a bare
+// interface every double would have to implement it, and any that did not would
+// panic inside the drive's own recovery rather than fail its test.
+//
+// The default reports nothing cleared, which is what a real store returns when
+// no row is in an ended state under the drive's lease. A double whose scenario
+// turns on the handback overrides it.
+type stubApplyOperationStore struct {
 	storage.ApplyOperationStore
-	operations      []*storage.ApplyOperation
-	err             error
-	resumeStateByOp map[int64]*storage.EngineResumeState
-	resumeStateErr  error
-	reaped          []*storage.ReapedOperation
-	reapErr         error
+}
+
+func (stubApplyOperationStore) ReleaseFinishedClaim(context.Context, storage.OperationLease) (bool, error) {
+	return false, nil
+}
+
+type staticApplyOperationStore struct {
+	stubApplyOperationStore
+	operations []*storage.ApplyOperation
+	err        error
+	reaped     []*storage.ReapedOperation
+	reapErr    error
+}
+
+func (s *staticApplyOperationStore) Get(_ context.Context, id int64) (*storage.ApplyOperation, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	for _, op := range s.operations {
+		if op.ID == id {
+			return op, nil
+		}
+	}
+	return nil, nil
 }
 
 func (s *staticApplyOperationStore) ListByApply(_ context.Context, applyID int64) ([]*storage.ApplyOperation, error) {
@@ -158,16 +203,6 @@ func (s *staticApplyOperationStore) ListByApplies(_ context.Context, applyIDs []
 	return operations, nil
 }
 
-func (s *staticApplyOperationStore) GetEngineResumeState(_ context.Context, operationID int64) (*storage.EngineResumeState, error) {
-	if s.resumeStateErr != nil {
-		return nil, s.resumeStateErr
-	}
-	if rs, ok := s.resumeStateByOp[operationID]; ok {
-		return rs, nil
-	}
-	return nil, storage.ErrEngineResumeStateNotFound
-}
-
 // ReapStranded is called by the stranded-operation reaper, which starts with the
 // operator, so every double reachable from the operator lifecycle answers it. It
 // can return settlements and an error together, the way a pass that fails partway
@@ -180,7 +215,26 @@ type staticPlanStore struct {
 	storage.PlanStore
 	plan      *storage.Plan
 	plansByID map[int64]*storage.Plan
-	err       error
+	// memberPlans are the plans stored for the members of a review round,
+	// listed by the round the apply was created from.
+	memberPlans []*storage.Plan
+	err         error
+}
+
+func (s *staticPlanStore) List(_ context.Context, opts storage.ListPlansOptions) ([]*storage.Plan, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	if opts.PrimaryPlanIdentifier == "" {
+		return s.memberPlans, nil
+	}
+	var matched []*storage.Plan
+	for _, plan := range s.memberPlans {
+		if plan.PrimaryPlanIdentifier == opts.PrimaryPlanIdentifier {
+			matched = append(matched, plan)
+		}
+	}
+	return matched, nil
 }
 
 func (s *staticPlanStore) Get(context.Context, string) (*storage.Plan, error) {
@@ -221,9 +275,47 @@ func (s *staticApplyStore) GetByApplyIdentifier(_ context.Context, applyIdentifi
 func (s *staticApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
 	return s.apply, s.err
 }
+
+// finishedAfterReadApplyStore hands a lookup a copy of the apply in readState
+// while the stored row is already finished: the view a handler holds when a
+// driver finishes the apply after the handler read it. Update refuses stopped
+// over a settled row the way the storage finished-apply guard does, and Get returns
+// the stored row.
+type finishedAfterReadApplyStore struct {
+	storage.ApplyStore
+	stored         *storage.Apply
+	readState      string
+	refusedUpdates int
+}
+
+func (s *finishedAfterReadApplyStore) GetByApplyIdentifier(context.Context, string) (*storage.Apply, error) {
+	read := *s.stored
+	read.State = s.readState
+	read.CompletedAt = nil
+	return &read, nil
+}
+
+func (s *finishedAfterReadApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	stored := *s.stored
+	return &stored, nil
+}
+
+func (s *finishedAfterReadApplyStore) Update(_ context.Context, apply *storage.Apply) error {
+	if state.IsState(apply.State, state.Apply.Stopped) && state.IsState(s.stored.State, state.SettledApplyStates...) {
+		s.refusedUpdates++
+		return fmt.Errorf("apply %s is %s: %w", s.stored.ApplyIdentifier, s.stored.State, storage.ErrApplyReopenRefused)
+	}
+	*s.stored = *apply
+	return nil
+}
 func (s *staticApplyStore) SetRevertSkipped(context.Context, int64, time.Time) error {
 	return nil
 }
+
+// GetByDatabase compares its arguments byte-for-byte against the fixture rows,
+// modelling a store with no collation forgiveness of its own. A handler that
+// forwards a caller's spelling unfolded therefore misses the fixture, so a
+// mixed-case request only matches when the handler folds it first.
 func (s *staticApplyStore) GetByDatabase(_ context.Context, database, dbType, environment string) ([]*storage.Apply, error) {
 	if s.err != nil {
 		return nil, s.err
@@ -545,9 +637,13 @@ func (s *capturingApplyStore) CheckLease(context.Context, storage.ApplyLease) er
 	return nil
 }
 
-func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.RetryableApplyExpiration, error) {
+func (s *capturingApplyStore) ExpireRetryable(context.Context, int) ([]*storage.RetryableApplyExpiration, error) {
 	return nil, nil
 }
+
+// queuedOperationLeaseToken is the token this double rotates onto the operation
+// row it leases out, standing in for the real store's generated token.
+const queuedOperationLeaseToken = "op-lease-token"
 
 // queuedOperationClaimStore serves the operation-level claim ladder over the
 // operation rows a dual-write captured in a capturingApplyStore. The cutover
@@ -555,10 +651,11 @@ func (s *capturingApplyStore) ExpireRetryable(context.Context) ([]*storage.Retry
 // operation claim, which signals the apply store's findCh — one observable
 // signal per tick — and leases the first captured row exactly once.
 type queuedOperationClaimStore struct {
-	storage.ApplyOperationStore
-	applies *capturingApplyStore
-	mu      sync.Mutex
-	claimed bool
+	stubApplyOperationStore
+	applies    *capturingApplyStore
+	mu         sync.Mutex
+	claimed    bool
+	leaseOwner string
 }
 
 func (s *queuedOperationClaimStore) capturedOperation() *storage.ApplyOperation {
@@ -594,8 +691,9 @@ func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, ow
 		return nil, nil
 	}
 	s.claimed = true
+	s.leaseOwner = owner
 	op.LeaseOwner = owner
-	op.LeaseToken = "op-lease-token"
+	op.LeaseToken = queuedOperationLeaseToken
 	return op, nil
 }
 
@@ -604,15 +702,31 @@ func (s *queuedOperationClaimStore) FindNextApplyOperation(_ context.Context, ow
 func (s *queuedOperationClaimStore) ReleaseClaim(_ context.Context, lease storage.OperationLease) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.claimed || lease.Token != "op-lease-token" {
+	if !s.claimed || lease.Token != queuedOperationLeaseToken {
 		return false, nil
 	}
 	s.claimed = false
+	s.leaseOwner = ""
 	return true, nil
 }
 
+// Get returns the row with whatever lease the claim rotated onto it, the way
+// the real store persists it: a driver re-reads the row to confirm its
+// operation lease survived the separate transaction that claims the parent
+// apply, and a double that dropped the lease on read would look to that driver
+// like a peer had rotated it away.
 func (s *queuedOperationClaimStore) Get(context.Context, int64) (*storage.ApplyOperation, error) {
-	return s.capturedOperation(), nil
+	op := s.capturedOperation()
+	if op == nil {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.claimed {
+		op.LeaseOwner = s.leaseOwner
+		op.LeaseToken = queuedOperationLeaseToken
+	}
+	return op, nil
 }
 
 func (s *queuedOperationClaimStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
@@ -634,6 +748,7 @@ type capturingTaskStore struct {
 	mu           sync.Mutex
 	tasks        []*storage.Task
 	createCalls  int
+	updateCalls  int
 	failOnCreate int
 	err          error
 }
@@ -653,6 +768,10 @@ func (s *capturingTaskStore) Create(_ context.Context, task *storage.Task) (int6
 	return int64(len(s.tasks)), nil
 }
 
+func (s *capturingTaskStore) ReapStrandedActive(context.Context, int) ([]*storage.ReapedTask, error) {
+	return nil, nil
+}
+
 func (s *capturingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*storage.ReapedTask, error) {
 	return nil, nil
 }
@@ -660,6 +779,7 @@ func (s *capturingTaskStore) ReapStrandedRetryable(context.Context, int) ([]*sto
 func (s *capturingTaskStore) Update(_ context.Context, task *storage.Task) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updateCalls++
 	for i, storedTask := range s.tasks {
 		if storedTask.ID == task.ID || storedTask.TaskIdentifier == task.TaskIdentifier {
 			s.tasks[i] = task
@@ -761,26 +881,38 @@ func hasApplyLogMessageContaining(logs []*storage.ApplyLog, want string) bool {
 
 // mockTernClient implements tern.Client for testing.
 type mockTernClient struct {
-	healthErr                error
-	planResp                 *ternv1.PlanResponse
-	planErr                  error
-	planReq                  *ternv1.PlanRequest
-	planDiffResp             *ternv1.PlanDiffResponse
-	planDiffErr              error
-	planDiffReq              *ternv1.PlanRequest
-	pullSchemaResp           *ternv1.PullSchemaResponse
-	pullSchemaErr            error
-	pullSchemaReq            *ternv1.PullSchemaRequest
-	pullSchemaReqs           []*ternv1.PullSchemaRequest
-	pullSchemaHook           func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
-	applyResp                *ternv1.ApplyResponse
-	applyErr                 error
-	applyReq                 *ternv1.ApplyRequest
-	progressResp             *ternv1.ProgressResponse
-	progressErr              error
-	progressReq              *ternv1.ProgressRequest
-	logsReqs                 []*ternv1.LogsRequest
-	logsHook                 func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error)
+	healthErr    error
+	planResp     *ternv1.PlanResponse
+	planErr      error
+	planReq      *ternv1.PlanRequest
+	planDiffResp *ternv1.PlanDiffResponse
+	planDiffErr  error
+	planDiffReq  *ternv1.PlanRequest
+	// planDiffMu guards planDiffReq: a rollout plan diffs its members
+	// concurrently, so one client can serve several diffs at once.
+	planDiffMu     sync.Mutex
+	pullSchemaResp *ternv1.PullSchemaResponse
+	pullSchemaErr  error
+	pullSchemaReq  *ternv1.PullSchemaRequest
+	pullSchemaReqs []*ternv1.PullSchemaRequest
+	pullSchemaMu   sync.Mutex
+	pullSchemaHook func(*ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error)
+	applyResp      *ternv1.ApplyResponse
+	applyErr       error
+	applyReq       *ternv1.ApplyRequest
+	progressResp   *ternv1.ProgressResponse
+	progressErr    error
+	progressReq    *ternv1.ProgressRequest
+	// logsMu guards logsReqs: an apply that fanned out reads its data planes
+	// concurrently, so one client can serve several reads at once.
+	logsMu   sync.Mutex
+	logsReqs []*ternv1.LogsRequest
+	logsHook func(*ternv1.LogsRequest) (*ternv1.LogsResponse, error)
+	// logsStall, when set, holds every Logs call open until it is closed or
+	// the call's own context expires, so a test can stall a data plane the way
+	// an unreachable one stalls: the call fails on its deadline rather than
+	// running on past it.
+	logsStall                chan struct{}
 	stopResp                 *ternv1.StopResponse
 	stopErr                  error
 	stopReq                  *ternv1.StopRequest // captured request
@@ -813,8 +945,12 @@ type mockTernClient struct {
 
 func (m *mockTernClient) Health(ctx context.Context) error { return m.healthErr }
 func (m *mockTernClient) PullSchema(ctx context.Context, req *ternv1.PullSchemaRequest) (*ternv1.PullSchemaResponse, error) {
+	// A multi-target pull fans its members out concurrently, so several
+	// goroutines record through this one client.
+	m.pullSchemaMu.Lock()
 	m.pullSchemaReq = req
 	m.pullSchemaReqs = append(m.pullSchemaReqs, req)
+	m.pullSchemaMu.Unlock()
 	if m.pullSchemaHook != nil {
 		return m.pullSchemaHook(req)
 	}
@@ -831,7 +967,9 @@ func (m *mockTernClient) Plan(ctx context.Context, req *ternv1.PlanRequest) (*te
 	return nil, m.planErr
 }
 func (m *mockTernClient) PlanDiff(ctx context.Context, req *ternv1.PlanRequest) (*ternv1.PlanDiffResponse, error) {
+	m.planDiffMu.Lock()
 	m.planDiffReq = req
+	m.planDiffMu.Unlock()
 	if m.planDiffResp != nil {
 		return m.planDiffResp, m.planDiffErr
 	}
@@ -851,8 +989,24 @@ func (m *mockTernClient) Progress(ctx context.Context, req *ternv1.ProgressReque
 	}
 	return nil, m.progressErr
 }
-func (m *mockTernClient) Logs(_ context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+func (m *mockTernClient) Logs(ctx context.Context, req *ternv1.LogsRequest) (*ternv1.LogsResponse, error) {
+	// A real client fails a call made on an expired context rather than
+	// answering it, which is what makes a caller's deadline mean anything.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.logsMu.Lock()
 	m.logsReqs = append(m.logsReqs, req)
+	m.logsMu.Unlock()
+	// A stalled data plane holds the call open until its deadline passes, as a
+	// real one does — it does not keep running after the caller has given up.
+	if m.logsStall != nil {
+		select {
+		case <-m.logsStall:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if m.logsHook != nil {
 		return m.logsHook(req)
 	}
@@ -1492,9 +1646,20 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		assert.Empty(t, plans.created.SchemaPath)
 	})
 
-	t.Run("duplicate plan identifier is tolerated", func(t *testing.T) {
+	// A planner that shares the service's storage stores the row for a plan
+	// with changes first, stamped with the database it was configured with as
+	// the deployment. The service keeps that row and restamps it with the
+	// rollout member it planned, so the apply can find the primary target by it.
+	t.Run("duplicate plan identifier keeps the stored row on the planned route", func(t *testing.T) {
 		svc, _, plans := newPolicyService()
 		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     "payments",
+			Target:         "payments-staging-target",
+		}
 		pr := int32(1)
 
 		resp, err := svc.ExecutePlan(t.Context(), PlanRequest{
@@ -1512,6 +1677,52 @@ func TestExecutePlanSourcePolicy(t *testing.T) {
 		require.NotNil(t, resp)
 		require.NotNil(t, plans.created)
 		assert.Equal(t, "schema/payments", plans.created.SchemaPath)
+		assert.Equal(t, []string{"plan-source-policy " + DefaultDeployment + "/payments-staging-target"}, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier already on the planned route is kept as is", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{
+			PlanIdentifier: "plan-source-policy",
+			Database:       "payments",
+			Environment:    "staging",
+			Deployment:     DefaultDeployment,
+			Target:         "payments-staging-target",
+		}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.NoError(t, err)
+		assert.Empty(t, plans.routed)
+	})
+
+	t.Run("duplicate plan identifier for another database fails the plan", func(t *testing.T) {
+		svc, _, plans := newPolicyService()
+		plans.createErr = storage.ErrPlanIDExists
+		plans.plan = &storage.Plan{PlanIdentifier: "plan-source-policy", Database: "orders", Environment: "staging"}
+		pr := int32(1)
+
+		_, err := svc.ExecutePlan(t.Context(), PlanRequest{
+			Database:    "payments",
+			Environment: "staging",
+			Type:        storage.DatabaseTypeMySQL,
+			SchemaFiles: schemaFiles,
+			Repository:  "octocat/hello-world",
+			PullRequest: &pr,
+		})
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "collides with a stored plan for database \"orders\"")
+		assert.Empty(t, plans.routed)
 	})
 }
 
@@ -1845,6 +2056,51 @@ func TestExecutePullSchemaLintsPulledTables(t *testing.T) {
 	assert.Contains(t, string(cleanJSON), `"lint":[]`)
 }
 
+// A PostgreSQL pull with lint runs the PostgreSQL schema audit over each
+// rendered table — CREATE TABLE plus its CREATE INDEX statements — and reports
+// the shape rules that have a PostgreSQL analog: primary key presence and
+// type, float columns, and table name case.
+func TestExecutePullSchemaLintsPostgresNamespaces(t *testing.T) {
+	mockClient := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "ledger",
+			Type:        storage.DatabaseTypePostgres,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"public": {Tables: map[string]string{
+					"orders": "CREATE TABLE orders (\n    id integer NOT NULL,\n    customer_id bigint NOT NULL,\n    CONSTRAINT orders_pkey PRIMARY KEY (id)\n);\n\nCREATE INDEX orders_customer_id_idx ON orders (customer_id);\n",
+					"events": "CREATE TABLE events (\n    occurred_at timestamp with time zone NOT NULL,\n    weight real\n);\n",
+				}},
+				"billing": {Tables: map[string]string{
+					"invoices": "CREATE TABLE invoices (\n    id bigint NOT NULL,\n    total numeric(12,2) NOT NULL,\n    CONSTRAINT invoices_pkey PRIMARY KEY (id)\n);\n",
+				}},
+			},
+			TableCount: 3,
+		},
+	}
+	svc := newTypeVocabularyService(t, &mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, mockClient, "ledger", storage.DatabaseTypePostgres, "primary")
+
+	resp, err := svc.ExecutePullSchema(t.Context(), apitypes.PullSchemaRequest{
+		Database:    "ledger",
+		Environment: "production",
+		Type:        storage.DatabaseTypePostgres,
+		Lint:        true,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, []*apitypes.LintViolationResponse{
+		{Table: "events", Linter: "primary_key", Severity: "warning", Message: "No primary key defined"},
+		{Table: "events", Column: "weight", Linter: "has_float", Severity: "warning", Message: `Column "weight" in table "events" uses "real" data type`},
+		{Table: "orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "orders" uses "integer"; allowed types: bigint, uuid`},
+	}, resp.Namespaces["public"].Lint)
+	require.NotNil(t, resp.Namespaces["billing"].Lint)
+	assert.Empty(t, resp.Namespaces["billing"].Lint)
+}
+
 // Every pulled table entry must be a CREATE TABLE statement: the linters
 // silently pass over other statement kinds, so a namespace containing one
 // would produce a partial audit. The whole request fails instead — even when
@@ -1929,10 +2185,26 @@ func TestPullSchemaHandlerRejectsLintFailuresAsBadRequest(t *testing.T) {
 			wantBody: "expected CREATE TABLE",
 		},
 		{
-			name:         "unsupported dialect",
+			name:         "non-CREATE PostgreSQL table entry",
 			databaseType: storage.DatabaseTypePostgres,
+			client: &mockTernClient{
+				pullSchemaResp: &ternv1.PullSchemaResponse{
+					Database:    "orders",
+					Type:        storage.DatabaseTypePostgres,
+					Environment: "production",
+					Namespaces: map[string]*ternv1.PulledNamespace{
+						"public": {Tables: map[string]string{"users": "ALTER TABLE users ADD COLUMN note text;\n"}},
+					},
+					TableCount: 1,
+				},
+			},
+			wantBody: "expected CREATE TABLE",
+		},
+		{
+			name:         "dialect without a schema audit",
+			databaseType: "cockroach",
 			client:       &mockTernClient{},
-			wantBody:     "schema linting on pull is not supported for postgres databases",
+			wantBody:     "schema linting on pull is not supported for cockroach databases",
 		},
 	}
 	for _, tt := range tests {
@@ -2005,15 +2277,16 @@ func TestExecutePullSchemaLintOffByDefault(t *testing.T) {
 	assert.Nil(t, resp.Namespaces["orders"].Lint)
 }
 
-// The schema linters parse MySQL-family DDL only, so a lint request against
-// any other dialect fails closed before the pull is dispatched — silently
-// returning zero violations would read as a clean audit.
+// The schema audits cover the MySQL family and PostgreSQL. A lint request
+// against a database of any other configured type fails closed before the
+// pull is dispatched — silently returning zero violations would read as a
+// clean audit.
 func TestExecutePullSchemaRejectsLintForUnsupportedDialect(t *testing.T) {
 	mockClient := &mockTernClient{}
 	cfg := &ServerConfig{
 		Databases: map[string]DatabaseConfig{
 			"ledger": {
-				Type: storage.DatabaseTypePostgres,
+				Type: "cockroach",
 				Environments: map[string]EnvironmentConfig{
 					"production": {Target: "ledger-production", Deployment: "primary"},
 				},
@@ -2039,7 +2312,7 @@ func TestExecutePullSchemaRejectsLintForUnsupportedDialect(t *testing.T) {
 
 	var lintDialectErr *unsupportedLintDialectError
 	require.ErrorAs(t, err, &lintDialectErr)
-	assert.Equal(t, storage.DatabaseTypePostgres, lintDialectErr.DatabaseType)
+	assert.Equal(t, "cockroach", lintDialectErr.DatabaseType)
 	assert.Nil(t, mockClient.pullSchemaReq)
 }
 
@@ -2236,6 +2509,255 @@ func TestPullSchemaHandlerRoutesPrimaryDeployment(t *testing.T) {
 	require.NotNil(t, euClient.pullSchemaReq, "primary deployment should be pulled")
 	assert.Equal(t, "orders-eu", euClient.pullSchemaReq.Target)
 	assert.Nil(t, usClient.pullSchemaReq, "non-primary deployment must not be pulled")
+}
+
+// newAppScopedPullService configures one production deployment with a MySQL
+// database per entry in apps (database name → app identifier, empty for no
+// app), backed by the given tern client, for pull-by-app tests.
+func newAppScopedPullService(t *testing.T, apps map[string]string, client *mockTernClient) *Service {
+	t.Helper()
+	databases := make(map[string]DatabaseConfig, len(apps))
+	for database, app := range apps {
+		databases[database] = DatabaseConfig{
+			Type: storage.DatabaseTypeMySQL,
+			App:  app,
+			Environments: map[string]EnvironmentConfig{
+				"production": {Target: database + "-production", Deployment: "us"},
+			},
+		}
+	}
+	cfg := &ServerConfig{
+		Databases:       databases,
+		TernDeployments: TernConfig{"us": {"production": "tern.example.com:80"}},
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	return New(&mockStorage{}, cfg, map[string]tern.Client{"us/production": client}, logger)
+}
+
+// A pull request may select its database by app identifier instead of name.
+// The app resolves through server config to the one database declaring it,
+// the pull routes exactly as a by-name request would, and the response echoes
+// both the resolved database and its app. App matching is case-insensitive
+// like every other request key.
+func TestPullSchemaHandlerSelectsDatabaseByApp(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce", "accounts": ""}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"CoMmErCe","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NotNil(t, client.pullSchemaReq, "resolved database should be pulled")
+	assert.Equal(t, "orders", client.pullSchemaReq.Database)
+	assert.Equal(t, "orders-production", client.pullSchemaReq.Target)
+	assert.Contains(t, w.Body.String(), `"database":"orders"`)
+	assert.Contains(t, w.Body.String(), `"app":"commerce"`)
+}
+
+// A by-name pull of a database that declares an app echoes the app, so every
+// pull response carries the grouping identifier regardless of the selector.
+func TestPullSchemaHandlerEchoesAppOnByNamePull(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `"app":"commerce"`)
+}
+
+// An app no configured database declares fails closed instead of guessing,
+// and the request never reaches a data plane.
+func TestPullSchemaHandlerRejectsUnknownApp(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"nosuch","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `app \"nosuch\" has no configured databases`)
+	assert.Nil(t, client.pullSchemaReq, "unresolvable app must not reach the data plane")
+}
+
+// A pull reads one database, so an app declared by several databases is
+// rejected with the candidates named — the caller picks, not the server.
+func TestPullSchemaHandlerRejectsAppNamingSeveralDatabases(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce", "billing": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"commerce","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "declared by 2 databases")
+	assert.Contains(t, w.Body.String(), "billing, orders")
+	assert.Nil(t, client.pullSchemaReq, "ambiguous app must not reach the data plane")
+}
+
+// Database and app are two ways to select the same target; a request naming
+// both is rejected rather than trusting them to agree.
+func TestPullSchemaHandlerRejectsDatabaseWithApp(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","app":"commerce","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "set exactly one")
+	assert.Nil(t, client.pullSchemaReq, "rejected request must not reach the data plane")
+}
+
+// An empty app string is the same as an absent one: a client that always
+// emits the field selects by name without tripping the exactly-one rule, and
+// a request with both selectors empty is told to provide one.
+func TestPullSchemaHandlerTreatsEmptyAppAsUnset(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"orders","app":"","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"","app":"","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "database or app is required")
+}
+
+// Surrounding whitespace on the app selector is trimmed before resolution,
+// matching the list endpoint's ?app= filter, so the same identifier resolves
+// through either surface.
+func TestPullSchemaHandlerTrimsAppWhitespace(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "orders",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"orders": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"  CoMmErCe  ","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.PullSchemaResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "orders", resp.Database)
+	assert.Equal(t, "commerce", resp.App)
+}
+
+// Environment is validated before the app resolves, so a request missing the
+// environment is told exactly that — not handed a resolution error for a
+// selector the server never needed to look up.
+func TestPullSchemaHandlerRequiresEnvironmentForAppPulls(t *testing.T) {
+	client := &mockTernClient{}
+	svc := newAppScopedPullService(t, map[string]string{"orders": "commerce"}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"app":"nonexistent"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "environment is required")
+	assert.NotContains(t, w.Body.String(), "no configured databases", "the app must not resolve before the request shape is validated")
+}
+
+// A pull of a database that declares no app omits the field from the response
+// instead of reporting an empty grouping value, mirroring the databases list.
+func TestPullSchemaHandlerOmitsAppForUndeclaredDatabase(t *testing.T) {
+	client := &mockTernClient{
+		pullSchemaResp: &ternv1.PullSchemaResponse{
+			Database:    "accounts",
+			Type:        storage.DatabaseTypeMySQL,
+			Environment: "production",
+			Namespaces: map[string]*ternv1.PulledNamespace{
+				"accounts": {Tables: map[string]string{"users": "CREATE TABLE `users` (`id` bigint NOT NULL);\n"}},
+			},
+			TableCount: 1,
+		},
+	}
+	svc := newAppScopedPullService(t, map[string]string{"accounts": ""}, client)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/pull", strings.NewReader(`{"database":"accounts","environment":"production"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), `"app"`)
 }
 
 // newTypeVocabularyService configures one database on a single production
@@ -2955,7 +3477,11 @@ func TestCreateStoredApplyFansOutOperationsForResolvedTargets(t *testing.T) {
 		controls:  &memoryControlRequestStore{},
 	}, cfg, map[string]tern.Client{}, logger)
 
-	apply, storedApplyID, err := svc.createStoredApply(t.Context(), executeApplyTestPlan(), ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
+	// A rollout-wide apply runs from the rollout primary's plan.
+	plan := executeApplyTestPlan()
+	plan.Deployment = "default-a"
+	plan.Target = "testdb-a"
+	apply, storedApplyID, err := svc.createStoredApply(t.Context(), plan, ApplyRequest{Environment: "staging"}, nil, "apply-fanout")
 
 	require.NoError(t, err)
 	assert.Equal(t, int64(123), storedApplyID)
@@ -3417,6 +3943,129 @@ func TestDatabaseListFiltersByConfiguredCustomType(t *testing.T) {
 	assert.Equal(t, "cockroach", resp.Databases[0].Type)
 }
 
+// The list reports each database's configured app identifier and filters on
+// it, so a caller holding only an app name can find its databases. An app no
+// configured database declares is rejected — fail closed, like the type
+// filter and app-scoped commands — rather than silently matching nothing.
+func TestDatabaseListReportsAndFiltersByApp(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				App:  "commerce",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-prod", Deployment: "us"},
+				},
+			},
+			"billing": {
+				Type: storage.DatabaseTypeMySQL,
+				App:  "commerce",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "billing-prod", Deployment: "us"},
+				},
+			},
+			"accounts": {
+				Type: storage.DatabaseTypeMySQL,
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "accounts-prod", Deployment: "us"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{"us": {"production": "us.example:9090"}},
+	}, nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.DatabaseListResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 3)
+	assert.Equal(t, "accounts", resp.Databases[0].Database)
+	assert.Empty(t, resp.Databases[0].App)
+	assert.Equal(t, "billing", resp.Databases[1].Database)
+	assert.Equal(t, "commerce", resp.Databases[1].App)
+	assert.Equal(t, "orders", resp.Databases[2].Database)
+	assert.Equal(t, "commerce", resp.Databases[2].App)
+
+	// A database with no app omits the field entirely instead of reporting
+	// an empty grouping value.
+	assert.NotContains(t, w.Body.String(), `"app":""`)
+
+	// The app filter is exact and case-insensitive, composing with the
+	// other filters.
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=CoMmErCe", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 2)
+	assert.Equal(t, "billing", resp.Databases[0].Database)
+	assert.Equal(t, "orders", resp.Databases[1].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=commerce&name=ord", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=nosuch", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), `app \"nosuch\" has no configured databases`)
+}
+
+// The app and type filters compose: each is validated against the whole
+// configured universe, so a valid app narrowed by a valid type it has no
+// databases of returns an empty list, not an error — the same contract the
+// type and name filters already share.
+func TestDatabaseListCombinesAppAndTypeFilters(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorage{}, &ServerConfig{
+		Databases: map[string]DatabaseConfig{
+			"orders": {
+				Type: storage.DatabaseTypeMySQL,
+				App:  "commerce",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "orders-prod", Deployment: "us"},
+				},
+			},
+			"ledger": {
+				Type: storage.DatabaseTypeVitess,
+				App:  "books",
+				Environments: map[string]EnvironmentConfig{
+					"production": {Target: "ledger-prod", Deployment: "us"},
+				},
+			},
+		},
+		TernDeployments: TernConfig{"us": {"production": "us.example:9090"}},
+	}, nil, logger)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=commerce&type=mysql", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.DatabaseListResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Databases, 1)
+	assert.Equal(t, "orders", resp.Databases[0].Database)
+
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/databases?app=commerce&type=vitess", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Empty(t, resp.Databases, "a valid app with no databases of the valid type filters to empty, not to an error")
+}
+
 func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
 	_, err := databaseListResponse(&ServerConfig{
 		Databases: map[string]DatabaseConfig{
@@ -3427,7 +4076,7 @@ func TestDatabaseListRejectsInvalidDeploymentTopology(t *testing.T) {
 				},
 			},
 		},
-	}, "", "")
+	}, "", "", "")
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `database "orders" environment "production" deployments map is empty`)
@@ -3491,6 +4140,69 @@ func TestProgressByApplyIDDisplaysStoredStateNotLiveProto(t *testing.T) {
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.Equal(t, state.Apply.WaitingForCutover, resp.State,
 		"displayed state must come from the stored apply state, not the live engine proto")
+}
+
+func TestProgressByApplyIDOverlaysTaskTimestampsByCanonicalStatement(t *testing.T) {
+	// A deployment's progress projection spells each statement as its own
+	// engine emitted it, qualified with its own physical schema, while the
+	// stored task rows carry the reviewed text. The per-table timestamps live
+	// only on the task rows, so each projected statement must find its task by
+	// canonical form: two statements on one table each get their own
+	// timestamps, and a projected statement that is a different change on
+	// that table gets none rather than a sibling's.
+	started := time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)
+	completed := started.Add(2 * time.Minute)
+	indexStarted := started.Add(3 * time.Minute)
+	const (
+		reviewedCreate = `CREATE TABLE "app-region-a".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
+		reviewedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-a".recall USING btree (consumer_uuid)`
+		renderedCreate = `CREATE TABLE "app-region-b".recall (id bigint NOT NULL, consumer_uuid text, CONSTRAINT recall_pkey PRIMARY KEY (id))`
+		renderedIndex  = `CREATE INDEX idx_recall_consumer_uuid ON "app-region-b".recall USING btree (consumer_uuid)`
+		renderedOther  = `CREATE INDEX idx_recall_agency ON "app-region-b".recall USING btree (agency_id)`
+	)
+	mock := &mockTernClient{
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			ApplyId: "remote-apply-canon",
+			State:   ternv1.State_STATE_RUNNING,
+			Tables: []*ternv1.TableProgress{
+				{Namespace: "app", TableName: "recall", Ddl: renderedCreate, Status: state.Task.Completed, PercentComplete: 100},
+				{Namespace: "app", TableName: "recall", Ddl: renderedIndex, Status: state.Task.Running, PercentComplete: 40},
+				{Namespace: "app", TableName: "recall", Ddl: renderedOther, Status: state.Task.Pending},
+			},
+		},
+	}
+	apply := activeTestApply("apply-canon-overlay")
+	apply.ExternalID = "remote-apply-canon"
+	apply.DatabaseType = storage.DatabaseTypePostgres
+	tasks := []*storage.Task{
+		{ID: 1, TaskIdentifier: "task-create", ApplyID: apply.ID, Namespace: "app", TableName: "recall", DDL: reviewedCreate, State: state.Task.Completed, StartedAt: &started, CompletedAt: &completed},
+		{ID: 2, TaskIdentifier: "task-index", ApplyID: apply.ID, Namespace: "app", TableName: "recall", DDL: reviewedIndex, State: state.Task.Running, StartedAt: &indexStarted},
+	}
+	svc := newControlTestServiceWithTasks(mock, apply, tasks)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-canon-overlay", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.Len(t, resp.Tables, 3)
+
+	assert.Equal(t, renderedCreate, resp.Tables[0].DDL, "the projection keeps the deployment's own spelling")
+	assert.Equal(t, started.Format(time.RFC3339), resp.Tables[0].StartedAt)
+	assert.Equal(t, completed.Format(time.RFC3339), resp.Tables[0].CompletedAt)
+
+	assert.Equal(t, renderedIndex, resp.Tables[1].DDL)
+	assert.Equal(t, indexStarted.Format(time.RFC3339), resp.Tables[1].StartedAt)
+	assert.Empty(t, resp.Tables[1].CompletedAt)
+
+	assert.Equal(t, renderedOther, resp.Tables[2].DDL)
+	assert.Empty(t, resp.Tables[2].StartedAt, "a different change on the table must not borrow a sibling's timestamps")
+	assert.Empty(t, resp.Tables[2].CompletedAt)
 }
 
 func TestProgressByApplyIDOnlySendsApplyIDAndEnvironment(t *testing.T) {
@@ -3681,6 +4393,74 @@ func TestExecuteApplyRejectsBlockedStoredPlan(t *testing.T) {
 	assert.Zero(t, applyID)
 	assert.Contains(t, err.Error(), "blocked change")
 	assert.Contains(t, err.Error(), "cannot be executed safely as written")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
+func TestExecuteApplyListsIndependentBlockedCauses(t *testing.T) {
+	plan := executeApplyTestPlan()
+	change := &plan.Namespaces["testdb"].Tables[0]
+	change.ExecutionMode = engine.ExecutionModeBlocked
+	change.ModeReason = engine.JoinBlockedCauses([]string{
+		"planner requires a rewrite; choose a supported statement",
+		"table exceeds the native-safe size ceiling; use an online path",
+	})
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{PlanID: "plan-1", Environment: "staging"})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), ":\n- planner requires a rewrite; choose a supported statement\n- table exceeds the native-safe size ceiling; use an online path")
+	assert.Nil(t, applies.apply)
+	assert.Empty(t, tasks.tasks)
+}
+
+func TestExecuteApplyRejectsBlockedUnsafeStoredPlanAsBlocked(t *testing.T) {
+	plan := executeApplyTestPlan()
+	change := &plan.Namespaces["testdb"].Tables[0]
+	change.IsUnsafe = true
+	change.UnsafeReason = "DROP COLUMN removes data"
+	change.ExecutionMode = "blocked"
+	change.ModeReason = "statement cannot be executed safely as written"
+
+	applies := &capturingApplyStore{}
+	tasks := &capturingTaskStore{}
+	applies.taskStore = tasks
+	svc := New(&mockStorageWithApplyStores{
+		plans:     &staticPlanStore{plan: plan},
+		applies:   applies,
+		tasks:     tasks,
+		locks:     &emptyLockStore{},
+		applyLogs: &noopApplyLogStore{},
+	}, testServerConfig(), map[string]tern.Client{
+		"default/staging": &mockTernClient{},
+	}, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, applyID, err := svc.ExecuteApply(t.Context(), ApplyRequest{
+		PlanID:      "plan-1",
+		Environment: "staging",
+	})
+
+	require.Error(t, err)
+	assert.Nil(t, resp)
+	assert.Zero(t, applyID)
+	assert.Contains(t, err.Error(), "blocked change")
+	assert.Contains(t, err.Error(), "cannot be executed safely as written")
+	assert.NotContains(t, err.Error(), "allow_unsafe")
 	assert.Nil(t, applies.apply)
 	assert.Empty(t, tasks.tasks)
 }
@@ -3901,6 +4681,10 @@ func TestProgressFromLocalStorageIncludesOperationProgressAndTableDeployment(t *
 	require.Len(t, resp.Tables, 2)
 	assert.Equal(t, "deploy-a", resp.Tables[0].Deployment)
 	assert.Equal(t, "deploy-b", resp.Tables[1].Deployment)
+	// One deployment can address several targets, so the deployment alone does
+	// not say which target a table's copy is running against.
+	assert.Equal(t, "target-a", resp.Tables[0].Target)
+	assert.Equal(t, "target-b", resp.Tables[1].Target)
 }
 
 func newActiveProgressServiceWithOperations(client tern.Client, apply *storage.Apply, operations storage.ApplyOperationStore) *Service {
@@ -4051,6 +4835,36 @@ func TestProgressByApplyIDActivePathToleratesOperationStorageError(t *testing.T)
 	assert.Equal(t, state.Apply.Running, resp.State)
 }
 
+// A task row can sit in an active state under an apply that has already reached
+// a verdict: a driver settled the apply and exited without closing the row, or
+// one failed task settled the apply while its siblings kept copying. The reader
+// cannot tell those apart, so it reports every task exactly as stored and never
+// writes. Repairing a genuinely stranded row belongs to a writer that can hold
+// a lease and wait out the parent's quiescence window, and a GET does neither.
+func TestProgressFromLocalStorageReportsActiveTaskUnderTerminalApplyVerbatim(t *testing.T) {
+	terminalStates := []string{state.Apply.Completed, state.Apply.Failed, state.Apply.Cancelled, state.Apply.Reverted, state.Apply.Stopped}
+	for _, applyState := range terminalStates {
+		t.Run(applyState, func(t *testing.T) {
+			apply := &storage.Apply{ID: 40, ApplyIdentifier: "apply_stranded", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: applyState, ExternalID: "remote-apply"}
+			tasks := &capturingTaskStore{tasks: []*storage.Task{
+				{ApplyID: apply.ID, TaskIdentifier: "task_users", TableName: "users", Namespace: "testdb", DDLAction: "alter", State: state.Task.Running, ProgressPercent: 42, Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Engine: storage.EngineSpirit, Environment: "staging"},
+			}}
+			svc := New(&mockStorageWithApplyStores{tasks: tasks, operations: &staticApplyOperationStore{}},
+				testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+			resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+			require.NoError(t, err)
+			require.Len(t, resp.Tables, 1)
+			assert.Equal(t, state.Task.Running, resp.Tables[0].Status, "the task's stored state is reported as stored, never rewritten to the apply's verdict")
+			assert.Equal(t, int32(42), resp.Tables[0].PercentComplete)
+			assert.Equal(t, "users", resp.Tables[0].TableName)
+			assert.Equal(t, state.Task.Running, tasks.tasks[0].State, "stored task row must be untouched by a read")
+			assert.Zero(t, tasks.updateCalls, "reading progress must not write task rows")
+		})
+	}
+}
+
 func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing.T) {
 	apply := &storage.Apply{ID: 20, ApplyIdentifier: "apply_single", Database: "testdb", DatabaseType: storage.DatabaseTypeMySQL, Environment: "staging", Engine: storage.EngineSpirit, State: state.Apply.Completed}
 	svc := New(&mockStorageWithApplyStores{
@@ -4072,7 +4886,8 @@ func TestProgressFromLocalStorageSingleDeploymentOmitsOperationFields(t *testing
 // display fields (branch, deploy-request URL, instant/deferred flags). The
 // engine is not polled on the storage path, so these are read from the durable
 // engine resume state persisted on the apply's operation — the "let me look at
-// what happened" case must not lose the deploy-request link.
+// what happened" case must not lose the deploy-request link. Where the
+// persisted progress metadata carries the same key, the resume state wins.
 func TestProgressFromLocalStorageOverlaysDisplayMetadataFromResumeState(t *testing.T) {
 	opID := int64(77)
 	apply := &storage.Apply{
@@ -4090,10 +4905,11 @@ func TestProgressFromLocalStorageOverlaysDisplayMetadataFromResumeState(t *testi
 		}},
 		operations: &staticApplyOperationStore{
 			operations: []*storage.ApplyOperation{
-				{ID: opID, ApplyID: apply.ID, Deployment: "testdb", Target: "testdb", State: state.ApplyOperation.Completed},
-			},
-			resumeStateByOp: map[int64]*storage.EngineResumeState{
-				opID: {ApplyOperationID: opID, Metadata: `{"branch_name":"schemabot-testdb-123","deploy_request_url":"https://app.planetscale.com/org/testdb/deploy-requests/42","is_instant":true,"deferred_deploy":true}`},
+				{
+					ID: opID, ApplyID: apply.ID, Deployment: "testdb", Target: "testdb", State: state.ApplyOperation.Completed,
+					ProgressMetadata:     `{"phase":"completed","branch_name":"progress-branch"}`,
+					EngineResumeMetadata: `{"branch_name":"schemabot-testdb-123","deploy_request_url":"https://app.planetscale.com/org/testdb/deploy-requests/42","is_instant":true,"deferred_deploy":true}`,
+				},
 			},
 		},
 	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
@@ -4106,6 +4922,124 @@ func TestProgressFromLocalStorageOverlaysDisplayMetadataFromResumeState(t *testi
 	assert.Equal(t, "https://app.planetscale.com/org/testdb/deploy-requests/42", resp.Metadata["deploy_request_url"])
 	assert.Equal(t, "true", resp.Metadata["is_instant"])
 	assert.Equal(t, "true", resp.Metadata["deferred_deploy"])
+	assert.Equal(t, "completed", resp.Metadata["phase"])
+}
+
+// A completed PostgreSQL apply served from storage surfaces the position the
+// engine last reported (phase, step, statement) from the progress metadata the
+// driver persisted on the operation. The engine is not polled on the storage
+// path and has no resume state to decode, so this is the only source of these
+// fields once the apply has settled.
+func TestProgressFromLocalStorageOverlaysPersistedProgressMetadata(t *testing.T) {
+	opID := int64(78)
+	apply := &storage.Apply{
+		ID:              32,
+		ApplyIdentifier: "apply_pg_completed",
+		Database:        "shop",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Environment:     "staging",
+		Engine:          storage.EnginePostgres,
+		State:           state.Apply.Completed,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &opID, TaskIdentifier: "task_orders", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Completed, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{
+					ID: opID, ApplyID: apply.ID, Deployment: "shop", Target: "shop", State: state.ApplyOperation.Completed,
+					ProgressMetadata: `{"phase":"completed","step":"2","steps_total":"2","statement":"ALTER TABLE public.orders ADD COLUMN note text","elapsed_ms":"1834"}`,
+				},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+	require.NoError(t, err)
+	resp.Metadata["phase"] = "caller-phase"
+	overlayStoredDisplayMetadata(resp, apply, []*storage.ApplyOperation{{ProgressMetadata: `{"phase":"stored-phase"}`}})
+	assert.Equal(t, map[string]string{
+		"phase": "caller-phase", "step": "2", "steps_total": "2",
+		"statement": "ALTER TABLE public.orders ADD COLUMN note text", "elapsed_ms": "1834",
+	}, resp.Metadata)
+}
+
+// On a multi-operation apply the top-level metadata has one slot per key, so
+// the operations are overlaid in creation order: the first-created operation
+// supplies the generic position fields and later operations fill only the keys
+// it left empty. The same operation wins on every poll, so consecutive reads
+// never flip between deployments.
+func TestProgressFromLocalStorageOverlaysOperationsInCreationOrder(t *testing.T) {
+	firstOpID, secondOpID := int64(80), int64(81)
+	apply := &storage.Apply{
+		ID:              34,
+		ApplyIdentifier: "apply_pg_two_ops",
+		Database:        "shop",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Environment:     "staging",
+		Engine:          storage.EnginePostgres,
+		State:           state.Apply.Running,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &firstOpID, TaskIdentifier: "task_orders_a", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Completed, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+			{ApplyID: apply.ID, ApplyOperationID: &secondOpID, TaskIdentifier: "task_orders_b", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Running, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{
+					ID: firstOpID, ApplyID: apply.ID, Deployment: "shop-a", Target: "shop-a", State: state.ApplyOperation.Completed,
+					ProgressMetadata: `{"phase":"completed","step":"2","steps_total":"2"}`,
+				},
+				{
+					ID: secondOpID, ApplyID: apply.ID, Deployment: "shop-b", Target: "shop-b", State: state.ApplyOperation.Running,
+					ProgressMetadata: `{"phase":"preflight","step":"1","steps_total":"2","statement":"ALTER TABLE public.orders ADD COLUMN note text"}`,
+				},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	for range 5 {
+		resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{
+			"phase": "completed", "step": "2", "steps_total": "2",
+			"statement": "ALTER TABLE public.orders ADD COLUMN note text",
+		}, resp.Metadata)
+	}
+}
+
+// Malformed persisted progress metadata degrades to a response without those
+// fields; it never fails the progress request.
+func TestProgressFromLocalStorageToleratesMalformedProgressMetadata(t *testing.T) {
+	opID := int64(79)
+	apply := &storage.Apply{
+		ID:              33,
+		ApplyIdentifier: "apply_pg_bad_metadata",
+		Database:        "shop",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		Environment:     "staging",
+		Engine:          storage.EnginePostgres,
+		State:           state.Apply.Failed,
+	}
+	svc := New(&mockStorageWithApplyStores{
+		tasks: &capturingTaskStore{tasks: []*storage.Task{
+			{ApplyID: apply.ID, ApplyOperationID: &opID, TaskIdentifier: "task_orders", TableName: "orders", Namespace: "public", DDLAction: "alter", DDL: "ALTER TABLE public.orders ADD COLUMN note text", State: state.Task.Failed, Database: "shop", DatabaseType: storage.DatabaseTypePostgres, Engine: storage.EnginePostgres, Environment: "staging"},
+		}},
+		operations: &staticApplyOperationStore{
+			operations: []*storage.ApplyOperation{
+				{ID: opID, ApplyID: apply.ID, Deployment: "shop", Target: "shop", State: state.ApplyOperation.Failed, ProgressMetadata: `{"phase":`},
+			},
+		},
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	resp, err := svc.progressFromLocalStorage(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.Empty(t, resp.Metadata["phase"])
 }
 
 // An apply with no engine resume state (e.g. one that predates resume-state
@@ -4462,6 +5396,7 @@ func TestHandleStatusDeploymentFilterProjectsMatchingOperation(t *testing.T) {
 	assert.Equal(t, "remote-operation-202", resp.Applies[0].ExternalOperationID)
 	assert.Equal(t, "deploy-a", resp.Applies[0].Deployment)
 	assert.Equal(t, state.Apply.Completed, resp.Applies[0].State)
+	assert.Equal(t, state.Apply.Running, resp.Applies[0].ApplyState, "the parent's state is reported beside the operation's, since the apply still holds the deployment")
 }
 
 // A deployment applied per shard has exactly one data-plane apply, so the
@@ -4945,6 +5880,19 @@ func TestServiceClose(t *testing.T) {
 	assert.NoError(t, svc.Close())
 }
 
+// serveApplyRequest sends body to POST /api/apply through the service's routes
+// and returns the recorded response.
+func serveApplyRequest(t *testing.T, svc *Service, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/apply", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	return w
+}
+
 func TestApplyHandler(t *testing.T) {
 	t.Run("returns bad request for unsupported apply feature", func(t *testing.T) {
 		plan := executeApplyTestPlan()
@@ -4966,6 +5914,108 @@ func TestApplyHandler(t *testing.T) {
 		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
 		assert.Equal(t, `apply rejected: database "testdb": deferred cutover is not supported for database_type: postgres`, resp.Error)
 		assert.Nil(t, applies.apply)
+	})
+
+	// A caller naming a plan_id SchemaBot never stored gets a 404 telling them
+	// to check the ID, not a 500 that reads like a server outage.
+	t.Run("returns not found for an unknown plan", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, tasks := newQueueApplyTestService(nil, &mockTernClient{}, applies)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-missing","environment":"staging"}`)
+
+		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Equal(t, "apply rejected: plan not found: plan-missing; check the plan_id or create a new plan", resp.Error)
+		assert.Nil(t, applies.apply, "an unknown plan must not store an apply")
+		assert.Empty(t, tasks.tasks)
+	})
+
+	// A plan store that reports a missing plan through the ErrPlanNotFound
+	// sentinel instead of a nil plan gets the same 404, not the 500 reserved
+	// for a read that actually failed.
+	t.Run("returns not found when the store reports the missing plan as an error", func(t *testing.T) {
+		logger := slog.New(slog.DiscardHandler)
+		plans := &mockPlanLookupStore{err: storage.ErrPlanNotFound}
+		svc := New(&mockStorageWithPlanLookup{plans: plans}, testServerConfig(), nil, logger)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-missing","environment":"staging"}`)
+
+		require.Equal(t, http.StatusNotFound, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeNotFound, resp.ErrorCode)
+		assert.Equal(t, "apply rejected: plan not found: plan-missing; check the plan_id or create a new plan", resp.Error)
+	})
+
+	// A plan reviewed for staging is refused when the caller asks to apply it
+	// to production: the request is wrong, so it is a 400 naming both
+	// environments, and nothing is queued against production.
+	t.Run("returns bad request when the plan was created for another environment", func(t *testing.T) {
+		applies := &capturingApplyStore{}
+		svc, tasks := newQueueApplyTestService(executeApplyTestPlan(), &mockTernClient{}, applies)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"production"}`)
+
+		require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+		assert.Equal(t, `apply rejected: plan plan-1 was created for environment "staging", not "production"; apply it to "staging" or create a plan for "production"`, resp.Error)
+		assert.Nil(t, applies.apply, "a mismatched environment must not store an apply")
+		assert.Empty(t, tasks.tasks)
+	})
+
+	// A stored plan missing either routing field is a 400 naming that field:
+	// the request cannot supply what the plan lacks, so the caller is told to
+	// create a new plan. Both fields are checked because each has its own
+	// branch, and nothing is queued for either.
+	t.Run("returns bad request when the plan lacks routing metadata", func(t *testing.T) {
+		missingDeployment := executeApplyTestPlan()
+		missingDeployment.Deployment = ""
+		missingTarget := executeApplyTestPlan()
+		missingTarget.Target = ""
+
+		cases := map[string]*storage.Plan{
+			"deployment": missingDeployment,
+			"target":     missingTarget,
+		}
+		for field, plan := range cases {
+			t.Run(field, func(t *testing.T) {
+				applies := &capturingApplyStore{}
+				svc, tasks := newQueueApplyTestService(plan, &mockTernClient{}, applies)
+
+				w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+				require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+				var resp apitypes.ErrorResponse
+				require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+				assert.Equal(t, apitypes.ErrCodeInvalidRequest, resp.ErrorCode)
+				assert.Equal(t, fmt.Sprintf(`apply rejected: plan plan-1 is missing server-side routing metadata field %q; create a new plan and retry apply`, field), resp.Error)
+				assert.Nil(t, applies.apply, "a plan without routing metadata must not store an apply")
+				assert.Empty(t, tasks.tasks)
+			})
+		}
+	})
+
+	// When the plan read itself fails, the apply is a server failure: a 500
+	// with the storage error code, and the raw storage error (which can carry
+	// hostnames) stays in the server log rather than the response.
+	t.Run("returns internal error without storage detail when the plan lookup fails", func(t *testing.T) {
+		logger := slog.New(slog.DiscardHandler)
+		storageErr := errors.New("dial tcp 10.0.0.5:3306: connect: connection refused")
+		svc := New(&mockStorageWithPlanLookup{plans: &mockPlanLookupStore{err: storageErr}}, testServerConfig(), nil, logger)
+
+		w := serveApplyRequest(t, svc, `{"plan_id":"plan-1","environment":"staging"}`)
+
+		require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+		var resp apitypes.ErrorResponse
+		require.NoError(t, json.NewDecoder(w.Body).Decode(&resp))
+		assert.Equal(t, apitypes.ErrCodeStorageError, resp.ErrorCode)
+		assert.Equal(t, "apply failed: failed to get plan plan-1; see server logs, then retry", resp.Error)
+		assert.NotContains(t, w.Body.String(), "10.0.0.5")
 	})
 
 	t.Run("returns conflict when an active apply already exists", func(t *testing.T) {
@@ -5892,6 +6942,69 @@ func TestStartHandler(t *testing.T) {
 		assert.Equal(t, int64(1), resp.StartedCount)
 	})
 
+	// The handler reads a running apply with a pending stop, and the data plane
+	// reports it stopped; before the handler records that, a driver finishes
+	// the apply. Storage refuses to write stopped over the completed row, so
+	// the start is refused for the verdict that won, nothing is queued, and the
+	// stop request stays pending for whoever finished the apply.
+	t.Run("refuses start when the apply finished during the remote stop check", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			progressResp: &ternv1.ProgressResponse{
+				State: ternv1.State_STATE_STOPPED,
+				Tables: []*ternv1.TableProgress{{
+					TableName: "users",
+					Status:    state.Task.Stopped,
+				}},
+			},
+		}
+		completedAt := time.Now().Add(-time.Second)
+		stored := activeTestApply("apply-remote-stop-finished")
+		stored.ExternalID = "remote-apply-stop-finished"
+		stored.State = state.Apply.Completed
+		stored.CompletedAt = &completedAt
+		applies := &finishedAfterReadApplyStore{stored: stored, readState: state.Apply.Running}
+		controls := &memoryControlRequestStore{}
+		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+		svc := New(&mockStorageWithApplyStores{
+			applies:  applies,
+			tasks:    &capturingTaskStore{},
+			controls: controls,
+		}, testServerConfig(), map[string]tern.Client{
+			"default/staging": mock,
+		}, logger)
+		_, alreadyPending, err := controls.RequestPending(t.Context(), &storage.ApplyControlRequest{
+			ApplyID:     stored.ID,
+			Operation:   storage.ControlOperationStop,
+			Status:      storage.ControlRequestPending,
+			RequestedBy: "cli:stopper",
+		})
+		require.NoError(t, err)
+		require.False(t, alreadyPending)
+		mux := http.NewServeMux()
+		svc.ConfigureRoutes(mux)
+
+		body := `{"environment": "staging", "apply_id": "apply-remote-stop-finished", "caller": "cli:starter"}`
+		req := httptest.NewRequestWithContext(t.Context(), "POST", "/api/start", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+		assert.Contains(t, w.Body.String(), state.Apply.Completed, "the refusal names the stored verdict")
+		require.NotNil(t, mock.progressReq)
+		assert.Nil(t, mock.startReq)
+		assert.Equal(t, state.Apply.Completed, stored.State, "the finished apply keeps its verdict")
+		assert.Equal(t, 1, applies.refusedUpdates, "the handler tried to record stopped exactly once")
+		pendingStop, err := controls.GetPending(t.Context(), stored.ID, storage.ControlOperationStop)
+		require.NoError(t, err)
+		require.NotNil(t, pendingStop, "the stop request stays with whoever finished the apply")
+		assert.Equal(t, "cli:stopper", pendingStop.RequestedBy)
+		pendingStart, err := controls.GetPending(t.Context(), stored.ID, storage.ControlOperationStart)
+		require.NoError(t, err)
+		assert.Nil(t, pendingStart, "no start is queued against a finished apply")
+	})
+
 	t.Run("returns already requested for remote duplicate after operator claim", func(t *testing.T) {
 		mock := &mockTernClient{
 			isRemote: true,
@@ -6710,6 +7823,73 @@ func TestControlRejectionsNameTheOperatorApplyID(t *testing.T) {
 			assert.NotContains(t, log.Message, remoteID, "no apply log line names the remote id")
 		}
 	})
+
+	// Cancel is queued durably and then attempted immediately, exactly as stop
+	// is. A rejected immediate attempt leaves the durable request pending for
+	// the owning drive, so the apply log is the only place an operator learns
+	// why nothing happened yet — and it reads in their terms.
+	t.Run("a rejected immediate cancel is logged against the operator apply id", func(t *testing.T) {
+		mock := &mockTernClient{
+			isRemote: true,
+			cancelResp: &ternv1.CancelResponse{
+				Accepted:     false,
+				ErrorMessage: "Schema change " + remoteID + " is already cutting over",
+			},
+		}
+		apply := activeTestApply(operatorID)
+		apply.ExternalID = remoteID
+		tasks := []*storage.Task{{
+			ID:             31,
+			TaskIdentifier: "task-cancel-relay",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}}
+		svc, stores := newControlTestServiceWithStores(mock, apply, tasks)
+
+		w := postControl(t, svc, "/api/cancel", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		require.NotNil(t, mock.cancelReq, "the queued cancel is followed by an immediate attempt")
+		assert.Equal(t, remoteID, mock.cancelReq.ApplyId, "the data plane is still addressed by its own id")
+
+		require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "Immediate cancel attempt was not accepted"),
+			"the apply log must record why the cancel request is still pending")
+		require.True(t, hasApplyLogMessageContaining(stores.applyLogs.logs, "is already cutting over"),
+			"the apply log carries the reason the attempt was refused")
+		for _, log := range stores.applyLogs.logs {
+			assert.NotContains(t, log.Message, remoteID, "no apply log line names the remote id")
+		}
+
+		pending, err := stores.controls.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+		require.NoError(t, err)
+		require.NotNil(t, pending, "a refused immediate attempt leaves the durable request for the owning drive")
+	})
+
+	// A refusal is not obliged to carry a reason. The log line still has to read
+	// as a sentence rather than trailing a colon into nothing.
+	t.Run("a rejected immediate cancel with no reason logs a complete sentence", func(t *testing.T) {
+		mock := &mockTernClient{cancelResp: &ternv1.CancelResponse{Accepted: false}}
+		apply := activeTestApply(operatorID)
+		apply.ExternalID = remoteID
+		tasks := []*storage.Task{{
+			ID:             32,
+			TaskIdentifier: "task-cancel-relay-silent",
+			ApplyID:        apply.ID,
+			State:          state.Task.Running,
+		}}
+		svc, stores := newControlTestServiceWithStores(mock, apply, tasks)
+
+		w := postControl(t, svc, "/api/cancel", operatorID)
+		assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+		var logged string
+		for _, log := range stores.applyLogs.logs {
+			if strings.Contains(log.Message, "Immediate cancel attempt was not accepted") {
+				logged = log.Message
+			}
+		}
+		require.NotEmpty(t, logged, "the apply log must record the refused attempt even with no reason")
+		assert.NotContains(t, logged, "pending:", "with no reason there is nothing to introduce with a colon")
+	})
 }
 
 // Revert and skip-revert are contradictory intents for the same revert window —
@@ -6853,4 +8033,74 @@ func TestSetRevertSkippedMetadata(t *testing.T) {
 	now := time.Now()
 	setRevertSkippedMetadata(resp, &storage.Apply{RevertSkippedAt: &now})
 	assert.Equal(t, "true", resp.Metadata["revert_skipped"], "flag set once revert_skipped_at is present")
+}
+
+// A gRPC apply is polled from two sources over its life: control-plane storage
+// while it is queued and once it is terminal, and the data plane's own progress
+// while it runs. The data plane mints its own task identifiers and knows
+// nothing of the control plane's operation rows, so a watcher keying its
+// per-table state on task_id would otherwise see the same statement under two
+// identities. Every source must report the stored task's identity and rollout
+// member.
+func TestProgressByApplyIDReportsOneTaskIdentityAcrossProgressSources(t *testing.T) {
+	const (
+		reviewed = "ALTER TABLE orders ADD COLUMN status INT"
+		rendered = "alter table `orders` add column `status` int"
+	)
+	opID := int64(41)
+	mock := &mockTernClient{
+		isRemote: true,
+		progressResp: &ternv1.ProgressResponse{
+			ApplyId: "remote-apply-identity",
+			State:   ternv1.State_STATE_RUNNING,
+			Tables: []*ternv1.TableProgress{
+				{Namespace: "testdb", TableName: "orders", Ddl: rendered, Status: state.Task.Running, TaskId: "task-data-plane", PercentComplete: 40},
+			},
+		},
+	}
+	apply := activeTestApply("apply-task-identity")
+	apply.ExternalID = ""
+	tasks := []*storage.Task{
+		{ID: 1, TaskIdentifier: "task-control-plane", ApplyID: apply.ID, ApplyOperationID: &opID, Namespace: "testdb", TableName: "orders", DDL: reviewed, State: state.Task.Pending},
+	}
+	operations := []*storage.ApplyOperation{
+		{ID: opID, ApplyID: apply.ID, Deployment: "commerce-a", Target: "shop-001", State: state.ApplyOperation.Running},
+	}
+	svc := newControlTestServiceWithOperations(mock, apply, tasks, operations)
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	poll := func(t *testing.T) *apitypes.TableProgressResponse {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-task-identity", nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+		var resp apitypes.ProgressResponse
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+		require.Len(t, resp.Tables, 1)
+		return resp.Tables[0]
+	}
+	assertIdentity := func(t *testing.T, tbl *apitypes.TableProgressResponse) {
+		t.Helper()
+		assert.Equal(t, "task-control-plane", tbl.TaskID)
+		assert.Equal(t, "commerce-a", tbl.Deployment)
+		assert.Equal(t, "shop-001", tbl.Target)
+	}
+
+	queued := poll(t)
+	require.Nil(t, mock.progressReq, "a queued remote apply is served from storage")
+	assertIdentity(t, queued)
+
+	apply.ExternalID = "remote-apply-identity"
+	tasks[0].State = state.Task.Running
+	active := poll(t)
+	require.NotNil(t, mock.progressReq, "an active remote apply is proxied to the data plane")
+	assert.Equal(t, rendered, active.DDL, "the projection keeps the deployment's own spelling")
+	assert.Equal(t, int32(40), active.PercentComplete, "live figures come from the data plane")
+	assertIdentity(t, active)
+
+	apply.State = state.Apply.Completed
+	tasks[0].State = state.Task.Completed
+	assertIdentity(t, poll(t))
 }

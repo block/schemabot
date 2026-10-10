@@ -10,59 +10,65 @@ import (
 	"github.com/block/schemabot/pkg/glyph"
 	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/schemabot/pkg/storage"
 )
 
-func (m WatchModel) multiDeploymentProgressView() string {
-	model := presentation.Derive(tuiOperationsForPresentation(m.operations, m.released))
+// multiDeploymentProgressSections renders the rollout as its body (the header
+// and each deployment's section) and its footer (the rollout's next command
+// and the keys the operator can press).
+func (m WatchModel) multiDeploymentProgressSections() (string, string) {
+	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.released))
+	groups := model.Groups()
+	view := templates.RolloutView{
+		ApplyID:      m.applyID,
+		Environment:  m.environment,
+		Engine:       m.engine,
+		Model:        model,
+		Tables:       m.tables,
+		SetupPhase:   state.IsSetupPhase(m.state),
+		DeferCutover: m.deferCutover,
+	}
 
 	var b strings.Builder
-	m.writeMultiDeploymentHeader(&b, model)
+	m.writeMultiDeploymentHeader(&b, model, groups)
 
-	for _, deployment := range model.Deployments {
-		m.writeDeploymentSection(&b, deployment)
+	// A deployment that addresses several targets renders as one rollup
+	// section, shared with the progress output; any other member keeps a
+	// section of its own. Each member names the row it reads its identifiers
+	// from, so each section renders its own operation's; a deployment can own
+	// several operations, so a name-based lookup cannot tell them apart.
+	for _, g := range groups {
+		if len(g.Members) > 1 {
+			b.WriteString(templates.FormatTargetRollup(view, g))
+			continue
+		}
+		d := model.Deployments[g.Members[0]]
+		m.writeDeploymentSection(&b, d, m.operations[d.Row])
 	}
 
-	m.writeMultiDeploymentFooter(&b, model)
-	return b.String()
-}
-
-// tuiOperationsForPresentation maps the watch model's progress operations to the
-// surface-neutral presentation inputs. released is the apply-level release latch:
-// a released pause behaves like continue, so the held siblings proceed and the
-// aggregate runs degraded instead of paused.
-func tuiOperationsForPresentation(ops []templates.ProgressOperation, released bool) []presentation.Operation {
-	presentationOps := make([]presentation.Operation, 0, len(ops))
-	for _, op := range ops {
-		presentationOps = append(presentationOps, presentation.Operation{
-			Deployment:        op.Deployment,
-			State:             op.State,
-			Barrier:           op.CutoverPolicy == storage.CutoverPolicyBarrier,
-			Parallel:          op.CutoverPolicy == storage.CutoverPolicyParallel,
-			ContinueOnFailure: op.OnFailure == storage.OnFailureContinue,
-			PauseOnFailure:    op.OnFailure == storage.OnFailurePause,
-			Released:          released,
-			Error:             op.ErrorMessage,
-		})
+	b.WriteString(templates.FormatThrottleReference(m.tables))
+	var f strings.Builder
+	if footer := templates.FormatRolloutFooter(view); footer != "" {
+		f.WriteString(footer + "\n")
 	}
-	return presentationOps
+	m.writeMultiDeploymentFooter(&f, model)
+	return b.String(), f.String()
 }
 
-func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply) {
+func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply, groups []presentation.Group) {
 	if state.IsRunningApplyState(model.State) || state.IsState(model.State, state.Apply.Pending, state.Apply.WaitingForCutover, state.Apply.CuttingOver, state.Apply.Recovering) {
 		b.WriteString(m.spinner.View() + model.Label + m.elapsed() + "\n")
 	} else {
 		b.WriteString(model.Label + "\n")
 	}
-	if counts := formatTUIDeploymentCounts(model.Counts); counts != "" {
-		b.WriteString(counts + "\n")
+	if label, counts := templates.RolloutCounts(model, groups); counts != "" {
+		fmt.Fprintf(b, "%s: %s\n", label, counts)
 	}
 	if model.FirstFailure != nil {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 		if model.FirstFailure.Error != "" {
-			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s — %s", model.FirstFailure.Deployment, model.FirstFailure.Error)))
+			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s — %s", model.FirstFailure.Name, model.FirstFailure.Error)))
 		} else {
-			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s", model.FirstFailure.Deployment)))
+			fmt.Fprintf(b, "%s\n", errStyle.Render(fmt.Sprintf(glyph.Failed+" First failure: %s", model.FirstFailure.Name)))
 		}
 	}
 	if m.applyID != "" {
@@ -74,24 +80,20 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 	b.WriteString("\n")
 }
 
-func formatTUIDeploymentCounts(counts []presentation.StateCount) string {
-	parts := make([]string, 0, len(counts))
-	for _, count := range counts {
-		parts = append(parts, fmt.Sprintf("%d %s", count.Count, count.Label))
-	}
-	return strings.Join(parts, " · ")
-}
-
-func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presentation.Deployment) {
-	fmt.Fprintf(b, "%s %s — %s", deployment.Emoji, deployment.Deployment, deployment.Label)
-	if target := targetForTUIDeployment(m.operations, deployment.Deployment); target != "" {
-		fmt.Fprintf(b, " (%s)", target)
+func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presentation.Deployment, op templates.ProgressOperation) {
+	fmt.Fprintf(b, "%s %s — %s", deployment.Emoji, deployment.Name, deployment.Label)
+	// A member whose name already carries its target does not repeat it in the
+	// trailing parenthetical.
+	if op.Target != "" && deployment.Name == deployment.Deployment {
+		fmt.Fprintf(b, " (%s)", op.Target)
 	}
 	b.WriteString("\n")
-	if externalOperationID := externalOperationIDForTUIDeployment(m.operations, deployment.Deployment); externalOperationID != "" {
-		fmt.Fprintf(b, "  External operation ID: %s\n", externalOperationID)
+	// The external operation ID identifies this operation's own data-plane row,
+	// so it never falls back to a sibling's value.
+	if op.ExternalOperationID != "" {
+		fmt.Fprintf(b, "  External operation ID: %s\n", op.ExternalOperationID)
 	}
-	if externalID := externalIDForTUIDeployment(m.operations, deployment.Deployment); externalID != "" {
+	if externalID := templates.SectionExternalID(op, m.operations); externalID != "" {
 		fmt.Fprintf(b, "  External apply ID: %s\n", externalID)
 	}
 
@@ -100,7 +102,10 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 		fmt.Fprintf(b, "  %s\n", errStyle.Render(deployment.Error))
 	}
 
-	tables := tablesForDeployment(m.tables, deployment.Deployment)
+	// The selector takes the member's recorded target, not the resolved one the
+	// header shows: a table row carries whatever its own operation carried, so
+	// matching an inherited value would look for a target the rows do not have.
+	tables := tablesForMember(m.tables, deployment.Deployment, deployment.Target)
 	if len(tables) > 0 && !state.IsSetupPhase(m.state) {
 		sortTablesByProgress(tables)
 		m.renderTables(b, tables)
@@ -108,57 +113,32 @@ func (m WatchModel) writeDeploymentSection(b *strings.Builder, deployment presen
 	b.WriteString("\n")
 }
 
-func targetForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment {
-			return op.Target
-		}
-	}
-	return ""
-}
-
-func externalOperationIDForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalOperationID != "" {
-			return op.ExternalOperationID
-		}
-	}
-	return ""
-}
-
-func externalIDForTUIDeployment(ops []templates.ProgressOperation, deployment string) string {
-	for _, op := range ops {
-		if op.Deployment == deployment && op.ExternalID != "" {
-			return op.ExternalID
-		}
-	}
-	return ""
-}
-
-func tablesForDeployment(tables []templates.TableProgress, deployment string) []templates.TableProgress {
-	deploymentTables := make([]templates.TableProgress, 0, len(tables))
+// tablesForMember selects the tables copied by one rollout member. Both halves
+// of the routing pair are matched: two targets of one deployment each copy the
+// same tables, and matching the deployment alone would list both members'
+// copies under each of them.
+func tablesForMember(tables []templates.TableProgress, deployment, target string) []templates.TableProgress {
+	memberTables := make([]templates.TableProgress, 0, len(tables))
 	for _, table := range tables {
-		if table.Deployment == deployment && table.TableName != "" {
-			deploymentTables = append(deploymentTables, table)
+		if table.Deployment == deployment && table.Target == target && table.TableName != "" {
+			memberTables = append(memberTables, table)
 		}
 	}
-	return deploymentTables
+	return memberTables
 }
 
+// writeMultiDeploymentFooter closes the view below the rollout footer. A
+// failed or stopped rollout ends on the footer's command, the way the progress
+// output does: the header already names the state, and a second banner would
+// repeat the recovery guidance beneath the command it describes.
 func (m WatchModel) writeMultiDeploymentFooter(b *strings.Builder, model presentation.Apply) {
 	switch {
 	case state.IsState(model.State, state.Apply.Completed):
 		b.WriteString("\n")
 		b.WriteString(templates.FormatApplyCompleteWithSummary(countTableProgressChanges(m.tables).summary(), m.applyID))
 		b.WriteString("\n")
-	case state.IsState(model.State, state.Apply.Failed):
-		b.WriteString("\n")
-		b.WriteString(templates.FormatApplyFailed())
-		b.WriteString("\n")
-	case state.IsState(model.State, state.Apply.Stopped):
-		b.WriteString("\n")
-		b.WriteString(templates.FormatApplyStopped())
-		b.WriteString("\n")
+	case state.IsState(model.State, state.Apply.Failed, state.Apply.Stopped):
+		// Nothing follows the rollout footer's command.
 	default:
 		dimStyle := lipgloss.NewStyle().Faint(true)
 		b.WriteString(dimStyle.Render("ESC to detach"))

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,6 +73,31 @@ func TestDurablePushWebhookQueuesAndAcks(t *testing.T) {
 		t.Fatal("durable request path should not create a GitHub client")
 	default:
 	}
+}
+
+func TestDurablePushWebhookCanonicalizesRepository(t *testing.T) {
+	events := newRecordingWebhookEventStore()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := api.New(&durableWebhookTestStorage{webhookEvents: events}, &api.ServerConfig{
+		Repos: map[string]api.RepoConfig{"mixedcase/sample-repo": {}},
+	}, nil, logger)
+	h := NewHandler(service, &fakeClientFactory{}, nil, logger, WithDurableWebhookDispatch())
+
+	req := buildPushWebhookRequest(t, "refs/heads/main", "MixedCaseSHA", false)
+	body, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	req.Body = io.NopCloser(strings.NewReader(strings.ReplaceAll(string(body), "octocat/hello-world", "MixedCase/Sample-Repo")))
+	req.Header.Set(headerDeliveryID, "mixed-case-push")
+	rr := httptest.NewRecorder()
+
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	event, err := events.GetByDeliveryID(t.Context(), storage.WebhookProviderGitHub, "mixed-case-push")
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	assert.Equal(t, "mixedcase/sample-repo", event.Repository)
+	assert.Equal(t, "MixedCaseSHA", event.HeadSHA)
 }
 
 // A non-default-branch push is filtered before enqueue, so no inbox row is

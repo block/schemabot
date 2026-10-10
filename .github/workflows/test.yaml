@@ -15,7 +15,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  # Detect whether the change touches anything other than *.md / docs/**.
+  # Detect whether the change touches any non-markdown file.
   # PRs that touch only docs skip the heavy jobs below; pushes (main/tags)
   # always run. Fails open: if detection fails, treat as code change.
   changes:
@@ -33,11 +33,19 @@ jobs:
         continue-on-error: true
         uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # dorny/paths-filter@v3.0.3
         with:
+          # The action's default quantifier ORs the patterns, and '**'
+          # matches every file, so without 'every' this filter reports
+          # code=true on every PR and the docs-only skip never fires.
+          # 'every' ANDs them: skip only Markdown, the docs TOC manifest,
+          # and documentation images. Keep image exclusions scoped to docs/
+          # and assets/ so scripts and Go files there still count as code.
+          predicate-quantifier: 'every'
           filters: |
             code:
               - '**'
               - '!**/*.md'
-              - '!docs/**'
+              - '!docs/.toc-manifest'
+              - '!{docs,assets}/**/*.{svg,png,jpg,jpeg,gif,webp,ico}'
       - name: "Resolve code-change and coverage flags"
         id: out
         shell: bash
@@ -170,10 +178,13 @@ jobs:
           # onto their own runner so the long tail keeps headroom under the job
           # budget.
           - shard: tern-webhook
-          # The single heaviest per-package binary (~4 min alone), which starts
-          # many MySQL testcontainers. Running it beside other container-heavy
-          # binaries contends on the shared Docker daemon and stretches it
-          # toward go test's own timeout, so it gets an uncontended runner.
+          # The service package: its storage-backed tests share one MySQL
+          # testcontainer and start a PostgreSQL testcontainer each, on top of
+          # a large body of unit tests in the same binary. Running it beside
+          # other container-heavy binaries contends on the shared Docker
+          # daemon, so it keeps an uncontended runner; fold it back into
+          # per-package once its wall clock has settled well below the other
+          # shards' for a stretch of main runs.
           - shard: pkg/api
           # Every other integration-tagged package: tests that live beside the
           # code they cover, spread across ./pkg, ./cmd and ./e2e. A newly
@@ -203,8 +214,12 @@ jobs:
             mysql:8.0 \
             mysql:8.4 \
             postgres:16 \
-            localstack/localstack:3.0 \
+            postgres:17 \
+            ministackorg/ministack:1.5.10 \
             testcontainers/ryuk:0.13.0
+      - name: "Pre-pull Supabase PostgreSQL"
+        if: matrix.shard == 'per-package'
+        run: scripts/ci/prepull-images.sh supabase/postgres:17.6.1.136@sha256:f371b5f3f2ac0a05703f33d6e6134515fb2498cab708fb948a0aeb7481467c00
       - name: "Test"
         # Cap package-level parallelism: the integration suite runs many heavy
         # MySQL/Spirit package binaries that otherwise thrash CPU and the shared
@@ -299,7 +314,30 @@ jobs:
           set -euo pipefail
           NUM_SHARDS=3
           # Deterministic order so a test always lands in the same bucket.
-          tests=$(grep -h -o 'func Test[^(]*' pkg/localscale/*_test.go | sed 's/func //' | grep -v '/' | sort)
+          # Searched recursively: the shard runner tests every package under
+          # pkg/localscale that carries test files, so a test in a nested
+          # package that no shard filter names would be run by nobody.
+          # grep exits 1 when no test file matches and 2 when the tree is
+          # unusable. Under `set -e` either would abort here with a bare exit
+          # status, so both are absorbed and reported apart: a missing or
+          # unreadable tree says so rather than being described as an empty
+          # test set. The status check below is the fail-closed gate, not
+          # just the label: with `set +e` in force, grep still prints the
+          # matches from every file it could read, so without the check one
+          # unreadable test file's tests would drop out of every shard filter
+          # and the job would pass with nobody running them.
+          # A Go identifier cannot contain `/`, so a match carrying
+          # one came from prose that mentions `func Test`, not from a
+          # declaration, and is dropped after discovery.
+          set +e
+          matches=$(grep -r --include='*_test.go' -h -o 'func Test[^(]*' pkg/localscale)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::pkg/localscale is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed -e 's/func //' -e '/\//d' | sort -u)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no localscale tests discovered"
@@ -363,15 +401,26 @@ jobs:
           docker build -f deploy/local/Dockerfile.localscale -t localscale:latest .
       - name: "Compile tests"
         run: go test -tags=integration -c -o /dev/null ./pkg/localscale/...
+      # The script streams per-test output and spends a time budget that keeps
+      # Go's own timeout below this job's timeout-minutes, so a shard that
+      # hangs panics with a dump naming the test it is stuck on instead of
+      # being killed with an empty log. Its budget is derived from the
+      # timeout-minutes above; see the script header before changing either.
       - name: "Test"
-        run: go test -tags=integration -timeout=8m -count=1 -v -run "${{ matrix.run_filter }}" ./pkg/localscale/... 2>&1 | tee /dev/stderr | tail -50
+        run: scripts/ci/run-localscale-shard.sh "${{ matrix.run_filter }}"
 
   e2e-mysql:
     name: "E2E MySQL Tests"
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (checkout, Go, cache restore, image pulls and compose
+    # startup — measured between three and a half and four and a half minutes)
+    # plus the E2E_TEST_TIMEOUT passed to make on the Test step lands inside
+    # the job budget with room for the goroutine dump and the log-capture step:
+    # a hung test panics with its dump instead of the runner cancelling the job
+    # first.
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -397,7 +446,7 @@ jobs:
             --dockerfile deploy/local/Dockerfile.dev \
             --dockerfile deploy/local/Dockerfile.localscale
       - name: "Test"
-        run: make test-e2e-mysql
+        run: make test-e2e-mysql E2E_TEST_TIMEOUT=10m
       - name: "Capture container logs on failure"
         if: failure()
         run: |
@@ -424,7 +473,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (including the server image build and compose startup)
+    # plus the E2E_TEST_TIMEOUT passed to make on the Test step lands inside
+    # the job budget: a hung test panics with its goroutine dump instead of
+    # the runner cancelling the job first.
+    timeout-minutes: 14
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -449,7 +502,7 @@ jobs:
             mysql:8.0 \
             --dockerfile deploy/local/Dockerfile.dev
       - name: "Test"
-        run: make test-e2e-grpc
+        run: make test-e2e-grpc E2E_TEST_TIMEOUT=10m
       - name: "Capture container logs on failure"
         if: failure()
         run: |
@@ -483,6 +536,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
+    # Sized so setup (about two and a half minutes including the server image
+    # build and compose startup) plus the E2E_TEST_TIMEOUT passed to make on
+    # the Test step lands inside the job budget: a hung test panics with its
+    # goroutine dump instead of the runner cancelling the job first.
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -491,7 +548,9 @@ jobs:
           - shard: ordered
             run: TestGRPCMultiDeploy_(SchemaBot_Health|TernHealth_BothDeployments|Plan_FansOut|OrderedCutover|OrderedCutoverObservability|BarrierReleaseBounded)$$
           - shard: failure-policy
-            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue)$$
+            run: TestGRPCMultiDeploy_(FailureHaltsRollout|OnFailureContinue|OnFailurePauseRelease)$$
+          - shard: targets
+            run: TestGRPCMultiDeploy_(TargetsRolloutThroughCLI)$$
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -516,7 +575,7 @@ jobs:
             mysql:8.0 \
             --dockerfile deploy/local/Dockerfile.dev
       - name: "Test"
-        run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}'
+        run: make test-e2e-grpc-multideploy E2E_GRPC_MD_RUN='${{ matrix.run }}' E2E_TEST_TIMEOUT=10m
       - name: "Show captured container logs on failure"
         if: failure()
         run: |
@@ -566,7 +625,20 @@ jobs:
           set -euo pipefail
           NUM_SHARDS=3
           # Deterministic order so a test always lands in the same bucket.
-          tests=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go | sed 's/func //' | sort)
+          # grep exits 1 when the file has no matching test and 2 when the
+          # file itself is unusable. Under `set -e` either would abort here
+          # with a bare exit status, so both are absorbed and reported apart:
+          # a missing or unreadable file says so rather than being described
+          # as an empty test set.
+          set +e
+          matches=$(grep -o 'func TestVitess_[^(]*' e2e/local/vitess_test.go)
+          grep_status=$?
+          set -e
+          if [ "$grep_status" -gt 1 ]; then
+            echo "::error::e2e/local/vitess_test.go is unusable for test discovery (grep exited $grep_status)"
+            exit 1
+          fi
+          tests=$(printf '%s\n' "$matches" | sed 's/func //' | sort)
           count=$(printf '%s\n' "$tests" | grep -c . || true)
           if [ "$count" -eq 0 ]; then
             echo "::error::no vitess e2e tests discovered"
@@ -596,7 +668,13 @@ jobs:
     needs: [changes, e2e-vitess-matrix]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Sized so setup (about three and a half minutes including the image
+    # builds and compose startup) plus the E2E_TEST_TIMEOUT passed to make on
+    # the Test step (8m for these shards, not the 10m the other e2e jobs use)
+    # lands inside the job budget with room for the goroutine dump and the
+    # log-capture step: a hung test panics with its dump instead of the runner
+    # cancelling the job first.
+    timeout-minutes: 14
     strategy:
       fail-fast: false
       matrix:
@@ -650,13 +728,14 @@ jobs:
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
     # Sized so setup (checkout, Go, cache restore, minikube start, plus the
-    # script's own image build and deploy — about five minutes) plus go
-    # test's per-binary timeout inside the script can land inside the job
-    # budget: a hung test panics with its goroutine dump instead of the
-    # runner cancelling the job first — or, on a slow run, cancelling it
-    # during the script's exit-trap cleanup after the suite already passed.
-    # Matches the sibling e2e-k8s-etre job's budget.
-    timeout-minutes: 15
+    # script's own image build and deploy — measured at about four minutes)
+    # plus the E2E_TEST_TIMEOUT set on the Deploy and test step lands inside
+    # the job budget with room left for the goroutine dump, the script's exit
+    # trap, and the pod-log capture step: a hung test panics with its dump
+    # instead of the runner cancelling the job first. The dump is guaranteed
+    # only where the binary's own deadline lands inside the job's — an
+    # unusually slow setup can still push it out.
+    timeout-minutes: 17
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -676,6 +755,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 2048
       # The script builds the schemabot image into minikube's docker daemon
@@ -687,6 +769,9 @@ jobs:
         env:
           E2E_K8S_NAMESPACE: schemabot-e2e
           KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-test.sh
       - name: "Pod logs on failure"
         if: failure()
@@ -707,7 +792,18 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true' && (needs.changes.outputs.full == 'true' || github.event_name != 'pull_request')
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Sized so setup (checkout, Go, cache restore, minikube start, plus the
+    # script's own build of both images and the deploy — typically a little
+    # over five minutes, but measured as high as six and a half) plus the
+    # E2E_TEST_TIMEOUT set on the Deploy and test step lands inside the job
+    # budget with room left for the goroutine dump, the script's exit trap,
+    # and the pod-log capture step: a hung test panics with its dump instead
+    # of the runner cancelling the job first. The budget is sized from the
+    # slowest setup seen, not the typical one, because the run that needs its
+    # pod logs is the one that must not lose them. The dump is guaranteed only
+    # where the binary's own deadline lands inside the job's — an unusually
+    # slow setup can still push it out.
+    timeout-minutes: 18
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # actions/checkout@v6
       - name: "Configure Go"
@@ -727,6 +823,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 4096
       # The script builds both the schemabot and etre images into minikube's
@@ -736,6 +835,9 @@ jobs:
         # logs; the runner is ephemeral, so there is nothing to clean up after.
         env:
           KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-etre-test.sh
       - name: "Pod logs on failure"
         if: failure()
@@ -792,6 +894,9 @@ jobs:
         uses: medyagh/setup-minikube@d8c0eb871f6f455542491d86a574477bd3894533 # medyagh/setup-minikube@v0.0.18
         with:
           driver: docker
+          # The e2e scripts build images through `minikube docker-env`, which
+          # only yields a usable Docker daemon under the docker runtime.
+          container-runtime: docker
           cpus: 2
           memory: 6144
       # The script builds the schemabot, etre, and localscale images into
@@ -801,6 +906,9 @@ jobs:
         # logs; the runner is ephemeral, so there is nothing to clean up after.
         env:
           KEEP_NAMESPACE: "1"
+          # go test's own timeout inside the script; the job budget above is
+          # sized to exceed it plus setup, so change the two together.
+          E2E_TEST_TIMEOUT: 10m
         run: e2e/k8s/e2e-vitess-test.sh
       - name: "Pod logs on failure"
         if: failure()

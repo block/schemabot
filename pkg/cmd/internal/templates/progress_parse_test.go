@@ -29,6 +29,13 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 				ErrorMessage:        "retryable failure",
 				StartedAt:           "2026-06-16T10:00:00Z",
 				CompletedAt:         "2026-06-16T10:05:00Z",
+				RolloutStep:         2,
+			},
+			{
+				Deployment:       "deploy-a",
+				Target:           "target-b",
+				State:            "STATE_COMPLETED",
+				AlreadyConverged: true,
 			},
 		},
 		Tables: []*apitypes.TableProgressResponse{
@@ -45,7 +52,9 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 
 	data := ParseProgressResponse(result)
 
-	require.Len(t, data.Operations, 1)
+	require.Len(t, data.Operations, 2)
+	assert.False(t, data.Operations[0].AlreadyConverged)
+	assert.True(t, data.Operations[1].AlreadyConverged, "the target that already had the change keeps its mark")
 	assert.Equal(t, "deploy-a", data.Operations[0].Deployment)
 	assert.Equal(t, "commerce/-80/users", data.Operations[0].OperationKey)
 	assert.Equal(t, "remote-apply-a", data.Operations[0].ExternalID)
@@ -58,6 +67,8 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 	assert.Equal(t, "retryable failure", data.Operations[0].ErrorMessage)
 	assert.Equal(t, "2026-06-16T10:00:00Z", data.Operations[0].StartedAt)
 	assert.Equal(t, "2026-06-16T10:05:00Z", data.Operations[0].CompletedAt)
+	assert.Equal(t, 2, data.Operations[0].RolloutStep)
+	assert.Equal(t, 0, data.Operations[1].RolloutStep)
 	require.Len(t, data.Tables, 1)
 	assert.Equal(t, "deploy-a", data.Tables[0].Deployment)
 	assert.Equal(t, state.Task.Running, data.Tables[0].Status)
@@ -181,20 +192,18 @@ func TestParseProgressResponseFiltersSpiritInternalTables(t *testing.T) {
 	assert.Equal(t, "users", data.Tables[0].TableName)
 }
 
-// Spirit's progress string is the freshest copy signal: when it parses, the
-// structured percent and row counts follow it so every consumer renders the
-// same numbers, and raw engine statuses normalize to canonical task states.
-func TestParseProgressResponsePrefersSpiritProgressStringAndNormalizesStatus(t *testing.T) {
+// The structured copy fields pass through untouched, and a raw engine phase
+// string normalizes to its canonical task state.
+func TestParseProgressResponseCarriesCopyFieldsAndNormalizesStatus(t *testing.T) {
 	result := &apitypes.ProgressResponse{
 		State: state.Apply.Running,
 		Tables: []*apitypes.TableProgressResponse{
 			{
 				TableName:       "users",
 				Status:          "copyRows",
-				RowsCopied:      100,
-				RowsTotal:       200,
-				PercentComplete: 50,
-				ProgressDetail:  "71436/221193 32.30% copyRows ETA TBD",
+				RowsCopied:      71436,
+				RowsTotal:       221193,
+				PercentComplete: 32,
 			},
 		},
 	}

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -497,4 +498,103 @@ func TestNewLocalTernClient_ConfiguresPostgresTableSizeLimit(t *testing.T) {
 	eng, ok := lc.Engine().(*postgresengine.Engine)
 	require.True(t, ok)
 	assert.Equal(t, limit, eng.TableSizeLimit())
+}
+
+// The server-level concurrent index bound reaches the engine of every local
+// client the control plane builds, so a configured value governs concurrent
+// builds instead of silently reverting to the default.
+func TestNewLocalTernClient_ConfiguresPostgresConcurrentIndexMaxDuration(t *testing.T) {
+	cfg := &ServerConfig{Postgres: PostgresConfig{ConcurrentIndexMaxDuration: "36h"}}
+	service := New(nil, cfg, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	envConfig := EnvironmentConfig{DSN: "postgres://localhost:5432/orders"}
+	client, err := service.newLocalTernClient("orders-staging", "orders", storage.DatabaseTypePostgres, envConfig)
+	require.NoError(t, err)
+
+	lc, ok := client.(*tern.LocalClient)
+	require.True(t, ok)
+	eng, ok := lc.Engine().(*postgresengine.Engine)
+	require.True(t, ok)
+	assert.Equal(t, 36*time.Hour, eng.ConcurrentIndexMaxDuration())
+}
+
+// namedProgressObserver gives each test observer its own identity so the
+// pending-observer slot can tell two commands' observers apart.
+type namedProgressObserver struct{ name string }
+
+func (namedProgressObserver) OnProgress(*storage.Apply, []*storage.Task) {}
+
+func (namedProgressObserver) OnTerminal(*storage.Apply, []*storage.Task) {}
+
+// sliceProgressObserver is not comparable: an interface holding one panics on
+// ==, so the slot must never compare observer values.
+type sliceProgressObserver struct{ seen []string }
+
+func (sliceProgressObserver) OnProgress(*storage.Apply, []*storage.Task) {}
+
+func (sliceProgressObserver) OnTerminal(*storage.Apply, []*storage.Task) {}
+
+// Two commands on the same target can each store a pending observer before
+// either apply request has been decided. The command whose request is
+// rejected withdraws only its own registration: when a competing command has
+// stored a newer one since, that observer stays for the competing apply to
+// consume, so the surviving apply keeps its progress and terminal reporting.
+func TestClearPendingObserverWithdrawsOnlyTheCallersObserver(t *testing.T) {
+	svc := New(nil, &ServerConfig{}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	loser := namedProgressObserver{name: "loser"}
+	winner := namedProgressObserver{name: "winner"}
+
+	t.Run("own registration is withdrawn", func(t *testing.T) {
+		handle := svc.SetPendingObserver("orders", "orders-staging", "staging", loser)
+		svc.ClearPendingObserver(handle)
+		assert.Nil(t, svc.consumePendingObserver("orders", "orders-staging", "staging"))
+	})
+
+	t.Run("a later registration for the same target is left in place", func(t *testing.T) {
+		handle := svc.SetPendingObserver("orders", "orders-staging", "staging", loser)
+		svc.SetPendingObserver("orders", "orders-staging", "staging", winner)
+		svc.ClearPendingObserver(handle)
+		assert.Equal(t, winner, svc.consumePendingObserver("orders", "orders-staging", "staging"))
+	})
+
+	// The same observer value registered twice is two registrations: a
+	// competing command that happens to build an equal observer must not have
+	// its registration withdrawn by the first command's clear.
+	t.Run("an equal observer registered later is a different registration", func(t *testing.T) {
+		handle := svc.SetPendingObserver("orders", "orders-staging", "staging", loser)
+		svc.SetPendingObserver("orders", "orders-staging", "staging", namedProgressObserver{name: "loser"})
+		svc.ClearPendingObserver(handle)
+		assert.Equal(t, loser, svc.consumePendingObserver("orders", "orders-staging", "staging"),
+			"the later, equal registration must survive the earlier handle's clear")
+	})
+
+	t.Run("a registration already consumed by an apply is not cleared twice", func(t *testing.T) {
+		handle := svc.SetPendingObserver("orders", "orders-staging", "staging", loser)
+		assert.Equal(t, loser, svc.consumePendingObserver("orders", "orders-staging", "staging"))
+		svc.SetPendingObserver("orders", "orders-staging", "staging", winner)
+		svc.ClearPendingObserver(handle)
+		assert.Equal(t, winner, svc.consumePendingObserver("orders", "orders-staging", "staging"))
+	})
+
+	t.Run("other targets are untouched", func(t *testing.T) {
+		handle := svc.SetPendingObserver("orders", "orders-staging", "staging", loser)
+		svc.SetPendingObserver("orders", "orders-production", "production", winner)
+		svc.ClearPendingObserver(handle)
+		assert.Equal(t, winner, svc.consumePendingObserver("orders", "orders-production", "production"))
+	})
+
+	t.Run("a non-comparable observer registers and clears without panicking", func(t *testing.T) {
+		observer := sliceProgressObserver{seen: []string{"progress"}}
+		handle := svc.SetPendingObserver("orders", "orders-staging", "staging", observer)
+		svc.SetPendingObserver("orders", "orders-staging", "staging", sliceProgressObserver{})
+		assert.NotPanics(t, func() { svc.ClearPendingObserver(handle) })
+		assert.NotNil(t, svc.consumePendingObserver("orders", "orders-staging", "staging"),
+			"the later registration survives the earlier handle's clear")
+	})
+
+	t.Run("the zero handle clears nothing", func(t *testing.T) {
+		svc.SetPendingObserver("orders", "orders-staging", "staging", winner)
+		assert.NotPanics(t, func() { svc.ClearPendingObserver(PendingObserverHandle{}) })
+		assert.Equal(t, winner, svc.consumePendingObserver("orders", "orders-staging", "staging"))
+	})
 }

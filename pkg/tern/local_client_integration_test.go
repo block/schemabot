@@ -9,13 +9,14 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	drivermysql "github.com/block/mysql"
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	drivermysql "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go/modules/mysql"
@@ -50,6 +51,7 @@ func TestMain(m *testing.M) {
 		mysql.WithDatabase("testdb"),
 		mysql.WithUsername("root"),
 		mysql.WithPassword("test"),
+		testutil.MySQLTmpfsDatadir(),
 	)
 	if err != nil {
 		log.Fatalf("failed to start MySQL container: %v", err)
@@ -62,7 +64,7 @@ func TestMain(m *testing.M) {
 	}
 
 	// Wait for MySQL to be ready
-	db, err := sql.Open("mysql", sharedDSN)
+	db, err := sql.Open("block-mysql", sharedDSN)
 	if err != nil {
 		_ = sharedContainer.Terminate(ctx)
 		log.Fatalf("failed to open database: %v", err)
@@ -101,7 +103,7 @@ func setupMySQLContainer(t *testing.T) (*mysql.MySQLContainer, string) {
 // cleanupTestTables removes test tables to avoid conflicts between tests
 func cleanupTestTables(t *testing.T, dsn string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for cleanup")
 	defer utils.CloseAndLog(db)
 
@@ -116,7 +118,7 @@ func cleanupTestTables(t *testing.T, dsn string) {
 // This is needed because tasks from previous tests can affect tests that expect no active schema change.
 func cleanupTasks(t *testing.T, dsn string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for task cleanup")
 	defer utils.CloseAndLog(db)
 
@@ -187,7 +189,7 @@ func setupStorageSchema(t *testing.T, dsn string) {
 // Requires setupStorageSchema to have been called first.
 func createStorage(t *testing.T, dsn string) storage.Storage {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for storage")
 	return mysqlstore.New(db)
 }
@@ -202,9 +204,10 @@ func createStorage(t *testing.T, dsn string) storage.Storage {
 func buildSchemaWithAllTables(t *testing.T, dsn string, testTableSchemas map[string]string) map[string]string {
 	t.Helper()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database for schema building")
 	defer utils.CloseAndLog(db)
+	require.NoError(t, db.PingContext(t.Context()), "failed to reach database for schema building")
 
 	tables, err := table.LoadSchemaFromDB(t.Context(), db)
 	require.NoError(t, err, "failed to load schema from database")
@@ -477,8 +480,9 @@ func (e *stagedGroupedResumeEngine) Progress(_ context.Context, req *engine.Prog
 	return &engine.ProgressResult{State: engine.StateCompleted}, nil
 }
 
-func (e *stagedGroupedResumeEngine) Drain() {
+func (e *stagedGroupedResumeEngine) DrainContext(context.Context) error {
 	e.drainCount++
+	return nil
 }
 
 func (e *stagedGroupedResumeEngine) DeferredCutoverSignalExists(ctx context.Context, req *engine.DeferredCutoverSignalRequest) (bool, error) {
@@ -561,8 +565,18 @@ func TestLocalClient_Health(t *testing.T) {
 	assert.NoError(t, client.Health(ctx), "Health() returned error")
 }
 
+// autoIncrementCounter matches the table-level AUTO_INCREMENT=N option together
+// with the blank separating it from the option before it, which is what
+// stripping removes.
+var autoIncrementCounter = regexp.MustCompile(`[ \t]*AUTO_INCREMENT=\d+`)
+
 // Pulling a live MySQL schema returns deterministic declarative files from the
 // data-plane database without preserving volatile AUTO_INCREMENT counters.
+//
+// The fixture is written to on purpose. MySQL only reports AUTO_INCREMENT=N on
+// a table whose sequence has moved, so a table that is created and never
+// inserted into emits no counter at all — and an assertion that the pulled file
+// carries none would then hold whether or not stripping ran.
 func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -570,7 +584,7 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 
 	container, dsn := setupMySQLContainer(t)
 	_ = container // container is managed by TestMain
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -579,7 +593,7 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for pull schema cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `pull_schema_users`, `pull_schema_users_archive_2026_06_12`")
@@ -587,8 +601,19 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	})
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `email` varchar(255) NOT NULL COMMENT 'login email', `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (`id`), UNIQUE KEY `idx_email` (`email`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci COMMENT='users table'")
 	require.NoError(t, err, "create pull schema table")
+	_, err = db.ExecContext(t.Context(), "INSERT INTO `pull_schema_users` (`email`) VALUES ('pull@example.com')")
+	require.NoError(t, err, "advance the auto-increment sequence")
 	_, err = db.ExecContext(t.Context(), "CREATE TABLE `pull_schema_users_archive_2026_06_12` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err, "create archive table")
+
+	// What the pulled file is measured against. Read after the insert, so the
+	// counter is in it; the test fails on this line rather than going quiet if
+	// a future server stops reporting one.
+	var liveTable, liveDDL string
+	require.NoError(t,
+		db.QueryRowContext(t.Context(), "SHOW CREATE TABLE `pull_schema_users`").Scan(&liveTable, &liveDDL),
+		"show create table")
+	require.Contains(t, liveDDL, "AUTO_INCREMENT=", "the fixture must carry a counter for stripping to be exercised")
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	client, err := NewLocalClient(LocalConfig{
@@ -617,6 +642,14 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.Contains(t, ddl, "`email` varchar(255) NOT NULL")
 	assert.NotContains(t, ddl, "AUTO_INCREMENT=")
 	assert.True(t, strings.HasSuffix(ddl, "\n"), "pulled schema file should end with a newline")
+	// The counter is all that may differ. A pulled file is a repo artifact, so
+	// re-rendering the statement — reflowing it onto one line, recasing the
+	// keywords — rewrites every schema file on the next pull even where the
+	// table did not change. The column-level AUTO_INCREMENT attribute carries no
+	// `=`, so only the table option is removed here.
+	wantDDL := autoIncrementCounter.ReplaceAllString(liveDDL, "")
+	assert.Equal(t, wantDDL, strings.TrimRight(ddl, "\n"), "pulled file should be the live DDL minus its counter, byte for byte")
+	assert.Contains(t, wantDDL, "AUTO_INCREMENT,", "the column attribute survives: without it the ids stop generating")
 	assert.NotContains(t, pulledNamespace.Tables, "pull_schema_users_archive_2026_06_12")
 	require.NotNil(t, pulledNamespace.NamespaceCatalog)
 	assert.Equal(t, "testdb", pulledNamespace.NamespaceCatalog.Name)
@@ -658,8 +691,8 @@ func TestLocalClient_PullSchemaLoadsLiveMySQLSchema(t *testing.T) {
 	assert.True(t, tableCatalog.Columns[0].AutoIncrement, "id column is AUTO_INCREMENT")
 	assert.False(t, tableCatalog.Columns[1].AutoIncrement, "email column is not AUTO_INCREMENT")
 	assert.False(t, tableCatalog.Columns[0].Generated, "id column is not generated")
-	// Size is an engine estimate; a freshly created InnoDB table always reports
-	// a non-zero data_length, so the field is wired even with no rows.
+	// Size is an engine estimate, not a row count, so this only shows the field
+	// is wired through.
 	assert.Positive(t, tableCatalog.DataSizeBytes, "table should report a non-zero size estimate at detailed")
 	assert.Empty(t, tableCatalog.ForeignKeys, "users table has no foreign keys")
 
@@ -688,7 +721,7 @@ func TestLocalClient_PullSchemaCatalogForeignKeysAndGeneratedColumns(t *testing.
 
 	container, dsn := setupMySQLContainer(t)
 	_ = container
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -699,7 +732,7 @@ func TestLocalClient_PullSchemaCatalogForeignKeysAndGeneratedColumns(t *testing.
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for catalog cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, dropStmt)
@@ -775,7 +808,7 @@ func TestLocalClient_PullSchemaDiscoversNonReservedNamespaces(t *testing.T) {
 
 	container, dsn := setupMySQLContainer(t)
 	_ = container // container is managed by TestMain
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -793,7 +826,7 @@ func TestLocalClient_PullSchemaDiscoversNonReservedNamespaces(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for namespace discovery cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		for _, stmt := range []string{
@@ -849,7 +882,7 @@ func TestLocalClient_PullSchemaOverridesReadPhysicalSchema(t *testing.T) {
 
 	container, dsn := setupMySQLContainer(t)
 	_ = container // container is managed by TestMain
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -873,7 +906,7 @@ func TestLocalClient_PullSchemaOverridesReadPhysicalSchema(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for schema override pull cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		for _, stmt := range []string{
@@ -963,7 +996,7 @@ func TestLocalClient_ApplySchemaOverridesTargetPhysicalSchema(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database")
 	defer utils.CloseAndLog(db)
 
@@ -986,7 +1019,7 @@ func TestLocalClient_ApplySchemaOverridesTargetPhysicalSchema(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), 30*time.Second)
 		defer cancel()
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr, "open database for schema override apply cleanup")
 		defer utils.CloseAndLog(cleanupDB)
 		for _, stmt := range []string{
@@ -1061,7 +1094,7 @@ func TestLocalClient_Plan(t *testing.T) {
 	ctx := t.Context()
 
 	// Create initial table
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -1183,7 +1216,7 @@ func TestLocalClient_Apply(t *testing.T) {
 	ctx := t.Context()
 
 	// Create initial table
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -1259,7 +1292,7 @@ func TestLocalClient_Apply_IdempotentDispatch(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -1364,7 +1397,7 @@ func TestLocalClient_Apply_WritesApplyOperationRow(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -2172,7 +2205,7 @@ func TestLocalClient_ResumeApplyGroupedFinalSchemaCheckCompletesWithoutReapply(t
 	require.NoError(t, err)
 	assert.Nil(t, pendingStart)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2209,7 +2242,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2219,7 +2252,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverRecoveryPreservesCutoverReadyStor
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupCtx := context.WithoutCancel(t.Context())
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr)
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `_spirit_sentinel`")
@@ -2444,7 +2477,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverFailureMarksApplyRetryable(t *tes
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2454,7 +2487,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverFailureMarksApplyRetryable(t *tes
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		cleanupCtx := context.WithoutCancel(t.Context())
-		cleanupDB, cleanupErr := sql.Open("mysql", dsn)
+		cleanupDB, cleanupErr := sql.Open("block-mysql", dsn)
 		require.NoError(t, cleanupErr)
 		defer utils.CloseAndLog(cleanupDB)
 		_, cleanupErr = cleanupDB.ExecContext(cleanupCtx, "DROP TABLE IF EXISTS `_spirit_sentinel`")
@@ -2572,7 +2605,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelReconcilesCompleted
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2683,7 +2716,7 @@ func TestLocalClient_ResumeApplyDeferredCutoverAbsentSentinelFailsWhenWorkRemain
 	stor := createStorage(t, dsn)
 	defer utils.CloseAndLog(stor)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2926,7 +2959,7 @@ func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *tes
 	require.NoError(t, err)
 	assert.Nil(t, pendingStart)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2943,6 +2976,333 @@ func TestLocalClient_ResumeApplyGroupedStartRequestFailsWhenEngineRejects(t *tes
 	logs, err := stor.ApplyLogs().GetByApply(ctx, applyID)
 	require.NoError(t, err)
 	assert.True(t, hasLogMessageContaining(logs, "Apply failed: engine apply failed: engine refused grouped resume"))
+}
+
+// This scenario covers an operator-owned start of a stopped apply whose task
+// row carries a blocked verdict from the admitting deployment. The resumed
+// drive must refuse the row before any engine hand-off, and because a failed
+// apply is never re-claimed, that same drive must settle everything the claim
+// left open: the durable start request fails with the refusal reason and the
+// terminal observer fires so the summary lands on the PR.
+func TestLocalClient_ResumeApplyStartRequestFailsWhenTaskRowIsBlocked(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	reason := "requires privileges unavailable to the engine"
+	_, apply, task := seedSingleTaskApply(t, stor, "blocked-row-start-fails", state.Apply.Stopped, state.Task.Stopped, engine.ExecutionModeBlocked, reason)
+	applyID := apply.ID
+	ddl := task.DDL
+
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyPending)
+
+	// The re-plan still lists the table, so the task stays active and the
+	// stored verdict — not the engine — is what refuses it.
+	resumeEngine := &stagedGroupedResumeEngine{
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{{
+				Namespace: "testdb",
+				TableChanges: []engine.TableChange{{
+					Table: "users",
+					DDL:   ddl,
+				}},
+			}},
+		}},
+	}
+	client.spiritEngine = resumeEngine
+	observer := &recordingTerminalObserver{}
+	client.SetObserver(applyID, observer)
+
+	claimed, err := stor.Applies().ClaimApplyByID(ctx, applyID, "test-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.Equal(t, state.Apply.Stopped, claimed.State)
+
+	require.NoError(t, client.ResumeApply(ctx, claimed))
+	assert.Equal(t, 0, resumeEngine.applyCount, "a blocked row must never reach the engine")
+
+	storedApply, err := stor.Applies().Get(ctx, applyID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Failed, storedApply.State)
+	assert.Contains(t, storedApply.ErrorMessage, reason)
+	assert.NotNil(t, storedApply.CompletedAt)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Failed, storedTask.State)
+	assert.Equal(t, engine.ExecutionModeBlocked, storedTask.ExecutionMode)
+	assert.Equal(t, reason, storedTask.ModeReason)
+
+	pendingStart, err := stor.ControlRequests().GetPending(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart, "the start that admitted this claim must not stay pending against a terminal apply")
+	startReq, err := stor.ControlRequests().GetByOperation(ctx, applyID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, storage.ControlRequestFailed, startReq.Status)
+	assert.Contains(t, startReq.ErrorMessage, reason)
+
+	assert.Equal(t, 1, observer.terminalCount(), "the drive that fails the apply posts its terminal summary")
+}
+
+// seedSingleTaskApply persists a plan, an apply in applyState, and one task
+// for `users` in taskState carrying the given execution verdict, and returns
+// the three with their row IDs set.
+func seedSingleTaskApply(t *testing.T, stor storage.Storage, scenario, applyState, taskState, executionMode, modeReason string) (*storage.Plan, *storage.Apply, *storage.Task) {
+	t.Helper()
+	ctx := t.Context()
+	ddl := "ALTER TABLE `users` ADD COLUMN phone varchar(32)"
+	now := time.Now()
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-%s-%d", scenario, now.UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {
+				Tables: []storage.TableChange{
+					{Namespace: "testdb", Table: "users", DDL: ddl, Operation: "alter"},
+				},
+			},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	apply := &storage.Apply{
+		ApplyIdentifier: fmt.Sprintf("apply-%s-%d", scenario, now.UnixNano()),
+		PlanID:          planID,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Deployment:      "testdb",
+		Engine:          storage.EngineSpirit,
+		State:           applyState,
+		Environment:     localClientTestEnvironment,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	applyID, err := stor.Applies().Create(ctx, apply)
+	require.NoError(t, err)
+	apply.ID = applyID
+
+	task := &storage.Task{
+		TaskIdentifier: fmt.Sprintf("task-%s-users-%d", scenario, now.UnixNano()),
+		ApplyID:        applyID,
+		PlanID:         planID,
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Engine:         storage.EngineSpirit,
+		State:          taskState,
+		TableName:      "users",
+		Namespace:      "testdb",
+		DDL:            ddl,
+		DDLAction:      "alter",
+		ExecutionMode:  executionMode,
+		ModeReason:     modeReason,
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	taskID, err := stor.Tasks().Create(ctx, task)
+	require.NoError(t, err)
+	task.ID = taskID
+	return plan, apply, task
+}
+
+// This scenario covers a stopped apply whose task row was admitted clean, on a
+// target whose own re-plan now refuses the statement: the table grew past the
+// direct-execution bound, or a grant was revoked, after the row was created.
+// The resumed drive must judge the target's current verdict, not the one
+// frozen on the row: it tightens the row to the re-plan's refusal and fails
+// the apply before any engine hand-off, and the persisted row records why.
+func TestLocalClient_ResumeApplyRefusesTableTheRePlanNowBlocks(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	_, apply, task := seedSingleTaskApply(t, stor, "replan-now-blocks", state.Apply.Stopped, state.Task.Stopped, "direct", "fit the direct-execution bound at admission")
+
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStart,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyPending)
+
+	// The re-plan still lists the table, so the task stays active, and this
+	// time the target refuses its statement.
+	reason := "table exceeds the direct-execution size bound"
+	resumeEngine := &stagedGroupedResumeEngine{
+		planResults: []*engine.PlanResult{{
+			Changes: []engine.SchemaChange{{
+				Namespace: "testdb",
+				TableChanges: []engine.TableChange{{
+					Table:         "users",
+					DDL:           task.DDL,
+					ExecutionMode: engine.ExecutionModeBlocked,
+					ModeReason:    reason,
+				}},
+			}},
+		}},
+	}
+	client.spiritEngine = resumeEngine
+	observer := &recordingTerminalObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	claimed, err := stor.Applies().ClaimApplyByID(ctx, apply.ID, "test-owner")
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	require.NoError(t, client.ResumeApply(ctx, claimed))
+	assert.Equal(t, 0, resumeEngine.applyCount, "a statement the re-plan refuses must never reach the engine")
+
+	storedApply, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Failed, storedApply.State)
+	assert.Contains(t, storedApply.ErrorMessage, reason)
+	assert.Contains(t, storedApply.ErrorMessage, task.TaskIdentifier)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Failed, storedTask.State)
+	assert.Equal(t, engine.ExecutionModeBlocked, storedTask.ExecutionMode, "the row records the verdict that refused it")
+	assert.Equal(t, reason, storedTask.ModeReason)
+
+	pendingStart, err := stor.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStart, "the start that admitted this claim must not stay pending against a terminal apply")
+	startReq, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	require.NotNil(t, startReq)
+	assert.Equal(t, storage.ControlRequestFailed, startReq.Status)
+	assert.Contains(t, startReq.ErrorMessage, reason)
+
+	assert.Equal(t, 1, observer.terminalCount(), "the drive that fails the apply posts its terminal summary")
+}
+
+// This scenario covers a fresh drive — the first drive of a newly admitted
+// apply — that loads a task row carrying a blocked verdict, as a drive on a
+// peer deployment does when it claims work admitted elsewhere. It must refuse
+// before any engine hand-off and, because a failed apply is never re-claimed,
+// settle what the terminal apply owes: the operator's pending stop is
+// completed, and the terminal observer fires so the summary lands on the PR.
+func TestLocalClient_RunApplyExecutionRefusesBlockedTaskRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+
+	ctx := t.Context()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+
+	client, err := NewLocalClient(LocalConfig{
+		Database:  "testdb",
+		Type:      storage.DatabaseTypeMySQL,
+		TargetDSN: dsn,
+	}, stor, logger)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(client)
+
+	reason := "requires privileges unavailable to the engine"
+	plan, apply, task := seedSingleTaskApply(t, stor, "fresh-drive-blocked-row", state.Apply.Running, state.Task.Pending, engine.ExecutionModeBlocked, reason)
+
+	_, alreadyPending, err := stor.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "integration-test",
+	})
+	require.NoError(t, err)
+	assert.False(t, alreadyPending)
+
+	driveEngine := &stagedGroupedResumeEngine{}
+	client.spiritEngine = driveEngine
+	observer := &recordingTerminalObserver{}
+	client.SetObserver(apply.ID, observer)
+
+	require.NoError(t, client.runApplyExecution(ctx, apply, []*storage.Task{task}, plan, nil, false))
+	assert.Equal(t, 0, driveEngine.applyCount, "a blocked row must never reach the engine")
+
+	storedApply, err := stor.Applies().Get(ctx, apply.ID)
+	require.NoError(t, err)
+	require.NotNil(t, storedApply)
+	assert.Equal(t, state.Apply.Failed, storedApply.State)
+	assert.Contains(t, storedApply.ErrorMessage, reason)
+	assert.NotNil(t, storedApply.CompletedAt)
+
+	storedTask, err := stor.Tasks().Get(ctx, task.TaskIdentifier)
+	require.NoError(t, err)
+	require.NotNil(t, storedTask)
+	assert.Equal(t, state.Task.Failed, storedTask.State)
+	assert.Contains(t, storedTask.ErrorMessage, reason)
+
+	pendingStop, err := stor.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, pendingStop, "a stop issued against the refused apply must not stay pending against a terminal apply")
+	stopReq, err := stor.ControlRequests().GetByOperation(ctx, apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, stopReq)
+	assert.Equal(t, storage.ControlRequestCompleted, stopReq.Status)
+
+	assert.Equal(t, 1, observer.terminalCount(), "the drive that fails the apply posts its terminal summary")
 }
 
 // This scenario covers restart recovery of a grouped Vitess apply whose opaque
@@ -3418,7 +3778,7 @@ func TestLocalClient_Apply_MultiTableSequential(t *testing.T) {
 	ctx := t.Context()
 
 	// Create two initial tables
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "failed to open database")
 	defer utils.CloseAndLog(db)
 
@@ -3558,7 +3918,7 @@ func TestLocalClient_StartApplyHeartbeat(t *testing.T) {
 	_ = container
 	setupStorageSchema(t, dsn)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -3624,7 +3984,7 @@ func TestLocalClient_Apply_AtomicHeartbeat(t *testing.T) {
 
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 
@@ -3810,7 +4170,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	ctx := t.Context()
 
 	// Create a table to alter
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE users (id INT PRIMARY KEY)")
 	require.NoError(t, err)
@@ -3828,7 +4188,7 @@ func TestLocalClient_Apply_SequentialNamespaceMatchesTask(t *testing.T) {
 	defer utils.CloseAndLog(client)
 
 	// Load current schema
-	dbConn, err := sql.Open("mysql", dsn)
+	dbConn, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(dbConn)
 
@@ -4159,7 +4519,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 	// The engine reports a failed result with Retryable=true. The local Tern
 	// driver should stop this attempt, keep the apply non-terminal, and leave
 	// already-completed task work untouched for the operator retry.
-	client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil, apply.GetOptions().Map(), false)
+	require.NoError(t, client.pollForCompletionAtomic(ctx, apply, tasks, &engine.Credentials{DSN: dsn}, nil, apply.GetOptions().Map(), false))
 
 	failedApply, err := stor.Applies().Get(ctx, applyID)
 	require.NoError(t, err)
@@ -4191,7 +4551,7 @@ func TestLocalClient_AtomicRetryableFailureQueuesOperatorRetry(t *testing.T) {
 	// When the operator claims this apply, retryable tasks are queued for the
 	// next dispatch attempt. Completed tasks stay completed so successful table
 	// work is not repeated.
-	client.prepareRetryableTasksForResume(ctx, failedApply, failedTasks)
+	require.NoError(t, client.prepareRetryableTasksForResume(ctx, failedApply, failedTasks))
 
 	preparedTasks, err := stor.Tasks().GetByApplyID(ctx, applyID)
 	require.NoError(t, err)

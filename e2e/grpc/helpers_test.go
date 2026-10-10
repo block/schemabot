@@ -15,10 +15,10 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -198,7 +198,10 @@ type grpcSimpleResponse struct {
 func grpcPlan(t *testing.T, database, env string, schemaFiles map[string]string) grpcPlanResponse {
 	t.Helper()
 
-	// Schema files format matches CLI: map[filename] -> content, wrapped in "default" keyspace
+	// Schema files format matches CLI: map[filename] -> content, wrapped in "default" keyspace.
+	// renders_rollout is what the CLI sends: these tests check every rollout
+	// member's outcome themselves, and the server refuses a rollout-wide plan
+	// of a multi-member environment from a caller that does not set it.
 	body := map[string]any{
 		"database":    database,
 		"environment": env,
@@ -208,6 +211,7 @@ func grpcPlan(t *testing.T, database, env string, schemaFiles map[string]string)
 				"files": schemaFiles,
 			},
 		},
+		"renders_rollout": true,
 	}
 	resp := grpcPost(t, "/api/plan", body)
 	if resp.StatusCode != http.StatusOK {
@@ -222,9 +226,12 @@ func grpcPlan(t *testing.T, database, env string, schemaFiles map[string]string)
 
 func grpcApply(t *testing.T, planID, env string, opts map[string]string) grpcApplyResponse {
 	t.Helper()
+	// renders_rollout as in grpcPlan: the server refuses a rollout-wide apply
+	// of a multi-member environment without it.
 	body := map[string]any{
-		"plan_id":     planID,
-		"environment": env,
+		"plan_id":         planID,
+		"environment":     env,
+		"renders_rollout": true,
 	}
 	if opts != nil {
 		body["options"] = opts
@@ -385,7 +392,7 @@ func grpcEnsureNoActiveChange(t *testing.T, database, env string) {
 func grpcClearSchemabotState(t *testing.T) {
 	t.Helper()
 	dsn := grpcSchemabotMySQLDSN(t)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		t.Logf("warning: could not open schemabot db to clear state: %v", err)
 		return
@@ -418,7 +425,7 @@ func grpcClearTernStorage(t *testing.T, env string) {
 	testappDSN := grpcTernMySQLDSN(t, env)
 	ternDSN := strings.Replace(testappDSN, "/testapp", "/tern", 1)
 
-	db, err := sql.Open("mysql", ternDSN)
+	db, err := sql.Open("block-mysql", ternDSN)
 	if err != nil {
 		t.Logf("warning: could not open tern storage db (%s): %v", env, err)
 		return
@@ -452,7 +459,7 @@ func grpcClearTernStorage(t *testing.T, env string) {
 func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 	t.Helper()
 	dsn := grpcTernMySQLDSN(t, env)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", env)
 
 	_, err = db.ExecContext(t.Context(), ddl)
@@ -460,7 +467,7 @@ func grpcCreateTestTable(t *testing.T, env, tableName, ddl string) {
 	_ = db.Close()
 
 	t.Cleanup(func() {
-		db2, err := sql.Open("mysql", dsn)
+		db2, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			return
 		}
@@ -487,7 +494,7 @@ func grpcSeedRows(t *testing.T, env, tableName, columns, valueTemplate string, r
 func grpcColumnExists(t *testing.T, env, tableName, columnName string) bool {
 	t.Helper()
 	dsn := grpcTernMySQLDSN(t, env)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", env)
 	defer utils.CloseAndLog(db)
 

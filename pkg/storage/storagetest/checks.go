@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -189,11 +190,13 @@ func TestChecks(t *testing.T, h Harness) {
 			ApplyID: apply.ID, HasChanges: true, Status: "in_progress",
 		}))
 
-		require.NoError(t, store.Checks().UpsertPlanResult(ctx, &storage.Check{
+		planStored, err := store.Checks().UpsertPlanResult(ctx, &storage.Check{
 			Repository: "org/repo", PullRequest: 123, HeadSHA: "new-sha",
 			Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "ownership_db",
 			HasChanges: false, Status: "completed", Conclusion: "success",
-		}, storage.PlanDriftClean))
+		}, storage.PlanDriftClean)
+		require.NoError(t, err)
+		assert.False(t, planStored, "a write the ownership guard refuses must report that it did not land")
 
 		stored, err := store.Checks().Get(ctx, "org/repo", 123, "staging", storage.DatabaseTypeMySQL, "ownership_db")
 		require.NoError(t, err)
@@ -235,7 +238,15 @@ func TestChecks(t *testing.T, h Harness) {
 		key.HasChanges = false
 		key.Status = "completed"
 		key.Conclusion = "success"
-		require.NoError(t, store.Checks().UpsertPlanResult(ctx, key, storage.PlanDriftClean))
+		planStored, err := store.Checks().UpsertPlanResult(ctx, key, storage.PlanDriftClean)
+		require.NoError(t, err)
+		assert.True(t, planStored)
+
+		// Rewriting the row with the values it already holds changes no columns.
+		// The write still landed, and must not be reported as a refusal.
+		planStored, err = store.Checks().UpsertPlanResult(ctx, key, storage.PlanDriftClean)
+		require.NoError(t, err)
+		assert.True(t, planStored, "a repeated plan write that changes nothing still landed")
 
 		stored, err := store.Checks().Get(ctx, "org/repo", 123, "staging", storage.DatabaseTypeMySQL, "unowned_db")
 		require.NoError(t, err)
@@ -263,7 +274,12 @@ func TestChecks(t *testing.T, h Harness) {
 			Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "recovery_db",
 			HasChanges: false, Status: "completed", Conclusion: "success",
 		}
-		require.NoError(t, store.Checks().UpsertPlanResult(ctx, noOp, storage.PlanDriftClean))
+		// The ownership guard refuses this write — which is what the explicit
+		// recovery path below exists to resolve for a no-op plan on the same head.
+		planStored, err := store.Checks().UpsertPlanResult(ctx, noOp, storage.PlanDriftClean)
+		require.NoError(t, err)
+		require.False(t, planStored)
+
 		recovered, err := store.Checks().RecoverApplyOwnedCheckWithNoOpPlan(ctx, noOp)
 		require.NoError(t, err)
 		require.True(t, recovered)
@@ -541,14 +557,14 @@ func TestChecks(t *testing.T, h Harness) {
 			BlockingReason: storage.ReviewTimeDeploymentDriftBlockingReason,
 			ChangeSummary:  "drift blocks apply",
 		}
-		require.NoError(t, store.Checks().UpsertPlanResult(ctx, blocked, storage.PlanDriftBlocked))
+		requirePlanResultStored(t, ctx, store, blocked, storage.PlanDriftBlocked)
 
 		notEvaluated := &storage.Check{
 			Repository: "org/repo", PullRequest: 123, HeadSHA: "sha-2",
 			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "drift_db",
 			Status: "completed", Conclusion: "success",
 		}
-		require.NoError(t, store.Checks().UpsertPlanResult(ctx, notEvaluated, storage.PlanDriftNotEvaluated))
+		requirePlanResultStored(t, ctx, store, notEvaluated, storage.PlanDriftNotEvaluated)
 
 		stored, err := store.Checks().Get(ctx, "org/repo", 123, "production", storage.DatabaseTypeMySQL, "drift_db")
 		require.NoError(t, err)
@@ -561,12 +577,12 @@ func TestChecks(t *testing.T, h Harness) {
 		predicateBase := *notEvaluated
 		predicateBase.DatabaseName = "drift_predicate_db"
 		predicateBase.ErrorMessage = "old error"
-		require.NoError(t, store.Checks().UpsertPlanResult(ctx, &predicateBase, storage.PlanDriftClean))
+		requirePlanResultStored(t, ctx, store, &predicateBase, storage.PlanDriftClean)
 		incomingBlock := predicateBase
 		incomingBlock.HeadSHA = "sha-block"
 		incomingBlock.BlockingReason = storage.ReviewTimeDeploymentDriftBlockingReason
 		incomingBlock.ErrorMessage = "new error"
-		require.NoError(t, store.Checks().UpsertPlanResult(ctx, &incomingBlock, storage.PlanDriftNotEvaluated))
+		requirePlanResultStored(t, ctx, store, &incomingBlock, storage.PlanDriftNotEvaluated)
 		stored, err = store.Checks().Get(ctx, "org/repo", 123, "production", storage.DatabaseTypeMySQL, "drift_predicate_db")
 		require.NoError(t, err)
 		require.NotNil(t, stored)
@@ -575,7 +591,7 @@ func TestChecks(t *testing.T, h Harness) {
 
 		clean := *notEvaluated
 		clean.HeadSHA = "sha-3"
-		require.NoError(t, store.Checks().UpsertPlanResult(ctx, &clean, storage.PlanDriftClean))
+		requirePlanResultStored(t, ctx, store, &clean, storage.PlanDriftClean)
 
 		stored, err = store.Checks().Get(ctx, "org/repo", 123, "production", storage.DatabaseTypeMySQL, "drift_db")
 		require.NoError(t, err)
@@ -584,6 +600,124 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Equal(t, "success", stored.Conclusion)
 		assert.Empty(t, stored.BlockingReason)
 		assert.Empty(t, stored.ChangeSummary)
+	})
+
+	// A namespace placement refusal is a review-time block too: a write that did
+	// not re-evaluate the review keeps it, and one that did clears it.
+	t.Run("PlanPlacementBlockDisposition", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		blocked := &storage.Check{
+			Repository: "org/repo", PullRequest: 124, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "placement_db",
+			Status: "completed", Conclusion: "failure",
+			BlockingReason: storage.NamespacePlacementRefusedBlockingReason,
+			ChangeSummary:  "namespace placement refused the plan",
+		}
+		requirePlanResultStored(t, ctx, store, blocked, storage.PlanDriftBlocked)
+
+		notEvaluated := &storage.Check{
+			Repository: "org/repo", PullRequest: 124, HeadSHA: "sha-2",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "placement_db",
+			Status: "completed", Conclusion: "success",
+		}
+		requirePlanResultStored(t, ctx, store, notEvaluated, storage.PlanDriftNotEvaluated)
+
+		stored, err := store.Checks().Get(ctx, "org/repo", 124, "production", storage.DatabaseTypeMySQL, "placement_db")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "sha-2", stored.HeadSHA)
+		assert.Equal(t, "failure", stored.Conclusion, "a write that did not re-plan the placement keeps the block")
+		assert.Equal(t, storage.NamespacePlacementRefusedBlockingReason, stored.BlockingReason)
+		assert.Equal(t, "namespace placement refused the plan", stored.ChangeSummary)
+
+		clean := *notEvaluated
+		clean.HeadSHA = "sha-3"
+		requirePlanResultStored(t, ctx, store, &clean, storage.PlanDriftClean)
+
+		stored, err = store.Checks().Get(ctx, "org/repo", 124, "production", storage.DatabaseTypeMySQL, "placement_db")
+		require.NoError(t, err)
+		require.NotNil(t, stored)
+		assert.Equal(t, "success", stored.Conclusion)
+		assert.Empty(t, stored.BlockingReason)
+	})
+
+	// A guard block never replaces a block the writer asked to preserve: the row
+	// keeps its reason, conclusion, summary, and apply ownership, and only its
+	// head SHA moves so the current-head aggregate still reads it. Any other
+	// row takes the guard block, a row an in-progress apply owns refuses it,
+	// and a missing row is created with it.
+	t.Run("UpsertGuardBlockDisposition", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "guard_db", storage.DatabaseTypeMySQL)
+		finished := CreateApplyWithStateAndEnv(t, store, lock, "apply-guard-finished", 710, state.Apply.Completed, "production")
+		guard := func(database, headSHA string) *storage.Check {
+			return &storage.Check{
+				Repository: "org/repo", PullRequest: 125, HeadSHA: headSHA,
+				Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: database,
+				HasChanges: true, Status: "completed", Conclusion: "failure",
+				BlockingReason: "guard_reason", ChangeSummary: "guard summary",
+			}
+		}
+		get := func(database string) *storage.Check {
+			stored, err := store.Checks().Get(ctx, "org/repo", 125, "production", storage.DatabaseTypeMySQL, database)
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			return stored
+		}
+
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: "org/repo", PullRequest: 125, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "kept_db",
+			ApplyID: finished.ID, HasChanges: true, Status: "completed", Conclusion: "action_required",
+			BlockingReason: "kept_reason", ErrorMessage: "kept message", ChangeSummary: "kept summary",
+		}))
+		stored, err := store.Checks().UpsertGuardBlock(ctx, guard("kept_db", "sha-2"), []string{"other_reason", "kept_reason"})
+		require.NoError(t, err)
+		assert.True(t, stored)
+		kept := get("kept_db")
+		assert.Equal(t, "sha-2", kept.HeadSHA)
+		assert.Equal(t, "kept_reason", kept.BlockingReason, "a preserved block is never replaced by a guard")
+		assert.Equal(t, "action_required", kept.Conclusion)
+		assert.Equal(t, "kept message", kept.ErrorMessage)
+		assert.Equal(t, "kept summary", kept.ChangeSummary)
+		assert.Equal(t, finished.ID, kept.ApplyID)
+
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: "org/repo", PullRequest: 125, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "replaced_db",
+			ApplyID: finished.ID, Status: "completed", Conclusion: "success",
+		}))
+		stored, err = store.Checks().UpsertGuardBlock(ctx, guard("replaced_db", "sha-2"), []string{"kept_reason"})
+		require.NoError(t, err)
+		assert.True(t, stored)
+		replaced := get("replaced_db")
+		assert.Equal(t, "guard_reason", replaced.BlockingReason)
+		assert.Equal(t, "failure", replaced.Conclusion)
+		assert.Equal(t, "guard summary", replaced.ChangeSummary)
+		assert.Zero(t, replaced.ApplyID)
+
+		running := CreateApplyWithStateAndEnv(t, store, lock, "apply-guard-running", 711, state.Apply.Running, "production")
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: "org/repo", PullRequest: 125, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "owned_db",
+			ApplyID: running.ID, HasChanges: true, Status: "in_progress",
+		}))
+		stored, err = store.Checks().UpsertGuardBlock(ctx, guard("owned_db", "sha-2"), []string{"kept_reason"})
+		require.NoError(t, err)
+		assert.False(t, stored, "a row an in-progress apply owns refuses the guard block")
+		owned := get("owned_db")
+		assert.Equal(t, "in_progress", owned.Status)
+		assert.Empty(t, owned.BlockingReason)
+		assert.Equal(t, running.ID, owned.ApplyID)
+
+		stored, err = store.Checks().UpsertGuardBlock(ctx, guard("fresh_db", "sha-2"), []string{"kept_reason"})
+		require.NoError(t, err)
+		assert.True(t, stored)
+		assert.Equal(t, "guard_reason", get("fresh_db").BlockingReason)
 	})
 
 	t.Run("MarkStalePlanSuccessful", func(t *testing.T) {
@@ -744,7 +878,16 @@ func TestChecks(t *testing.T, h Harness) {
 	check := &storage.Check{Repository: "org/repo", PullRequest: 123, Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "errors_db", Status: "completed", Conclusion: "success"}
 	apply := &storage.Apply{ID: 1}
 	t.Run("UpsertPlanResult_DBError", func(t *testing.T) {
-		require.Error(t, h.NewUnreachableStorage(t).Checks().UpsertPlanResult(t.Context(), check, storage.PlanDriftClean))
+		_, err := h.NewUnreachableStorage(t).Checks().UpsertPlanResult(t.Context(), check, storage.PlanDriftClean)
+		require.Error(t, err)
+	})
+	t.Run("UpsertGuardBlock_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().UpsertGuardBlock(t.Context(), &storage.Check{
+			Repository: "org/repo", PullRequest: 123, HeadSHA: "sha",
+			Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "errors_db",
+			Status: "completed", Conclusion: "failure", BlockingReason: "guard_reason",
+		}, []string{"kept_reason"})
+		require.Error(t, err)
 	})
 	t.Run("RecoverApplyOwnedCheckWithNoOpPlan_DBError", func(t *testing.T) {
 		_, err := h.NewUnreachableStorage(t).Checks().RecoverApplyOwnedCheckWithNoOpPlan(t.Context(), check)
@@ -786,6 +929,16 @@ func TestChecks(t *testing.T, h Harness) {
 	t.Run("DeleteByPRRetainingBlockingApplyOwned_DBError", func(t *testing.T) {
 		require.Error(t, h.NewUnreachableStorage(t).Checks().DeleteByPRRetainingBlockingApplyOwned(t.Context(), "org/repo", 123, false))
 	})
+}
+
+// requirePlanResultStored writes a plan result and asserts it landed, for the
+// cases that exercise something other than the ownership guard and would be
+// meaningless if the write had been refused.
+func requirePlanResultStored(t *testing.T, ctx context.Context, store storage.Storage, check *storage.Check, drift storage.PlanDriftState) {
+	t.Helper()
+	stored, err := store.Checks().UpsertPlanResult(ctx, check, drift)
+	require.NoError(t, err)
+	require.True(t, stored, "plan result must land for %s/%s/%s", check.Environment, check.DatabaseType, check.DatabaseName)
 }
 
 // createCompletedTask persists a completed forward task under the given apply,

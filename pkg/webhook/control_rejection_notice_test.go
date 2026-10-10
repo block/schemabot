@@ -106,4 +106,25 @@ func TestStatusCommentSurfacesRejectedControlCommands(t *testing.T) {
 		assert.Contains(t, body, "requested by `octocat`")
 		assert.Contains(t, body, "cutover rejected: apply already finished")
 	})
+
+	// A cancel the schema change outran is the case an operator is most likely to
+	// misread: the summary says the change completed, and the accepted cancel is
+	// nowhere in sight. The notice has to name the command and say the change is
+	// live, so the operator knows to reconcile the target rather than assume the
+	// cancel took the change back.
+	t.Run("a cancel the schema change outran surfaces on the completed summary", func(t *testing.T) {
+		terminal := *apply
+		terminal.State = state.Apply.Completed
+		body := observer(&storage.ApplyControlRequest{
+			Operation:    storage.ControlOperationCancel,
+			Status:       storage.ControlRequestFailed,
+			RequestedBy:  "octocat",
+			ErrorMessage: "the schema change completed before the cancel could take effect; the change is live on the target",
+		}).summaryCommentFromOps(t.Context(), &terminal, nil, nil, nil, nil)
+
+		assert.Contains(t, body, "Command not applied")
+		assert.Contains(t, body, "`cancel` was accepted but did not take effect")
+		assert.Contains(t, body, "requested by `octocat`")
+		assert.Contains(t, body, "the change is live on the target")
+	})
 }

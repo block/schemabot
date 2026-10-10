@@ -3,19 +3,224 @@
 package postgres
 
 import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"maps"
 	"net/url"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/block/pg-sprite/pkg/dbconn"
+	"github.com/block/pg-sprite/pkg/schemadiff"
+	"github.com/block/pg-sprite/pkg/statement"
+	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/lint"
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/testutil"
 )
 
-const postgresApplyDeadline = 10 * time.Second
+const (
+	postgresApplyDeadline               = 10 * time.Second
+	introspectionCapObservationDeadline = 250 * time.Millisecond
+)
+
+// TestEnginePullSchema exports every ordinary table in a requested schema as
+// an independently parseable declarative file, including constraints and
+// secondary indexes.
+func TestEnginePullSchema(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY, balance bigint NOT NULL CHECK (balance >= 0));
+		CREATE INDEX accounts_balance_idx ON app.accounts (balance);
+		CREATE TABLE app.events (id bigint PRIMARY KEY, message text NOT NULL)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "pull_test", Type: "postgres", Environment: "test", Namespace: "app",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), response.TableCount)
+	require.Len(t, response.Namespaces, 1)
+	require.Len(t, response.Namespaces["app"].Tables, 2)
+	for _, table := range []string{"accounts", "events"} {
+		ddl := response.Namespaces["app"].Tables[table]
+		parsed, parseErr := statement.ParseDesired(ddl)
+		require.NoError(t, parseErr)
+		assert.Equal(t, table, parsed.Table())
+	}
+	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "CHECK")
+	assert.Contains(t, response.Namespaces["app"].Tables["accounts"], "accounts_balance_idx")
+}
+
+// TestEnginePullSchemaRejectsMissingSchema proves a request for a schema that
+// does not exist fails instead of producing an empty baseline that a typo
+// could be mistaken for a schema with no tables.
+func TestEnginePullSchemaRejectsMissingSchema(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "pull_missing_test")
+
+	eng := NewForTarget(0, 0, "pull_missing_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "missing"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "missing" does not exist`)
+}
+
+// TestEnginePullSchemaAggregatesUnrenderableTables proves a pull never returns
+// a partial baseline and identifies every table that needs manual resolution.
+func TestEnginePullSchemaAggregatesUnrenderableTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_refusal_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE UNLOGGED TABLE app.audit_log (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.delivery_log (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_refusal_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "audit_log"`)
+	assert.Contains(t, err.Error(), `schema "app" table "delivery_log"`)
+}
+
+// A table carrying trigger behavior or descriptive metadata is refused so the
+// printed schema never suggests that its declarative table definition is the
+// whole live object.
+func TestEnginePullSchemaRejectsUnmodeledTableObjects(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_objects_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
+		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_objects_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "accounts"`)
+	assert.Contains(t, err.Error(), "trigger")
+	assert.Contains(t, err.Error(), "comment")
+}
+
+// A child table created with PostgreSQL table inheritance is refused because
+// flattening inherited columns would lose the relationship to its parent.
+func TestEnginePullSchemaRejectsTableInheritance(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_inheritance_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.parent (id bigint PRIMARY KEY);
+		CREATE TABLE app.child (detail text) INHERITS (app.parent)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_inheritance_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "child"`)
+	assert.Contains(t, err.Error(), "table inheritance")
+}
+
+// Omitting the namespace exports each application schema while keeping server
+// and information schemas outside the response.
+func TestEnginePullSchemaDiscoversNonReservedSchemas(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_discovery_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA billing;
+		CREATE TABLE billing.invoices (id bigint PRIMARY KEY);
+		CREATE SCHEMA shipping;
+		CREATE TABLE shipping.parcels (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_discovery_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{})
+
+	require.NoError(t, err)
+	assert.Contains(t, response.Namespaces, "billing")
+	assert.Contains(t, response.Namespaces, "shipping")
+	assert.Contains(t, response.Namespaces["billing"].Tables, "invoices")
+	assert.Contains(t, response.Namespaces["shipping"].Tables, "parcels")
+	assert.NotContains(t, response.Namespaces, "pg_catalog")
+	assert.NotContains(t, response.Namespaces, "information_schema")
+}
+
+// A partitioned hierarchy selects only its parent for rendering; the child is
+// neither exported nor reported as an independently unrenderable table.
+func TestEnginePullSchemaExcludesPartitionChildren(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_partition_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.events (id bigint, created_at date) PARTITION BY RANGE (created_at);
+		CREATE TABLE app.events_2026 PARTITION OF app.events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_partition_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.Error(t, err)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `schema "app" table "events"`)
+	assert.NotContains(t, err.Error(), "events_2026")
+}
+
+// Views are outside the table baseline, so ordinary and materialized views do
+// not become declarative tables in a successful pull.
+func TestEnginePullSchemaExcludesViews(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_views_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE VIEW app.account_view AS SELECT id FROM app.accounts;
+		CREATE MATERIALIZED VIEW app.account_snapshot AS SELECT id FROM app.accounts`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_views_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{Namespace: "app"})
+
+	require.NoError(t, err)
+	require.Len(t, response.Namespaces["app"].Tables, 1)
+	assert.Contains(t, response.Namespaces["app"].Tables, "accounts")
+	assert.NotContains(t, response.Namespaces["app"].Tables, "account_view")
+	assert.NotContains(t, response.Namespaces["app"].Tables, "account_snapshot")
+}
+
+// A cancelled request remains a context failure and is never presented as a
+// refusal caused by an unrepresentable table.
+func TestEnginePullSchemaReturnsCancelledContext(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "pull_cancel_test")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	eng := NewForTarget(0, 0, "pull_cancel_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(ctx, &ternv1.PullSchemaRequest{Namespace: "public"})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, response)
+	assert.Contains(t, err.Error(), `PostgreSQL database "pull_cancel_test" for schema pull`)
+	assert.NotContains(t, err.Error(), "refused incomplete baseline")
+}
 
 // TestEnginePlanCreateTable proves a greenfield CREATE TABLE derived from
 // desired state plans as an executable change: the role's schema CREATE
@@ -46,10 +251,675 @@ func TestEnginePlanCreateTable(t *testing.T) {
 	assert.Empty(t, change.ModeReason)
 }
 
-// TestEnginePlanPrivilegeRefusal proves a role that cannot alter the target
-// gets a blocked plan naming the exact provisioning statement, instead of an
-// executable plan that deterministically fails at apply. The plan itself
-// still succeeds: the operator needs the review surface to carry the grant.
+// Planning captures the canonical live schema for rollback, including an
+// explicitly empty baseline when every declared table is new.
+func TestEnginePlanCapturesOriginalFiles(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+	const originalAccounts = "CREATE TABLE \"accounts\" (\n    \"id\" bigint NOT NULL,\n    \"name\" text NOT NULL,\n    CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id)\n);\n"
+
+	tests := []struct {
+		name          string
+		database      string
+		setup         string
+		schemaFiles   schema.SchemaFiles
+		expectedFiles map[string]map[string]string
+	}{
+		{
+			name:     "alter existing table",
+			database: "plan_original_alter_test",
+			setup:    "CREATE TABLE public.users (id bigint PRIMARY KEY)",
+			schemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			}}},
+			expectedFiles: map[string]map[string]string{"public": {"users.sql": originalUsers}},
+		},
+		{
+			name:     "mixed namespaces",
+			database: "plan_original_mixed_test",
+			setup:    "CREATE SCHEMA app; CREATE TABLE app.accounts (id bigint PRIMARY KEY, name text NOT NULL); CREATE SCHEMA fresh",
+			schemaFiles: schema.SchemaFiles{
+				"app": {Files: map[string]string{
+					"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY, name text NOT NULL, active boolean)",
+					"events.sql":   "CREATE TABLE events (id bigint PRIMARY KEY)",
+				}},
+				"fresh": {Files: map[string]string{
+					"jobs.sql": "CREATE TABLE jobs (id bigint PRIMARY KEY)",
+				}},
+			},
+			expectedFiles: map[string]map[string]string{
+				"app":   {"accounts.sql": originalAccounts},
+				"fresh": {},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			_, err := db.ExecContext(t.Context(), tt.setup)
+			require.NoError(t, err)
+
+			result, err := New().Plan(t.Context(), &engine.PlanRequest{
+				Database: tt.database, SchemaFiles: tt.schemaFiles, Credentials: &engine.Credentials{DSN: dsn},
+			})
+			require.NoError(t, err)
+			require.Len(t, result.Changes, len(tt.expectedFiles))
+			for _, change := range result.Changes {
+				assert.True(t, change.OriginalFilesCaptured)
+				assert.Equal(t, tt.expectedFiles[change.Namespace], change.OriginalFiles)
+			}
+		})
+	}
+}
+
+// Capture keeps the forward plan's table membership: ignored bookkeeping
+// tables do not become rollback declarations or block capture when their shape
+// cannot be rendered, while an explicitly declared archive keeps its original.
+// Replanning and applying those originals reverses the nullable-column addition
+// without changing ignored tables, and still marks the column drop unsafe.
+func TestEnginePlanRollbackBaselineMembershipRoundTrip(t *testing.T) {
+	tests := []struct {
+		name       string
+		database   string
+		table      string
+		ignoredDDL string
+	}{
+		{
+			name:       "ignored renderable table",
+			database:   "baseline_ignore_renderable_test",
+			table:      "users",
+			ignoredDDL: "CREATE TABLE public.flyway_schema_history (installed_rank integer PRIMARY KEY, version text)",
+		},
+		{
+			name:       "ignored unrenderable table",
+			database:   "baseline_ignore_unrenderable_test",
+			table:      "users",
+			ignoredDDL: "CREATE UNLOGGED TABLE public.flyway_schema_history (installed_rank integer PRIMARY KEY, version text)",
+		},
+		{
+			name:     "declared archive table",
+			database: "baseline_declared_archive_test",
+			table:    "audit_log_archive_2019",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+			defer cancel()
+			_, err := db.ExecContext(ctx, fmt.Sprintf("CREATE TABLE public.%s (id bigint PRIMARY KEY)", tt.table))
+			require.NoError(t, err)
+			_, err = db.ExecContext(ctx, fmt.Sprintf("INSERT INTO public.%s (id) VALUES (1)", tt.table))
+			require.NoError(t, err)
+			var ignored []string
+			if tt.ignoredDDL != "" {
+				_, err = db.ExecContext(ctx, tt.ignoredDDL)
+				require.NoError(t, err)
+				_, err = db.ExecContext(ctx, "INSERT INTO public.flyway_schema_history VALUES (1, 'v1')")
+				require.NoError(t, err)
+				ignored = []string{"flyway_schema_history"}
+			}
+
+			eng := New()
+			forward, err := eng.Plan(ctx, &engine.PlanRequest{
+				Database: tt.database,
+				SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+					tt.table + ".sql": fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY, email text)", tt.table),
+				}}},
+				Credentials:  &engine.Credentials{DSN: dsn},
+				IgnoreTables: ignored,
+			})
+			require.NoError(t, err)
+			require.Len(t, forward.Changes, 1)
+			originals := forward.Changes[0].OriginalFiles
+			require.True(t, forward.Changes[0].OriginalFilesCaptured)
+			assert.Equal(t, map[string]string{tt.table + ".sql": fmt.Sprintf(
+				"CREATE TABLE \"%s\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"%s_pkey\" PRIMARY KEY (id)\n);\n", tt.table, tt.table)}, originals)
+			require.Len(t, forward.Changes[0].TableChanges, 1)
+			addition := forward.Changes[0].TableChanges[0]
+			assert.Equal(t, tt.table, addition.Table)
+			assert.False(t, addition.IsUnsafe)
+			require.Empty(t, addition.ExecutionMode)
+			applied, err := eng.Apply(ctx, applyRequest(dsn, addition.Table, addition.DDL))
+			require.NoError(t, err)
+			require.True(t, applied.Accepted)
+			require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, tt.table).State)
+
+			rollbackRequest := &engine.PlanRequest{
+				Database:     tt.database,
+				SchemaFiles:  schema.SchemaFiles{"public": {Files: originals}},
+				Credentials:  &engine.Credentials{DSN: dsn},
+				IgnoreTables: ignored,
+			}
+			rollback, err := eng.Plan(ctx, rollbackRequest)
+			require.NoError(t, err, "originals and the source plan's ignores must be consistent")
+			require.False(t, rollback.NoChanges)
+			require.Len(t, rollback.Changes, 1)
+			require.Len(t, rollback.Changes[0].TableChanges, 1)
+			drop := rollback.Changes[0].TableChanges[0]
+			assert.Equal(t, tt.table, drop.Table)
+			assert.Equal(t, ddl.StatementAlterTable, drop.Operation)
+			assert.Equal(t, fmt.Sprintf("ALTER TABLE public.%s DROP email", tt.table), drop.DDL)
+			assert.True(t, drop.IsUnsafe, "rollback keeps destructive-change disclosure")
+			assert.NotEmpty(t, drop.UnsafeReason)
+			require.Empty(t, drop.ExecutionMode)
+			rolledBack, err := eng.Apply(ctx, applyRequest(dsn, drop.Table, drop.DDL))
+			require.NoError(t, err)
+			require.True(t, rolledBack.Accepted)
+			require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, tt.table).State)
+			converged, err := eng.Plan(ctx, rollbackRequest)
+			require.NoError(t, err)
+			assert.True(t, converged.NoChanges)
+
+			var id int64
+			err = db.QueryRowContext(ctx, fmt.Sprintf("SELECT id FROM public.%s", tt.table)).Scan(&id)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), id)
+			if tt.ignoredDDL != "" {
+				var version string
+				err = db.QueryRowContext(ctx, "SELECT version FROM public.flyway_schema_history WHERE installed_rank = 1").Scan(&version)
+				require.NoError(t, err)
+				assert.Equal(t, "v1", version)
+			}
+		})
+	}
+}
+
+// A pull refuses a namespace whose tables carry objects the declarative
+// format cannot represent, because those files become the owner's declared
+// schema. A rollback baseline is declared by nobody, and the differ cannot
+// see those objects in either direction, so plan capture keeps the namespace
+// and the plan stays rollback-capable.
+func TestEnginePlanCapturesNamespaceWithUnmodeledObjects(t *testing.T) {
+	const originalAccounts = "CREATE TABLE \"accounts\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"accounts_pkey\" PRIMARY KEY (id)\n);\n"
+
+	dsn, db := testutil.StartPostgres(t, "plan_unmodeled_capture_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY);
+		CREATE FUNCTION app.touch_account() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch_account BEFORE INSERT ON app.accounts FOR EACH ROW EXECUTE FUNCTION app.touch_account();
+		COMMENT ON TABLE app.accounts IS 'customer accounts'`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_unmodeled_capture_test",
+		SchemaFiles: schema.SchemaFiles{"app": {Files: map[string]string{
+			"accounts.sql": "CREATE TABLE accounts (id bigint PRIMARY KEY, email text)",
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	assert.True(t, result.Changes[0].OriginalFilesCaptured,
+		"a trigger and a comment are invisible to the renderer and to the differ, so they do not cost the namespace its rollback baseline")
+	assert.Equal(t, map[string]string{"accounts.sql": originalAccounts}, result.Changes[0].OriginalFiles)
+}
+
+// An undeclared archive table is left in place rather than dropped, so it sits
+// outside management on the forward plan and on any rollback re-plan. Its
+// shape is therefore not the rollback baseline's concern: an archive table
+// the renderer refuses neither appears in the baseline nor costs the
+// namespace its rollback capability.
+func TestEnginePlanCaptureLeavesExemptArchiveTablesOutOfBaseline(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+
+	dsn, db := testutil.StartPostgres(t, "plan_archive_capture_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY, note text COLLATE "C")`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_archive_capture_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.ExemptTables, 1)
+	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
+	assert.True(t, result.Changes[0].OriginalFilesCaptured,
+		"a table the planner refuses to manage must not decide whether the namespace can be rolled back")
+	assert.Equal(t, map[string]string{"users.sql": originalUsers}, result.Changes[0].OriginalFiles,
+		"the baseline declares exactly the tables a rollback re-plan would manage")
+}
+
+// A declared archive the forward plan creates has no live original, so the
+// baseline holds only the tables that existed, and the plan stays
+// rollback-capable. The rollback re-plan reverses the managed table's change
+// and finds the new archive live with no file: it is left in place and
+// disclosed as exempt, as any archive-named table without a file is.
+func TestEnginePlanRollbackLeavesCreatedDeclaredArchiveInPlace(t *testing.T) {
+	const originalUsers = "CREATE TABLE \"users\" (\n    \"id\" bigint NOT NULL,\n    CONSTRAINT \"users_pkey\" PRIMARY KEY (id)\n);\n"
+	const archive = "audit_log_archive_2019"
+
+	dsn, db := testutil.StartPostgres(t, "plan_created_archive_rollback_test")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+
+	eng := New()
+	forward, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database: "plan_created_archive_rollback_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"users.sql":      "CREATE TABLE users (id bigint PRIMARY KEY, email text)",
+			archive + ".sql": fmt.Sprintf("CREATE TABLE %s (id bigint PRIMARY KEY)", archive),
+		}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, forward.Changes, 1)
+	assert.Empty(t, forward.ExemptTables, "a declared archive is managed, not exempt")
+	require.True(t, forward.Changes[0].OriginalFilesCaptured)
+	assert.Equal(t, map[string]string{"users.sql": originalUsers}, forward.Changes[0].OriginalFiles,
+		"a table that does not exist yet has no original to capture")
+	require.Len(t, forward.Changes[0].TableChanges, 2)
+	for _, change := range forward.Changes[0].TableChanges {
+		require.Empty(t, change.ExecutionMode, "%s", change.DDL)
+		applied, err := eng.Apply(ctx, applyRequest(dsn, change.Table, change.DDL))
+		require.NoError(t, err)
+		require.True(t, applied.Accepted)
+		require.Equal(t, engine.StateCompleted, awaitPostgresProgress(t, eng, change.Table).State)
+	}
+
+	rollback, err := eng.Plan(ctx, &engine.PlanRequest{
+		Database:    "plan_created_archive_rollback_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: forward.Changes[0].OriginalFiles}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	require.Len(t, rollback.Changes, 1)
+	require.Len(t, rollback.Changes[0].TableChanges, 1)
+	assert.Equal(t, "ALTER TABLE public.users DROP email", rollback.Changes[0].TableChanges[0].DDL)
+	require.Len(t, rollback.ExemptTables, 1)
+	assert.Equal(t, "public", rollback.ExemptTables[0].Namespace)
+	assert.Equal(t, []string{archive}, rollback.ExemptTables[0].Tables)
+	assert.Equal(t, "archive naming", rollback.ExemptTables[0].Reason)
+}
+
+// A cancellation that arrives after listing a namespace of excluded tables
+// still ends capture, even though no managed table needs introspection.
+func TestRenderPostgresTablesReturnsCancellationAfterFiltering(t *testing.T) {
+	tests := []struct {
+		name     string
+		database string
+		setup    string
+		ignored  []string
+	}{
+		{
+			name:     "undeclared archive",
+			database: "render_archive_cancel_test",
+			setup:    "CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY)",
+		},
+		{
+			name:     "ignored table",
+			database: "render_ignored_cancel_test",
+			setup:    "CREATE UNLOGGED TABLE public.flyway_schema_history (installed_rank integer PRIMARY KEY)",
+			ignored:  []string{"flyway_schema_history"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dsn, db := testutil.StartPostgres(t, tt.database)
+			deadline, end := context.WithTimeout(t.Context(), postgresApplyDeadline)
+			defer end()
+			_, err := db.ExecContext(deadline, tt.setup)
+			require.NoError(t, err)
+
+			ctx, cancel := context.WithCancel(deadline)
+			defer cancel()
+			poolCfg, err := pgxpool.ParseConfig(dsn)
+			require.NoError(t, err)
+			poolCfg.ConnConfig.Tracer = &cancelAfterFirstQuery{cancel: cancel}
+			pool, err := pgxpool.NewWithConfig(deadline, poolCfg)
+			require.NoError(t, err)
+			defer pool.Close()
+
+			files, captured, err := captureOriginalFiles(ctx, pool, tt.database, "public", nil, mustIgnoredTables(t, tt.ignored))
+			require.ErrorIs(t, err, context.Canceled)
+			assert.False(t, captured)
+			assert.Nil(t, files)
+		})
+	}
+}
+
+// cancelAfterFirstQuery cancels the capture's context as soon as its table
+// listing has returned, so every introspection that follows runs against a
+// cancelled context.
+type cancelAfterFirstQuery struct {
+	cancel  context.CancelFunc
+	queries atomic.Int32
+}
+
+func (c *cancelAfterFirstQuery) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return ctx
+}
+
+func (c *cancelAfterFirstQuery) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
+	if c.queries.Add(1) == 1 {
+		c.cancel()
+	}
+}
+
+// A context cancelled part-way through the capture is the plan's outcome,
+// not one table's: the capture returns the cancellation as an error instead
+// of recording the namespace as rollback-incapable, so a plan interrupted by
+// a shutdown is never stored looking like a namespace that holds an
+// unrenderable table.
+func TestCaptureOriginalFilesReturnsCancellationInsteadOfIncompleteBaseline(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_cancel_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.ConnConfig.Tracer = &cancelAfterFirstQuery{cancel: cancel}
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	files, captured, err := captureOriginalFiles(ctx, pool, "capture_cancel_test", "public", nil, engine.IgnoredTables{})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, captured)
+	assert.Nil(t, files)
+}
+
+// introspectionRendezvous holds the first two introspection transactions at
+// their BEGIN until both have arrived, so a render that introspects one table
+// at a time can never get past the first: the hold then outlives the deadline
+// and is reported as such rather than deadlocking the test.
+type introspectionRendezvous struct {
+	deadline context.Context
+	mu       sync.Mutex
+	arrivals int
+	both     chan struct{}
+	timedOut atomic.Bool
+}
+
+func newIntrospectionRendezvous(deadline context.Context) *introspectionRendezvous {
+	return &introspectionRendezvous{deadline: deadline, both: make(chan struct{})}
+}
+
+func (r *introspectionRendezvous) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if !strings.EqualFold(strings.TrimSpace(data.SQL), "begin") {
+		return ctx
+	}
+	r.mu.Lock()
+	r.arrivals++
+	if r.arrivals == 2 {
+		close(r.both)
+	}
+	r.mu.Unlock()
+	select {
+	case <-r.both:
+	case <-r.deadline.Done():
+		r.timedOut.Store(true)
+	}
+	return ctx
+}
+
+func (r *introspectionRendezvous) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+type introspectionCeiling struct {
+	mu        sync.Mutex
+	inFlight  int
+	peak      int
+	breached  chan struct{}
+	breachOne sync.Once
+}
+
+func (c *introspectionCeiling) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if !strings.EqualFold(strings.TrimSpace(data.SQL), "begin") {
+		return ctx
+	}
+	c.mu.Lock()
+	c.inFlight++
+	c.peak = max(c.peak, c.inFlight)
+	over := c.inFlight > baselineIntrospectionConcurrency
+	c.mu.Unlock()
+	if over {
+		c.breachOne.Do(func() { close(c.breached) })
+	}
+	timer := time.NewTimer(introspectionCapObservationDeadline)
+	defer timer.Stop()
+	select {
+	case <-c.breached:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	c.mu.Lock()
+	c.inFlight--
+	c.mu.Unlock()
+	return ctx
+}
+
+func (c *introspectionCeiling) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (c *introspectionCeiling) observedPeak() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.peak
+}
+
+// A baseline render uses the configured concurrency cap even when the pool
+// has enough connections and the namespace has enough tables to exceed it.
+func TestRenderPostgresTablesHoldsTheConcurrencyCap(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_cap_test")
+	var ddl strings.Builder
+	ddl.WriteString("CREATE SCHEMA app;")
+	for i := range baselineIntrospectionConcurrency * 2 {
+		fmt.Fprintf(&ddl, "CREATE TABLE app.t%02d (id bigint PRIMARY KEY);", i)
+	}
+	_, err := db.ExecContext(t.Context(), ddl.String())
+	require.NoError(t, err)
+
+	ceiling := &introspectionCeiling{breached: make(chan struct{})}
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.MaxConns = int32(baselineIntrospectionConcurrency * 2)
+	poolCfg.ConnConfig.Tracer = ceiling
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(t.Context(), pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
+	require.NoError(t, err)
+	assert.Empty(t, renderErrors)
+	assert.Len(t, rendered, baselineIntrospectionConcurrency*2)
+	peak := ceiling.observedPeak()
+	assert.LessOrEqual(t, peak, baselineIntrospectionConcurrency,
+		"introspections in flight at once must never exceed the cap")
+	assert.Greater(t, peak, 1,
+		"the render must overlap introspections for the cap to be exercised at all")
+}
+
+// tableDroppedAfterListing removes one table from the namespace the moment
+// the render's table listing has returned, so the listing names a table that
+// introspection can no longer find. Every other table's introspection is
+// then held at the query that resolves its relation until the render cancels
+// it: a render that keeps its remaining introspections running after a
+// sibling's hard failure never cancels them, so the hold outlives the
+// deadline and is reported as such rather than deadlocking the test. The
+// dropped table's own resolve is held until one sibling is at that hold, so
+// the failure always finds an introspection in flight to cancel: a render
+// that took tables one at a time would fail on the dropped table before any
+// sibling began, and the cancellation the test is named for would go
+// unexercised while every assertion still passed.
+type tableDroppedAfterListing struct {
+	table       string
+	drop        func()
+	deadline    context.Context
+	queries     atomic.Int32
+	begins      atomic.Int32
+	timedOut    atomic.Bool
+	siblingHeld chan struct{}
+	holdOne     sync.Once
+}
+
+func newTableDroppedAfterListing(table string, deadline context.Context, drop func()) *tableDroppedAfterListing {
+	return &tableDroppedAfterListing{table: table, deadline: deadline, drop: drop, siblingHeld: make(chan struct{})}
+}
+
+func (d *tableDroppedAfterListing) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.EqualFold(strings.TrimSpace(data.SQL), "begin") {
+		d.begins.Add(1)
+		return ctx
+	}
+	table, resolves := d.resolvesTable(data.Args)
+	if !resolves {
+		return ctx
+	}
+	if table == d.table {
+		select {
+		case <-d.siblingHeld:
+		case <-d.deadline.Done():
+			d.timedOut.Store(true)
+		}
+		return ctx
+	}
+	d.holdOne.Do(func() { close(d.siblingHeld) })
+	select {
+	case <-ctx.Done():
+	case <-d.deadline.Done():
+		d.timedOut.Store(true)
+	}
+	return ctx
+}
+
+// resolvesTable recognizes the introspection query that looks a table up by
+// schema and name, and reports which table it resolves.
+func (d *tableDroppedAfterListing) resolvesTable(args []any) (table string, ok bool) {
+	if len(args) != 2 {
+		return "", false
+	}
+	table, ok = args[1].(string)
+	return table, ok
+}
+
+func (d *tableDroppedAfterListing) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
+	if d.queries.Add(1) == 1 {
+		d.drop()
+	}
+}
+
+// A table the listing named but introspection cannot find is a schema that
+// changed under the render, not a shape of that table: the render ends with
+// the introspection failure instead of recording it as one table's refusal
+// and assembling a baseline around it, and the failure cancels the
+// introspections still in flight rather than letting the render finish
+// reading a namespace it already knows it cannot report consistently.
+func TestRenderPostgresTablesEndsOnIntrospectionFailureAndCancelsTheRest(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_dropped_test")
+	var ddl strings.Builder
+	ddl.WriteString("CREATE SCHEMA app; CREATE TABLE app.a_dropped (id bigint PRIMARY KEY);")
+	for i := range baselineIntrospectionConcurrency * 2 {
+		fmt.Fprintf(&ddl, "CREATE TABLE app.t%02d (id bigint PRIMARY KEY);", i)
+	}
+	_, err := db.ExecContext(t.Context(), ddl.String())
+	require.NoError(t, err)
+
+	deadline, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	dropped := newTableDroppedAfterListing("a_dropped", deadline, func() {
+		_, err := db.ExecContext(deadline, `DROP TABLE app.a_dropped`)
+		assert.NoError(t, err)
+	})
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.MaxConns = int32(baselineIntrospectionConcurrency * 2)
+	poolCfg.ConnConfig.Tracer = dropped
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", rollbackBaseline(nil, engine.IgnoredTables{}))
+	assert.False(t, dropped.timedOut.Load(),
+		"the sibling introspections must be cancelled by the failure; a render that lets them run holds them to the deadline")
+	require.ErrorIs(t, err, schemadiff.ErrTableNotFound)
+	assert.ErrorContains(t, err, `introspect schema "app" table "a_dropped"`)
+	assert.Nil(t, rendered)
+	assert.Nil(t, renderErrors)
+	begins := int(dropped.begins.Load())
+	assert.Greater(t, begins, 1,
+		"a sibling introspection must be in flight when the dropped table's read fails, or the cancellation goes unexercised")
+	assert.LessOrEqual(t, begins, baselineIntrospectionConcurrency,
+		"a sibling's hard failure must cancel the introspections still in flight and start no more; only the first wave may have begun")
+}
+
+// A baseline render introspects tables concurrently, and the baseline it
+// assembles does not depend on which introspection finished first: the
+// rendered set and the per-table refusals come back in table-listing order
+// on every run, so the same namespace always reports the same refusals in
+// the same words.
+func TestRenderPostgresTablesIntrospectsConcurrentlyInListingOrder(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "render_concurrent_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.a_accounts (id bigint PRIMARY KEY);
+		CREATE TABLE app.b_commented (id bigint PRIMARY KEY);
+		COMMENT ON TABLE app.b_commented IS 'refused: comment';
+		CREATE TABLE app.c_customers (id bigint PRIMARY KEY, name text NOT NULL);
+		CREATE TABLE app.d_triggered (id bigint PRIMARY KEY);
+		CREATE FUNCTION app.touch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER touch BEFORE INSERT ON app.d_triggered FOR EACH ROW EXECUTE FUNCTION app.touch();
+		CREATE TABLE app.e_events (id bigint PRIMARY KEY);
+		CREATE UNLOGGED TABLE app.f_unlogged (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	deadline, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	rendezvous := newIntrospectionRendezvous(deadline)
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	poolCfg.MaxConns = 4
+	poolCfg.ConnConfig.Tracer = rendezvous
+	pool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	rendered, renderErrors, err := renderPostgresTables(deadline, pool, "appdb", "app", pulledBaseline)
+	assert.False(t, rendezvous.timedOut.Load(),
+		"two introspections must be in flight at once; a render that takes tables one at a time never reaches the second BEGIN")
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, []string{"a_accounts", "c_customers", "e_events"}, slices.Collect(maps.Keys(rendered)))
+	assert.Contains(t, rendered["c_customers"], `"name" text NOT NULL`)
+	require.Len(t, renderErrors, 3)
+	assert.Contains(t, renderErrors[0].Error(), `schema "app" table "b_commented"`)
+	assert.Contains(t, renderErrors[0].Error(), "comment")
+	assert.Contains(t, renderErrors[1].Error(), `schema "app" table "d_triggered"`)
+	assert.Contains(t, renderErrors[1].Error(), "trigger")
+	assert.Contains(t, renderErrors[2].Error(), `schema "app" table "f_unlogged": render`)
+
+	// The order is a property of the assembly, not of the run that happened
+	// to finish in listing order: a second pass with no rendezvous holding
+	// anything back reports the same refusals in the same positions.
+	poolCfg.ConnConfig.Tracer = nil
+	freePool, err := pgxpool.NewWithConfig(t.Context(), poolCfg)
+	require.NoError(t, err)
+	defer freePool.Close()
+	for range 3 {
+		again, againErrors, err := renderPostgresTables(t.Context(), freePool, "appdb", "app", pulledBaseline)
+		require.NoError(t, err)
+		assert.Equal(t, rendered, again)
+		require.Len(t, againErrors, len(renderErrors))
+		for i := range renderErrors {
+			assert.Equal(t, renderErrors[i].Error(), againErrors[i].Error())
+		}
+	}
+}
+
+// TestEnginePlanPrivilegeRefusal proves a role that cannot alter an oversized
+// target gets one blocked verdict with the privilege cause followed by the
+// size cause, so the operator can address both findings from one plan.
 func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "plan_privilege_test")
 	_, err := db.ExecContext(t.Context(), `
@@ -72,7 +942,7 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		Credentials: &engine.Credentials{DSN: limitedDSN.String()},
 	}
 
-	result, err := New().Plan(t.Context(), req)
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
 	require.NoError(t, err)
 	require.Len(t, result.Changes, 1)
 	require.Len(t, result.Changes[0].TableChanges, 1)
@@ -84,6 +954,11 @@ func TestEnginePlanPrivilegeRefusal(t *testing.T) {
 		"the reason must carry the exact provisioning statement")
 	assert.Contains(t, change.ModeReason, "pg_has_role(plan_limited,",
 		"the reason must carry the exact failed catalog check")
+	causes := engine.BlockedCauses(change.ModeReason)
+	require.Len(t, causes, 2, "the privilege gap and the size ceiling are independent causes")
+	assert.Contains(t, causes[0], "in-place ALTER TABLE", "the privilege cause comes first")
+	assert.True(t, strings.HasPrefix(causes[1], `statement for table "users": table size`),
+		"the size cause follows the privilege cause: %q", causes[1])
 }
 
 // TestEnginePlanPrivilegeRefusalPerTier proves a privilege gap blocks only
@@ -162,6 +1037,98 @@ func TestEnginePlanTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, change.ModeReason, "SchemaBot's ceiling for a native-safe apply")
 }
 
+// TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim proves the size verdict
+// names the table exactly as the database spells it: a quoted PostgreSQL
+// identifier may carry Markdown delimiters, and the operator reading the
+// verdict needs the real name to act on it. Escaping for the surface that
+// shows the reason is the renderer's job, so the engine does not rewrite the
+// identifier on the renderer's behalf.
+func TestEnginePlanTableSizeRefusalKeepsTableNameVerbatim(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_size_limit_odd_name_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public."odd|users" (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_size_limit_odd_name_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"odd_users.sql": `CREATE TABLE "odd|users" (id bigint PRIMARY KEY, email text)`,
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+	assert.Contains(t, change.ModeReason, `statement for table "odd|users":`)
+	assert.Contains(t, change.ModeReason, "1-byte threshold")
+}
+
+// TestEnginePlanOversizedTableAdmitsConcurrentIndex proves the plan applies
+// the rewrite ceiling only to the native step while leaving a concurrent
+// index build executable under its duration policy.
+func TestEnginePlanOversizedTableAdmitsConcurrentIndex(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_concurrent_index_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_concurrent_index_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 2)
+	alter := result.Changes[0].TableChanges[0]
+	index := result.Changes[0].TableChanges[1]
+	assert.Equal(t, engine.ExecutionModeBlocked, alter.ExecutionMode)
+	assert.Contains(t, alter.ModeReason, "1-byte threshold")
+	assert.Empty(t, index.ExecutionMode)
+	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+}
+
+// TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange proves the
+// plan a reviewer can actually apply: when the only diff against an
+// already-oversized table is a new index, the plan holds exactly one change,
+// a concurrent index build, and none of its changes is blocked. The ceiling
+// bounds rewrites of existing data, and an index build rewrites none, so a
+// table past the ceiling must not turn an index-only PR into one that can
+// never merge.
+func TestEnginePlanOversizedTableIndexOnlyDiffHasNoBlockedChange(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_oversized_index_only_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_oversized_index_only_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text); CREATE INDEX users_email_idx ON users (email)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := NewWithTableSizeLimit(1).Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1, "an index-only diff plans as the index build alone")
+	index := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "users", index.Table)
+	assert.Empty(t, index.ExecutionMode, "the only change must be executable, not blocked")
+	assert.Empty(t, index.ModeReason)
+	assert.Contains(t, index.DDL, "CREATE INDEX CONCURRENTLY")
+	assert.Contains(t, index.DDL, "users_email_idx")
+}
+
 // TestEnginePlanCreateTableIgnoresSizeCeiling proves the native-safe table
 // size ceiling never blocks a greenfield CREATE TABLE: the ceiling bounds
 // rewrites of existing data, and a table that does not exist yet has none —
@@ -187,6 +1154,303 @@ func TestEnginePlanCreateTableIgnoresSizeCeiling(t *testing.T) {
 	assert.Empty(t, change.ModeReason)
 }
 
+// TestEnginePlanUndeclaredTableIsBlockedDrop proves a live table that no
+// schema file declares never vanishes from the plan: the declarative diff
+// surfaces it as a DROP TABLE that is both destructive and blocked, so the
+// reviewer sees the divergence and the apply path can never run the drop. The
+// verdict prescribes only remedies the operator can follow — a table that owns
+// a foreign key cannot be declared, and a table that another table's foreign
+// key references cannot be declared by a pulled file, so each reason names the
+// constraint and the side it lives on instead of a file that cannot be
+// written. A declared table that already matches its file contributes nothing,
+// even when foreign keys elsewhere reference it. Tables whose definition lives
+// elsewhere are not reported on their own: a partition belongs to its parent
+// and an extension-owned table to its extension. Archive tables are exempt by
+// naming convention, as they are on MySQL, while an underscore prefix means
+// nothing on PostgreSQL. An inheritance child and an unlogged table are
+// ordinary tables that must carry their own file.
+func TestEnginePlanUndeclaredTableIsBlockedDrop(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_undeclared_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY, email text NOT NULL);
+		CREATE TABLE public.legacy_users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
+		CREATE TABLE public.regions (id bigint PRIMARY KEY);
+		CREATE TABLE public.warehouses (id bigint PRIMARY KEY, region_id bigint REFERENCES public.regions (id));
+		CREATE TABLE public.events (id bigint, day date) PARTITION BY RANGE (day);
+		CREATE TABLE public.events_2026 PARTITION OF public.events
+			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+		CREATE TABLE public.users_history () INHERITS (public.users);
+		CREATE UNLOGGED TABLE public.scratch (id bigint PRIMARY KEY);
+		CREATE TABLE public._settings (id bigint PRIMARY KEY);
+		CREATE TABLE public.audit_log_archive_2019 (id bigint PRIMARY KEY);
+		CREATE EXTENSION hstore;
+		CREATE TABLE public.ext_owned_config (key text PRIMARY KEY);
+		ALTER EXTENSION hstore ADD TABLE public.ext_owned_config`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_undeclared_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY, email text NOT NULL)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := New().Plan(t.Context(), req)
+	require.NoError(t, err)
+	assert.False(t, result.NoChanges, "an undeclared live table is a change the reviewer must see")
+	require.Len(t, result.Changes, 1)
+	assert.Equal(t, "public", result.Changes[0].Namespace)
+	assert.False(t, result.Changes[0].OriginalFilesCaptured,
+		"a namespace with tables that cannot be rendered as a desired schema plans rollback-incapable rather than not at all")
+	assert.Nil(t, result.Changes[0].OriginalFiles)
+	require.Len(t, result.ExemptTables, 1)
+	assert.Equal(t, "public", result.ExemptTables[0].Namespace)
+	assert.Equal(t, []string{"audit_log_archive_2019"}, result.ExemptTables[0].Tables)
+	assert.Equal(t, "archive naming", result.ExemptTables[0].Reason)
+	assert.NotContains(t, result.ExemptTables[0].Tables, "legacy_users")
+	require.Len(t, result.Changes[0].TableChanges, 8,
+		"every undeclared table with a definition of its own is reported; the declared table, its partition, the extension-owned table and the archive table are not")
+
+	const declarable = "declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
+	const ownsForeignKey = `cannot be declared while it carries foreign key constraint(s) "orders_user_id_fkey", which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process`
+	const referencedByForeignKey = `foreign key constraint(s) "warehouses_region_id_fkey" on other tables reference it, and schema files do not support foreign keys, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process`
+	for i, want := range []struct{ table, ddl, remedy string }{
+		{"_settings", "DROP TABLE public._settings", declarable},
+		{"events", "DROP TABLE public.events", declarable},
+		{"legacy_users", "DROP TABLE public.legacy_users", declarable},
+		{"orders", "DROP TABLE public.orders", ownsForeignKey},
+		{"regions", "DROP TABLE public.regions", referencedByForeignKey},
+		{"scratch", "DROP TABLE public.scratch", declarable},
+		{"users_history", "DROP TABLE public.users_history", declarable},
+		{"warehouses", "DROP TABLE public.warehouses", `cannot be declared while it carries foreign key constraint(s) "warehouses_region_id_fkey"`},
+	} {
+		change := result.Changes[0].TableChanges[i]
+		assert.Equal(t, want.table, change.Table)
+		assert.Equal(t, ddl.StatementDropTable, change.Operation)
+		assert.Equal(t, want.ddl, change.DDL)
+		assert.True(t, change.IsUnsafe, "a drop removes live data and must carry the unsafe flag")
+		assert.Equal(t, `DROP TABLE removes all data from table "`+want.table+`"`, change.UnsafeReason)
+		assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode,
+			"the native-safe path never executes a drop, so the verdict must say so at plan time")
+		assert.Contains(t, change.ModeReason, `table "`+want.table+`" exists on the target but no schema file in namespace "public" declares it`)
+		assert.Contains(t, change.ModeReason, want.remedy)
+	}
+	for _, table := range []string{"legacy_users", "orders", "regions", "warehouses", "scratch", "users_history", "_settings", "audit_log_archive_2019", "ext_owned_config"} {
+		assert.True(t, testutil.PostgresTableExists(t, db, "public", table), "planning must never touch the target")
+	}
+}
+
+// TestEnginePlanEmptyNamespaceSurfacesAllLiveTables proves an explicitly empty
+// namespace remains a destructive divergence rather than a no-changes plan.
+func TestEnginePlanEmptyNamespaceSurfacesAllLiveTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_empty_namespace_test")
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE public.users (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	result, err := New().Plan(t.Context(), &engine.PlanRequest{
+		Database: "plan_empty_namespace_test",
+		SchemaFiles: schema.SchemaFiles{
+			"public": {Files: map[string]string{}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.NoError(t, err)
+	assert.False(t, result.NoChanges)
+	require.Len(t, result.Changes, 1)
+	assert.Equal(t, "public", result.Changes[0].Namespace)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	change := result.Changes[0].TableChanges[0]
+	assert.Equal(t, "users", change.Table)
+	assert.Equal(t, "DROP TABLE public.users", change.DDL)
+	assert.Equal(t, ddl.StatementDropTable, change.Operation)
+	assert.Equal(t, engine.ExecutionModeBlocked, change.ExecutionMode)
+}
+
+// TestEnginePlanUndeclaredTableInMissingSchema proves a namespace whose
+// schema does not exist yet plans as a greenfield create: the live-table
+// enumeration finds nothing to reconcile against, and the declared table is
+// created rather than the plan failing on the absent schema.
+func TestEnginePlanUndeclaredTableInMissingSchema(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "plan_missing_schema_test")
+	req := &engine.PlanRequest{
+		Database: "plan_missing_schema_test",
+		SchemaFiles: schema.SchemaFiles{
+			"app": {Files: map[string]string{
+				"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY)",
+			}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := New().Plan(t.Context(), req)
+	require.NoError(t, err)
+	require.Len(t, result.Changes, 1)
+	require.Len(t, result.Changes[0].TableChanges, 1)
+	assert.Equal(t, ddl.StatementCreateTable, result.Changes[0].TableChanges[0].Operation)
+}
+
+// TestEnginePlanUndeclaredTablesAcrossNamespaces proves every namespace in
+// the request is reconciled against its own live tables: an undeclared table
+// in one namespace is reported there and nowhere else, so a repository with
+// several namespaces sees each divergence under the namespace that owns it.
+func TestEnginePlanUndeclaredTablesAcrossNamespaces(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_namespaces_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE SCHEMA billing;
+		CREATE TABLE app.users (id bigint PRIMARY KEY);
+		CREATE TABLE app.legacy_users (id bigint PRIMARY KEY);
+		CREATE TABLE billing.invoices (id bigint PRIMARY KEY);
+		CREATE TABLE billing.legacy_invoices (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+	req := &engine.PlanRequest{
+		Database: "plan_namespaces_test",
+		SchemaFiles: schema.SchemaFiles{
+			"app":     {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint PRIMARY KEY)"}},
+			"billing": {Files: map[string]string{"invoices.sql": "CREATE TABLE invoices (id bigint PRIMARY KEY)"}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	result, err := New().Plan(t.Context(), req)
+	require.NoError(t, err)
+	assert.False(t, result.NoChanges)
+	require.Len(t, result.Changes, 2)
+	dropsByNamespace := make(map[string][]string, len(result.Changes))
+	for _, change := range result.Changes {
+		for _, tc := range change.TableChanges {
+			assert.Equal(t, ddl.StatementDropTable, tc.Operation)
+			assert.Equal(t, engine.ExecutionModeBlocked, tc.ExecutionMode)
+			assert.Contains(t, tc.ModeReason, `no schema file in namespace "`+change.Namespace+`" declares it`)
+			dropsByNamespace[change.Namespace] = append(dropsByNamespace[change.Namespace], tc.Table)
+		}
+	}
+	assert.Equal(t, map[string][]string{
+		"app":     {"legacy_users"},
+		"billing": {"legacy_invoices"},
+	}, dropsByNamespace, "each namespace reports exactly its own undeclared table")
+}
+
+// TestLiveTablesUnderShadowingSearchPath proves the catalog reads that find
+// undeclared live tables and the schema pull fail closed when the target's
+// search_path lists a user schema ahead of pg_catalog. Decoy relations named
+// after every catalog table the queries touch, decoy "=", "<>", ">" and ">="
+// operators over every operand type the queries compare, and decoy array_agg
+// and cardinality routines must not shadow the catalog: a shadowed
+// enumeration would come back empty and an undeclared table would linger
+// silently, and a shadowed pull would hand the operator a wrong baseline. The
+// fixture includes a partition and an extension-owned table so the exemption
+// subqueries have rows to get wrong, not a vacuous NOT EXISTS.
+//
+// The pool is plain pgx rather than pg-sprite's: pg-sprite rewrites every new
+// session's search_path to drop a shadowed pg_catalog entry (proven by
+// TestSpritePoolUnshadowsCatalog), which would hide the hostile path from the
+// queries under test. The queries must resolve the catalog correctly on their
+// own, without relying on the pool that happens to carry them in production.
+func TestLiveTablesUnderShadowingSearchPath(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "plan_shadow_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.users (id bigint PRIMARY KEY);
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, user_id bigint REFERENCES public.users (id));
+		CREATE TABLE public.events (id bigint, day date) PARTITION BY RANGE (day);
+		CREATE TABLE public.events_2026 PARTITION OF public.events
+			FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
+		CREATE EXTENSION hstore;
+		CREATE TABLE public.ext_owned_config (key text PRIMARY KEY);
+		ALTER EXTENSION hstore ADD TABLE public.ext_owned_config;
+		CREATE SCHEMA hostile;
+		CREATE TABLE hostile.pg_class (oid oid, relname name, relnamespace oid, relkind "char", relispartition boolean,
+			relrowsecurity boolean, relforcerowsecurity boolean, reloptions text[]);
+		CREATE TABLE hostile.pg_namespace (oid oid, nspname name);
+		CREATE TABLE hostile.pg_inherits (inhrelid oid);
+		CREATE TABLE hostile.pg_depend (classid oid, objid oid, deptype "char");
+		CREATE TABLE hostile.pg_constraint (conrelid oid, confrelid oid, conname name, contype "char");
+		CREATE TABLE hostile.pg_trigger (tgrelid oid, tgisinternal boolean);
+		CREATE TABLE hostile.pg_policy (polrelid oid);
+		CREATE TABLE hostile.pg_description (objoid oid, objsubid integer);
+		CREATE FUNCTION hostile.never(oid, oid) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false';
+		CREATE FUNCTION hostile.never("char", "char") RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false';
+		CREATE FUNCTION hostile.never(name, name) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false';
+		CREATE FUNCTION hostile.never(name, text) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false';
+		CREATE FUNCTION hostile.never(integer, integer) RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT false';
+		CREATE OPERATOR hostile.= (LEFTARG = oid, RIGHTARG = oid, FUNCTION = hostile.never);
+		CREATE OPERATOR hostile.<> (LEFTARG = oid, RIGHTARG = oid, FUNCTION = hostile.never);
+		CREATE OPERATOR hostile.= (LEFTARG = "char", RIGHTARG = "char", FUNCTION = hostile.never);
+		CREATE OPERATOR hostile.= (LEFTARG = name, RIGHTARG = name, FUNCTION = hostile.never);
+		CREATE OPERATOR hostile.= (LEFTARG = name, RIGHTARG = text, FUNCTION = hostile.never);
+		CREATE OPERATOR hostile.>= (LEFTARG = integer, RIGHTARG = integer, FUNCTION = hostile.never);
+		CREATE OPERATOR hostile.> (LEFTARG = integer, RIGHTARG = integer, FUNCTION = hostile.never);
+		CREATE FUNCTION hostile.empty_agg(anyarray, anyelement) RETURNS anyarray LANGUAGE sql IMMUTABLE AS 'SELECT $1';
+		CREATE AGGREGATE hostile.array_agg(anyelement) (SFUNC = hostile.empty_agg, STYPE = anyarray);
+		CREATE FUNCTION hostile.cardinality(anyarray) RETURNS integer LANGUAGE sql IMMUTABLE AS 'SELECT 1';
+		ALTER DATABASE plan_shadow_test SET search_path = hostile, pg_catalog, public`)
+	require.NoError(t, err)
+	pool, err := pgxpool.New(t.Context(), dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+
+	var searchPath string
+	require.NoError(t, pool.QueryRow(t.Context(), "SHOW search_path").Scan(&searchPath))
+	require.Equal(t, "hostile, pg_catalog, public", searchPath, "the pool must see the hostile search_path for the test to prove anything")
+
+	tables, err := liveTables(t.Context(), pool, "public")
+	require.NoError(t, err)
+	assert.Equal(t, []liveTable{
+		{name: "events", foreignKeys: []string{}, referencedBy: []string{}},
+		{name: "orders", foreignKeys: []string{"orders_user_id_fkey"}, referencedBy: []string{}},
+		{name: "users", foreignKeys: []string{}, referencedBy: []string{"orders_user_id_fkey"}},
+	}, tables, "every live table and its foreign keys must be enumerated, and only the partition and the extension-owned table left out, despite the shadowing search_path")
+
+	pulled, err := schemadiff.ListManagedTables(t.Context(), pool, "public")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"events", "orders", "users"}, pulled, "the pull must render the same set the plan holds files accountable for")
+
+	namespaces, err := pullNamespaces(t.Context(), pool, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"hostile", "public"}, namespaces, "namespace discovery must read the real catalog")
+	namespaces, err = pullNamespaces(t.Context(), pool, "public")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"public"}, namespaces, "the existence check for a requested namespace must read the real catalog")
+
+	objects, err := pullUnmodeledTableObjects(t.Context(), pool, "public", "users")
+	require.NoError(t, err)
+	assert.Equal(t, unmodeledTableObjects{}, objects, "a plain table must not acquire unmodeled objects from decoy catalog rows")
+}
+
+// TestSpritePoolUnshadowsCatalog pins the search_path every pg-sprite pool
+// session arrives with: an explicit pg_catalog entry that a user schema
+// precedes is dropped, every other entry keeps its position, and a path with
+// nothing shadowed is left as configured. The plan, apply, and pull dial
+// sites all build their pool through spritePoolConfig, so this is the session
+// state their queries run under, and a change to it upstream would surface
+// here rather than as a wrong catalog answer on a target with a hardened
+// search_path.
+func TestSpritePoolUnshadowsCatalog(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pool_shadow_test")
+	sessionSearchPath := func(t *testing.T, dsn string) string {
+		t.Helper()
+		poolCfg, err := spritePoolConfig(dsn, "")
+		require.NoError(t, err)
+		pool, err := dbconn.NewPool(t.Context(), poolCfg)
+		require.NoError(t, err)
+		defer pool.Close()
+		var searchPath string
+		require.NoError(t, pool.QueryRow(t.Context(), "SHOW search_path").Scan(&searchPath))
+		return searchPath
+	}
+
+	_, err := db.ExecContext(t.Context(), `ALTER DATABASE pool_shadow_test SET search_path = hostile, pg_catalog, public`)
+	require.NoError(t, err)
+	assert.Equal(t, "hostile, public", sessionSearchPath(t, dsn), "a pg_catalog entry listed behind a user schema is dropped from every pooled session")
+
+	_, err = db.ExecContext(t.Context(), `ALTER DATABASE pool_shadow_test SET search_path = pg_catalog, public`)
+	require.NoError(t, err)
+	assert.Equal(t, "pg_catalog, public", sessionSearchPath(t, dsn), "a leading pg_catalog entry shadows nothing and is kept as configured")
+}
+
 // TestEngineApplyNativeSafe proves a planned metadata-only ALTER runs through
 // pg-sprite's preflight and bounded optimistic executor.
 func TestEngineApplyNativeSafe(t *testing.T) {
@@ -203,6 +1467,9 @@ func TestEngineApplyNativeSafe(t *testing.T) {
 	assert.Equal(t, 100, progress.Progress)
 	assert.Equal(t, "completed", progress.Metadata["phase"])
 	assert.Equal(t, "1", progress.Metadata["step"])
+	assert.Equal(t, "1", progress.Metadata["steps_total"])
+	assert.Equal(t, "ALTER TABLE public.users ADD COLUMN email text", progress.Metadata["statement"],
+		"the terminal position names the statement the executor ran")
 
 	var exists bool
 	err = db.QueryRowContext(t.Context(), `SELECT EXISTS (
@@ -237,10 +1504,72 @@ func TestEngineApplyCreateTable(t *testing.T) {
 	assert.True(t, exists)
 }
 
+// TestEngineApplyGreenfieldCreateSet proves a new table and its declared indexes
+// execute as one unit before the table can carry traffic, then converge cleanly.
+func TestEngineApplyGreenfieldCreateSet(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "create_set_test")
+	desired := "CREATE TABLE widgets (id bigint PRIMARY KEY, name text); CREATE UNIQUE INDEX widgets_name_key ON widgets (name); CREATE INDEX widgets_id_idx ON widgets (id);"
+	planRequest := &engine.PlanRequest{
+		Database:    "create_set_test",
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{"widgets.sql": desired}}},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	eng := New()
+	plan, err := eng.Plan(t.Context(), planRequest)
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 1)
+	change := plan.Changes[0].TableChanges[0]
+	assert.Empty(t, change.ExecutionMode)
+	assert.Contains(t, change.DDL, ";\nCREATE UNIQUE INDEX widgets_name_key")
+	assert.Contains(t, change.DDL, ";\nCREATE INDEX widgets_id_idx")
+
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets", change.DDL))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+	assert.Equal(t, "3", progress.Metadata["step"], "a completed create set reports its last step, not the first")
+	assert.Equal(t, "3", progress.Metadata["steps_total"])
+	assert.Contains(t, progress.Metadata["statement"], "CREATE INDEX widgets_id_idx")
+
+	rows, err := db.QueryContext(t.Context(), "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND tablename = 'widgets' ORDER BY indexname")
+	require.NoError(t, err)
+	defer utils.CloseAndLog(rows)
+	var indexes []string
+	for rows.Next() {
+		var index string
+		require.NoError(t, rows.Scan(&index))
+		indexes = append(indexes, index)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []string{"widgets_id_idx", "widgets_name_key", "widgets_pkey"}, indexes)
+
+	converged, err := eng.Plan(t.Context(), planRequest)
+	require.NoError(t, err)
+	assert.True(t, converged.NoChanges)
+}
+
+// TestEngineApplyCreateSetDuplicateNameRefusal proves name ownership across the
+// table and index declarations is validated before any object is created.
+func TestEngineApplyCreateSetDuplicateNameRefusal(t *testing.T) {
+	dsn, _ := testutil.StartPostgres(t, "duplicate_create_name_test")
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id int PRIMARY KEY);\nCREATE INDEX widgets_pkey ON public.widgets (id)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.Equal(t, `the create set for "widgets" claims the same relation name twice; rename the index or constraint that repeats it in the schema file, then re-plan against the current schema`, progress.ErrorMessage)
+}
+
 // TestEngineApplyCreateCollisionRefusal proves a CREATE TABLE whose name is
-// already occupied on the target is a permanent refusal directing a re-plan —
-// the apply must never guess whether the occupying relation is the desired
-// one — not a retryable failure.
+// already occupied on the target is a permanent refusal whose detail names
+// the kinds of name in play and ends on the collision remedy — the apply must
+// never guess whether the occupying relation is the desired one — not a
+// retryable failure.
 func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	dsn, db := testutil.StartPostgres(t, "collision_test")
 	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.widgets (id bigint PRIMARY KEY)")
@@ -253,8 +1582,36 @@ func TestEngineApplyCreateCollisionRefusal(t *testing.T) {
 	progress := awaitPostgresProgress(t, eng, "widgets")
 	assert.Equal(t, engine.StateFailed, progress.State)
 	assert.Equal(t, "refused", progress.Metadata["phase"])
-	assert.False(t, progress.Retryable, "a collision refusal is permanent until a re-plan; the drive must not offer a retry")
-	assert.Contains(t, progress.ErrorMessage, "re-plan")
+	assert.False(t, progress.Retryable, "a collision refusal is permanent until the name conflict is resolved; the drive must not offer a retry")
+	assert.Equal(t, `a name the create set for "widgets" needs is already occupied (table, view, index, or sequence); re-plan, and if it recurs drop or rename the occupant or give the constraint, index, or sequence another name`, progress.ErrorMessage)
+}
+
+// TestEngineApplyCreateSetCommittedPrefixNotRetryable proves a create set
+// that fails after its CREATE TABLE committed is published as a failure the
+// drive must not retry: the table now exists, so a retry can only land on a
+// collision refusal for a state the operator did not author. The second
+// statement fails on the server because its operator class does not accept
+// the column's type — a shape the desired-schema parse admits, so nothing
+// refuses it before the first step commits.
+func TestEngineApplyCreateSetCommittedPrefixNotRetryable(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "committed_prefix_test")
+
+	eng := New()
+	_, err := eng.Apply(t.Context(), applyRequest(dsn, "widgets",
+		"CREATE TABLE public.widgets (id bigint PRIMARY KEY, name integer);\nCREATE INDEX widgets_name_idx ON public.widgets (name text_pattern_ops)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "widgets")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "the CREATE TABLE committed; a retry cannot succeed, so the drive must not offer one")
+	assert.Equal(t, `step 2 of 2 failed after the CREATE TABLE for "widgets" committed; re-plan against the current schema`, progress.ErrorMessage)
+	assert.Equal(t, "2", progress.Metadata["step"], "the position names the step that failed")
+	assert.Equal(t, "2", progress.Metadata["steps_total"])
+	assert.Contains(t, progress.Metadata["statement"], "CREATE INDEX widgets_name_idx")
+
+	var exists bool
+	require.NoError(t, db.QueryRowContext(t.Context(), "SELECT to_regclass('public.widgets') IS NOT NULL").Scan(&exists))
+	assert.True(t, exists, "the committed CREATE TABLE stays for the next plan to reconcile")
 }
 
 // TestEngineApplyCreateIfNotExistsRefusal proves a CREATE TABLE carrying
@@ -333,6 +1690,37 @@ func TestEngineApplyTableSizeRefusal(t *testing.T) {
 	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
 }
 
+// TestEngineApplyOversizedTableUsesKindSpecificBounds proves a concurrent
+// index build completes under its duration envelope on a table above the
+// rewrite ceiling, while a native ALTER on that table remains refused.
+func TestEngineApplyOversizedTableUsesKindSpecificBounds(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "oversized_kind_bounds_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+
+	eng := NewWithOptions(1, postgresApplyDeadline)
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = 'public.users_email_idx'::regclass`).Scan(&valid)
+	require.NoError(t, err)
+	assert.True(t, valid)
+
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users", "ALTER TABLE public.users ADD COLUMN nickname text"))
+	require.NoError(t, err)
+	progress = awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable)
+	assert.Contains(t, progress.ErrorMessage, "1-byte threshold")
+}
+
 // TestEngineApplyOperationalFailure proves an execution-path error — here an
 // unreachable target — remains a failed operation rather than being
 // misclassified as a safety refusal.
@@ -402,6 +1790,590 @@ func TestEngineApplyRefusesNonNativeShape(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not execute this statement shape yet")
 }
 
+// TestEngineApplyConcurrentIndexBuild proves a CREATE INDEX CONCURRENTLY
+// routes to the dedicated concurrent-build executor and completes: the
+// statement must never reach the transactional optimistic executor, whose
+// transaction block PostgreSQL refuses, and the built index must be valid
+// on the target when the drive reports completion.
+func TestEngineApplyConcurrentIndexBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "index_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+
+	eng := New()
+	result, err := eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	progress := awaitPostgresProgress(t, eng, "users")
+	assert.Equal(t, engine.StateCompleted, progress.State)
+	assert.Equal(t, 100, progress.Progress)
+	assert.Equal(t, "completed", progress.Metadata["phase"])
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = 'public.users_email_idx'::regclass`).Scan(&valid)
+	require.NoError(t, err)
+	assert.True(t, valid, "the built index must be catalog-valid, not merely present")
+}
+
+// An operator cancel signals a concurrent build parked behind an open writer,
+// removes the invalid catalog entry under its bounded cleanup envelope, and
+// settles the apply as cancelled with no debris for the next drive.
+func TestEngineCancelConcurrentIndexBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "cancel_index_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var invalid bool
+		err := db.QueryRowContext(t.Context(), `SELECT NOT indisvalid FROM pg_index WHERE indexrelid = to_regclass('public.orders_ref_idx')`).Scan(&invalid)
+		return err == nil && invalid
+	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked after creating its invalid catalog entry")
+
+	type cancelAnswer struct {
+		result *engine.ControlResult
+		err    error
+	}
+	answered := make(chan cancelAnswer, 1)
+	go func() {
+		result, cancelErr := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+		answered <- cancelAnswer{result: result, err: cancelErr}
+	}()
+	// The cleanup proves abandonment with a table lock. Release the writer
+	// once the cancellation has ended the builder so that proof can proceed.
+	require.Eventually(t, func() bool {
+		var builders int
+		err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'CREATE INDEX CONCURRENTLY orders_ref_idx%' AND state <> 'idle'`).Scan(&builders)
+		return err == nil && builders == 0
+	}, postgresApplyDeadline, 10*time.Millisecond, "the cancelled build backend did not exit")
+	writer.release(t)
+	answer := <-answered
+	require.NoError(t, answer.err)
+	assert.True(t, answer.result.Accepted)
+
+	got := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCancelled, got.State)
+	assert.Contains(t, got.ErrorMessage, `"public"."orders_ref_idx" was removed`)
+	var exists bool
+	err = db.QueryRowContext(t.Context(), `SELECT to_regclass('public.orders_ref_idx') IS NOT NULL`).Scan(&exists)
+	require.NoError(t, err)
+	assert.False(t, exists, "operator cancellation must not leave an invalid index")
+}
+
+// An operator cancel during a recovery build removes both the pre-existing
+// debris and the recovery build's own invalid index before settling cancelled.
+func TestEngineCancelConcurrentIndexRecoveryBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "cancel_index_recovery_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text);
+		INSERT INTO public.orders (id, ref) SELECT n, 'ref-' || n FROM generate_series(2, 200001) AS n;
+		CREATE INDEX orders_ref_idx ON public.orders (ref);
+		UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass`)
+	require.NoError(t, err)
+	var seededOID uint32
+	err = db.QueryRowContext(t.Context(), `SELECT 'public.orders_ref_idx'::regclass::oid`).Scan(&seededOID)
+	require.NoError(t, err)
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		var invalid bool
+		var currentOID uint32
+		err := db.QueryRowContext(t.Context(), `SELECT NOT indisvalid, indexrelid FROM pg_index WHERE indexrelid = to_regclass('public.orders_ref_idx')`).Scan(&invalid, &currentOID)
+		return err == nil && invalid && currentOID != seededOID
+	}, postgresApplyDeadline, 10*time.Millisecond, "the recovery build never parked after replacing the seeded debris")
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	type cancelAnswer struct {
+		result *engine.ControlResult
+		err    error
+	}
+	answered := make(chan cancelAnswer, 1)
+	go func() {
+		result, cancelErr := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+		answered <- cancelAnswer{result: result, err: cancelErr}
+	}()
+	require.Eventually(t, func() bool {
+		var builders int
+		err := db.QueryRowContext(t.Context(), `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND query LIKE 'CREATE INDEX CONCURRENTLY orders_ref_idx%' AND state <> 'idle'`).Scan(&builders)
+		return err == nil && builders == 0
+	}, postgresApplyDeadline, 10*time.Millisecond, "the cancelled recovery build backend did not exit")
+	writer.release(t)
+	answer := <-answered
+	require.NoError(t, answer.err)
+	assert.True(t, answer.result.Accepted)
+
+	got := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCancelled, got.State)
+	assert.Contains(t, got.ErrorMessage, `"public"."orders_ref_idx" was removed`)
+	assertIndexAbsentWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
+// TestEngineCancelConcurrentIndexBuildWithoutABackendSignal proves the cancel
+// of last resort against a live build. With activity tracking off on the
+// target the server reports every backend's state as disabled, so the
+// tracker cannot tell the parked build from an idle backend and sends no
+// signal; the engine ends the drive's own context instead. That must still
+// stop the statement on the server: the cancel settles while the writer the
+// build is waiting on is still open, so nothing but the context ended the
+// build, and the operator is answered with a cancelled apply whose leftover
+// identity remains explicit for recovery.
+func TestEngineCancelConcurrentIndexBuildWithoutABackendSignal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "cancel_fallback_test")
+	_, err := db.ExecContext(t.Context(), "ALTER DATABASE cancel_fallback_test SET track_activities = off")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	// Tracking off leaves the build's query text unrecorded, so the parked
+	// builder is found through the lock it waits on — the writer's virtual
+	// transaction — rather than through what it is running.
+	var builderPID int
+	var builderState sql.NullString
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(t.Context(), `
+			SELECT a.pid, a.state
+			FROM pg_locks l
+			JOIN pg_stat_activity a ON a.pid = l.pid
+			JOIN pg_index i ON i.indexrelid = to_regclass('public.orders_ref_idx')
+			WHERE a.datname = current_database() AND l.locktype = 'virtualxid' AND NOT l.granted AND NOT i.indisvalid`).Scan(&builderPID, &builderState)
+		return err == nil
+	}, postgresApplyDeadline, 10*time.Millisecond, "the build never parked behind the writer after creating its invalid catalog entry")
+	require.Equal(t, "disabled", builderState.String, "the server must hide the builder's state, or the tracker signals it and the context path is not what settles the cancel")
+
+	result, err := eng.Cancel(t.Context(), cancelRequestFor("orders"))
+	require.NoError(t, err)
+	assert.True(t, result.Accepted)
+	assert.Equal(t, "Concurrent index build cancelled", result.Message)
+
+	got := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCancelled, got.State, "progress: %+v", got)
+	assert.Equal(t, "cancelled", got.Metadata["phase"])
+	assert.Equal(t, `index "public"."orders_ref_idx" may be invalid but its catalog state could not be verified; inspect pg_index.indisvalid on the target before any recovery, then retry`, got.ErrorMessage)
+	assertBackendGone(t, db, builderPID)
+
+	writer.release(t)
+	assertIndexInvalid(t, db, "orders_ref_idx")
+}
+
+// TestEngineApplyConcurrentIndexBoundEndsTheBuild proves the configured
+// bound is what governs a concurrent build on the target: a build that
+// cannot finish inside it is ended by the server, the apply fails, and the
+// operator detail names the option and the bound the build ran past, so the
+// operator's next step is to raise it. Whether the cancelled build left its
+// own invalid index behind (retryable, the retry recovers it) or nothing at
+// all (refused, since retrying unchanged spends the same bound again)
+// depends on how far the build got before the timer fired; both surfaces
+// carry the option, so the assertion holds on either.
+func TestEngineApplyConcurrentIndexBoundEndsTheBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "index_bound_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.users (id bigint PRIMARY KEY, email text)")
+	require.NoError(t, err)
+	// Enough rows that the build's table scans outlast the bound on any
+	// machine; an empty table could finish inside it and report completion.
+	_, err = db.ExecContext(t.Context(),
+		"INSERT INTO public.users (id, email) SELECT n, 'user-' || n || '@example.com' FROM generate_series(1, 200000) AS n")
+	require.NoError(t, err)
+
+	bound := time.Millisecond
+	eng := NewWithOptions(0, bound)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "users",
+		"CREATE INDEX CONCURRENTLY users_email_idx ON public.users (email)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "users")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Contains(t, progress.ErrorMessage, "postgres.concurrent_index_max_duration (1ms)")
+	assert.Contains(t, progress.ErrorMessage, "raise postgres.concurrent_index_max_duration")
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT coalesce(bool_and(i.indisvalid), false) FROM pg_index i WHERE i.indexrelid = to_regclass('public.users_email_idx')`).Scan(&valid)
+	require.NoError(t, err)
+	assert.False(t, valid, "a build the bound ended must not leave a valid index the drive reported as failed")
+}
+
+// TestEngineApplyPartitionedParentConcurrentIndexRefusal proves the
+// partition admission policy runs at apply time: a concurrent build against
+// a partitioned parent is permanently refused with the typed fixed-sentence
+// detail, never attempted as a raw statement the server would fail.
+func TestEngineApplyPartitionedParentConcurrentIndexRefusal(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "partition_test")
+	_, err := db.ExecContext(t.Context(),
+		"CREATE TABLE public.events (id bigint, created date) PARTITION BY RANGE (created)")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "events",
+		"CREATE INDEX CONCURRENTLY events_created_idx ON public.events (created)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "events")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a partitioned-parent refusal is permanent until the plan or target changes")
+	assert.Contains(t, progress.ErrorMessage, "cannot build parent-level indexes concurrently")
+}
+
+// TestEngineApplyConcurrentIndexRecoversAbandonedInvalid proves an abandoned
+// invalid index already occupying the target name — on the target table,
+// with no backend building it — is recovered inside the apply, not handed to
+// an operator: the drive removes the proven-abandoned entry, builds the
+// index, and reports completion only with the index valid and no quarantine
+// debris left on the table. This is the state a re-driven apply meets after
+// an earlier build died mid-flight, so it must converge on its own.
+func TestEngineApplyConcurrentIndexRecoversAbandonedInvalid(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "invalid_index_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE INDEX orders_ref_idx ON public.orders (ref)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "completed", progress.Metadata["phase"])
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
+// TestEngineApplyConcurrentIndexOutlivesFixedApplyCeiling proves a concurrent
+// index build keeps its configured build envelope while an ordinary statement
+// remains bounded by the fixed apply ceiling. While parked behind a writer,
+// the build remains running past that ceiling and exposes its current executor
+// position; after the writer releases, it completes with a valid index.
+//
+// The ceiling is shortened so the build can be observed past twice its
+// length inside the shared poll deadline; that coupling is the constraint on
+// its value. Its relationship to the lock timeout is not: the executor
+// retries a lost lock budget, so a budget verdict cannot surface before
+// several lock timeouts have elapsed, and any ceiling short enough to be
+// observed here ends the ordinary statement first. Its failure therefore
+// carries the generic detail, which is what tells the ceiling apart from a
+// lock budget — the two are otherwise published identically.
+func TestEngineApplyConcurrentIndexOutlivesFixedApplyCeiling(t *testing.T) {
+	const fixedCeiling = 2 * time.Second
+	require.Less(t, 2*fixedCeiling, postgresApplyDeadline,
+		"the build must be observable past twice the ceiling inside the poll deadline")
+	dsn, db := testutil.StartPostgres(t, "long_index_build_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text);
+		CREATE TABLE public.accounts (id bigint PRIMARY KEY)`)
+	require.NoError(t, err)
+
+	// parkWriter opens a transaction holding a row lock on the table so a
+	// build or statement against it waits. The cleanup rolls the writer back
+	// before closing its connection — closing a connection waits for its
+	// open transaction, so a failed assertion must not leave the writer
+	// parked or the container teardown would hang behind it.
+	parkWriter := func(table string) *sql.Tx {
+		conn, connErr := db.Conn(t.Context())
+		require.NoError(t, connErr)
+		tx, txErr := conn.BeginTx(t.Context(), nil)
+		require.NoError(t, txErr)
+		t.Cleanup(func() {
+			if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+				t.Errorf("roll back writer transaction on %s: %v", table, err)
+			}
+			utils.CloseAndLog(conn)
+		})
+		_, execErr := tx.ExecContext(t.Context(), "INSERT INTO public."+table+" (id) VALUES (1)")
+		require.NoError(t, execErr)
+		return tx
+	}
+
+	writerTx := parkWriter("orders")
+	eng := New()
+	eng.optimisticApplyCeiling = fixedCeiling
+	statement := "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+
+	started := time.Now()
+	var midBuild *engine.ProgressResult
+	require.Eventually(t, func() bool {
+		midBuild, err = eng.Progress(t.Context(), progressRequestFor("orders"))
+		if err != nil || midBuild.State != engine.StateRunning {
+			return false
+		}
+		var valid bool
+		catalogErr := db.QueryRowContext(t.Context(),
+			`SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass('public.orders_ref_idx')`).Scan(&valid)
+		return catalogErr == nil && !valid && time.Since(started) >= 2*fixedCeiling
+	}, postgresApplyDeadline, 10*time.Millisecond,
+		"concurrent index build did not remain running past the fixed apply ceiling")
+	// The statement text is the one position key the accepted record does
+	// not seed: a single-statement apply already carries step 1 of 1 before
+	// the executor reports anything, so only the statement proves the
+	// executor tracker is the source of the mid-build position.
+	assert.Equal(t, statement, midBuild.Metadata["statement"],
+		"the mid-build position must come from the executor tracker, not the accept-time seed")
+	require.NoError(t, writerTx.Rollback())
+
+	completed := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCompleted, completed.State, "progress: %+v", completed)
+	assert.Equal(t, "completed", completed.Metadata["phase"])
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+
+	ordinaryWriterTx := parkWriter("accounts")
+	ordinaryStarted := time.Now()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "accounts",
+		"ALTER TABLE public.accounts ADD COLUMN email text"))
+	require.NoError(t, err)
+	failed := awaitPostgresProgress(t, eng, "accounts")
+	assert.GreaterOrEqual(t, time.Since(ordinaryStarted), fixedCeiling)
+	assert.Equal(t, engine.StateFailed, failed.State)
+	assert.Equal(t, "failed", failed.Metadata["phase"])
+	assert.True(t, failed.Retryable)
+	assert.Equal(t, "PostgreSQL schema change failed; see server logs", failed.ErrorMessage)
+	require.NoError(t, ordinaryWriterTx.Rollback())
+}
+
+// TestEngineApplyConcurrentIndexRedriveAfterKilledBuild proves the
+// convergence a crashed drive depends on. A concurrent build whose backend
+// is killed after the catalog entry commits leaves its own invalid index
+// under the requested name; that drive fails retryable, naming the index.
+// Re-applying the same statement — what the next drive does — must find the
+// leftover, prove it abandoned, remove it, and build the index to a valid
+// state, with nothing left behind for an operator.
+func TestEngineApplyConcurrentIndexRedriveAfterKilledBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "killed_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+
+	// An open writer holds a lock the build must wait for after it commits
+	// its invalid catalog entry, so the build is parked at a point where
+	// killing it provably leaves that entry behind.
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	eng := New()
+	statement := "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+
+	builderPID := awaitParkedBuilder(t, db, "orders_ref_idx")
+	// The bounded form waits for the backend to exit, so the writer's
+	// rollback below cannot race a builder that has not gone yet.
+	var terminated bool
+	err = db.QueryRowContext(t.Context(), "SELECT pg_terminate_backend($1, 5000)", builderPID).Scan(&terminated)
+	require.NoError(t, err)
+	require.True(t, terminated, "the build backend must be gone before the writer releases its lock")
+	writer.release(t)
+
+	progress := awaitPostgresProgress(t, eng, "orders")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "a killed build's leftover is operational; the drive must offer the retry")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
+	assert.Contains(t, progress.ErrorMessage, "invalid index")
+
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+	progress = awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "completed", progress.Metadata["phase"])
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
+// TestEngineHaltForShutdownEndsAParkedConcurrentBuild proves a shutdown halt
+// brings a live concurrent build down on the server and leaves the apply for
+// the next driver. The build is parked behind an open writer, so the halt
+// returning within its bound while the writer is still open shows the
+// drive's context — not the lock release — ended the statement. The halt
+// records no cancel: the drive publishes the failure its leftover index
+// describes, retryable, and re-driving the same statement recovers that
+// leftover and completes the index.
+func TestEngineHaltForShutdownEndsAParkedConcurrentBuild(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "halt_build_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	writer := holdOrdersWriter(t, db)
+	defer writer.release(t)
+
+	eng := New()
+	statement := "CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+	builderPID := awaitParkedBuilder(t, db, "orders_ref_idx")
+
+	haltCtx, cancelHalt := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancelHalt()
+	require.NoError(t, eng.HaltForShutdown(haltCtx), "the halt must bring the parked build down while the writer still holds its lock")
+
+	progress, err := eng.Progress(t.Context(), progressRequestFor("orders"))
+	require.NoError(t, err)
+	require.Equal(t, engine.StateFailed, progress.State, "a halt is not an operator cancel; progress: %+v", progress)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "the halted build's leftover is operational; the next driver recovers it")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
+	assert.Contains(t, progress.ErrorMessage, "invalid index")
+	assertBackendGone(t, db, builderPID)
+	assertIndexInvalid(t, db, "orders_ref_idx")
+
+	writer.release(t)
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders", statement))
+	require.NoError(t, err)
+	progress = awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateCompleted, progress.State, "progress: %+v", progress)
+	assertIndexValidWithoutDebris(t, db, "orders", "orders_ref_idx")
+}
+
+// TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion proves a
+// recovery that clears the abandoned entry but whose build then fails
+// reports the failure, never a completion: the abandoned invalid index is
+// removed, the unique build fails on duplicate rows and leaves its own
+// invalid index under the name, and the apply fails retryable naming that
+// index — while the catalog still shows it invalid, the state a completion
+// would have misreported as the index the schema declares.
+func TestEngineApplyConcurrentIndexRecoveryFailureIsNotCompletion(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "recovery_failure_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'ref-collision'), (2, 'ref-collision')")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE INDEX orders_ref_key ON public.orders (ref)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_key'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE UNIQUE INDEX CONCURRENTLY orders_ref_key ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	require.Equal(t, engine.StateFailed, progress.State, "progress: %+v", progress)
+	assert.Equal(t, "failed", progress.Metadata["phase"])
+	assert.True(t, progress.Retryable, "a build that fails after the recovery is operational; the drive must offer the retry")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_key")
+	assert.Contains(t, progress.ErrorMessage, "invalid index")
+	assert.NotContains(t, progress.ErrorMessage, "ref-collision", "the server's unique-violation text never reaches the operator surface")
+
+	var valid bool
+	err = db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass('public.orders_ref_key')`).Scan(&valid)
+	require.NoError(t, err)
+	assert.False(t, valid, "the failed unique build leaves its own invalid index under the name")
+}
+
+// assertIndexValidWithoutDebris checks the named index on public.<table> is
+// catalog-valid and that the recovery left no quarantined entry on the table:
+// a completed report must mean the index the schema declares, and only it.
+// The debris pattern is the quarantine name pg-sprite's recovery gives an
+// entry before dropping it; pg-sprite does not export it, so the literal is
+// pinned here and a rename upstream would make this assertion pass
+// vacuously — the recovery tests' completed state would still hold, but the
+// no-debris half would no longer be proven.
+func assertIndexValidWithoutDebris(t *testing.T, db *sql.DB, table, index string) {
+	t.Helper()
+	var valid bool
+	err := db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)`, "public."+index).Scan(&valid)
+	require.NoError(t, err)
+	assert.True(t, valid, "the built index must be catalog-valid, not merely present")
+
+	var debris int
+	err = db.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass($1) AND c.relname LIKE 'pgsprite\_abandoned\_%'`, "public."+table).Scan(&debris)
+	require.NoError(t, err)
+	assert.Zero(t, debris, "the recovery must not leave quarantined entries on the table")
+}
+
+func assertIndexAbsentWithoutDebris(t *testing.T, db *sql.DB, table, index string) {
+	t.Helper()
+	var indexes int
+	err := db.QueryRowContext(t.Context(), `
+		SELECT count(*) FROM pg_index i
+		JOIN pg_class c ON c.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass($1) AND (c.relname = $2 OR c.relname LIKE 'pgsprite\_abandoned\_%')`,
+		"public."+table, index).Scan(&indexes)
+	require.NoError(t, err)
+	assert.Zero(t, indexes, "the cancelled build must leave neither its requested index nor quarantined debris")
+}
+
+// TestEngineApplyConcurrentIndexOnOtherTableRefused proves an invalid index
+// holding the requested name on a different table in the schema is a
+// permanent refusal, not a retry: this change can never clear another table's
+// entry, so the detail names both the index and the table it sits on and
+// sends the author back to the schema file.
+func TestEngineApplyConcurrentIndexOnOtherTableRefused(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "invalid_index_other_table_test")
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE public.shipments (id bigint PRIMARY KEY, ref text)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE INDEX orders_ref_idx ON public.shipments (ref)")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "another table's invalid index is permanent until the plan or target changes")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
+	assert.Contains(t, progress.ErrorMessage, `"shipments"`)
+	assert.Contains(t, progress.ErrorMessage, "re-plan")
+	assert.NotContains(t, progress.ErrorMessage, "retry removes it")
+	assert.NotContains(t, progress.ErrorMessage, "drop")
+}
+
+// TestEngineApplyConcurrentIndexBackingConstraintRefused proves an invalid
+// index holding the requested name on the target table but backing a
+// constraint is a permanent refusal, not a retry: the server will not drop a
+// constraint's index concurrently, so no recovery this change can run clears
+// the name. The detail names the index, leaves it to an operator, and never
+// tells anyone to drop it.
+func TestEngineApplyConcurrentIndexBackingConstraintRefused(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "invalid_index_constraint_test")
+	_, err := db.ExecContext(t.Context(),
+		"CREATE TABLE public.orders (id bigint PRIMARY KEY, ref text, CONSTRAINT orders_ref_idx UNIQUE (ref))")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(),
+		"UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'public.orders_ref_idx'::regclass")
+	require.NoError(t, err)
+
+	eng := New()
+	_, err = eng.Apply(t.Context(), applyRequest(dsn, "orders",
+		"CREATE INDEX CONCURRENTLY orders_ref_idx ON public.orders (ref)"))
+	require.NoError(t, err)
+	progress := awaitPostgresProgress(t, eng, "orders")
+	assert.Equal(t, engine.StateFailed, progress.State)
+	assert.Equal(t, "refused", progress.Metadata["phase"])
+	assert.False(t, progress.Retryable, "a constraint's invalid index is permanent until an operator resolves it or the plan changes")
+	assert.Contains(t, progress.ErrorMessage, "orders_ref_idx")
+	assert.Contains(t, progress.ErrorMessage, "constraint's index")
+	assert.Contains(t, progress.ErrorMessage, "an operator must resolve it")
+	assert.NotContains(t, progress.ErrorMessage, "retry removes it")
+	assert.NotContains(t, progress.ErrorMessage, "drop")
+}
+
 // applyRequest builds a single-statement apply request with the same identity
 // shape the drive layer uses: the task identifier stamped into
 // ResumeState.MigrationContext keys the engine's progress to this apply.
@@ -425,6 +2397,87 @@ func progressRequestFor(table string) *engine.ProgressRequest {
 	return &engine.ProgressRequest{ResumeState: &engine.ResumeState{MigrationContext: applyTaskID(table)}}
 }
 
+func cancelRequestFor(table string) *engine.ControlRequest {
+	return &engine.ControlRequest{ResumeState: &engine.ResumeState{MigrationContext: applyTaskID(table)}}
+}
+
+// heldWriter is an open transaction with an uncommitted row write on
+// public.orders. A concurrent index build on the table commits its invalid
+// catalog entry and then waits for this transaction to finish, so the build
+// is parked at a point where ending it provably leaves that entry behind.
+type heldWriter struct {
+	conn     *sql.Conn
+	tx       *sql.Tx
+	released sync.Once
+}
+
+// holdOrdersWriter opens the writer. Tests call release at the point the
+// build should be let go and also defer it, so an assertion failing earlier
+// still frees the lock. The deferred call must be a defer, not a t.Cleanup:
+// closing the conn waits for its open transaction to finish, so the
+// rollback has to run before the conn closes or a failing test would hang.
+func holdOrdersWriter(t *testing.T, db *sql.DB) *heldWriter {
+	t.Helper()
+	conn, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	tx, err := conn.BeginTx(t.Context(), nil)
+	require.NoError(t, err)
+	_, err = tx.ExecContext(t.Context(), "INSERT INTO public.orders (id, ref) VALUES (1, 'held')")
+	require.NoError(t, err)
+	return &heldWriter{conn: conn, tx: tx}
+}
+
+// release rolls the transaction back and closes its conn. The second call —
+// the deferred one after an explicit release — is a no-op, so the conn is
+// closed by exactly one owner.
+func (w *heldWriter) release(t *testing.T) {
+	t.Helper()
+	w.released.Do(func() {
+		assert.NoError(t, w.tx.Rollback(), "roll back writer transaction")
+		utils.CloseAndLog(w.conn)
+	})
+}
+
+// awaitParkedBuilder waits for a concurrent build of index to have committed
+// its invalid catalog entry and be parked, and returns its backend PID.
+func awaitParkedBuilder(t *testing.T, db *sql.DB, index string) int {
+	t.Helper()
+	var builderPID int
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(t.Context(), `
+			SELECT a.pid
+			FROM pg_stat_activity a
+			JOIN pg_index i ON i.indexrelid = to_regclass($1)
+			WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+			  AND a.query LIKE 'CREATE INDEX CONCURRENTLY%' AND a.state <> 'idle' AND NOT i.indisvalid`, "public."+index).Scan(&builderPID)
+		return err == nil
+	}, postgresApplyDeadline, 10*time.Millisecond, "the build never committed its invalid catalog entry while parked behind the writer")
+	return builderPID
+}
+
+// assertBackendGone waits for the server to have no backend under pid: the
+// statement it ran is over and its session is closed.
+func assertBackendGone(t *testing.T, db *sql.DB, pid int) {
+	t.Helper()
+	assert.Eventually(t, func() bool {
+		var present bool
+		err := db.QueryRowContext(t.Context(), `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)`, pid).Scan(&present)
+		return err == nil && !present
+	}, postgresApplyDeadline, 10*time.Millisecond, "backend %d is still on the server", pid)
+}
+
+// assertIndexInvalid asserts the index exists in public and is marked invalid:
+// the leftover a build that was ended after committing its catalog entry
+// leaves for the next drive to recover.
+func assertIndexInvalid(t *testing.T, db *sql.DB, index string) {
+	t.Helper()
+	var valid sql.NullBool
+	err := db.QueryRowContext(t.Context(),
+		`SELECT i.indisvalid FROM pg_index i WHERE i.indexrelid = to_regclass($1)`, "public."+index).Scan(&valid)
+	require.NoError(t, err, "index public.%s must still exist", index)
+	assert.False(t, valid.Bool, "the ended build's index entry must be invalid, not completed behind the cancel")
+}
+
 func awaitPostgresProgress(t *testing.T, eng *Engine, table string) *engine.ProgressResult {
 	t.Helper()
 	var result *engine.ProgressResult
@@ -438,4 +2491,95 @@ func awaitPostgresProgress(t *testing.T, eng *Engine, table string) *engine.Prog
 	}, postgresApplyDeadline, 10*time.Millisecond)
 	require.True(t, finished, "PostgreSQL apply did not finish; last progress: %+v", result)
 	return result
+}
+
+// TestEnginePullSchemaLintsRenderedTables proves the PostgreSQL pull audit
+// runs over the schema exactly as the engine renders it — one CREATE TABLE
+// followed by that table's CREATE INDEX statements — and reports an integer
+// primary key, a float column, and a mixed-case table name as warnings while a
+// well-shaped table audits clean.
+func TestEnginePullSchemaLintsRenderedTables(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "pull_lint_test")
+	_, err := db.ExecContext(t.Context(), `
+		CREATE SCHEMA app;
+		CREATE TABLE app.accounts (id bigint PRIMARY KEY, balance bigint NOT NULL);
+		CREATE INDEX accounts_balance_idx ON app.accounts (balance);
+		CREATE TABLE app.legacy_orders (id integer PRIMARY KEY, weight real);
+		CREATE INDEX legacy_orders_weight_idx ON app.legacy_orders (weight);
+		CREATE TABLE app.sessions (token char(36) PRIMARY KEY, account_id bigint NOT NULL, seen_at timestamptz);
+		CREATE INDEX sessions_account_idx ON app.sessions (account_id);
+		CREATE INDEX sessions_account_seen_idx ON app.sessions (account_id, seen_at);
+		CREATE TABLE app."Events" (id uuid PRIMARY KEY, payload jsonb)`)
+	require.NoError(t, err)
+
+	eng := NewForTarget(0, 0, "pull_lint_test", &engine.Credentials{DSN: dsn})
+	response, err := eng.PullSchema(t.Context(), &ternv1.PullSchemaRequest{
+		Database: "pull_lint_test", Type: "postgres", Environment: "test", Namespace: "app",
+	})
+	require.NoError(t, err)
+	require.Len(t, response.Namespaces["app"].Tables, 4)
+
+	results, err := lint.New().LintPostgresSchema(response.Namespaces["app"].Tables)
+	require.NoError(t, err)
+	assert.Equal(t, []lint.Result{
+		{Table: "Events", Linter: "name_case", Severity: "warning", Message: `table name "Events" is not lowercase`},
+		{Table: "legacy_orders", Column: "id", Linter: "primary_key", Severity: "warning", Message: `Primary key column "id" in table "legacy_orders" uses "integer"; allowed types: bigint, uuid`},
+		{Table: "legacy_orders", Column: "weight", Linter: "has_float", Severity: "warning", Message: `Column "weight" in table "legacy_orders" uses "real" data type`},
+		{Table: "sessions", Linter: "redundant_indexes", Severity: "warning", Message: `Index "sessions_account_idx" on column "account_id" is redundant - covered by index "sessions_account_seen_idx" on columns ("account_id", "seen_at")`},
+		{Table: "sessions", Column: "token", Linter: "primary_key", Severity: "warning", Message: `Primary key column "token" in table "sessions" uses "character(36)"; allowed types: bigint, uuid`},
+	}, results)
+}
+
+// RLS namespaces remain rollback-incapable until complete security definitions
+// can be executed during recovery. Never drop policies from a partial baseline.
+func TestCaptureOriginalFilesWithRowSecurity(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "capture_rls")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+ `)
+	require.NoError(t, err)
+	pool, err := pgxpool.New(ctx, dsn)
+	require.NoError(t, err)
+	defer pool.Close()
+	files, captured, err := captureOriginalFiles(ctx, pool, "capture_rls", "public", nil, engine.IgnoredTables{})
+	require.NoError(t, err)
+	assert.False(t, captured)
+	assert.Nil(t, files)
+}
+
+// Forward structural planning remains available for RLS tables and siblings.
+func TestEngineForwardPlanWithRowSecurity(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "forward_rls")
+	ctx, cancel := context.WithTimeout(t.Context(), postgresApplyDeadline)
+	defer cancel()
+	_, err := db.ExecContext(ctx, `
+  CREATE TABLE public.documents (id bigint PRIMARY KEY);
+  ALTER TABLE public.documents ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY readers ON public.documents FOR SELECT USING (id = 1);
+  CREATE TABLE public.accounts (id bigint PRIMARY KEY);
+ `)
+	require.NoError(t, err)
+	result, err := New().Plan(ctx, &engine.PlanRequest{
+		Database: "forward_rls", Credentials: &engine.Credentials{DSN: dsn},
+		SchemaFiles: schema.SchemaFiles{"public": {Files: map[string]string{
+			"documents.sql": `CREATE TABLE documents (id bigint PRIMARY KEY, summary text);`,
+			"accounts.sql":  `CREATE TABLE accounts (id bigint PRIMARY KEY, label text);`,
+		}}},
+	})
+	require.NoError(t, err)
+	require.False(t, result.NoChanges)
+	require.Len(t, result.Changes, 1)
+	assert.False(t, result.Changes[0].OriginalFilesCaptured)
+	assert.Nil(t, result.Changes[0].OriginalFiles)
+	require.Len(t, result.Changes[0].TableChanges, 2)
+	for _, change := range result.Changes[0].TableChanges {
+		assert.Empty(t, change.ExecutionMode, change.ModeReason)
+		assert.Contains(t, change.DDL, "ADD COLUMN")
+		assert.NotContains(t, change.DDL, "POLICY")
+	}
 }

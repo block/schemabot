@@ -13,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/caller"
+	"github.com/block/schemabot/pkg/storage"
 )
 
 func TestCallPullSchemaAPI(t *testing.T) {
@@ -181,6 +183,37 @@ func TestCheckActiveSchemaChangeRequestsActiveOnly(t *testing.T) {
 	assert.Equal(t, "staging", gotEnvironment)
 }
 
+// The preflight compares the operator's flags against stored keys. Either side
+// can arrive in a different case — the flags as typed, a stored row in the
+// spelling it was written with before storage folded its keys — and the busy
+// apply must be found either way rather than the database reported idle.
+func TestCheckActiveSchemaChangeFoldsKeysBeforeComparing(t *testing.T) {
+	cases := map[string]struct {
+		stored                string
+		database, environment string
+	}{
+		"flags typed in another case":        {stored: `"database":"orders","environment":"staging"`, database: "Orders", environment: "Staging"},
+		"stored row spelled in another case": {stored: `"database":"Orders","environment":"Staging"`, database: "orders", environment: "staging"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, err := w.Write([]byte(`{"active_count":1,"limit":1000,"applies":[` +
+					`{"apply_id":"apply-busy",` + tc.stored + `,"state":"running"}]}`))
+				assert.NoError(t, err)
+			}))
+			t.Cleanup(server.Close)
+
+			active, err := CheckActiveSchemaChange(server.URL, tc.database, tc.environment)
+			require.NoError(t, err)
+			require.NotNil(t, active)
+			assert.Equal(t, "apply-busy", active.ApplyID)
+			assert.Equal(t, "running", active.State)
+		})
+	}
+}
+
 func TestReadSchemaFiles_RegularDirectories(t *testing.T) {
 	dir := t.TempDir()
 
@@ -296,7 +329,7 @@ func TestCallPlanAPI_IgnoreSoleFlatNamespace(t *testing.T) {
 	require.NoError(t, os.MkdirAll(dir, 0o755))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
 
-	_, ignored, err := CallPlanAPI("http://unreachable.invalid", "orders", "mysql", "development", dir, "", 0, []string{"orders"}, false)
+	_, ignored, err := CallPlanAPI("http://unreachable.invalid", "orders", "mysql", "development", dir, "", 0, PlanExclusions{Namespaces: []string{"orders"}}, false)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "after excluding ignored namespaces")
 	assert.Contains(t, err.Error(), "orders")
@@ -325,13 +358,39 @@ func TestCallPlanAPI_SendsIgnoredNamespaces(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, ignored, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, []string{"local_fixtures"}, false)
+	_, ignored, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{Namespaces: []string{"local_fixtures"}}, false)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"local_fixtures"}, ignored)
 	assert.Equal(t, []string{"local_fixtures"}, gotReq.IgnoredNamespaces)
 	require.Contains(t, gotReq.SchemaFiles, "payments")
 	assert.NotContains(t, gotReq.SchemaFiles, "local_fixtures")
+}
+
+// ignore_tables cannot be expressed by omission the way ignore_namespaces can
+// — the tables live on the target, not in the repository — so the entries have
+// to reach the server on the request itself or the plan proposes dropping the
+// very tables the config withholds.
+func TestCallPlanAPI_SendsIgnoreTables(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+
+	var gotReq apitypes.PlanRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&gotReq))
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0,
+		PlanExclusions{Tables: []string{"flyway_schema_history", "legacy_audit_log"}}, false)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, gotReq.IgnoreTables)
+	assert.Contains(t, gotReq.SchemaFiles, "payments",
+		"withholding a live table removes nothing from the declared schema")
 }
 
 // A plan made for an apply that will hand the engine every ALTER at once has
@@ -351,12 +410,117 @@ func TestCallPlanAPI_SendsGroupedExecution(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, true)
+	_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, true)
 	require.NoError(t, err)
 	assert.True(t, gotReq.GroupedExecution, "the grouping the apply will use reaches the server")
 
 	gotReq = apitypes.PlanRequest{}
-	_, _, err = CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, nil, false)
+	_, _, err = CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false)
 	require.NoError(t, err)
 	assert.False(t, gotReq.GroupedExecution, "a caller that has not chosen leaves the plan on the ungrouped default")
+}
+
+// The server refuses a rollout-wide plan or apply of an environment with more
+// than one member unless the caller says it reads every member's plan. Each
+// helper says so only when its caller decides it: the helpers that take the
+// statement send exactly what they are given, and every other helper says it
+// does not, so a caller that never reads the rollout is refused rather than
+// shown the primary's plan as the whole rollout's.
+func TestPlanAndApplyHelpers_SendRendersRolloutOnlyWhenTheCallerSaysSo(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "payments"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "payments", "users.sql"), []byte("CREATE TABLE users (id INT)"), 0o644))
+	files := map[string]*apitypes.SchemaFiles{"payments": {Files: map[string]string{"users.sql": "CREATE TABLE users (id INT)"}}}
+
+	var sent struct {
+		path           string
+		rendersRollout bool
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			RendersRollout bool `json:"renders_rollout"`
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		sent.path, sent.rendersRollout = r.URL.Path, body.RendersRollout
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/api/apply" {
+			require.NoError(t, json.NewEncoder(w).Encode(apitypes.ApplyResponse{Accepted: true}))
+			return
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(apitypes.PlanResponse{}))
+	}))
+	t.Cleanup(server.Close)
+
+	for _, tc := range []struct {
+		name     string
+		call     func() error
+		wantPath string
+		want     bool
+	}{
+		{"CallPlanAPI", func() error {
+			_, _, err := CallPlanAPI(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false)
+			return err
+		}, "/api/plan", false},
+		{"CallPlanAPIWithFiles", func() error {
+			_, err := CallPlanAPIWithFiles(server.URL, "orders", "mysql", "development", files, "", 0)
+			return err
+		}, "/api/plan", false},
+		{"CallPlanAPIForTarget for a caller that renders the rollout", func() error {
+			_, _, err := CallPlanAPIForTarget(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false, "", true)
+			return err
+		}, "/api/plan", true},
+		{"CallPlanAPIForTarget for a caller that does not", func() error {
+			_, _, err := CallPlanAPIForTarget(server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false, "", false)
+			return err
+		}, "/api/plan", false},
+		{"CallPlanAPIWithContext for a caller that renders the rollout", func() error {
+			_, _, err := CallPlanAPIWithContext(t.Context(), server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false, true)
+			return err
+		}, "/api/plan", true},
+		{"CallPlanAPIWithContext for a caller that does not", func() error {
+			_, _, err := CallPlanAPIWithContext(t.Context(), server.URL, "orders", "mysql", "development", dir, "", 0, PlanExclusions{}, false, false)
+			return err
+		}, "/api/plan", false},
+		{"CallApplyAPI", func() error {
+			_, err := CallApplyAPI(server.URL, "plan-1", "development", "", nil)
+			return err
+		}, "/api/apply", false},
+		{"CallApplyAPIForTarget for a caller that renders the rollout", func() error {
+			_, err := CallApplyAPIForTarget(server.URL, "plan-1", "development", "", "", true, nil)
+			return err
+		}, "/api/apply", true},
+		{"CallApplyAPIForTarget for a caller that does not", func() error {
+			_, err := CallApplyAPIForTarget(server.URL, "plan-1", "development", "", "", false, nil)
+			return err
+		}, "/api/apply", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sent.path, sent.rendersRollout = "", !tc.want
+			require.NoError(t, tc.call())
+			assert.Equal(t, tc.wantPath, sent.path)
+			assert.Equal(t, tc.want, sent.rendersRollout)
+		})
+	}
+}
+
+// A CLI owner is the ownership token the lock API matches byte-exactly against
+// the folded spelling it stored at acquire. An operator on a host whose name
+// carries uppercase characters must still recognize their own lock, so the
+// owner is generated already folded.
+func TestGenerateCLIOwnerIsCanonical(t *testing.T) {
+	t.Run("uppercase hostname and username fold", func(t *testing.T) {
+		owner := cliOwner("JDoe", "MacBook.local")
+		assert.Equal(t, "cli:jdoe@macbook.local", owner)
+		assert.Equal(t, storage.CanonicalKey(owner), owner, "owner matches the spelling the lock API stores")
+
+		user, host, ok := caller.SplitCLI(owner)
+		require.True(t, ok, "folding keeps the owner CLI-shaped")
+		assert.Equal(t, "jdoe", user)
+		assert.Equal(t, "macbook.local", host)
+	})
+
+	t.Run("generated owner is already folded", func(t *testing.T) {
+		owner := GenerateCLIOwner()
+		assert.Equal(t, storage.CanonicalKey(owner), owner)
+	})
 }

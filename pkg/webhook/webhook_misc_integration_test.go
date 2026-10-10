@@ -44,7 +44,7 @@ func TestE2EApplyCreateDualWritesApplyOperationRow(t *testing.T) {
 
 	// Seed the target so the plan produces a real DDL change.
 	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
-	db, err := sql.Open("mysql", appDSN)
+	db, err := sql.Open("block-mysql", appDSN)
 	require.NoError(t, err)
 	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
 	require.NoError(t, err)
@@ -166,4 +166,58 @@ func TestE2EWebhookMetrics(t *testing.T) {
 	require.True(t, found, "schemabot.webhook.events_total metric not found")
 	assert.True(t, observedEvents["issue_comment/created"], "expected issue_comment/created metric")
 	assert.True(t, observedEvents["pull_request/opened"], "expected pull_request/opened metric")
+}
+
+// A plan command plans the environment once, and the plan counter records it
+// once: the API that executes the plan owns the count, so the webhook that
+// asked for it adds nothing of its own.
+func TestE2EWebhookPlanCommandCountsThePlanOnce(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+
+	dbName := "webhook_plan_count_test"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	schemaFiles := map[string]string{
+		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+	setupFakeGitHubForPlan(t, mux, schemaFiles, fmt.Sprintf("database: %s\ntype: mysql\n", dbName), dbName)
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	h := NewHandler(svc, &fakeClientFactory{client: ghclient.NewInstallationClient(client, logger)}, nil, logger)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot plan -e staging", isPR: true}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	counted := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.plans.total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok, "schemabot.plans.total is not an int64 sum")
+			for _, dp := range sum.DataPoints {
+				status, _ := dp.Attributes.Value(attribute.Key("status"))
+				environment, _ := dp.Attributes.Value(attribute.Key("environment"))
+				counted[environment.AsString()+" "+status.AsString()] += dp.Value
+			}
+		}
+	}
+	assert.Equal(t, map[string]int64{"staging success": 1}, counted)
 }

@@ -440,6 +440,32 @@ func TestHandleApplyCommandBlocksUnauthorizedActorBeforePlanning(t *testing.T) {
 	assert.Contains(t, body, "@mona is not authorized")
 }
 
+// TestHandleApplyCommandResolvesMixedCaseConsumerDatabase proves that a
+// consumer schemabot.yaml declaring the database in a different case than the
+// server key still resolves to the configured database. The command reaches
+// actor authorization (and is denied for an unauthorized actor) instead of
+// being reported as an unconfigured database.
+func TestHandleApplyCommandResolvesMixedCaseConsumerDatabase(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	registerApplyDiscoveryEndpointsDeclaring(t, mux, "orders", "Orders")
+
+	comments := make(chan string, 2)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+
+	installClient := ghclient.NewInstallationClient(client, testLogger())
+	cfg := actorAuthTestConfig(true, func(cfg *api.ServerConfig) {
+		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
+	})
+	h := actorAuthTestHandler(cfg, installClient)
+
+	h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "mona", CommandResult{Action: action.Apply})
+
+	body := requireComment(t, comments, "mixed-case consumer database apply comment")
+	assert.Contains(t, body, "SchemaBot Command Not Authorized")
+	assert.Contains(t, body, "@mona is not authorized")
+	assert.NotContains(t, body, "is not configured on this server")
+}
+
 // Apply-scoped control commands are mutating PR comments, so the full webhook
 // path uses the same configured admin/operator authorization as apply before
 // recording durable operator intent.
@@ -671,8 +697,7 @@ func TestHandleUnlockCommandBlocksUnauthorizedActor(t *testing.T) {
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")
 	assert.Contains(t, body, "@mona is not authorized")
 	assert.Contains(t, body, "`schemabot unlock`")
-	assert.Empty(t, locks.forceReleased, "denied unlock must not force-release any lock")
-	assert.Empty(t, locks.released, "denied unlock must not release any lock")
+	assert.Empty(t, locks.releasedByID, "denied unlock must not release any lock")
 }
 
 // TestHandleUnlockCommandAllowsAuthorizedActor verifies that a configured
@@ -699,7 +724,7 @@ func TestHandleUnlockCommandAllowsAuthorizedActor(t *testing.T) {
 	body := requireComment(t, comments, "unlock success comment")
 	assert.Contains(t, body, "Lock Released")
 	assert.Contains(t, body, "@hubot")
-	assert.Equal(t, []string{"orders"}, locks.forceReleased)
+	assert.Equal(t, []string{"orders"}, locks.releasedByID)
 }
 
 // TestHandleUnlockCommandUnconfiguredDatabaseHint exercises the PR force-unlock
@@ -728,8 +753,7 @@ func TestHandleUnlockCommandUnconfiguredDatabaseHint(t *testing.T) {
 	body := requireComment(t, comments, "unconfigured-database unlock comment")
 	assert.Contains(t, body, "database `payments` is not configured on this SchemaBot instance")
 	assert.NotContains(t, body, "is not authorized", "unconfigured database must not render a plain access denial")
-	assert.Empty(t, locks.forceReleased, "unconfigured database unlock must not force-release any lock")
-	assert.Empty(t, locks.released, "unconfigured database unlock must not release any lock")
+	assert.Empty(t, locks.releasedByID, "unconfigured database unlock must not release any lock")
 }
 
 func actorAuthRollbackApply() *storage.Apply {
@@ -852,7 +876,7 @@ func (s *actorAuthTaskStore) GetByDatabase(_ context.Context, database string) (
 // mutation so tests can assert which releases and acquisitions happened.
 // Setting getErr makes every Get call fail with that error, simulating a
 // storage outage during the lock lookup; setting releaseErr does the same for
-// Release, simulating an outage during lock release.
+// every release method, simulating an outage during lock release.
 type actorAuthLockStore struct {
 	storage.LockStore
 	locks             []*storage.Lock
@@ -860,7 +884,7 @@ type actorAuthLockStore struct {
 	acquired          []*storage.Lock
 	released          []string
 	releasedIfPending []string
-	forceReleased     []string
+	releasedByID      []string
 	releaseErr        error
 }
 
@@ -911,8 +935,11 @@ func (s *actorAuthLockStore) ReleaseIfPendingPlanID(_ context.Context, _, _, _, 
 	return true, nil
 }
 
-func (s *actorAuthLockStore) ForceRelease(_ context.Context, database, _ string) error {
-	s.forceReleased = append(s.forceReleased, database)
+func (s *actorAuthLockStore) ReleaseByID(_ context.Context, _ int64, database, _, _, _ string) error {
+	if s.releaseErr != nil {
+		return s.releaseErr
+	}
+	s.releasedByID = append(s.releasedByID, database)
 	return nil
 }
 
@@ -1040,7 +1067,7 @@ func TestHandleMultiEnvPlanBlocksUnauthorizedActorAfterDiscovery(t *testing.T) {
 	})
 	h := actorAuthStorageTestHandler(cfg, &emptyStorage{}, installClient)
 
-	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, true, 0)
+	h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "mona", false, 0, true, 0, nil)
 
 	body := requireComment(t, comments, "unauthorized plan comment")
 	assert.Contains(t, body, "SchemaBot Command Not Authorized")
@@ -1093,8 +1120,16 @@ func teamMembersHandler(t *testing.T, statusCode int, members ...string) http.Ha
 
 func registerApplyDiscoveryEndpoints(t *testing.T, mux *http.ServeMux, database string) {
 	t.Helper()
+	registerApplyDiscoveryEndpointsDeclaring(t, mux, database, database)
+}
 
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", database)
+// registerApplyDiscoveryEndpointsDeclaring serves a schema directory named
+// database whose schemabot.yaml declares declaredDatabase, so tests can vary
+// the author's spelling independently of the directory layout.
+func registerApplyDiscoveryEndpointsDeclaring(t *testing.T, mux *http.ServeMux, database, declaredDatabase string) {
+	t.Helper()
+
+	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", declaredDatabase)
 	schemaSQL := "CREATE TABLE `users` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))"
 
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {

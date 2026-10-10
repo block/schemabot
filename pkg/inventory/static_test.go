@@ -5,10 +5,135 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestValidateSchemaOverrides(t *testing.T) {
+	tests := []struct {
+		name         string
+		databaseType string
+		overrides    map[string]string
+		wantError    string
+	}{
+		{name: "PostgreSQL hyphenated physical name", databaseType: "postgres", overrides: map[string]string{"svc": "svc-database-qa"}},
+		{name: "PostgreSQL double quote", databaseType: "postgres", overrides: map[string]string{"svc": `svc"qa`}, wantError: "must not contain a double quote"},
+		{name: "PostgreSQL byte limit", databaseType: "postgres", overrides: map[string]string{"svc": strings.Repeat("a", 64)}, wantError: "63-byte identifier limit"},
+		{name: "PostgreSQL one mapping limit", databaseType: "postgres", overrides: map[string]string{"svc": "svc-qa", "audit": "audit-qa"}, wantError: "exactly one mapping"},
+		{name: "PostgreSQL empty physical name", databaseType: "postgres", overrides: map[string]string{"svc": ""}, wantError: `value "" for key "svc": schema name must not be empty`},
+		{name: "PostgreSQL empty canonical key", databaseType: "postgres", overrides: map[string]string{"": "svc-qa"}, wantError: `key "": schema name must not be empty`},
+		{name: "PostgreSQL trailing whitespace", databaseType: "postgres", overrides: map[string]string{"svc": "svc-qa "}, wantError: "must not have leading or trailing whitespace"},
+		{name: "PostgreSQL leading whitespace", databaseType: "postgres", overrides: map[string]string{"svc": " svc-qa"}, wantError: "must not have leading or trailing whitespace"},
+		{name: "PostgreSQL interior space accepted", databaseType: "postgres", overrides: map[string]string{"svc": "svc qa"}},
+		{name: "PostgreSQL NUL", databaseType: "postgres", overrides: map[string]string{"svc": "svc\x00qa"}, wantError: "must not contain NUL"},
+		{name: "PostgreSQL canonical key held to the same rules", databaseType: "postgres", overrides: map[string]string{`svc"`: "svc-qa"}, wantError: `key "svc\"": schema name must not contain a double quote`},
+		{name: "MySQL rule unchanged", databaseType: "mysql", overrides: map[string]string{"svc": "svc-qa"}, wantError: "only [a-zA-Z0-9_$] is allowed"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateSchemaOverrides(tt.databaseType, tt.overrides)
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
+func TestValidateTableOwner(t *testing.T) {
+	tests := []struct {
+		name, databaseType, owner, wantError string
+	}{
+		{name: "omitted on MySQL", databaseType: "mysql"},
+		{name: "PostgreSQL role", databaseType: "postgres", owner: "app_owner"},
+		{name: "MySQL rejected", databaseType: "mysql", owner: "app_owner", wantError: `only supported for postgres, not "mysql"`},
+		{name: "Vitess rejected", databaseType: "vitess", owner: "app_owner", wantError: `only supported for postgres, not "vitess"`},
+		{name: "byte limit", databaseType: "postgres", owner: strings.Repeat("a", 64), wantError: "63-byte identifier limit"},
+		{name: "double quote", databaseType: "postgres", owner: `app"owner`, wantError: "must not contain a double quote"},
+		{name: "NUL", databaseType: "postgres", owner: "app\x00owner", wantError: "must not contain NUL"},
+		{name: "leading whitespace", databaseType: "postgres", owner: " app_owner", wantError: "leading or trailing whitespace"},
+		{name: "trailing whitespace", databaseType: "postgres", owner: "app_owner ", wantError: "leading or trailing whitespace"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateTableOwner(tt.databaseType, tt.owner)
+			if tt.wantError == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tt.wantError)
+		})
+	}
+}
+
+func TestStaticResolverEnumerate(t *testing.T) {
+	t.Setenv("TARGET_CONFIG", `{"host":"db.example","port":3306}`)
+	t.Setenv("TARGET_PASSWORD", "secret")
+
+	type enumerateCase struct {
+		name     string
+		resolver *StaticResolver
+		want     []ProbeRequest
+	}
+
+	mixed, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"z-postgres": {DatabaseType: "postgres", DSN: "postgres://user:pass@db.example:5432/app?sslmode=disable"},
+		"a-mysql":    {DatabaseType: "mysql", DSN: "root@tcp(localhost:3306)/"},
+		"m-from": {
+			DatabaseType: "mysql",
+			DSNFrom: &StaticDSNFromConfig{
+				ConfigRef:   "env:TARGET_CONFIG",
+				Username:    "user",
+				PasswordRef: "env:TARGET_PASSWORD",
+			},
+		},
+	}})
+	require.NoError(t, err)
+
+	tests := []enumerateCase{
+		// The constructor rejects an empty target set; the zero value only
+		// guards a resolver built without it, which enumerates nothing.
+		{name: "zero value", resolver: &StaticResolver{}, want: nil},
+		{
+			name: "one",
+			resolver: &StaticResolver{targets: map[string]staticTargetEntry{
+				"orders": {target: "orders", databaseType: "mysql"},
+			}},
+			want: []ProbeRequest{{Target: "orders", DatabaseType: "mysql"}},
+		},
+		{
+			name:     "mixed targets",
+			resolver: mixed,
+			want: []ProbeRequest{
+				{Target: "a-mysql", DatabaseType: "mysql"},
+				{Target: "m-from", DatabaseType: "mysql"},
+				{Target: "z-postgres", DatabaseType: "postgres"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.resolver.Enumerate(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+			assert.Nil(t, tt.resolver.UnenumerableDatabaseTypes())
+		})
+	}
+}
+
+// A nil resolver reports itself the same way from every method, so a caller
+// holding a typed nil sees an error rather than a panic.
+func TestStaticResolverNilEnumerate(t *testing.T) {
+	var resolver *StaticResolver
+	got, err := resolver.Enumerate(t.Context())
+	require.Error(t, err)
+	assert.Nil(t, got)
+	assert.EqualError(t, err, "static target resolver is nil")
+}
 
 func TestStaticResolverResolveTarget(t *testing.T) {
 	t.Setenv("TARGET_DSN", "user:pass@tcp(db.example:3306)/")
@@ -462,6 +587,22 @@ func TestStaticResolverResolveTargetSchemaOverrides(t *testing.T) {
 	assert.Equal(t, map[string]string{"bikeshare": "bikeshare_eu_qa"}, got.SchemaOverrides)
 }
 
+func TestStaticResolverResolveTargetTableOwner(t *testing.T) {
+	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
+		"bikeshare": {
+			DatabaseType: "postgres",
+			DSN:          "postgres://engine:secret@localhost:5432/bikeshare?sslmode=disable",
+			TableOwner:   "app_owner",
+		},
+	}})
+	require.NoError(t, err)
+
+	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "bikeshare"})
+
+	require.NoError(t, err)
+	assert.Equal(t, "app_owner", got.TableOwner)
+}
+
 func TestStaticResolverResolveTargetClonesSchemaOverrides(t *testing.T) {
 	resolver, err := NewStaticResolver(StaticConfig{Targets: map[string]StaticTarget{
 		"target-1": {
@@ -498,9 +639,9 @@ func TestNewStaticResolverValidatesSchemaOverrides(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "non-mysql target",
+			name:    "vitess target",
 			config:  target(map[string]string{"bikeshare": "bikeshare_eu_qa"}, "vitess"),
-			wantErr: "schema_overrides is only supported for mysql",
+			wantErr: `schema_overrides is only supported for mysql and postgres, not "vitess"`,
 		},
 		{
 			name: "more than one mapping",
@@ -566,7 +707,7 @@ func TestStaticResolverResolveTargetDSNFromPostgres(t *testing.T) {
 
 	assert.Equal(t, "orders-prod", got.Target)
 	assert.Equal(t, "postgres", got.DatabaseType)
-	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN) // sadscan:disable np.postgres.1
 	assert.Equal(t, map[string]string{
 		"extra":               "field",
 		MetadataPostgresCARef: PostgresCARefEmbeddedRDSGlobal,
@@ -617,7 +758,7 @@ func TestStaticResolverDSNFromPostgresDefaults(t *testing.T) {
 
 	got, err := resolver.ResolveTarget(t.Context(), Request{Target: "orders-prod"})
 	require.NoError(t, err)
-	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", got.DSN) // sadscan:disable np.postgres.1
 	assert.Equal(t, PostgresCARefEmbeddedRDSGlobal, got.Metadata[MetadataPostgresCARef])
 }
 

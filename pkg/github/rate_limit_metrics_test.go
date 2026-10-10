@@ -535,6 +535,6 @@ func attributeValueString(value attribute.Value) string {
 	case attribute.INT64:
 		return strconv.FormatInt(value.AsInt64(), 10)
 	default:
-		return value.Emit()
+		return value.String()
 	}
 }

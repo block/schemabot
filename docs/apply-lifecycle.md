@@ -5,11 +5,10 @@
 ## Table of Contents
 
 - [Foundations](#foundations)
-  - [The record tree](#the-record-tree)
-  - [Active vs terminal](#active-vs-terminal)
 - [The one rule](#the-one-rule)
 - [State reference](#state-reference)
 - [The retry budget](#the-retry-budget)
+- [Refused before an apply exists](#refused-before-an-apply-exists)
 - [Recovering from a failed apply](#recovering-from-a-failed-apply)
 - [What cleans up after a failed rollout](#what-cleans-up-after-a-failed-rollout)
 - [Guidance for agents](#guidance-for-agents)
@@ -34,7 +33,7 @@ document:
   the database being changed). That record moves through states — from
   `pending` through `running` to a final verdict — and it is what you see in
   CLI status output and PR comments.
-- **Driver** — the worker inside SchemaBot that claims an apply and drives it
+- **Driver** — the component inside SchemaBot that claims an apply and drives it
   to a final state, reporting progress along the way. If a driver crashes, a
   peer picks the apply up and continues; the apply record is the durable truth,
   not any single process.
@@ -201,6 +200,63 @@ Two things end the loop:
 Either way, the apply is then terminalized as permanent `failed`, and the
 normal recovery path applies: fix the cause, fresh plan, fresh apply. The
 budget and window are per-apply — a new apply starts with a full budget.
+
+## Refused before an apply exists
+
+`POST /api/apply` checks the stored plan before it records an apply. Two
+admission refusals require the caller to change the request or the plan;
+retrying the same request cannot succeed:
+
+- `400 unsafe_opt_in_required` means the plan contains an unsafe change but
+  the request did not include `"options":{"allow_unsafe":"true"}`. Inspect the
+  plan, obtain the required consent, and resend the request with that option.
+- `422 plan_blocked` means the plan contains a change the engine refuses to
+  execute. No apply option or retry can make that plan executable. Change the
+  schema, create a new plan, and apply the new plan.
+
+An apply of a whole rollout checks every member's own plan the same way, and
+a member's refusal carries the same status and code as the primary target's
+would. Its `error` names the member that stopped the apply. A member's unsafe
+change that the plan the caller reviewed never disclosed is refused as
+`400 invalid_request` instead, because no opt-in covers a change the caller
+was not shown: review that member's own plan and apply it in an apply narrowed
+to that member.
+
+No apply record is created for any of these refusals. Match `error_code`
+rather than parsing the human-readable `error` field.
+
+<details>
+<summary>Admission refusal examples</summary>
+
+An unsafe plan without caller consent returns:
+
+```http
+HTTP/1.1 400 Bad Request
+Content-Type: application/json
+```
+
+```json
+{
+  "error": "apply rejected: stored plan plan-example-42 contains unsafe change for table \"old_orders\": DROP TABLE removes all data; retry with allow_unsafe=true",
+  "error_code": "unsafe_opt_in_required"
+}
+```
+
+A rollout member whose own plan contains a blocked change returns:
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+Content-Type: application/json
+```
+
+```json
+{
+  "error": "apply rejected: rollout member eu/orders-002: stored plan plan-example-43 contains a blocked change for table \"orders\": statement is not supported by the configured engine",
+  "error_code": "plan_blocked"
+}
+```
+
+</details>
 
 ## Recovering from a failed apply
 

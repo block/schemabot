@@ -1,8 +1,13 @@
-// Package glyph is the severity vocabulary for operator-facing output: one
-// glyph per meaning, one meaning per glyph, shared by the CLI and the GitHub
-// PR comment surfaces. The glyph codepoints are identical on both surfaces —
+// Package glyph is the glyph vocabulary for operator-facing output: one glyph
+// per meaning, one meaning per glyph, shared by the CLI and the GitHub PR
+// comment surfaces. The glyph codepoints are identical on both surfaces —
 // everything that differs between them (ANSI color, cell padding, markdown
 // emphasis) is markup around the glyph and stays with the surface.
+//
+// Most of the vocabulary is severity: how urgently an operator should react
+// to the line beside the glyph. Docs is the one member that is not — it marks
+// a pointer to documentation and carries no urgency — and it lives here so
+// both surfaces render the same glyph and the rules below cover it.
 //
 // Two rules keep the vocabulary unambiguous at the sites that could blur it:
 //
@@ -16,7 +21,7 @@
 //     SchemaBot understood and will not perform, where retrying unchanged
 //     refuses again.
 //
-// Every severity glyph occupies two terminal cells (pinned by test against
+// Every glyph occupies two terminal cells (pinned by test against
 // ui.VisibleWidth), so any of them can share a padded CLI column without
 // misaligning it.
 //
@@ -34,7 +39,7 @@ const (
 	Escalation = "🚨"
 
 	// Refused marks an operation that is not proceeding because SchemaBot or
-	// the schema-change engine refused it: an engine-blocked change, a
+	// the schema change engine refused it: an engine-blocked change, a
 	// rejected apply, an apply blocked on a merged or closed PR. The operator
 	// should read the reason; the change or the situation must change before
 	// a retry can succeed.
@@ -51,4 +56,9 @@ const (
 
 	// Info marks neutral information that requires nothing of the operator.
 	Info = "ℹ️"
+
+	// Docs marks a pointer to the documentation page that answers the
+	// question the surface beside it raises. It is not a severity: the line
+	// it introduces asks nothing of the operator beyond reading.
+	Docs = "📖"
 )

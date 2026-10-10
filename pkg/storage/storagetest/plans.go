@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -17,6 +18,46 @@ import (
 // storage.ErrNotImplemented. When an implementation lands, it joins this
 // family.
 func TestPlans(t *testing.T, h Harness) {
+	t.Run("CanonicalizesIdentityKeys", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		plan := &storage.Plan{
+			PlanIdentifier: "plan_mixed_case",
+			Database:       "OrdersDB",
+			DatabaseType:   "MySQL",
+			Repository:     "MixedCase/Sample-Repo",
+			PullRequest:    42,
+			Environment:    "Staging",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		}
+		_, err := store.Plans().Create(ctx, plan)
+		require.NoError(t, err)
+
+		// Stored-value equality is the cross-dialect check that identity keys are canonicalized before persistence.
+		assert.Equal(t, "ordersdb", plan.Database)
+		assert.Equal(t, "mysql", plan.DatabaseType)
+		assert.Equal(t, "mixedcase/sample-repo", plan.Repository)
+		assert.Equal(t, "staging", plan.Environment)
+
+		byPR, err := store.Plans().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 42)
+		require.NoError(t, err)
+		require.Len(t, byPR, 1)
+		assert.Equal(t, "plan_mixed_case", byPR[0].PlanIdentifier)
+
+		listed, err := store.Plans().List(ctx, storage.ListPlansOptions{
+			Database: "ORDERSDB", Environment: "STAGING",
+			Repository: "MIXEDCASE/SAMPLE-REPO", PullRequest: 42, Limit: 10,
+		})
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.Equal(t, "plan_mixed_case", listed[0].PlanIdentifier)
+
+		require.NoError(t, store.Plans().DeleteByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 42))
+		deleted, err := store.Plans().Get(ctx, "plan_mixed_case")
+		require.NoError(t, err)
+		assert.Nil(t, deleted)
+	})
+
 	t.Run("Create_And_Get", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -43,6 +84,12 @@ func TestPlans(t *testing.T, h Harness) {
 			SchemaPath:     "schema/commerce",
 			Environment:    "staging",
 			HeadSHA:        "sha_head",
+			// A member planned against its own live schema is bound to the
+			// reviewed plan of its round; every store must carry that link.
+			PrimaryPlanIdentifier: "plan_reviewed",
+			// A plan narrowed to one rollout member is held to it at apply
+			// creation; every store must carry the narrowing.
+			NarrowedTo: "primary/commerce-target",
 			SchemaFiles: schema.SchemaFiles{
 				"commerce": {Files: map[string]string{"users.sql": "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)"}},
 			},
@@ -65,6 +112,8 @@ func TestPlans(t *testing.T, h Harness) {
 			assert.Equal(t, "schema/commerce", got.SchemaPath)
 			assert.Equal(t, "staging", got.Environment)
 			assert.Equal(t, "sha_head", got.HeadSHA)
+			assert.Equal(t, "plan_reviewed", got.PrimaryPlanIdentifier)
+			assert.Equal(t, "primary/commerce-target", got.NarrowedTo)
 			require.Contains(t, got.SchemaFiles, "commerce")
 			assert.Equal(t, "CREATE TABLE `users` (`id` bigint unsigned NOT NULL)",
 				got.SchemaFiles["commerce"].Files["users.sql"])
@@ -100,6 +149,62 @@ func TestPlans(t *testing.T, h Harness) {
 		second := plan
 		_, err = store.Plans().Create(ctx, &second)
 		require.ErrorIs(t, err, storage.ErrPlanIDExists)
+	})
+
+	// A planner sharing the service's storage stores a plan's row first, with
+	// the route it knows and no narrowing; the service restamps it with the
+	// member it planned. The restamp records a narrowing on a row without one,
+	// but never widens a narrowed row or moves it to another member.
+	t.Run("UpdateRoute_RecordsNarrowingButNeverReplacesOne", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		_, err := store.Plans().Create(ctx, &storage.Plan{
+			PlanIdentifier: "plan_restamp",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Deployment:     "commerce",
+			Target:         "commerce-001",
+			Repository:     "org/repo",
+			PullRequest:    123,
+			Environment:    "staging",
+			HeadSHA:        "sha_head",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		})
+		require.NoError(t, err)
+
+		requireRoute := func(deployment, target, narrowedTo string) {
+			t.Helper()
+			got, err := store.Plans().Get(ctx, "plan_restamp")
+			require.NoError(t, err)
+			require.NotNil(t, got)
+			assert.Equal(t, deployment, got.Deployment)
+			assert.Equal(t, target, got.Target)
+			assert.Equal(t, narrowedTo, got.NarrowedTo)
+			assert.Equal(t, "commerce", got.Database)
+			assert.Equal(t, "sha_head", got.HeadSHA)
+		}
+
+		require.NoError(t, store.Plans().UpdateRoute(ctx, "plan_restamp", "eu", "commerce-002", "eu/commerce-002"))
+		requireRoute("eu", "commerce-002", "eu/commerce-002")
+
+		// Restamping with the narrowing the row records is the same plan.
+		require.NoError(t, store.Plans().UpdateRoute(ctx, "plan_restamp", "eu", "commerce-002", "eu/commerce-002"))
+		requireRoute("eu", "commerce-002", "eu/commerce-002")
+
+		err = store.Plans().UpdateRoute(ctx, "plan_restamp", "us", "commerce-003", "us/commerce-003")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `records narrowing "eu/commerce-002", not "us/commerce-003"`)
+		requireRoute("eu", "commerce-002", "eu/commerce-002")
+
+		err = store.Plans().UpdateRoute(ctx, "plan_restamp", "us", "commerce-003", "")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `records narrowing "eu/commerce-002", not ""`)
+		requireRoute("eu", "commerce-002", "eu/commerce-002")
+
+		err = store.Plans().UpdateRoute(ctx, "plan_missing", "eu", "commerce-002", "eu/commerce-002")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no plan carries the identifier")
 	})
 
 	t.Run("RoundTripsShardPlans", func(t *testing.T) {
@@ -222,6 +327,117 @@ func TestPlans(t *testing.T, h Harness) {
 		assert.Equal(t, "changing vindex user_idx type re-computes keyspace ids", changes[1].Reason)
 	})
 
+	t.Run("RoundTripsIgnoreTables", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// The tables the plan's ignore_tables config withheld are absent from
+		// the namespace's captured files, so a re-plan that did not know about
+		// them would propose dropping them. The record must survive the
+		// round-trip for a rollback, a resume, or a member's drift check to be
+		// asked to withhold the same entries.
+		plan := &storage.Plan{
+			PlanIdentifier: "plan_ignore_tables",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Repository:     "org/repo",
+			PullRequest:    123,
+			Environment:    "staging",
+			Namespaces: map[string]*storage.NamespacePlanData{
+				"commerce": {
+					Tables: []storage.TableChange{{Namespace: "commerce", Table: "users", Operation: "alter"}},
+				},
+				"billing": {
+					Tables: []storage.TableChange{{Namespace: "billing", Table: "invoices", Operation: "alter"}},
+				},
+			},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		}
+		plan.RecordIgnoreTables([]string{"legacy_audit_log", "flyway_schema_history"})
+		_, err := store.Plans().Create(ctx, plan)
+		require.NoError(t, err)
+
+		got, err := store.Plans().Get(ctx, "plan_ignore_tables")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		require.Contains(t, got.Namespaces, "commerce")
+		assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, got.Namespaces["commerce"].IgnoreTables)
+		assert.Equal(t, []string{"flyway_schema_history", "legacy_audit_log"}, got.IgnoreTables(),
+			"the re-plan reads the union across namespaces")
+	})
+
+	t.Run("RoundTripsDirectExecutionPolicy", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// The apply created from a plan runs under the policy the plan's
+		// execution verdicts were judged against, so the policy has to come
+		// back off the row rather than be resolved again from a configuration
+		// that has moved on since the review.
+		plan := &storage.Plan{
+			PlanIdentifier: "plan_direct_execution",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Repository:     "org/repo",
+			PullRequest:    123,
+			Environment:    "staging",
+			DirectExecution: &storage.DirectExecutionPolicy{
+				Enabled:                       true,
+				MaxTableRows:                  10000,
+				MaxTableBytes:                 100 << 20,
+				LockAcquisitionTimeoutSeconds: 5,
+			},
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		}
+		_, err := store.Plans().Create(ctx, plan)
+		require.NoError(t, err)
+
+		got, err := store.Plans().Get(ctx, "plan_direct_execution")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, plan.DirectExecution, got.DirectExecution)
+	})
+
+	t.Run("DirectExecutionOptOutRoundTripsDistinctFromAbsent", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A plan judged under no grant recorded that answer. Only a plan
+		// stored before the column existed comes back with nothing, and that
+		// is the one case admission may resolve from configuration — so the
+		// two must not collapse into each other across the round-trip.
+		optedOut := &storage.Plan{
+			PlanIdentifier:  "plan_direct_execution_off",
+			Database:        "commerce",
+			DatabaseType:    storage.DatabaseTypeMySQL,
+			Environment:     "staging",
+			DirectExecution: &storage.DirectExecutionPolicy{Enabled: false},
+			CreatedAt:       time.Now().UTC().Truncate(time.Second),
+		}
+		_, err := store.Plans().Create(ctx, optedOut)
+		require.NoError(t, err)
+
+		unstated := &storage.Plan{
+			PlanIdentifier: "plan_direct_execution_unstated",
+			Database:       "commerce",
+			DatabaseType:   storage.DatabaseTypeMySQL,
+			Environment:    "staging",
+			CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		}
+		_, err = store.Plans().Create(ctx, unstated)
+		require.NoError(t, err)
+
+		got, err := store.Plans().Get(ctx, "plan_direct_execution_off")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Equal(t, &storage.DirectExecutionPolicy{Enabled: false}, got.DirectExecution)
+
+		got, err = store.Plans().Get(ctx, "plan_direct_execution_unstated")
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		assert.Nil(t, got.DirectExecution)
+	})
+
 	t.Run("EmptyPlanDataRoundTripsAsAbsent", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -336,14 +552,102 @@ func TestPlans(t *testing.T, h Harness) {
 		assert.Empty(t, unmatched, "a filter matching nothing lists as empty, not an error")
 	})
 
-	t.Run("List_RejectsNonPositiveLimit", func(t *testing.T) {
+	t.Run("List_FiltersByReviewRound", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
 
-		// An unbounded listing is refused rather than silently returning
-		// nothing or everything.
+		// Two review rounds of the same commit: same database, environment,
+		// repository, pull request, and head SHA, differing only in which
+		// reviewed plan each member plan was produced alongside. The round is
+		// the only thing that tells them apart, so the filter is what keeps an
+		// apply from pairing a member with a round the operator never saw.
+		base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+		create := func(identifier, target, primary string, createdAt time.Time) {
+			t.Helper()
+			_, err := store.Plans().Create(ctx, &storage.Plan{
+				PlanIdentifier:        identifier,
+				Database:              "commerce",
+				DatabaseType:          storage.DatabaseTypeMySQL,
+				Environment:           "production",
+				Deployment:            "eu",
+				Target:                target,
+				Repository:            "org/repo",
+				PullRequest:           7,
+				HeadSHA:               "sha_head",
+				PrimaryPlanIdentifier: primary,
+				CreatedAt:             createdAt,
+			})
+			require.NoError(t, err)
+		}
+
+		create("plan_reviewed_first", "commerce-001", "", base)
+		create("plan_member_first", "commerce-002", "plan_reviewed_first", base.Add(time.Second))
+		create("plan_reviewed_second", "commerce-001", "", base.Add(2*time.Second))
+		create("plan_member_second", "commerce-002", "plan_reviewed_second", base.Add(3*time.Second))
+
+		firstRound, err := store.Plans().List(ctx, storage.ListPlansOptions{
+			Repository:            "org/repo",
+			PullRequest:           7,
+			PrimaryPlanIdentifier: "plan_reviewed_first",
+			Limit:                 10,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"plan_member_first"}, planIdentifiers(firstRound),
+			"the later round's member plan must not answer a lookup for the earlier round")
+
+		secondRound, err := store.Plans().List(ctx, storage.ListPlansOptions{
+			Repository:            "org/repo",
+			PullRequest:           7,
+			PrimaryPlanIdentifier: "plan_reviewed_second",
+			Limit:                 10,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"plan_member_second"}, planIdentifiers(secondRound))
+
+		unfiltered, err := store.Plans().List(ctx, storage.ListPlansOptions{Repository: "org/repo", PullRequest: 7, Limit: 10})
+		require.NoError(t, err)
+		assert.Len(t, unfiltered, 4, "an unfiltered listing still sees every round")
+	})
+
+	t.Run("List_RejectsNonPositiveLimitWithoutARound", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// An open-ended listing with no row cap is refused rather than silently
+		// returning nothing or everything.
 		_, err := store.Plans().List(ctx, storage.ListPlansOptions{})
 		require.ErrorContains(t, err, "limit must be positive")
+	})
+
+	t.Run("List_ByRoundNeedsNoLimit", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		// A round names the rows it wants, so it bounds the listing on its own
+		// and every member of the round comes back. Capping the rows could only
+		// drop members the caller must see.
+		base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+		const memberCount = 25
+		for i := range memberCount {
+			_, err := store.Plans().Create(ctx, &storage.Plan{
+				PlanIdentifier:        fmt.Sprintf("plan_member_%02d", i),
+				Database:              "commerce",
+				DatabaseType:          storage.DatabaseTypeMySQL,
+				Environment:           "production",
+				Deployment:            "eu",
+				Target:                fmt.Sprintf("commerce-%03d", i),
+				Repository:            "org/repo",
+				PullRequest:           7,
+				HeadSHA:               "sha_head",
+				PrimaryPlanIdentifier: "plan_reviewed",
+				CreatedAt:             base.Add(time.Duration(i) * time.Second),
+			})
+			require.NoError(t, err)
+		}
+
+		members, err := store.Plans().List(ctx, storage.ListPlansOptions{PrimaryPlanIdentifier: "plan_reviewed"})
+		require.NoError(t, err)
+		assert.Len(t, members, memberCount, "a round-filtered listing returns every member plan of the round")
 	})
 
 	t.Run("List_RejectsPullRequestWithoutRepository", func(t *testing.T) {

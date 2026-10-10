@@ -72,6 +72,106 @@ func TestPostgresConfigFixturePlansAndAppliesNativeSafeChange(t *testing.T) {
 	assert.True(t, postgresColumnExists(t, db, "users", "email"))
 }
 
+// A PostgreSQL plan whose desired state adds a column and an index to one
+// table is an ordered multi-statement sequence for that table: every
+// statement must survive into both the plan response the operator reviews
+// and the stored plan the apply executes — a table appearing more than once
+// is legal, and dropping its later statements would silently under-apply the
+// reviewed change.
+func TestPostgresConfigFixtureKeepsAllStatementsForOneTable(t *testing.T) {
+	fixture := loadPostgresConfigFixture(t, "postgres")
+	fixture.schema = "CREATE TABLE users (\n    id bigint PRIMARY KEY,\n    email text\n);\nCREATE INDEX idx_users_email ON users (email);\n"
+	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	createFixtureUsersTable(t, db)
+
+	svc := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType: string(fixture.config.Type),
+		targetDSN:    dsn,
+	})
+	plan, err := svc.ExecutePlan(t.Context(), fixture.planRequest())
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 2)
+	alter := plan.Changes[0].TableChanges[0]
+	index := plan.Changes[0].TableChanges[1]
+	assert.Equal(t, "users", alter.TableName)
+	assert.Contains(t, alter.DDL, "ADD COLUMN")
+	assert.Equal(t, "users", index.TableName)
+	assert.Contains(t, index.DDL, "CREATE")
+	assert.Contains(t, index.DDL, "INDEX")
+	assert.Contains(t, index.DDL, "idx_users_email")
+
+	stored, err := svc.Storage().Plans().Get(t.Context(), plan.PlanID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+	storedChanges := stored.FlatDDLChanges()
+	require.Len(t, storedChanges, 2)
+	assert.Contains(t, storedChanges[0].DDL, "ADD COLUMN")
+	assert.Contains(t, storedChanges[1].DDL, "idx_users_email")
+	for _, tc := range storedChanges {
+		assert.Equal(t, "users", tc.Table)
+	}
+}
+
+// A PostgreSQL apply whose plan carries two statements for one table runs one
+// task per statement: each task settles on its own outcome rather than
+// inheriting the last-reported state of a sibling on the same table, and
+// every effect lands on the target.
+func TestPostgresConfigFixtureAppliesEveryStatementForOneTable(t *testing.T) {
+	fixture := loadPostgresConfigFixture(t, "postgres")
+	fixture.schema = "CREATE TABLE users (\n    id bigint PRIMARY KEY,\n    email text,\n    name text\n);\n"
+	dsn, db := testutil.StartPostgres(t, fixture.config.Database)
+	createFixtureUsersTable(t, db)
+
+	svc := setupE2EServiceOpts(t, fixture.config.Database, e2eServiceOpts{
+		databaseType: string(fixture.config.Type),
+		targetDSN:    dsn,
+	})
+	plan, err := svc.ExecutePlan(t.Context(), fixture.planRequest())
+	require.NoError(t, err)
+	require.Len(t, plan.Changes, 1)
+	require.Len(t, plan.Changes[0].TableChanges, 2)
+	for _, tc := range plan.Changes[0].TableChanges {
+		assert.Equal(t, "users", tc.TableName)
+		assert.Contains(t, tc.DDL, "ADD COLUMN")
+	}
+
+	_, _, err = svc.ExecuteApply(t.Context(), api.ApplyRequest{
+		PlanID:      plan.PlanID,
+		Environment: "staging",
+		Caller:      "integration-test",
+	})
+	require.NoError(t, err)
+
+	var settled *storage.Apply
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		apply, err := findFixtureApply(t, svc, fixture.config.Database)
+		if !assert.NoError(c, err) || !assert.NotNil(c, apply, "no apply stored for the fixture PR") {
+			return
+		}
+		if !assert.True(c, applyIsSettled(apply.State),
+			"apply not settled yet, state=%s", apply.State) {
+			return
+		}
+		settled = apply
+	}, postgresConfigFixtureDeadline, 100*time.Millisecond)
+	require.True(t, state.IsState(settled.State, state.Apply.Completed),
+		"both statements must land, state=%s", settled.State)
+
+	tasks, err := svc.Storage().Tasks().GetByApplyID(t.Context(), settled.ID)
+	require.NoError(t, err)
+	require.Len(t, tasks, 2, "one task per statement, not one per table")
+	for _, task := range tasks {
+		assert.Equal(t, "users", task.TableName)
+		assert.True(t, state.IsState(task.State, state.Task.Completed),
+			"task %s (%s) state=%s", task.TaskIdentifier, task.DDL, task.State)
+		assert.NotNil(t, task.CompletedAt, "task %s (%s) must record its own completion", task.TaskIdentifier, task.DDL)
+	}
+
+	assert.True(t, postgresColumnExists(t, db, "users", "email"))
+	assert.True(t, postgresColumnExists(t, db, "users", "name"))
+}
+
 // A repository config selecting PostgreSQL surfaces a statement outside the
 // optimistic native-safe slice as a typed blocked plan, and the apply gate
 // refuses to queue it when an apply is attempted anyway.

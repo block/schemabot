@@ -12,6 +12,9 @@ CREATE TABLE plans (
   schema_files jsonb NOT NULL,
   plan_data jsonb NOT NULL,
   head_sha varchar(64) NOT NULL DEFAULT '',
+  primary_plan_identifier varchar(255) NOT NULL DEFAULT '',
+  direct_execution jsonb DEFAULT NULL,
+  narrowed_to varchar(255) NOT NULL DEFAULT '',
   created_at timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id)
 );

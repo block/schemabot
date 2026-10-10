@@ -9,6 +9,41 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestBlockedCauses(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  []string
+		joined string
+		want   []string
+	}{
+		{name: "empty", input: []string{"", "  "}, joined: "", want: nil},
+		{name: "single", input: []string{"planner refused the statement"}, joined: "planner refused the statement", want: []string{"planner refused the statement"}},
+		{name: "internal clauses", input: []string{"cause; step; remedy"}, joined: "cause; step; remedy", want: []string{"cause; step; remedy"}},
+		{name: "trims and drops", input: []string{" first cause ", "", " second cause\t"}, joined: "first cause ‖ second cause", want: []string{"first cause", "second cause"}},
+		// A cause that itself contains the separator — an identifier a schema
+		// author chose — is neutralized on the way in, so it cannot decode as
+		// causes the engine never issued.
+		{name: "separator inside one cause", input: []string{`table "left ‖ right" is refused`}, joined: `table "left // right" is refused`, want: []string{`table "left // right" is refused`}},
+		{name: "bare separator rune inside one cause", input: []string{"a‖b", "c"}, joined: "a//b ‖ c", want: []string{"a//b", "c"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			joined := JoinBlockedCauses(tt.input)
+			assert.Equal(t, tt.joined, joined)
+			assert.Equal(t, tt.want, BlockedCauses(joined))
+		})
+	}
+}
+
+// The decoder's contract does not depend on who encoded the reason: a bare
+// or doubled separator yields no empty cause.
+func TestBlockedCausesDropsEmptyParts(t *testing.T) {
+	assert.Equal(t, []string{"a", "b"}, BlockedCauses("a ‖  ‖ b"))
+	assert.Equal(t, []string{"a"}, BlockedCauses(" ‖ a ‖ "))
+	assert.Empty(t, BlockedCauses(" ‖ "))
+}
+
 func TestState_IsTerminal(t *testing.T) {
 	tests := []struct {
 		state    State
@@ -217,6 +252,27 @@ func TestIsUnsupportedOperation(t *testing.T) {
 	})
 }
 
+// A settled-outcome refusal is its own type: it never reads as a gap in what
+// the engine supports or as a completion, and it stays retryable so no generic
+// failure path records an outcome the engine has not reported.
+func TestIsSettledOutcome(t *testing.T) {
+	refusal := NewSettledOutcomeError("stop rejected: the schema change on database %s failed before the stop arrived", "testdb")
+	wrapped := fmt.Errorf("stop local engine for task t-1: %w", refusal)
+
+	assert.True(t, IsSettledOutcome(refusal))
+	assert.True(t, IsSettledOutcome(wrapped))
+	settled, ok := AsSettledOutcome(wrapped)
+	require.True(t, ok)
+	assert.Equal(t, "stop rejected: the schema change on database testdb failed before the stop arrived", settled.Error())
+
+	assert.False(t, IsUnsupportedOperation(wrapped))
+	assert.False(t, IsAlreadyCompleted(wrapped))
+	assert.True(t, IsRetryable(wrapped))
+	assert.False(t, IsSettledOutcome(NewUnsupportedOperationError("stop is not supported")))
+	assert.False(t, IsSettledOutcome(fmt.Errorf("connection refused")))
+	assert.False(t, IsSettledOutcome(nil))
+}
+
 func TestIsTransientTransportError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -247,12 +303,18 @@ type remoteWorkEngine struct{ Engine }
 // haltableEngine models an engine that runs its schema change in this process.
 type haltableEngine struct {
 	Engine
-	haltErr error
-	halts   int
+	haltErr    error
+	halts      int
+	ownedHalts []string
 }
 
 func (e *haltableEngine) HaltForShutdown(context.Context) error {
 	e.halts++
+	return e.haltErr
+}
+
+func (e *haltableEngine) HaltWorkOwnedBy(_ context.Context, owner string) error {
+	e.ownedHalts = append(e.ownedHalts, owner)
 	return e.haltErr
 }
 
@@ -290,4 +352,80 @@ func TestHaltEngineForShutdownReportsTheHaltResult(t *testing.T) {
 		assert.True(t, supported)
 		assert.Contains(t, err.Error(), "runner still copying")
 	})
+}
+
+// A drive halts only the work it started. The owner the drive names reaches
+// the engine unchanged, and an engine whose work runs elsewhere still has
+// nothing to halt.
+func TestHaltEngineWorkOwnedByScopesTheHaltToTheOwner(t *testing.T) {
+	eng := &haltableEngine{}
+
+	supported, err := HaltEngineWorkOwnedBy(t.Context(), eng, "drive-a")
+
+	require.NoError(t, err)
+	assert.True(t, supported)
+	assert.Equal(t, []string{"drive-a"}, eng.ownedHalts)
+	assert.Zero(t, eng.halts, "an owner-scoped halt is not a halt of everything")
+
+	supported, err = HaltEngineWorkOwnedBy(t.Context(), &remoteWorkEngine{}, "drive-a")
+	require.NoError(t, err)
+	assert.False(t, supported)
+}
+
+// shutdownOnlyEngine runs its work in this process and halts it for shutdown,
+// but cannot halt one drive's work apart from another's.
+type shutdownOnlyEngine struct {
+	Engine
+	halts int
+}
+
+func (e *shutdownOnlyEngine) HaltForShutdown(context.Context) error {
+	e.halts++
+	return nil
+}
+
+// The owner-scoped halt is its own capability, so an engine that implements
+// only the shutdown halt keeps it. Its drives hand the apply back without
+// halting anything rather than losing the shutdown halt as well.
+func TestShutdownOnlyEngineKeepsItsShutdownHalt(t *testing.T) {
+	eng := &shutdownOnlyEngine{}
+
+	supported, err := HaltEngineForShutdown(t.Context(), eng)
+	require.NoError(t, err)
+	assert.True(t, supported, "the shutdown halt does not depend on the owner-scoped one")
+	assert.Equal(t, 1, eng.halts)
+
+	supported, err = HaltEngineWorkOwnedBy(t.Context(), eng, "drive-a")
+	require.NoError(t, err)
+	assert.False(t, supported, "an engine without the owner-scoped halt has nothing a drive can halt alone")
+	assert.Equal(t, 1, eng.halts, "a drive's exit never falls back to halting everything")
+}
+
+// The owner a drive attaches is the one the engine reads back, and a context
+// with none reads as the empty owner.
+func TestWorkOwnerRoundTripsThroughTheContext(t *testing.T) {
+	assert.Equal(t, "drive-a", WorkOwnerFromContext(WithWorkOwner(t.Context(), "drive-a")))
+	assert.Empty(t, WorkOwnerFromContext(t.Context()))
+}
+
+func TestSchemaChange_Sharded(t *testing.T) {
+	tests := []struct {
+		name      string
+		shard     string
+		sharded   bool
+		shardName string
+	}{
+		{name: "named shard", shard: "-80", sharded: true, shardName: "-80"},
+		{name: "named shard with surrounding whitespace", shard: " 80- \n", sharded: true, shardName: "80-"},
+		{name: "empty shard", shard: "", sharded: false, shardName: ""},
+		{name: "whitespace-only shard", shard: " \t\n", sharded: false, shardName: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := SchemaChange{Namespace: "payments", Shard: Shard{Name: tt.shard}}
+			assert.Equal(t, tt.sharded, sc.Sharded())
+			assert.Equal(t, tt.shardName, sc.ShardName())
+		})
+	}
 }

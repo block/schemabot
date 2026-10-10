@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -218,4 +219,137 @@ func TestPublishTerminalSummaryIfWon_ReloadError(t *testing.T) {
 
 	assert.False(t, called, "must not publish when the apply reload fails")
 	assert.False(t, taskStore.called, "must not reload tasks when the apply reload fails")
+}
+
+// settleOrderApplyStore serves the apply at its pre-CAS state until the
+// projection swaps it, then serves the terminal row, so a drive that reloads
+// after its own swap sees what it wrote.
+type settleOrderApplyStore struct {
+	storage.ApplyStore
+	preCAS   *storage.Apply
+	terminal *storage.Apply
+	swapped  bool
+}
+
+func (s *settleOrderApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	if s.swapped {
+		return s.terminal, nil
+	}
+	return s.preCAS, nil
+}
+
+func (s *settleOrderApplyStore) UpdateDerivedState(context.Context, int64, string, string, string, *time.Time, *time.Time) (bool, error) {
+	s.swapped = true
+	return true, nil
+}
+
+// settleOrderOperationStore fails the one operation of a single-operation apply
+// and lists it back terminal, so the projection derives the apply's own failure.
+type settleOrderOperationStore struct {
+	stubApplyOperationStore
+	op *storage.ApplyOperation
+}
+
+func (s *settleOrderOperationStore) MarkFailed(_ context.Context, _ int64, reason string) error {
+	s.op.State = state.Apply.Failed
+	s.op.ErrorMessage = reason
+	return nil
+}
+
+func (s *settleOrderOperationStore) ListByApply(context.Context, int64) ([]*storage.ApplyOperation, error) {
+	return []*storage.ApplyOperation{s.op}, nil
+}
+
+// settleOrderControlStore records the pending cancel's settlement and answers
+// GetPending from the live row, so a reader can tell settled from pending.
+type settleOrderControlStore struct {
+	storage.ControlRequestStore
+	cancel *storage.ApplyControlRequest
+}
+
+func (s *settleOrderControlStore) GetPending(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if op != storage.ControlOperationCancel || s.cancel.Status != storage.ControlRequestPending {
+		return nil, nil
+	}
+	return s.cancel, nil
+}
+
+func (s *settleOrderControlStore) FailPending(_ context.Context, _ int64, op storage.ControlOperation, reason string) error {
+	if op == storage.ControlOperationCancel {
+		s.cancel.Status = storage.ControlRequestFailed
+		s.cancel.ErrorMessage = reason
+	}
+	return nil
+}
+
+func (s *settleOrderControlStore) CompletePending(_ context.Context, _ int64, op storage.ControlOperation) error {
+	if op == storage.ControlOperationCancel {
+		s.cancel.Status = storage.ControlRequestCompleted
+	}
+	return nil
+}
+
+func (s *settleOrderControlStore) GetByOperation(_ context.Context, _ int64, op storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if op != storage.ControlOperationCancel {
+		return nil, nil
+	}
+	return s.cancel, nil
+}
+
+type settleOrderStorage struct {
+	mockStorage
+	applies  storage.ApplyStore
+	tasks    storage.TaskStore
+	applyOps storage.ApplyOperationStore
+	control  storage.ControlRequestStore
+}
+
+func (m *settleOrderStorage) Applies() storage.ApplyStore { return m.applies }
+func (m *settleOrderStorage) Tasks() storage.TaskStore    { return m.tasks }
+func (m *settleOrderStorage) ApplyOperations() storage.ApplyOperationStore {
+	return m.applyOps
+}
+func (m *settleOrderStorage) ControlRequests() storage.ControlRequestStore { return m.control }
+
+// An operator cancels an apply, and before the cancel is delivered the drive
+// fails closed on a claim whose operation has no tasks. That failure resolves
+// the apply, so the cancel the operator issued never takes effect — and the
+// terminal summary is the only comment that discloses it, published exactly
+// once. The cancel must therefore be settled as outrun before the summary is
+// published, or the operator reads a summary that says nothing about their
+// command.
+func TestFailOperationWithoutTasks_SettlesTheOutrunCancelBeforeTheSummary(t *testing.T) {
+	const applyID int64 = 7
+	preCAS := &storage.Apply{ID: applyID, ApplyIdentifier: "apply-x", Database: "db", Environment: "staging", State: state.Apply.Running}
+	terminal := &storage.Apply{ID: applyID, ApplyIdentifier: "apply-x", Database: "db", Environment: "staging", State: state.Apply.Failed}
+	control := &settleOrderControlStore{cancel: &storage.ApplyControlRequest{
+		ApplyID:     applyID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}
+	svc := New(&settleOrderStorage{
+		applies:  &settleOrderApplyStore{preCAS: preCAS, terminal: terminal},
+		tasks:    &terminalSummaryTaskStore{},
+		applyOps: &settleOrderOperationStore{op: &storage.ApplyOperation{ID: 11, ApplyID: applyID, State: state.Apply.Running}},
+		control:  control,
+	}, testServerConfig(), nil, slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+
+	var statusAtPublish storage.ControlRequestStatus
+	var reasonAtPublish string
+	published := false
+	svc.OnApplyTerminalSummary = func(context.Context, *storage.Apply, []*storage.Task) error {
+		published = true
+		statusAtPublish = control.cancel.Status
+		reasonAtPublish = control.cancel.ErrorMessage
+		return nil
+	}
+
+	svc.failOperationWithoutTasks(t.Context(), t.Context(), 1,
+		&storage.ApplyOperation{ID: 11, ApplyID: applyID, State: state.Apply.Running}, preCAS)
+
+	require.True(t, published, "the apply resolved terminal, so the summary must be published")
+	assert.Equal(t, storage.ControlRequestFailed, statusAtPublish,
+		"the cancel must already be settled as outrun when the summary renders it")
+	assert.Contains(t, reasonAtPublish, "the schema change reached Failed before the cancel could take effect")
 }

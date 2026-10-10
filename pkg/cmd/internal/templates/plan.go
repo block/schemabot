@@ -20,11 +20,20 @@ const minBoxWidth = 45
 
 // PlanHeaderData contains data for rendering the plan header.
 type PlanHeaderData struct {
+	Engine      string
 	Database    string
 	SchemaName  string
 	Environment string
 	IsMySQL     bool
 	IsApply     bool
+	// EngineLabel names the database family in the title for a surface whose
+	// family IsMySQL cannot express — SchemaBot's own storage is MySQL or
+	// PostgreSQL. Empty keeps the MySQL/Vitess wording every other plan uses.
+	EngineLabel string
+	// SchemaLabel names the row carrying SchemaName. Empty says "Schema name",
+	// which is the directory a plan was built from; a surface whose desired
+	// schema is something else says what it is instead.
+	SchemaLabel string
 }
 
 // WritePlanHeader writes the common plan header to stdout.
@@ -32,6 +41,13 @@ func WritePlanHeader(data PlanHeaderData) {
 	dbType := "Vitess"
 	if data.IsMySQL {
 		dbType = "MySQL"
+	}
+	if data.EngineLabel != "" {
+		dbType = data.EngineLabel
+	}
+
+	if strings.EqualFold(data.Engine, "postgres") || strings.EqualFold(data.Engine, "PostgreSQL") {
+		dbType = "PostgreSQL"
 	}
 
 	action := "Plan"
@@ -49,9 +65,13 @@ func WritePlanHeader(data PlanHeaderData) {
 		lines = append(lines, fmt.Sprintf("Environment: %s", data.Environment))
 	}
 	// Show schema name (directory) for MySQL. Vitess uses keyspace headers instead.
-	showSchemaName := data.IsMySQL && data.SchemaName != ""
+	showSchemaName := data.SchemaName != "" && (data.IsMySQL || data.EngineLabel != "")
+	schemaLabel := "Schema name"
+	if data.SchemaLabel != "" {
+		schemaLabel = data.SchemaLabel
+	}
 	if showSchemaName {
-		lines = append(lines, fmt.Sprintf("Schema name: %s", data.SchemaName))
+		lines = append(lines, fmt.Sprintf("%s: %s", schemaLabel, data.SchemaName))
 	}
 	boxWidth := minBoxWidth
 	for _, line := range lines {
@@ -69,7 +89,7 @@ func WritePlanHeader(data PlanHeaderData) {
 		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("Environment: %s", data.Environment))
 	}
 	if showSchemaName {
-		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("Schema name: %s", data.SchemaName))
+		fmt.Printf("│  %-*s│\n", boxWidth-2, fmt.Sprintf("%s: %s", schemaLabel, data.SchemaName))
 	}
 	fmt.Printf("╰%s╯\n", strings.Repeat("─", boxWidth))
 	fmt.Println()
@@ -78,8 +98,12 @@ func WritePlanHeader(data PlanHeaderData) {
 // DDLChange represents a single DDL change with its type.
 type DDLChange struct {
 	ChangeType string // "CREATE", "ALTER", "DROP"
-	TableName  string
-	DDL        string
+	// Namespace is the schema (MySQL/PostgreSQL) or keyspace (Vitess) the
+	// table lives in. It keeps equal table names in two namespaces apart in
+	// the summary counts; callers that render one namespace may leave it empty.
+	Namespace string
+	TableName string
+	DDL       string
 }
 
 // NamespaceChange groups DDL and VSchema changes for a single namespace (keyspace/schema).
@@ -88,13 +112,21 @@ type NamespaceChange struct {
 	Changes        []DDLChange
 	VSchemaChanged bool
 	VSchemaDiff    string
+	// Finalize marks a namespace the engine asked to finalize after its DDL.
+	// It gets its own line only when it is the namespace's only work.
+	Finalize bool
 }
 
 // WriteNamespaceChanges writes per-namespace DDL and VSchema sections.
 // For MySQL with a single namespace matching the database, the namespace header is omitted.
-// For Vitess, each keyspace gets a header with optional VSchema diff.
-func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string) {
-	singleNamespace := len(namespaces) == 1 && isMySQL && namespaces[0].Namespace == database
+// For Vitess, each keyspace gets a header, and a keyspace whose VSchema
+// changes shows that change whatever engine reported the plan.
+func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database string, dialect schema.Dialect) {
+	names := make([]string, len(namespaces))
+	for i, ns := range namespaces {
+		names[i] = ns.Namespace
+	}
+	singleNamespace := OmitsNamespaceHeader(names, isMySQL, database)
 
 	// Sort a copy so callers aren't affected by reordering. This keeps output
 	// stable and groups similarly named namespaces together, but collapsing
@@ -112,13 +144,13 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 	}
 	var groups []nsGroup
 	for _, ns := range namespaces {
-		if len(ns.Changes) == 0 && !ns.VSchemaChanged {
+		if len(ns.Changes) == 0 && !ns.VSchemaChanged && !ns.Finalize {
 			continue
 		}
 		// Try to merge with previous group if DDL is identical
-		if len(groups) > 0 && !ns.VSchemaChanged {
+		if len(groups) > 0 && collapsible(ns) {
 			prev := &groups[len(groups)-1]
-			if !prev.namespaces[0].VSchemaChanged && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
+			if collapsible(prev.namespaces[0]) && ddlChangesEqual(prev.namespaces[0].Changes, ns.Changes) {
 				prev.namespaces = append(prev.namespaces, ns)
 				continue
 			}
@@ -141,25 +173,44 @@ func WriteNamespaceChanges(namespaces []NamespaceChange, isMySQL bool, database 
 				fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 			}
 			// Show DDL once
-			WriteSQLChanges(g.namespaces[0].Changes)
+			WriteSQLChanges(g.namespaces[0].Changes, dialect)
 		} else {
 			for _, ns := range g.namespaces {
 				if !singleNamespace {
 					fmt.Print(FormatKeyspaceHeader(ns.Namespace))
 				}
-				if ns.VSchemaChanged && !isMySQL {
+				if ns.VSchemaChanged {
 					fmt.Println(indentTable + "~ VSchema:")
 					if ns.VSchemaDiff != "" {
 						fmt.Print(FormatVSchemaDiff(ns.VSchemaDiff, indentContent))
 						fmt.Println()
 					}
 				}
+				if ns.Finalize && !ns.VSchemaChanged && len(ns.Changes) == 0 {
+					fmt.Println(indentTable + "~ Finalized by the engine once every shard's DDL has landed")
+				}
 				if len(ns.Changes) > 0 {
-					WriteSQLChanges(ns.Changes)
+					WriteSQLChanges(ns.Changes, dialect)
 				}
 			}
 		}
 	}
+}
+
+// OmitsNamespaceHeader reports whether WriteNamespaceChanges writes the
+// changes of these namespaces without a header above each: a MySQL plan of
+// the one namespace named for its database. Every other plan opens on a
+// namespace header, which brings its own blank line above it.
+func OmitsNamespaceHeader(namespaces []string, isMySQL bool, database string) bool {
+	return len(namespaces) == 1 && isMySQL && namespaces[0] == database
+}
+
+// collapsible reports whether a namespace renders as its DDL alone, so it can
+// collapse with neighbours that have the same DDL. A VSchema change renders
+// its own section, and a finalize renders its own line when it is the
+// namespace's only work.
+func collapsible(ns NamespaceChange) bool {
+	return !ns.VSchemaChanged && (!ns.Finalize || len(ns.Changes) > 0)
 }
 
 // ddlChangesEqual returns true if two slices of DDL changes have identical content.
@@ -195,14 +246,16 @@ func colorizeDiffLine(line string) string {
 
 // WriteSQLChanges writes the SQL changes section matching the progress view format:
 // table name on its own line with change symbol, DDL indented below.
-func WriteSQLChanges(changes []DDLChange) {
-	combined := combineAlterStatements(changes)
+func WriteSQLChanges(changes []DDLChange, dialect schema.Dialect) {
+	combined := changes
+	if dialect == schema.DialectMySQL {
+		combined = combineAlterStatements(changes)
+	}
 	for _, change := range combined {
 		// Table name line: "     ~ tablename:"
 		fmt.Printf(indentTable+"%s%s\n", progressSymbol(change.ChangeType), change.TableName)
-		// DDL indented below. The plan view reconstructs statements under
-		// MySQL grammar (combineAlterStatements), so it renders MySQL-pinned.
-		fmt.Print(formatProgressDDLForDialect(schema.DialectMySQL, change.DDL))
+		// DDL uses the target dialect; only MySQL statements are combined.
+		fmt.Print(formatProgressDDLForDialect(dialect, change.DDL))
 		fmt.Println()
 	}
 }
@@ -307,44 +360,7 @@ func extractAlterClause(ddl string) string {
 
 // WritePlanSummary writes the Terraform-style summary line.
 func WritePlanSummary(changes []DDLChange) {
-	creates := 0
-	alters := 0
-	drops := 0
-
-	for _, c := range changes {
-		switch strings.ToUpper(c.ChangeType) {
-		case "CHANGE_TYPE_CREATE", "CREATE":
-			creates++
-		case "CHANGE_TYPE_ALTER", "ALTER":
-			alters++
-		case "CHANGE_TYPE_DROP", "DROP":
-			drops++
-		}
-	}
-
-	var parts []string
-	if creates > 0 {
-		word := "table"
-		if creates > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to create", creates, word))
-	}
-	if alters > 0 {
-		word := "table"
-		if alters > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, word))
-	}
-	if drops > 0 {
-		word := "table"
-		if drops > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, word))
-	}
-
+	parts := ddlSummaryParts(changes)
 	if len(parts) > 0 {
 		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
 	}
@@ -359,42 +375,23 @@ type VSchemaChange struct {
 
 // WritePlanSummaryWithVSchema writes a single plan summary line including VSchema changes.
 func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchemaChange) {
-	creates := 0
-	alters := 0
-	drops := 0
-	for _, c := range ddlChanges {
-		switch strings.ToUpper(c.ChangeType) {
-		case "CHANGE_TYPE_CREATE", "CREATE":
-			creates++
-		case "CHANGE_TYPE_ALTER", "ALTER":
-			alters++
-		case "CHANGE_TYPE_DROP", "DROP":
-			drops++
-		}
-	}
+	WritePlanSummaryWithKeyspaceUpdates(ddlChanges, vschemaChanges, 0)
+}
 
-	var parts []string
-	if creates > 0 {
-		word := "table"
-		if creates > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to create", creates, word))
+// WritePlanSummaryWithKeyspaceUpdates writes a single plan summary line
+// including VSchema changes and the keyspaces whose only work is a finalize.
+func WritePlanSummaryWithKeyspaceUpdates(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) {
+	if parts := planSummaryParts(ddlChanges, vschemaChanges, finalizes); len(parts) > 0 {
+		fmt.Printf("📋 Plan: %s\n", strings.Join(parts, ", "))
+		fmt.Println()
 	}
-	if alters > 0 {
-		word := "table"
-		if alters > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to alter", alters, word))
-	}
-	if drops > 0 {
-		word := "table"
-		if drops > 1 {
-			word = "tables"
-		}
-		parts = append(parts, fmt.Sprintf("%d %s to drop", drops, word))
-	}
+}
+
+// planSummaryParts builds the clauses of the plan summary: the table and
+// index clauses, then VSchema changes and keyspaces whose only work is a
+// finalize.
+func planSummaryParts(ddlChanges []DDLChange, vschemaChanges []VSchemaChange, finalizes int) []string {
+	parts := ddlSummaryParts(ddlChanges)
 	if len(vschemaChanges) > 0 {
 		word := "VSchema change"
 		if len(vschemaChanges) > 1 {
@@ -402,11 +399,30 @@ func WritePlanSummaryWithVSchema(ddlChanges []DDLChange, vschemaChanges []VSchem
 		}
 		parts = append(parts, fmt.Sprintf("%d %s", len(vschemaChanges), word))
 	}
-
-	if len(parts) > 0 {
-		fmt.Printf("📋 **Plan**: %s\n", strings.Join(parts, ", "))
-		fmt.Println()
+	if finalizes > 0 {
+		word := "keyspace"
+		if finalizes > 1 {
+			word = "keyspaces"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s to finalize", finalizes, word))
 	}
+	return parts
+}
+
+// ddlSummaryParts builds the table and index clauses of the plan summary.
+// Index builds and drops on existing tables are named in their own clauses.
+// Statements outside every bucket (types, extensions, comments) still run, so
+// a mixed plan names them alongside the counted clauses, and a plan made only
+// of them reports its raw statement total so it never reads as "no changes".
+func ddlSummaryParts(changes []DDLChange) []string {
+	var counts ui.PlanCounts
+	for _, c := range changes {
+		// ChangeType arrives either bare ("ALTER") or with the proto enum
+		// prefix ("CHANGE_TYPE_ALTER"); both name the same operation.
+		op := strings.ToLower(strings.TrimPrefix(strings.ToUpper(c.ChangeType), "CHANGE_TYPE_"))
+		counts.AddTable(c.Namespace, op, c.TableName)
+	}
+	return ui.PlanSummaryParts(counts, len(changes), false)
 }
 
 // WriteOptions writes the options section if any flags are set.
@@ -478,6 +494,25 @@ func WriteIgnoredNamespaces(ignored, unmatched []string) {
 	}
 }
 
+// WriteExemptTables disclosure: one line per namespace holding live tables no
+// schema file declares that the plan leaves in place rather than dropping, so
+// a reader can tell an exempted table from a declared one. No-op when nothing
+// was exempted, which is the ordinary case.
+func WriteExemptTables(groups []*apitypes.ExemptTablesResponse) {
+	wrote := false
+	for _, group := range groups {
+		if group == nil || len(group.Tables) == 0 {
+			continue
+		}
+		fmt.Printf(glyph.Info+"  Ignored tables in namespace %s (%s): %s\n",
+			group.Namespace, group.Reason, strings.Join(group.Tables, ", "))
+		wrote = true
+	}
+	if wrote {
+		fmt.Println()
+	}
+}
+
 // UnsafeChange is a type alias for the shared unsafe change type.
 type UnsafeChange = apitypes.UnsafeChange
 
@@ -493,10 +528,44 @@ func WriteUnsafeChangesWarning(changes []UnsafeChange) {
 	fmt.Println()
 }
 
+// WriteChangeNotice writes a list of changes under a heading and the severity
+// glyph the heading earns — Attention while a change is only disclosed,
+// Refused once something has been refused, Escalation when destructive consent
+// is in effect (see pkg/glyph). It is the unsafe-change list under another
+// name, because a reader wants the same things of a change that will not run as
+// of one that might: which table, what it would do, and what stands in the way.
+//
+// One change is one numbered line, and its reason is printed as it was written.
+// The unsafe-change list splits a reason into findings because a lint reason is
+// a concatenation of them; a reason written for one change is one sentence, and
+// splitting it renders half of it as a finding of its own — "NOT NULL without a
+// DEFAULT" and "add it manually" as two separate things to fix, the second of
+// them the remedy for the first. A change carrying no reason is named by what it
+// would do, which keeps an entry a line rather than a block of DDL.
+func WriteChangeNotice(severity, heading string, changes []UnsafeChange) {
+	if len(changes) == 0 {
+		return
+	}
+	fmt.Println(severity + " " + heading)
+	for i, c := range changes {
+		reason := c.Reason
+		if reason == "" {
+			reason = c.ChangeType
+		}
+		fmt.Printf("  %d. %s: %s\n", i+1, c.Table, reason)
+	}
+	fmt.Println()
+}
+
 // WriteUnsafeChangesBlocked writes the unsafe changes list and instruction to re-run with --allow-unsafe.
 // The apply was refused, so Refused attaches to the refusal itself — the heading
 // names the blocked apply, not the unsafeness of the changes.
-func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, schemaDir string) {
+//
+// rerun is the command that permits them, without the binary name. The caller
+// builds it because it is the one that knows which flags addressed the target:
+// a suggested command that dropped them would name a different database than
+// the refusal is about, and it is meant to be copied and run.
+func WriteUnsafeChangesBlocked(changes []UnsafeChange, rerun string) {
 	if len(changes) > 0 {
 		fmt.Printf(glyph.Refused+" Apply blocked: %d unsafe change(s) detected\n", countUnsafeFindings(changes))
 		writeUnsafeChangesList(changes)
@@ -504,41 +573,68 @@ func WriteUnsafeChangesBlocked(changes []UnsafeChange, database, environment, sc
 	}
 	fmt.Println(glyph.Escalation + " To proceed with these destructive changes, re-run with --allow-unsafe:")
 	fmt.Println()
-	fmt.Printf("  %s apply -s %s -e %s --allow-unsafe\n", cliname.Name(), schemaDir, environment)
+	fmt.Printf("  %s %s\n", cliname.Name(), rerun)
 	fmt.Println()
 }
 
-// WriteUnsafeWarningAllowed writes a warning when --allow-unsafe is used.
-func WriteUnsafeWarningAllowed(changes []UnsafeChange) {
+// UnsafeChangesBlockedSummary is WriteUnsafeChangesBlocked on one line, for a
+// refusal with nowhere to print the list, such as JSON output: the same count
+// and findings, and the command that permits them, starting with the binary
+// name so it runs as pasted. rerun is built as for WriteUnsafeChangesBlocked.
+func UnsafeChangesBlockedSummary(changes []UnsafeChange, rerun string) string {
+	findings := unsafeFindingLines(changes)
+	return fmt.Sprintf("apply blocked: %d unsafe change(s) detected (%s); to proceed with these destructive changes, re-run with: %s %s",
+		len(findings), strings.Join(findings, "; "), cliname.Name(), rerun)
+}
+
+// WriteUnsafeWarningAllowed writes a warning when destructive changes are
+// permitted and will run.
+//
+// consent names what permitted them, in the heading, because that is the fact
+// an operator checks the heading for. It is not always a flag on the line: a
+// deployment can carry standing permission of its own, and a heading naming a
+// flag nobody passed would send them looking for it in their shell history.
+func WriteUnsafeWarningAllowed(changes []UnsafeChange, consent string) {
 	if len(changes) == 0 {
 		return
 	}
 	fmt.Println()
-	fmt.Println(glyph.Escalation + " Unsafe Changes (--allow-unsafe enabled)")
+	fmt.Printf("%s Unsafe Changes (%s)\n", glyph.Escalation, consent)
 	fmt.Println()
 	fmt.Println("The following unsafe changes will be applied:")
 	writeUnsafeChangesList(changes)
 	fmt.Println()
 }
 
+// UnsafeConsentAllowFlag is what permitted a schema change apply's destructive
+// changes: the flag, which is the only way to permit them there.
+const UnsafeConsentAllowFlag = "--allow-unsafe enabled"
+
 // writeUnsafeChangesList writes the unsafe changes one numbered line per
 // finding, the same list shape as the PR plan comment, so a heading's count
 // always equals the number of lines below it and a finding can be referenced
 // by its number.
 func writeUnsafeChangesList(changes []UnsafeChange) {
-	n := 0
+	for i, finding := range unsafeFindingLines(changes) {
+		fmt.Printf("  %d. %s\n", i+1, finding)
+	}
+}
+
+// unsafeFindingLines is each unsafe finding as "table: finding", in the order
+// the list numbers them.
+func unsafeFindingLines(changes []UnsafeChange) []string {
+	var lines []string
 	for _, c := range changes {
-		reasons := ui.LintReasons(c.Reason)
+		reasons := unsafeChangeFindings(c)
 		if len(reasons) == 0 {
-			n++
-			fmt.Printf("  %d. %s: %s\n", n, c.Table, c.ChangeType)
+			lines = append(lines, c.Table+": "+c.ChangeType)
 			continue
 		}
 		for _, r := range reasons {
-			n++
-			fmt.Printf("  %d. %s: %s\n", n, c.Table, r)
+			lines = append(lines, c.Table+": "+r)
 		}
 	}
+	return lines
 }
 
 // countUnsafeFindings sums the individual findings across changes so the
@@ -549,11 +645,26 @@ func writeUnsafeChangesList(changes []UnsafeChange) {
 func countUnsafeFindings(changes []UnsafeChange) int {
 	n := 0
 	for _, c := range changes {
-		if reasons := ui.LintReasons(c.Reason); len(reasons) > 0 {
+		if reasons := unsafeChangeFindings(c); len(reasons) > 0 {
 			n += len(reasons)
 		} else {
 			n++
 		}
 	}
 	return n
+}
+
+// unsafeChangeFindings is a change's findings, as the list and its count both
+// see them — one function so a heading that counts N always sits above N lines.
+//
+// A producer that separated its own findings has already said what they are.
+// The engine-reported reason is split instead because it is a concatenation of
+// findings (see ui.LintReasons), and splitting one that was written as a
+// sentence would cut it in half at its semicolon and render each half as a
+// finding of its own.
+func unsafeChangeFindings(c UnsafeChange) []string {
+	if len(c.Reasons) > 0 {
+		return c.Reasons
+	}
+	return ui.LintReasons(c.Reason)
 }

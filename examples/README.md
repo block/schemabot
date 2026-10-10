@@ -1,3 +1,20 @@
+# Try SchemaBot
+
+From a fresh project directory, run `schemabot init` and choose a sample MySQL or PostgreSQL
+database. Docker supplies the database; SchemaBot handles the connection and imports two sample
+tables. Edit a schema file, preview with `schemabot plan`, and apply when ready. The wizard prints
+the exact command and profile for your project.
+
+From this repository, `make demo` creates a reusable project in `.schemabot-demo/mysql` and starts the MySQL sample.
+Use `make demo ENGINE=postgres` for PostgreSQL in `.schemabot-demo/postgres`.
+Repeating either command retries setup in the same project without overwriting files.
+Setup verifies a matching baseline; after editing SQL, continue with `plan` and `apply`
+in the project directory instead of rerunning setup. Neither path starts Vitess. See the
+[initialization guide](../docs/init.md#try-without-a-database) for lifecycle and cleanup details.
+
+The full developer environment remains available as `make demo-full`; the sections below
+cover those multi-environment examples.
+
 # Examples
 
 ## MySQL Test Schema
@@ -6,12 +23,14 @@ The `mysql/schema/testapp/` directory contains example SQL files and a `schemabo
 
 ### Quick Start
 
+Run these commands from the repository root. The demo starts local MySQL containers, applies the sample schema, and seeds data.
+
 ```bash
 # Install the CLI
 make install
 
 # Start local environment (applies schema and seeds 10k rows)
-make demo
+make demo-full
 ```
 
 ### Using the CLI
@@ -38,13 +57,16 @@ schemabot apply -y --endpoint http://localhost:13370
 ### Connect to MySQL
 
 ```bash
-make mysql DB=testapp
+make mysql               # SchemaBot storage (port 13371)
+make mysql DB=staging    # Staging testapp (port 13372)
+make mysql DB=production # Production testapp (port 13373)
 ```
 
 | Service | Endpoint |
 |---------|----------|
 | SchemaBot API | http://localhost:13370 |
-| TestApp MySQL | localhost:13372 |
+| Staging TestApp MySQL | localhost:13372 |
+| Production TestApp MySQL | localhost:13373 |
 | SchemaBot MySQL | localhost:13371 |
 
 Credentials: `root` / `testpassword`

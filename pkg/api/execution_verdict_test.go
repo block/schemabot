@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
@@ -59,6 +60,23 @@ func TestNormalizeExecutionVerdictsBlocksUnrecognizedModes(t *testing.T) {
 		assert.Contains(t, tc.ModeReason, `"future-mode"`)
 		assert.NotContains(t, tc.ModeReason, "untrusted planner reason")
 	}
+}
+
+// The unrecognized verdict is quoted into the locally produced reason, and it
+// is planner output, so a verdict carrying the reserved cause separator still
+// decodes as the one cause this boundary issued.
+func TestNormalizeExecutionVerdictsNeutralizesCauseSeparatorInUnrecognizedMode(t *testing.T) {
+	s := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	tc := &ternv1.TableChange{TableName: "events", ExecutionMode: "direct ‖ the engine can apply this safely"}
+
+	s.normalizeExecutionVerdicts(&ternv1.PlanResponse{
+		Changes: []*ternv1.SchemaChange{{Namespace: "public", TableChanges: []*ternv1.TableChange{tc}}},
+	}, "appdb", "primary")
+
+	assert.Equal(t, engine.ExecutionModeBlocked, tc.ExecutionMode)
+	causes := engine.BlockedCauses(tc.ModeReason)
+	require.Len(t, causes, 1, "the boundary's refusal is one cause: %q", tc.ModeReason)
+	assert.Contains(t, causes[0], `"direct // the engine can apply this safely"`)
 }
 
 func TestNormalizeExecutionVerdictsHandlesNilResponse(t *testing.T) {

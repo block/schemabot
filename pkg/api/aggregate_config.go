@@ -3,6 +3,8 @@ package api
 import (
 	"fmt"
 	"strings"
+
+	"github.com/block/schemabot/pkg/storage"
 )
 
 // Aggregate-check roles for a repository. In a multi-tenant aggregate check,
@@ -65,7 +67,7 @@ func (c *ServerConfig) AggregateRoleForRepo(repo string) string {
 	if c == nil {
 		return ""
 	}
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok || repoConfig.Aggregate == nil {
 		return ""
 	}
@@ -107,7 +109,7 @@ func (c *ServerConfig) ExpectedParticipantChecksForPR(repo string, changedFiles 
 	if c == nil {
 		return nil
 	}
-	repoConfig, ok := c.Repos[repo]
+	repoConfig, ok := c.Repos[storage.CanonicalKey(repo)]
 	if !ok || !repoConfig.Aggregate.isLeader() {
 		return nil
 	}
@@ -118,6 +120,19 @@ func (c *ServerConfig) ExpectedParticipantChecksForPR(repo string, changedFiles 
 		}
 	}
 	return expected
+}
+
+// ExpectedTenantManagesSchemaPath reports whether an expected participant on
+// repo manages schemaPath: whether it falls under one of the path prefixes the
+// leader's expected-tenant set declares for some participant, with the same
+// directory-prefix matching as databases.<db>.allowed_dirs. This is how the
+// leader tells "another deployment owns this schema" from "no deployment
+// does": its own registry covers only its slice of the fleet, and the
+// expected-tenant set is its only view of every other slice. Always false when
+// this deployment is not the leader for repo, since only the leader holds the
+// expected set.
+func (c *ServerConfig) ExpectedTenantManagesSchemaPath(repo, schemaPath string) bool {
+	return len(c.ExpectedParticipantChecksForPR(repo, []string{schemaPath})) > 0
 }
 
 // anyPathCovered reports whether any changed file falls under one of dirs, using

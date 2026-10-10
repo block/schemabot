@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,6 +44,193 @@ func TestTableNameCapsAtMySQLLimit(t *testing.T) {
 	parsed, ok := ParseTimestamp(name)
 	require.True(t, ok)
 	assert.Equal(t, now, parsed)
+}
+
+func TestTableNameCountsCharactersAndPreservesUTF8(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 0, time.UTC)
+	table := strings.Repeat("é", 40)
+
+	name := TableName("app", table, now)
+
+	assert.Equal(t, "20260610143022000_"+table, name)
+	assert.Equal(t, 58, len([]rune(name)))
+	assert.True(t, strings.Contains(name, table))
+
+	truncated := TableName("app", strings.Repeat("é", 80), now)
+	assert.True(t, utf8.ValidString(truncated))
+	assert.Equal(t, 64, len([]rune(truncated)))
+}
+
+func TestDestinationsAreUniqueWithinOneMove(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 123*int(time.Millisecond), time.UTC)
+	// 44 characters: Spirit's "_<t>_new" and "_<t>_old" differ only after the
+	// 46th character, so plain truncation gives both the same name.
+	longTable := strings.Repeat("t", 44)
+
+	tests := []struct {
+		name   string
+		tables []TableMove
+	}{
+		{
+			name: "shadow and cutover original of a long table name",
+			tables: []TableMove{
+				{SchemaName: "app", TableName: "_" + longTable + "_new"},
+				{SchemaName: "app", TableName: "_" + longTable + "_old"},
+			},
+		},
+		{
+			name: "two tables sharing their first 46 characters",
+			tables: []TableMove{
+				{SchemaName: "app", TableName: strings.Repeat("a", 46) + "_archive"},
+				{SchemaName: "app", TableName: strings.Repeat("a", 46) + "_backup"},
+			},
+		},
+		{
+			name: "same table name in two schemas",
+			tables: []TableMove{
+				{SchemaName: "s1", TableName: "users"},
+				{SchemaName: "s2", TableName: "users"},
+			},
+		},
+		{
+			name: "same table name in two schemas differing only in case",
+			tables: []TableMove{
+				{SchemaName: "s1", TableName: "Users"},
+				{SchemaName: "s2", TableName: "users"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			moved, err := Destinations(tt.tables, now)
+			require.NoError(t, err)
+			require.Len(t, moved, len(tt.tables))
+
+			seen := make(map[string]string, len(moved))
+			for _, table := range moved {
+				key := strings.ToLower(table.QuarantineTable)
+				prior, dup := seen[key]
+				assert.False(t, dup, "%s.%s and %s share quarantine name %q",
+					table.SchemaName, table.TableName, prior, table.QuarantineTable)
+				seen[key] = table.SchemaName + "." + table.TableName
+
+				assert.LessOrEqual(t, len(table.QuarantineTable), 64)
+				assert.Equal(t, Database, table.QuarantineSchema)
+				parsed, ok := ParseTimestamp(table.QuarantineTable)
+				require.True(t, ok, "cleaner must recognize %q", table.QuarantineTable)
+				assert.Equal(t, now, parsed)
+			}
+
+			again, err := Destinations(tt.tables, now)
+			require.NoError(t, err)
+			assert.Equal(t, moved, again, "destinations must be deterministic")
+		})
+	}
+}
+
+func TestDestinationsKeepPlainNameWhenNoCollision(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 123*int(time.Millisecond), time.UTC)
+	moved, err := Destinations([]TableMove{
+		{SchemaName: "app", TableName: "users"},
+		{SchemaName: "app", TableName: "orders"},
+		{SchemaName: "app", TableName: strings.Repeat("c", 46)},
+	}, now)
+	require.NoError(t, err)
+	require.Len(t, moved, 3)
+	assert.Equal(t, "20260610143022123_users", moved[0].QuarantineTable)
+	assert.Equal(t, "20260610143022123_orders", moved[1].QuarantineTable)
+	assert.Equal(t, "20260610143022123_"+strings.Repeat("c", 46), moved[2].QuarantineTable)
+}
+
+func TestDestinationsProgressPastHashPrefixCollision(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 123*int(time.Millisecond), time.UTC)
+	tables := []TableMove{
+		{SchemaName: "app", TableName: strings.Repeat("a", 55) + "018256"},
+		{SchemaName: "app", TableName: strings.Repeat("a", 55) + "029916"},
+	}
+
+	moved, err := Destinations(tables, now)
+	require.NoError(t, err)
+
+	require.Len(t, moved, 2)
+	assert.NotEqual(t, strings.ToLower(moved[0].QuarantineTable), strings.ToLower(moved[1].QuarantineTable))
+	assert.Equal(t, 64, len([]rune(moved[0].QuarantineTable)))
+	assert.Equal(t, 64, len([]rune(moved[1].QuarantineTable)))
+	again, err := Destinations(tables, now)
+	require.NoError(t, err)
+	assert.Equal(t, moved, again)
+}
+
+// A candidate generator that repeats itself must surface as an error from the
+// move, not as a loop the drive goroutine never leaves. The bound scales with
+// the move, so a generator whose candidates are all distinct is never cut off:
+// a move of n tables can need at most n-1 retries for any one destination.
+func TestDestinationsFailInsteadOfLoopingWhenCandidatesRepeat(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 123*int(time.Millisecond), time.UTC)
+	tables := []TableMove{
+		{SchemaName: "s1", TableName: "users"},
+		{SchemaName: "s2", TableName: "users"},
+	}
+
+	t.Run("repeating candidates return an error", func(t *testing.T) {
+		calls := 0
+		_, err := destinations(tables, now, func(table TableMove, attempt int) string {
+			calls++
+			return TableName(table.SchemaName, table.TableName, now) // never changes
+		})
+		require.ErrorContains(t, err, "no unique quarantine name for s2.users")
+		assert.Equal(t, len(tables)+destinationAttemptSlack, calls, "the loop stops at the bound")
+	})
+
+	t.Run("a fresh candidate on the last permitted attempt is admitted", func(t *testing.T) {
+		// Every candidate repeats the first table's name until the last attempt
+		// the bound allows, which offers a fresh one. One attempt later would
+		// be the error above, so this pins the bound's edge.
+		lastAttempt := len(tables) + destinationAttemptSlack - 1
+		moved, err := destinations(tables, now, func(table TableMove, attempt int) string {
+			if attempt < lastAttempt {
+				return TableName("s1", "users", now)
+			}
+			return TableName(table.SchemaName, table.TableName, now) + "_fresh"
+		})
+		require.NoError(t, err)
+		require.Len(t, moved, 2)
+		assert.Equal(t, TableName("s2", "users", now)+"_fresh", moved[1].QuarantineTable)
+	})
+}
+
+// Every attempt stays within the identifier limit and yields a distinct name,
+// including the attempts where the hash alone would overrun the room left
+// after the timestamp prefix.
+func TestDisambiguatedTableNameStaysDistinctAndBoundedAcrossAttempts(t *testing.T) {
+	prefix := timestampPrefix(time.Date(2026, 6, 10, 14, 30, 22, 0, time.UTC))
+	seen := make(map[string]struct{})
+	for attempt := range 120 {
+		name := disambiguatedTableName(prefix, "app", strings.Repeat("a", 80), attempt)
+		assert.LessOrEqual(t, utf8.RuneCountInString(name), 64, "attempt %d", attempt)
+		assert.True(t, strings.HasPrefix(name, prefix), "attempt %d: %s", attempt, name)
+		_, dup := seen[name]
+		assert.False(t, dup, "attempt %d repeated %s", attempt, name)
+		seen[name] = struct{}{}
+		assert.Equal(t, name, disambiguatedTableName(prefix, "app", strings.Repeat("a", 80), attempt))
+	}
+}
+
+func TestTableNameDisambiguatesTruncatedNamesBySource(t *testing.T) {
+	now := time.Date(2026, 6, 10, 14, 30, 22, 0, time.UTC)
+	longTable := strings.Repeat("a", 80)
+
+	first := TableName("s1", longTable, now)
+	otherSchema := TableName("s2", longTable, now)
+	otherTable := TableName("s1", longTable+"b", now)
+
+	assert.NotEqual(t, first, otherSchema)
+	assert.NotEqual(t, first, otherTable)
+	assert.Equal(t, first, TableName("s1", longTable, now))
+	for _, name := range []string{first, otherSchema, otherTable} {
+		assert.Len(t, name, 64)
+		assert.True(t, strings.HasPrefix(name, "20260610143022000_aaaa"), name)
+	}
 }
 
 func TestParseTimestampRejectsInvalidNames(t *testing.T) {

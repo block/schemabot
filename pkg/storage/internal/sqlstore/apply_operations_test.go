@@ -5,11 +5,13 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,29 +68,6 @@ func TestApplyOperationStore_InsertAndGet(t *testing.T) {
 	assert.NotZero(t, got.UpdatedAt)
 }
 
-func TestApplyOperationStore_SaveExternalOperationID(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApply(t, store, lock, "apply_save_external_operation", 1)
-
-	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID:    apply.ID,
-		Deployment: "region-a",
-		Target:     "payments",
-	})
-	require.NoError(t, err)
-
-	require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
-
-	got, err := store.ApplyOperations().Get(ctx, operationID)
-	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.Equal(t, "remote-operation-1", got.ExternalOperationID)
-}
-
 func TestApplyOperationStore_SaveExternalID(t *testing.T) {
 	clearTables(t)
 	ctx := t.Context()
@@ -104,7 +83,7 @@ func TestApplyOperationStore_SaveExternalID(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
 	require.NoError(t, err)
@@ -138,7 +117,7 @@ func TestApplyOperationStore_SaveExternalIDSharesDeploymentRemoteApply(t *testin
 	})
 	require.NoError(t, err)
 
-	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a"))
+	require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a", ""))
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
 	require.NoError(t, err)
@@ -178,7 +157,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesDeploymentConflict(t *testing.
 			})
 			require.NoError(t, err)
 
-			err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other")
+			err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other", "")
 			require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
 			assert.Contains(t, err.Error(), `"remote-apply-a"`)
 			assert.Contains(t, err.Error(), `"remote-apply-other"`)
@@ -212,7 +191,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesReplayWhenSiblingsDiverged(t *
 	})
 	require.NoError(t, err)
 
-	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other")
+	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-other", "")
 	require.ErrorIs(t, err, storage.ErrRemoteApplyDeploymentIDConflict)
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
@@ -238,7 +217,7 @@ func TestApplyOperationStore_SaveExternalIDRefusesForeignOperation(t *testing.T)
 	})
 	require.NoError(t, err)
 
-	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a")
+	err = store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-a", "")
 	require.ErrorIs(t, err, storage.ErrApplyOperationNotFound)
 
 	got, err := store.ApplyOperations().Get(ctx, operationID)
@@ -287,11 +266,11 @@ func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
 		{"state transition", func(t *testing.T) {
 			require.NoError(t, store.ApplyOperations().UpdateState(ctx, operationID, state.ApplyOperation.Running))
 		}},
-		{"save external operation id", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalOperationID(ctx, operationID, "remote-operation-1"))
-		}},
 		{"save external id", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
+		}},
+		{"save external id with its remote operation", func(t *testing.T) {
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", "remote-operation-1"))
 		}},
 		{"save engine resume state", func(t *testing.T) {
 			require.NoError(t, store.ApplyOperations().SaveEngineResumeState(ctx, operationID, &storage.EngineResumeState{
@@ -301,7 +280,7 @@ func TestApplyOperationStore_WritesStampUpdatedAt(t *testing.T) {
 			}))
 		}},
 		{"identical-value replay", func(t *testing.T) {
-			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1"))
+			require.NoError(t, store.ApplyOperations().SaveExternalID(ctx, apply.ID, operationID, "remote-apply-1", ""))
 		}},
 	}
 	for _, w := range writes {
@@ -457,6 +436,34 @@ func TestApplyOperationStore_EngineResumeState(t *testing.T) {
 	assert.Equal(t, "ctx-123", operation.EngineResumeContext)
 	assert.JSONEq(t, initial.Metadata, operation.EngineResumeMetadata)
 
+	progressMetadata := map[string]string{
+		"phase":       "copying",
+		"step":        "3",
+		"steps_total": "8",
+		"statement":   "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)",
+	}
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(ctx, operationID, progressMetadata))
+	operation, err = store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, operation)
+	var storedProgressMetadata map[string]string
+	require.NoError(t, json.Unmarshal([]byte(operation.ProgressMetadata), &storedProgressMetadata))
+	assert.Equal(t, progressMetadata, storedProgressMetadata)
+
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(ctx, operationID, nil))
+	operation, err = store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, operation)
+	assert.Equal(t, `{}`, operation.ProgressMetadata)
+	storedProgressMetadata = nil
+	require.NoError(t, json.Unmarshal([]byte(operation.ProgressMetadata), &storedProgressMetadata))
+	assert.NotNil(t, storedProgressMetadata)
+	assert.Empty(t, storedProgressMetadata)
+	parsedProgressMetadata, err := operation.ParseProgressMetadata()
+	require.NoError(t, err)
+	assert.NotNil(t, parsedProgressMetadata)
+	assert.Empty(t, parsedProgressMetadata)
+
 	updated := &storage.EngineResumeState{
 		ApplyOperationID: operationID,
 		MigrationContext: "ctx-456",
@@ -468,6 +475,60 @@ func TestApplyOperationStore_EngineResumeState(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ctx-456", retrieved.MigrationContext)
 	assert.JSONEq(t, updated.Metadata, retrieved.Metadata)
+}
+
+// The production MySQL pool interpolates parameters client-side, so a JSON
+// column write only succeeds when the driver renders the argument as a
+// character-set string literal rather than a _binary one. This test drives the
+// progress-metadata write through that connection shape; the shared test pool
+// uses server-side prepared statements and cannot observe the difference.
+func TestApplyOperationStore_SaveProgressMetadata_InterpolatedParams(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := newInterpolatedParamsStore(t)
+
+	lock := createTestLock(t, store, "testdb", storage.DatabaseTypeMySQL)
+	apply := createTestApply(t, store, lock, "apply_op_progress_interpolated", 1)
+	operationID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID:    apply.ID,
+		Deployment: "region-a",
+		Target:     "payments",
+	})
+	require.NoError(t, err)
+
+	progressMetadata := map[string]string{
+		"phase":     "copying",
+		"step":      "2",
+		"statement": "ALTER TABLE `orders` ADD COLUMN `status` varchar(32)",
+	}
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(ctx, operationID, progressMetadata))
+
+	operation, err := store.ApplyOperations().Get(ctx, operationID)
+	require.NoError(t, err)
+	require.NotNil(t, operation)
+	stored, err := operation.ParseProgressMetadata()
+	require.NoError(t, err)
+	assert.Equal(t, progressMetadata, stored)
+}
+
+// newInterpolatedParamsStore opens a store whose Go MySQL driver interpolates
+// parameters client-side, matching how mysqlconn configures the production
+// pool, so JSON-column writes are exercised under that argument rendering.
+func newInterpolatedParamsStore(t *testing.T) *Storage {
+	t.Helper()
+	cfg, err := mysql.ParseDSN(testDSNChangedRows)
+	require.NoError(t, err)
+	cfg.InterpolateParams = true
+	dsn := cfg.FormatDSN()
+	require.Contains(t, dsn, "interpolateParams=true",
+		"the store under test must interpolate client-side, or it cannot observe the binding")
+	db, err := sql.Open("block-mysql", dsn)
+	require.NoError(t, err)
+	require.NoError(t, db.PingContext(t.Context()))
+	t.Cleanup(func() {
+		require.NoError(t, db.Close())
+	})
+	return NewMySQL(db)
 }
 
 func TestApplyOperationStore_EngineResumeStateMissingOperation(t *testing.T) {
@@ -1178,9 +1239,9 @@ func TestApplyOperationStore_FindNextApplyOperation_TerminalParentDoesNotBlockNe
 
 // TestApplyOperationStore_FindNextApplyOperation_StoppedParentResumesThroughStoppedRow
 // verifies the resume path for a stopped rollout with a not-yet-started sibling
-// under a parallel cutover policy (which has no earlier-sibling gate, so the
-// parent's state is the only thing standing between the pending row and a
-// claim). A pending start request makes the stopped apply claimable again, and
+// under a parallel cutover policy (which leaves copy starts unordered when no
+// earlier member has failed, so only the parent's state holds the pending row).
+// A pending start request makes the stopped apply claimable again, and
 // the whole rollout resumes with it: the stopped operation — the row that was
 // already under way — is claimed first, and the not-yet-started sibling is
 // claimable behind it.
@@ -1604,7 +1665,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaimsStoppedWithP
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
-		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		db, openErr := sql.Open("block-mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
@@ -2145,6 +2206,12 @@ func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecovery
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	// The crashed driver stopped heartbeating this row too, so it is stale
+	// alongside its parent.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "recovery-operator")
 	require.NoError(t, err)
@@ -2261,6 +2328,12 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentA
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	// The crashed driver stopped heartbeating this row too, so it is stale
+	// alongside its parent.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
@@ -2291,11 +2364,111 @@ func TestApplyOperationStore_FindNextApplyOperation_ClaimsFailedRetryableParentA
 		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
 	})
 	require.NoError(t, err)
+	// The crashed driver stopped heartbeating this row too, so it is stale
+	// alongside its parent.
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
 
 	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
 	require.NoError(t, err)
 	require.NotNil(t, claimed, "a crashed retry must be recoverable even with the budget spent; the attempt was already counted")
 	assert.Equal(t, id, claimed.ID)
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryAdmitsOneDriverPerWindow
+// verifies that recovering a crashed retry admits exactly one driver per
+// staleness window. Leasing the operation and claiming its parent apply are
+// separate transactions, so the parent stays active-and-stale for the whole gap
+// between them. Every peer polling inside that gap sees the same crash-recovery
+// shape, and if they could all lease the row they would each rotate its token —
+// leaving whichever driver went on to win the parent lease holding a superseded
+// operation token, so its first operation-scoped write is refused and the drive
+// ends having done nothing. Because a driver that loses the parent claim
+// releases its operation lease (which backdates the row past the window), that
+// race would re-run identically every window and the apply could never
+// terminalize.
+func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryAdmitsOneDriverPerWindow(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_fr_crash_one_driver", 1, state.Apply.Running, "staging")
+	// Parent claimed for retry then crashed: running, budget remaining, stale.
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET state = ?, attempt = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, state.Apply.Running, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+	require.NoError(t, err)
+	require.NotNil(t, first, "the first driver must recover the crashed retry")
+	require.Equal(t, id, first.ID)
+
+	// driver-a holds the operation lease but has not reached ClaimApplyByID yet,
+	// so the parent apply is still active and stale.
+	second, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+	require.NoError(t, err)
+	assert.Nil(t, second, "a peer polling between the operation claim and the parent claim must not re-lease the recovering operation")
+
+	persisted, err := store.ApplyOperations().Get(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, persisted)
+	assert.Equal(t, "driver-a", persisted.LeaseOwner, "the recovering driver keeps the operation lease")
+	assert.Equal(t, first.LeaseToken, persisted.LeaseToken, "the recovering driver's lease token must not be rotated out from under it")
+}
+
+// TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryHandsOffOnRelease
+// verifies the crash-recovery arm still hands off promptly: the driver that
+// leases the operation but cannot acquire the parent apply lease releases its
+// claim, and the peer holding the parent must be able to take the row on its
+// very next poll rather than waiting out a staleness window.
+func TestApplyOperationStore_FindNextApplyOperation_FailedRetryableCrashRecoveryHandsOffOnRelease(t *testing.T) {
+	clearTables(t)
+	ctx := t.Context()
+	store := NewMySQL(testDB)
+
+	lock := createTestLock(t, store, "testdb", "mysql")
+	apply := createTestApplyWithStateAndEnv(t, store, lock, "apply_op_fr_crash_handoff", 1, state.Apply.Running, "staging")
+	_, err := testDB.ExecContext(ctx, `
+		UPDATE applies SET state = ?, attempt = ?, updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, state.Apply.Running, maxRecoveryAttempts-1, apply.ID)
+	require.NoError(t, err)
+
+	id, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+		ApplyID: apply.ID, Deployment: "region-a", State: state.ApplyOperation.FailedRetryable,
+	})
+	require.NoError(t, err)
+	_, err = testDB.ExecContext(ctx, `
+		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 2 MINUTE WHERE id = ?
+	`, id)
+	require.NoError(t, err)
+
+	blocked, err := store.ApplyOperations().FindNextApplyOperation(ctx, "blocked-driver")
+	require.NoError(t, err)
+	require.NotNil(t, blocked)
+
+	released, err := store.ApplyOperations().ReleaseClaim(ctx, blocked.Lease())
+	require.NoError(t, err)
+	require.True(t, released)
+
+	reclaimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "parent-holder")
+	require.NoError(t, err)
+	require.NotNil(t, reclaimed, "a released crash-recovery row must be claimable on the next poll without aging")
+	assert.Equal(t, id, reclaimed.ID)
+	assert.Equal(t, "parent-holder", reclaimed.LeaseOwner)
+	assert.Equal(t, state.ApplyOperation.FailedRetryable, reclaimed.State, "the handoff must not change the row's state")
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_RecoversStaleSetupPhase
@@ -2363,7 +2536,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentClaims(t *testing.
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
-		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		db, openErr := sql.Open("block-mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
@@ -2531,7 +2704,7 @@ func TestApplyOperationStore_FindNextApplyOperation_ConcurrentDriversClaimDistin
 	const drivers = 16
 	stores := make([]*Storage, drivers)
 	for i := range drivers {
-		db, openErr := sql.Open("mysql", testDSNChangedRows)
+		db, openErr := sql.Open("block-mysql", testDSNChangedRows)
 		require.NoError(t, openErr)
 		db.SetMaxOpenConns(1)
 		db.SetMaxIdleConns(1)
@@ -3455,42 +3628,119 @@ func TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastRunningSib
 	assert.Equal(t, "region-b", claimed.Deployment)
 }
 
-// TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling
-// verifies that parallel drops copy-phase ordering entirely: a terminal-failed
-// earlier sibling does not block a later deployment's copy start, because the
-// copy gate has no earlier-sibling arm for parallel at all. Cutover ordering
-// (where halt-on-failure still applies) is enforced separately on the cutover
-// claim path.
-func TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
+// TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesMemberOrderToTheDispatcher
+// verifies that the copy-start gate between rollout members applies only
+// where the members were ordered: on an apply a dispatcher created (it carries
+// the dispatch's idempotency key), each member target arrives as its own
+// dispatch once the dispatcher has decided it may start, under the default
+// rolling policy the data plane's operations carry. Gating it again here
+// would serialize a parallel rollout and could strand a member behind a
+// sibling the dispatcher has already let fail. A keyless apply keeps the gate.
+func TestApplyOperationStore_FindNextApplyOperation_DispatchedApplyLeavesMemberOrderToTheDispatcher(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		idempotencyKey string
+		wantClaimed    bool
+	}{
+		{name: "apply ordered here", wantClaimed: false},
+		{name: "dispatched apply", idempotencyKey: "schemabot:v1:dispatched", wantClaimed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
 
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApply(t, store, lock, "apply_op_parallel_failed", 1)
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApply(t, store, lock, "apply_op_member_order", 1)
+			if tc.idempotencyKey != "" {
+				_, err := testDB.ExecContext(ctx, `UPDATE applies SET idempotency_key = ? WHERE id = ?`, tc.idempotencyKey, apply.ID)
+				require.NoError(t, err)
+			}
 
-	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a",
-		State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel,
-	})
-	require.NoError(t, err)
-	regionBID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyParallel,
-	})
-	require.NoError(t, err)
+			// payments-001 is still copying (running, fresh so not
+			// stale-reclaimable); payments-002 is pending behind it. Both
+			// leave CutoverPolicy unset, so it resolves to rolling.
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-001", OperationKey: "payments-001",
+				State: state.ApplyOperation.Running,
+			})
+			require.NoError(t, err)
+			secondID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002", OperationKey: "payments-002",
+			})
+			require.NoError(t, err)
 
-	// Backdate the failed row so staleness can't be confused with the reason the
-	// later row is claimable; parallel claims past it on copy regardless.
-	_, err = testDB.ExecContext(ctx, `
-		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
-	`, failedID)
-	require.NoError(t, err)
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.wantClaimed {
+				assert.Nil(t, claimed, "a rolling member of an apply ordered here waits for the earlier member to complete")
+				return
+			}
+			require.NotNil(t, claimed, "a dispatched member starts when it arrives; the dispatcher already ordered it")
+			assert.Equal(t, secondID, claimed.ID)
+			assert.Equal(t, "payments-002", claimed.Target)
+		})
+	}
+}
 
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
-	require.NoError(t, err)
-	require.NotNil(t, claimed, "parallel must let a later deployment copy past a failed earlier sibling")
-	assert.Equal(t, regionBID, claimed.ID)
-	assert.Equal(t, "region-b", claimed.Deployment)
+// TestApplyOperationStore_FindNextApplyOperation_DispatchedMemberFinalizerLeavesMemberOrderToTheDispatcher
+// verifies the finalizer start gate's half of the same rule. payments-002's
+// work has completed and its group_finalizer is pending while payments-001 is
+// still copying. On an apply a dispatcher created, payments-002's finalizer
+// starts, since the dispatcher already ordered the members; on an apply
+// ordered here it waits for payments-001. Either way it still waits for its
+// own target's work, which member order never relaxes.
+func TestApplyOperationStore_FindNextApplyOperation_DispatchedMemberFinalizerLeavesMemberOrderToTheDispatcher(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		idempotencyKey string
+		ownWorkState   string
+		wantClaimed    bool
+	}{
+		{name: "apply ordered here", ownWorkState: state.ApplyOperation.Completed, wantClaimed: false},
+		{name: "dispatched apply", idempotencyKey: "schemabot:v1:dispatched", ownWorkState: state.ApplyOperation.Completed, wantClaimed: true},
+		{name: "dispatched apply with its own work still copying", idempotencyKey: "schemabot:v1:dispatched", ownWorkState: state.ApplyOperation.Running, wantClaimed: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearTables(t)
+			ctx := t.Context()
+			store := NewMySQL(testDB)
+
+			lock := createTestLock(t, store, "testdb", "mysql")
+			apply := createTestApply(t, store, lock, "apply_op_member_finalizer_order", 1)
+			if tc.idempotencyKey != "" {
+				_, err := testDB.ExecContext(ctx, `UPDATE applies SET idempotency_key = ? WHERE id = ?`, tc.idempotencyKey, apply.ID)
+				require.NoError(t, err)
+			}
+
+			_, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-001", OperationKey: "payments-001",
+				State: state.ApplyOperation.Running,
+			})
+			require.NoError(t, err)
+			_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002", OperationKey: "payments-002",
+				State: tc.ownWorkState,
+			})
+			require.NoError(t, err)
+			finalizerID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+				ApplyID: apply.ID, Deployment: "default", Target: "payments-002",
+				OperationKey:  storage.TargetOperationKey("payments-002", "group_finalizer"),
+				OperationKind: storage.ApplyOperationKindGroupFinalizer,
+			})
+			require.NoError(t, err)
+
+			claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
+			require.NoError(t, err)
+			if !tc.wantClaimed {
+				assert.Nil(t, claimed, "payments-002's finalizer must wait")
+				return
+			}
+			require.NotNil(t, claimed, "a dispatched member's finalizer starts once its own work has completed")
+			assert.Equal(t, finalizerID, claimed.ID)
+			assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
+		})
+	}
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_BarrierHaltsOnFailedSibling
@@ -4488,6 +4738,20 @@ func TestApplyOperationStore_LeaseGuardsWrites(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resumeAfterCurrent)
 	assert.Equal(t, "current-context", resumeAfterCurrent.EngineResumeContext)
+
+	progressID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-progress-metadata")
+	stampOperationLease(t, progressID, "driver", "op-token")
+	invalidProgressCtx := storage.WithOperationLease(ctx, storage.OperationLease{ApplyID: apply.ID, OperationID: progressID, Owner: "driver"})
+	require.ErrorIs(t, store.ApplyOperations().SaveProgressMetadata(invalidProgressCtx, progressID, map[string]string{"step": "1"}), storage.ErrApplyLeaseLost)
+	require.ErrorIs(t, store.ApplyOperations().SaveProgressMetadata(staleCtx, progressID, map[string]string{"step": "2"}), storage.ErrApplyLeaseLost)
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(currentCtx, progressID, nil))
+	progressAfterCurrent, err := store.ApplyOperations().Get(ctx, progressID)
+	require.NoError(t, err)
+	require.NotNil(t, progressAfterCurrent)
+	parsedProgressMetadata, err := progressAfterCurrent.ParseProgressMetadata()
+	require.NoError(t, err)
+	assert.NotNil(t, parsedProgressMetadata)
+	assert.Empty(t, parsedProgressMetadata)
 	assert.JSONEq(t, `{"deploy_request_id":456}`, resumeAfterCurrent.EngineResumeMetadata)
 
 	otherID := createApplyOperationForLeaseTest(t, store, otherApply.ID, "region-other")
@@ -4608,6 +4872,11 @@ func TestApplyOperationStore_OperationLeaseGuardsWrites(t *testing.T) {
 	require.NotNil(t, resumeAfterCurrent)
 	assert.Equal(t, "current-context", resumeAfterCurrent.EngineResumeContext)
 
+	progressID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-progress-metadata")
+	stampOperationLease(t, progressID, "driver", "op-token")
+	require.ErrorIs(t, store.ApplyOperations().SaveProgressMetadata(opCtx(progressID, "stale-op-token"), progressID, map[string]string{"step": "2"}), storage.ErrApplyLeaseLost)
+	require.NoError(t, store.ApplyOperations().SaveProgressMetadata(opCtx(progressID, "op-token"), progressID, map[string]string{"step": "2"}))
+
 	// Operation lease takes precedence: even with a current apply lease also on
 	// the context, a stale operation token must fail closed.
 	precedenceID := createApplyOperationForLeaseTest(t, store, apply.ID, "op-precedence")
@@ -4648,7 +4917,7 @@ func assertApplyOperationState(t *testing.T, store *Storage, id int64, expected 
 }
 
 func TestApplyOperationStore_Heartbeat_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4690,7 +4959,7 @@ func TestApplyOperationStore_DeleteByApply(t *testing.T) {
 // DB error tests — mirror the pattern used by apply_comments_test.go.
 
 func TestApplyOperationStore_Insert_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4702,7 +4971,7 @@ func TestApplyOperationStore_Insert_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_Get_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4712,7 +4981,7 @@ func TestApplyOperationStore_Get_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_GetByApplyAndDeployment_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4722,7 +4991,7 @@ func TestApplyOperationStore_GetByApplyAndDeployment_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_ListByApply_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4732,7 +5001,7 @@ func TestApplyOperationStore_ListByApply_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_UpdateState_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4742,7 +5011,7 @@ func TestApplyOperationStore_UpdateState_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_MarkStarted_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4752,7 +5021,7 @@ func TestApplyOperationStore_MarkStarted_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_MarkCompleted_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4762,7 +5031,7 @@ func TestApplyOperationStore_MarkCompleted_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_MarkFailed_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -4772,7 +5041,7 @@ func TestApplyOperationStore_MarkFailed_DBError(t *testing.T) {
 }
 
 func TestApplyOperationStore_DeleteByApply_DBError(t *testing.T) {
-	db, err := sql.Open("mysql", testDSN)
+	db, err := sql.Open("block-mysql", testDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 

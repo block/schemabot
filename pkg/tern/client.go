@@ -27,6 +27,59 @@ var ErrNoTasksForApplyOperation = errors.New("no tasks found for apply operation
 // as an engine failure.
 var ErrApplyLeasePresumedLost = errors.New("apply lease presumed lost after heartbeat failures spanning the staleness window")
 
+// ErrOperatorShutdown is the cause the operator cancels its drives with when the
+// process shuts down. A drive handing its apply back for any other reason halts
+// the engine work it started in this process before it returns; one ended by
+// shutdown leaves that to the shutdown, which halts every in-process engine
+// itself once the drives have returned.
+var ErrOperatorShutdown = errors.New("operator is shutting down")
+
+type operatorShutdownKey struct{}
+
+// NewOperatorContext returns the context an operator runs its drives under and
+// the function that shuts them down, which cancels the drives with
+// ErrOperatorShutdown. A drive's context can end for other reasons first — a
+// lost lease, a stall, a hand-back, or the operator's parent context being
+// cancelled — and then its cause never says shutdown. So the signal that
+// shutdown has begun lives on a context of its own that only shutDown ends,
+// and a drive tearing down after any earlier cancellation still sees a
+// shutdown begin and leaves the teardown to it.
+func NewOperatorContext(parent context.Context) (ctx context.Context, shutDown func()) {
+	drives, cancelDrives := context.WithCancelCause(parent)
+	shutdown, signalShutdown := context.WithCancelCause(context.WithoutCancel(parent))
+	ctx = context.WithValue(drives, operatorShutdownKey{}, shutdown)
+	return ctx, func() {
+		signalShutdown(ErrOperatorShutdown)
+		cancelDrives(ErrOperatorShutdown)
+	}
+}
+
+// operatorShuttingDown reports whether the operator running this drive has
+// begun shutting down, read from the drive's own cancellation cause and from
+// the shutdown signal NewOperatorContext attached.
+func operatorShuttingDown(ctx context.Context) bool {
+	if errors.Is(context.Cause(ctx), ErrOperatorShutdown) {
+		return true
+	}
+	shutdown, ok := ctx.Value(operatorShutdownKey{}).(context.Context)
+	return ok && errors.Is(context.Cause(shutdown), ErrOperatorShutdown)
+}
+
+// afterOperatorShutdown arranges for f to run once the operator running this
+// drive begins shutting down, and returns a function that stops the
+// arrangement. A drive with no operator shutdown signal never runs f.
+func afterOperatorShutdown(ctx context.Context, f func()) (stop func() bool) {
+	shutdown, ok := ctx.Value(operatorShutdownKey{}).(context.Context)
+	if !ok {
+		return func() bool { return true }
+	}
+	return context.AfterFunc(shutdown, func() {
+		if errors.Is(context.Cause(shutdown), ErrOperatorShutdown) {
+			f()
+		}
+	})
+}
+
 // ErrApplyOperationRowMissing is returned by ResumeApplyOperation when tasks
 // scope to the operation but the apply_operation row itself is absent. It is a
 // distinct, more accurate cause than the no-tasks case, but wraps
@@ -50,6 +103,14 @@ var ErrPlanMissingForApplyOperation = fmt.Errorf("plan not found for apply opera
 // The drive fails closed and the apply stays claimable, so the work stays
 // visibly stuck until the rows load or an operator intervenes.
 var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader did not return")
+
+// ErrApplyTaskRowMissing is returned by a sequential drive whose pre-start
+// re-read of a task found no row. The drive loaded that task, so the apply is
+// undriveable, not done: the rows that remain would derive a verdict the
+// vanished task never earned. The drive exits without a verdict and the apply
+// stays claimable, so the work stays visibly stuck until the row is restored or
+// an operator intervenes.
+var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
@@ -172,7 +233,7 @@ type Client interface {
 // service do not implement it: that service owns its own engines and halts them
 // on its own shutdown.
 type ShutdownHalter interface {
-	// HaltForShutdown brings this client's in-flight schema-change work down,
+	// HaltForShutdown brings this client's in-flight schema change work down,
 	// checkpointed so another driver can resume it, and returns once its engine
 	// no longer holds the target. It is not an operator stop: the applies it
 	// halts stay active for reclaim.

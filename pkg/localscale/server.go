@@ -36,7 +36,6 @@ import (
 
 	"github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/ddl"
 	localscaleschema "github.com/block/schemabot/pkg/localscale/schema"
@@ -237,8 +236,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 
 			vtgateDBs := make(map[string]*sql.DB)
 			for _, ks := range dbCfg.Keyspaces {
-				dsn := fmt.Sprintf("root@tcp(%s)/%s", mc.vtgateMySQLAddr, ks.Name)
-				db, err := sql.Open("mysql", dsn)
+				db, err := openMySQL(fmt.Sprintf("root@tcp(%s)/", mc.vtgateMySQLAddr), ks.Name)
 				if err != nil {
 					closeDatabaseBackend(vtctld, vtgateDBs)
 					return nil, fmt.Errorf("connect to vtgate keyspace %s (%s/%s): %w", ks.Name, orgName, dbName, err)
@@ -252,7 +250,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 			}
 
 			// Create unscoped vtgate DB pool (no default keyspace) for shard-targeted connections.
-			unscopedDB, err := sql.Open("mysql", fmt.Sprintf("root@tcp(%s)/", mc.vtgateMySQLAddr))
+			unscopedDB, err := openMySQL(fmt.Sprintf("root@tcp(%s)/", mc.vtgateMySQLAddr), "")
 			if err != nil {
 				closeDatabaseBackend(vtctld, vtgateDBs)
 				return nil, fmt.Errorf("connect unscoped vtgate for %s/%s: %w", orgName, dbName, err)
@@ -1387,6 +1385,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 
 	// Deploy request CRUD endpoints
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/deploy-requests/{number}", s.handleError(s.handleGetDeployRequest))
+	mux.HandleFunc("PATCH /v1/organizations/{org}/databases/{db}/deploy-requests/{number}", s.handleError(s.handleUpdateDeployRequest))
 	mux.HandleFunc("GET /v1/organizations/{org}/databases/{db}/deploy-requests", s.handleError(s.handleListDeployRequests))
 	mux.HandleFunc("POST /v1/organizations/{org}/databases/{db}/deploy-requests", s.handleError(s.handleCreateDeployRequest))
 

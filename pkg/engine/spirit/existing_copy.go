@@ -24,9 +24,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/checkpoint"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
@@ -139,8 +139,11 @@ func (c *existingCopy) planned(namespace, statement string, maxAge time.Duration
 // concatenates their results.
 //
 // A plan is a read: it must describe the target, never fail because of it. A
-// target that cannot be read is logged and the plan carries no disclosure,
-// which leaves the plan exactly as it is without this check.
+// target that cannot be read is logged and the plan carries no disclosure for
+// it, which leaves the plan exactly as it is without this check. What it
+// cannot leave is the claim that the target was checked: checked is false
+// whenever a lookup failed, so a caller that acts on "no disclosure" can tell a
+// clean target from one nobody could read.
 //
 // Two things keep this a prediction rather than a fact, and both fail quiet
 // rather than wrong. The target may be unreadable, as above. And the batch is
@@ -151,12 +154,12 @@ func (c *existingCopy) planned(namespace, statement string, maxAge time.Duration
 // time against the routing the apply actually took, and Spirit decides for
 // itself regardless, so a plan that discloses nothing is never the last word on
 // whether a copy survives.
-func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB, database string, changes []engine.TableChange, grouped bool) []*engine.ExistingCopy {
+func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB, database string, changes []engine.TableChange, grouped bool) (copies []*engine.ExistingCopy, checked bool) {
 	batches, ok := plannedSpiritBatches(changes, grouped)
 	if !ok {
 		e.logger.Debug("plan has no statements that reach the engine's copy path, so no existing copy is at stake",
 			"database", database, "grouped_execution", grouped)
-		return nil
+		return nil, true
 	}
 
 	// One deadline covers the whole prediction: the per-lookup bound inside
@@ -165,7 +168,7 @@ func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB
 	ctx, cancel := context.WithTimeout(ctx, copyDetectionTimeout)
 	defer cancel()
 
-	var copies []*engine.ExistingCopy
+	checked = true
 	evaluated := make(map[string]bool, len(batches))
 	for _, batch := range batches {
 		// An apply drives these batches in order, and the first batch that
@@ -187,14 +190,17 @@ func (e *Engine) plannedExistingCopies(ctx context.Context, target *lazyTargetDB
 			// The raw error carries target infrastructure detail and a plan is
 			// rendered into a PR comment, so it stays in the logs. One batch
 			// failing says nothing about the others: an apply runs them
-			// independently, so the rest are still worth disclosing.
-			e.logger.Warn("cannot tell whether applying this plan continues or discards an existing copy; this batch discloses nothing",
+			// independently, so the rest are still worth disclosing. The plan
+			// no longer counts as checked, though, since this batch's copy is
+			// unknown rather than absent.
+			e.logger.Warn("cannot tell whether applying this plan continues or discards an existing copy; this batch discloses nothing and the plan is reported as not checked for copies",
 				"database", database, "tables", batch.Tables, "error", err)
+			checked = false
 			continue
 		}
 		copies = append(copies, found.planned(database, batch.Statement, e.checkpointMaxAge)...)
 	}
-	return copies
+	return copies, checked
 }
 
 // allTablesEvaluated reports whether every table in tables has already been

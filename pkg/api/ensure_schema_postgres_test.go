@@ -4,11 +4,16 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -20,9 +25,27 @@ func TestEnsurePostgresSchema_MalformedDSNFailsAtOpen(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	err := ensurePostgresSchema("postgres://user@host:notaport/db", logger, nil)
+	err := ensurePostgresSchema(t.Context(), "postgres://user@host:notaport/db", logger, ensureSchemaOptions{}, nil)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "open storage database")
+}
+
+// unverifiableLocker takes locks but cannot say whether the session they live
+// on is the session its caller keeps reaching.
+type unverifiableLocker struct{ namedlock.Locker }
+
+// The bootstrap's cross-instance exclusion is only as good as the guarantee
+// that a lock stays on a session the pod can reach. A locker that cannot
+// establish that guarantee leaves the bootstrap unable to tell an exclusive
+// convergence from a concurrent one, so startup refuses rather than assuming
+// the favorable case.
+func TestVerifyStorageSessionAffinity_RefusesLockerThatCannotVerify(t *testing.T) {
+	t.Parallel()
+
+	err := verifyStorageSessionAffinity(t.Context(), nil, unverifiableLocker{}, "schemabot")
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "refusing to bootstrap storage database \"schemabot\" without cross-instance exclusion")
 }
 
 // The embedded PostgreSQL schema files are the source of truth for the
@@ -76,4 +99,283 @@ func TestPostgresCreateTableColumns_EmbeddedFiles(t *testing.T) {
 		require.NoError(t, err, "table %s", table)
 		assert.NotEmpty(t, columns, "table %s", table)
 	}
+}
+
+// The manual-remediation gate must name every problem across every table in
+// one error, so an operator fixes them all in one pass instead of one per
+// startup attempt. An all-automatic drift set passes the gate untouched.
+func TestPostgresManualRemediation(t *testing.T) {
+	t.Parallel()
+
+	tables := []string{"applies", "settings"}
+	automatic := postgresSchemaDrift{
+		"applies": {{operation: "add_column", object: "caller", ddl: "ALTER TABLE applies ADD COLUMN caller text"}},
+	}
+	require.NoError(t, postgresManualRemediation(tables, automatic))
+
+	mixed := postgresSchemaDrift{
+		"applies": {
+			{operation: "add_column", object: "caller", ddl: "ALTER TABLE applies ADD COLUMN caller text"},
+			{operation: "add_column", object: "lock_id", manualReason: "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT"},
+		},
+		"settings": {
+			{operation: "add_column", object: "setting_value", manualReason: "definition is NOT NULL without a DEFAULT; add it manually or ship the column with a DEFAULT"},
+			{operation: "create_index", object: "idx_settings_setting_key", manualReason: "live state is non-unique where the embedded schema requires a unique index; replace it manually"},
+		},
+	}
+	err := postgresManualRemediation(tables, mixed)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `storage table "applies" is missing column "lock_id"`)
+	assert.Contains(t, err.Error(), `storage table "settings" is missing column "setting_value"`)
+	assert.Contains(t, err.Error(), "add it manually or ship the column with a DEFAULT")
+	assert.Contains(t, err.Error(), `storage table "settings" has index "idx_settings_setting_key" whose live state is non-unique`)
+}
+
+// A live index satisfies an expectation only when PostgreSQL can use it: an
+// invalid index is reported regardless of uniqueness, a non-unique index
+// cannot stand in for a unique one, and a unique index answers a non-unique
+// expectation's reads. An invalid index still under construction is told
+// apart from one a failed build abandoned, since only the latter needs the
+// operator to act.
+func TestPostgresLiveIndexManualReason(t *testing.T) {
+	t.Parallel()
+
+	unique := postgresIndexExpectation{name: "idx_settings_setting_key", unique: true}
+	nonUnique := postgresIndexExpectation{name: "idx_apply_logs_level"}
+
+	assert.Empty(t, postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: true, valid: true}))
+	assert.Empty(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: false, valid: true}))
+	assert.Empty(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: true, valid: true}))
+
+	assert.Contains(t, postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: false, valid: true}), "live state is non-unique")
+	failedBuild := postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: true, valid: false})
+	assert.Contains(t, failedBuild, "live state is invalid and no CREATE INDEX CONCURRENTLY is visible building it")
+	assert.Contains(t, failedBuild, "DROP INDEX it so startup recreates it")
+	assert.Contains(t, postgresLiveIndexManualReason(nonUnique, postgresLiveIndex{unique: false, valid: false}), "live state is invalid and no CREATE INDEX CONCURRENTLY is visible building it")
+
+	inFlight := postgresLiveIndexManualReason(unique, postgresLiveIndex{unique: true, valid: false, building: true})
+	assert.Contains(t, inFlight, "live state is invalid because a CREATE INDEX CONCURRENTLY is still building it")
+	assert.Contains(t, inFlight, "startup succeeds once that build completes")
+	assert.NotContains(t, inFlight, "DROP INDEX")
+}
+
+// The expectations parser fails closed on schema-file statements the additive
+// convergence cannot create or verify — an unnamed index or a non-index
+// trailing statement — so a schema file can never silently stop being the
+// source of truth for the live schema.
+func TestPostgresExpectationsFor_RejectsUntrackableStatements(t *testing.T) {
+	t.Parallel()
+
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		file string
+		want string
+	}{
+		{
+			name: "unnamed index",
+			file: "CREATE TABLE settings (id bigint);\nCREATE INDEX ON settings (id);",
+			want: "cannot track",
+		},
+		{
+			name: "non-index trailing statement",
+			file: "CREATE TABLE settings (id bigint);\nCOMMENT ON TABLE settings IS 'x';",
+			want: "cannot track",
+		},
+		{
+			name: "index on another table",
+			file: "CREATE TABLE settings (id bigint);\nCREATE INDEX idx_other ON other (id);",
+			want: `declares index "idx_other" on table "other"`,
+		},
+		{
+			// The file's name is the table's identity for the whole
+			// convergence, so a file that creates a different relation would
+			// have every check run against one table and the DDL create
+			// another.
+			name: "creates a different table than it is named for",
+			file: "CREATE TABLE other (id bigint);",
+			want: `schema file for table "settings" declares table "other"`,
+		},
+		{
+			name: "does not begin with CREATE TABLE",
+			file: "CREATE INDEX idx_settings_id ON settings (id);",
+			want: "must begin with CREATE TABLE",
+		},
+		{
+			// The bare name matches, so the identity check above passes while
+			// the DDL targets a relation the convergence never looks at: it
+			// resolves existence, columns and indexes through the connection's
+			// current schema, so the table this file is named for would stay
+			// missing on every boot.
+			name: "creates the table in another schema",
+			file: "CREATE TABLE archive.settings (id bigint);",
+			want: `declares table settings in schema "archive"`,
+		},
+		{
+			// The same reasoning for the index: qualified here, unqualified
+			// everywhere the convergence looks for it.
+			name: "creates the index in another schema",
+			file: "CREATE TABLE settings (id bigint);\nCREATE INDEX idx_settings_id ON archive.settings (id);",
+			want: `declares index idx_settings_id in schema "archive"`,
+		},
+		{
+			// Naming the schema the convergence happens to be pointed at is
+			// refused too. Whether it matches depends on the connection's
+			// search_path, which the parser cannot see and the file cannot
+			// promise, so an agreement here would be a coincidence.
+			name: "creates the table in the public schema explicitly",
+			file: "CREATE TABLE public.settings (id bigint);",
+			want: `declares table settings in schema "public"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := postgresExpectationsFor(parser, "settings", tt.file)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+}
+
+// Every embedded PostgreSQL schema file must parse into trackable
+// expectations: a CREATE TABLE followed only by named CREATE INDEX statements
+// on the file's own table.
+func TestPostgresExpectationsFor_EmbeddedFiles(t *testing.T) {
+	t.Parallel()
+
+	tables, files, err := readEmbeddedPostgresSchemaFiles()
+	require.NoError(t, err)
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+	for _, table := range tables {
+		expected, err := postgresExpectationsFor(parser, table, files[table])
+		require.NoError(t, err, "table %s", table)
+		assert.NotEmpty(t, expected.columns, "table %s", table)
+	}
+}
+
+// The bootstrap DDL budget is derived from the convergence's own ceiling, and
+// that derivation is what makes it safe: it can only end a statement the
+// overall deadline was going to end anyway. If it ever crept above the overall
+// deadline it would stop bounding anything; if it were set independently it
+// could start failing statements that converge today. Both shipped ceilings are
+// checked, because the two paths no longer share one.
+func TestPostgresBootstrapDDLBudgetStaysUnderItsCeiling(t *testing.T) {
+	t.Parallel()
+
+	for name, ceiling := range map[string]time.Duration{
+		"boot":     EnsureSchemaTimeout,
+		"operator": apitypes.DefaultStorageApplyTimeout,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			budget := postgresBootstrapDDLBudget(ceiling)
+			assert.Positive(t, budget)
+			assert.Less(t, budget, ceiling,
+				"the DDL budget must expire before the overall deadline so the failure names a budget")
+			assert.Greater(t, budget, DefaultPostgresStatementTimeout,
+				"bootstrap DDL must get a longer budget than an ordinary storage query")
+		})
+	}
+}
+
+// A caller may name any whole-second budget up to the maximum, so the
+// derivation has to stay strictly under every one of them, not only the two
+// that ship. A budget at or above its ceiling stops bounding anything: the
+// convergence's own deadline fires first and the failure names a context
+// instead of a statement_timeout. The sweep starts at the shortest ceiling
+// EnsureSchema admits, is cheap and closed-form, and so covers the whole range
+// rather than sampling the edges.
+func TestPostgresBootstrapDDLBudgetStaysUnderEveryAdmissibleCeiling(t *testing.T) {
+	t.Parallel()
+
+	for ceiling := MinConvergenceTimeout; ceiling <= apitypes.MaxStorageApplyTimeout; ceiling += time.Second {
+		budget := postgresBootstrapDDLBudget(ceiling)
+		if !assert.Less(t, budget, ceiling, "ceiling %s", ceiling) {
+			return
+		}
+		if !assert.GreaterOrEqual(t, budget.Milliseconds(), int64(1), "ceiling %s", ceiling) {
+			return
+		}
+	}
+}
+
+// A budget of 0 disables statement_timeout rather than making it strict, so
+// the derivation must never reach one however far the bootstrap ceiling is
+// shortened. Below the margin the budget can no longer keep its floor without
+// crossing the ceiling, so it takes half the ceiling instead. The shipped
+// ceilings sit far above the margin, so this branch is only exercised at
+// ceilings nobody ships — which is exactly why it is worth pinning here
+// instead of trusting it on inspection.
+func TestPostgresBootstrapDDLBudgetNeverDerivesADisabledBudget(t *testing.T) {
+	t.Parallel()
+
+	const margin = postgresBootstrapDDLTimeoutMargin
+	const floor = postgresBootstrapDDLFloor
+
+	for _, tc := range []struct {
+		name    string
+		ceiling time.Duration
+		want    time.Duration
+	}{
+		{name: "a roomy ceiling keeps the margin below it", ceiling: 5 * time.Minute, want: 5*time.Minute - margin},
+		{name: "a ceiling just above the margin still subtracts", ceiling: margin + 10*time.Second, want: 10 * time.Second},
+		{name: "a ceiling exactly the floor above the margin keeps the floor", ceiling: margin + floor, want: floor},
+		// Between the margin and the margin plus the floor, the subtraction
+		// is positive but shorter than the floor, and the floor wins — this
+		// is the one range where the two branches disagree.
+		{name: "a ceiling less than the floor above the margin keeps the floor", ceiling: margin + 3*time.Second, want: floor},
+		{name: "a ceiling at the margin would derive a disable", ceiling: margin, want: floor},
+		{name: "a ceiling under the margin would derive a negative", ceiling: 12 * time.Second, want: floor},
+		{name: "a ceiling at the floor halves rather than matching it", ceiling: floor, want: floor / 2},
+		{name: "the shortest admissible ceiling stays under itself", ceiling: MinConvergenceTimeout, want: MinConvergenceTimeout / 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := postgresBootstrapDDLBudget(tc.ceiling)
+			assert.Equal(t, tc.want, got)
+			assert.Positive(t, got, "a derived budget of 0 or less disables statement_timeout")
+		})
+	}
+}
+
+// 57014 is raised both by statement_timeout expiring and by an operator's
+// pg_cancel_backend, so elapsed time is what tells them apart: a cancellation
+// that arrives before the budget could have fired came from outside SchemaBot.
+// Getting this backwards would tell an operator to look for an external cause
+// during their own timeout, and vice versa.
+func TestPostgresStatementTimeoutError(t *testing.T) {
+	t.Parallel()
+
+	cancelled := &pgconn.PgError{Code: postgresQueryCanceled, Message: "canceling statement due to statement timeout"}
+
+	t.Run("exhausting the budget names the budget", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 30*time.Second, 30*time.Second)
+		assert.ErrorContains(t, err, "exhausting its 30s statement_timeout")
+		assert.ErrorIs(t, err, cancelled)
+	})
+
+	t.Run("cancelled early points outside SchemaBot", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 30*time.Second, time.Second)
+		assert.ErrorContains(t, err, "something outside SchemaBot cancelled it")
+		assert.ErrorIs(t, err, cancelled)
+	})
+
+	t.Run("a disabled budget cannot have fired early", func(t *testing.T) {
+		t.Parallel()
+		err := postgresStatementTimeoutError(cancelled, 0, time.Second)
+		assert.ErrorContains(t, err, "exhausting its 0s statement_timeout")
+	})
+
+	t.Run("another error passes through untouched", func(t *testing.T) {
+		t.Parallel()
+		other := &pgconn.PgError{Code: "55P03", Message: "lock not available"}
+		assert.Equal(t, other, postgresStatementTimeoutError(other, 30*time.Second, time.Second))
+	})
 }

@@ -12,7 +12,18 @@
 # Build stage
 FROM golang:1.26-alpine AS builder
 
-RUN apk add --no-cache git ca-certificates
+# The Alpine CDN intermittently answers "temporary error (try again later)" and a
+# single failed fetch fails the whole build, so every apk add in this repo's
+# Alpine images retries with backoff instead of failing on the first miss. This
+# is the canonical copy of the loop and its rationale; the other Dockerfiles
+# point here rather than restating it.
+RUN for attempt in 1 2 3 4 5; do \
+        apk add --no-cache git ca-certificates && break; \
+        echo "apk add git ca-certificates failed (attempt ${attempt}/5)" >&2; \
+        [ "$attempt" -lt 5 ] || exit 1; \
+        echo "retrying in $((attempt * 5))s" >&2; \
+        sleep $((attempt * 5)); \
+    done
 
 WORKDIR /src
 
@@ -34,7 +45,14 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # Runtime stage
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates tzdata
+# Retried for the reason given on the builder stage's apk add above.
+RUN for attempt in 1 2 3 4 5; do \
+        apk add --no-cache ca-certificates tzdata && break; \
+        echo "apk add ca-certificates tzdata failed (attempt ${attempt}/5)" >&2; \
+        [ "$attempt" -lt 5 ] || exit 1; \
+        echo "retrying in $((attempt * 5))s" >&2; \
+        sleep $((attempt * 5)); \
+    done
 
 # Add AWS RDS CA certificates to the system trust store so tls=true works in DSNs
 ADD https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \

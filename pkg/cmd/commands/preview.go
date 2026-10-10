@@ -65,12 +65,21 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewPlansList, templates.PreviewPullSchema, templates.PreviewPullSchemaDetailed,
 		templates.PreviewPullVitessSchema:
 		templates.PreviewCLIOutput(previewType)
+	// Rate limit types
+	case templates.PreviewPullRateLimitedCaller, templates.PreviewPullRateLimitedShared,
+		templates.PreviewPullRateLimitedTarget,
+		templates.PreviewPullRateLimitedResponse, templates.PreviewRateLimitAll:
+		templates.PreviewCLIOutput(previewType)
 	// Lint and unsafe types
 	case templates.PreviewLintViolations, templates.PreviewUnsafeBlocked,
 		templates.PreviewUnsafeAllowed, templates.PreviewLintAll:
 		templates.PreviewCLIOutput(previewType)
 	// Comment template types
 	case templates.PreviewCommentPlan, templates.PreviewCommentPlanBlocked,
+		templates.PreviewCommentPlanBlockedPostgres,
+		templates.PreviewCommentPlanIgnoredNamespaces, templates.PreviewCommentPlanExemptTables,
+		templates.PreviewCommentPlanUnmanagedSchema,
+		templates.PreviewCommentPlanIgnoreTables,
 		templates.PreviewCommentPlanDirect,
 		templates.PreviewCommentPlanCopyDiscarded, templates.PreviewCommentPlanCopyDiscardedApplying,
 		templates.PreviewCommentPlanCopyDiscardedPaused,
@@ -78,6 +87,8 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentPlanCopyAdopted, templates.PreviewCommentPlanCopyRunning,
 		templates.PreviewCommentApplyBlockedRejected,
 		templates.PreviewCommentPlanTenant,
+		templates.PreviewCommentPlanColumnOnlyAlter, templates.PreviewCommentPlanManyTables,
+		templates.PreviewCommentPlanCollationChanges,
 		templates.PreviewCommentPlanEmpty,
 		templates.PreviewCommentNoManagedSchema,
 		templates.PreviewCommentReconcileInProgress,
@@ -86,7 +97,7 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentMultiEnvLint,
 		templates.PreviewCommentVitessPlan, templates.PreviewCommentVitessApplyPlan,
 		templates.PreviewCommentMySQLMultiSchema,
-		templates.PreviewCommentHelp, templates.PreviewCommentSupportChannel,
+		templates.PreviewCommentHelp, templates.PreviewCommentSupportChannel, templates.PreviewCommentOversized,
 		templates.PreviewCommentErrors, templates.PreviewCommentUnsafeBlocked,
 		templates.PreviewCommentDropColumnBlocked, templates.PreviewCommentDropIndexBlocked,
 		templates.PreviewCommentLintErrorsBlocked,
@@ -103,16 +114,17 @@ func (cmd *PreviewCmd) Run(g *Globals) error {
 		templates.PreviewCommentMultiDeployInProgress, templates.PreviewCommentMultiDeployFailed,
 		templates.PreviewCommentMultiDeployCompleted, templates.PreviewCommentMultiDeployAll,
 		templates.PreviewCLIMultiDeployInProgress, templates.PreviewCLIMultiDeployFailed,
+		templates.PreviewCLIMultiDeployHalted,
 		templates.PreviewCLIMultiDeployCompleted, templates.PreviewCLIMultiDeployAll,
 		templates.PreviewCommentShardedAll, templates.PreviewAggregateCheckSummary,
-		templates.PreviewAggregateCheckFileCapBlocked,
+		templates.PreviewAggregateCheckFileCapBlocked, templates.PreviewAggregateCheckStopped,
 		templates.PreviewCommentSingleProgress, templates.PreviewCommentSingleComplete,
 		templates.PreviewCommentSingleFailed, templates.PreviewCommentSingleStopped,
 		templates.PreviewCommentSummaryCompleted, templates.PreviewCommentSummaryFailed,
 		templates.PreviewCommentSummaryStopped,
 		templates.PreviewCommentSummaryCompletedLarge, templates.PreviewCommentSummaryVitessVSchema,
 		templates.PreviewCommentSummaryVitessVSchemaOnly,
-		templates.PreviewCommentSummaryFailedLarge,
+		templates.PreviewCommentSummaryFailedLarge, templates.PreviewCommentSummaryFailedEngineLogs,
 		templates.PreviewCommentSummaryMultiNSFailed, templates.PreviewCommentSummaryMultiNSCompleted,
 		templates.PreviewCommentAll:
 		templates.PreviewCLIOutput(previewType)
@@ -229,6 +241,13 @@ Status:
   pull_schema_detailed  Pulled live schema with the detailed catalog's estimates
   pull_schema_vitess    Multi-keyspace Vitess pull with VSchema artifacts
 
+Rate Limits:
+  pull_rate_limited_caller    Pull refused: caller spent its own request budget
+  pull_rate_limited_shared    Pull refused: budget shared by every client because auth is disabled
+  pull_rate_limited_target    Pull refused: target database is absorbing every client's reads
+  pull_rate_limited_response  The 429 a service caller reads off the wire
+  rate_limit_all              Show all rate limit previews
+
 Lint and Unsafe:
   lint_violations         Lint violations output
   unsafe_blocked        Unsafe changes blocked (need --allow-unsafe)
@@ -253,11 +272,12 @@ Interactive TUI:
 Comment Templates (GitHub PR comments):
   comment_plan                  Plan comment with DDL changes + lint violations
   comment_plan_blocked          Plan with a statement the engine refuses (blocked verdict)
+  comment_plan_blocked_postgres PostgreSQL plan with a refused statement carrying two causes
   comment_plan_direct           Locked plan with a statement routed to direct execution
   comment_apply_blocked_rejected Apply rejected: plan contains engine-blocked statements
   comment_plan_tenant           Tenant-targeted plan comment
   comment_plan_empty            Plan comment with no changes
-  comment_no_managed_schema     No managed schema changes in current PR
+  comment_no_managed_schema     No schema files changed in current PR
   comment_reconcile_in_progress Empty diff with an in-progress apply
   comment_reconcile_completed   Empty diff with a completed apply
   comment_plan_copy_discarded   Plan whose apply would throw away an unfinished copy

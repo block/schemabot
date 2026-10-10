@@ -1,10 +1,14 @@
 package webhook
 
 import (
+	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +18,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 // aggregateLeaderConfig returns a server config where the test repo has the
@@ -29,6 +34,25 @@ func aggregateLeaderConfig() *api.ServerConfig {
 			}},
 		},
 	}
+}
+
+// aggregateLeaderWithAllowlistConfig returns aggregateLeaderConfig with one
+// database of the leader's own, "billing", registered for the test repo under
+// billing/schema — the shape of a leader whose ownership is partitioned by
+// allowed_dirs rather than by registry alone.
+func aggregateLeaderWithAllowlistConfig() *api.ServerConfig {
+	cfg := aggregateLeaderConfig()
+	cfg.Databases = map[string]api.DatabaseConfig{
+		"billing": {
+			Type:         "mysql",
+			AllowedRepos: []string{"octocat/hello-world"},
+			AllowedDirs:  []string{"billing/schema"},
+			Environments: map[string]api.EnvironmentConfig{
+				"staging": {Deployment: "default", Target: "billing"},
+			},
+		},
+	}
+	return cfg
 }
 
 // nonAggregateConfig returns a server config where the test repo has no
@@ -112,9 +136,32 @@ func serveCompleteRootConfigTree(t *testing.T, mux *http.ServeMux) {
 }
 
 // serveSchemaConfigForDatabase registers the GitHub content routes config
-// discovery needs so the PR resolves to a schemabot.yaml for the given
-// database.
+// discovery needs so the PR resolves to a schemabot.yaml at the repository
+// root for the given database.
 func serveSchemaConfigForDatabase(t *testing.T, mux *http.ServeMux, database string) {
+	t.Helper()
+	serveSchemaConfigForDatabaseUnder(t, mux, database, "")
+}
+
+// serveSchemaConfigForDatabaseUnder is serveSchemaConfigForDatabase with the
+// schemabot.yaml under dir ("" for the repository root), so a test can place
+// the config inside or outside a participant's schema directory.
+func serveSchemaConfigForDatabaseUnder(t *testing.T, mux *http.ServeMux, database, dir string) {
+	t.Helper()
+	serveSchemaConfigs(t, mux, schemaConfigFixture{database: database, dir: dir})
+}
+
+// schemaConfigFixture places one schemabot.yaml declaring database under dir
+// ("" for the repository root).
+type schemaConfigFixture struct {
+	database string
+	dir      string
+}
+
+// serveSchemaConfigs registers the GitHub routes config discovery needs for a
+// PR that changes every given schemabot.yaml. Discovery orders the configs by
+// path, whatever order the PR lists them in.
+func serveSchemaConfigs(t *testing.T, mux *http.ServeMux, configs ...schemaConfigFixture) {
 	t.Helper()
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
@@ -123,72 +170,157 @@ func serveSchemaConfigForDatabase(t *testing.T, mux *http.ServeMux, database str
 			"user": map[string]any{"login": "testuser"},
 		}))
 	})
+	files := make([]map[string]string, 0, len(configs))
+	for _, cfg := range configs {
+		configPath := "schemabot.yaml"
+		if cfg.dir != "" {
+			configPath = cfg.dir + "/schemabot.yaml"
+		}
+		files = append(files, map[string]string{"filename": configPath, "status": "modified"})
+		content := "database: " + cfg.database + "\ntype: mysql\n"
+		mux.HandleFunc("GET /repos/octocat/hello-world/contents/"+configPath, func(w http.ResponseWriter, _ *http.Request) {
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
+				"type":     "file",
+				"encoding": "base64",
+				"content":  base64.StdEncoding.EncodeToString([]byte(content)),
+			}))
+		})
+	}
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1/files", func(w http.ResponseWriter, _ *http.Request) {
-		require.NoError(t, json.NewEncoder(w).Encode([]map[string]string{{
-			"filename": "schemabot.yaml",
-			"status":   "modified",
-		}}))
-	})
-	mux.HandleFunc("GET /repos/octocat/hello-world/contents/schemabot.yaml", func(w http.ResponseWriter, _ *http.Request) {
-		content := "database: " + database + "\ntype: mysql\n"
-		require.NoError(t, json.NewEncoder(w).Encode(map[string]string{
-			"type":     "file",
-			"encoding": "base64",
-			"content":  base64.StdEncoding.EncodeToString([]byte(content)),
-		}))
+		require.NoError(t, json.NewEncoder(w).Encode(files))
 	})
 }
 
 // On an aggregate repo, an unscoped `apply -e <env>` fans out to every
 // installed deployment. A deployment whose databases registry has no entry for
 // the database discovered from the PR's schemabot.yaml is not the owner under
-// the aggregate contract, so it stays silent instead of posting a "database is
-// not configured on this server" failure comment. A -t-scoped command and a
-// non-aggregate repo still surface the error.
-func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
-	t.Run("unscoped apply on aggregate repo stays silent", func(t *testing.T) {
+// the aggregate contract, so it stays silent while the owner acts — unless it
+// is the leader and the config is under no expected participant's paths: a
+// database the leader has not registered there is one it answers for, once,
+// with Database Not Registered rather than leaving the command
+// unanswered. A -t-scoped command and a non-aggregate repo still surface the
+// error.
+func TestUnscopedApplyOnUnregisteredDatabase(t *testing.T) {
+	apply := func(h *Handler, tenant string) {
+		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply, Tenant: tenant})
+	}
+
+	t.Run("leader answers for a database it has not registered", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+		apply(h, "")
 
-		assert.Empty(t, comments, "non-owning deployment must not post a comment for an unscoped fan-out apply")
+		body := requireComment(t, comments, "database-not-registered apply error")
+		assert.Contains(t, body, "Database Not Registered")
+		assert.Contains(t, body, "**Database**: `orders` | **Schema directory**: `.` | **Environment**: `staging`")
+		assert.Contains(t, body, "ask a SchemaBot operator to register it with this schema directory")
+	})
+
+	t.Run("leader with an allowlist answers for a database it has not registered", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderWithAllowlistConfig())
+		serveSchemaConfigForDatabaseUnder(t, mux, "orders", "orders/schema")
+
+		apply(h, "")
+
+		body := requireComment(t, comments, "database-not-registered apply error")
+		assert.Contains(t, body, "Database Not Registered")
+		assert.Contains(t, body, "**Database**: `orders` | **Schema directory**: `orders/schema`")
+	})
+
+	// The leader's own database declared outside its allowed_dirs, where no
+	// participant manages either, is misplaced for the whole fleet: the
+	// allowed_dirs remedy is the right one and the leader is the one to give it.
+	t.Run("leader answers for its own database misplaced outside every managed directory", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderWithAllowlistConfig())
+		serveSchemaConfigForDatabaseUnder(t, mux, "billing", "misc/schema")
+
+		apply(h, "")
+
+		body := requireComment(t, comments, "config-not-authorized apply error")
+		assert.Contains(t, body, "SchemaBot Configuration Not Authorized")
+		assert.Contains(t, body, "**Schema directory**: `misc/schema`")
+		assert.Contains(t, body, "`databases.billing.allowed_dirs`")
+	})
+
+	// A PR that adds several configs the leader has not registered gets one
+	// reply naming all of them, so the author does not learn about the second
+	// one only after fixing the first and re-running the command.
+	t.Run("leader names every unregistered config in one reply", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigs(t, mux,
+			schemaConfigFixture{database: "orders", dir: "orders/schema"},
+			schemaConfigFixture{database: "ledger", dir: "ledger/schema"})
+
+		apply(h, "")
+
+		body := requireComment(t, comments, "databases-not-registered apply error")
+		assert.Contains(t, body, "Databases Not Registered")
+		assert.Contains(t, body, "- `ledger/schema` declares database `ledger`\n- `orders/schema` declares database `orders`\n")
+		assert.NotContains(t, body, "**Database**:", "several configs have no one database for the header")
+		assert.Empty(t, comments, "one reply answers the command")
+	})
+
+	// A config a participant owns is left to it even when discovery lists it
+	// first (tenant-b/schema sorts before unowned/schema), and the config the
+	// leader has not registered is still answered for.
+	t.Run("leader answers for an unregistered config listed after a participant's", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigs(t, mux,
+			schemaConfigFixture{database: "payments", dir: "tenant-b/schema"},
+			schemaConfigFixture{database: "orders", dir: "unowned/schema"})
+
+		apply(h, "")
+
+		body := requireComment(t, comments, "database-not-registered apply error")
+		assert.Contains(t, body, "Database Not Registered")
+		assert.Contains(t, body, "**Database**: `orders` | **Schema directory**: `unowned/schema`")
+		assert.NotContains(t, body, "payments", "the participant answers for its own config")
+		assert.Empty(t, comments, "one reply answers the command")
+	})
+
+	t.Run("leader stays silent for a database under a participant's directory", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabaseUnder(t, mux, "orders", "tenant-b/schema")
+
+		apply(h, "")
+
+		assert.Empty(t, comments, "the participant managing tenant-b/schema answers; the leader must not")
 	})
 
 	// A participant deployment receives the same fan-out for a PR touching
-	// only a database another deployment owns; the skip is role-agnostic, so
-	// it stays just as silent as a leader would.
-	t.Run("unscoped apply on participant deployment stays silent", func(t *testing.T) {
-		cfg := aggregateLeaderConfig()
-		repoCfg := cfg.Repos["octocat/hello-world"]
-		repoCfg.Aggregate = &api.AggregateConfig{Role: api.AggregateRoleParticipant}
-		cfg.Repos["octocat/hello-world"] = repoCfg
-		h, mux, comments := newFanOutSkipHandler(t, cfg)
+	// only a database another deployment owns. Its view covers only its own
+	// slice of the fleet, so it cannot tell whether anyone else owns the
+	// config and stays silent.
+	t.Run("participant deployment stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+		apply(h, "")
 
 		assert.Empty(t, comments, "a participant must not post Apply Failed for a database another deployment owns")
 	})
 
-	t.Run("tenant-scoped apply still reports the error", func(t *testing.T) {
-		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+	t.Run("tenant-scoped apply on a participant still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply, Tenant: "tenant-b"})
+		apply(h, "tenant-b")
 
 		body := requireComment(t, comments, "database-not-configured apply error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
 	})
 
 	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, nonAggregateConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
-		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.Apply})
+		apply(h, "")
 
 		body := requireComment(t, comments, "database-not-configured apply error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
 	})
 }
 
@@ -196,24 +328,37 @@ func TestUnscopedApplyOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 // installed deployment just like its -e sibling. A deployment whose databases
 // registry has no entry for the database discovered from the PR's
 // schemabot.yaml is not the owner under the aggregate contract, so it stays
-// silent instead of posting a "database is not configured on this server"
-// failure comment next to the owning deployment's real plan. A -t-scoped
-// command and a non-aggregate repo still surface the error.
-func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
+// silent instead of posting a failure next to the owning deployment's real
+// plan — unless it is the leader and the config is under no expected
+// participant's paths, in which case the leader answers once with Database Not
+// Registered.
+// A -t-scoped command and a non-aggregate repo still surface the error.
+func TestUnscopedMultiEnvPlanOnUnregisteredDatabase(t *testing.T) {
 	barePlan := func(h *Handler, databaseName, tenant string) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, true, 0)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, databaseName, tenant, 12345, "hubot", false, 0, true, 0, nil)
 	}
 
-	t.Run("bare plan on aggregate repo stays silent", func(t *testing.T) {
+	t.Run("leader answers for a database it has not registered", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
 		barePlan(h, "", "")
 
-		assert.Empty(t, comments, "non-owning deployment must not post a comment for an unscoped fan-out plan")
+		body := requireComment(t, comments, "database-not-registered plan error")
+		assert.Contains(t, body, "Database Not Registered")
+		assert.Contains(t, body, "**Database**: `orders` | **Schema directory**: `.`")
 	})
 
-	t.Run("bare plan on participant deployment stays silent", func(t *testing.T) {
+	t.Run("leader stays silent for a database under a participant's directory", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabaseUnder(t, mux, "orders", "tenant-b/schema")
+
+		barePlan(h, "", "")
+
+		assert.Empty(t, comments, "the participant managing tenant-b/schema answers; the leader must not")
+	})
+
+	t.Run("participant deployment stays silent", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
@@ -223,25 +368,40 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 	})
 
 	// Naming the database with -d does not name a deployment: the discovered
-	// config still belongs to whichever deployment registers the database, so a
-	// non-owner defers just as silently as it does for the unscoped form.
-	t.Run("database-scoped bare plan stays silent", func(t *testing.T) {
+	// config still belongs to whichever deployment registers the database. A
+	// participant defers as silently as it does for the unscoped form; the
+	// leader, which keeps searching the repository for a -d database precisely
+	// so a database no deployment it knows of serves is still reported,
+	// answers.
+	t.Run("database-scoped bare plan on a participant stays silent", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		barePlan(h, "orders", "")
+
+		assert.Empty(t, comments, "a -d-scoped fan-out plan on an unowned database must stay silent on a participant")
+	})
+
+	t.Run("database-scoped bare plan on the leader answers for a database it has not registered", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
 		barePlan(h, "orders", "")
 
-		assert.Empty(t, comments, "a -d-scoped fan-out plan on an unowned database must stay silent")
+		body := requireComment(t, comments, "database-not-registered plan error")
+		assert.Contains(t, body, "Database Not Registered")
+		assert.Contains(t, body, "`orders`")
 	})
 
-	t.Run("tenant-scoped plan still reports the error", func(t *testing.T) {
-		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+	t.Run("tenant-scoped plan on a participant still reports the error", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
 		barePlan(h, "", "tenant-b")
 
 		body := requireComment(t, comments, "database-not-configured plan error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
 	})
 
 	t.Run("non-aggregate repo still reports the error", func(t *testing.T) {
@@ -251,7 +411,285 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 		barePlan(h, "", "")
 
 		body := requireComment(t, comments, "database-not-configured plan error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
+	})
+}
+
+// splitLeaderConfig returns the config of one of two aggregate leaders that
+// split the test repo's environments: both expect the same participant, each
+// serves only env, and each registers only the given databases.
+func splitLeaderConfig(env string, databases map[string]api.DatabaseConfig) *api.ServerConfig {
+	cfg := aggregateLeaderConfig()
+	cfg.AllowedEnvironments = []string{env}
+	cfg.Databases = databases
+	return cfg
+}
+
+// ledgerOnStaging registers ledger with the staging leader only, under the
+// schema directory the PR's schemabot.yaml sits in.
+func ledgerOnStaging() map[string]api.DatabaseConfig {
+	return map[string]api.DatabaseConfig{
+		"ledger": {
+			Type:         "mysql",
+			AllowedRepos: []string{"octocat/hello-world"},
+			AllowedDirs:  []string{"services/ledger/schema"},
+			Environments: map[string]api.EnvironmentConfig{
+				"staging": {Deployment: "default", Target: "ledger"},
+			},
+		},
+	}
+}
+
+// fleetLeader is one deployment of a split-environment fleet, reached through
+// its webhook endpoint the way GitHub reaches it, with its own fake GitHub so
+// every comment, reaction, and log line is attributable to it.
+type fleetLeader struct {
+	h         *Handler
+	mux       *http.ServeMux
+	comments  chan string
+	reactions chan string
+	logs      *syncBuffer
+}
+
+// fleetLeaderWorkDeadline bounds the wait for a leader's dispatched webhook
+// work so a hang fails the test instead of stalling the suite.
+const fleetLeaderWorkDeadline = 5 * time.Second
+
+func newFleetLeader(t *testing.T, cfg *api.ServerConfig) fleetLeader {
+	t.Helper()
+	client, mux := setupGitHubServer(t)
+	comments := make(chan string, 10)
+	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
+	reactions := registerReactionRecorder(t, mux)
+	logs := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	installClient := ghclient.NewInstallationClient(client, logger)
+	installClient.SetConfigDirHints(cfg)
+	h := NewHandler(api.New(&emptyStorage{}, cfg, nil, logger), &fakeClientFactory{client: installClient}, nil, logger)
+	t.Cleanup(func() { h.DrainInProcessWebhookWork(t.Context()) })
+	return fleetLeader{h: h, mux: mux, comments: comments, reactions: reactions, logs: logs}
+}
+
+// comment delivers a PR comment to the leader's webhook endpoint and waits for
+// the work it dispatched to finish, so every reply it would post has been
+// posted.
+func (l fleetLeader) comment(t *testing.T, body string) {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	l.h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: body, isPR: true}, nil))
+	require.Equal(t, http.StatusOK, rr.Code)
+	ctx, cancel := context.WithTimeout(t.Context(), fleetLeaderWorkDeadline)
+	defer cancel()
+	l.h.DrainInProcessWebhookWork(ctx)
+	require.NoError(t, ctx.Err(), "the leader's webhook work did not finish")
+}
+
+// syncBuffer is a bytes.Buffer safe for a logger writing from the handler's
+// goroutines while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// A repository can have one aggregate leader per environment, each with its
+// own registry. Every leader receives an unscoped command, and each one that
+// lacks the PR's database in its own registry would reach the same "not
+// registered" conclusion, so only the leader serving the first environment in
+// environment_order answers. A -e command is answered by the leader serving
+// that environment, and a single leader serving every environment always
+// answers. The reply speaks for the leader's own registry and names it.
+func TestUnregisteredDatabaseAnsweredOncePerFleet(t *testing.T) {
+	const ledgerDir = "services/ledger/schema"
+
+	t.Run("unscoped plan registered on neither gets one reply from the first environment's leader", func(t *testing.T) {
+		staging := newFleetLeader(t, splitLeaderConfig("staging", nil))
+		production := newFleetLeader(t, splitLeaderConfig("production", nil))
+		for _, leader := range []fleetLeader{staging, production} {
+			serveSchemaConfigForDatabaseUnder(t, leader.mux, "ledger", ledgerDir)
+		}
+
+		staging.comment(t, "schemabot plan")
+		production.comment(t, "schemabot plan")
+
+		body := requireComment(t, staging.comments, "staging leader's Database Not Registered")
+		assert.Contains(t, body, "## ⚠️ Database Not Registered\n")
+		assert.Contains(t, body, "**Database**: `ledger` | **Schema directory**: `services/ledger/schema` | **Deployment**: `staging`")
+		assert.Contains(t, body, "The staging SchemaBot deployment has no `ledger` entry under `databases`")
+		assert.Empty(t, staging.comments, "the staging leader replies once")
+		require.Len(t, staging.reactions, 1, "the leader that answers acknowledges")
+		assert.Equal(t, "eyes", <-staging.reactions)
+
+		assert.Empty(t, production.comments, "the production leader leaves the reply to the staging leader")
+		assert.Empty(t, production.reactions, "a leader that does not answer does not acknowledge")
+		assert.Contains(t, production.logs.String(), "database not registered on this leader; the leader serving the responder environment answers the command")
+		assert.Contains(t, production.logs.String(), "responder_environment=staging")
+	})
+
+	t.Run("unscoped plan registered on staging only is planned by staging and ignored by production", func(t *testing.T) {
+		staging := newFleetLeader(t, splitLeaderConfig("staging", ledgerOnStaging()))
+		production := newFleetLeader(t, splitLeaderConfig("production", nil))
+		for _, leader := range []fleetLeader{staging, production} {
+			serveSchemaConfigForDatabaseUnder(t, leader.mux, "ledger", ledgerDir)
+		}
+
+		staging.comment(t, "schemabot plan")
+		production.comment(t, "schemabot plan")
+
+		require.Len(t, staging.reactions, 1, "the staging leader owns ledger and acts on the command")
+		assert.Equal(t, "eyes", <-staging.reactions)
+		for len(staging.comments) > 0 {
+			assert.NotContains(t, <-staging.comments, "Not Registered", "the staging leader registers ledger")
+		}
+		assert.Empty(t, production.comments, "the production leader is not the one to answer an unscoped command")
+		assert.Empty(t, production.reactions)
+	})
+
+	t.Run("plan -e production registered on neither gets one reply from the production leader", func(t *testing.T) {
+		staging := newFleetLeader(t, splitLeaderConfig("staging", nil))
+		production := newFleetLeader(t, splitLeaderConfig("production", nil))
+		for _, leader := range []fleetLeader{staging, production} {
+			serveSchemaConfigForDatabaseUnder(t, leader.mux, "ledger", ledgerDir)
+		}
+
+		staging.comment(t, "schemabot plan -e production")
+		production.comment(t, "schemabot plan -e production")
+
+		assert.Empty(t, staging.comments, "environment routing keeps a production command from the staging leader")
+		assert.Empty(t, staging.reactions)
+		body := requireComment(t, production.comments, "production leader's Database Not Registered")
+		assert.Contains(t, body, "**Database**: `ledger` | **Schema directory**: `services/ledger/schema` | **Deployment**: `production`")
+		assert.Contains(t, body, "The production SchemaBot deployment has no `ledger` entry under `databases`")
+		assert.Empty(t, production.comments, "the production leader replies once")
+	})
+
+	t.Run("single leader serving every environment answers", func(t *testing.T) {
+		leader := newFleetLeader(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabaseUnder(t, leader.mux, "ledger", ledgerDir)
+
+		leader.comment(t, "schemabot plan")
+
+		body := requireComment(t, leader.comments, "single leader's Database Not Registered")
+		assert.Contains(t, body, "## ⚠️ Database Not Registered\n")
+		assert.Contains(t, body, "This SchemaBot deployment has no `ledger` entry under `databases`")
+		assert.Empty(t, leader.comments, "the leader replies once")
+	})
+}
+
+// Auto-plan on an aggregate repo leaves a schema config it does not manage to
+// the deployment that does, so the unmanaged-config notice stays a log line on
+// every deployment there, leader or participant. A leader cannot see a sibling
+// leader's registry, so a config it dropped may be one a leader serving another
+// environment plans.
+func TestNotifyUnmanagedDiscoveredConfigsOnAggregateRepo(t *testing.T) {
+	ledger := []ghclient.DiscoveredConfig{{
+		Config:    &ghclient.SchemabotConfig{Database: "ledger", Type: "mysql"},
+		SchemaDir: "services/ledger/schema",
+	}}
+	notify := func(h *Handler, managed []ghclient.DiscoveredConfig) {
+		h.notifyUnmanagedDiscoveredConfigs("octocat/hello-world", 1, 12345, "pull_request", "abc123", func() bool { return true }, ledger, managed)
+	}
+
+	t.Run("split-environment leaders post no notice for a database one of them registers", func(t *testing.T) {
+		staging, _, stagingComments := newFanOutSkipHandler(t, splitLeaderConfig("staging", ledgerOnStaging()))
+		production, _, productionComments := newFanOutSkipHandler(t, splitLeaderConfig("production", nil))
+
+		notify(staging, ledger)
+		notify(production, nil)
+
+		assert.Empty(t, stagingComments, "the staging leader plans ledger")
+		assert.Empty(t, productionComments, "the production leader cannot see that the staging leader registers ledger")
+	})
+
+	t.Run("participant posts no notice", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
+
+		notify(h, nil)
+
+		assert.Empty(t, comments)
+	})
+
+	t.Run("non-aggregate repo notices a dropped config", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		notify(h, nil)
+
+		body := requireComment(t, comments, "unmanaged schema config notice")
+		assert.Contains(t, body, "Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "`services/ledger/schema`")
+	})
+}
+
+// Auto-plan on a deployment scoped to some environments leaves a schema config
+// it does not manage to whichever deployment serves the other environments. A
+// repo split across a staging deployment and a production deployment, where a
+// database exists only in production, gets the production plan for it and no
+// notice from staging claiming that nothing will ever apply it; staging's own
+// plan comments say only that it does not manage the directory in staging. A
+// deployment serving every environment still posts the notice, since no
+// sibling can own the directory.
+func TestNotifyUnmanagedDiscoveredConfigsOnEnvironmentScopedDeployment(t *testing.T) {
+	sandbox := []ghclient.DiscoveredConfig{{
+		Config:    &ghclient.SchemabotConfig{Database: "ledger_sandbox", Type: "vitess"},
+		SchemaDir: "services/ledger/schema_sandbox",
+	}, {
+		Config:    &ghclient.SchemabotConfig{Database: "merchants", Type: "mysql"},
+		SchemaDir: "services/merchants/schema",
+	}}
+	notify := func(h *Handler) []templates.UnmanagedSchemaConfigNoticeData {
+		return h.notifyUnmanagedDiscoveredConfigs("octocat/hello-world", 1, 12345, "pull_request", "abc123", func() bool { return true }, sandbox, nil)
+	}
+
+	// The staging deployment hands the dropped configs back for its plan
+	// comments to name, and logs them on one line that carries every
+	// identifier triage needs, however many configs it dropped.
+	t.Run("staging-scoped deployment posts no notice for a production-only database", func(t *testing.T) {
+		cfg := nonAggregateConfig()
+		cfg.AllowedEnvironments = []string{"staging"}
+		h, _, comments := newFanOutSkipHandler(t, cfg)
+		var logs bytes.Buffer
+		h.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+		note := notify(h)
+
+		assert.Empty(t, comments, "the production deployment may plan ledger_sandbox")
+		assert.Equal(t, []templates.UnmanagedSchemaConfigNoticeData{
+			{Database: "ledger_sandbox", SchemaPath: "services/ledger/schema_sandbox"},
+			{Database: "merchants", SchemaPath: "services/merchants/schema"},
+		}, note, "the plan comments name every dropped config")
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), "exactly one log entry: %s", logs.String())
+		assert.Equal(t, "WARN", entry["level"])
+		assert.Equal(t, "octocat/hello-world", entry["repo"])
+		assert.EqualValues(t, 1, entry["pr"])
+		assert.Equal(t, "abc123", entry["head_sha"])
+		assert.Equal(t, "pull_request", entry["source"])
+		assert.Equal(t, []any{"ledger_sandbox", "merchants"}, entry["databases"])
+		assert.Equal(t, []any{"services/ledger/schema_sandbox", "services/merchants/schema"}, entry["schema_paths"])
+		assert.Equal(t, []any{"staging"}, entry["allowed_environments"])
+	})
+
+	t.Run("deployment serving every environment posts the notice", func(t *testing.T) {
+		h, _, comments := newFanOutSkipHandler(t, nonAggregateConfig())
+
+		assert.Nil(t, notify(h), "the notice names the configs, so no plan comment repeats them")
+
+		body := requireComment(t, comments, "unmanaged schema config notice")
+		assert.Contains(t, body, "- `services/ledger/schema_sandbox` — declares database `ledger_sandbox`")
+		assert.Contains(t, body, "**Environments**: `staging`, `production`")
+		assert.Contains(t, body, "These schema changes will **not** be planned or applied in any environment")
 	})
 }
 
@@ -260,7 +698,7 @@ func TestUnscopedMultiEnvPlanOnUnregisteredDatabaseStaysSilent(t *testing.T) {
 // the leader may publish Database Not Found as the fleet-authoritative answer.
 func TestMultiEnvPlanDatabaseNotFoundParticipantDefersToLeader(t *testing.T) {
 	barePlan := func(h *Handler) {
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, true, 0)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "orders", "", 12345, "hubot", false, 0, true, 0, nil)
 	}
 
 	t.Run("participant stays silent", func(t *testing.T) {
@@ -829,12 +1267,12 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 	// config discovery successfully even on a deployment that does not own the
 	// database — ownership is only decided at the registry lookup. A fan-out
 	// participant in that position silently skips, so it must not acknowledge.
-	t.Run("multi-env plan on unowned database does not react", func(t *testing.T) {
-		h, mux, _ := newFanOutSkipHandler(t, aggregateLeaderConfig())
+	t.Run("multi-env plan on unowned database does not react on a participant", func(t *testing.T) {
+		h, mux, _ := newFanOutSkipHandler(t, aggregateParticipantConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 		reactions := registerReactionRecorder(t, mux)
 
-		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, true, 42)
+		h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil)
 
 		select {
 		case <-reactions:
@@ -845,7 +1283,7 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 
 	t.Run("silently skipping deployment does not react", func(t *testing.T) {
 		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
-		serveSchemaConfigForDatabase(t, mux, "orders")
+		serveSchemaConfigForDatabaseUnder(t, mux, "orders", "tenant-b/schema")
 		reactions := registerReactionRecorder(t, mux)
 
 		h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
@@ -856,6 +1294,42 @@ func TestCommandAcknowledgmentFollowsOwnership(t *testing.T) {
 		case <-reactions:
 			t.Fatal("a silently skipping deployment must not acknowledge the command")
 		case <-time.After(100 * time.Millisecond):
+		}
+	})
+
+	// The leader that answers for a database it has not registered is acting on
+	// the command, so its answer carries the acknowledgment: the user sees the
+	// reaction and the comment together, never a comment from nowhere.
+	t.Run("leader answering for an unregistered database reacts", func(t *testing.T) {
+		for name, run := range map[string]func(h *Handler){
+			"apply": func(h *Handler) {
+				h.handleApplyCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+					CommandResult{Action: action.Apply, CommentID: 42})
+			},
+			"apply-confirm": func(h *Handler) {
+				h.handleApplyConfirmCommand("octocat/hello-world", 1, "staging", "", 12345, "hubot",
+					CommandResult{Action: action.ApplyConfirm, CommentID: 42})
+			},
+			"multi-env plan": func(h *Handler) {
+				h.handleMultiEnvPlan("octocat/hello-world", 1, "", "", 12345, "hubot", false, 0, true, 42, nil)
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+				serveSchemaConfigForDatabase(t, mux, "orders")
+				reactions := registerReactionRecorder(t, mux)
+
+				run(h)
+
+				body := requireComment(t, comments, "database-not-registered answer")
+				assert.Contains(t, body, "Database Not Registered")
+				select {
+				case content := <-reactions:
+					assert.Equal(t, "eyes", content)
+				case <-time.After(2 * time.Second):
+					t.Fatal("the leader that answers must acknowledge the command")
+				}
+			})
 		}
 	})
 }

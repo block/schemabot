@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,6 +31,7 @@ type CLI struct {
 
 	VersionFlag kong.VersionFlag `name:"version" help:"Show version information"`
 
+	Init       commands.InitCmd       `cmd:"" help:"Initialize a local connection and verify imported schema"`
 	Plan       commands.PlanCmd       `cmd:"" help:"Create a schema change plan"`
 	Onboard    commands.OnboardCmd    `cmd:"" help:"Pull live schema into a new declarative schema directory"`
 	Pull       commands.PullCmd       `cmd:"" help:"Return live schema from a source environment"`
@@ -56,7 +58,8 @@ type CLI struct {
 	Settings   commands.SettingsCmd   `cmd:"" help:"View or update schema change settings"`
 	Webhooks   commands.WebhooksCmd   `cmd:"" help:"Manage GitHub App webhook deliveries"`
 	Checks     commands.ChecksCmd     `cmd:"" help:"Manage SchemaBot Check Runs on PRs"`
-	Storage    commands.StorageCmd    `cmd:"" help:"Operate directly on SchemaBot's storage database"`
+	Storage    commands.StorageCmd    `cmd:"" help:"Inspect and maintain SchemaBot's own storage database"`
+	Local      commands.LocalCmd      `cmd:"" hidden:"" help:"Internal local runtime host"`
 	Serve      commands.ServeCmd      `cmd:"" help:"Start the SchemaBot HTTP API server"`
 }
 
@@ -88,20 +91,41 @@ func main() {
 	// Bound the resolution so a slow or unreachable issuer during a token refresh
 	// can't hang the CLI at startup. Cancel as soon as it returns rather than via
 	// defer, since the os.Exit below would skip a deferred cancel.
-	authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
-	token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
-	cancelAuth()
-	if err != nil {
-		// Per ResolveBearerToken's contract: an empty token with an error is a hard
-		// failure; a non-empty token with an error is a non-fatal warning (the
-		// returned token is still usable and re-login can fix it).
-		if token == "" {
-			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
-			os.Exit(1)
+	// Hosting a local runtime does not use a remote profile or its credentials.
+	var localEndpoint string
+	if !strings.HasPrefix(ctx.Command(), "local ") && ctx.Command() != "init" {
+		if usesLocalRuntime(ctx.Command(), &cli) {
+			localCtx, cancelLocal := context.WithTimeout(context.Background(), 30*time.Second)
+			connection, err := client.ResolveLocalConnection(localCtx, cli.Endpoint, cli.Profile, cli.Token, version)
+			cancelLocal()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			if connection != nil {
+				localEndpoint = connection.Endpoint
+				cli.Endpoint = connection.Endpoint
+				cli.Token = connection.Token
+			}
 		}
-		fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
+		authCtx, cancelAuth := context.WithTimeout(context.Background(), 30*time.Second)
+		token, err := client.ResolveBearerToken(authCtx, cli.Token, cli.Endpoint, cli.Profile)
+		cancelAuth()
+		if err != nil {
+			// Per ResolveBearerToken's contract: an empty token with an error is a hard
+			// failure; a non-empty token with an error is a non-fatal warning (the
+			// returned token is still usable and re-login can fix it).
+			if token == "" {
+				fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "\033[33mWarning: %v\033[0m\n", err)
+		}
+		client.SetAuthToken(token)
+		if localEndpoint != "" {
+			client.SetLocalAuth(token, localEndpoint)
+		}
 	}
-	client.SetAuthToken(token)
 
 	// Cancel long-running commands on Ctrl+C / SIGTERM. The first signal
 	// cancels the context so in-flight requests stop and the command can print
@@ -132,7 +156,7 @@ func main() {
 	}()
 	ctx.BindTo(runCtx, (*context.Context)(nil))
 
-	err = ctx.Run(&cli.Globals)
+	err := ctx.Run(&cli.Globals)
 	// Release the watcher and stop intercepting signals now that the command
 	// is done; explicit rather than deferred, since the os.Exit below would
 	// skip a deferred call.
@@ -140,10 +164,33 @@ func main() {
 	signal.Stop(sigCh)
 	cancelRun()
 	if err != nil {
-		// ErrSilent means the error was already displayed - just exit with code 1
+		// ErrSilent means the error was already displayed, so only the status
+		// is left to report. A command may ask for its own status when a caller
+		// scripting it needs to tell two successful-but-different outcomes
+		// apart (see commands.ExitCodeFor); anything else exits 1.
 		if !errors.Is(err, commands.ErrSilent) {
 			fmt.Fprintf(os.Stderr, "\033[31mError: %v\033[0m\n", err)
 		}
-		os.Exit(1)
+		os.Exit(commands.ExitCodeFor(err))
+	}
+}
+
+// Only commands that use the schema API may implicitly start a selected runtime.
+func usesLocalRuntime(command string, cli *CLI) bool {
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return false
+	}
+	switch parts[0] {
+	case "plan", "onboard", "pull", "apply", "progress", "cutover", "stop", "cancel", "start", "release", "revert", "skip-revert", "rollback", "databases", "unlock", "locks", "logs", "status", "list-plans":
+		return true
+	case "storage":
+		// A storage subcommand reaches its database either through the API or
+		// by opening it directly, and only the first needs an endpoint. The
+		// direct path exists for when no server is up, so starting a runtime
+		// for it would be work the operator asked this command to avoid.
+		return len(parts) > 1 && cli.Storage.UsesAPI(parts[1])
+	default:
+		return false
 	}
 }

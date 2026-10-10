@@ -32,7 +32,7 @@ import (
 func TestUpdateCheckRecordForApplyStart_ConvergesWhenApplyAlreadyTerminal(t *testing.T) {
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", e2eSchemabotDSN)
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
 	t.Cleanup(func() { assert.NoError(t, db.Close()) })
@@ -134,7 +134,7 @@ func TestUpdateCheckRecordForApplyStart_ConvergesWhenApplyAlreadyTerminal(t *tes
 func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testing.T) {
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", e2eSchemabotDSN)
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
 	t.Cleanup(func() { assert.NoError(t, db.Close()) })
@@ -219,7 +219,7 @@ func TestUpdateCheckRecordForApplyStart_KeepsInProgressForRunningApply(t *testin
 func TestUpdateCheckRecordForApplyStart_RollbackOnConcludedAggregatePublishesFreshCheckRun(t *testing.T) {
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", e2eSchemabotDSN)
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
 	t.Cleanup(func() { assert.NoError(t, db.Close()) })

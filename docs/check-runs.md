@@ -9,38 +9,13 @@
 - [Cross-Deployment Trust Model](#cross-deployment-trust-model)
 - [Published Checks](#published-checks)
 - [Managed Schema Configs](#managed-schema-configs)
-  - [Onboarding a schema directory](#onboarding-a-schema-directory)
 - [Internal Records](#internal-records)
 - [Lifecycle](#lifecycle)
-  - [Pull Request Events](#pull-request-events)
-  - [Merge Queue Events](#merge-queue-events)
-  - [Auto-Plan](#auto-plan)
-  - [Apply](#apply)
-  - [Rollback](#rollback)
-  - [Unlock And Close](#unlock-and-close)
 - [Check States](#check-states)
 - [Blocking Reasons](#blocking-reasons)
 - [Operator Guidance](#operator-guidance)
-  - [Backfilling missing Check Runs](#backfilling-missing-check-runs)
 - [SHA Handling](#sha-handling)
 - [Edge Cases](#edge-cases)
-  - [PR opened](#pr-opened)
-  - [PR touches no managed schema files](#pr-touches-no-managed-schema-files)
-  - [Config discovery fails](#config-discovery-fails)
-  - [GitHub unavailable](#github-unavailable)
-  - [New commit pushed](#new-commit-pushed)
-  - [New commit pushed while an apply is in progress](#new-commit-pushed-while-an-apply-is-in-progress)
-  - [PR closed](#pr-closed)
-  - [PR reopened](#pr-reopened)
-  - [Manual plan](#manual-plan)
-  - [Apply requested](#apply-requested)
-  - [Apply confirmed](#apply-confirmed)
-  - [Automatic apply](#automatic-apply)
-  - [Rollback requested](#rollback-requested)
-  - [Rollback confirmed](#rollback-confirmed)
-  - [Unlock](#unlock)
-  - [Schema changes but no configured environments are allowed](#schema-changes-but-no-configured-environments-are-allowed)
-  - [Stale in-progress check](#stale-in-progress-check)
 - [Stale Check Reconciliation](#stale-check-reconciliation)
 - [Race Safety](#race-safety)
 - [Environment Ordering](#environment-ordering)
@@ -175,9 +150,16 @@ name that can be required in branch protection.
 When the aggregate check is required by branch protection, SchemaBot must create
 a check run with that exact name on every PR head commit. That includes PRs that
 do not touch managed schema files. For those PRs, SchemaBot publishes a passing
-`No managed schema changes` aggregate so GitHub can satisfy the required check
+`No schema files changed` aggregate so GitHub can satisfy the required check
 and allow the PR to merge. Skipping check creation would leave the required
 check missing, which GitHub treats as not passing.
+
+A PR whose schema changes all sit under directories the deployment does not
+manage gets a passing aggregate too, titled for what it covers instead:
+`No schema changes managed in <environment>` on a deployment scoped to some
+environments, or `No schema changes managed by SchemaBot` on one serving every
+environment. Its summary lists each unmanaged schema directory and the database
+it declares.
 
 When all environments are owned by one SchemaBot deployment, require this check:
 
@@ -219,8 +201,11 @@ See [namespaces](./namespaces.md) for the schema directory and namespace layout.
 
 ### Onboarding a schema directory
 
-To onboard an existing declarative schema directory, add a `schemabot.yaml` file
-next to the SQL files or namespace subdirectories it owns:
+`schemabot onboard` generates a schema directory from a live pull — `schemabot.yaml`,
+namespace subdirectories, and one `.sql` file per table — so onboarding usually starts
+there rather than with hand-written files. To onboard an existing declarative schema
+directory, add a `schemabot.yaml` file next to the SQL files or namespace
+subdirectories it owns:
 
 ```yaml
 database: widgets
@@ -240,8 +225,9 @@ configured environment, and publishes the normal aggregate check for the
 discovered database.
 
 On the happy path, where the live database already matches the declarative
-schema files, the aggregate check completes successfully with a clear no-op
-summary:
+schema files (for PostgreSQL, that also means no live table is left
+undeclared — see [Blocked plans](postgresql.md#blocked-plans)), the
+aggregate check completes successfully with a clear no-op summary:
 
 ```text
 SchemaBot (staging) — Schema up to date
@@ -269,12 +255,12 @@ SchemaBot (staging) — 1 apply pending
 ```
 
 If the PR does not add or edit `schemabot.yaml` and does not touch managed SQL
-or `vschema.json` files, SchemaBot publishes `No managed schema changes` instead
+or `vschema.json` files, SchemaBot publishes `No schema files changed` instead
 because the PR does not affect a managed schema directory.
 
 ## Internal Records
 
-The `checks` MySQL table stores one internal record per
+The `checks` storage table stores one internal record per
 `repository`, `pull_request`, `environment`, `database_type`, and `database_name`.
 Aggregate check records use the same unique key, with `_aggregate` as a
 sentinel for `database_type` and `database_name`.
@@ -547,6 +533,7 @@ Run output remains human-readable and may change.
 | `schema_config_discovery_failed` | Aggregate row | SchemaBot could reach GitHub, but could not determine the managed schema configuration or schema files. |
 | `pr_file_cap_exceeded` | Aggregate row | The PR changes more files than GitHub will report for a single pull request, so SchemaBot's changed-file list is incomplete. Unlike the reasons above this is a property of the PR itself, so it clears only when the PR is split — not by retrying. |
 | `no_allowed_configured_environments` | Aggregate row | Schema files changed, but none of the database's server-configured environments are allowed for this deployment. |
+| `narrowed_apply` | Per-database row | The rollout is going one target at a time (`--target`), so nothing yet shows the other targets have the change. It does not replace a reconciliation, review-time drift, or namespace placement block already on the row: the narrowed apply evaluated none of them. An apply or plan of the whole environment (`schemabot apply -e <environment>`) replaces it with its own result. |
 
 Generic plan and apply errors can still publish `completed` / `failure` without
 a stable `blocking_reason` when the error is not one of the explicit classes
@@ -592,9 +579,58 @@ Common fail-closed scenarios:
 | Accepted apply cannot be tracked | The engine accepted work, but SchemaBot could not store or reload the apply ID needed for progress and check ownership. | Treat this as a storage or apply-tracking incident. Inspect engine state and the `applies` table before retrying; do not rely on branch protection until a new plan reflects the live schema. |
 | Accepted apply could not update required check state | The apply may be running, but SchemaBot could not mark the stored check row `in_progress` with the accepted `apply_id`. | Inspect the accepted apply, storage health, and aggregate check. Retry only after confirming the live schema state and stored check state agree. |
 | Prior-environment check state could not be read | SchemaBot cannot prove that an earlier environment is clean. | Treat this as a SchemaBot storage health issue. Restore storage access, then repeat the blocked command, for example `schemabot apply -e production`. Do not bypass the promotion gate unless this is an explicit breakglass decision. |
+| Prior-environment check recorded on another commit | The earlier environment's stored check state names a commit other than the one the apply read its schema from, usually because a push landed after that environment was applied. Its result says nothing about the commit being applied. | Comment `schemabot plan -e <prior-environment>` to re-check the earlier environment on the PR head. If the plan finds changes, apply it and wait for the SchemaBot check to succeed, then repeat the blocked command. |
 | Stored check ownership miss | A newer plan or apply owns the stored check state for the same PR, environment, and database. Letting the older driver write would overwrite newer safety state. | Inspect the newest apply for that repo/PR/environment/database with the CLI, for example `schemabot status -d <database> -e <environment>` or `schemabot progress <apply-id>`. Let the newest apply finish, or reconcile it with operator commands before retrying PR comments. |
 | Schema changes were removed while an apply may still be running | The live database may still change even though the current PR no longer represents that change. | Inspect the in-flight apply in Tern or with the CLI. If the change reached the live database, either put the schema change back in the PR and comment `schemabot plan -e <environment>` before applying again, or roll back/reconcile the live schema first. |
 | Stale in-progress row after a pod crash | Stored check state says an apply is running, but the watcher may have died before publishing the terminal result. | Comment `schemabot plan -e <environment>` or `schemabot apply -e <environment>` to trigger stale-check reconciliation. If reconciliation fails, inspect SchemaBot storage and the latest apply for that database. |
+
+### Explaining a blocked check
+
+`schemabot checks show <pull-request>` prints the Check Run on the pull
+request head beside every stored check row, and reads each row against the
+commit the pull request is gated on. That last part is what a Check Run cannot
+tell you: a row recorded for an earlier commit contributes to the aggregate as
+blocking whatever it concluded, so a successful apply and a blocked merge gate
+are not a contradiction.
+
+The pull request is named however you already have it: by URL, by
+`owner/name#number`, or by `owner/name` with the number as a second argument.
+
+Each row carries a stable `reason` code, and the two that decide what to do
+next are `awaiting_replan_after_apply`, which SchemaBot converges on its own,
+and `reconciliation_owed`, which it never will. The command separates them
+under "Waiting on SchemaBot" and "Waiting on an operator" so the distinction
+does not have to be inferred from a status and a conclusion. The full set of
+codes is defined in `pkg/checkstate`, and `--json` emits them alongside the
+`blocking` and `self_converging` flags for a script or an agent to branch on.
+
+A durable `blocking_reason` decides the reading before status or ownership
+does, because that is how the publisher treats it: the block was recorded to
+survive writes that did not re-evaluate the condition. A completed rollback
+clears its apply ownership on the way out, so reading ownership first would
+report a reconciliation as an ordinary plan verdict a newer plan supersedes.
+Every blocking reason SchemaBot writes is classified in `pkg/checkstate`, and
+a test over the writers' own registry fails when a new one ships without a
+classification; one this version does not recognize is read as needing a
+person, which is the safe direction for a block whose remedy is unknown.
+
+The classification is about what clears the block, not how it was written.
+Review-time deployment drift is stored to survive a plan that did not
+re-evaluate it, but a plan that does re-evaluate the rollup lifts it once the
+deployments match, so it reads as a guard rather than as a reconciliation.
+Calling it a reconciliation would tell an operator that the one action that
+clears it does not.
+
+The review-time rollup also shows each deployment's blocked change count. This
+is informational beside drift: blocked verdicts do not make matching change
+sets diverge, while apply admission still refuses them on that deployment. The
+count is read from the same representation drift compares, so a sharded
+namespace counts once per shard, and a deployment whose plan could not be
+computed or compared shows no count rather than one read from an unusable plan.
+
+It reads state and never writes: recreating a missing Check Run is
+`checks backfill` below, and clearing a `reconciliation_owed` row means
+reconciling the target environment, not running a command.
 
 ### Backfilling missing Check Runs
 
@@ -605,6 +641,15 @@ whose expected SchemaBot Check Run is missing and (outside `--dry-run`)
 recreates each by replaying the auto-plan flow server-side. Check Runs that
 exist but never completed are reported for investigation, never acted on — an
 uncompleted run can belong to a genuinely in-flight apply.
+
+Each reported run carries the stored check state behind it, classified the
+same way [`checks show`](#explaining-a-blocked-check) classifies it: the
+sweep says whether the run is waiting on SchemaBot or on an operator, and
+lists the blocking rows' reason codes. That is what separates a run to leave
+alone from one nothing will ever clear, without opening each pull request. A
+run whose stored state could not be read is reported without a
+classification — the missing-check findings the backfill acts on are already
+in hand, so the annotation is dropped rather than the finding.
 
 **The backfill is scoped to the deployment it runs against.** A SchemaBot
 instance scans with its own GitHub App credentials, its own `repos:` config,
@@ -654,9 +699,12 @@ proof the PR is safe to re-plan. The CLI additionally holds any missing-check
 PR whose head carries an uncompleted Check Run of any age, because that run
 may belong to a started apply the scanning instance cannot see.
 
-For repositories where several deployments coordinate one shared check
-through a leader/participant aggregate configuration, the same scoping
-applies: a backfill creates only the deployment's own check. Run against a
+Several deployments can coordinate one shared check through a
+leader/participant aggregate configuration: one deployment (the leader) owns
+the single required Check Run and folds the participants' results into it,
+while each participant publishes an informational check of its own. In that
+configuration the same scoping applies: a backfill creates only the
+deployment's own check. Run against a
 participant, it recreates the participant check the leader folds; run against
 the leader, it replays the role-aware auto-plan flow, whose fold fails closed
 on expected participants that have not reported. A missing participant check
@@ -706,10 +754,22 @@ the PR. For each affected database and environment, SchemaBot stores an internal
 per-database record and then publishes or updates the aggregate check on the PR
 head SHA.
 
-If auto-plan finds changes, the internal records become `action_required` and
-the aggregate blocks. If auto-plan finds no changes, the records become
-`success` and the aggregate passes. Auto-plan skips the PR comment when every
-environment has no changes and no errors, but it still writes the check state.
+If auto-plan finds changes on any rollout member, the internal records become
+`action_required` and the aggregate blocks. If no member has changes, the
+records become `success` and the aggregate passes. Auto-plan skips the PR
+comment when no member in any environment has changes and nothing errored,
+but it still writes the check state.
+
+Two cases keep the comment even though no environment's primary target has
+changes, because the reviewer needs to be told why the check is not passing. A
+deployment that diverged or could not be verified fails the check closed, and
+the comment explains the failure. A rollout of independent targets whose
+primary target is already at the desired schema, while another target is not,
+keeps the check pending (MG-12), and the comment is the only place that shows
+the plans those targets still need. It offers `schemabot apply` for them, unless
+a PR apply would refuse one of those plans whatever its flags (see
+[Apply requested](#apply-requested) below); the comment then says why in place of
+the apply command.
 
 ### PR touches no managed schema files
 
@@ -863,25 +923,141 @@ then plans the requested environment. `schemabot plan` without an environment
 does the same reconciliation, then plans all configured environments. The plan
 result writes per-database records and updates the aggregate.
 
-If the plan finds no changes, that environment's record becomes `success`. If it
-finds changes, the record becomes `action_required`. If planning fails, SchemaBot
+If the plan finds no changes on any rollout member, that environment's record
+becomes `success`. If it finds changes on any member, the record becomes
+`action_required`, including when the primary target is already at the desired
+schema and only another target still needs the change (MG-12). If planning fails, SchemaBot
 posts a failure comment; when every environment in a multi-environment plan
 fails, it also publishes a failing aggregate check.
 
+A plan narrowed to one target with `--target` posts its comment and writes no
+record: it speaks for one target, so it cannot move the environment's check in
+either direction. That holds when it fails too, including for a target the
+environment does not have: the failure is answered on the comment. The one
+exception is a namespace placement refusal, which is a fault in the
+environment's configuration rather than the target's, so it blocks the
+environment's check the same way a plan of every target does.
+
+An apply narrowed the same way stores `narrowed_apply` on the
+environment's record before it dispatches and keeps it there when it completes,
+so the check blocks until an apply or plan of the whole environment records
+its own result (MG-12). A record already blocked for reconciliation, review-time
+drift, or namespace placement keeps that block, with its own reason, from
+dispatch through completion. A narrowed apply is not refused on drift or
+placement, since applying one target at a time is how diverged targets are
+brought back in line; the block stays until a rollup of the whole environment
+finds them converged.
+
 ### Apply requested
 
-`schemabot apply -e <environment>` re-plans before acquiring a lock. If changes
-exist and pass safety checks, SchemaBot acquires a lock, posts a confirmation
-comment, stores `action_required`, and updates the aggregate.
+`schemabot apply -e <environment>` re-plans before acquiring a lock, then plans
+the environment's other rollout members before answering, whether or not the
+primary target's plan has changes. A target planned against a schema of its own runs
+the plan this round stores for it; a target that mirrors the primary runs
+the primary target's plan.
 
-If the apply command finds no changes, SchemaBot posts a no-change plan comment
-and does not acquire a lock. A later plan on the current head records the passing
-state if the stored check still needs to be updated.
+When no target other than the primary has work under a plan of its own,
+and the primary target's plan has changes that pass safety checks, SchemaBot acquires a lock, stores `action_required`, updates the
+aggregate, posts the plan comment, and submits the apply in the same step. If
+storing `action_required` fails, nothing is submitted: SchemaBot releases the
+lock and posts an error, and the command can be retried. It pauses for
+`apply-confirm` instead, keeping the lock pinned to that plan, when applying
+would discard an unfinished copy, or when the plan it just stored cannot be read
+back for the drift check. The re-plan that runs just before submitting pauses it
+the same way when the DDL differs from the stored plan, or when it routes a
+change to direct execution that the stored plan did not. When no target has
+work, SchemaBot posts a no-change plan comment and does not acquire a lock.
+
+When other targets have work under plans of their own, whether or not the
+primary target does,
+SchemaBot stores `action_required` before anything else can end the apply, so
+an apply that loses the lock race or fails a later gate still leaves the record
+blocking. It then acquires the lock, posts a comment that renders each
+target's own plan, and submits the apply in the same step, as it does for the
+primary target alone, since every one-step gate reads each target's plan. The
+apply runs each target's plan on that target, and the record, stored from the
+rollout round rather than from the primary target's plan alone, keeps blocking
+merge until every target has the change (MG-12). The re-plan that runs just
+before submitting pauses it for `apply-confirm` when any target's work differs
+from what that comment showed, keeping the lock pinned to a fresh comment that
+shows each target's plan as it is now.
+
+The apply is refused instead, with nothing run and the record left
+`action_required` (or `failure` for drift), when a target could not be
+confirmed, when the comment cannot render every target's plan, or when a
+target's plan carries work the apply cannot run as planned. That is a change
+its engine refuses, an unfinished copy it would discard, or work the apply's
+operation shape has no place for. When the primary target is already at the
+desired schema, that includes any per-shard or finalizer change on another
+target. These refusals come before the pause for a fresh confirmation, so an
+apply never asks for a confirmation that could not run. An unsafe change on
+another target is not refused: the comment discloses it under that target, and
+it runs under `--allow-unsafe` like the primary target's own, whether or not the
+primary target has work. A target's direct-execution change is not refused
+either: the comment discloses it under that target, and the apply runs it
+there as native DDL that blocks writes to the table until it finishes. An
+apply created any other way, such as a
+`POST /api/apply` of the primary target's plan, refuses another target's
+direct-execution change, and its unsafe changes unless the primary target's
+plan carries the same statement up to its schema qualifier. A target whose data plane
+could not say whether it holds an unfinished copy, because it does not look or
+its lookup failed, is refused the same way. The plan comment offers no apply
+for a rollout it knows would be refused, and says why in its place.
+
+Apply-confirm asks all of this again against the rollout as it is at confirm,
+and also refuses when a target's work differs from what the confirmed comment
+showed, the primary target's included, or when a primary target confirmed as
+already converged has since gained changes of its own. A target's work is its
+whole plan: its table statements, how each runs and whether each is unsafe and why, each shard's own changes,
+which namespaces end with a finalizer, and the VSchema each of those writes.
+The primary target is held to the confirmed plan while the environment has
+several targets, and also when the confirmed round stored plans for other
+targets, even if the rollout has since shrunk to the primary target alone.
+If the primary member's deployment or target changed since review, confirmation
+refuses even identical DDL, releases the pending confirmation, and asks for a fresh
+apply to review the current targets. It does not remap consent between members,
+and the same refusal, with the same reason, applies whichever comment the
+confirmation acts on, a single target's included: a target whose deployment or
+target changed is not the one the comment reviewed. An automatic apply plans and
+re-plans within one command against one configuration, so its primary target
+cannot change between the comment it posts and the apply it creates.
+A fully converged rollout still reports no changes without creating an apply.
+So a statement on the primary target whose DDL is unchanged but that now runs as
+direct execution, or is now blocked, refuses here and releases the lock rather
+than pausing again or being rejected as blocked, as it would on a single
+target. The refusal names the target whose plan changed and the part of its
+work that differs: its statements, how they run, which namespaces it
+finalizes, or the VSchema it writes. If that re-check cannot read the plans it
+compares, apply-confirm keeps the pending confirmation for a retry, and an
+automatic apply releases the lock.
 
 ### Apply confirmed
 
 `schemabot apply-confirm -e <environment>` verifies review and PR-check gates,
-verifies the lock, re-plans for drift, and then submits the apply.
+verifies the lock, verifies the plan the lock pins, re-runs the environment
+ordering gate, re-plans for drift, and then submits the apply.
+
+The pinned plan is the only record of which environment the operator reviewed,
+so the confirmation is refused when that record cannot vouch for the command:
+
+- If the lock pins no plan SchemaBot can load, nothing is applied and the
+  comment asks for a fresh `schemabot apply -e <environment>`. That command
+  replaces the unloadable pin with a new plan and applies it in one step,
+  pausing for `apply-confirm` only when that plan needs confirmation, and it
+  answers to the environment ordering gate like any apply.
+- If the pinned plan was made for a different environment than `-e` names,
+  nothing is applied; the comment gives the `apply-confirm` command for the
+  planned environment, which keeps the pinned plan, and says what the `apply`
+  command for the requested environment does instead: it drops the pinned
+  plan and plans and applies the requested environment in one step, subject
+  to the same ordering gate.
+- If a prior environment in the rollout order has pending changes again, the
+  same block that stops `schemabot apply` stops the confirmation.
+
+Each refusal keeps the pending confirmation pinned, so the plan the operator
+reviewed can still be confirmed once the reason is resolved. Only a stale plan
+(the PR head moved since it was posted) releases the pin, because that plan can
+no longer be confirmed at all.
 
 When Tern accepts the apply, SchemaBot marks the internal record `in_progress`
 and stores the accepted `apply_id`. Accepted applies must have a stored apply ID;
@@ -923,6 +1099,12 @@ operator-facing controls for emergencies and direct maintenance.
 
 `schemabot rollback-confirm -e <environment>` submits the rollback apply and
 marks the check `in_progress` with the rollback apply's `apply_id`.
+
+A rollback that carries unsafe changes, such as dropping a table the PR added,
+needs `--allow-unsafe` exactly as `apply` does. Without it, rollback-confirm
+lists the unsafe changes and the command to re-issue, nothing runs, the check
+is left unchanged, and the lock keeps the rollback plan pinned for
+`schemabot rollback-confirm -e <environment> --allow-unsafe`.
 
 Like normal applies, accepted rollbacks must have a stored apply ID before
 SchemaBot can safely watch progress or update the required check state.
@@ -1033,11 +1215,20 @@ another SchemaBot deployment.
 
 | Prior environment state | Apply allowed? | Reason |
 | --- | --- | --- |
-| `success` | Yes | Prior environment is clean. |
-| `action_required` | No | Apply the prior environment first. |
+| `success` on the PR head commit | Yes | Prior environment is clean for the commit being applied. |
+| `action_required` on the PR head commit | No | Apply the prior environment first. |
 | `in_progress` | No | Wait for the prior environment to finish. |
-| `failure` | No | Fix and re-apply the prior environment. |
+| `failure` on the PR head commit | No | Fix and re-apply the prior environment. |
+| Completed on another commit | No | The result says nothing about the commit being applied. Re-check the prior environment on the PR head with `schemabot plan -e <prior-environment>`. |
 | No record | No | SchemaBot cannot prove the prior environment is clean. |
+
+Stored check state is one row per PR, environment, and database, not one per
+commit, so after a push the row still names the previous commit until the plan
+for the new head lands. The gate compares the row's commit with the commit the
+apply read its schema from, retries briefly while the row is missing, running,
+or on another commit, and then blocks. The block comment names both commits and
+asks for a re-check on the PR head; retrying the later apply alone does not
+help until that re-check has recorded a result on the head.
 
 The lookup path depends on which SchemaBot deployment owns the prior
 environment:
@@ -1119,8 +1310,9 @@ Common breakglass capabilities:
   -e <environment>`, `schemabot progress <apply-id>`, and `schemabot logs
   <apply-id>`.
 - Control active work with `schemabot stop <apply-id>`, `schemabot start
-  <apply-id>`, `schemabot cutover <apply-id>`, `schemabot revert <apply-id>`,
-  and `schemabot skip-revert <apply-id>`.
+  <apply-id>`, `schemabot cancel <apply-id>`, `schemabot cutover <apply-id>`,
+  `schemabot revert <apply-id>`, `schemabot skip-revert <apply-id>`, and
+  `schemabot release <apply-id>`.
 - Apply or roll back directly with `schemabot apply -s <schema-dir> -e
   <environment>` and `schemabot rollback <apply-id>`.
 - Inspect and release locks with `schemabot locks`, `schemabot unlock -d

@@ -10,6 +10,8 @@
 package caller
 
 import (
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -173,4 +175,100 @@ func PullRequestURL(repo string, pr int) string {
 // pull request.
 func PullRequestMarkdownLink(repo string, pr int) string {
 	return "[" + repo + "#" + strconv.Itoa(pr) + "](" + PullRequestURL(repo, pr) + ")"
+}
+
+// ParsePullRequestReference reads a repository and pull request number out of
+// the forms a caller already has in hand, so naming a pull request never means
+// retyping one that is already on the clipboard: the browser URL, with or
+// without a scheme and with whatever trailing path, query, or fragment the
+// page added; the "owner/name#number" form comments and PR bodies use; and a
+// bare "owner/name", which returns a zero number for callers that take the
+// number separately.
+//
+// The host is not checked, and neither is the path in front of the repository.
+// A URL that names a repository and a pull request number identifies them just
+// as well from an enterprise deployment as from github.com, and refusing one
+// would send the caller back to retype an address that was already unambiguous.
+func ParsePullRequestReference(reference string) (repo string, pr int, err error) {
+	trimmed := strings.TrimSpace(reference)
+	if trimmed == "" {
+		return "", 0, errors.New("name a pull request: its URL, owner/name#number, or owner/name")
+	}
+	if repo, pr, ok := parsePullRequestURL(trimmed); ok {
+		return repo, pr, nil
+	}
+	if repo, number, found := strings.Cut(trimmed, "#"); found {
+		if !IsRepoFullName(repo) {
+			return "", 0, invalidPullRequestReference(reference)
+		}
+		pr, err := parsePullRequestNumber(number)
+		if err != nil {
+			return "", 0, err
+		}
+		return repo, pr, nil
+	}
+	if !IsRepoFullName(trimmed) {
+		return "", 0, invalidPullRequestReference(reference)
+	}
+	return trimmed, 0, nil
+}
+
+// parsePullRequestURL reads the "<owner>/<name>/pull/<number>" tail every
+// pull request address ends in, from the last such segment onward: the query
+// and fragment a page appends carry no part of the identity, and neither does
+// anything in front of the owner, so a scheme, a host, and an enterprise path
+// prefix are all skipped rather than matched against.
+//
+// A trailing path segment ("/files", "/commits/<sha>") is likewise ignored,
+// because it names a view of the pull request rather than a different one.
+func parsePullRequestURL(reference string) (string, int, bool) {
+	path := reference
+	if cut := strings.IndexAny(path, "?#"); cut >= 0 {
+		path = path[:cut]
+	}
+	segments := strings.Split(path, "/")
+	for i := len(segments) - 2; i >= 2; i-- {
+		if segments[i] != "pull" && segments[i] != "pulls" {
+			continue
+		}
+		pr, err := parsePullRequestNumber(segments[i+1])
+		if err != nil {
+			return "", 0, false
+		}
+		owner, name := segments[i-2], segments[i-1]
+		if owner == "" || name == "" {
+			return "", 0, false
+		}
+		return owner + "/" + name, pr, true
+	}
+	return "", 0, false
+}
+
+// parsePullRequestNumber reads a pull request number, refusing the values that
+// name no pull request. Zero is one of them: it is what an unset number
+// decodes to, and admitting it would turn a missing argument into a lookup of
+// a pull request that cannot exist.
+func parsePullRequestNumber(number string) (int, error) {
+	pr, err := strconv.Atoi(strings.TrimSpace(number))
+	if err != nil {
+		return 0, fmt.Errorf("read %q as a pull request number: %w", number, err)
+	}
+	if pr <= 0 {
+		return 0, fmt.Errorf("pull request number must be positive, got %d", pr)
+	}
+	return pr, nil
+}
+
+// IsRepoFullName reports whether a string is an "owner/name" pair. Neither
+// half may be empty, and a third segment means the string is a path rather
+// than a repository. Exported so a caller that takes a repository as its own
+// parameter refuses a malformed one the same way a reference carrying it does,
+// rather than passing the mistake down to whatever fails on it first.
+func IsRepoFullName(s string) bool {
+	owner, name, found := strings.Cut(s, "/")
+	return found && owner != "" && name != "" && !strings.Contains(name, "/")
+}
+
+func invalidPullRequestReference(reference string) error {
+	return fmt.Errorf("read %q as a pull request: name it by URL, owner/name#number, or owner/name", reference)
 }

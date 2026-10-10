@@ -1,9 +1,7 @@
 package templates
 
 import (
-	"math"
-	"regexp"
-	"strconv"
+	"log/slog"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
@@ -11,11 +9,6 @@ import (
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
-
-// spiritProgressPattern matches the row-copy prefix of a Spirit progress
-// string, e.g. "71436/221193 32.30% copyRows". The ETA is carried separately as
-// a structured field, so it is not parsed out of this string.
-var spiritProgressPattern = regexp.MustCompile(`(\d+)/(\d+)\s+([\d.]+)%\s+(\w+)`)
 
 // ProgressData contains data for rendering schema change progress.
 type ProgressData struct {
@@ -29,6 +22,10 @@ type ProgressData struct {
 	ErrorMessage   string
 	StartedAt      string // RFC3339 format
 	CompletedAt    string // RFC3339 format
+	Step           int
+	StepsTotal     int
+	Statement      string
+	BuildWork      apitypes.BuildWork
 	Operations     []ProgressOperation
 	Tables         []TableProgress
 	Options        map[string]string // Apply options (defer_cutover, skip_revert, etc.)
@@ -45,20 +42,29 @@ type ProgressOperation struct {
 	OperationKey        string
 	ExternalID          string
 	ExternalOperationID string
+	OperationKind       string
 	Target              string
 	State               string
 	CutoverPolicy       string
 	OnFailure           string
 	ErrorMessage        string
 	ErrorCode           string
-	StartedAt           string
-	CompletedAt         string
+	AlreadyConverged    bool
+	// RolloutStep is the table step the operation runs when the rollout runs
+	// table by table, and 0 otherwise.
+	RolloutStep int
+	StartedAt   string
+	CompletedAt string
 }
 
 // TableProgress represents progress for a single table schema change.
 type TableProgress struct {
-	TableName       string
-	Deployment      string
+	TableName  string
+	Deployment string
+	// Target is the address within Deployment this table's copy ran against. One
+	// deployment can address several targets, each copying the same table
+	// separately, so a section scoped to a deployment alone would merge them.
+	Target          string
 	Namespace       string // Keyspace (Vitess) or schema name (MySQL)
 	Dialect         schema.Dialect
 	ChangeType      string // create, alter, drop
@@ -68,6 +74,9 @@ type TableProgress struct {
 	RowsTotal       int64
 	PercentComplete int
 	ETASeconds      int64
+	// EstimatedBytes is the table's on-disk size when it was planned, shown
+	// beside the row counts. Nil when the plan had no estimate.
+	EstimatedBytes *int64
 	// Checksum phase progress: rows verified so far and total to verify.
 	// Non-zero only while the table is checksumming (verifying copied data).
 	ChecksumRowsChecked int64
@@ -78,8 +87,24 @@ type TableProgress struct {
 	Throttled      bool
 	ThrottleReason string
 	IsInstant      bool
-	ProgressDetail string // e.g., Spirit: "12.5% copyRows ETA 1h 30m"
-	Shards         []ShardProgress
+	// Shards is the table's per-part progress: one entry per shard, or one per
+	// target when AcrossTargets is set.
+	Shards []ShardProgress
+	// AcrossTargets marks a table that stands for one change across a
+	// rollout's targets, rolled up the way a sharded table rolls up its shards.
+	AcrossTargets bool
+	// OnTargets names the targets a rolled-up table's DDL runs on when they
+	// are only some of the deployment's, shown above the DDL. Empty when the
+	// DDL runs on every target.
+	OnTargets string
+	// UnreportedTargets counts the targets a rolled-up table speaks for that
+	// are still to run and have reported no progress yet, so have not started
+	// it. A settled target is not among them.
+	UnreportedTargets int
+	// RolloutSettled marks a rolled-up table whose rollout has settled with no
+	// target left to run, so a target still pending on it never starts it and
+	// reads as not started rather than queued.
+	RolloutSettled bool
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -91,51 +116,6 @@ type ShardProgress struct {
 	ETASeconds      int64
 	PercentComplete int
 	CutoverAttempts int
-}
-
-// ShardCounts holds aggregated shard status counts.
-type ShardCounts struct {
-	Total             int
-	Complete          int
-	Running           int
-	WaitingForCutover int
-	CuttingOver       int
-	Queued            int
-	Failed            int
-	Cancelled         int
-}
-
-// SpiritProgressInfo contains parsed Spirit progress information.
-type SpiritProgressInfo struct {
-	RowsCopied int64
-	RowsTotal  int64
-	Percent    int
-	State      string // "copyRows", "checksum", etc.
-}
-
-// ParseSpiritProgress parses a Spirit progress string like "71436/221193 32.30% copyRows ETA TBD"
-// Returns nil if the string cannot be parsed.
-func ParseSpiritProgress(progress string) *SpiritProgressInfo {
-	if progress == "" {
-		return nil
-	}
-
-	matches := spiritProgressPattern.FindStringSubmatch(progress)
-	if len(matches) < 5 {
-		return nil
-	}
-
-	rowsCopied, _ := strconv.ParseInt(matches[1], 10, 64)
-	rowsTotal, _ := strconv.ParseInt(matches[2], 10, 64)
-	percentFloat, _ := strconv.ParseFloat(matches[3], 64)
-	state := matches[4]
-
-	return &SpiritProgressInfo{
-		RowsCopied: rowsCopied,
-		RowsTotal:  rowsTotal,
-		Percent:    int(math.Round(percentFloat)),
-		State:      state,
-	}
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -161,6 +141,16 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		Metadata:       result.Metadata,
 		Released:       result.Released,
 	}
+	if step, err := apitypes.ParseProgressStep(result.Metadata); err != nil {
+		slog.Warn("progress output omits the statement position because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
+	} else {
+		data.Step, data.StepsTotal, data.Statement = step.Step, step.StepsTotal, step.Statement
+	}
+	if work, err := apitypes.ParseBuildWork(result.Metadata); err != nil {
+		slog.Warn("progress output omits build work because the progress metadata is malformed", "apply_id", result.ApplyID, "error", err)
+	} else {
+		data.BuildWork = work
+	}
 	dialect := schema.DialectForDatabaseType(result.DatabaseType)
 
 	for _, op := range result.Operations {
@@ -169,12 +159,15 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			OperationKey:        op.OperationKey,
 			ExternalID:          op.ExternalID,
 			ExternalOperationID: op.ExternalOperationID,
+			OperationKind:       op.OperationKind,
 			Target:              op.Target,
 			State:               state.NormalizeState(op.State),
 			CutoverPolicy:       op.CutoverPolicy,
 			OnFailure:           op.OnFailure,
 			ErrorMessage:        op.ErrorMessage,
 			ErrorCode:           op.ErrorCode,
+			AlreadyConverged:    op.AlreadyConverged,
+			RolloutStep:         op.RolloutStep,
 			StartedAt:           op.StartedAt,
 			CompletedAt:         op.CompletedAt,
 		})
@@ -184,6 +177,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 		tp := TableProgress{
 			TableName:           tbl.TableName,
 			Deployment:          tbl.Deployment,
+			Target:              tbl.Target,
 			Namespace:           tbl.Keyspace,
 			Dialect:             dialect,
 			ChangeType:          tbl.ChangeType,
@@ -191,6 +185,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Status:              state.NormalizeTaskStatus(tbl.Status),
 			RowsCopied:          tbl.RowsCopied,
 			RowsTotal:           tbl.RowsTotal,
+			EstimatedBytes:      tbl.EstimatedBytes,
 			PercentComplete:     int(tbl.PercentComplete),
 			ETASeconds:          tbl.ETASeconds,
 			ChecksumRowsChecked: tbl.ChecksumRowsChecked,
@@ -198,18 +193,6 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			Throttled:           tbl.Throttled,
 			ThrottleReason:      tbl.ThrottleReason,
 			IsInstant:           tbl.IsInstant,
-			ProgressDetail:      tbl.ProgressDetail,
-		}
-		// When a table carries an engine progress string, it is fresher than
-		// the stored copy fields, so prefer it and keep the percent, the rows
-		// line, and anything aggregated from them in agreement. The live
-		// progress API sends ProgressDetail empty (the drive loop does not
-		// persist it to the task record), so this override only takes effect
-		// for responses that populate the field, such as log preview fixtures.
-		if info := ParseSpiritProgress(tp.ProgressDetail); info != nil {
-			tp.PercentComplete = info.Percent
-			tp.RowsCopied = info.RowsCopied
-			tp.RowsTotal = info.RowsTotal
 		}
 		for _, sh := range tbl.Shards {
 			pct := int(sh.PercentComplete)

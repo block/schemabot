@@ -5,13 +5,14 @@ package lint
 
 import (
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 
 	spiritlint "github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/table"
 
-	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 )
 
@@ -27,6 +28,12 @@ type Config struct {
 	// Default: "bigint,binary,varbinary"
 	AllowedPKTypes string
 
+	// AllowedPostgresPKTypes are the allowed primary key column types for the
+	// PostgreSQL schema audit. Serial pseudo-types are judged by the integer
+	// type they store, so bigserial passes as bigint.
+	// Default: "bigint,uuid"
+	AllowedPostgresPKTypes string
+
 	// AllowedCharsets are the allowed character sets.
 	// Default: "utf8mb4,binary"
 	AllowedCharsets string
@@ -38,10 +45,11 @@ type Config struct {
 // DefaultConfig returns the default linting configuration.
 func DefaultConfig() Config {
 	return Config{
-		AllowUnsafe:     false,
-		AllowedPKTypes:  "bigint,binary,varbinary",
-		AllowedCharsets: "utf8mb4,binary",
-		IgnoreTables:    []string{"schema_version"},
+		AllowUnsafe:            false,
+		AllowedPKTypes:         "bigint,binary,varbinary",
+		AllowedPostgresPKTypes: "bigint,uuid",
+		AllowedCharsets:        "utf8mb4,binary",
+		IgnoreTables:           []string{"schema_version"},
 	}
 }
 
@@ -111,22 +119,13 @@ func (l *Linter) LintStatements(ddlStatements []string) ([]Result, bool, error) 
 // LintSchema analyzes CREATE TABLE statements for lint issues.
 // This checks the schema itself (PK types, charsets, etc.).
 func (l *Linter) LintSchema(schemaFiles map[string]string) ([]Result, error) {
-	// Parse CREATE TABLE statements
 	var createTables []*statement.CreateTable
 	for filename, content := range schemaFiles {
-		stmts, err := ddl.SplitStatements(content)
+		tables, err := parseCreateTables(filename, content)
 		if err != nil {
-			return nil, fmt.Errorf("failed to split statements in %s: %w", filename, err)
+			return nil, err
 		}
-		for _, stmt := range stmts {
-			// ParseCreateTable returns an error for non-CREATE TABLE statements;
-			// we intentionally skip those since we only lint table definitions here.
-			ct, err := statement.ParseCreateTable(stmt)
-			if err != nil {
-				continue
-			}
-			createTables = append(createTables, ct)
-		}
+		createTables = append(createTables, tables...)
 	}
 	if len(createTables) == 0 {
 		return nil, nil
@@ -147,6 +146,37 @@ func (l *Linter) LintSchema(schemaFiles map[string]string) ([]Result, error) {
 		results = append(results, l.convertViolation(v))
 	}
 	return results, nil
+}
+
+// parseCreateTables parses every statement in a schema file with the TiDB
+// parser and returns one CreateTable per CREATE TABLE statement. Each table is
+// built from its own statement's AST node, so a file that declares several
+// tables has every one of them linted. A file the parser rejects is an error;
+// supported statements of other kinds are skipped, because this audit covers
+// table definitions only.
+func parseCreateTables(filename, content string) ([]*statement.CreateTable, error) {
+	if strings.TrimSpace(content) == "" {
+		slog.Debug("schema lint skipped empty schema file", "file", filename)
+		return nil, nil
+	}
+	stmts, err := statement.NewWithOptions(content, statement.Options{AllowMixedStatementTypes: true})
+	if err != nil {
+		return nil, fmt.Errorf("parse statements in schema file %s: %w", filename, err)
+	}
+	var tables []*statement.CreateTable
+	for i, stmt := range stmts {
+		if !stmt.IsCreateTable() {
+			slog.Debug("schema lint skipped statement that is not CREATE TABLE",
+				"file", filename, "statement_index", i+1, "table", stmt.Table)
+			continue
+		}
+		ct, err := stmt.ParseCreateTable()
+		if err != nil {
+			return nil, fmt.Errorf("parse CREATE TABLE %s (statement %d) in schema file %s: %w", stmt.Table, i+1, filename, err)
+		}
+		tables = append(tables, ct)
+	}
+	return tables, nil
 }
 
 // SpiritConfig returns the Spirit lint.Config derived from our Config.

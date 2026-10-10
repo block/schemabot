@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -154,7 +154,7 @@ func TestCLI_OnboardPullsLiveMySQLSchema(t *testing.T) {
 	cfg, err := mysql.ParseDSN(targetDSN)
 	require.NoError(t, err)
 	cfg.DBName = dbName
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err, "open target database")
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()), "ping target database")
@@ -587,7 +587,7 @@ CREATE TABLE items (
 	// Insert rows into the table to make the copy phase take longer
 	t.Run("insert_test_data", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -704,7 +704,7 @@ CREATE TABLE items (
 	// Verify the schema change was applied
 	t.Run("verify_indexes_exist", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -756,7 +756,7 @@ CREATE TABLE items (
 	// before the stop command can intervene.
 	t.Run("insert_test_data", func(t *testing.T) {
 		targetDSN := strings.Replace(targetDSN, "/target_test", "/"+dbName, 1)
-		db, err := sql.Open("mysql", targetDSN)
+		db, err := sql.Open("block-mysql", targetDSN)
 		require.NoError(t, err, "open target db")
 		defer utils.CloseAndLog(db)
 
@@ -870,7 +870,7 @@ func startSchemaBotLocal(t *testing.T) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)
@@ -941,7 +941,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)
@@ -949,7 +949,7 @@ func startSchemaBotLocalDB(t *testing.T, dbName string) string {
 	storage := mysqlstore.New(db)
 
 	// Create the target database
-	targetDB, err := sql.Open("mysql", targetDSN+"&multiStatements=true")
+	targetDB, err := sql.Open("block-mysql", targetDSN+"&multiStatements=true")
 	require.NoError(t, err, "open target db connection")
 	t.Cleanup(func() {
 		ctx, cancel := testutil.CleanupContext(30 * time.Second)
@@ -1025,7 +1025,7 @@ func startSchemaBotWithGRPC(t *testing.T) string {
 	t.Helper()
 
 	// Connect to SchemaBot storage and clear stale state from prior tests.
-	db, err := sql.Open("mysql", schemabotDSN)
+	db, err := sql.Open("block-mysql", schemabotDSN)
 	require.NoError(t, err, "open schemabot db")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	clearStorageDB(t, db)
@@ -1125,10 +1125,10 @@ func runCLIWithError(t *testing.T, binPath string, args ...string) (string, erro
 // parseApplyID extracts an apply ID (e.g., "apply-abc12345") from CLI output.
 func parseApplyID(t *testing.T, output string) string {
 	t.Helper()
-	re := regexp.MustCompile(`apply-[a-f0-9]+`)
-	match := re.FindString(output)
-	require.NotEmptyf(t, match, "no apply ID found in output:\n%s", output)
-	return match
+	re := regexp.MustCompile(`(?:Apply|Rollback) started: (apply-[a-f0-9]+)`)
+	match := re.FindStringSubmatch(output)
+	require.Lenf(t, match, 2, "no started apply ID found in output:\n%s", output)
+	return match[1]
 }
 
 // waitForHTTP waits for an HTTP endpoint to be available.
@@ -1269,6 +1269,24 @@ CREATE TABLE items (
 		waitForState(t, endpoint, applyID, "completed", 30*time.Second)
 	})
 
+	// Rolling back an ADD COLUMN drops the column, so the rollback plan is
+	// unsafe and needs the same --allow-unsafe consent as an apply would.
+	t.Run("rollback_blocked_without_allow_unsafe", func(t *testing.T) {
+		require.NotEmpty(t, applyID, "apply ID must be set by previous subtest")
+		out, err := runCLIWithErrorInDir(t, binPath, schemaDir, "rollback",
+			applyID,
+			"-e", "staging",
+			"--endpoint", endpoint,
+			"-y",
+			"--watch=false",
+		)
+		require.Error(t, err, "expected rollback to fail without --allow-unsafe")
+		assertContains(t, out, "Apply blocked")
+		assertContains(t, out, "unsafe change(s) detected")
+		assertContains(t, out, "--allow-unsafe")
+		assert.NotContains(t, out, "Rollback started")
+	})
+
 	t.Run("rollback_to_original", func(t *testing.T) {
 		require.NotEmpty(t, applyID, "apply ID must be set by previous subtest")
 		out := runCLIInDir(t, binPath, schemaDir, "rollback",
@@ -1277,10 +1295,15 @@ CREATE TABLE items (
 			"--endpoint", endpoint,
 			"-y",
 			"--watch=false",
+			"--allow-unsafe",
 		)
-		// Should show rollback plan with DROP COLUMN
+		// Should show rollback plan with DROP COLUMN, accepted under --allow-unsafe
+		assertContains(t, out, "Unsafe Changes")
+		assertContains(t, out, "--allow-unsafe enabled")
 		assertContains(t, out, "Rollback started")
-		waitForApplyFromOutput(t, endpoint, out, "completed", 30*time.Second)
+		rollbackID := parseApplyID(t, out)
+		require.NotEqual(t, applyID, rollbackID, "rollback starts a new apply")
+		waitForState(t, endpoint, rollbackID, "completed", 30*time.Second)
 	})
 
 	// Step 4: Verify schema matches original (plan should show we need to add the column back)
@@ -1374,27 +1397,22 @@ CREATE TABLE users (
 		assertContains(t, out, "No lint issues found")
 	})
 
-	t.Run("canonicalization", func(t *testing.T) {
+	t.Run("clean_file_left_as_written", func(t *testing.T) {
 		schemaDir := t.TempDir()
 
-		// Write a schema with style issues only (lowercase, no backticks)
-		writeFile(t, filepath.Join(schemaDir, "style.sql"), `
+		// A lint-clean file spelled in lowercase with no backticks has nothing
+		// to fix, so it keeps its exact bytes.
+		style := `
 create table users (id bigint not null auto_increment primary key) charset=utf8mb4;
-`)
+`
+		writeFile(t, filepath.Join(schemaDir, "style.sql"), style)
 
 		out := runCLI(t, binPath, "fix-lint", "-s", schemaDir)
 
-		// Should report canonicalization
-		assertContains(t, out, "canonical")
+		assertContains(t, out, "No lint issues found")
 
-		// File should be canonicalized
 		content, err := os.ReadFile(filepath.Join(schemaDir, "style.sql"))
 		require.NoError(t, err, "read schema file")
-		contentStr := string(content)
-
-		// Should have uppercase keywords
-		assert.Contains(t, contentStr, "CREATE TABLE", "expected uppercase CREATE TABLE")
-		// Should have backtick identifiers
-		assert.Contains(t, contentStr, "`users`", "expected backtick identifiers")
+		assert.Equal(t, style, string(content))
 	})
 }

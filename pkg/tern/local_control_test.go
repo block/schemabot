@@ -232,6 +232,10 @@ func newMySQLControlTestClient(apply *storage.Apply, tasks []*storage.Task, eng 
 }
 
 func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, resumeState *storage.EngineResumeState, eng engine.Engine) *LocalClient {
+	return newVitessControlTestClientWithRequests(apply, tasks, resumeState, eng, &testControlRequestStore{})
+}
+
+func newVitessControlTestClientWithRequests(apply *storage.Apply, tasks []*storage.Task, resumeState *storage.EngineResumeState, eng engine.Engine, controlRequests storage.ControlRequestStore) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
 			Database: "testdb",
@@ -242,7 +246,7 @@ func newVitessControlTestClient(apply *storage.Apply, tasks []*storage.Task, res
 			tasks:           &controlTestTaskStore{tasks: tasks},
 			applyLogs:       &controlTestApplyLogStore{},
 			applyOperations: &controlTestApplyOperationStore{data: resumeState},
-			controlRequests: &testControlRequestStore{},
+			controlRequests: controlRequests,
 		},
 		planetscaleEngine: eng,
 		logger:            slog.Default(),
@@ -397,6 +401,82 @@ func TestLocalClient_CancelQueuesCancelRequestForApplyOwner(t *testing.T) {
 	assert.Equal(t, apply.ApplyIdentifier, wakeApplyID)
 	assert.Equal(t, apply.Database, wakeDatabase)
 	assert.Equal(t, apply.Environment, wakeEnvironment)
+}
+
+// A cancel that lands on an apply already past cutover is a decision about the
+// schema change, not a failure to deliver the command. It answers as a refusal
+// carrying the reason, so a control plane on the far side of the RPC boundary
+// can resolve its durable request instead of reading a generic internal error
+// and re-sending the same doomed cancel on every later claim. No request is
+// queued: nothing is going to consume it.
+func TestLocalClient_CancelRefusesRevertWindowWithAReason(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-revert-window-cancel",
+		State:           state.Apply.RevertWindow,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-vitess-revert-window-cancel",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.RevertWindow,
+	}
+	eng := &controlCaptureEngine{}
+	client := newVitessControlTestClient(apply, []*storage.Task{task}, nil, eng)
+
+	resp, err := client.Cancel(t.Context(), &ternv1.CancelRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a refusal is an answer, not a transport failure")
+	require.NotNil(t, resp)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, "schema change apply-vitess-revert-window-cancel is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resp.ErrorMessage)
+	assert.NotContains(t, resp.ErrorMessage, task.TaskIdentifier, "the refusal names the apply identifier, not the per-table task id")
+	assert.Nil(t, eng.cancelReq, "a refused cancel must not touch the engine")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a refused cancel must not move the apply")
+	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "a refused cancel queues nothing for an owner to consume")
+}
+
+// Stop refuses a revert-phase apply for the same reason cancel does, and on the
+// same shape: the reason travels in the response so the caller can resolve its
+// durable request rather than retry a command the apply can never accept.
+func TestLocalClient_StopRefusesRevertWindowWithAReason(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-revert-window-stop-refusal",
+		State:           state.Apply.RevertWindow,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-revert-window-stop-refusal",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.RevertWindow,
+	}
+	eng := &controlCaptureEngine{}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	resp, err := client.Stop(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier})
+
+	require.NoError(t, err, "a refusal is an answer, not a transport failure")
+	require.NotNil(t, resp)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, "schema change apply-revert-window-stop-refusal is in the revert window and has already been applied: use revert to undo it or skip-revert to finalize it", resp.ErrorMessage)
+	assert.Nil(t, eng.stopReq, "a refused stop must not touch the engine")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a refused stop must not move the apply")
+	controlReq, err := client.storage.ControlRequests().GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.Nil(t, controlReq, "a refused stop queues nothing for an owner to consume")
 }
 
 // Apply-owner stop is only authoritative after the local Spirit runner stops.
@@ -1231,6 +1311,321 @@ func TestEngineProgressShowsLiveWork(t *testing.T) {
 	})
 }
 
+// A stop that reaches an engine with no live work for the task has nothing
+// left to pause — after a driver crash and restart, the engine tracks nothing
+// in memory while the persisted checkpoint already holds the resume point. The
+// engine stop error must not surface: the durable stop completes by recording
+// the tasks and apply stopped (resumable, no completion time), so a later
+// start resumes from the checkpoint. Surfacing the error would abort the drive
+// and re-run the same failing stop on every claim.
+func TestLocalClient_StopCompletesWhenEngineHasNoLiveWork(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-no-live-work",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-no-live-work",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	eng := &controlCaptureEngine{
+		stopErr:        engine.NewPermanentError("no active schema change to stop"),
+		progressResult: &engine.ProgressResult{State: engine.StatePending, Message: "No active schema change"},
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StoppedCount)
+	require.NotNil(t, eng.stopReq, "stop must attempt the engine before deciding it has no live work")
+	require.NotNil(t, eng.progressReq, "the live-work probe must ask the engine before completing the stop")
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Nil(t, apply.CompletedAt, "a stopped apply is resumable and must not carry a completion time")
+}
+
+// A stop the engine refuses while it still has live work must surface: a
+// stopped record over an engine still copying rows would let the change keep
+// running unwatched, so storage must stay active until the engine work is
+// actually paused.
+func TestLocalClient_StopSurfacesErrorWhenEngineHasLiveWork(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-live-work",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-live-work",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	stopErr := errors.New("stop refused")
+	eng := &controlCaptureEngine{
+		stopErr:        stopErr,
+		progressResult: &engine.ProgressResult{State: engine.StateRunning},
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr)
+	require.NotNil(t, eng.progressReq, "the live-work probe must run before the stop error surfaces")
+	assert.Equal(t, state.Task.Running, task.State, "a refused stop over live work must not record the task stopped")
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// A stop refused because the engine has already failed is a settled-outcome
+// refusal. It bypasses the live-work probe so the durable request processor can
+// resolve it terminally while the drive continues and records the failure.
+func TestLocalClient_StopPreservesSettledEngineFailure(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-failed",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-failed",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	stopErr := engine.NewSettledOutcomeError("schema change already failed")
+	eng := &controlCaptureEngine{
+		stopErr:        stopErr,
+		progressResult: &engine.ProgressResult{State: engine.StateFailed},
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr)
+	assert.True(t, engine.IsSettledOutcome(err))
+	assert.Nil(t, eng.progressReq, "a settled-outcome refusal must not enter the live-work retry path")
+	assert.Equal(t, state.Task.Running, task.State)
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// A durable stop or cancel that reaches a MySQL schema change whose engine has
+// already failed, before the drive's next poll has recorded the failure, is
+// refused by the engine with a settled-outcome refusal. The drive resolves the
+// request as failed with the engine's reason, so it is not re-sent on every
+// claim, and keeps going rather than standing down: the task and apply are not
+// recorded stopped or cancelled, and the drive's next poll records the failure
+// the engine reports.
+func TestLocalClient_PendingControlResolvesSettledEngineFailure(t *testing.T) {
+	tests := []struct {
+		name      string
+		operation storage.ControlOperation
+		configure func(eng *controlCaptureEngine, refusal error)
+		process   func(t *testing.T, client *LocalClient, apply *storage.Apply) (bool, error)
+		reason    string
+	}{
+		{
+			name:      "stop",
+			operation: storage.ControlOperationStop,
+			configure: func(eng *controlCaptureEngine, refusal error) { eng.stopErr = refusal },
+			process: func(t *testing.T, client *LocalClient, apply *storage.Apply) (bool, error) {
+				return client.processPendingStopControlRequest(t.Context(), apply)
+			},
+			reason: "stop rejected: the schema change on database testdb failed before the stop arrived; the failure stands, plan and apply again to retry",
+		},
+		{
+			name:      "cancel",
+			operation: storage.ControlOperationCancel,
+			configure: func(eng *controlCaptureEngine, refusal error) { eng.cancelErr = refusal },
+			process: func(t *testing.T, client *LocalClient, apply *storage.Apply) (bool, error) {
+				return client.processPendingCancelControlRequest(t.Context(), apply)
+			},
+			reason: "cancel rejected: the schema change on database testdb failed before the cancel arrived; the failure stands, plan and apply again to retry",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-mysql-pending-" + tc.name + "-failed",
+				State:           state.Apply.Running,
+				Database:        "testdb",
+				DatabaseType:    storage.DatabaseTypeMySQL,
+				Environment:     "staging",
+			}
+			task := &storage.Task{
+				ID:             7,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-mysql-pending-" + tc.name + "-failed",
+				Database:       "testdb",
+				Namespace:      "testdb",
+				State:          state.Task.Running,
+			}
+			eng := &controlCaptureEngine{progressResult: &engine.ProgressResult{State: engine.StateFailed}}
+			tc.configure(eng, engine.NewSettledOutcomeError("%s", tc.reason))
+			client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+			testStorage, ok := client.storage.(*controlTestStorage)
+			require.True(t, ok)
+			controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:     apply.ID,
+				Operation:   tc.operation,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "cli:alice",
+			}}}
+			testStorage.controlRequests = controlRequests
+
+			standDown, err := tc.process(t, client, apply)
+
+			require.NoError(t, err)
+			assert.False(t, standDown, "the drive must keep going and record the engine's failure, not an operator command")
+			assert.Nil(t, eng.progressReq, "a settled-outcome refusal must not enter the live-work retry path")
+			assert.Equal(t, state.Task.Running, task.State, "the task must not be recorded stopped or cancelled over a failed change")
+			assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for the drive's poll to record the failure")
+			pending, err := controlRequests.GetPending(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			assert.Nil(t, pending, "the durable request must be resolved, not re-sent on every claim")
+			resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			require.NotNil(t, resolved)
+			assert.Equal(t, storage.ControlRequestFailed, resolved.Status)
+			assert.Equal(t, tc.reason, resolved.ErrorMessage, "the failed request must carry the engine's reason, including how to recover")
+
+			standDown, err = tc.process(t, client, apply)
+			require.NoError(t, err)
+			assert.False(t, standDown, "a resolved refusal must not be re-consumed on the next drive claim")
+		})
+	}
+}
+
+// When the live-work probe itself fails, the engine's state is unknown:
+// completing the stop could record running work as stopped. The original stop
+// error surfaces so the drive retries with engine state intact.
+func TestLocalClient_StopSurfacesErrorWhenLiveWorkProbeFails(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-mysql-stop-probe-error",
+		State:           state.Apply.Running,
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeMySQL,
+		Environment:     "staging",
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-mysql-stop-probe-error",
+		Database:       "testdb",
+		Namespace:      "testdb",
+		State:          state.Task.Running,
+	}
+	stopErr := errors.New("stop refused")
+	eng := &controlCaptureEngine{
+		stopErr:     stopErr,
+		progressErr: errors.New("progress unavailable"),
+	}
+	client := newMySQLControlTestClient(apply, []*storage.Task{task}, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr, "the original stop error must surface, not the probe error")
+	assert.Equal(t, state.Task.Running, task.State, "an uncertain probe must never record the task stopped")
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// An externally authoritative engine reporting pending has an open change the
+// provider can still run. A failed stop must surface rather than settle, or
+// the change could land on the target after storage recorded it stopped.
+func TestLocalClient_StopSurfacesErrorWhenProviderChangeStillOpen(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-strata-stop-open-change",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-strata-stop-open-change",
+		State:            state.Task.Running,
+	}
+	resumeState := &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-strata-stop",
+		Metadata:         `{"change_id":"321"}`,
+	}
+	stopErr := errors.New("stop rejected: provider change state pending")
+	eng := &externallyAuthoritativeCaptureEngine{controlCaptureEngine: controlCaptureEngine{
+		stopErr:        stopErr,
+		progressResult: &engine.ProgressResult{State: engine.StatePending},
+	}}
+	client := newCustomTypeControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	_, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.ErrorIs(t, err, stopErr)
+	assert.Equal(t, state.Task.Running, task.State, "an open provider change must never be recorded stopped")
+	assert.Equal(t, state.Apply.Running, apply.State)
+}
+
+// When the provider's own record says the change is closed, a failed stop call
+// has nothing left to pause: the durable stop completes by recording the tasks
+// and apply stopped instead of re-running a guaranteed-failing stop on every
+// claim. Stopped stays the resumable operator verb — a later start re-plans
+// against the target rather than resuming the closed provider change.
+func TestLocalClient_StopCompletesWhenProviderClosedTheChange(t *testing.T) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-strata-stop-closed-change",
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-strata-stop-closed-change",
+		State:            state.Task.Running,
+	}
+	resumeState := &storage.EngineResumeState{
+		ApplyOperationID: operationID,
+		MigrationContext: "ctx-strata-stop",
+		Metadata:         `{"change_id":"321"}`,
+	}
+	eng := &externallyAuthoritativeCaptureEngine{controlCaptureEngine: controlCaptureEngine{
+		stopErr:        errors.New("stop rejected: provider change already cancelled"),
+		progressResult: &engine.ProgressResult{State: engine.StateCancelled},
+	}}
+	client := newCustomTypeControlTestClient(apply, []*storage.Task{task}, resumeState, eng)
+
+	resp, err := client.stopOwnedApply(t.Context(), &ternv1.StopRequest{ApplyId: apply.ApplyIdentifier}, "")
+
+	require.NoError(t, err)
+	assert.True(t, resp.Accepted)
+	assert.Equal(t, int64(1), resp.StoppedCount)
+	require.NotNil(t, eng.progressReq, "the live-work probe must ask the engine before completing the stop")
+	require.NotNil(t, eng.progressReq.ResumeState, "the probe must carry the persisted resume state to address the provider change")
+	assert.Equal(t, "ctx-strata-stop", eng.progressReq.ResumeState.MigrationContext)
+	assert.Equal(t, state.Task.Stopped, task.State)
+	assert.Equal(t, state.Apply.Stopped, apply.State)
+	assert.Nil(t, apply.CompletedAt, "a stopped apply is resumable and must not carry a completion time")
+}
+
 // A task in the revert window has already cut over: the new schema is live.
 // Stop must reject rather than record it as cancelled, so an operator chooses
 // explicitly between reverting (undo) and skip-revert (finalize). The engine is
@@ -1343,7 +1738,9 @@ func TestLocalClient_CancelRejectsSkippingRevertApply(t *testing.T) {
 // as permanently failed — not retried and not executed. Failing the stored
 // request stops the operator-owned retry loop, and the apply keeps its
 // revert-phase state so the in-flight revert or finalization drives the
-// terminal outcome.
+// terminal outcome. The drive is told the cancel did not take effect, for the
+// same reason: the revert owns the outcome, and a drive that stood down here
+// would settle the apply stopped on top of it.
 func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              42,
@@ -1374,10 +1771,10 @@ func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
 		logger:            slog.Default(),
 	}
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.False(t, standDown, "the refusal cancelled nothing, so the drive must keep driving the revert to its own outcome")
 	assert.Nil(t, eng.cancelReq, "cancel must not touch the engine for a revert-phase apply")
 	assert.Equal(t, state.Apply.Reverting, apply.State, "revert-phase apply must keep its state")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
@@ -1393,6 +1790,12 @@ func TestLocalClient_PendingCancelFailsClosedForRevertPhase(t *testing.T) {
 // control tests exercise the engine's own typed declines end to end, not a
 // fake standing in for them.
 func newPostgresControlTestClient(apply *storage.Apply, tasks []*storage.Task, controlRequests *testControlRequestStore) *LocalClient {
+	return newPostgresControlTestClientWithEngine(apply, tasks, controlRequests, postgres.New())
+}
+
+// newPostgresControlTestClientWithEngine wires eng as the PostgreSQL engine,
+// for the declines the real engine only issues over an apply it is driving.
+func newPostgresControlTestClientWithEngine(apply *storage.Apply, tasks []*storage.Task, controlRequests *testControlRequestStore, eng engine.Engine) *LocalClient {
 	return &LocalClient{
 		config: LocalConfig{
 			Database:  "testdb",
@@ -1406,7 +1809,7 @@ func newPostgresControlTestClient(apply *storage.Apply, tasks []*storage.Task, c
 			applyOperations: &controlTestApplyOperationStore{},
 			controlRequests: controlRequests,
 		},
-		postgresEngine: postgres.New(),
+		postgresEngine: eng,
 		logger:         slog.Default(),
 	}
 }
@@ -1439,10 +1842,10 @@ func TestLocalClient_PendingStopResolvesPostgresUnsupportedDecline(t *testing.T)
 	}}}
 	client := newPostgresControlTestClient(apply, []*storage.Task{task}, controlRequests)
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.False(t, handled, "a declined stop must not read as an operator stop, or the drive loop would mark the running apply stopped")
+	assert.False(t, standDown, "a declined stop must not read as an operator stop, or the drive loop would mark the running apply stopped")
 	assert.Equal(t, state.Apply.Running, apply.State, "the running apply must be left untouched to settle on its own")
 	assert.Equal(t, state.Task.Running, task.State, "the running task must not be marked stopped by a declined stop")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
@@ -1454,17 +1857,18 @@ func TestLocalClient_PendingStopResolvesPostgresUnsupportedDecline(t *testing.T)
 	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "an unsupported-operation decline is a permanent rejection")
 	assert.NotEmpty(t, resolved.ErrorMessage, "the failed request must carry the engine's reason for the operator")
 
-	handled, err = client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err = client.processPendingStopControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.False(t, handled, "a resolved decline must not be re-consumed on the next drive claim")
+	assert.False(t, standDown, "a resolved decline must not be re-consumed on the next drive claim")
 }
 
-// A durable cancel request against a running PostgreSQL apply is resolved as
-// permanently failed for the same reason as stop: the engine's decline is
-// deterministic, so failing the stored request terminally is the only way to
-// end the operator-owned retry loop without misrepresenting the healthy
-// running change.
-func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.T) {
+// A durable cancel request against running PostgreSQL plain DDL is resolved as
+// permanently failed for the same reason as stop: the engine declines cancel
+// for that shape deterministically, so failing the stored request terminally
+// is the only way to end the operator-owned retry loop without
+// misrepresenting the healthy running change. The engine's own tests pin the
+// decline; this pins what the drive does with it.
+func TestLocalClient_PendingCancelResolvesPostgresPlainDDLDecline(t *testing.T) {
 	apply := &storage.Apply{
 		ID:              42,
 		ApplyIdentifier: "apply-postgres-pending-cancel",
@@ -1484,12 +1888,13 @@ func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.
 		Status:      storage.ControlRequestPending,
 		RequestedBy: "operator",
 	}}}
-	client := newPostgresControlTestClient(apply, []*storage.Task{task}, controlRequests)
+	eng := &controlCaptureEngine{cancelErr: engine.NewUnsupportedOperationError("cancel is supported for PostgreSQL concurrent index builds only")}
+	client := newPostgresControlTestClientWithEngine(apply, []*storage.Task{task}, controlRequests, eng)
 
-	handled, err := client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
 
 	require.NoError(t, err)
-	assert.False(t, handled, "a declined cancel must not read as an operator cancel, or the drive loop would mark the running apply stopped")
+	assert.False(t, standDown, "a declined cancel must not read as an operator cancel, or the drive loop would mark the running apply stopped")
 	assert.Equal(t, state.Apply.Running, apply.State, "the running apply must be left untouched to settle on its own")
 	assert.Equal(t, state.Task.Running, task.State, "the running task must not be marked cancelled by a declined cancel")
 	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
@@ -1501,9 +1906,585 @@ func TestLocalClient_PendingCancelResolvesPostgresUnsupportedDecline(t *testing.
 	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "an unsupported-operation decline is a permanent rejection")
 	assert.NotEmpty(t, resolved.ErrorMessage, "the failed request must carry the engine's reason for the operator")
 
-	handled, err = client.processPendingCancelControlRequest(t.Context(), apply)
+	standDown, err = client.processPendingCancelControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.False(t, handled, "a resolved decline must not be re-consumed on the next drive claim")
+	assert.False(t, standDown, "a resolved decline must not be re-consumed on the next drive claim")
+}
+
+// revertWindowRefusalFixture stages a schema change whose stored task has cut
+// over and is holding its revert window, with one pending request for the given
+// operation. The apply row still reads running: the drive learns the phase from
+// the task the engine reported it on, which is how a revert-phase refusal is
+// reached while the drive is mid-flight.
+func revertWindowRefusalFixture(operation storage.ControlOperation) (*LocalClient, *storage.Apply, *storage.Task, *testControlRequestStore) {
+	operationID := int64(99)
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-vitess-revert-window-refusal",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:               7,
+		ApplyID:          apply.ID,
+		ApplyOperationID: &operationID,
+		TaskIdentifier:   "task-vitess-revert-window-refusal",
+		State:            state.Task.RevertWindow,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   operation,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, nil, &controlCaptureEngine{}, controlRequests)
+	return client, apply, task, controlRequests
+}
+
+// cancelRequestAtTerminalObserver reads the stored cancel request at the moment
+// the terminal summary is posted, which is when that comment renders its
+// command-not-applied notice from the request.
+type cancelRequestAtTerminalObserver struct {
+	ctx      context.Context
+	requests *testControlRequestStore
+	applyID  int64
+	seen     *storage.ApplyControlRequest
+	seenErr  error
+	notified bool
+}
+
+func (o *cancelRequestAtTerminalObserver) OnProgress(*storage.Apply, []*storage.Task) {}
+func (o *cancelRequestAtTerminalObserver) OnTerminal(*storage.Apply, []*storage.Task) {
+	o.notified = true
+	o.seen, o.seenErr = o.requests.GetByOperation(o.ctx, o.applyID, storage.ControlOperationCancel)
+}
+
+// An operator can send cancel to a schema change that completes on the engine
+// before the command arrives. The apply settles completed, and the operator has
+// to learn from the summary comment that lands on their PR that the command did
+// not take effect and the change is live — so the cancel must be settled with
+// that reason before the summary is posted, not after it.
+func TestLocalClient_ACancelTheEngineOutranIsSettledBeforeTheTerminalSummary(t *testing.T) {
+	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationCancel)
+	task.State = state.Task.Running
+	observer := &cancelRequestAtTerminalObserver{ctx: t.Context(), requests: controlRequests, applyID: apply.ID}
+	client.SetObserver(apply.ID, observer)
+
+	rejection := engine.NewAlreadyCompletedError("schema change already completed on the engine")
+	_, err := client.settleControlForCompletedEngineChange(t.Context(), "cancel", nil, apply.ID, apply, "operator", rejection)
+	require.NoError(t, err)
+
+	require.True(t, observer.notified, "settling a completed schema change posts the terminal summary")
+	require.NoError(t, observer.seenErr)
+	require.NotNil(t, observer.seen, "the cancel request must already be settled when the summary renders")
+	assert.Equal(t, storage.ControlRequestFailed, observer.seen.Status,
+		"a cancel the schema change outran did not take effect, so the summary must not render it as applied")
+	assert.Contains(t, observer.seen.ErrorMessage, "the schema change completed before the cancel could take effect",
+		"the notice the summary renders comes from this message")
+}
+
+// A durable cancel can land on a schema change that has already cut over and is
+// holding its revert window. The drive refuses it permanently — the operator has
+// to choose revert or skip-revert — and that refusal must change nothing else:
+// the change is applied and its revert phase is still running against the
+// database, so settling the apply stopped would report an outcome that
+// contradicts what the engine is doing underneath (CO-5), and would leave the
+// revert window with no drive watching it expire.
+func TestLocalClient_PendingCancelRefusedInRevertWindowLeavesTheDriveRunning(t *testing.T) {
+	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationCancel)
+
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.False(t, standDown, "a refused cancel must not read as an operator cancel, or the drive loop would settle the revert-window apply stopped")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "the cut-over task keeps its revert window")
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the durable cancel request must be resolved, not left pending")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase refusal is a permanent rejection")
+	assert.Contains(t, resolved.ErrorMessage, "use revert to undo it or skip-revert to finalize it",
+		"the failed request must tell the operator which command does what they wanted")
+
+	standDown, err = client.processPendingCancelControlRequest(t.Context(), apply)
+	require.NoError(t, err)
+	assert.False(t, standDown, "a resolved refusal must not be re-consumed on the next drive claim")
+}
+
+// Stop refuses a revert-window schema change for the same reason cancel does,
+// and owes the drive the same answer: nothing was paused, so the drive keeps
+// driving and the apply is not settled stopped.
+func TestLocalClient_PendingStopRefusedInRevertWindowLeavesTheDriveRunning(t *testing.T) {
+	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationStop)
+
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.False(t, standDown, "a refused stop must not read as an operator stop, or the drive loop would settle the revert-window apply stopped")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "the cut-over task keeps its revert window")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase refusal is a permanent rejection")
+	assert.Contains(t, resolved.ErrorMessage, "use revert to undo it or skip-revert to finalize it",
+		"the failed request must tell the operator which command does what they wanted")
+}
+
+// An operator who sends stop and then cancel on a schema change that has
+// already cut over leaves both requests pending against the same claim. The
+// combined processor refuses the cancel and, because a refusal is not the drive
+// standing down, goes on to refuse the stop in the same pass — so the operator
+// gets a rejection for each command they issued rather than one rejection and
+// one command left pending for a claim that may never come (CO-5).
+func TestLocalClient_BothPendingRefusedInRevertWindowResolveInOneClaim(t *testing.T) {
+	client, apply, task, controlRequests := revertWindowRefusalFixture(storage.ControlOperationCancel)
+	controlRequests.requests = append(controlRequests.requests, &storage.ApplyControlRequest{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationStop,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	})
+
+	standDown, err := client.processPendingCancelOrStopControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.False(t, standDown, "neither refusal stops the drive; the revert phase still owns the outcome")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	assert.Equal(t, state.Task.RevertWindow, task.State, "the cut-over task keeps its revert window")
+	for _, operation := range []storage.ControlOperation{storage.ControlOperationCancel, storage.ControlOperationStop} {
+		pending, err := controlRequests.GetPending(t.Context(), apply.ID, operation)
+		require.NoError(t, err)
+		assert.Nilf(t, pending, "the durable %s request must be resolved in this claim, not left pending", operation)
+		resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, operation)
+		require.NoError(t, err)
+		require.NotNilf(t, resolved, "the %s request must be recorded", operation)
+		assert.Equalf(t, storage.ControlRequestFailed, resolved.Status, "a revert-phase %s refusal is a permanent rejection", operation)
+	}
+}
+
+// failPendingErrorStore makes the durable write that resolves a request fail, so
+// a test can reach an error path the drive's own callers never expose.
+type failPendingErrorStore struct {
+	*testControlRequestStore
+	err error
+}
+
+func (s *failPendingErrorStore) FailPending(context.Context, int64, storage.ControlOperation, string) error {
+	return s.err
+}
+
+// The refusal decides that nothing was stopped before the drive tries to record
+// it, so a storage failure recording it changes what the operator can read, not
+// what happened to their schema change. The drive is owed the same answer either
+// way, and the request stays pending for a later claim to resolve.
+func TestLocalClient_PendingStopRefusalReportsNoEffectWhenResolvingTheRequestFails(t *testing.T) {
+	_, apply, task, requests := revertWindowRefusalFixture(storage.ControlOperationStop)
+	store := &failPendingErrorStore{testControlRequestStore: requests, err: errors.New("apply lease lost")}
+	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, nil, &controlCaptureEngine{}, store)
+
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
+
+	require.ErrorContains(t, err, "apply lease lost", "the storage failure must reach the caller")
+	assert.False(t, standDown, "the refusal already decided nothing was stopped, so a failed write must not report a stop")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	pending, err := requests.GetPending(t.Context(), apply.ID, storage.ControlOperationStop)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "the request could not be resolved, so it stays pending for a later claim")
+}
+
+// Cancel answers a failed refusal write the same way stop does: the refusal
+// already decided that nothing was cancelled, so the drive keeps driving the
+// revert phase to its own outcome no matter what the storage write does.
+func TestLocalClient_PendingCancelRefusalReportsNoEffectWhenResolvingTheRequestFails(t *testing.T) {
+	_, apply, task, requests := revertWindowRefusalFixture(storage.ControlOperationCancel)
+	store := &failPendingErrorStore{testControlRequestStore: requests, err: errors.New("apply lease lost")}
+	client := newVitessControlTestClientWithRequests(apply, []*storage.Task{task}, nil, &controlCaptureEngine{}, store)
+
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.ErrorContains(t, err, "apply lease lost", "the storage failure must reach the caller")
+	assert.False(t, standDown, "the refusal already decided nothing was cancelled, so a failed write must not stand the drive down")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply must be left for its revert phase to settle")
+	pending, err := requests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, pending, "the request could not be resolved, so it stays pending for a later claim")
+}
+
+// applyReadErrorStore makes the apply reload a control-request processor does
+// before it acts fail, so a test can reach an error path the drive's own
+// callers never expose.
+type applyReadErrorStore struct {
+	storage.ApplyStore
+	err error
+}
+
+func (s *applyReadErrorStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return nil, s.err
+}
+
+// taskReadErrorStore makes the task read that detects a revert phase fail.
+type taskReadErrorStore struct {
+	storage.TaskStore
+	err error
+}
+
+func (s *taskReadErrorStore) GetByApplyID(context.Context, int64) ([]*storage.Task, error) {
+	return nil, s.err
+}
+
+// staleCallerApplyStore answers with a stored apply that has not settled,
+// modelling a drive whose own copy has moved ahead of the row it came from.
+type staleCallerApplyStore struct {
+	storage.ApplyStore
+	stored *storage.Apply
+}
+
+func (s *staleCallerApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	return s.stored, nil
+}
+
+// completePendingErrorStore makes the durable write that settles a request on a
+// terminal apply fail.
+type completePendingErrorStore struct {
+	*testControlRequestStore
+	err error
+}
+
+func (s *completePendingErrorStore) CompletePending(context.Context, int64, storage.ControlOperation) error {
+	return s.err
+}
+
+// pendingStartReadErrorStore fails only the check for a queued start, leaving
+// the rest of the request store working so the stop ahead of it still settles.
+type pendingStartReadErrorStore struct {
+	*testControlRequestStore
+	err error
+}
+
+func (s *pendingStartReadErrorStore) GetPending(ctx context.Context, applyID int64, operation storage.ControlOperation) (*storage.ApplyControlRequest, error) {
+	if operation == storage.ControlOperationStart {
+		return nil, s.err
+	}
+	return s.testControlRequestStore.GetPending(ctx, applyID, operation)
+}
+
+// A drive that cannot read or record a control request has learned nothing
+// about the operator's intent, so it keeps the claim it already holds. Every
+// caller returns on the error, but reporting a stand-down alongside it asserts
+// a pause that nothing performed — and a caller written to that contract would
+// settle a still-running apply stopped over a transient storage failure.
+func TestLocalClient_AStorageFailureConsumingAControlRequestKeepsTheClaim(t *testing.T) {
+	failure := errors.New("apply lease lost")
+	tests := []struct {
+		name       string
+		operation  storage.ControlOperation
+		applyState string
+		breakStore func(*controlTestStorage, *testControlRequestStore)
+	}{
+		{
+			name:       "reloading the apply before a stop fails",
+			operation:  storage.ControlOperationStop,
+			applyState: state.Apply.Running,
+			breakStore: func(store *controlTestStorage, _ *testControlRequestStore) {
+				store.applies = &applyReadErrorStore{err: failure}
+			},
+		},
+		{
+			name:       "reading the revert phase before a stop fails",
+			operation:  storage.ControlOperationStop,
+			applyState: state.Apply.Running,
+			breakStore: func(store *controlTestStorage, _ *testControlRequestStore) {
+				store.tasks = &taskReadErrorStore{err: failure}
+			},
+		},
+		{
+			name:       "checking for a queued start after a settled stop fails",
+			operation:  storage.ControlOperationStop,
+			applyState: state.Apply.Completed,
+			breakStore: func(store *controlTestStorage, requests *testControlRequestStore) {
+				store.controlRequests = &pendingStartReadErrorStore{testControlRequestStore: requests, err: failure}
+			},
+		},
+		{
+			name:       "settling a stop against a terminal apply fails",
+			operation:  storage.ControlOperationStop,
+			applyState: state.Apply.Completed,
+			breakStore: func(store *controlTestStorage, requests *testControlRequestStore) {
+				store.applies = &staleCallerApplyStore{stored: &storage.Apply{ID: 42, State: state.Apply.Running}}
+				store.controlRequests = &completePendingErrorStore{testControlRequestStore: requests, err: failure}
+			},
+		},
+		{
+			name:       "reading the revert phase before a cancel fails",
+			operation:  storage.ControlOperationCancel,
+			applyState: state.Apply.Running,
+			breakStore: func(store *controlTestStorage, _ *testControlRequestStore) {
+				store.tasks = &taskReadErrorStore{err: failure}
+			},
+		},
+		{
+			name:       "completing a cancel that settled its own apply fails",
+			operation:  storage.ControlOperationCancel,
+			applyState: state.Apply.Cancelled,
+			breakStore: func(store *controlTestStorage, requests *testControlRequestStore) {
+				store.controlRequests = &completePendingErrorStore{testControlRequestStore: requests, err: failure}
+			},
+		},
+		{
+			name:       "recording that a cancel was outrun by its own apply fails",
+			operation:  storage.ControlOperationCancel,
+			applyState: state.Apply.Failed,
+			breakStore: func(store *controlTestStorage, requests *testControlRequestStore) {
+				store.controlRequests = &failPendingErrorStore{testControlRequestStore: requests, err: failure}
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client, apply, _, requests := revertWindowRefusalFixture(tc.operation)
+			apply.State = tc.applyState
+			testStorage, ok := client.storage.(*controlTestStorage)
+			require.True(t, ok)
+			tc.breakStore(testStorage, requests)
+
+			process := client.processPendingStopControlRequest
+			if tc.operation == storage.ControlOperationCancel {
+				process = client.processPendingCancelControlRequest
+			}
+			standDown, err := process(t.Context(), apply)
+
+			require.ErrorIs(t, err, failure, "the storage failure must reach the caller")
+			assert.False(t, standDown, "the drive learned nothing about the request, so it keeps the claim it holds")
+		})
+	}
+}
+
+// settledApplyReadErrorStore serves the apply until the command settles it,
+// then fails the reload that would complete the durable request.
+type settledApplyReadErrorStore struct {
+	*controlTestApplyStore
+	err error
+}
+
+func (s *settledApplyReadErrorStore) Get(ctx context.Context, id int64) (*storage.Apply, error) {
+	if s.apply != nil && state.IsTerminalApplyState(s.apply.State) {
+		return nil, s.err
+	}
+	return s.controlTestApplyStore.Get(ctx, id)
+}
+
+// A stop or cancel the engine accepted settles the apply before the drive
+// reloads it to complete the durable request, so a failure on that reload
+// leaves the drive unable to say what became of the command it just issued. It
+// keeps the claim it holds: the caller returns on the error, and a later claim
+// finds the request still pending against an apply that has already settled.
+func TestLocalClient_AnAcceptedCommandKeepsTheClaimWhenTheReloadFails(t *testing.T) {
+	failure := errors.New("apply lease lost")
+	tests := []struct {
+		name         string
+		operation    storage.ControlOperation
+		databaseType string
+		newClient    func(*storage.Apply, []*storage.Task, *testControlRequestStore) *LocalClient
+	}{
+		{
+			name:         "stop",
+			operation:    storage.ControlOperationStop,
+			databaseType: storage.DatabaseTypeMySQL,
+			newClient: func(apply *storage.Apply, tasks []*storage.Task, requests *testControlRequestStore) *LocalClient {
+				client := newMySQLControlTestClient(apply, tasks, &controlCaptureEngine{})
+				client.config.TargetDSN = "root@tcp(localhost:3306)/testdb"
+				client.storage.(*controlTestStorage).controlRequests = requests
+				return client
+			},
+		},
+		{
+			name:         "cancel",
+			operation:    storage.ControlOperationCancel,
+			databaseType: storage.DatabaseTypePostgres,
+			newClient:    newPostgresControlTestClient,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			apply := &storage.Apply{
+				ID:              42,
+				ApplyIdentifier: "apply-" + string(tc.operation) + "-reload-fails",
+				Database:        "testdb",
+				DatabaseType:    tc.databaseType,
+				State:           state.Apply.Running,
+			}
+			task := &storage.Task{
+				ID:             7,
+				ApplyID:        apply.ID,
+				TaskIdentifier: "task-" + string(tc.operation) + "-reload-fails",
+				State:          state.Task.Running,
+			}
+			requests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+				ApplyID:     apply.ID,
+				Operation:   tc.operation,
+				Status:      storage.ControlRequestPending,
+				RequestedBy: "operator",
+			}}}
+			client := tc.newClient(apply, []*storage.Task{task}, requests)
+			testStorage, ok := client.storage.(*controlTestStorage)
+			require.True(t, ok)
+			testStorage.applies = &settledApplyReadErrorStore{controlTestApplyStore: &controlTestApplyStore{apply: apply}, err: failure}
+
+			process := client.processPendingStopControlRequest
+			if tc.operation == storage.ControlOperationCancel {
+				process = client.processPendingCancelControlRequest
+			}
+			standDown, err := process(t.Context(), apply)
+
+			require.ErrorIs(t, err, failure, "the storage failure must reach the caller")
+			assert.False(t, standDown, "the drive cannot tell what became of the command, so it keeps the claim it holds")
+			pending, err := requests.GetPending(t.Context(), apply.ID, tc.operation)
+			require.NoError(t, err)
+			assert.NotNil(t, pending, "the request could not be completed, so it stays pending for a later claim")
+		})
+	}
+}
+
+// A durable cancel request against a PostgreSQL apply this process has no live
+// work for — the drive that ran it is gone, so its statement died with that
+// connection — has nothing left to stop: the engine's permanent decline does
+// not surface, the live-work probe reads idle, and the durable cancel
+// completes by terminalizing the task and apply, as it does for every engine.
+func TestLocalClient_PendingCancelCompletesWhenPostgresEngineHasNoLiveWork(t *testing.T) {
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-postgres-cancel-no-live-work",
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		State:           state.Apply.Running,
+	}
+	task := &storage.Task{
+		ID:             7,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task-postgres-cancel-no-live-work",
+		State:          state.Task.Running,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client := newPostgresControlTestClient(apply, []*storage.Task{task}, controlRequests)
+
+	standDown, err := client.processPendingCancelControlRequest(t.Context(), apply)
+
+	require.NoError(t, err)
+	assert.True(t, standDown, "a completed cancel is the operator's cancel")
+	assert.Equal(t, state.Apply.Cancelled, apply.State)
+	assert.Equal(t, state.Task.Cancelled, task.State)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.Nil(t, pending, "the durable cancel request must be resolved, not left pending")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestCompleted, resolved.Status)
+}
+
+// revertPhaseDeclineFixture stages an apply in its revert window with one
+// pending request for the given revert-phase operation, and returns the client
+// that drives it alongside the stored request the drive would consume.
+func revertPhaseDeclineFixture(t *testing.T, operation storage.ControlOperation) (*LocalClient, *storage.Apply, *testControlRequestStore, *storage.ApplyControlRequest) {
+	t.Helper()
+	apply := &storage.Apply{
+		ID:              42,
+		ApplyIdentifier: "apply-postgres-" + string(operation),
+		Database:        "testdb",
+		DatabaseType:    storage.DatabaseTypePostgres,
+		State:           state.Apply.RevertWindow,
+	}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   operation,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client := newPostgresControlTestClient(apply, nil, controlRequests)
+	pending, err := controlRequests.GetPending(t.Context(), apply.ID, operation)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	return client, apply, controlRequests, pending
+}
+
+// A durable revert request the engine declines for its whole database type is
+// resolved as permanently failed. The decline is deterministic, so leaving the
+// request pending would re-run the same rejection on every drive claim for as
+// long as the revert window lasts. The window itself is untouched: the refusal
+// declines the operator's command rather than carrying it out, so the schema
+// change finishes the way it would have without the command, and the operator
+// reads the engine's reason on the failed request.
+func TestLocalClient_DeclinedRevertRequestResolvesTerminally(t *testing.T) {
+	client, apply, controlRequests, pending := revertPhaseDeclineFixture(t, storage.ControlOperationRevert)
+
+	_, revertErr := client.getEngine().Revert(t.Context(), nil)
+	require.Error(t, revertErr, "the PostgreSQL engine declines revert for its whole database type")
+
+	client.resolveOrRetryRevertPhaseRequest(t.Context(), client.logger, apply,
+		storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending, revertErr)
+
+	stillPending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+	require.NoError(t, err)
+	assert.Nil(t, stillPending, "the durable revert request must be resolved, not left for the next drive claim to retry")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationRevert)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "an unsupported-operation decline is a permanent rejection")
+	assert.Contains(t, resolved.ErrorMessage, "no revert window",
+		"the failed request must carry the engine's reason, not a generic failure")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a declined revert must leave the revert window running")
+}
+
+// A durable skip-revert request is resolved the same way and for the same
+// reason: an engine with no revert window to close declines identically every
+// time it is asked, so the request is failed with that reason instead of
+// re-attempted until the window expires on its own.
+func TestLocalClient_DeclinedSkipRevertRequestResolvesTerminally(t *testing.T) {
+	client, apply, controlRequests, pending := revertPhaseDeclineFixture(t, storage.ControlOperationSkipRevert)
+
+	_, skipErr := client.getEngine().SkipRevert(t.Context(), nil)
+	require.Error(t, skipErr, "the PostgreSQL engine declines skip-revert for its whole database type")
+
+	client.resolveOrRetryRevertPhaseRequest(t.Context(), client.logger, apply,
+		storage.ControlOperationSkipRevert, storage.LogEventSkipRevertTriggered, pending, skipErr)
+
+	stillPending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+	require.NoError(t, err)
+	assert.Nil(t, stillPending, "the durable skip-revert request must be resolved, not left for the next drive claim to retry")
+	resolved, err := controlRequests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationSkipRevert)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "an unsupported-operation decline is a permanent rejection")
+	assert.Contains(t, resolved.ErrorMessage, "no revert window",
+		"the failed request must carry the engine's reason, not a generic failure")
+	assert.Equal(t, state.Apply.RevertWindow, apply.State, "a declined skip-revert must leave the revert window running")
+}
+
+// A revert that fails for a reason a later attempt could survive stays pending.
+// Only a decline the engine issues for its whole database type is permanent, so
+// terminal resolution must not swallow the ordinary failures the operator-owned
+// retry loop exists to ride out.
+func TestLocalClient_RetryableRevertRequestFailureStaysPending(t *testing.T) {
+	client, apply, controlRequests, pending := revertPhaseDeclineFixture(t, storage.ControlOperationRevert)
+
+	client.resolveOrRetryRevertPhaseRequest(t.Context(), client.logger, apply,
+		storage.ControlOperationRevert, storage.LogEventRevertTriggered, pending,
+		errors.New("data plane is unreachable"))
+
+	stillPending, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationRevert)
+	require.NoError(t, err)
+	require.NotNil(t, stillPending, "a retryable failure must leave the request for the next drive claim")
+	assert.Equal(t, storage.ControlRequestPending, stillPending.Status, "a retryable failure is not a rejection")
 }
 
 // Cancelled must never overwrite a revert-phase apply state, whichever path
@@ -1582,9 +2563,9 @@ func TestProcessPendingStopControlRequest_LogsCarryApplyIdentity(t *testing.T) {
 		logger: slog.New(captureHandler{records: &records}),
 	}
 
-	handled, err := client.processPendingStopControlRequest(t.Context(), apply)
+	standDown, err := client.processPendingStopControlRequest(t.Context(), apply)
 	require.NoError(t, err)
-	assert.True(t, handled)
+	assert.True(t, standDown)
 
 	line := requireCapturedLog(t, records, "completing pending stop request for resolved apply")
 	assert.Equal(t, "apply-stop-identity", line.attrs["apply_id"])
@@ -1718,7 +2699,7 @@ func TestLocalClient_ControlOperationCountsOnlyLandedTaskWrites(t *testing.T) {
 	}
 
 	marked, skipped, applyID, err := client.markTasksWithState(t.Context(),
-		[]*storage.Task{landing, refused, alreadyDone}, apply.ID, nil, state.Task.Stopped)
+		[]*storage.Task{landing, refused, alreadyDone}, apply.ID, StatementIndex[engine.TableProgress]{}, state.Task.Stopped)
 
 	require.Error(t, err, "a refused task write must be reported, not absorbed into the count")
 	assert.Contains(t, err.Error(), "failed to settle 1 of 2 tasks",
@@ -1889,4 +2870,80 @@ func TestLocalClient_StartDistinguishesAFinishedApplyFromAMissingOne(t *testing.
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already reached a terminal state")
 	assert.NotContains(t, err.Error(), "state start cannot act on")
+}
+
+// An engine that declines an operation for its whole database type has given a
+// deterministic answer, and the RPC surface has to express it as a refusal. An
+// error is the one shape that cannot cross the boundary: the gRPC server maps
+// every error to a generic internal status, so the caller cannot tell a
+// permanent decline from a transient failure and retries a request that can
+// never succeed.
+func TestLocalClientRevertWindowDeclinesAreRefusalsNotErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		decline error
+		call    func(*LocalClient) (bool, string, error)
+		reason  string
+	}{
+		{
+			name:    "revert",
+			decline: engine.NewUnsupportedOperationError("revert is not supported for these schema changes"),
+			reason:  "revert is not supported",
+			call: func(c *LocalClient) (bool, string, error) {
+				resp, err := c.Revert(t.Context(), &ternv1.RevertRequest{Environment: "staging"})
+				if resp == nil {
+					return false, "", err
+				}
+				return resp.Accepted, resp.ErrorMessage, err
+			},
+		},
+		{
+			name:    "skip-revert",
+			decline: engine.NewUnsupportedOperationError("skip-revert is not supported for these schema changes"),
+			reason:  "skip-revert is not supported",
+			call: func(c *LocalClient) (bool, string, error) {
+				resp, err := c.SkipRevert(t.Context(), &ternv1.SkipRevertRequest{Environment: "staging"})
+				if resp == nil {
+					return false, "", err
+				}
+				return resp.Accepted, resp.ErrorMessage, err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := newDecliningControlLocalClient(tc.decline)
+			accepted, message, err := tc.call(client)
+			require.NoError(t, err, "a deterministic decline must not surface as an error the caller would retry")
+			assert.False(t, accepted, "the operation was declined")
+			assert.Contains(t, message, tc.reason, "the refusal carries the engine's reason to the caller")
+		})
+	}
+}
+
+// newDecliningControlLocalClient builds a client whose engine declines the
+// revert-window controls for its whole database type.
+func newDecliningControlLocalClient(decline error) *LocalClient {
+	apply := &storage.Apply{
+		ID: 1, ApplyIdentifier: "apply-decline", Database: "testdb",
+		Environment: "staging", State: state.Apply.RevertWindow,
+	}
+	task := &storage.Task{
+		ID: 1, ApplyID: apply.ID, TaskIdentifier: "task-decline",
+		Database: "testdb", Namespace: "testdb", TableName: "users", State: state.Task.RevertWindow,
+	}
+	return &LocalClient{
+		config: LocalConfig{
+			Database:  "testdb",
+			Type:      storage.DatabaseTypeMySQL,
+			TargetDSN: "root@tcp(localhost:3306)/",
+		},
+		storage: &controlTestStorage{
+			applies:         &controlTestApplyStore{apply: apply},
+			tasks:           &controlTestTaskStore{tasks: []*storage.Task{task}},
+			applyLogs:       &controlTestApplyLogStore{},
+			controlRequests: &testControlRequestStore{},
+		},
+		spiritEngine: &fakeControlEngine{revertErr: decline, skipRevertErr: decline},
+		logger:       slog.Default(),
+	}
 }

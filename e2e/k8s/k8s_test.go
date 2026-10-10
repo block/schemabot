@@ -54,7 +54,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 
 	"github.com/block/schemabot/e2e/testutil"
 	"github.com/block/schemabot/pkg/apitypes"
@@ -523,7 +523,7 @@ func TestK8s_PlanApply_CreateTable(t *testing.T) {
 
 	// Register cleanup for the table the apply created
 	t.Cleanup(func() {
-		db, err := sql.Open("mysql", dsn)
+		db, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			return
 		}
@@ -864,7 +864,14 @@ func hasRowCopyProgress(rowsTotal, rowsCopied int64, percentComplete int32) bool
 
 func storedK8sApplyAndTaskStates(t *testing.T, dsn, applyID string) (string, string) {
 	t.Helper()
-	db := testutil.OpenMySQL(t, dsn)
+	return storedApplyAndTaskStates(t, testutil.OpenMySQL(t, dsn), applyID)
+}
+
+// storedApplyAndTaskStates is the handle-taking form of
+// storedK8sApplyAndTaskStates for callers that already hold the storage pool,
+// such as poll loops that would otherwise open one per tick.
+func storedApplyAndTaskStates(t *testing.T, db *sql.DB, applyID string) (string, string) {
+	t.Helper()
 
 	var applyState, taskState string
 	require.NoError(t, db.QueryRowContext(t.Context(), `

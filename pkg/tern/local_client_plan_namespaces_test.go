@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -13,10 +14,33 @@ import (
 )
 
 func planNamespacesTestClient() *LocalClient {
-	return &LocalClient{config: LocalConfig{
-		Database: "commerce",
-		Type:     storage.DatabaseTypeVitess,
-	}}
+	return &LocalClient{
+		config: LocalConfig{
+			Database: "commerce",
+			Type:     storage.DatabaseTypeVitess,
+		},
+		logger: slog.New(slog.DiscardHandler),
+	}
+}
+
+// TestNormalizeSchemaFilesKeepsEmptyNamespace proves a namespace that
+// declares no schema files reaches the engine on every database type, so the
+// engine can surface each live table it still holds as a DROP TABLE change
+// instead of the plan reporting nothing to change.
+func TestNormalizeSchemaFilesKeepsEmptyNamespace(t *testing.T) {
+	for _, databaseType := range []string{storage.DatabaseTypeMySQL, storage.DatabaseTypeVitess, storage.DatabaseTypeStrata, storage.DatabaseTypePostgres} {
+		t.Run(databaseType, func(t *testing.T) {
+			client := &LocalClient{config: LocalConfig{Database: "commerce", Type: databaseType}}
+
+			normalized, err := client.normalizeSchemaFiles(schema.SchemaFiles{"orders": {Files: map[string]string{}}})
+
+			require.NoError(t, err)
+			require.Len(t, normalized, 1)
+			for _, files := range normalized {
+				assert.Empty(t, files.Files)
+			}
+		})
+	}
 }
 
 // TestNamespacesFromEngineChangesPersistsVSchemaMetadata verifies the local
@@ -258,4 +282,145 @@ func TestNamespacesFromEngineChangesWithoutVSchemaWork(t *testing.T) {
 	nsData := namespaces["payments"]
 	assert.Nil(t, nsData.Metadata)
 	assert.Empty(t, nsData.Artifacts)
+}
+
+// nonShardedMultiStatementChange is a non-sharded engine change whose table
+// appears in three ordered statements — its CREATE TABLE followed by two index
+// builds — the shape a PostgreSQL greenfield table plans as.
+func nonShardedMultiStatementChange() engine.SchemaChange {
+	return engine.SchemaChange{
+		Namespace: "payments",
+		TableChanges: []engine.TableChange{
+			{
+				Table:     "users",
+				DDL:       `CREATE TABLE "users" ("id" bigint PRIMARY KEY, "email" text, "org" text)`,
+				Operation: ddl.StatementCreateTable,
+			},
+			{
+				Table:     "users",
+				DDL:       `CREATE UNIQUE INDEX "users_email_idx" ON "users" ("email")`,
+				Operation: ddl.StatementCreateIndex,
+			},
+			{
+				Table:     "users",
+				DDL:       `CREATE INDEX "users_org_idx" ON "users" ("org")`,
+				Operation: ddl.StatementCreateIndex,
+			},
+		},
+	}
+}
+
+// TestNamespacesFromEngineChangesKeepsNonShardedStatementOrder verifies the
+// stored plan keeps every statement of a non-sharded change even when one
+// table appears more than once: a table's CREATE TABLE and each of its index
+// builds must all survive into the plan the apply executes, in plan order.
+func TestNamespacesFromEngineChangesKeepsNonShardedStatementOrder(t *testing.T) {
+	client := planNamespacesTestClient()
+
+	namespaces, shardPlans := client.namespacesFromEngineChanges(
+		[]engine.SchemaChange{nonShardedMultiStatementChange()}, schema.SchemaFiles{})
+
+	assert.Empty(t, shardPlans)
+	require.Contains(t, namespaces, "payments")
+	tables := namespaces["payments"].Tables
+	require.Len(t, tables, 3)
+	assert.Contains(t, tables[0].DDL, "CREATE TABLE")
+	assert.Contains(t, tables[1].DDL, `"users_email_idx"`)
+	assert.Contains(t, tables[2].DDL, `"users_org_idx"`)
+	for _, tc := range tables {
+		assert.Equal(t, "users", tc.Table)
+	}
+}
+
+// A sharded keyspace's generated-only VSchema marker reaches the plan response
+// when every shard that reports VSchema work carries it, including when only
+// one shard reports the keyspace's VSchema work at all. When a shard reports
+// VSchema work without the marker, the merged keyspace drops it, so the plan
+// comment never claims a keyspace has no hand-written VSchema change on the
+// word of one shard alone.
+func TestPlanResultToProtoChangesKeepsGeneratedOnlyMarkerOnlyWhenShardsAgree(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	generated := map[string]string{
+		storage.PlanMetadataVSchemaChanged:  "true",
+		engine.MetadataVSchemaGeneratedOnly: "true",
+	}
+	plan := func(first, second map[string]string) map[string]string {
+		t.Helper()
+		changes, _, _ := client.planResultToProtoChanges(&engine.PlanResult{
+			Changes: []engine.SchemaChange{
+				{Namespace: "payments", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: first},
+				{Namespace: "payments", Shard: engine.Shard{Name: "80-"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: second},
+			},
+		})
+		require.Len(t, changes, 1)
+		return changes[0].Metadata
+	}
+
+	assert.Equal(t, "true", plan(generated, generated)[engine.MetadataVSchemaGeneratedOnly], "every shard agrees")
+	assert.Equal(t, "true", plan(nil, generated)[engine.MetadataVSchemaGeneratedOnly], "the only shard reporting VSchema work carries the marker")
+
+	unexplained := plan(map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, generated)
+	assert.NotContains(t, unexplained, engine.MetadataVSchemaGeneratedOnly, "a shard reports VSchema work without the marker")
+	assert.Equal(t, "true", unexplained[storage.PlanMetadataVSchemaChanged], "the VSchema change itself still reaches the plan")
+
+	diffed := plan(generated, map[string]string{storage.PlanMetadataVSchemaDiff: "+    \"refunds\": {}"})
+	assert.NotContains(t, diffed, engine.MetadataVSchemaGeneratedOnly, "a shard renders a VSchema diff")
+}
+
+// The stored plan keeps a sharded keyspace's generated-only VSchema marker by
+// the same rule as the plan response: only when every shard that reports
+// VSchema work carries it.
+func TestNamespacesFromEngineChangesKeepsGeneratedOnlyMarkerOnlyWhenShardsAgree(t *testing.T) {
+	client := planNamespacesTestClient()
+	alterUsers := engine.TableChange{
+		Table:     "users",
+		DDL:       "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		Operation: ddl.StatementAlterTable,
+	}
+	generated := map[string]string{
+		storage.PlanMetadataVSchemaChanged:  "true",
+		engine.MetadataVSchemaGeneratedOnly: "true",
+	}
+	stored := func(first, second map[string]string) map[string]string {
+		t.Helper()
+		namespaces, _ := client.namespacesFromEngineChanges([]engine.SchemaChange{
+			{Namespace: "payments", Shard: engine.Shard{Name: "-80"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: first},
+			{Namespace: "payments", Shard: engine.Shard{Name: "80-"}, TableChanges: []engine.TableChange{alterUsers}, Metadata: second},
+		}, nil)
+		require.Contains(t, namespaces, "payments")
+		return namespaces["payments"].Metadata
+	}
+
+	assert.Equal(t, generated, stored(generated, generated), "every shard agrees")
+	assert.Equal(t, generated, stored(nil, generated), "the only shard reporting VSchema work carries the marker")
+	assert.Equal(t, map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, stored(map[string]string{storage.PlanMetadataVSchemaChanged: "true"}, generated), "a shard reports VSchema work without the marker")
+}
+
+// TestPlanResultToProtoChangesKeepsNonShardedStatementOrder verifies the plan
+// response carries every statement of a non-sharded change even when one table
+// appears more than once, so the plan an operator reviews shows the same
+// ordered statement list the apply will execute.
+func TestPlanResultToProtoChangesKeepsNonShardedStatementOrder(t *testing.T) {
+	client := planNamespacesTestClient()
+
+	changes, violations, shards := client.planResultToProtoChanges(&engine.PlanResult{
+		Changes: []engine.SchemaChange{nonShardedMultiStatementChange()},
+	})
+
+	assert.Empty(t, violations)
+	assert.Empty(t, shards)
+	require.Len(t, changes, 1)
+	tableChanges := changes[0].TableChanges
+	require.Len(t, tableChanges, 3)
+	assert.Contains(t, tableChanges[0].Ddl, "CREATE TABLE")
+	assert.Contains(t, tableChanges[1].Ddl, `"users_email_idx"`)
+	assert.Contains(t, tableChanges[2].Ddl, `"users_org_idx"`)
+	for _, tc := range tableChanges {
+		assert.Equal(t, "users", tc.TableName)
+	}
 }

@@ -5,45 +5,138 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
+	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/block/pg-sprite/pkg/dbconn"
-	"github.com/block/pg-sprite/pkg/diffplan"
+	"github.com/block/pg-sprite/pkg/executor"
 	pgplan "github.com/block/pg-sprite/pkg/plan"
 	"github.com/block/pg-sprite/pkg/planner"
 	"github.com/block/pg-sprite/pkg/preflight"
+	"github.com/block/pg-sprite/pkg/progress"
 	"github.com/block/pg-sprite/pkg/router"
+	"github.com/block/pg-sprite/pkg/schemadiff"
 	pgstatement "github.com/block/pg-sprite/pkg/statement"
+	spirittable "github.com/block/spirit/pkg/table"
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/targetauth"
 )
 
 // Engine implements engine.Engine for PostgreSQL databases.
 type Engine struct {
-	mu sync.Mutex
-	wg sync.WaitGroup
-	// progress is the tracked schema change's latest state, keyed by
-	// progressKey (the apply's ResumeState.MigrationContext). One engine is
-	// shared for the lifetime of a target, so Progress must answer for the
-	// apply the caller identifies — never for whichever apply wrote last.
-	progress       *engine.ProgressResult
-	progressKey    string
+	mu              sync.Mutex
+	wg              sync.WaitGroup
+	pullDatabase    string
+	pullCredentials *engine.Credentials
+	tableOwner      string
+	// progress holds the latest state of every schema change this engine is
+	// tracking, keyed by the apply's identity (its
+	// ResumeState.MigrationContext). One engine is shared for the lifetime of a
+	// target, so Progress must answer for the apply the caller identifies — and
+	// accepting a second apply on the same target must not evict the first
+	// one's state while it is still running, or the running apply's driver
+	// would be told its work no longer exists.
+	progress       map[string]*trackedApply
 	tableSizeLimit int64
+
+	// optimisticApplyCeiling is the fixed client-side ceiling on one ordinary
+	// apply, seeded from the package constant of the same name. It is not an
+	// operator option: production never varies it, and only in-package tests
+	// assign it, to observe the ceiling ending an apply without waiting out
+	// the production value.
+	optimisticApplyCeiling     time.Duration
+	concurrentIndexMaxDuration time.Duration
+
+	// execute is a test seam standing in for executeOptimistic, so the apply
+	// drive — accept, claim, execute, terminal publish — can be exercised
+	// against an executor the test scripts instead of a target to dial. Nil
+	// selects the real executor.
+	execute func(ctx context.Context, conn targetConn, change nativeApply, tableSizeLimit int64, tracker *progress.Tracker, logger *slog.Logger) error
+}
+
+// trackedApply pairs the progress the engine has published for one apply
+// with the pg-sprite tracker its executor feeds. The published result changes
+// only at accept and at the terminal outcome; the tracker is what moves in
+// between, so Progress reads the step position and statement from it. The
+// logger is the apply's own, so a poll that cannot read the tracker logs
+// under the identifiers the apply was accepted with.
+//
+// Every field but done is read and written under Engine.mu. done is closed
+// by the drive goroutine once its terminal result is published, so a cancel
+// can wait for the outcome the drive settles on instead of guessing it.
+type trackedApply struct {
+	result  *engine.ProgressResult
+	tracker buildTracker
+	logger  *slog.Logger
+	// concurrentIndex records the shape the apply was admitted as: a
+	// concurrent index build is the one PostgreSQL change an operator can
+	// cancel, so the shape decides the answer before any server is asked.
+	concurrentIndex bool
+	// cancelApply ends the drive's own context. It is the cancel of last
+	// resort: the build backend is signalled through the tracker first, and
+	// the context is cancelled only when that signal cannot reach a running
+	// statement — the build has not started, has already returned, or its
+	// backend cannot be observed or signalled by this role.
+	cancelApply context.CancelFunc
+	// cancelRequested records that a Cancel may have reached this apply — its
+	// signal may have landed on the build backend, or it cancelled the drive's
+	// context — so the drive can tell the operator's cancellation from a
+	// backend cancellation it did not ask for. Once set it is never reset.
+	cancelRequested bool
+	// cancelsInFlight counts the Cancel calls that have committed to acting
+	// on this apply but have not yet learned whether their signal was sent.
+	// The drive reads the apply as cancelled by the operator while any is in
+	// flight, because a signal can land before the call that sent it hears
+	// back. The cost runs the other way too: while a call is in flight, a
+	// backend cancellation SchemaBot did not send is also read as the
+	// operator's.
+	cancelsInFlight int
+	done            chan struct{}
+	// owner is the drive the apply was started for (engine.WithWorkOwner).
+	owner string
+}
+
+type buildTracker interface {
+	Progress(context.Context) (progress.Snapshot, error)
+	CancelBuild(context.Context) error
 }
 
 // DefaultNativeSafeTableSizeLimitBytes preserves the native-safe execution
 // ceiling when the server does not configure one.
 const DefaultNativeSafeTableSizeLimitBytes = int64(1 << 30)
+
+// DefaultConcurrentIndexMaxDuration bounds one concurrent index build.
+const DefaultConcurrentIndexMaxDuration = 24 * time.Hour
+
+// MaxConcurrentIndexMaxDuration is the largest bound the engine accepts for
+// one concurrent index build: the largest statement_timeout PostgreSQL
+// accepts, in milliseconds. The build runs under that server-side timer set
+// to the bound, so a larger value could not be handed to the server; the
+// recovery's engine-owned deadline honors the same ceiling. A bound above it
+// is not a build anyone waits for; it is the absence of a bound.
+const MaxConcurrentIndexMaxDuration = time.Duration(math.MaxInt32) * time.Millisecond
+
+// MinConcurrentIndexMaxDuration is the smallest bound the engine accepts for
+// one concurrent index build: statement_timeout is an integer millisecond
+// count, so anything shorter rounds to zero on the server, which disables
+// the timer instead of tightening it. The executor refuses such a budget as
+// unbounded; the engine never hands it one.
+const MinConcurrentIndexMaxDuration = time.Millisecond
 
 // New creates a new PostgreSQL engine.
 func New() *Engine {
@@ -57,15 +150,64 @@ func New() *Engine {
 // the plan-time preflight check rejects a non-positive limit before apply,
 // and server config validation rejects it at startup.
 func NewWithTableSizeLimit(tableSizeLimit int64) *Engine {
+	return NewWithOptions(tableSizeLimit, DefaultConcurrentIndexMaxDuration)
+}
+
+// NewWithOptions creates a PostgreSQL engine with its process-wide apply
+// bounds. A concurrentIndexMaxDuration that is not positive adopts
+// DefaultConcurrentIndexMaxDuration: unlike the table size limit, no later
+// check refuses a negative bound, and a deadline already in the past would
+// end every concurrent build the instant it started. One above
+// MaxConcurrentIndexMaxDuration is clamped to it, and a positive one below
+// MinConcurrentIndexMaxDuration is raised to it, so the bound the engine
+// serves is always one the server's timer can hold. Server config validation
+// refuses all three before they reach this constructor; the normalization
+// here covers embedders that build the engine directly.
+func NewWithOptions(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration) *Engine {
 	if tableSizeLimit == 0 {
 		tableSizeLimit = DefaultNativeSafeTableSizeLimitBytes
 	}
-	return &Engine{tableSizeLimit: tableSizeLimit}
+	if concurrentIndexMaxDuration <= 0 {
+		concurrentIndexMaxDuration = DefaultConcurrentIndexMaxDuration
+	}
+	if concurrentIndexMaxDuration < MinConcurrentIndexMaxDuration {
+		concurrentIndexMaxDuration = MinConcurrentIndexMaxDuration
+	}
+	if concurrentIndexMaxDuration > MaxConcurrentIndexMaxDuration {
+		concurrentIndexMaxDuration = MaxConcurrentIndexMaxDuration
+	}
+	return &Engine{
+		tableSizeLimit:             tableSizeLimit,
+		optimisticApplyCeiling:     optimisticApplyCeiling,
+		concurrentIndexMaxDuration: concurrentIndexMaxDuration,
+	}
+}
+
+// NewForTarget creates a PostgreSQL engine with the target information needed
+// by capabilities whose request does not carry resolved credentials.
+func NewForTarget(tableSizeLimit int64, concurrentIndexMaxDuration time.Duration, database string, credentials *engine.Credentials) *Engine {
+	e := NewWithOptions(tableSizeLimit, concurrentIndexMaxDuration)
+	e.pullDatabase = database
+	e.pullCredentials = credentials
+	return e
+}
+
+// WithTableOwner configures the PostgreSQL role used for greenfield table
+// creation. Empty preserves creation as the connected role.
+func (e *Engine) WithTableOwner(owner string) *Engine {
+	e.tableOwner = owner
+	return e
 }
 
 // TableSizeLimit exposes the native-safe ceiling for wiring verification and observability.
 func (e *Engine) TableSizeLimit() int64 {
 	return e.tableSizeLimit
+}
+
+// ConcurrentIndexMaxDuration exposes the bound one concurrent index build
+// runs under, for wiring verification and observability.
+func (e *Engine) ConcurrentIndexMaxDuration() time.Duration {
+	return e.concurrentIndexMaxDuration
 }
 
 // Name returns the engine identifier.
@@ -98,8 +240,10 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("open PostgreSQL database %q for planning: %w", req.Database, err)
 	}
 	defer utils.CloseAndLog(db)
+	// Open only parsed the DSN; this ping is the first dial, so it is where the
+	// target can refuse the session and the only error worth classifying.
 	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("ping PostgreSQL database %q for planning: %w", req.Database, err)
+		return nil, fmt.Errorf("ping PostgreSQL database %q for planning: %w", req.Database, targetauth.Wrap(err))
 	}
 
 	poolCfg, err := spritePoolConfig(req.Credentials.DSN, caPath)
@@ -111,48 +255,103 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		return nil, fmt.Errorf("open pg-sprite pool for PostgreSQL database %q: %w", req.Database, err)
 	}
 	defer pool.Close()
-	return planSchemas(ctx, pool, req, e.tableSizeLimit)
+	return planSchemas(ctx, pool, req, e.tableSizeLimit, e.tableOwner)
 }
 
-func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest, tableSizeLimit int64) (*engine.PlanResult, error) {
+func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanRequest, tableSizeLimit int64, tableOwner string) (*engine.PlanResult, error) {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return nil, fmt.Errorf("select PostgreSQL statement parser: %w", err)
 	}
 
 	namespaces := sortedKeys(req.SchemaFiles)
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan PostgreSQL database %q: %w", req.Database, err)
+	}
 	result := &engine.PlanResult{}
 	for _, namespace := range namespaces {
 		ns := req.SchemaFiles[namespace]
 		if ns == nil {
 			return nil, fmt.Errorf("plan PostgreSQL namespace %q: schema files are required", namespace)
 		}
-		files := sortedKeys(ns.Files)
+		if err := refuseTableDeclaredTwice(namespace, ns.Files); err != nil {
+			return nil, err
+		}
 		schemaChange := engine.SchemaChange{Namespace: namespace}
+		files := sortedKeys(ns.Files)
+		desiredTables := make(map[string]bool, len(files))
 		for _, filename := range files {
-			desired, err := pgstatement.ParseDesired(ns.Files[filename])
+			table, rlsChanges, handled, err := planRowSecurityOperation(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
-				return nil, fmt.Errorf("parse desired PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
-			report, err := diffplan.Plan(ctx, pool, diffplan.Request{Schema: namespace, Desired: desired})
-			if err != nil {
-				return nil, fmt.Errorf("diff PostgreSQL table %q in namespace %q from file %q: %w", desired.Table(), namespace, filename, err)
+			if handled {
+				desiredTables[table] = true
+				schemaChange.TableChanges = append(schemaChange.TableChanges, rlsChanges...)
+				continue
 			}
-			changes, tiers, err := tableChanges(report, parser)
+			report, table, err := planPostgresDefinition(ctx, pool, namespace, ns.Files[filename])
 			if err != nil {
-				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
 			}
-			changes, err = blockMissingPrivileges(ctx, pool, report, changes, tiers)
+			desiredTables[table] = true
+			changes, tiers, unrecognized, err := tableChanges(report, parser)
 			if err != nil {
-				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("render PostgreSQL plan for table %q in namespace %q: %w", table, namespace, err)
 			}
-			changes, err = blockOversizedTable(ctx, pool, report, changes, tableSizeLimit)
+			for _, vocabulary := range unrecognized {
+				// The plan renders a blocked placeholder for the statement,
+				// so the operator is safe but uninformed; the log is where
+				// triage learns the planner's vocabulary grew, for whose
+				// schema file, and which value to map next.
+				slog.Warn("PostgreSQL planner returned vocabulary SchemaBot does not recognize; the plan blocks the statement with a placeholder verdict",
+					"database", req.Database,
+					"namespace", namespace,
+					"table", table,
+					"vocabulary", vocabulary.kind,
+					"value", vocabulary.value)
+			}
+			changes, err = blockMissingPrivileges(ctx, pool, req.Database, report, changes, tiers, tableOwner)
 			if err != nil {
-				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", desired.Table(), namespace, err)
+				return nil, fmt.Errorf("verify privileges for table %q in namespace %q: %w", table, namespace, err)
+			}
+			changes, err = blockOversizedTable(ctx, pool, req.Database, report, changes, tableSizeLimit)
+			if err != nil {
+				return nil, fmt.Errorf("verify size for table %q in namespace %q: %w", table, namespace, err)
 			}
 			schemaChange.TableChanges = append(schemaChange.TableChanges, changes...)
 		}
+		// A table the config withholds that a schema file also declares is a
+		// contradiction: the declaring file would keep managing the table while
+		// the config says to leave it alone.
+		if err := ignored.RefuseDeclared(namespace, sortedKeys(desiredTables)); err != nil {
+			return nil, err
+		}
+		drops, exempt, withheld, err := undeclaredTableDrops(ctx, pool, req.Database, namespace, desiredTables, ignored, parser)
+		if err != nil {
+			return nil, fmt.Errorf("compare live tables against schema files in namespace %q: %w", namespace, err)
+		}
+		schemaChange.TableChanges = append(schemaChange.TableChanges, drops...)
+		if len(exempt) > 0 {
+			slices.Sort(exempt)
+			result.ExemptTables = append(result.ExemptTables, &engine.ExemptTables{
+				Namespace: namespace,
+				Tables:    exempt,
+				Reason:    exemptReasonArchiveNaming,
+			})
+		}
+		if exemption := ignored.Exemption(namespace, withheld); exemption != nil {
+			result.ExemptTables = append(result.ExemptTables, exemption)
+		}
 		if len(schemaChange.TableChanges) > 0 {
+			// Only a namespace with changes needs a rollback baseline, so
+			// the render is paid once per changed namespace rather than for
+			// every namespace the schema files declare.
+			schemaChange.OriginalFiles, schemaChange.OriginalFilesCaptured, err = captureOriginalFiles(ctx, pool, req.Database, namespace, desiredTables, ignored)
+			if err != nil {
+				return nil, err
+			}
 			result.Changes = append(result.Changes, schemaChange)
 		}
 	}
@@ -161,16 +360,112 @@ func planSchemas(ctx context.Context, pool *pgxpool.Pool, req *engine.PlanReques
 	return result, nil
 }
 
+// refuseTableDeclaredTwice fails the plan when two schema files in one
+// namespace declare the same table. Each file is diffed against the live table
+// on its own, so a table declared twice would get two contradictory diffs,
+// each dropping what only the other file declares; there is no single desired
+// definition to review. The error names the table and both files so the
+// operator knows which one to remove. It runs before any file is planned, and
+// applies the same rule every planner does (ddl.TableDeclarations), so a
+// duplicate declaration reads the same whichever engine refuses it.
+func refuseTableDeclaredTwice(namespace string, files map[string]string) error {
+	var declared ddl.TableDeclarations
+	for _, filename := range sortedKeys(files) {
+		table, err := desiredTableName(files[filename])
+		if err != nil {
+			return fmt.Errorf("plan PostgreSQL schema in %q/%q: %w", namespace, filename, err)
+		}
+		if err := declared.Declare(filename, table); err != nil {
+			return fmt.Errorf("plan PostgreSQL namespace %q: %w", namespace, err)
+		}
+	}
+	return nil
+}
+
+// captureOriginalFiles renders the live namespace as the plan's rollback
+// baseline, keyed by schema file name. The baseline is every managed table
+// in the namespace except ignored tables and undeclared archives. Declared
+// archives keep their originals. Exclusions are applied before introspection,
+// so only tables the forward plan manages decide capture completeness. It is
+// complete or it is nothing, and the two ways it can fall short end
+// differently. A table the engine read but pg-sprite's renderer refuses —
+// each shape it refuses is named by one of its ErrUnrenderable errors,
+// foreign keys on either side and inheritance among them — leaves captured
+// false, and RV-7 then refuses rollback for this plan rather than
+// reconstructing the originals; the plan itself still proceeds, because
+// rollback capability is not a precondition for reviewing or applying the
+// change. A table the engine could not read — the listing named it and
+// introspection cannot find or resolve it, a catalog query fails, the
+// context is cancelled — is an error that ends the plan, whether it is one
+// table's read or the namespace's: a catalog that could not be read
+// consistently is not one to plan against, and a plan interrupted
+// mid-capture is never recorded as rollback-incapable.
+//
+// The render introspects every managed table in the namespace, changed or
+// not, so its cost grows with the namespace rather than with the change; the
+// introspections run concurrently within the pool's ceiling, so the wall
+// time grows more slowly than the table count does.
+func captureOriginalFiles(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables) (files map[string]string, captured bool, err error) {
+	originalTables, renderErrors, err := renderPostgresTables(ctx, pool, database, namespace, rollbackBaseline(declared, ignored))
+	if err != nil {
+		return nil, false, fmt.Errorf("capture original PostgreSQL schema in namespace %q: %w", namespace, err)
+	}
+	if len(renderErrors) > 0 {
+		// One representative cause is enough to start triage; the count says
+		// how far the namespace is from a complete baseline without the log
+		// line growing with the number of unrenderable tables.
+		slog.Warn("PostgreSQL plan could not capture the whole namespace as rollback originals; the plan proceeds rollback-incapable",
+			"database", database,
+			"namespace", namespace,
+			"unrenderable_tables", len(renderErrors),
+			"first_error", renderErrors[0])
+		return nil, false, nil
+	}
+	files = make(map[string]string, len(originalTables))
+	for table, content := range originalTables {
+		files[table+".sql"] = content
+	}
+	return files, true, nil
+}
+
+// tierUnderived marks a step whose privilege tier could not be derived: its
+// statement is a shape the engine does not execute, so the step is blocked
+// and there is no access to probe on its behalf. It sits below preflight's
+// lowest rung so it can never match a checked tier.
+const tierUnderived preflight.Tier = -1
+
 // tableChanges renders the report's statements as planned table changes and
-// derives each executable step's privilege tier alongside them. The returned
-// slices are parallel: tiers[i] is the access changes[i] needs from the
-// engine role, and is meaningful only while changes[i] carries no verdict —
-// a blocked step never reaches a privilege check.
-func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, error) {
+// derives each step's privilege tier alongside them. The returned slices are
+// parallel: tiers[i] is the access changes[i] needs from the engine role,
+// including when an earlier verdict already blocked that step, so a later
+// gate can name the grant a blocked step will also need; a blocked step whose
+// shape has no tier carries tierUnderived. unrecognized carries one entry per
+// statement whose verdict is a placeholder for planner vocabulary this build
+// does not map, for the caller to log with the plan's identifiers.
+func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.TableChange, []preflight.Tier, []unrecognizedPlannerVocabulary, error) {
+	// Each statement's verdict is derived once and reused for both the
+	// greenfield decision and the rendering, so a placeholder verdict is
+	// reported once per statement.
+	verdicts := make([]stepVerdict, len(report.Statements))
+	var unrecognized []unrecognizedPlannerVocabulary
+	for i, statement := range report.Statements {
+		verdicts[i] = executionVerdict(report.FormatVersion, statement, report.Table)
+		if verdicts[i].unrecognized != nil {
+			unrecognized = append(unrecognized, *verdicts[i].unrecognized)
+		}
+	}
+	if isGreenfieldCreateSet(report, verdicts) {
+		change, tier, err := greenfieldCreateSet(report, parser)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return []engine.TableChange{change}, []preflight.Tier{tier}, unrecognized, nil
+	}
+
 	changes := make([]engine.TableChange, 0, len(report.Statements))
 	tiers := make([]preflight.Tier, 0, len(report.Statements))
-	for _, statement := range report.Statements {
-		mode, reason := executionVerdict(report.FormatVersion, statement, report.Table)
+	for i, statement := range report.Statements {
+		mode, reason := verdicts[i].mode, verdicts[i].reason
 		rendered := statement.ExecSQL
 		if len(rendered) == 0 {
 			rendered = []string{statement.SQL}
@@ -178,28 +473,32 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 		for _, sql := range rendered {
 			operation, table, err := parser.Classify(sql)
 			if err != nil {
-				return nil, nil, fmt.Errorf("classify planned statement for table %q: %w", report.Table, err)
+				return nil, nil, nil, fmt.Errorf("classify planned statement for table %q: %w", report.Table, err)
 			}
 			if table == "" {
 				table = report.Table
 			}
 			stepMode, stepReason := mode, reason
-			var stepTier preflight.Tier
-			if stepMode == "" {
-				// The apply path derives a privilege tier for every statement
-				// it executes, and that derivation refuses shapes outside the
-				// native-safe set. Run the same authority here so the verdict
-				// the operator reviews matches what the engine will do,
-				// instead of emitting an executable plan that deterministically
-				// fails at apply.
-				tier, tierErr := preflight.RequiredTier([]string{sql})
-				if tierErr != nil {
-					stepMode = engine.ExecutionModeBlocked
-					stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
-				} else {
-					stepTier = tier
-				}
+			// The apply path derives a privilege tier for every statement it
+			// executes, and that derivation refuses shapes outside the
+			// native-safe set. Run the same authority here, for blocked steps
+			// too: an executable step whose shape it refuses becomes a blocked
+			// verdict that matches what the engine will do, instead of an
+			// executable plan that deterministically fails at apply, and a
+			// step the planner already blocked keeps the tier the privilege
+			// gate needs to name the grant the operator will also need.
+			stepTier := tierUnderived
+			tier, tierErr := preflight.RequiredTier([]string{sql})
+			switch {
+			case tierErr == nil:
+				stepTier = tier
+			case stepMode == "":
+				stepMode = engine.ExecutionModeBlocked
+				stepReason = fmt.Sprintf("statement for table %q is a shape SchemaBot's PostgreSQL support does not execute yet; rewriting the change cannot make it eligible", table)
 			}
+			// Verdict reasons quote the table name, a planner-sourced
+			// identifier, so the reserved cause separator is neutralized
+			// before the reason becomes one cause of the verdict.
 			changes = append(changes, engine.TableChange{
 				Table:         table,
 				Operation:     operation,
@@ -207,16 +506,107 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 				IsUnsafe:      statement.Destructive,
 				UnsafeReason:  destructiveReason(statement.Destructive, table),
 				ExecutionMode: stepMode,
-				ModeReason:    stepReason,
+				ModeReason:    engine.SanitizeBlockedCause(stepReason),
 			})
 			tiers = append(tiers, stepTier)
 		}
 	}
-	return changes, tiers, nil
+	return changes, tiers, unrecognized, nil
+}
+
+// stepVerdict is the execution mode and operator-facing reason derived for
+// one planned statement; an empty mode means the statement is executable.
+// unrecognized is set when the verdict is a placeholder for planner
+// vocabulary this build does not map, so the caller can log what moved.
+type stepVerdict struct {
+	mode         string
+	reason       string
+	unrecognized *unrecognizedPlannerVocabulary
+}
+
+// unrecognizedPlannerVocabulary names a planner value outside the set this
+// build renders in its own words: kind says which vocabulary grew (the plan
+// contract, a disposition, or a create shape cause) and value is the entry
+// the planner returned. The operator sees a blocked placeholder either way;
+// this record exists so the server log names the value and the schema file
+// behind it.
+type unrecognizedPlannerVocabulary struct {
+	kind  string
+	value string
+}
+
+// isGreenfieldCreateSet reports whether the report describes a table that
+// does not exist yet and whose every statement is executable, so the table
+// and its indexes can ship as one apply unit. A report carrying any verdict
+// or destructive step keeps its per-statement rendering so each verdict
+// stays visible to the reviewer.
+func isGreenfieldCreateSet(report pgplan.Report, verdicts []stepVerdict) bool {
+	if !isGreenfieldTable(report) {
+		return false
+	}
+	if len(report.Statements) == 0 {
+		return false
+	}
+	for i, statement := range report.Statements {
+		if verdicts[i].mode != "" || statement.Destructive {
+			return false
+		}
+	}
+	return true
+}
+
+// isGreenfieldTable reports whether the planner proved the table absent.
+func isGreenfieldTable(report pgplan.Report) bool {
+	return report.TableExists != nil && !*report.TableExists
+}
+
+// greenfieldCreateSet renders a greenfield report as a single CREATE TABLE
+// change whose DDL carries the table and its indexes in execution order, and
+// derives the privilege tier the whole set needs. Every statement is
+// re-classified against the planner's own table so a report that is not a
+// create set fails closed here rather than at apply time.
+func greenfieldCreateSet(report pgplan.Report, parser ddl.StatementParser) (engine.TableChange, preflight.Tier, error) {
+	statements := make([]string, len(report.Statements))
+	for i, statement := range report.Statements {
+		// pg-sprite may render ExecSQL with CONCURRENTLY, which ExecuteCreate
+		// refuses for a table born in the run; canonical SQL is deliberate
+		// regardless of renderer behavior.
+		statements[i] = statement.SQL
+	}
+	createSet, err := ddl.CreateSetStatements(parser, strings.Join(statements, ";\n"))
+	if err != nil {
+		return engine.TableChange{}, 0, fmt.Errorf("validate greenfield create set for table %q: %w", report.Table, err)
+	}
+	_, table, err := parser.Classify(createSet[0])
+	if err != nil {
+		return engine.TableChange{}, 0, fmt.Errorf("classify greenfield CREATE TABLE for table %q: %w", report.Table, err)
+	}
+	if table != report.Table {
+		return engine.TableChange{}, 0, fmt.Errorf("greenfield create set targets table %q, expected planner table %q", table, report.Table)
+	}
+	tier, err := preflight.RequiredTier(createSet)
+	if err != nil {
+		return engine.TableChange{}, 0, fmt.Errorf("derive privilege tier for greenfield table %q: %w", report.Table, err)
+	}
+	if err := ensureGreenfieldCreateTier(report.Table, tier); err != nil {
+		return engine.TableChange{}, 0, err
+	}
+	return engine.TableChange{
+		Table:     report.Table,
+		Operation: ddl.StatementCreateTable,
+		DDL:       strings.Join(createSet, ";\n"),
+	}, tier, nil
+}
+
+func ensureGreenfieldCreateTier(table string, tier preflight.Tier) error {
+	if tier != preflight.TierCreateTable {
+		return fmt.Errorf("greenfield table %q requires tier %s, expected %s", table, tier, preflight.TierCreateTable)
+	}
+	return nil
 }
 
 // blockMissingPrivileges verifies the connected role holds the access each
-// executable step needs, at that step's own tier, so a missing grant surfaces
+// step needs, at that step's own tier, so a missing grant surfaces
 // on the plan the operator reviews — with the exact provisioning statement —
 // instead of failing only after apply is requested. Tiers are checked
 // per-step rather than aggregated so a refusal's remediation names only the
@@ -226,30 +616,77 @@ func tableChanges(report pgplan.Report, parser ddl.StatementParser) ([]engine.Ta
 // grant revoked between plan and apply still fails closed there. A privilege
 // refusal blocks the steps at its tier; a table-scoped refusal blocks every
 // executable step; any other failure fails the plan — an executable plan
-// must never be produced while the check's answer is unknown. Reasons come
-// from classifyRefusal, so the same failure reads identically at plan and
-// apply time. The returned slice is the input with verdicts marked.
-func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier) ([]engine.TableChange, error) {
+// must never be produced while the check's answer is unknown. When every step
+// is already blocked, a refusal the operator answers by provisioning — a
+// grant, a role, a schema — is appended as an independent cause; any other
+// answer leaves the safe verdicts intact and is logged. Reasons come
+// from classifyRefusal, so the same failure carries the same detail at plan
+// and apply time; here it is prefixed with the statement it blocks. The
+// returned slice is the input with verdicts marked.
+func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier, tableOwner string) ([]engine.TableChange, error) {
+	checkTier := func(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, tier preflight.Tier, tableOwner string) error {
+		if tier == preflight.TierCreateTable {
+			// The off-ladder create tier is checked against the schema, not
+			// the table: CheckPrivileges' ladder walks facts about an
+			// existing table, and a greenfield target has none.
+			_, err := preflight.CheckCreatePrivilegesAs(ctx, pool, report.Schema, tableOwner)
+			return err
+		}
+		_, err := preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
+		return err
+	}
+	return blockMissingPrivilegesWithCheck(ctx, pool, database, report, changes, tiers, tableOwner, checkTier)
+}
+
+// privilegeTierCheck answers whether the connected role holds one tier's
+// access for the report's target; the error is the preflight's own so
+// classifyRefusal can render it.
+type privilegeTierCheck func(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, tier preflight.Tier, tableOwner string) error
+
+// blockMissingPrivilegesWithCheck is blockMissingPrivileges with the per-tier
+// check injected, so the verdict rewriting can be exercised without a target.
+func blockMissingPrivilegesWithCheck(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tiers []preflight.Tier, tableOwner string, checkTier privilegeTierCheck) ([]engine.TableChange, error) {
 	if len(changes) != len(tiers) {
 		return nil, fmt.Errorf("verify privileges for table %q: %d planned changes carry %d privilege tiers", report.Table, len(changes), len(tiers))
 	}
+	fullyBlocked := !hasExecutableChanges(changes)
 	// Checked before any verdict rewriting below: blocking dependent steps
 	// must never launder a report that carries executable work but names no
 	// target into a plan that skips the privilege check entirely.
-	if hasExecutableChanges(changes) && report.Table == "" {
+	if report.Table == "" {
+		if fullyBlocked {
+			return changes, nil
+		}
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
-	if report.TableExists != nil && !*report.TableExists {
+	if isGreenfieldTable(report) {
 		// A privilege probe against a table that provably does not exist can
 		// only answer "table not found" — a dead end for the operator. Only
 		// the CREATE TABLE step's off-ladder tier states facts an absent
 		// target can satisfy; every other executable step depends on the
 		// table's creation, so that dependency is its accurate reason.
 		blockAbsentTableDependents(changes, tiers, report.Table)
+		// Blocking the dependents can leave no executable step: a plan whose
+		// CREATE TABLE the planner refused and whose index build was the
+		// only executable work is now blocked throughout, and its create
+		// step is probed below like any other fully blocked plan's, so the
+		// schema grant is named beside the shape refusal here too.
+		fullyBlocked = !hasExecutableChanges(changes)
 	}
+	// Executable steps are always checked. On a plan every gate has already
+	// refused, the blocked steps' tiers are checked too, so a grant the
+	// operator will also need is named in the same verdict rather than after
+	// the planner refusal is fixed.
+	greenfield := isGreenfieldTable(report)
 	required := make(map[preflight.Tier]bool)
 	for i, change := range changes {
-		if change.ExecutionMode == "" {
+		switch {
+		case change.ExecutionMode == "":
+			if tiers[i] == tierUnderived {
+				return nil, fmt.Errorf("verify privileges for table %q: executable statement %q carries no privilege tier", report.Table, change.DDL)
+			}
+			required[tiers[i]] = true
+		case fullyBlocked && change.ExecutionMode == engine.ExecutionModeBlocked && blockedTierIsProbeable(tiers[i], greenfield):
 			required[tiers[i]] = true
 		}
 	}
@@ -257,19 +694,39 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 		return changes, nil
 	}
 	for _, tier := range slices.Sorted(maps.Keys(required)) {
-		var err error
-		if tier == preflight.TierCreateTable {
-			// The off-ladder create tier is checked against the schema, not
-			// the table: CheckPrivileges' ladder walks facts about an
-			// existing table, and a greenfield target has none.
-			_, err = preflight.CheckCreatePrivileges(ctx, pool, report.Schema)
-		} else {
-			_, err = preflight.CheckPrivileges(ctx, pool, report.Schema, report.Table, preflight.Requirement{Tier: tier})
-		}
+		err := checkTier(ctx, pool, report, tier, tableOwner)
 		if err == nil {
 			continue
 		}
 		r := classifyRefusal(err, report.Table)
+		if fullyBlocked {
+			// The plan is already safe as it stands, so the probe's answer
+			// can only add to the verdicts, never replace them. A refusal
+			// that names something to provision — a grant, a role, a
+			// schema — is work the operator will have to do anyway, so it
+			// is appended beside the earlier cause. Every other answer goes
+			// to the log: a refusal about the table itself names nothing to
+			// provision on a plan nothing will run, and an operational
+			// failure is not a fact about the target at all.
+			switch {
+			case r != nil && r.provisionable:
+				appendBlockedCauseAtTier(changes, tiers, tier, r.detail)
+			case r != nil:
+				slog.Warn("PostgreSQL privilege check refused the table; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"refusal", r.reason,
+					"detail", r.detail)
+			default:
+				slog.Warn("PostgreSQL privilege check failed; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"error", err)
+			}
+			continue
+		}
 		if r == nil {
 			return nil, fmt.Errorf("check privileges for table %q: %w", report.Table, err)
 		}
@@ -280,39 +737,428 @@ func blockMissingPrivileges(ctx context.Context, pool *pgxpool.Pool, report pgpl
 			blockChangesAtTier(changes, tiers, tier, r.detail)
 			continue
 		}
-		// Any other refusal is a property of the table itself — vanished, or
-		// not an ordinary table — so it holds for every executable step.
+		// Any other refusal is a property of the table itself — vanished,
+		// not an ordinary table, or to be created for an owner the target
+		// has no role for — so it holds for every executable step.
 		blockExecutableChanges(changes, r.detail)
 		return changes, nil
 	}
 	return changes, nil
 }
 
-// blockOversizedTable applies the native-safe table size ceiling to every
-// still-executable step. The apply path repeats the same CheckTable call, so
-// growth between plan and apply cannot bypass the ceiling. A typed refusal is
-// rendered as a blocked verdict; an operational failure fails planning rather
-// than producing an executable plan while the table size is unknown.
-func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
-	if !hasExecutableChanges(changes) {
+// blockedTierIsProbeable reports whether a blocked step's tier can be checked
+// against the target on a plan every gate has already refused. A step whose
+// shape has no tier has no access to probe. On a table the planner proved
+// absent, only the CREATE TABLE tier states facts the target can answer:
+// probing an absent table for any other tier can only say "table not found",
+// which names nothing the operator can provision.
+func blockedTierIsProbeable(tier preflight.Tier, greenfield bool) bool {
+	if tier == tierUnderived {
+		return false
+	}
+	return !greenfield || tier == preflight.TierCreateTable
+}
+
+// blockOversizedTable applies the native-safe table size ceiling to executable
+// steps whose native cost scales with the existing table. The preflight
+// measures the table and proves it exists and is an ordinary or partitioned
+// table; which steps a size refusal blocks is decided in blockRewriteSteps,
+// where concurrent index builds keep their verdict because their bound is a
+// duration envelope, not the table size. A typed refusal is rendered as a
+// blocked verdict; an operational failure fails planning rather than producing
+// an executable plan while the table size is unknown. When an earlier gate has
+// already blocked every step, an operational failure or a refusal unrelated to
+// size leaves those safe verdicts intact and is logged for operator triage.
+func blockOversizedTable(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64) ([]engine.TableChange, error) {
+	return blockOversizedTableWithCheck(ctx, pool, database, report, changes, tableSizeLimit, preflight.CheckTable)
+}
+
+func blockOversizedTableWithCheck(ctx context.Context, pool *pgxpool.Pool, database string, report pgplan.Report, changes []engine.TableChange, tableSizeLimit int64, checkTable func(context.Context, *pgxpool.Pool, string, string, int64) (preflight.PreflightedTable, error)) ([]engine.TableChange, error) {
+	// A table the plan leaves untouched has no step for a size verdict to
+	// land on, so it is not charged a catalog round trip.
+	if len(changes) == 0 {
 		return changes, nil
 	}
+	// When an earlier gate has already blocked every step the plan is safe as
+	// it stands; the size check then runs only so the operator sees both
+	// causes at once, and nothing it finds may turn that safe plan into a
+	// planning failure.
+	fullyBlocked := !hasExecutableChanges(changes)
 	if report.Table == "" {
+		if fullyBlocked {
+			return changes, nil
+		}
 		return nil, fmt.Errorf("plan report carries executable steps but names no target table")
 	}
-	if report.TableExists != nil && !*report.TableExists {
+	if isGreenfieldTable(report) {
 		return changes, nil
 	}
-	_, err := preflight.CheckTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
+	_, err := checkTable(ctx, pool, report.Schema, report.Table, tableSizeLimit)
 	if err == nil {
 		return changes, nil
 	}
 	r := classifyRefusal(err, report.Table)
 	if r == nil {
+		if fullyBlocked {
+			slog.Warn("PostgreSQL table size check failed; existing blocked plan verdicts remain unchanged",
+				"database", database,
+				"namespace", report.Schema,
+				"table", report.Table,
+				"error", err)
+			return changes, nil
+		}
 		return nil, fmt.Errorf("check size for table %q: %w", report.Table, err)
 	}
-	blockExecutableChanges(changes, fmt.Sprintf("statement for table %q: %s", report.Table, r.detail))
+	// The table name is a database-sourced identifier. Quoting escapes control
+	// characters but not whitespace runs, so the composed reason is collapsed
+	// to one line as a whole; the Markdown surfaces that render it escape
+	// their own delimiters at the rendering boundary, so the name reaches the
+	// operator as the relation it is. The blocked-cause separator is the one
+	// delimiter decoded before rendering, so it is neutralized here.
+	reason := engine.SanitizeBlockedCause(singleLine(fmt.Sprintf("statement for table %q: %s", report.Table, r.detail)))
+	var sizeErr *preflight.SizeError
+	if errors.As(err, &sizeErr) {
+		if err := blockRewriteSteps(changes, reason); err != nil {
+			if fullyBlocked {
+				slog.Warn("PostgreSQL table size check could not classify a blocked step; existing blocked plan verdicts remain unchanged",
+					"database", database,
+					"namespace", report.Schema,
+					"table", report.Table,
+					"error", err)
+				return changes, nil
+			}
+			return nil, err
+		}
+		return changes, nil
+	}
+	if fullyBlocked {
+		// A refusal about the table itself, not its size, has no executable
+		// step left to land on; the verdicts already carry a cause the
+		// operator can act on, so the answer goes to the log instead of
+		// being lost.
+		slog.Warn("PostgreSQL table size check refused the table; existing blocked plan verdicts remain unchanged",
+			"database", database,
+			"namespace", report.Schema,
+			"table", report.Table,
+			"refusal", r.reason,
+			"detail", r.detail)
+		return changes, nil
+	}
+	blockExecutableChanges(changes, reason)
 	return changes, nil
+}
+
+// blockRewriteSteps marks every step whose native cost scales with the existing
+// table blocked with the reason. A concurrent index build keeps its verdict: it
+// is bounded by its duration envelope rather than the table size ceiling. An
+// earlier blocked verdict retains its reason and gains the independent size
+// cause so the operator can resolve both without another planning round trip.
+// parser.Classify in tableChanges parsed every rendered statement, including
+// blocked steps, with the same single-statement requirements used here. A
+// statement that now fails to classify is therefore an invariant violation.
+// Every step is classified before any verdict is written, so a caller that
+// keeps the plan on that error keeps it exactly as it was rather than with
+// the size cause on some steps and not others.
+func blockRewriteSteps(changes []engine.TableChange, reason string) error {
+	concurrentIndexes := make([]bool, len(changes))
+	for i := range changes {
+		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
+			continue
+		}
+		concurrentIndex, err := concurrentIndexStatement(changes[i].DDL)
+		if err != nil {
+			return fmt.Errorf("classify planned statement for table %q: %w", changes[i].Table, err)
+		}
+		concurrentIndexes[i] = concurrentIndex
+	}
+	for i := range changes {
+		if changes[i].ExecutionMode != "" && changes[i].ExecutionMode != engine.ExecutionModeBlocked {
+			continue
+		}
+		if concurrentIndexes[i] {
+			continue
+		}
+		if changes[i].ExecutionMode == engine.ExecutionModeBlocked {
+			causes := engine.BlockedCauses(changes[i].ModeReason)
+			if !slices.Contains(causes, reason) {
+				changes[i].ModeReason = engine.JoinBlockedCauses(append(causes, reason))
+			}
+			continue
+		}
+		changes[i].ExecutionMode = engine.ExecutionModeBlocked
+		changes[i].ModeReason = reason
+	}
+	return nil
+}
+
+// concurrentIndexStatement reports whether sql is a single CREATE INDEX
+// CONCURRENTLY statement — the one shape SchemaBot's PostgreSQL support runs
+// under the concurrent index duration envelope instead of the table size
+// ceiling. Every other concurrent form the parser recognizes, including a
+// concurrent partition detach, stays inside the ceiling. The plan and apply
+// paths share this classification so the two can never disagree about which
+// bound a statement is admitted under.
+func concurrentIndexStatement(sql string) (bool, error) {
+	statement, err := pgstatement.ParseOne(sql)
+	if err != nil {
+		return false, fmt.Errorf("parse PostgreSQL statement: %w", err)
+	}
+	return statement.Kind() == pgstatement.KindCreateIndex && statement.Concurrent(), nil
+}
+
+// exemptReasonArchiveNaming is the exemption reason a plan carries for an
+// undeclared live table whose name marks it as an archive: the table is left
+// in place rather than dropped, and left out of the rollback baseline.
+const exemptReasonArchiveNaming = "archive naming"
+
+// undeclaredTableDrops surfaces every live table in the namespace that no
+// schema file declares, whether its file was deleted or it was never declared
+// at all. Desired state is declarative: an undeclared table converges only by
+// being dropped, so the plan must show that drop rather than stay silent while
+// the table lingers on the target. Each drop is both destructive and blocked —
+// SchemaBot's PostgreSQL support never executes DROP TABLE — so the operator
+// either brings the table under management by declaring it in a schema file
+// or removes it through a separately reviewed process; a plan that hid the
+// drop would let a merge pass with the target still diverged from the
+// repository.
+//
+// Archive tables (<name>_archive_YYYY[_MM[_DD]]) are the one naming
+// convention exempt from the verdict, as they are in the MySQL engine's view
+// of its live schema: an archive is a retired copy kept outside declarative
+// schema files. The naming convention is the per-table exemption;
+// ignore_namespaces is the per-namespace one. Each exempt table is logged
+// and returned on the plan so the PR comment discloses what the verdict
+// skipped.
+//
+// The verdict names only remedies the operator can follow. A table that owns
+// or is referenced by foreign key constraints cannot be brought under
+// management by a pulled file — the declarative format refuses foreign keys —
+// so its reason names the constraints and says what each side of the
+// relationship needs instead of pointing at a file the pull cannot write. The
+// catalog is read directly because the namespace's schema may not exist yet,
+// in which case the answer is an empty set, not an error.
+func undeclaredTableDrops(ctx context.Context, pool *pgxpool.Pool, database, namespace string, declared map[string]bool, ignored engine.IgnoredTables, parser ddl.StatementParser) ([]engine.TableChange, []string, []string, error) {
+	tables, err := liveTables(ctx, pool, namespace)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	var drops []engine.TableChange
+	var exempt []string
+	var withheld []string
+	for _, live := range tables {
+		if declared[live.name] {
+			continue
+		}
+		// The config's own entry is reported ahead of the naming conventions:
+		// an operator who wrote the table down deserves to read their own
+		// reason back, not an incidental one the table also happens to match.
+		if ignored.Withholds(live.name) {
+			slog.Info("live table withheld from the plan by ignore_tables",
+				"database", database,
+				"namespace", namespace,
+				"table", live.name)
+			withheld = append(withheld, live.name)
+			continue
+		}
+		if spirittable.IsArchiveTable(live.name) {
+			slog.Info("PostgreSQL archive table has no schema file and is left in place rather than dropped",
+				"database", database,
+				"namespace", namespace,
+				"table", live.name)
+			exempt = append(exempt, live.name)
+			continue
+		}
+		sql := parser.Canonicalize("DROP TABLE " + pgx.Identifier{namespace, live.name}.Sanitize())
+		operation, _, err := parser.Classify(sql)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("classify drop for undeclared table %q: %w", live.name, err)
+		}
+		// The plan comment classifies this drop from the statement; when a
+		// stored plan carries no statement it falls back to the words "DROP
+		// TABLE" in this reason, and then to the change type, so the wording
+		// stays a useful fallback rather than a requirement.
+		drops = append(drops, engine.TableChange{
+			Table:         live.name,
+			Operation:     operation,
+			DDL:           sql,
+			IsUnsafe:      true,
+			UnsafeReason:  sanitizeReasonText(fmt.Sprintf("DROP TABLE removes all data from table %q", live.name)),
+			ExecutionMode: engine.ExecutionModeBlocked,
+			ModeReason:    sanitizeReasonText(undeclaredTableReason(namespace, live)),
+		})
+	}
+	return drops, exempt, withheld, nil
+}
+
+// undeclaredTableReason explains why the drop is blocked and what the
+// operator can do about it, tailored to the table's foreign key relationships.
+// The declarative format refuses foreign keys on either side: a table that
+// owns them cannot be declared at all, and a table that other tables
+// reference can be declared only by a hand-written file, because the
+// constraints live on the referencing tables and the schema pull refuses to
+// render a table it would describe incompletely. A drop of a referenced
+// table has to take the referencing constraints with it.
+func undeclaredTableReason(namespace string, live liveTable) string {
+	preamble := fmt.Sprintf(
+		"table %q exists on the target but no schema file in namespace %q declares it; converging would drop the table, which SchemaBot's PostgreSQL support never executes",
+		live.name, namespace)
+	owned := strings.Join(quoteAll(live.foreignKeys), ", ")
+	referencing := strings.Join(quoteAll(live.referencedBy), ", ")
+	switch {
+	case len(live.foreignKeys) > 0 && len(live.referencedBy) > 0:
+		return fmt.Sprintf(
+			"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which schema files do not support, and foreign key constraint(s) %s on other tables reference it — drop the table together with the referencing constraints, or remove its own foreign keys and declare it by hand, through a separately reviewed process",
+			preamble, owned, referencing)
+	case len(live.foreignKeys) > 0:
+		return fmt.Sprintf(
+			"%s; the table cannot be declared while it carries foreign key constraint(s) %s, which schema files do not support — drop the table, or remove its foreign keys before declaring it, through a separately reviewed process",
+			preamble, owned)
+	case len(live.referencedBy) > 0:
+		return fmt.Sprintf(
+			"%s; foreign key constraint(s) %s on other tables reference it, and schema files do not support foreign keys, so the schema pull cannot write a file for it — declare the table by hand in a schema file to keep it under management, or drop it together with the referencing constraints through a separately reviewed process",
+			preamble, referencing)
+	}
+	return preamble + " — declare the table in a schema file to keep it under management, or drop it through a separately reviewed process"
+}
+
+// quoteAll wraps each name in double quotes so a list of identifiers reads
+// unambiguously inside a reason sentence.
+func quoteAll(names []string) []string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = fmt.Sprintf("%q", name)
+	}
+	return quoted
+}
+
+// liveTable is a table the namespace holds on the target, with the foreign
+// key constraint names on each side of the table that decide which remedy the
+// verdict can offer: foreignKeys are the constraints the table owns,
+// referencedBy the constraints on other tables that point at it.
+type liveTable struct {
+	name         string
+	foreignKeys  []string
+	referencedBy []string
+}
+
+// liveTables lists the tables pg-sprite's declarative model manages, in name
+// order, with the foreign key metadata SchemaBot needs to explain blocked
+// drops. The caller decides which managed tables policy exempts from a schema
+// file.
+//
+// Tables whose definition lives elsewhere are omitted. A partition is declared
+// through its parent's PARTITION BY and has no file of its own, so it follows
+// the parent's verdict wherever the parent lives. Extension-owned tables
+// belong to their extension: no file can declare them and the server refuses
+// to drop them while the extension is installed, so no operator remedy exists
+// for the verdict they would otherwise produce. Inheritance children and
+// unlogged tables are ordinary tables with definitions of their own, so they
+// are listed and must carry their own file.
+//
+// ListManagedTables is the authoritative table-set query and pg_catalog
+// qualifies every relation, operator, and type so search_path shadowing cannot
+// change its answer. The separate query here only decorates those returned
+// names with constraint metadata and carries the same qualification.
+//
+// The two reads are separate statements on separate snapshots, because
+// ListManagedTables opens its own connection from the pool; a variant that
+// runs inside a caller-supplied transaction would let both reads share one
+// snapshot and retire the skew check in joinForeignKeys.
+func liveTables(ctx context.Context, pool *pgxpool.Pool, namespace string) ([]liveTable, error) {
+	names, err := schemadiff.ListManagedTables(ctx, pool, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("list declarable tables in namespace %q: %w", namespace, err)
+	}
+	if len(names) == 0 {
+		return []liveTable{}, nil
+	}
+	keys, err := foreignKeysFor(ctx, pool, namespace, names)
+	if err != nil {
+		return nil, err
+	}
+	return joinForeignKeys(namespace, names, keys)
+}
+
+// tableForeignKeys is one table's foreign key constraint names on each side,
+// as the catalog reports them.
+type tableForeignKeys struct {
+	name         string
+	foreignKeys  []string
+	referencedBy []string
+}
+
+// foreignKeysFor reads the foreign key constraint names on each side of every
+// named table in the namespace. The result is restricted to names, so the
+// join in joinForeignKeys can treat any row outside it as a broken query
+// rather than a table to add.
+func foreignKeysFor(ctx context.Context, pool *pgxpool.Pool, namespace string, names []string) ([]tableForeignKeys, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT c.relname,
+		       COALESCE((SELECT pg_catalog.array_agg(con.conname ORDER BY con.conname)
+		                 FROM pg_catalog.pg_constraint con
+		                 WHERE con.conrelid OPERATOR(pg_catalog.=) c.oid
+		                   AND con.contype OPERATOR(pg_catalog.=) 'f'), '{}'),
+		       COALESCE((SELECT pg_catalog.array_agg(con.conname ORDER BY con.conname)
+		                 FROM pg_catalog.pg_constraint con
+		                 WHERE con.confrelid OPERATOR(pg_catalog.=) c.oid
+		                   AND con.conrelid OPERATOR(pg_catalog.<>) c.oid
+		                   AND con.contype OPERATOR(pg_catalog.=) 'f'), '{}')
+		FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+		WHERE n.nspname OPERATOR(pg_catalog.=) $1
+		  AND c.relname OPERATOR(pg_catalog.=) ANY($2::pg_catalog.text[])`, namespace, names)
+	if err != nil {
+		return nil, fmt.Errorf("list foreign keys for declarable tables in namespace %q: %w", namespace, err)
+	}
+	defer rows.Close()
+	keys := make([]tableForeignKeys, 0, len(names))
+	for rows.Next() {
+		var key tableForeignKeys
+		if err := rows.Scan(&key.name, &key.foreignKeys, &key.referencedBy); err != nil {
+			return nil, fmt.Errorf("scan foreign keys for declarable table in namespace %q: %w", namespace, err)
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read foreign keys for declarable tables in namespace %q: %w", namespace, err)
+	}
+	return keys, nil
+}
+
+// joinForeignKeys attaches each table's foreign key metadata to the managed
+// table set, preserving the set's order. The join must be total in both
+// directions: a key for a name outside the set means the decoration query no
+// longer restricts itself to the set, and a name with no key means the table
+// left the catalog between the two reads. Either way the verdict's input is
+// uncertain, and a reason sentence built from a missing row would describe a
+// table with no foreign keys when the truth is that nothing was read, so the
+// plan fails instead of guessing.
+func joinForeignKeys(namespace string, names []string, keys []tableForeignKeys) ([]liveTable, error) {
+	tables := make([]liveTable, len(names))
+	byName := make(map[string]*liveTable, len(names))
+	for i, name := range names {
+		tables[i].name = name
+		byName[name] = &tables[i]
+	}
+	decorated := make(map[string]bool, len(names))
+	for _, key := range keys {
+		live, ok := byName[key.name]
+		if !ok {
+			return nil, fmt.Errorf("foreign key metadata for table %q in namespace %q is outside the managed table set", key.name, namespace)
+		}
+		if decorated[key.name] {
+			return nil, fmt.Errorf("foreign key metadata for table %q in namespace %q was returned more than once", key.name, namespace)
+		}
+		decorated[key.name] = true
+		live.foreignKeys = key.foreignKeys
+		live.referencedBy = key.referencedBy
+	}
+	for _, name := range names {
+		if !decorated[name] {
+			return nil, fmt.Errorf("table %q in namespace %q left the catalog while the plan was reading it; retry the plan", name, namespace)
+		}
+	}
+	return tables, nil
 }
 
 func hasExecutableChanges(changes []engine.TableChange) bool {
@@ -361,49 +1207,165 @@ func blockChangesAtTier(changes []engine.TableChange, tiers []preflight.Tier, ti
 	}
 }
 
+// appendBlockedCauseAtTier adds an independent cause to every blocked step
+// whose statement requires the given tier, leaving steps at other tiers and
+// steps that already carry this cause untouched. The step's existing verdict
+// stays first: it is the refusal the operator saw before this gate ran.
+func appendBlockedCauseAtTier(changes []engine.TableChange, tiers []preflight.Tier, tier preflight.Tier, reason string) {
+	for i := range changes {
+		if changes[i].ExecutionMode == engine.ExecutionModeBlocked && tiers[i] == tier && !strings.Contains(changes[i].ModeReason, reason) {
+			changes[i].ModeReason += clauseSeparator + reason
+		}
+	}
+}
+
 // sanitizeReasonText makes text that embeds database-sourced identifiers safe
 // for the single-line Markdown surfaces that render a blocked reason: control
 // and format characters (including bidi overrides usable for visual spoofing)
 // are stripped, whitespace runs — including newlines — collapse to one space,
 // and the table cell separator is neutralized so a crafted identifier cannot
-// break comment layout.
+// break comment layout. The blocked-cause separator is neutralized for the
+// same reason: an identifier carrying it would otherwise decode as causes the
+// engine never issued.
 func sanitizeReasonText(s string) string {
+	return engine.SanitizeBlockedCause(strings.ReplaceAll(singleLine(s), "|", "/"))
+}
+
+// maxStatementMetadataLen bounds the statement text carried in progress
+// metadata. The value is stored and rendered alongside other clamped
+// operator-facing summaries, and a statement is unbounded input — a create
+// set's index definition can run to any length — so it is cut on a rune
+// boundary with an ellipsis rather than trusted to fit.
+const maxStatementMetadataLen = 255
+
+// sanitizeStatementText prepares the SQL the executor is running for
+// progress metadata. Unlike a reason, which is prose SchemaBot composes, a
+// statement is quoted back to the operator as the SQL it is: control and
+// format characters are stripped and whitespace collapses to one line, but
+// the text is otherwise left as written, so `||` stays concatenation and
+// `1 | 2` stays a bitwise or. A surface that embeds the value in Markdown
+// backslash-escapes the delimiters it cares about at render time, the way
+// the comment templates already do for engine-influenced inline text; the
+// metadata carries the statement, not one surface's escaping of it.
+func sanitizeStatementText(s string) string {
+	s = singleLine(s)
+	runes := []rune(s)
+	if len(runes) > maxStatementMetadataLen {
+		return string(runes[:maxStatementMetadataLen-1]) + "…"
+	}
+	return s
+}
+
+// singleLine strips control and format characters and collapses every
+// whitespace run — newlines included — to one space, so the result cannot
+// span lines or carry a bidi override.
+func singleLine(s string) string {
 	s = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return ' '
 		}
 		return r
 	}, s)
-	s = strings.Join(strings.Fields(s), " ")
-	return strings.ReplaceAll(s, "|", "/")
+	return strings.Join(strings.Fields(s), " ")
 }
 
-func executionVerdict(formatVersion int, statement pgplan.Statement, table string) (string, string) {
+// executionVerdict maps one planned statement to the verdict the operator
+// reviews. A planner value outside the vocabulary this mapping knows — a plan
+// contract, a disposition, or a create shape cause the planner added after the
+// mapping was written — still renders a blocked placeholder, and is reported
+// on the verdict so the caller can log it with the identifiers this function
+// does not have.
+func executionVerdict(formatVersion int, statement pgplan.Statement, table string) stepVerdict {
 	if formatVersion != pgplan.FormatVersion {
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has an unrecognized plan contract", table)
+		return stepVerdict{
+			mode:         engine.ExecutionModeBlocked,
+			reason:       fmt.Sprintf("statement for table %q has an unrecognized plan contract", table),
+			unrecognized: &unrecognizedPlannerVocabulary{kind: "plan_contract", value: strconv.Itoa(formatVersion)},
+		}
 	}
 	if statement.Disposition == router.DispositionExecute && statement.Route == planner.RouteNative &&
 		statement.Backend == router.BackendNative && len(statement.ExecSQL) > 0 {
-		return "", ""
+		return stepVerdict{}
 	}
 
 	// Planner explanations are deliberately not copied to operator-facing
 	// text, and neither is the planner's own vocabulary: each known
 	// disposition maps to a sentence in SchemaBot's words, since the operator
 	// reading it has never heard of the planning library.
+	blocked := func(reason string) stepVerdict {
+		return stepVerdict{mode: engine.ExecutionModeBlocked, reason: reason}
+	}
 	switch statement.Disposition {
 	case router.DispositionUnavailable:
 		if statement.Backend == router.BackendCopyAndSwap {
-			return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q requires copy-and-swap, which is unavailable", table)
+			return blocked(fmt.Sprintf("statement for table %q requires copy-and-swap, which is unavailable", table))
 		}
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table)
+		return blocked(fmt.Sprintf("statement for table %q requires an execution path SchemaBot's PostgreSQL support does not provide yet", table))
 	case router.DispositionRewriteRequired:
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table)
+		return blocked(fmt.Sprintf("statement for table %q must be rewritten into a form the engine can execute natively, then re-planned", table))
 	case router.DispositionRefuse:
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table)
+		if reason, ok := createShapeRefusalReason(statement.Cause, table); ok {
+			return blocked(reason)
+		}
+		verdict := blocked(fmt.Sprintf("statement for table %q is refused: it cannot be executed safely as written", table))
+		// An absent cause is a refusal from outside the create path and the
+		// generic sentence is the right one; only a cause the mapping has no
+		// sentence for is vocabulary that moved.
+		if statement.Cause != "" {
+			verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "create_shape_cause", value: string(statement.Cause)}
+		}
+		return verdict
+	case router.DispositionExecute:
+		// Execute on anything but the native route with native steps is a
+		// route or backend this build does not run, or a plan with nothing
+		// to run; the disposition itself is known, so the shape is what the
+		// triager needs to see.
+		verdict := blocked(fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table))
+		verdict.unrecognized = &unrecognizedPlannerVocabulary{
+			kind:  "execute_shape",
+			value: fmt.Sprintf("route=%s backend=%s steps=%d", statement.Route, statement.Backend, len(statement.ExecSQL)),
+		}
+		return verdict
 	default:
-		return engine.ExecutionModeBlocked, fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table)
+		verdict := blocked(fmt.Sprintf("statement for table %q has an unrecognized planner verdict", table))
+		verdict.unrecognized = &unrecognizedPlannerVocabulary{kind: "disposition", value: string(statement.Disposition)}
+		return verdict
 	}
+}
+
+// createShapeRefusalReason renders the create path's typed refusal cause in
+// SchemaBot's words, naming the clause the author wrote and what to do about
+// it. The mapping covers the planner's whole closed set of causes, so the
+// completeness test over that set fails the day the planner grows a new one.
+// Two entries are reachable only through a front door other than this
+// engine's: pgstatement.ParseDesired refuses CONCURRENTLY and every statement
+// kind other than CREATE TABLE and CREATE INDEX before a plan exists, so
+// through planSchemas those shapes fail parsing rather than reaching a verdict.
+func createShapeRefusalReason(cause executor.CreateShapeCause, table string) (string, bool) {
+	var reason string
+	switch cause {
+	case executor.CreateShapePartitionOf:
+		reason = "declares PARTITION OF against a live parent, which SchemaBot's PostgreSQL create path does not support; create the partition outside SchemaBot or re-model the table"
+	case executor.CreateShapeInherits:
+		reason = "declares INHERITS against a live parent, which SchemaBot's PostgreSQL create path does not support; create the inheritance relationship outside SchemaBot or model a standalone table"
+	case executor.CreateShapeLike:
+		reason = "declares LIKE against a live source table, which SchemaBot's PostgreSQL create path does not support; declare the new table's columns and constraints explicitly"
+	case executor.CreateShapeOfType:
+		reason = "declares OF against a live composite type, which SchemaBot's PostgreSQL create path does not support; declare the new table's columns explicitly"
+	case executor.CreateShapeIfNotExists:
+		reason = "declares IF NOT EXISTS, which cannot verify that an existing relation has the requested shape; remove the clause and ensure the relation name is available"
+	case executor.CreateShapeConcurrently:
+		reason = "declares CONCURRENTLY for an index on a new table, which SchemaBot's PostgreSQL create path does not support; remove CONCURRENTLY so the index can be built before the table receives traffic"
+	case executor.CreateShapeDuplicateName:
+		reason = "declares the same relation name more than once; give every table, index, constraint, and sequence a unique name"
+	case executor.CreateShapeMultipleOperations:
+		reason = "contains multiple create operations in one statement; split them into separate CREATE TABLE or CREATE INDEX statements"
+	case executor.CreateShapeUnsupportedKind:
+		reason = "uses a statement kind SchemaBot's PostgreSQL create path does not support; use CREATE TABLE or CREATE INDEX, or create the object outside SchemaBot"
+	default:
+		return "", false
+	}
+	return fmt.Sprintf("statement for table %q %s", table, reason), true
 }
 
 func destructiveReason(destructive bool, table string) string {
@@ -426,43 +1388,181 @@ func sortedKeys[V any](values map[string]V) []string {
 // change on this engine before it returns, so there is no window in which the
 // engine has accepted work it cannot yet describe. The statement executes in a
 // goroutine of this process with nothing to provision first, and the tracked
-// progress is claimed under the engine mutex before Apply returns; Drain is
-// the only writer that clears it, and a drained engine's work is not coming
-// back. A pending progress report for a task a driver believes is in flight is
-// therefore conclusive rather than a phase to wait out.
+// progress is claimed under the engine mutex before Apply returns. Because
+// progress is tracked per apply, a second apply on the same target cannot
+// displace a running one's entry, so the only ways an entry disappears are
+// Drain and the retirement of an already-terminal entry — neither of which can
+// erase work still in flight. A pending progress report for a task a driver
+// believes is in flight is therefore conclusive rather than a phase to wait out.
 func (e *Engine) RegistersWorkSynchronously() bool {
 	return true
 }
 
-// Drain blocks until every background apply goroutine has finished, then
-// clears the tracked schema change so the next Progress reports the idle
-// sentinel. Resume and recovery paths call this before re-planning so a
-// statement still in flight from a lost lease cannot race the next drive's
-// view of the schema, and so the next poll reads a clean engine instead of
-// the previous change's terminal snapshot.
+// Drain blocks until every background apply goroutine has finished, then stops
+// tracking the schema changes it waited out so the next Progress reports the
+// idle sentinel.
+// Resume and recovery paths call this before re-planning so a statement still
+// in flight from a lost lease cannot race the next drive's view of the schema,
+// and so the next poll reads a clean engine instead of the previous change's
+// terminal snapshot.
+//
+// Drain waits without a bound, for a caller that owns the engine outright. A
+// drive waits through DrainContext instead, so it never outlives its claim.
 func (e *Engine) Drain() {
+	drained := e.trackedAtDrainStart()
 	e.wg.Wait()
+	e.clearDrainedProgress(drained)
+}
+
+// DrainContext is Drain bounded by ctx. When ctx ends before every apply
+// goroutine has finished, it returns an error and leaves the schema changes
+// tracked, so the engine still reports them as holding the target.
+//
+// The snapshot scopes only what a finished drain clears. The wait itself is on
+// every apply goroutine, including one accepted after the drain began, so a
+// drive draining behind a newly started apply waits for that apply too, up to
+// ctx. Giving up does not release the wait: its goroutine stays parked until
+// the applies it was waiting on exit, then closes a channel no one reads.
+func (e *Engine) DrainContext(ctx context.Context) error {
+	drained := e.trackedAtDrainStart()
+	done := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		e.clearDrainedProgress(drained)
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("drain PostgreSQL schema changes: still running after %w", ctx.Err())
+	}
+}
+
+// trackedAtDrainStart snapshots the schema changes a drain is waiting out.
+// Only these are the drain's to clear: an apply accepted while the drain waits
+// belongs to the drive that started it, and its poller must still find it.
+func (e *Engine) trackedAtDrainStart() map[string]*trackedApply {
 	e.mu.Lock()
-	e.progress = nil
-	e.progressKey = ""
+	defer e.mu.Unlock()
+	drained := make(map[string]*trackedApply, len(e.progress))
+	maps.Copy(drained, e.progress)
+	return drained
+}
+
+// clearDrainedProgress stops tracking the schema changes the drain started
+// with whose apply goroutine has exited. An entry replaced since the snapshot
+// is a newer apply and stays, as does one whose goroutine is still running.
+func (e *Engine) clearDrainedProgress(drained map[string]*trackedApply) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for key, tracked := range drained {
+		if e.progress[key] == tracked && applyGoroutineExited(tracked) {
+			delete(e.progress, key)
+		}
+	}
+}
+
+// applyGoroutineExited reports whether the goroutine executing a tracked apply
+// has returned. An entry with no goroutine has nothing left to run.
+func applyGoroutineExited(tracked *trackedApply) bool {
+	if tracked.done == nil {
+		return true
+	}
+	select {
+	case <-tracked.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// HaltForShutdown brings this instance's in-flight concurrent index builds
+// down so the process can exit without leaving them running on the target
+// under a lease nobody renews. A concurrent build has no checkpoint: halting
+// it cancels the statement, and the invalid index it leaves is what the next
+// driver to claim the apply meets as abandoned debris and recovers before its
+// own build. Plain DDL is left to finish — its statements are bounded by
+// their own lock and statement timeouts, and interrupting a create set
+// mid-sequence would leave a committed prefix no later drive can complete.
+//
+// This is not an operator cancel: no cancel is recorded on the tracked
+// applies, so the outcome the drive publishes for a halted build is the
+// failure its leftover index describes, and the apply stays active for
+// another driver to claim. The wait is bounded by ctx so a build that will
+// not come down reports that the target may still be held instead of holding
+// shutdown open.
+func (e *Engine) HaltForShutdown(ctx context.Context) error {
+	e.mu.Lock()
+	halted := e.cancelConcurrentBuildsLocked(func(*trackedApply) bool { return true })
 	e.mu.Unlock()
+	if halted > 0 {
+		slog.Info("PostgreSQL engine halting concurrent index builds for shutdown", "builds", halted)
+	}
+
+	// Wait off the calling goroutine so work that will not come down bounds
+	// shutdown at ctx rather than blocking it forever. The wait goroutine ends
+	// with the drives it is waiting on.
+	settled := make(chan struct{})
+	go func() {
+		e.wg.Wait()
+		close(settled)
+	}()
+	select {
+	case <-settled:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("halt PostgreSQL engine for shutdown: schema change work is still running on the target: %w", ctx.Err())
+	}
 }
 
-// Stop declines: a PostgreSQL schema change runs each statement as a single
-// transactional DDL with no engine phase to pause — an in-flight statement
-// either commits or fails on its own. The typed decline lets the control
-// path resolve a durable stop request terminally instead of retrying it.
+// HaltWorkOwnedBy halts like HaltForShutdown, but only the applies started
+// for owner, and waits only for those. Another drive's applies on the same
+// engine are left running and are not waited on.
+func (e *Engine) HaltWorkOwnedBy(ctx context.Context, owner string) error {
+	e.mu.Lock()
+	owned := func(tracked *trackedApply) bool { return tracked.owner == owner }
+	halted := e.cancelConcurrentBuildsLocked(owned)
+	var pending []chan struct{}
+	for _, tracked := range e.progress {
+		if owned(tracked) {
+			pending = append(pending, tracked.done)
+		}
+	}
+	e.mu.Unlock()
+	if halted > 0 {
+		slog.Info("PostgreSQL engine halting the concurrent index builds a drive started as it returns", "builds", halted)
+	}
+
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return fmt.Errorf("halt PostgreSQL engine work a drive started: schema change work is still running on the target: %w", ctx.Err())
+		}
+	}
+	return nil
+}
+
+// cancelConcurrentBuildsLocked ends the running concurrent index builds that
+// selected picks and returns how many it ended. The caller holds e.mu.
+func (e *Engine) cancelConcurrentBuildsLocked(selected func(*trackedApply) bool) int {
+	halted := 0
+	for _, tracked := range e.progress {
+		if selected(tracked) && tracked.concurrentIndex && !tracked.result.State.IsTerminal() && tracked.cancelApply != nil {
+			tracked.cancelApply()
+			halted++
+		}
+	}
+	return halted
+}
+
+// Stop declines: a concurrent index build has no resumable midpoint, so stop
+// would be a permanent cancel under a misleading name. Other PostgreSQL DDL
+// also has no engine phase to pause. The typed decline lets the control path
+// resolve a durable stop request terminally instead of retrying it.
 func (e *Engine) Stop(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: each statement runs as a single transaction that commits or fails on its own")
-}
-
-// Cancel declines: the engine runs each statement as one transaction and does
-// not track the database backend executing it, so it cannot terminate the
-// statement itself. An in-flight DDL can still be interrupted at the database
-// — during a lock pileup that is exactly what an operator needs — so the
-// decline reason points at the out-of-band path instead of stopping at "no".
-func (e *Engine) Cancel(ctx context.Context, req *engine.ControlRequest) (*engine.ControlResult, error) {
-	return nil, engine.NewUnsupportedOperationError("cancel is not implemented for PostgreSQL schema changes: the engine cannot terminate its in-flight statement, which commits or fails as one transaction; to interrupt it at the database, find the backend running the DDL in pg_stat_activity and cancel it with pg_cancel_backend")
+	return nil, engine.NewUnsupportedOperationError("stop is not supported for PostgreSQL schema changes: concurrent index builds have no resumable midpoint, and other statements commit or fail on their own")
 }
 
 // Start declines: PostgreSQL schema changes cannot be stopped, so there is
@@ -494,3 +1594,8 @@ var _ engine.Engine = (*Engine)(nil)
 
 // Compile-time check that Engine implements engine.Drainer.
 var _ engine.Drainer = (*Engine)(nil)
+
+// Compile-time check that Engine implements engine.ShutdownHalter and
+// engine.OwnedWorkHalter.
+var _ engine.ShutdownHalter = (*Engine)(nil)
+var _ engine.OwnedWorkHalter = (*Engine)(nil)

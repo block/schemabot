@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -94,6 +95,53 @@ func TestFetchPullRequest_NoCacheFallsThrough(t *testing.T) {
 		require.NoError(t, err)
 	}
 	assert.Equal(t, int32(3), calls.Load(), "no cache on ctx → every call must hit GitHub")
+}
+
+// A seeded scope answers a fetch for that PR from the caller's own read, so a
+// caller that has to act on a head and then have it verified spends one round
+// trip and both decisions see one value.
+func TestWithPRInfo_SeededScopeServesTheCallersRead(t *testing.T) {
+	server, calls := newPRFakeGitHubServer(t)
+	defer server.Close()
+
+	ic := newPRTestInstallationClient(t, server)
+	seeded := &PullRequestInfo{HeadRef: "feature", HeadSHA: "seeded999", BaseRef: "main", User: "octocat"}
+	ctx := WithPRInfo(t.Context(), "octo/repo", 42, seeded)
+
+	got, err := ic.FetchPullRequest(ctx, "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, seeded, got)
+	assert.Equal(t, int32(0), calls.Load(), "the seeded read answers the fetch")
+}
+
+// Seeding one PR must not silence reads of any other, which would hand a
+// caller another PR's head.
+func TestWithPRInfo_OtherPullRequestsStillFetch(t *testing.T) {
+	server, calls := newPRFakeGitHubServer(t)
+	defer server.Close()
+
+	ic := newPRTestInstallationClient(t, server)
+	ctx := WithPRInfo(t.Context(), "octo/repo", 7, &PullRequestInfo{HeadSHA: "seeded999"})
+
+	got, err := ic.FetchPullRequest(ctx, "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, "abc123", got.HeadSHA)
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+// A caller with nothing to seed still gets a usable scope rather than one that
+// answers every fetch with a nil head.
+func TestWithPRInfo_NilSeedFallsThroughToGitHub(t *testing.T) {
+	server, calls := newPRFakeGitHubServer(t)
+	defer server.Close()
+
+	ic := newPRTestInstallationClient(t, server)
+	ctx := WithPRInfo(t.Context(), "octo/repo", 42, nil)
+
+	got, err := ic.FetchPullRequest(ctx, "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, "abc123", got.HeadSHA)
+	assert.Equal(t, int32(1), calls.Load())
 }
 
 // TestFetchPullRequest_ErrorsAreNotCached verifies that a failed fetch
@@ -234,6 +282,81 @@ func TestFetchPullRequest_ReturnsIndependentCopies(t *testing.T) {
 
 	first.HeadSHA = "mutated"
 	assert.Equal(t, "abc123", second.HeadSHA, "second caller must not observe the first caller's mutation")
+}
+
+// TestFetchPRFiles_CacheCollapsesDuplicateCallsWithinScope locks in the same
+// request-scoped dedup for the changed-file list that FetchPullRequest has for
+// the head: every FetchPRFiles call inside one ctx scope for the same (repo, pr)
+// hits GitHub once, and each caller gets its own copy of the listing.
+func TestFetchPRFiles_CacheCollapsesDuplicateCallsWithinScope(t *testing.T) {
+	server, calls := newPRFilesFakeGitHubServer(t, []map[string]string{
+		{"filename": "schema/orders/orders.sql", "status": "removed"},
+		{"filename": "schema/users/users.sql", "previous_filename": "schema/accounts/users.sql", "status": "renamed"},
+	})
+	defer server.Close()
+
+	ic := newPRTestInstallationClient(t, server)
+	ctx := WithPRInfoCache(t.Context())
+
+	want := []PRFile{
+		{Filename: "schema/orders/orders.sql", Status: "removed"},
+		{Filename: "schema/users/users.sql", PreviousFilename: "schema/accounts/users.sql", Status: "renamed"},
+	}
+	first, err := ic.FetchPRFiles(ctx, "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, want, first)
+
+	first[0].Status = "mutated by the first caller"
+	second, err := ic.FetchPRFiles(ctx, "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, want, second, "the cached listing must not observe a caller's mutation")
+
+	assert.Equal(t, int32(1), calls.Load(), "two FetchPRFiles calls inside one ctx scope must collapse to one upstream GitHub call")
+
+	_, err = ic.FetchPRFiles(WithPRInfoCache(t.Context()), "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), calls.Load(), "a new scope must refetch — caches are not shared across scopes")
+
+	_, err = ic.FetchPRFiles(t.Context(), "octo/repo", 42)
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), calls.Load(), "a ctx without a cache fetches on every call")
+}
+
+// TestFetchPRFiles_CappedListingIsNotCached verifies that a listing GitHub
+// capped is returned with its error every time rather than served from the
+// cache as though it were complete.
+func TestFetchPRFiles_CappedListingIsNotCached(t *testing.T) {
+	files := make([]map[string]string, maxGitHubPRFiles)
+	for i := range files {
+		files[i] = map[string]string{"filename": "schema/orders/" + strconv.Itoa(i) + ".sql", "status": "added"}
+	}
+	server, calls := newPRFilesFakeGitHubServer(t, files)
+	defer server.Close()
+
+	ic := newPRTestInstallationClient(t, server)
+	ctx := WithPRInfoCache(t.Context())
+
+	for range 2 {
+		visible, err := ic.FetchPRFiles(ctx, "octo/repo", 42)
+		require.ErrorIs(t, err, ErrPRFilesIncomplete)
+		assert.Len(t, visible, maxGitHubPRFiles)
+	}
+	assert.Equal(t, int32(2), calls.Load(), "a capped listing is an error, and errors are not cached")
+}
+
+// newPRFilesFakeGitHubServer returns an httptest server that serves the given
+// files as the single page of GET /repos/octo/repo/pulls/42/files, and the
+// counter of how many times the endpoint has been hit.
+func newPRFilesFakeGitHubServer(t *testing.T, files []map[string]string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var calls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/octo/repo/pulls/42/files", func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(files))
+	})
+	return httptest.NewServer(mux), &calls
 }
 
 // TestForInstallation_CachesByInstallationID locks in the invariant that

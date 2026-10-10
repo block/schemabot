@@ -33,8 +33,20 @@ type CommentObserver struct {
 	applyLease     storage.ApplyLease
 	deferCutover   bool
 	supportChannel api.SupportChannelConfig
+	cliName        string
 	tenant         string
-	logger         interface {
+	// engineLogs reads the engine's own lines back from the data planes that
+	// ran an apply, for the engine-logs fold on a failed apply's summary.
+	// Nil where no reader was wired; see EngineLogReader.
+	engineLogs EngineLogReader
+	// plans remembers the plan rows this apply's members run, so the progress
+	// comment reads each once for the observer's life, not once per render.
+	plans planIdentities
+	// shardedPlans remembers what each sharded apply's stored plan says about
+	// its finalizers and table sizes once it has been read; see
+	// shardedPlanCache.
+	shardedPlans *shardedPlanCache
+	logger       interface {
 		Debug(msg string, args ...any)
 		Info(msg string, args ...any)
 		Warn(msg string, args ...any)
@@ -75,10 +87,12 @@ type CommentObserver struct {
 	// claim.
 	authorityOwner string
 
-	mu                sync.Mutex
-	lastProgressPost  time.Time
-	lastState         string
-	lastRowsCopied    int64
+	mu               sync.Mutex
+	lastProgressPost time.Time
+	// lastRendered is the progress snapshot the tracked comment last showed;
+	// progressCommentDue judges movement against it. Rotations that post a
+	// fresh comment record only the state they rendered.
+	lastRendered      progressSnapshot
 	stagnantTicks     int
 	hasCutoverComment bool
 	resumeRotated     bool
@@ -157,10 +171,25 @@ type CommentObserverConfig struct {
 	DeferCutover   bool
 	SupportChannel api.SupportChannelConfig
 
+	// CLIName is the tool name the CLI command hints in the observer's
+	// comments start with, the server's cli_name. Empty renders the CLI's own
+	// default.
+	CLIName string
+
 	// Tenant is the deployment's tenant identity, carried into every pasteable
 	// command hint the observer's comments render. Empty on single-tenant
 	// deployments.
 	Tenant string
+
+	// EngineLogs reads the engine's own lines back from the data planes that
+	// ran an apply, so a failed apply's summary comment carries the engine's
+	// account of the failure alongside SchemaBot's. Optional — nil leaves the
+	// engine-logs fold off the summary.
+	EngineLogs EngineLogReader
+
+	// shardedPlans is the sharded plan cache shared with every other
+	// comment render in the process. Nil gives the observer a cache of its own.
+	shardedPlans *shardedPlanCache
 
 	Logger interface {
 		Debug(msg string, args ...any)
@@ -229,6 +258,10 @@ func (o *CommentObserver) logInfo(apply *storage.Apply, msg string, args ...any)
 // NewCommentObserver creates a new CommentObserver for posting PR comments.
 func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 	clk := clock.Default(cfg.Clock)
+	shardedPlans := cfg.shardedPlans
+	if shardedPlans == nil {
+		shardedPlans = newShardedPlanCache()
+	}
 	return &CommentObserver{
 		ghClient:       cfg.GHClient,
 		stor:           cfg.Storage,
@@ -239,7 +272,10 @@ func NewCommentObserver(cfg CommentObserverConfig) *CommentObserver {
 		applyLease:     cfg.ApplyLease,
 		deferCutover:   cfg.DeferCutover,
 		supportChannel: cfg.SupportChannel,
+		cliName:        cfg.CLIName,
 		tenant:         cfg.Tenant,
+		engineLogs:     cfg.EngineLogs,
+		shardedPlans:   shardedPlans,
 		logger:         cfg.Logger,
 		OnTerminalHook: cfg.OnTerminalHook,
 		clock:          clk,
@@ -320,7 +356,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		if _, posted, _ := o.postAndTrackComment(apply, state.Comment.Cutover, body, nil); posted {
 			o.hasCutoverComment = true
 		}
-		o.lastState = currentState
+		o.lastRendered.state = currentState
 		return
 	}
 
@@ -340,7 +376,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 			return
 		}
 		if adopted && o.rotateProgressCommentAfterCutover(apply, tasks) {
-			o.lastState = currentState
+			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
 		}
@@ -354,7 +390,7 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		// copy and leave the prior comment frozen at "Stopped" as the record of where
 		// the apply paused.
 		if !state.IsTerminalApplyState(apply.State) && o.rotateProgressCommentForResume(apply, tasks) {
-			o.lastState = currentState
+			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
 			return
@@ -365,47 +401,93 @@ func (o *CommentObserver) OnProgress(apply *storage.Apply, tasks []*storage.Task
 		// belongs at the bottom of the PR timeline, with the old comment frozen at
 		// its pre-operation state as the record.
 		if o.rotateProgressCommentForControlPhase(apply, tasks) {
-			o.lastState = currentState
+			o.lastRendered.state = currentState
 			o.lastProgressPost = now
 			o.stagnantTicks = 0
 			return
 		}
 	}
 
-	// Adaptive rate limiting — ported from watchApplyProgress.
-	// Edit every 5s when progress is moving, slow to 30s when stagnant.
-	var totalRows int64
-	for _, t := range tasks {
-		totalRows += t.RowsCopied
+	// The operation rows are loaded ahead of the rate-limit decision because
+	// the statement position they carry is part of what counts as movement;
+	// the same rows then feed the render, so the comment shows the position
+	// that made it due. A failed load leaves the position out of this tick's
+	// signal and the render falls back to the single-deployment layout, which
+	// logs the failure.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ops, opsErr := o.stor.ApplyOperations().ListByApply(ctx, o.applyID)
+	if opsErr != nil {
+		o.logger.Debug("observer: failed to load apply operations for the comment freshness check; the statement position will not count as movement this tick",
+			"apply_id", o.applyID, "error", opsErr)
+	}
+	if !o.progressCommentDue(now, progressSnapshotOf(currentState, tasks, ops)) {
+		return
 	}
 
+	body := o.statusCommentFromOps(apply, ops, opsErr, tasks, o.shardsByTable(ctx, apply, ops))
+	o.editTrackedComment(apply, state.Comment.Progress, body)
+}
+
+// progressSnapshot is the freshness signal for the tracked progress comment:
+// the figures whose movement between polls means the comment is out of date.
+type progressSnapshot struct {
+	state      string
+	rowsCopied int64
+	// steps fingerprints every operation's statement position and the server's
+	// work on the running statement. It is what moves for an engine that
+	// executes a statement sequence and reports no row counts, so without it
+	// such an apply would read as stalled from its first poll and its position
+	// would refresh only at the slow interval.
+	steps string
+}
+
+func progressSnapshotOf(applyState string, tasks []*storage.Task, ops []*storage.ApplyOperation) progressSnapshot {
+	snapshot := progressSnapshot{state: applyState, steps: progressFingerprint(ops)}
+	for _, t := range tasks {
+		snapshot.rowsCopied += t.RowsCopied
+	}
+	return snapshot
+}
+
+// progressCommentDue applies the adaptive rate limit — ported from
+// watchApplyProgress — and reports whether the tracked progress comment is due
+// an edit on this tick, recording the snapshot as rendered when it is. Edits
+// land every activeInterval while the snapshot keeps moving and slow to
+// stagnantInterval once it has held still for stagnantThresh consecutive ticks;
+// a state change is rendered at once.
+//
+// Movement is judged against the snapshot the comment last rendered, not the
+// last one observed. A change that arrives inside the interval therefore stays
+// pending — every tick until the interval elapses still reads as movement — and
+// is rendered on the first due tick. Comparing against the last observed
+// snapshot instead would count the ticks after the change as stagnant and, for
+// a figure that moves rarely, defer rendering it to the slow interval.
+func (o *CommentObserver) progressCommentDue(now time.Time, current progressSnapshot) bool {
 	interval := activeInterval
 	if o.stagnantTicks >= stagnantThresh {
 		interval = stagnantInterval
 	}
+	sinceLastPost := now.Sub(o.lastProgressPost)
 
-	if totalRows == o.lastRowsCopied && currentState == o.lastState {
+	if current == o.lastRendered {
 		o.stagnantTicks++
-		if o.stagnantTicks >= stagnantThresh && now.Sub(o.lastProgressPost) < stagnantInterval {
-			return // stagnant — skip edit
+		if o.stagnantTicks >= stagnantThresh && sinceLastPost < stagnantInterval {
+			return false // stagnant — skip edit
 		}
-		if now.Sub(o.lastProgressPost) < interval {
-			return // not time yet
+		if sinceLastPost < interval {
+			return false // not time yet
 		}
 	} else {
 		o.stagnantTicks = 0
-		o.lastRowsCopied = totalRows
-		if now.Sub(o.lastProgressPost) < activeInterval && currentState == o.lastState {
-			return // active but not time yet (unless state changed)
+		if sinceLastPost < activeInterval && current.state == o.lastRendered.state {
+			return false // moving but not time yet (unless state changed)
 		}
 	}
 
-	o.lastState = currentState
+	o.lastRendered = current
 	o.lastProgressPost = now
-
-	// Edit the progress comment
-	body := o.formatStatusComment(apply, tasks)
-	o.editTrackedComment(apply, state.Comment.Progress, body)
+	return true
 }
 
 // OnTerminal is called when the apply reaches a terminal state.
@@ -640,7 +722,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 			"apply_id", o.applyID, "error", opsErr)
 		body = formatProgressComment(apply, tasks, shardsByTable, o.tenant)
 	} else {
-		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
+		body = formatApplyStatusComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveShardedPlan(apply, ops), o.tenant, o.cliName)
 	}
 	return body + controlRejectionSection(context.Background(), o.stor, o.logger, apply, body)
 }
@@ -652,7 +734,7 @@ func (o *CommentObserver) statusCommentFromOps(apply *storage.Apply, ops []*stor
 func (o *CommentObserver) resolveDisplay(apply *storage.Apply, ops []*storage.ApplyOperation) map[int64]operationDisplay {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveDisplayByOperation(ctx, o.stor, apply, ops)
+	return resolveDisplayByOperation(ctx, o.stor, apply, ops, &o.plans)
 }
 
 // resolveReleased reports whether the apply's paused rollout has been released
@@ -665,14 +747,15 @@ func (o *CommentObserver) resolveReleased(apply *storage.Apply, ops []*storage.A
 	return releasedForApply(ctx, o.stor, apply, ops, o.logger)
 }
 
-// resolveVSchemaDiffs loads the stored plan's per-namespace VSchema diffs for
-// a sharded apply's comment rendering. It uses a short, independent deadline
-// so a slow storage read degrades to a comment without diffs rather than
-// blocking the update.
-func (o *CommentObserver) resolveVSchemaDiffs(apply *storage.Apply, ops []*storage.ApplyOperation) map[string]string {
+// resolveShardedPlan loads what the stored plan says about a sharded apply's
+// finalizers and table sizes for its comment rendering, through the cache
+// shared with every other render of the apply (see shardedPlanCache). It uses
+// a short, independent deadline so a slow storage read degrades to a comment
+// without VSchema diffs or table sizes rather than blocking the update.
+func (o *CommentObserver) resolveShardedPlan(apply *storage.Apply, ops []*storage.ApplyOperation) *shardedPlanView {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	return resolveShardedVSchemaDiffs(ctx, o.stor, apply, ops)
+	return o.shardedPlans.resolve(ctx, o.stor, apply, ops)
 }
 
 // formatTerminalSummaryComment renders the apply's terminal summary comment,
@@ -698,16 +781,33 @@ func (o *CommentObserver) formatTerminalSummaryComment(apply *storage.Apply) str
 // section, appended after whichever layout rendered, so triage data lands on
 // the PR without an extra operator step.
 func (o *CommentObserver) summaryCommentFromOps(ctx context.Context, apply *storage.Apply, ops []*storage.ApplyOperation, opsErr error, tasks []*storage.Task, shardsByTable map[string][]*storage.Task) string {
-	var body string
 	if opsErr != nil {
 		o.logger.Error("observer: failed to load apply operations for summary comment dispatch; rendering single-deployment layout",
 			"apply_id", o.applyID, "error", opsErr)
-		body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
-	} else {
-		body = formatApplySummaryComment(apply, ops, o.resolveReleased(apply, ops), tasks, o.resolveDisplay(apply, ops), shardsByTable, o.resolveVSchemaDiffs(apply, ops), o.tenant)
 	}
-	body += controlRejectionSection(ctx, o.stor, o.logger, apply, body)
-	return body + failureLogsSection(ctx, o.stor, o.logger, apply, body)
+	// Everything read from storage is resolved once, before the body is
+	// rendered: summaryWithFailureLogs can render it twice, and a best-effort
+	// read that failed on the second pass would silently drop a section from
+	// the body actually posted.
+	var released bool
+	var display map[int64]operationDisplay
+	var view *shardedPlanView
+	if opsErr == nil {
+		released = o.resolveReleased(apply, ops)
+		display = o.resolveDisplay(apply, ops)
+		view = o.resolveShardedPlan(apply, ops)
+	}
+	rejections := loadControlRejections(ctx, o.stor, o.logger, apply)
+	renderBody := func(apply *storage.Apply) string {
+		var body string
+		if opsErr != nil {
+			body = formatSummaryComment(apply, tasks, shardsByTable, o.tenant)
+		} else {
+			body = formatApplySummaryComment(apply, ops, released, tasks, display, shardsByTable, view, o.tenant, o.cliName)
+		}
+		return body + renderControlRejections(rejections, o.logger, apply, body)
+	}
+	return summaryWithFailureLogs(ctx, o.stor, o.engineLogs, o.logger, apply, renderBody)
 }
 
 func (o *CommentObserver) shouldDeferCutover(apply *storage.Apply) bool {
@@ -929,7 +1029,7 @@ func (o *CommentObserver) decideProgressCommentAuthority(apply *storage.Apply, o
 	return true
 }
 
-// operationScopedWorkInFlight reports whether the apply's schema-change work
+// operationScopedWorkInFlight reports whether the apply's schema change work
 // is still in flight under operation-scoped dispatch — the one shape whose
 // parent apply lease is legitimately unheld mid-apply. True when the apply is
 // non-terminal and either its generation manifest still lists keys with no
@@ -1023,7 +1123,7 @@ func (o *CommentObserver) editTrackedComment(apply *storage.Apply, commentState 
 		return
 	}
 
-	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(body)); err != nil {
+	if err := client.EditIssueComment(ctx, o.repo, comment.GitHubCommentID, o.renderPRComment(apply, body)); err != nil {
 		o.logError(apply, "observer: failed to edit comment", "error", err, "comment_state", commentState)
 		return
 	}
@@ -1615,7 +1715,7 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 		return 0, false, false
 	}
 
-	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
+	commentID, _, err = client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(apply, body))
 	if err != nil {
 		o.logError(apply, "observer: failed to post comment", "error", err, "comment_state", commentState)
 		return 0, false, false
@@ -1644,8 +1744,15 @@ func (o *CommentObserver) postAndTrackComment(apply *storage.Apply, commentState
 	return commentID, true, true
 }
 
-func (o *CommentObserver) renderPRComment(body string) string {
-	return appendSupportChannelFooter(body, o.supportChannel)
+// renderPRComment finishes a comment body about apply for posting on the
+// observed PR: an oversized body is replaced with the notice that fits, its CLI
+// hint scoped to the apply's environment, then the support footer is appended.
+func (o *CommentObserver) renderPRComment(apply *storage.Apply, body string) string {
+	environment := ""
+	if apply != nil {
+		environment = apply.Environment
+	}
+	return appendSupportChannelFooter(fitPRComment(o.logger, o.repo, o.pr, environment, body, o.cliName), o.supportChannel)
 }
 
 // publishClaimedSummary posts the separate apply-level terminal summary
@@ -1679,7 +1786,7 @@ func (o *CommentObserver) publishClaimedSummary(apply *storage.Apply, body strin
 		o.releaseSummaryClaim(ctx, apply)
 		return
 	}
-	commentID, _, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(body))
+	commentID, _, err := client.CreateIssueComment(ctx, o.repo, o.pr, o.renderPRComment(apply, body))
 	if err != nil {
 		o.logError(apply, "observer: failed to post claimed terminal summary; releasing claim",
 			"error", err)

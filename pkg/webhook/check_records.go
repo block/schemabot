@@ -2,11 +2,15 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -23,7 +27,7 @@ const (
 	// plan). Zero value so an unset outcome fails safe — it preserves, never
 	// clears, an existing drift block.
 	driftNotEvaluated reviewDriftState = iota
-	// driftClean: the rollup ran and every deployment matched the reviewed plan.
+	// driftClean: the rollup ran and every deployment matched the primary plan.
 	driftClean
 	// driftBlocked: the rollup ran and a deployment diverged or could not be
 	// confirmed, so the plan check fails closed.
@@ -32,13 +36,119 @@ const (
 
 // reviewDriftOutcome carries the review-time per-deployment drift outcome into
 // the plan check record. When the state is driftBlocked the plan check fails
-// closed regardless of whether the reviewed primary plan itself had changes,
+// closed regardless of whether the primary plan itself had changes,
 // because a deployment's live schema no longer matches what was reviewed (or
 // could not be confirmed to match). summary explains why for the check's Change
 // column and logs.
 type reviewDriftOutcome struct {
 	state   reviewDriftState
 	summary string
+	// work is how many rollout members still need the change, read from the
+	// same rollup. The primary plan speaks only for the primary, so a
+	// primary already at the desired schema says nothing about members planned
+	// against schemas of their own.
+	work memberWork
+	// block is the durable reason a blocked outcome is stored under, so the
+	// apply it refuses names the right fix. Unset is review-time deployment
+	// drift, which is what the rollup reports.
+	block checkBlockReason
+	// preserve lists stored blocking reasons a blocked outcome must not
+	// replace: a row already carrying one keeps it, because it is the stronger
+	// block. Empty for outcomes the rollup reports, which rewrite any block.
+	preserve []string
+}
+
+// blockingReason is the stored reason for a blocked outcome.
+func (o reviewDriftOutcome) blockingReason() string {
+	if o.block.blockingReason != "" {
+		return o.block.blockingReason
+	}
+	return reviewTimeDeploymentDriftBlock.blockingReason
+}
+
+// memberWork counts the rollout members, primary included, whose own plan
+// would change something, out of the members a rollup planned.
+type memberWork struct {
+	pending int
+	members int
+	// names are the members with work, the way an operator addresses them, in
+	// rollout order.
+	names []string
+	// primary is the name of the target the apply's own plan was planned
+	// against, the first in rollout order, whether or not it has work. Empty
+	// when no rollup was run.
+	primary string
+	// copyAtStake names a member other than the primary whose apply would
+	// discard an unfinished copy, or could not say whether it would, and why.
+	// Zero when no member with work puts a copy at stake.
+	copyAtStake memberRefusal
+	// others counts the members with work other than the primary target,
+	// whose work runs from plans of their own rather than the primary plan.
+	others int
+}
+
+// memberWorkOf counts the work in a rollup. A nil rollup is one that was not
+// run, which leaves the primary plan to speak for the work on its own.
+func memberWorkOf(rollup *api.PlanRollup) memberWork {
+	if rollup == nil {
+		return memberWork{}
+	}
+	withWork := map[string]bool{}
+	for _, member := range rollup.MembersWithWork() {
+		withWork[member.MemberID()] = true
+	}
+	// Names are rendered over the whole rollout so a target is qualified exactly
+	// where the rest of the comment qualifies it.
+	names := rollupMemberNames(*rollup)
+	work := memberWork{members: len(rollup.Entries)}
+	if len(names) > 0 {
+		work.primary = names[0]
+	}
+	for i, entry := range rollup.Entries {
+		if withWork[routing.ExecutionTarget{Deployment: entry.Deployment, Target: entry.Target}.MemberID()] {
+			work.names = append(work.names, names[i])
+			if i > 0 {
+				work.others++
+			}
+		}
+	}
+	work.pending = len(work.names)
+	if at, reason := rollup.MemberCopyAtStake(); at >= 0 {
+		work.copyAtStake = memberRefusal{target: names[at], reason: reason}
+	}
+	return work
+}
+
+// summary says how many targets still need the change, for a check whose
+// primary plan has nothing of its own to summarize. Targets already at the
+// schema are left out of the count, as every PR surface leaves them out.
+func (w memberWork) summary() string {
+	if w.pending == 1 {
+		return "1 target needs this change"
+	}
+	return fmt.Sprintf("%d targets need this change", w.pending)
+}
+
+// pendingTargets names the targets that still need the change, for a refusal
+// that tells the operator which targets it held back. Targets already at the
+// schema are left out, as the plan comment leaves them out.
+func (w memberWork) pendingTargets() string {
+	names := "`" + strings.Join(w.names, "`, `") + "`"
+	if len(w.names) == 1 {
+		return "target " + names + " needs this change"
+	}
+	return "targets " + names + " need this change"
+}
+
+// unstoredSummary is the failing aggregate's summary when the check record for
+// this work could not be stored. The work counts the primary, so a plan for a
+// single target with changes of its own lands here too, and names no count.
+func (w memberWork) unstoredSummary() string {
+	const unstored = "SchemaBot could not record this plan's result; re-run plan"
+	if w.members > 1 {
+		return unstored + " (" + w.summary() + ")"
+	}
+	return unstored
 }
 
 // blocks reports whether this outcome must fail the plan check closed.
@@ -64,6 +174,36 @@ func (o reviewDriftOutcome) planDriftState() storage.PlanDriftState {
 // Returns the commit SHA used for the plan. Failures are non-fatal.
 func (h *Handler) storePlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome) (string, error) {
 	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, planResp, environment, drift)
+	return headSHA, err
+}
+
+// namespacePlacementCheckSummary is the stored Change column for an environment
+// whose plan was refused by namespace placement. The plan comment carries the
+// refusal in full.
+const namespacePlacementCheckSummary = "namespace placement refused the plan; see the plan comment"
+
+// namespacePlacementUnstoredSummary is the failing aggregate's summary when an
+// environment's namespace placement refusal could not be stored. The aggregate
+// then carries the placement block itself, and a stored aggregate block is
+// released only by the auto-plan guards re-verifying the whole PR, never by a
+// plan command: the block does not record which database and environment set
+// it, so a plan of one of them cannot prove the refusal no longer stands
+// anywhere. A re-run of the check or a new commit re-plans every environment,
+// which clears the block once the placement agrees and stores the refusal
+// again where it does not.
+const namespacePlacementUnstoredSummary = "namespace placement refused the plan and SchemaBot could not record it; see the plan comment, then re-run this check or push a commit to re-plan every environment"
+
+// storeNamespacePlacementCheck stores a failing check for an environment whose
+// plan was refused because its targets entries and the schema files disagree on
+// namespace placement (api.NamespacePlacementRefused). That environment has no
+// plan, so without this row the aggregate folds only the environments that did
+// plan and can pass while a namespace is planned and applied nowhere (MG-12).
+// The row carries its own review-time block, so an apply it refuses is told to
+// fix the placement, and a later plan whose placement agrees clears it the way
+// a clean rollup clears drift.
+func (h *Handler) storeNamespacePlacementCheck(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, environment string) (string, error) {
+	blocked := reviewDriftOutcome{state: driftBlocked, summary: namespacePlacementCheckSummary, block: namespacePlacementRefusedBlock}
+	headSHA, _, err := h.upsertPlanCheckRecord(ctx, client, repo, pr, schema, &apitypes.PlanResponse{}, environment, blocked)
 	return headSHA, err
 }
 
@@ -117,9 +257,9 @@ func (h *Handler) storeManualPlanCheckRecord(ctx context.Context, client *ghclie
 
 // planCheckConclusion decides a plan check's stored conclusion. Review-time
 // drift fails the check closed ahead of the plan's own outcome: a deployment
-// whose live schema no longer matches the reviewed plan (or that could not be
+// whose live schema no longer matches the primary plan (or that could not be
 // confirmed to match) must block the PR even when the primary's diff is clean or
-// empty. A primary plan that reported errors or a final engine refusal likewise
+// empty. The primary plan that reported errors or a final engine refusal likewise
 // fails. Destructive changes remain action-required: the apply path requires
 // the separate --allow-unsafe acknowledgement before they can proceed.
 func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocked bool) string {
@@ -140,10 +280,12 @@ func planCheckConclusion(hasChanges, hasPlanErrors, hasFinalRefusal, driftBlocke
 // planRefusalFailsCheck reports whether a plan's engine-blocked changes are
 // final enough to fail the check rather than leave the PR at action-required.
 //
-// A refusal is final when it is a property of the statement rather than of live
-// target state, so no re-plan can lift it and no apply the operator runs can
-// satisfy it: PostgreSQL blocks a change it has no authoritative classifier
-// verdict for, and Vitess refuses constructs it cannot execute at all. The
+// A refusal is final when no apply SchemaBot runs can satisfy it, so leaving
+// the PR at action-required would coach an apply that is certain to be
+// refused. PostgreSQL blocks a change it has no authoritative classifier
+// verdict for and a DROP TABLE it never executes — the latter is lifted only
+// by the operator changing the repository or the target and re-planning, never
+// by an apply — and Vitess refuses constructs it cannot execute at all. The
 // MySQL engine also marks a refused statement blocked, but there the verdict
 // previews a direct-execution routing decision that apply time re-resolves
 // against live policy and table size, so a plan blocked at review can still
@@ -159,6 +301,27 @@ func planRefusalFailsCheck(databaseType string, planResp *apitypes.PlanResponse)
 }
 
 func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string, drift reviewDriftOutcome) (string, *storage.Check, error) {
+	// A plan narrowed to one rollout member says nothing about the others, so
+	// recording it would let one member's result stand for the whole rollout
+	// (MG-12). Refusing the write leaves the stored check state as the last
+	// rollout-wide round recorded it, so a narrowed plan can never move it
+	// toward passing.
+	if planResp != nil && planResp.NarrowedTo != "" {
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "error",
+		})
+		h.logger.Warn("stored check state not written: the plan was narrowed to one rollout member and cannot speak for the rollout",
+			"repo", repo, "pr", pr, "head_sha", schema.HeadSHA,
+			"environment", environment, "database_type", schema.Type, "database", schema.Database,
+			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+		return "", nil, fmt.Errorf("plan %s for repo %s pr %d environment %s database %s was narrowed to rollout member %s; a narrowed plan never records stored check state",
+			planResp.PlanID, repo, pr, environment, schema.Database, planResp.NarrowedTo)
+	}
 	headSHA := schema.HeadSHA
 	if headSHA == "" {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -198,20 +361,25 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			repo, pr, environment, schema.Type, schema.Database, headSHA, prInfo.HeadSHA)
 	}
 
-	hasChanges := planResp.HasChanges()
+	// A check passes only when no rollout member has work (MG-12), so work on a
+	// member counts even when the primary plan is empty.
+	hasChanges := planResp.HasChanges() || drift.work.pending > 0
 	driftBlocked := drift.blocks()
 
 	conclusion := planCheckConclusion(hasChanges, len(planResp.Errors) > 0, planRefusalFailsCheck(schema.Type, planResp), driftBlocked)
 
 	// Review-time drift is a first-class blocking reason, not an overload of the
-	// plan facts: HasChanges stays "the reviewed primary plan has changes", and
-	// the block rides on BlockingReason + Conclusion so a stored drift block is
+	// plan facts: HasChanges stays "some rollout member has changes", and the
+	// block rides on BlockingReason + Conclusion so a stored drift block is
 	// legible and durable across write paths.
 	changeSummary := summarizePlanChanges(schema, planResp, environment)
+	if changeSummary == "" && drift.work.pending > 0 {
+		changeSummary = drift.work.summary()
+	}
 	blockingReason := ""
 	if driftBlocked {
 		changeSummary = drift.summary
-		blockingReason = reviewTimeDeploymentDriftBlock.blockingReason
+		blockingReason = drift.blockingReason()
 	}
 
 	check := &storage.Check{
@@ -227,7 +395,34 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 		BlockingReason: blockingReason,
 		ChangeSummary:  changeSummary,
 	}
-	if err := h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState()); err != nil {
+	var stored bool
+	if driftBlocked && len(drift.preserve) > 0 {
+		stored, err = h.service.Storage().Checks().UpsertGuardBlock(ctx, check, drift.preserve)
+	} else {
+		stored, err = h.service.Storage().Checks().UpsertPlanResult(ctx, check, drift.planDriftState())
+	}
+	if errors.Is(err, storage.ErrCheckNotFound) {
+		// The PR closed and its check state was cleaned up while this plan ran.
+		// There is no gate left for the result to land on, so the plan itself is
+		// not failed by it.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "target_missing",
+		})
+		h.logger.Info("plan check result discarded: the PR's check state was deleted while the plan ran, so there is no check for it to update",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"environment", environment,
+			"database_type", schema.Type,
+			"database", schema.Database)
+		return headSHA, check, nil
+	}
+	if err != nil {
 		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
 			Operation:    "plan_check_recorded",
 			Repository:   repo,
@@ -237,6 +432,30 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 			Status:       "error",
 		})
 		return headSHA, nil, fmt.Errorf("store check state: %w", err)
+	}
+	if !stored {
+		// The guard preserving in-progress apply-owned state refused this write.
+		// That is correct while the apply runs, but it leaves the stored row on
+		// the apply's commit, which the aggregate holds as blocking whenever the
+		// PR head has moved past it (see normalizeStaleContributions). Releasing
+		// it takes a write from a path the guard admits — the manual same-head
+		// no-op recovery below, or a plan that runs once the apply is terminal.
+		metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
+			Operation:    "plan_check_recorded",
+			Repository:   repo,
+			Database:     schema.Database,
+			DatabaseType: schema.Type,
+			Environment:  environment,
+			Status:       "refused",
+		})
+		h.logger.Warn("plan check result not stored: an in-flight apply owns this check, so the stored row still names the apply's commit and the aggregate holds it as blocking",
+			"repo", repo,
+			"pr", pr,
+			"head_sha", headSHA,
+			"environment", environment,
+			"database_type", schema.Type,
+			"database", schema.Database)
+		return headSHA, check, nil
 	}
 
 	metrics.RecordStatusCheckOperation(ctx, metrics.StatusCheckOperation{
@@ -256,7 +475,7 @@ func (h *Handler) upsertPlanCheckRecord(ctx context.Context, client *ghclient.In
 // (e.g. "5 created, 3 altered · 2 vschema updates") always agrees with the plan
 // comment's summary line. Returns "" when the plan has no changes.
 func summarizePlanChanges(schema *ghclient.SchemaRequestResult, planResp *apitypes.PlanResponse, environment string) string {
-	commentData := buildPlanCommentData(schema, planResp, environment, "", "", "")
+	commentData := buildPlanCommentData(schema, planResp, environment, "", "", "", "")
 	return templates.SummarizeChanges(commentData)
 }
 
@@ -462,6 +681,21 @@ func isCompletedRollback(a *storage.Apply) bool {
 	return a.IsRollback() && state.IsState(a.State, state.Apply.Completed)
 }
 
+// completedNarrowedApply reports whether a forward apply narrowed to one
+// rollout member completed. It changed one target, so its success cannot pass
+// the environment's check (MG-12). A check already blocked because the PR
+// removed the schema change keeps that reason, which names the reconciliation
+// the operator owes.
+func completedNarrowedApply(a *storage.Apply, check *storage.Check) bool {
+	if !state.IsState(a.State, state.Apply.Completed) || a.IsRollback() {
+		return false
+	}
+	if storage.ParseApplyOptions(a.Options).NarrowedTo == "" {
+		return false
+	}
+	return !checkBlockedByRemovedSchemaAfterApply(check)
+}
+
 // completedForwardTaskBeforeCancellation returns durable evidence that the
 // cancelled apply or an earlier forward apply changed the same target. Apply
 // rows cannot provide this proof because an apply may be cancelled or failed
@@ -618,6 +852,25 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 					append(apply.LogAttrs(), "check_status", check.Status, "check_conclusion", check.Conclusion)...)
 			}
 		}
+	case completedNarrowedApply(apply, check):
+		check.Status = checkStatusCompleted
+		check.Conclusion = checkConclusionActionRequired
+		check.HasChanges = true
+		// A block the narrowed apply kept when it started stays with its own
+		// reason and summary; only a rollup of the whole environment lifts it.
+		if !narrowedApplyKeepsBlock(check.BlockingReason) {
+			check.BlockingReason = narrowedApplyBlock.blockingReason
+			check.ErrorMessage = narrowedApplyBlock.message
+			check.ChangeSummary = narrowedApplyCheckSummary
+		}
+		// MarkActionRequiredForApply releases check ownership, so the plan of
+		// the whole environment that lifts this block can write its result.
+		updated, err = h.service.Storage().Checks().MarkActionRequiredForApply(ctx, check, apply)
+		if err != nil {
+			recordOutcome("error")
+			return false, fmt.Errorf("mark stored check state action_required after apply narrowed to one target repo %s pr %d environment %s database_type %s database %s: %w",
+				repo, pr, apply.Environment, apply.DatabaseType, apply.Database, err)
+		}
 	default:
 		var conclusion string
 		switch {
@@ -652,10 +905,13 @@ func (h *Handler) updateCheckRecordForApplyResult(ctx context.Context, repo stri
 		// The action-required writes yield only to a newer apply, while ordinary
 		// completion requires the row to still be owned by this apply.
 		msg := "skipping check state update because stored state no longer belongs to apply"
-		if isCompletedRollback(apply) {
+		switch {
+		case isCompletedRollback(apply):
 			msg = "skipping rollback action_required update because a newer apply supersedes the rollback"
-		} else if cancelledForwardApply {
+		case cancelledForwardApply:
 			msg = "skipping cancelled apply action_required update because a newer apply supersedes the cancellation"
+		case completedNarrowedApply(apply, check):
+			msg = "skipping narrowed apply action_required update because a newer apply supersedes it"
 		}
 		h.logger.Warn(msg,
 			"repo", repo, "pr", pr, "database", apply.Database,

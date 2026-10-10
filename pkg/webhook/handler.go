@@ -79,6 +79,11 @@ type Handler struct {
 	service   *api.Service
 	ghClients github.ClientSet
 
+	// shardedPlans is the sharded plan cache every comment render this
+	// handler starts shares; see shardedPlanCache. Nil (a Handler built
+	// without its constructor) reads storage on every render.
+	shardedPlans *shardedPlanCache
+
 	// transientPlanRetryDelay overrides the pause before retrying a plan
 	// request that failed with transient remote unavailability. Zero means
 	// the package default.
@@ -133,6 +138,13 @@ type Handler struct {
 	durableWebhookCancel        context.CancelFunc
 	durableWebhookWake          chan struct{}
 	durableWebhookWg            sync.WaitGroup
+	// durableWebhookClaims holds the log identity of every delivery this
+	// process's drivers currently have claimed, so a shutdown drain that
+	// expires can name the inbox rows it walked away from rather than only
+	// counting them. It has a lock of its own because the drivers write it on
+	// every claim, while durableWebhookMu guards the dispatch lifecycle.
+	durableWebhookClaimMu sync.Mutex
+	durableWebhookClaims  map[string][]any
 	// durableWebhookProcessOverride is a test seam that replaces
 	// processDurableWebhookEvent so driver finish-path behavior (for example
 	// refusing to complete a delivery after lease loss) can be exercised
@@ -173,6 +185,7 @@ type Handler struct {
 	webhookReconcileLookback  time.Duration
 	webhookReconcileGrace     time.Duration
 	webhookReconcileMaxPages  int
+	webhookReconcileScanClaim time.Duration
 
 	checkSuiteRecovery      bool
 	checkSuiteRecoveryGrace time.Duration
@@ -233,6 +246,24 @@ func WithWebhookReconcileSynthesis() HandlerOption {
 	}
 }
 
+// WithWebhookReconcileScanBounds sizes the reconciler's missing-delivery scan:
+// maxPages is the per-repository page budget of one reconcile pass and
+// lookback is how far back in update time the scan covers. Raising the budget
+// or shortening the lookback is the remedy when the scan is chronically
+// truncated (see the reconcile_scan_truncated_total metric). A budget below
+// MinWebhookReconcileMaxPages or a non-positive lookback leaves the
+// corresponding default in place.
+func WithWebhookReconcileScanBounds(maxPages int, lookback time.Duration) HandlerOption {
+	return func(h *Handler) {
+		if maxPages >= MinWebhookReconcileMaxPages {
+			h.webhookReconcileMaxPages = maxPages
+		}
+		if lookback > 0 {
+			h.webhookReconcileLookback = lookback
+		}
+	}
+}
+
 // WithCheckSuiteRecovery feeds check_suite.requested deliveries into the
 // durable inbox as a redundant convergence signal: each is enqueued with a
 // not-before time (the recovery grace) and, once claimable, synthesizes a
@@ -288,9 +319,11 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 		webhookReconcileLookback:    defaultWebhookReconcileLookback,
 		webhookReconcileGrace:       defaultWebhookReconcileGrace,
 		webhookReconcileMaxPages:    defaultWebhookReconcileMaxPages,
+		webhookReconcileScanClaim:   defaultWebhookReconcileScanClaim,
 		checkSuiteRecoveryGrace:     defaultCheckSuiteRecoveryGrace,
 		priorEnvCheckMaxAttempts:    defaultPriorEnvCheckMaxAttempts,
 		priorEnvCheckRetryInterval:  defaultPriorEnvCheckRetryInterval,
+		shardedPlans:                newShardedPlanCache(),
 	}
 	for _, opt := range opts {
 		opt(h)
@@ -316,22 +349,13 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				"apply_id", apply.ApplyIdentifier,
 				"repo", apply.Repository,
 				"pr", apply.PullRequest)
-			service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID,
-				NewCommentObserver(CommentObserverConfig{
-					GHClient:       factory,
-					Storage:        service.Storage(),
-					Repo:           apply.Repository,
-					PR:             apply.PullRequest,
-					InstallationID: apply.InstallationID,
-					ApplyID:        apply.ID,
-					ApplyLease:     apply.Lease(),
-					SupportChannel: h.supportChannel(),
-					Tenant:         h.deploymentTenant(),
-					Logger:         logger,
-					OnTerminalHook: func(a *storage.Apply) {
-						h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
-					},
-				}))
+			cfg := h.commentObserverConfig(factory, apply.Repository, apply.PullRequest, apply.InstallationID)
+			cfg.ApplyID = apply.ID
+			cfg.ApplyLease = apply.Lease()
+			cfg.OnTerminalHook = func(a *storage.Apply) {
+				h.refreshChecksForTerminalApply(context.Background(), a, "recovered apply")
+			}
+			service.SetApplyObserver(apply.Database, apply.Deployment, apply.Environment, apply.ID, NewCommentObserver(cfg))
 		}
 
 		// Register the aggregate terminal-summary callback, invoked by the
@@ -358,20 +382,12 @@ func NewHandlerWithDispatch(service *api.Service, ghClients github.ClientSet, we
 				"repo", apply.Repository,
 				"pr", apply.PullRequest,
 				"state", apply.State)
-			obs := NewAggregateTerminalCommentObserver(CommentObserverConfig{
-				GHClient:       factory,
-				Storage:        service.Storage(),
-				Repo:           apply.Repository,
-				PR:             apply.PullRequest,
-				InstallationID: apply.InstallationID,
-				ApplyID:        apply.ID,
-				SupportChannel: h.supportChannel(),
-				Tenant:         h.deploymentTenant(),
-				Logger:         logger,
-				OnTerminalHook: func(a *storage.Apply) {
-					h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
-				},
-			})
+			cfg := h.commentObserverConfig(factory, apply.Repository, apply.PullRequest, apply.InstallationID)
+			cfg.ApplyID = apply.ID
+			cfg.OnTerminalHook = func(a *storage.Apply) {
+				h.refreshChecksForTerminalApply(context.Background(), a, "aggregate terminal apply")
+			}
+			obs := NewAggregateTerminalCommentObserver(cfg)
 			obs.OnTerminal(apply, tasks)
 			return nil
 		}
@@ -424,7 +440,154 @@ func (h *Handler) refreshChecksForTerminalApply(ctx context.Context, a *storage.
 			checkFields()...)
 		return
 	}
-	h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
+	// The stored row names the commit the apply started on, and the terminal
+	// write above re-pins it there. Both decisions left — which commit carries
+	// the outcome, and whether a re-plan is owed — turn on where the PR is now,
+	// so read the head uncached rather than trusting the row.
+	prInfo, err := ghInstClient.FetchPullRequestNoCache(ctx, a.Repository, a.PullRequest)
+	if err != nil {
+		// The outcome still has to land somewhere, and the apply's own commit is
+		// the only one left in hand. The fold makes its own read and publishes
+		// there only while that commit is still the head; if it has moved, the
+		// fold skips and this outcome is not recorded on any commit the PR is
+		// gated on. Name the target so an operator can tell the two apart.
+		h.logger.Warn("terminal apply's aggregate refresh targets the apply's commit and no re-plan is considered: could not read the PR head",
+			append(checkFields(), "check_head_sha", checkRecord.HeadSHA, "error", err)...)
+		h.updateAggregateCheck(ctx, ghInstClient, a.Repository, a.PullRequest, checkRecord.HeadSHA)
+		return
+	}
+
+	h.updateAggregateCheck(publishHeadCtx(ctx, a, prInfo), ghInstClient, a.Repository, a.PullRequest, aggregatePublishSHA(checkRecord, prInfo))
+	h.replanAfterTerminalApply(a, checkRecord, prInfo)
+}
+
+// publishHeadCtx scopes the aggregate publish to the head the caller already
+// read, so the fold's own currency check is answered by that read instead of a
+// second one.
+//
+// Two independent reads of a mutable head can disagree, and the fold treats a
+// disagreement as a stale write: it skips the publish and arms a re-fold. That
+// re-fold only runs on an aggregate leader, so on every other repo a terminal
+// outcome caught in the gap is not published anywhere — it is dropped, with a
+// debug line as the only trace. One read closes the gap and costs one round
+// trip instead of two.
+//
+// A head GitHub did not report seeds nothing: an empty head cannot answer the
+// currency check, so the fold reads for itself as it otherwise would.
+func publishHeadCtx(ctx context.Context, a *storage.Apply, prInfo *github.PullRequestInfo) context.Context {
+	if prInfo.HeadSHA == "" {
+		return ctx
+	}
+	return github.WithPRInfo(ctx, a.Repository, a.PullRequest, prInfo)
+}
+
+// aggregatePublishSHA picks the commit a terminal apply's aggregate is
+// published on.
+//
+// The stored row names the commit the apply started on. Publishing there once
+// the PR head has moved puts the outcome on a Check Run GitHub no longer
+// displays or gates, leaving the run an operator is actually looking at showing
+// whatever it last said. It matters most for an apply that ends owing a
+// reconciliation: no re-plan follows that one by design, so the publish is the
+// only chance to state the block on the commit the PR is gated on.
+//
+// The stored commit stays the fallback for a head GitHub did not report,
+// because an empty SHA is one the fold rejects outright rather than compares.
+// It buys a publish only while the stored commit is still the head; past that
+// the fold skips, so the fallback avoids an error rather than guaranteeing an
+// outcome.
+func aggregatePublishSHA(check *storage.Check, prInfo *github.PullRequestInfo) string {
+	if prInfo.HeadSHA == "" {
+		return check.HeadSHA
+	}
+	return prInfo.HeadSHA
+}
+
+// replanAfterTerminalApply re-plans a PR whose head moved while an apply held
+// its check.
+//
+// A plan that ran during the apply was refused by the guard preserving
+// in-progress apply-owned state, so the stored row is still recorded against
+// the apply's commit. The aggregate holds a row recorded for another commit as
+// blocking until results land for the current head, and nothing else produces
+// them: a terminal apply writes the row it owned, not a plan for the newer
+// commit. The apply settling is the first moment a plan for the current head
+// can be stored, which is why the re-plan belongs here — without it the PR
+// stays gated on a check no path will refresh.
+//
+// A terminal outcome that leaves the target owing an operator a reconciliation
+// is deliberately left alone: a clean plan must not replace that block.
+//
+// prInfo is the caller's uncached read of the PR, shared with the commit the
+// aggregate was just published on so both decisions see one head.
+func (h *Handler) replanAfterTerminalApply(a *storage.Apply, check *storage.Check, prInfo *github.PullRequestInfo) {
+	logFields := []any{
+		"apply_id", a.ApplyIdentifier,
+		"repo", a.Repository,
+		"pr", a.PullRequest,
+		"database", a.Database,
+		"database_type", a.DatabaseType,
+		"environment", a.Environment,
+		"check_head_sha", check.HeadSHA,
+		"head_sha", prInfo.HeadSHA,
+		"check_apply_id", check.ApplyID,
+		"check_conclusion", check.Conclusion,
+		"pr_state", prInfo.State,
+	}
+	if !replanOwedAfterTerminalApply(check, prInfo) {
+		h.logger.Debug("no re-plan after terminal apply: the stored check owes a reconciliation, already covers the PR head, or the PR is closed",
+			logFields...)
+		return
+	}
+
+	tenant := ""
+	if config := h.service.Config(); config != nil {
+		tenant = config.Tenant
+	}
+	h.logger.Info("re-planning after a terminal apply: the PR head moved while the apply held its check, so no plan result covers the current commit",
+		logFields...)
+	h.goSafe(a.Repository, a.PullRequest, a.InstallationID, "", func() {
+		// System-triggered: no actor to authorize, and no new comment while the
+		// visible plan comment still matches the outcome — the operator asked
+		// for an apply, not for a plan. The stored check state it writes is the
+		// whole point. It re-plans the one database the settled apply held the
+		// check for.
+		h.handleMultiEnvPlan(a.Repository, a.PullRequest, a.Database, tenant, a.InstallationID, "", true, 1, false, 0, nil)
+	})
+}
+
+// replanOwedAfterTerminalApply reports whether a settled apply leaves the PR
+// with no plan result for the commit it is gated on.
+//
+// A row already on the PR head needs nothing. A closed PR has no gate left to
+// converge.
+func replanOwedAfterTerminalApply(check *storage.Check, prInfo *github.PullRequestInfo) bool {
+	return checkOpenToPlanForNewerCommit(check) &&
+		!prInfo.IsClosed() &&
+		prInfo.HeadSHA != "" &&
+		prInfo.HeadSHA != check.HeadSHA
+}
+
+// checkOpenToPlanForNewerCommit reports whether a plan computed for a newer
+// commit may replace this stored row.
+//
+// A row the terminal write left unowned is open to one: no apply is holding it
+// and no block was retained on it. A row still carrying its apply is open only
+// where that apply succeeded, because success is the one terminal outcome that
+// leaves the target holding exactly what the apply set out to put there — a
+// plan against it measures the newer commit and nothing else.
+//
+// Every other retained row is a block an operator owes a target: a cancelled
+// apply whose completed task history keeps the row claimed, a failed apply, an
+// apply whose commit removed the schema it had already applied. A plan run
+// against those targets could come back clean while the divergence it is
+// blocking on is still there, so the block outlives the head it was recorded
+// for and is cleared by reconciliation rather than by a newer commit.
+func checkOpenToPlanForNewerCommit(check *storage.Check) bool {
+	if check.ApplyID == 0 {
+		return true
+	}
+	return check.Status == checkStatusCompleted && check.Conclusion == checkConclusionSuccess
 }
 
 // errGitHubAppResolution marks factoryForRepo failures. GitHub App resolution
@@ -483,6 +646,29 @@ func (h *Handler) deploymentTenant() string {
 		return ""
 	}
 	return cfg.Tenant
+}
+
+// commentObserverConfig returns the configuration every comment observer the
+// handler builds starts from: the PR it comments on, and the deployment-wide
+// settings its comments render with (cli_name, tenant, support channel, the
+// engine-log reader, the shared sharded plan cache). Building every observer
+// from here keeps a setting added to one observer from going missing on
+// another. Callers set the per-apply fields: the apply ID, its lease, cutover
+// deferral, and the terminal hook.
+func (h *Handler) commentObserverConfig(factory github.GitHubClientFactory, repo string, pr int, installationID int64) CommentObserverConfig {
+	return CommentObserverConfig{
+		GHClient:       factory,
+		Storage:        h.service.Storage(),
+		Repo:           repo,
+		PR:             pr,
+		InstallationID: installationID,
+		SupportChannel: h.supportChannel(),
+		CLIName:        h.cliName(),
+		Tenant:         h.deploymentTenant(),
+		EngineLogs:     h.engineLogReader(),
+		shardedPlans:   h.shardedPlans,
+		Logger:         h.logger,
+	}
 }
 
 // clientForRepo returns an installation-scoped GitHub client for the App
@@ -552,10 +738,19 @@ func (h *Handler) ReconcileMissingSummaryComments(ctx context.Context) {
 				"apply_id", apply.ApplyIdentifier, "error", err)
 			ops = nil
 		}
+		// Everything read from storage is resolved once, before the body is
+		// rendered: summaryWithFailureLogs can render it twice, and a
+		// best-effort read that failed on the second pass would silently drop
+		// a section from the body actually posted.
 		released := releasedForApply(ctx, h.service.Storage(), apply, ops, h.logger)
-		summaryBase := formatApplySummaryComment(apply, ops, released, tasks, resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops), nil, resolveShardedVSchemaDiffs(ctx, h.service.Storage(), apply, ops), h.deploymentTenant())
-		summaryBase += controlRejectionSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
-		summaryBody := summaryBase + failureLogsSection(ctx, h.service.Storage(), h.logger, apply, summaryBase)
+		display := resolveDisplayByOperation(ctx, h.service.Storage(), apply, ops, nil)
+		view := h.shardedPlans.resolve(ctx, h.service.Storage(), apply, ops)
+		rejections := loadControlRejections(ctx, h.service.Storage(), h.logger, apply)
+		renderBody := func(apply *storage.Apply) string {
+			body := formatApplySummaryComment(apply, ops, released, tasks, display, nil, view, h.deploymentTenant(), h.cliName())
+			return body + renderControlRejections(rejections, h.logger, apply, body)
+		}
+		summaryBody := summaryWithFailureLogs(ctx, h.service.Storage(), h.engineLogReader(), h.logger, apply, renderBody)
 		h.postClaimedSummaryComment(ctx, apply, summaryBody)
 	}
 }
@@ -603,7 +798,7 @@ func (h *Handler) postClaimedSummaryComment(ctx context.Context, apply *storage.
 		return
 	}
 
-	commentID, _, err := client.CreateIssueComment(ctx, apply.Repository, apply.PullRequest, h.renderPRComment(body))
+	commentID, _, err := client.CreateIssueComment(ctx, apply.Repository, apply.PullRequest, h.renderPRComment(apply.Repository, apply.PullRequest, apply.Environment, body))
 	if err != nil {
 		h.logger.Error("failed to post reconciled summary comment; releasing summary claim",
 			append(apply.LogAttrs(), "error", err)...)
@@ -969,7 +1164,7 @@ func webhookMetadata(body []byte) (action, repo string) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return "", ""
 	}
-	return payload.Action, payload.Repository.FullName
+	return payload.Action, storage.CanonicalKey(payload.Repository.FullName)
 }
 
 // verifyHMAC validates a GitHub-style "sha256=<hex>" signature against the

@@ -1,0 +1,1097 @@
+# Use the CLI
+
+Inspect your databases, review the SQL a change needs, and follow it to
+completion from your terminal. Start with one database; use the same commands
+to see what is changing across your fleet.
+
+| What would you like to do? | Start here |
+|---|---|
+| Try SchemaBot for the first time | [Initialize your database](#initialize-your-database) or [try the demo](../README.md#quick-start) |
+| See what is in a database | [Read the live schema](#read-the-live-schema) |
+| Make a schema change | [Plan and apply a change](#plan-and-apply-a-change) |
+| Check an ongoing change | [Follow progress and control the apply](#follow-and-control-a-change) |
+| Manage a PlanetScale deploy request | [Deploy, follow shards, and control cutover](#manage-planetscale-deploy-requests) |
+| Understand a merge check that will not clear | [Explain a blocked check](#explain-a-blocked-check) |
+| Build an integration | [Use structured output](#use-the-cli-from-scripts-and-agents) |
+| Converge SchemaBot's own storage schema | [Storage schema guide](storage-schema.md) |
+
+The examples use a MySQL database named `shop` in `staging`.
+Substitute a database and environment from your server's inventory. The local
+quick start uses `testapp`; it does not create the `shop` database shown here.
+
+## Initialize your database
+
+`init` connects to your database, imports its schema, and stores a plan proving
+that the files match. It does not apply changes to the application database.
+Paste a connection string or enter connection details directly in the wizard. Existing
+`DATABASE_URL` and `SCHEMABOT_STORAGE_DSN` variables are detected when available.
+Choose Integrated to create a separate `schemabot` database on the same server, or
+connect an existing state database with Standalone. A standalone
+connection must name an existing database dedicated to SchemaBot’s own data. In a terminal,
+the wizard asks for everything else:
+
+```console
+$ schemabot init
+```
+
+[Initialize a database](init.md) walks through each step. Scripts and agents
+pass the same decisions as flags:
+
+```console
+$ schemabot init -d shop -e staging --type mysql --dsn env:APP_DSN --storage-dsn env:STATE_DSN --namespace shop --schema-dir schema --json
+{"database":"shop","environment":"staging","profile":"default","schema_dir":"/home/dev/shop/schema","plan_id":"plan-example-01","tables":4,"verified":true}
+```
+
+Keep the connection variable names stable on retries. Correct their values for
+credential or address mistakes. To use a different state database, choose a new
+`--runtime` and `--profile`; an existing runtime's durable state is never replaced.
+Use a local filesystem that supports exclusive directory rename for `--schema-dir`.
+
+## Manage a local runtime
+
+`local status` and `local stop` use the selected profile’s local runtime. Profile selection
+follows `--profile`, `SCHEMABOT_PROFILE`, then the configured default. Without any configured
+profile, they use the runtime named `local`.
+
+For a stopped default runtime:
+
+```console
+$ schemabot local status
+{"id":"local","generation":"","binary":"","config":"","version":"","pid":0,"state":"stopped"}
+$ schemabot local stop
+{"state":"stopped"}
+```
+
+An explicit runtime name overrides the profile, including a remote profile:
+
+```console
+$ schemabot local stop my-project
+{"state":"stopped"}
+```
+
+A selected remote, missing, or mixed local/remote profile requires an explicit runtime name
+or an unambiguous local profile.
+Neither command starts a runtime. Stopping retains its configuration and durable state.
+
+## Connect to a server
+
+Install a [released CLI binary](../README.md#releases). If you have not set
+up a server yet, the [local quick start](../README.md#quick-start) starts one
+with demo databases. For your own installation, follow the
+[server and access guide](auth.md#where-schemabot-runs).
+
+A **profile** saves a server URL and its login settings. A profile is not a
+database environment: one server can manage staging and production, and
+`-e staging` selects the environment for a command.
+
+### Save your endpoint
+
+Create `~/.schemabot/config.yaml` and its parent directory if needed:
+
+```yaml
+default_profile: demo
+profiles:
+  demo:
+    endpoint: http://localhost:13370
+```
+
+Use the quick start's URL above for local testing, or your own server's HTTPS
+URL. The endpoint is SchemaBot's address, not a database connection string.
+Database credentials belong in the server's configuration; the CLI does not
+need them to call the API.
+
+Check the saved settings:
+
+```console
+$ schemabot configure show
+SchemaBot Configuration
+
+  Config file: /home/alex/.schemabot/config.yaml
+
+  Active profile: demo (from config default_profile)
+  Endpoint: http://localhost:13370 (from profile)
+
+  Profiles:
+    * demo: http://localhost:13370
+```
+
+The config path depends on your machine. You can also use the interactive
+`configure` prompt; it saves the same file. When a profile contains a token,
+keep the file private to your user (mode `0600`).
+
+### Check the connection
+
+If you followed the local quick start, no login is needed. For an authenticated
+server, complete [sign-in](#authenticate-when-the-server-requires-it) first.
+
+Check that the CLI can reach your server:
+
+```console
+$ schemabot databases
+DATABASE  TYPE   ENVIRONMENTS  DEPLOYMENTS
+shop      mysql  staging       -
+```
+
+A successful response confirms the connection and lists the database names
+and environments available on this server. An empty list means the connection
+works, but no databases are visible to this caller. Use the listed names in
+the commands below.
+
+| If you see… | What to check |
+|---|---|
+| Connection refused or a timeout | The server is running, the endpoint and port are correct, and your terminal can reach it |
+| A certificate error | The endpoint uses the server's HTTPS hostname and your machine trusts its certificate |
+| `401 Unauthorized` | Your token or login has expired, or the server expects a different sign-in method |
+| `403 Forbidden` | The caller needs permission for this operation; check the [server's access rules](auth.md#what-read-and-write-access-include) |
+
+### Authenticate when the server requires it
+
+Use the setup that matches your server. Local quick-start users can continue
+to [Explore your databases](#explore-your-databases).
+
+<details>
+<summary>Sign in with an identity provider (OIDC, alpha)</summary>
+
+First [register your provider and configure the server](auth.md#connect-your-identity-provider).
+Then add the provider settings to your CLI profile:
+
+```yaml
+default_profile: demo
+profiles:
+  demo:
+    endpoint: https://schemabot.example.com
+    oidc:
+      issuer: https://issuer.example.com
+      client_id: schemabot-cli
+```
+
+Then sign in:
+
+```console
+$ schemabot login --profile demo
+Open this URL in your browser to log in:
+
+  https://issuer.example.com/authorize?...
+
+Logged in as alex@example.com. Token cached for profile "demo".
+```
+
+The authorization URL above is abbreviated; use the full URL the CLI prints.
+Login opens your browser and returns to `http://127.0.0.1:8765/callback` on
+the machine running the CLI. `--no-browser` prints the URL without opening
+it; it does not move the callback to another machine. The CLI caches an ID
+token and, when the provider issues one, a refresh token. See the
+[authentication guide](auth.md#connect-your-identity-provider) for scopes,
+groups, and refresh requirements.
+
+</details>
+
+For **an authenticating proxy**, use the proxy's supported terminal login
+method. A browser session does not automatically authenticate the CLI, and
+`schemabot login` handles OIDC, not arbitrary proxy logins. If the proxy
+accepts bearer tokens, it may work with `SCHEMABOT_TOKEN`. See
+[proxy access](auth.md#use-your-existing-proxy) before configuring it.
+
+For **local access or a tunnel**, network access and API authentication are
+separate. A tunnel does not bypass an enabled authentication check. With auth
+disabled, anyone who can reach the API can run commands; keep the endpoint
+restricted to the intended callers.
+
+### Choose a profile for a command
+
+Settings resolve independently, using the first available value:
+
+| Setting | Precedence |
+|---|---|
+| Profile | `--profile` → `SCHEMABOT_PROFILE` → `default_profile` → `default` |
+| Endpoint | `--endpoint` → `SCHEMABOT_ENDPOINT` → the profile's `endpoint` |
+| Token | `--token` → `SCHEMABOT_TOKEN` → the profile's cached token |
+
+A cached token is bound to its profile's endpoint. Changing the endpoint
+through `configure` clears the cached login; sign in again for the new server.
+When supplying a token explicitly, use the endpoint it was issued for.
+
+## Explore your databases
+
+These commands read schemas and change history without applying database
+changes. For a shared server, read access is enough to start exploring.
+
+### Read the live schema
+
+```sh
+schemabot pull -d shop -e staging
+```
+
+SQL excerpt, formatted for readability:
+
+```sql
+-- Namespace `shop` — 1 table
+
+CREATE TABLE `orders` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `status` varchar(32) NOT NULL DEFAULT 'new',
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+```
+
+`pull` prints SQL by default. It reads the environment's primary deployment;
+it is not a comparison of every replica or shard. An environment that lists
+`targets` is the exception: its members each hold their own schema, so a pull
+reads every one of them and reports how they differ. Use the
+[schema intelligence guide](schema-intelligence.md#whats-in-this-database)
+for namespace and table filters, structured columns and indexes, and lint
+findings, each with output examples.
+
+### Find recent changes and plans
+
+![Explore databases, inspect live schemas and lint findings, list recent changes, and follow logs](../assets/cli-ops.gif)
+
+```console
+$ schemabot status -e staging
+1 active schema change
+4 total: 2 Completed · 1 Failed · 1 Running
+
+  APPLY ID          DATABASE  ENV      STATE      STARTED         SOURCE
+  apply-example-73  shop      staging  Running    10 minutes ago  https://github.com/acme/store/pull/42
+  apply-example-72  billing   staging  Completed  1 hour ago      https://github.com/acme/billing/pull/18
+  apply-example-71  catalog   staging  Failed     2 hours ago     https://github.com/acme/store/pull/40
+  apply-example-70  accounts  staging  Completed  3 hours ago     https://github.com/acme/accounts/pull/12
+
+Use 'schemabot status <apply_id>' to view details
+```
+
+Inspect one apply with `status <apply_id>` for a single snapshot, or use
+`progress <apply_id>` to keep watching. The [progress example](#follow-and-control-a-change) shows the live view.
+Stored plans have their own inventory:
+
+```console
+$ schemabot list-plans -e staging
+Recent plans
+
+  PLAN ID          DATABASE  ENV      CHANGES   CREATED         SOURCE
+  plan-example-42  shop      staging  1 alter   10 minutes ago  acme/store#42
+  plan-example-41  billing   staging  1 create  1 hour ago      acme/billing#18
+  plan-example-40  catalog   staging  1 alter   2 hours ago     acme/store#40
+```
+
+Read [a stored plan](schema-intelligence.md#inspect-a-stored-plan) to see
+its DDL, or [change history](schema-intelligence.md#what-changed-in-this-database)
+to follow what actually ran. A plan and an apply have separate identifiers.
+
+## Plan and apply a change
+
+This walkthrough adds an index to an existing `orders` table. You edit the
+schema you want; SchemaBot works out the `ALTER TABLE` statement. Planning
+and applying require write access to the chosen database and environment.
+
+### Start from the live schema
+
+If your repository already has schema files, use that directory. Otherwise,
+run `onboard` from your repository root to create a new `schema` directory:
+
+```console
+$ schemabot onboard -d shop -e staging -s ./schema
+Pulled 1 tables from shop/staging.
+Wrote declarative schema files:
+  schema/schemabot.yaml
+  schema/shop/orders.sql
+
+Verifying pulled schema against the source environment...
+Verified: pulled schema produces no schema changes in the source environment.
+
+Onboarding complete for shop from staging.
+Next: open a normal PR with these files. SchemaBot will reconcile other configured environments.
+```
+
+`onboard` writes local files and verifies them with a plan; it does not apply
+DDL. It refuses to overwrite existing files by default. Keep the complete
+schema for the namespaces you manage: omitting an existing table can propose
+a drop. See [namespace scope](namespaces.md) for shared databases.
+
+The command's PR hint is for GitHub automation. You can also use the generated
+files directly with the CLI, as shown below.
+
+#### Recovering from onboarding formatting errors
+
+Onboarding reports every table-formatting failure together and writes no files
+if any table fails. Existing files stay untouched. `--force` only permits
+overwrites; it does not bypass formatting checks. Editing a local file and
+rerunning `onboard` does not fix the refusal, because the command pulls the live
+schema again.
+
+To build the schema root manually, retrieve the original definitions with
+`pull -o json`, using the same database, environment, profile or endpoint,
+type override, and concrete namespace selection as the failed onboarding.
+Omit `--table`: recovery needs the complete managed schema, including namespace
+artifacts. For example, a one-table MySQL database returns:
+
+```console
+$ schemabot pull -d shop -e staging -o json
+{
+  "database": "shop",
+  "type": "mysql",
+  "environment": "staging",
+  "namespaces": {
+    "shop": {
+      "tables": {
+        "orders": "CREATE TABLE orders (id bigint NOT NULL) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */"
+      }
+    }
+  },
+  "table_count": 1
+}
+```
+
+Create `schema/schemabot.yaml` with the returned `database` and `type`:
+
+```yaml
+database: shop
+type: mysql
+```
+
+Preserve any existing `ignore_namespaces` and `ignore_tables` settings. For
+each managed table, copy its decoded SQL string to
+`schema/<namespace>/<table>.sql`, adding line breaks outside quoted content
+without changing options, comments, or statements. The example becomes
+`schema/shop/orders.sql`:
+
+```sql
+CREATE TABLE orders (
+    id bigint NOT NULL
+) /*!50100 PARTITION BY HASH (id) PARTITIONS 4 */;
+```
+
+Copy namespace artifacts such as `vschema.json` into the same namespace
+directory. Include every managed table, not just the tables named in the
+error; omit tables explicitly withheld by the preserved exclusions. If you
+used `--template-env-suffix`, apply the same namespace-directory mapping
+described in [namespace scope](namespaces.md).
+
+For a managed namespace with no tables or artifacts, keep its scope explicit
+with a `schema.sql` file containing exactly:
+
+```sql
+-- This namespace is empty. Add CREATE TABLE declarations here.
+```
+
+Run `schemabot plan -s ./schema -e staging` with the same connection settings.
+Before committing, require `✓ No schema changes detected.` as shown in the
+[plan walkthrough](#plan-and-apply-a-change). Resolve every error or proposed
+change against the original pull; do not apply changes to make the live
+database match an incorrectly copied baseline. If the original SQL itself
+cannot pass the dialect parser, report that parser limitation instead of
+removing the unsupported schema definition.
+
+### Review an index change
+
+Plan output uses the target database dialect, including PostgreSQL identifier
+quoting. Statements for other dialects are kept separate instead of being
+combined with MySQL syntax.
+
+For this example, `schema/schemabot.yaml` contains:
+
+```yaml
+database: shop
+type: mysql
+```
+
+For the one-table example, edit `schema/shop/orders.sql` to include the new
+`idx_status` index. Keep the rest of the table definition as pulled:
+
+```sql
+CREATE TABLE `orders` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `status` varchar(32) NOT NULL DEFAULT 'new',
+  PRIMARY KEY (`id`),
+  KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+```
+
+Ask SchemaBot to compare those files with staging:
+
+```console
+$ schemabot plan -s ./schema -e staging
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Plan                   │
+│                                             │
+│  Database: shop                             │
+│  Schema name: schema                        │
+╰─────────────────────────────────────────────╯
+
+Staging
+     ~ orders
+       ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
+
+📋 Plan: 1 table to alter
+```
+
+Planning does not apply DDL, but it stores a proposed change and requires
+write access. Leaving out `-e` plans for all environments registered for the
+database. Specify it when you want to review one target.
+
+![CLI plan and progress through a completed schema change](../assets/cli-plan-apply.gif)
+
+### Apply and verify
+
+Apply the schema directory when you are ready. The CLI generates a fresh
+plan, shows it, asks for confirmation, acquires the database lock, and watches
+the accepted apply. Example prompt excerpt:
+
+```console
+$ schemabot apply -s ./schema -e staging
+...
+Do you want to apply these changes? Only 'yes' will be accepted: yes
+```
+
+The animation shows the progress after confirmation. `-y` skips the prompt;
+it does not grant permissions or bypass safety checks.
+
+After the apply completes, plan again against the same environment:
+
+```console
+$ schemabot plan -s ./schema -e staging
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Plan                   │
+│                                             │
+│  Database: shop                             │
+│  Schema name: schema                        │
+╰─────────────────────────────────────────────╯
+
+Staging
+✓ No schema changes detected.
+```
+
+This confirms that the live schema matches your files. Commit the files so
+your repository records the schema you now run. If your team uses GitHub
+merge gates, follow the [PR workflow](pre-merge-workflow.md) instead.
+
+### Apply to one target of a rollout
+
+An environment can fan out to several targets, from a `targets:` list or a
+`deployments:` map. `plan` and `apply` cover the whole rollout by default.
+Pass `--target` to plan and apply one member only, for example to land a
+change on one target before the rest:
+
+```console
+$ schemabot apply -s ./schema -e production --target payments-002
+...
+Target: prod/payments-002 (this plan covers only this rollout member)
+
+Do you want to apply these changes? Only 'yes' will be accepted: yes
+```
+
+`--target` takes the target's name, or `deployment/target` when two
+deployments address a target of the same name; an ambiguous bare name is
+refused. An unknown name is refused with the list of valid targets. `plan`
+takes the same flag and needs `-e` with it.
+
+A narrowed plan speaks for its one target. It shows only that target's
+changes, never the whole rollout's split of what applies where, and it is
+never gated on another target that needs attention. It never records a GitHub
+check result, so a narrowed plan or apply cannot pass a PR merge gate while
+other targets still need the change. On a pull request, `schemabot plan -e
+<env> --target <target>` and `schemabot apply -e <env> --target <target>`
+narrow the same way. A narrowed plan comment leaves the schema check as it
+was; a narrowed apply blocks it with `narrowed_apply` from the moment it is
+dispatched, and an apply or plan of the whole environment lifts that block
+once every target has the change. `apply-confirm` takes no `--target`: it confirms the
+target its apply named. The server records the narrowing on the
+stored plan and refuses to apply it anywhere but the target it was made for,
+and a narrowed apply cannot be rolled back with `rollback`: restore that
+target by planning and applying the previous schema with the same `--target`.
+In an environment with a single target, `--target` names the whole rollout,
+so the plan and apply are not narrowed.
+
+A plan of the whole rollout plans every target beside the first one and shows
+what applies where. It reports no changes only when every target is at the
+desired schema, so a re-run of an `apply` that already landed, or the
+verification step of `onboard`, reads as up to date. When the first target is
+already at the desired schema, for example after an apply narrowed to it,
+another target can still need the change, and the plan says so rather than
+reading as up to date from the first target alone. A target planned against
+its own schema shows that work under its own heading. A deployment expected to
+mirror the first target is listed as needing attention instead, with the
+`--target` that applies it on its own, since its plan differs from the one it
+mirrors. A target that cannot be planned is listed as needing attention too.
+`apply` of the whole rollout refuses while any target needs attention, and
+`onboard` fails its verification.
+
+A plan or apply of a whole rollout of more than one target needs a CLI that
+renders every target's plan. The server refuses one from an older CLI, which
+would show only the first target's plan, with `upgrade the schemabot CLI to
+plan or apply a multi-target environment`; `--target` still works from it.
+Upgrade the server before the CLI, as [releases](release.md) describes: an
+older server refuses a request from a newer CLI as an unknown field.
+
+A targeted apply checks for a schema change already in progress on its
+target's deployment, which every target of a `targets:` list shares, and
+refuses to start while one is queued or running there.
+
+A rollback of a rollout-wide apply is made against the first target the apply
+ran from. If the rollout order changed since, the rollback is refused rather
+than reverting that one target alone: restore the order the apply ran under,
+then retry it. A rollout of a `targets:` list plans each target against its own
+schema, and a rollback is one plan, so its rollback is refused before anything
+is planned: restore each target by planning and applying the previous schema
+with `--target`. The refusal follows how the apply ran, as recorded with its
+plan, not how the environment is configured now, so respelling the targets as
+mirrored deployments, or removing all but the first, does not let the rollback
+through. An apply that ran one plan on every target is refused only if its
+targets are now each planned against their own schema.
+
+### Understand a refusal
+
+Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
+Review the exact DDL and its consequences before providing it. Some changes
+are unsupported or blocked by the engine; the flag does not make them valid.
+`apply` and `rollback` refuse a blocked plan before they check or take a lock
+or ask for confirmation, for a single target, the whole rollout, or `--target`
+alike. The refusal follows the plan and names the plan, the first blocked
+table, and the engine's reason, one line per cause. Fix what the reason names:
+the statement, a grant on the target, or the server's policy. `--yield` has no
+lock to release on this refusal.
+
+An apply of the whole rollout runs each target's own plan, but holds every
+target to what the first target's plan discloses, since that is the plan you
+review and consent against. So the server refuses, whatever the flags,
+`--allow-unsafe` included, a target whose own plan carries an unsafe change
+the first target's plan does not, a change the engine runs as direct-execution
+DDL there, or work the apply, laid out from the first target's plan, has no
+operation to run. It returns those targets with the plan, and `apply` refuses
+before it takes a lock or prompts. For each target it prints the
+`apply --target <target>` that applies that target's own plan, with
+`--allow-unsafe` when that plan is unsafe; once those have landed, apply the
+rollout again for the rest. A target whose plan no apply runs, because its
+engine refuses a change or its own plan's work has no operation to run from,
+gets no such command: change the schema files instead. These refused targets
+are listed only once no target needs attention, since a target needing
+attention refuses the apply first. So after you fix a target that needed
+attention and plan again, the plan can still list a target the apply refuses.
+
+A database lock can also block a new apply. Inspect the owner and ongoing
+work before releasing it. Locks span the database's environments; forcing
+one away from its owner is an administrative action, not a routine retry.
+See [locks](schema-intelligence.md#check-locks) for the inspection request and
+response, and [access rules](auth.md#what-read-and-write-access-include) for
+who may act.
+
+For changes that need PR approval and merge checks, use the
+[PR workflow](pre-merge-workflow.md). Direct CLI access is a separate path;
+it does not create a PR review trail.
+
+## Follow and control a change
+
+An apply can outlive your terminal. Keep its apply ID to inspect it or
+reattach to progress. A single status snapshot and a live watch read the
+same underlying change.
+
+```console
+$ schemabot progress apply-example-73
+⣾ Running...
+
+  ── shop ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 60.00% (throttled)
+       ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
+       • Rows: 6,000,000 / 10,000,000 · ETA: 8m 0s
+       • ℹ️ Throttled: commit-latency 120ms >= 100ms · backing off while database writes commit slowly
+
+  📖 Docs: https://github.com/block/schemabot/blob/main/docs/throttle.md
+
+
+
+ESC detach • s stop
+```
+
+The live view refreshes until completion or a state that needs your decision.
+It includes rows copied, ETA when available, and the reason for throttling.
+Press **Esc** to detach while copying; the apply keeps running. **s** requests
+a stop for this MySQL example. At deferred cutover, **Enter** requests the
+swap. During cutover, the watcher asks you to wait and disables Esc/stop.
+
+### Understand throttling
+
+When copying is throttled, the live view explains why. This MySQL example
+pauses when commits are slow, then continues as conditions improve. Recognized
+signals include a short explanation beside each affected table. One shared
+link to the [throttle reference](throttle.md) appears below the tables.
+The link shows the page's path, `docs/throttle.md`, in supported terminals and
+the full URL in plain output, matching how `list-plans` and `status` link a PR.
+
+![MySQL progress shows a commit-latency throttle signal, its docs link, and completion](../assets/cli-throttle.gif)
+
+### Stop and resume a change
+
+For a MySQL online copy, press **s** in the live view to request a stop.
+Once the watcher confirms **Stopped**, run the displayed `start` command
+to resume from the checkpoint and reopen live progress.
+**Esc** only detaches your terminal and leaves the change running.
+
+![Press s, wait for Stopped, then run start and follow the change to completion](../assets/cli-stop.gif)
+
+### Choose when to cut over
+
+For engines that support deferred cutover, start the apply with
+`--defer-cutover` to hold the final swap. Copying can finish while the live
+table continues to accept writes. When the apply is ready, request cutover
+from the watch or with the cutover command. The CLI acknowledges the request
+and then watches progress. Initial output:
+
+```console
+$ schemabot cutover -e staging apply-example-73
+✓ Cutover requested successfully.
+🔄 Cutting over...
+...
+```
+
+Keep watching until the state is `Completed`; acceptance alone does not mean
+the swap has finished.
+
+![CLI progress shows copying, deferred cutover, and completion](../assets/cli-cutover.gif)
+
+### Manage PlanetScale deploy requests
+
+For a Vitess database using PlanetScale, use the CLI to deploy, cut over,
+revert, or close the revert window while following progress across shards.
+This example uses
+`shop` registered as a Vitess database, `type: vitess` in `schema/schemabot.yaml`,
+and table files under `schema/commerce/` for the `commerce` keyspace.
+
+![CLI creates a PlanetScale deploy request, deploys with Enter, follows four shards, and closes the revert window](../assets/cli-vitess.gif)
+
+Use `--defer-deploy` to review the deploy request before starting deployment.
+The animation confirms the apply with `yes`, then uses **Enter** at the deploy
+prompt. During copying, **Esc** detaches and **c** cancels the deploy request
+permanently; PlanetScale cancellation cannot be resumed.
+
+The CLI and PlanetScale console control the same deployment, with PlanetScale
+as the source of truth. You can cut over, revert, or close the revert window
+from either interface. If you act in the console, the CLI watcher follows
+along automatically; there is no need to repeat the action.
+
+You can attach to the same apply later. Each shard reports its own progress,
+rows, and ETA, so you can see which shard is still working:
+
+```console
+$ schemabot progress apply-example-84
+⣾ Running...
+  Deploy Request:  https://app.planetscale.com/acme/shop/deploy-requests/42
+
+  ── commerce ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.50%
+       ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
+       • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
+       • Shards: 4 (3 copying, 1 complete)
+           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
+           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
+           ✓ -40: 1,000,000 rows
+
+
+ESC detach • c cancel
+```
+
+Per-shard rows and ETA require a server-side SQL connection to vtgate, where
+SchemaBot reads migration progress. Without that connection, the CLI reports
+the deploy-request state instead.
+
+After deployment, the watcher shows the open revert window. **Esc** leaves
+that window open; **Enter** closes it when you are ready to finalize. The
+animation takes the latter path. To undo the deployment while its window is
+open, use the [revert operation](engines.md); closing the window gives up
+that option. The deploy-request URL stays visible during the live workflow.
+
+### Respond to a change that needs attention
+
+Pick the operation for the current state and engine:
+
+| Command | When to use it |
+|---|---|
+| `stop` | Request a pause where the engine supports it |
+| `start` | Resume a stopped apply |
+| `cutover` | Request the final swap for a ready, deferred apply |
+| `cancel` | End the apply permanently; it cannot be resumed |
+| `revert` | Undo a completed Vitess/PlanetScale apply while its revert window remains open |
+| `skip-revert` | Close that Vitess/PlanetScale revert window |
+| `release` | Let a rollout continue after a failure paused later deployments |
+| `rollback` | Plan a new change toward the schema stored before an earlier apply |
+
+Support and timing differ by engine; see the [engine capability matrix](engines.md).
+A request being accepted does not mean its effect has landed. Check progress
+until you see the resulting state. For example, a completed apply returns:
+
+```console
+$ schemabot status apply-example-73
+┌──────────────────────────────────┐
+│  Apply ID:     apply-example-73  │
+│  Database:     shop              │
+│  Environment:  staging           │
+│  State:        Completed         │
+└──────────────────────────────────┘
+
+
+  ── shop ──
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
+```
+
+### Review a rollback before running it
+
+The preview and live progress format SQL using the target database dialect,
+preserving quoted names and values. If the server omits the database type or
+returns an unrecognized type, both views preserve the original SQL.
+
+Here is a rollback of the index added earlier. Dropping the index is an unsafe
+change, and rollback needs `--allow-unsafe` for unsafe changes exactly as
+`apply` does. Without the flag it stops before the confirmation prompt, with
+or without `-y`, and nothing changes:
+
+```console
+$ schemabot rollback -e staging apply-example-73
+Rollback Plan
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-73  │
+└───────────────────────────────────┘
+
+The following changes will be applied to rollback:
+
+  orders (alter):
+    ALTER TABLE `orders` DROP INDEX `idx_status`;
+⛔ Apply blocked: 1 unsafe change(s) detected
+  1. orders: Index "idx_status" should be made invisible before dropping to ensure it's not needed
+
+🚨 To proceed with these destructive changes, re-run with --allow-unsafe:
+
+  schemabot rollback apply-example-73 -e staging --allow-unsafe
+```
+
+With `--allow-unsafe`, the unsafe changes are listed again and the confirmation
+still follows. This example declines it, so nothing changes:
+
+```console
+$ schemabot rollback apply-example-73 -e staging --allow-unsafe
+Rollback Plan
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-73  │
+└───────────────────────────────────┘
+
+The following changes will be applied to rollback:
+
+  orders (alter):
+    ALTER TABLE `orders` DROP INDEX `idx_status`;
+
+🚨 Unsafe Changes (--allow-unsafe enabled)
+
+The following unsafe changes will be applied:
+  1. orders: Index "idx_status" should be made invisible before dropping to ensure it's not needed
+
+Do you want to apply this rollback? Only 'yes' will be accepted: no
+Rollback cancelled.
+```
+
+When you are ready, answer `yes`. For a separate example, suppose
+the completed `apply-example-85` removed an index you now need again. This animation restores
+that index, using fictional local API responses:
+
+![CLI rollback previews the index change, accepts confirmation, and completes a new apply](../assets/cli-rollback.gif)
+
+After you confirm, rollback opens the live watcher automatically. Stay in the
+same terminal until it confirms completion.
+
+```console
+$ schemabot rollback -e staging apply-example-85
+Rollback Plan
+┌───────────────────────────────────┐
+│  Database:      shop              │
+│  Environment:   staging           │
+│  Source apply:  apply-example-85  │
+└───────────────────────────────────┘
+
+The following changes will be applied to rollback:
+
+  orders (alter):
+    ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
+
+Do you want to apply this rollback? Only 'yes' will be accepted: yes
+🔒 Lock acquired for shop (mysql)
+
+Applying rollback...
+
+Rollback started: apply-example-86
+Watching progress...
+...progress updates...
+✓ Apply complete! Changes: 1 altered. Apply ID: apply-example-86
+```
+
+The watcher follows the **new** apply ID (`apply-example-86`). Wait for
+`Apply complete!`; reaching 100% of the copy alone does not
+confirm that the apply has finished. In this example, completion means the
+index has been restored.
+
+Rollback uses the stored schema and current database to produce a new plan.
+It is not a data restore, and feasibility depends on the engine, intervening
+changes, and retained history. Review the generated DDL and confirmation
+before running it. Recreating a dropped column cannot recover its old data.
+
+### Read the logs
+
+```console
+$ schemabot logs apply-example-73
+11:47:07 [INF] Apply queued: apply-example-73
+11:47:07 [INF] [orders] Starting spirit migration
+11:47:07 [INF] [orders] acquired advisory lock
+...
+```
+
+The default is the newest 50 entries, printed oldest first. `-n` changes that
+window; `-f` follows new entries. Follow mode is text output and cannot be
+combined with `--json`.
+
+In local mode, omit `--deployment`: the stored log includes engine activity.
+In gRPC mode, add it with a deployment name from the apply's progress to read
+remote engine details such as copying, throttling, or cutover. It requires an
+explicit apply ID. See [deployment log examples](schema-intelligence.md#read-deployment-logs).
+
+### Explain a blocked check
+
+A SchemaBot check that will not clear has two records behind it: the Check Run
+GitHub shows, and the stored check state SchemaBot decides it from. When those
+disagree, the Check Run alone cannot say why. `checks show` prints both, and
+what each stored row is waiting on.
+
+Name the pull request however you already have it. A URL pasted from the
+browser works, with whatever trailing path, query, or fragment the page added,
+and so do `acme/store#412` and a repository with the number beside it:
+
+```bash
+schemabot checks show https://github.com/acme/store/pull/412
+schemabot checks show acme/store#412
+schemabot checks show acme/store 412
+```
+
+```console
+$ schemabot checks show acme/store 412
+acme/store#412 is open at 43da12bb.
+Check Run "SchemaBot (staging)" on 43da12bb: in_progress (started 2026-09-10T05:16:44Z).
+Missing on 43da12bb: SchemaBot (production). `sq schemabot checks backfill acme/store` will not recreate it while "SchemaBot (staging)" (in_progress) has not concluded: the backfill holds a pull request whose head still carries an uncompleted Check Run.
+
+ENVIRONMENT  DATABASE    COMMIT            STATUS       CONCLUSION       DISPOSITION
+staging      _aggregate  43da12bb          in_progress  -                aggregate_rollup
+staging      inventory   43da12bb          completed    action_required  reconciliation_owed
+staging      orders      e22e4cef (older)  completed    success          awaiting_replan_after_apply
+staging      shipments   43da12bb          in_progress  -                apply_stopped
+
+Waiting on SchemaBot:
+  staging/_aggregate: The rollup is holding the merge gate open.
+    do: Read the rows below: the rollup clears when every one of them does.
+  staging/orders: An apply succeeded, but its result is recorded for an earlier commit, so the gate holds it as blocking.
+    apply: apply-example-73 (completed)
+    do: SchemaBot re-plans this database when the apply settles. If it has not, comment `schemabot plan -e <environment>` on the pull request to record a result for the current commit.
+
+Waiting on an operator:
+  staging/inventory: A terminal outcome left this check blocking, and the target may not match the pull request.
+    apply: apply-example-68 (rolled_back)
+    blocking reason: rollback_completed
+    do: Reconcile the target environment. No plan and no new commit clears this on its own.
+  staging/shipments: The apply holding this check is stopped, so the check stays in progress and the gate stays closed.
+    apply: apply-example-81 (stopped)
+    do: Start the apply or cancel it. It does not settle on its own, and no plan replaces a stopped apply's result.
+```
+
+Every Check Run name the deployment publishes is reported, present or
+missing. Branch protection requires each name on its own, so a present
+staging run never stands in for an absent production one. A name GitHub could
+not be read for is reported as neither, since absence has to be observed
+before a backfill is the answer, and an unanswered read never renders as a
+clear gate.
+
+The backfill is only recommended where it will act. It holds a pull request
+whose head still carries an uncompleted Check Run, so while one is in
+progress the line says so rather than naming a command that recreates
+nothing. On a repository the deployment publishes no Check Runs for, nothing
+is reported as missing at all: there the absence is the configuration, and a
+run another app has under an expected name is simply that app's, with no
+SchemaBot run for it to contest.
+
+A name another app is also answering under is reported on its own line,
+whether or not SchemaBot's own run is there. Branch protection reads whichever
+run it picked and no backfill touches the other app's, so that conflict is
+resolved on GitHub — remove or rename the other run, or add its app to the
+trusted apps — and until it is, nothing here claims the gate is clear. Which
+of the two the line names decides what the backfill is worth: where SchemaBot's
+own run is absent it recreates that run and the conflict outlives it, and where
+the run is already there the backfill finds nothing missing and does nothing,
+so the line says so rather than sending an operator to it.
+
+These states coexist, and the closing summary names all of them rather than
+stopping at the first. One expected name can be absent while a second sits on
+the head unconcluded or failed: the backfill recreates the first and will not
+touch the second, so a summary that named only the absence would send an
+operator to a remedy and leave the reason the gate stays shut unaccounted for.
+
+A row marked `(older)` was recorded for a commit the pull request has moved
+past. The aggregate holds those as blocking whatever they concluded, which is
+why a successful apply can leave the gate open.
+
+The two headings are the distinction that decides what to do. Rows under
+"Waiting on SchemaBot" clear on their own, or with a `schemabot plan` comment
+on the pull request. Rows under "Waiting on an operator" do not: no plan and
+no new commit clears them. A stopped apply is in that second group even though
+its check reads in progress, because it settles only when someone starts or
+cancels it.
+
+The reading is deliberately pessimistic. A row whose apply cannot be read from
+storage, and a durable blocking reason this version does not recognize, both
+come back as blocking and waiting on a person: reporting either as
+self-converging would tell an operator to wait out something that may never
+resolve.
+
+`-e` narrows the output to one environment, and is refused on a deployment
+that publishes a single check for every environment, since there is nothing
+to narrow to there. A narrowed run that finds nothing blocking says so in
+those terms ("Nothing in production is holding the merge gate open. Other
+environments were not read."), because a clean answer for one environment is
+not a clean answer for the pull request. `--json` gives each row a stable
+`reason` code to branch on. The inspection only reads, so any token that can
+already see a pull request's status can run it; recreating a Check Run with
+`checks backfill` is the admin operation. Every inspection reads GitHub
+through the App installation, so each caller has a
+[request budget](configuration.md#check-inspection); a loop that exceeds it is
+refused with a retry delay rather than spending the quota the merge gate needs.
+
+### Recover missing GitHub checks
+
+SchemaBot has automatic reconciliation for missing checks. When you need an
+explicit recovery sweep, `checks backfill` finds missing checks and recreates
+them through the normal server flow. Start with a bounded dry run once GitHub
+is reachable; it cannot repair a GitHub outage while the API is unavailable.
+
+```console
+$ schemabot checks backfill acme/store -e staging --last 2h --dry-run
+Scanned 8 open PRs updated in the last 2h in acme/store for SchemaBot (staging).
+No missing SchemaBot Check Runs found.
+```
+
+Review the findings before running the same sweep without `--dry-run`.
+Existing unfinished checks are reported for investigation, not overwritten.
+A long-running apply can legitimately own one. The command returns nonzero
+when findings remain; do not treat every nonzero exit as a transport error.
+This is an admin operation. See [PR recovery](pre-merge-workflow.md) for the
+workflow and automatic recovery behavior.
+
+A sweep that does find unfinished checks says what each one is waiting on, so
+the report can be triaged without opening every pull request in it:
+
+```console
+$ schemabot checks backfill --all-repos --dry-run
+Scanned 148 open PRs in acme/store, acme/ledger for SchemaBot (staging), SchemaBot (production).
+
+Stuck Check Runs — uncompleted for over 1h (backfill does not act on existing Check Runs; investigate the apply or plan that owns each):
+PR                                      CHECK                   STATUS       AGE      WAITING ON  REASON
+https://github.com/acme/store/pull/412  SchemaBot (staging)     in_progress  5h12m0s  schemabot   awaiting_replan_after_apply
+https://github.com/acme/ledger/pull/88  SchemaBot (production)  in_progress  31h0m0s  operator    reconciliation_owed
+https://github.com/acme/ledger/pull/91  SchemaBot (production)  queued       unknown  -           -
+
+A run waiting on an operator will not clear on its own. Read the stored rows behind one with `sq schemabot checks show <owner/repo> <pr>`.
+
+No missing SchemaBot Check Runs found.
+```
+
+`WAITING ON` is `schemabot` when every blocking stored row behind the run
+resolves on its own, and `operator` as soon as one of them does not. A `-`
+means no stored row explains that run, either because the server could not
+read any or because none of the rows it read is blocking. Neither is the same
+as nothing needing a person. `REASON` lists the blocking rows' `reason` codes,
+the same ones `checks show` prints, so an entry worth opening is visible from
+the sweep itself.
+
+Each row is read against the environment its own Check Run gates, so a pull
+request with a clean staging gate and a production reconciliation shows the
+reconciliation only on the production line.
+
+The stored rows are read only for runs old enough to reach the report, since
+a fleet sweep would otherwise pay a storage read per pull request for runs
+that started minutes ago and never get printed. `--stuck-after` sets that
+threshold, and a run whose start time cannot be read is always explained.
+
+## Use the CLI from scripts and agents
+
+Prefer structured output when another program consumes the result:
+
+| Commands | JSON option |
+|---|---|
+| `databases`, `status`, `list-plans`, `logs`, `plan`, `init`, `checks show` | `--json` |
+| `pull` | `-o json` |
+
+For example:
+
+```console
+$ schemabot databases --json
+{
+  "databases": [
+    {
+      "database": "shop",
+      "type": "mysql",
+      "environments": [
+        {"environment": "staging"}
+      ]
+    }
+  ]
+}
+```
+
+`apply -o json` controls its progress stream; it is not a single JSON response
+for the entire command, which also prints the plan and other messages.
+For fully structured writes, use the API. `progress` has no JSON output flag;
+use `status --json` for a structured snapshot.
+
+For agents and automated processes, `apply --no-watch` and `rollback --no-watch`
+return after submission without opening an interactive watcher. Retain the new
+apply ID and check its status; submission alone does not confirm completion.
+Interactive operators should keep the default automatic watcher.
+
+A watching `apply -o log` or `apply -o json` returns as soon as the apply
+reaches a final state. It exits 0 only when the apply completed, and non-zero
+when it was stopped, failed, was cancelled, or was reverted, because in each of
+those the schema change is not on the target. For a stopped apply the error
+names the `start` command that resumes it. A watcher that cannot reach the
+server retries with backoff, and exits non-zero once polls have kept failing
+for a few minutes in a row; the interactive watcher gives up on the same
+schedule. Giving up does not affect the apply. The error tells the operator to
+rerun the original watch command, preserving its output format and connection
+flags, or to run `progress` with the apply ID to see its current state. When a
+refused poll carries a `Retry-After` header, as a proxy or rate limiter in
+front of SchemaBot may send, a watcher waits at least that long before polling
+again, up to 5 minutes per poll, so a watcher held off this way takes longer
+to give up.
+
+Do not scrape colored tables or progress bars. Check the exit status and the
+returned payload, and retain plan/apply IDs for follow-up reads. An accepted
+apply may still be running. Use [schema intelligence](schema-intelligence.md)
+for response shapes and [agent access](ai-agents.md) to choose credentials
+and boundaries.
+
+### Wrap the CLI for your team
+
+A wrapper can resolve your server URL and perform your terminal login before
+launching SchemaBot. Keep those organization-specific steps in the wrapper;
+use the upstream CLI for plans and operations.
+
+An exec-style wrapper passes `--cli-name "acme schemabot"` so generated hints
+lead back through the wrapper. Set the server's
+[`cli_name`](configuration.md#cli-name) to the same value so the CLI hints in
+PR comments lead back through it too. It can supply the endpoint with `--endpoint`
+and a bearer token through `SCHEMABOT_TOKEN`. Avoid placing credentials in
+shell history or printing them in diagnostics.
+
+For a Go wrapper, embed the command types from `pkg/cmd/commands` and set
+`cliname.Set("acme schemabot")` before parsing. See the
+[command package](../pkg/cmd/) for the upstream wiring. Wrapper routing and
+authentication remain your integration's responsibility; changing the
+printed name does not grant permissions.

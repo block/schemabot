@@ -7,7 +7,7 @@ package spirit
 
 import (
 	"fmt"
-	"strconv"
+	"slices"
 	"time"
 )
 
@@ -17,29 +17,14 @@ import (
 // slower and riskier than starting over.
 const DefaultCheckpointMaxAge = 3 * 24 * time.Hour
 
-// DefaultChecksumYieldTimeout bounds how long each checksum read transaction
-// may run before yielding. The checksum reads under a REPEATABLE READ
-// snapshot; without a yield bound a long checksum pins InnoDB purge and
-// history-list growth degrades the whole target instance.
-const DefaultChecksumYieldTimeout = 12 * time.Hour
-
 // Settings tunes the Spirit runs this engine starts. A zero value resolves to
 // the corresponding default in New; fields are set only to deviate from the
-// fleet defaults.
+// fleet defaults. Everything else about a run (thread autoscaling on Aurora,
+// the lockless checksum) is Spirit's own default and not configurable here.
 type Settings struct {
-	// EnableExperimentalAutoscaling scales Spirit's write threads dynamically
-	// from throttler feedback so apply throughput tracks the target instance's
-	// capacity instead of a fixed constant. nil defaults to enabled; false is
-	// the operator kill switch when autoscaling misbehaves on a target fleet.
-	EnableExperimentalAutoscaling *bool
-
 	// CheckpointMaxAge bounds how old a checkpoint may be and still be
 	// resumed. Zero defaults to DefaultCheckpointMaxAge.
 	CheckpointMaxAge time.Duration
-
-	// ChecksumYieldTimeout bounds each checksum read transaction before it
-	// yields its snapshot. Zero defaults to DefaultChecksumYieldTimeout.
-	ChecksumYieldTimeout time.Duration
 }
 
 // Engine metadata keys read by SettingsFromMetadata. These are the
@@ -47,30 +32,41 @@ type Settings struct {
 // translated into these keys, and a database's own metadata entry wins over
 // the server-level value.
 const (
-	MetadataEnableExperimentalAutoscaling = "enable_experimental_autoscaling"
-	MetadataCheckpointMaxAge              = "checkpoint_max_age"
-	MetadataChecksumYieldTimeout          = "checksum_yield_timeout"
+	MetadataCheckpointMaxAge = "checkpoint_max_age"
 )
+
+// removedSettingKeys are run settings this engine no longer exposes because
+// Spirit now chooses them itself: thread autoscaling and the checksum
+// algorithm.
+var removedSettingKeys = []string{
+	"enable_experimental_autoscaling",
+	"enable_experimental_lockless_checksum",
+	"checksum_yield_timeout",
+}
+
+// RemovedSettingKeys returns the run setting keys this engine no longer
+// accepts. A config that still sets one is rejected rather than ignored: the
+// operator set it to change how runs behave, and Spirit's default would
+// silently replace that intent.
+func RemovedSettingKeys() []string {
+	return slices.Clone(removedSettingKeys)
+}
 
 // SettingsFromMetadata builds Settings from engine metadata key-value pairs.
 // Absent keys leave the corresponding field at its zero value so New resolves
 // the default; present keys must parse, because silently ignoring a
 // misconfigured override would run the apply with settings the operator
-// believes they changed.
+// believes they changed. A removed setting key is an error for the same
+// reason.
 func SettingsFromMetadata(metadata map[string]string) (Settings, error) {
-	var settings Settings
-	if raw, ok := metadata[MetadataEnableExperimentalAutoscaling]; ok {
-		enabled, err := strconv.ParseBool(raw)
-		if err != nil {
-			return Settings{}, fmt.Errorf("parse %s %q: %w", MetadataEnableExperimentalAutoscaling, raw, err)
+	for _, key := range removedSettingKeys {
+		if _, ok := metadata[key]; ok {
+			return Settings{}, fmt.Errorf("metadata key %s is no longer supported: Spirit now chooses this itself; remove the key from the database's metadata", key)
 		}
-		settings.EnableExperimentalAutoscaling = &enabled
 	}
+	var settings Settings
 	var err error
 	if settings.CheckpointMaxAge, err = parsePositiveDuration(metadata, MetadataCheckpointMaxAge); err != nil {
-		return Settings{}, err
-	}
-	if settings.ChecksumYieldTimeout, err = parsePositiveDuration(metadata, MetadataChecksumYieldTimeout); err != nil {
 		return Settings{}, err
 	}
 	return settings, nil

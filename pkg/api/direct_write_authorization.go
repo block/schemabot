@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 )
@@ -23,10 +24,17 @@ import (
 // Reasons are stable for metrics and mirror the PR-door
 // ActorAuthorizationResult vocabulary.
 const (
-	DirectWriteReasonAdminAllow            = "admin_allow"
-	DirectWriteReasonScopedAllow           = "scoped_allow"
-	DirectWriteReasonScopedLaneDisabled    = "scoped_lane_disabled"
-	DirectWriteReasonMissingIdentity       = "missing_identity"
+	DirectWriteReasonAdminAllow         = "admin_allow"
+	DirectWriteReasonScopedAllow        = "scoped_allow"
+	DirectWriteReasonScopedLaneDisabled = "scoped_lane_disabled"
+	DirectWriteReasonTargetUnresolved   = "target_unresolved"
+	DirectWriteReasonMissingIdentity    = "missing_identity"
+	// DirectWriteReasonUnverifiedIdentity is an attribution outcome, not an
+	// authorization one: the caller is authenticated and the write is allowed,
+	// but the identity came from a lane the server did not verify, so no
+	// acquirer is recorded. It is logged by the handler and never reaches the
+	// authorization decision metric.
+	DirectWriteReasonUnverifiedIdentity    = "unverified_identity"
 	DirectWriteReasonNotAdmin              = "not_admin"
 	DirectWriteReasonNotDatabaseOperator   = "not_database_operator"
 	DirectWriteReasonEnvironmentNotAllowed = "environment_not_allowed"
@@ -47,7 +55,7 @@ type DirectWriteAuthorizationResult struct {
 // whole decision and the handler-level check is a pass-through, preserving
 // the semantics of deployments that never configure operator groups.
 func (c *ServerConfig) scopedWriteEnabled() bool {
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		if len(trimmedNonEmpty(dbConfig.OperatorGroups)) > 0 {
 			return true
 		}
@@ -68,7 +76,7 @@ func (c *ServerConfig) AuthorizeDirectWrite(user *auth.User, database, environme
 		return result
 	}
 
-	dbConfig, ok := c.Databases[database]
+	dbConfig, ok := c.DatabaseConfigs()[database]
 	if !ok {
 		return DirectWriteAuthorizationResult{Allowed: false, Reason: DirectWriteReasonMissingDatabaseConfig}
 	}
@@ -94,7 +102,7 @@ func (c *ServerConfig) AuthorizeDirectDatabaseWrite(user *auth.User, database st
 		return result
 	}
 
-	dbConfig, ok := c.Databases[database]
+	dbConfig, ok := c.DatabaseConfigs()[database]
 	if !ok {
 		return DirectWriteAuthorizationResult{Allowed: false, Reason: DirectWriteReasonMissingDatabaseConfig}
 	}
@@ -149,7 +157,7 @@ func (c *ServerConfig) validateOperatorScoping() error {
 	environments := trimmedNonEmpty(c.Auth.ForwardAuth.OperatorEnvironments)
 
 	var grantedDatabases []string
-	for name, dbConfig := range c.Databases {
+	for name, dbConfig := range c.DatabaseConfigs() {
 		groups := trimmedNonEmpty(dbConfig.OperatorGroups)
 		if len(groups) == 0 {
 			continue
@@ -195,7 +203,7 @@ func (c *ServerConfig) validateOperatorScoping() error {
 // are all outside the operator-environment policy can never authorize an
 // operation, so it is a configuration error, not a silent no-op.
 func (c *ServerConfig) databaseHasAnyEnvironment(database string, environments []string) bool {
-	dbConfig, ok := c.Databases[database]
+	dbConfig, ok := c.DatabaseConfigs()[database]
 	if !ok {
 		return false
 	}
@@ -211,7 +219,7 @@ func (c *ServerConfig) databaseHasAnyEnvironment(database string, environments [
 // defines the environment. Used as a typo guard on instance-wide environment
 // lists: an environment nobody configures can never authorize anything.
 func (c *ServerConfig) environmentConfiguredOnAnyDatabase(env string) bool {
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		if _, ok := dbConfig.Environments[env]; ok {
 			return true
 		}
@@ -226,7 +234,7 @@ func (c *ServerConfig) environmentConfiguredOnAnyDatabase(env string) bool {
 func (c *ServerConfig) OperatorGroupUnion() []string {
 	seen := make(map[string]struct{})
 	var union []string
-	for _, dbConfig := range c.Databases {
+	for _, dbConfig := range c.DatabaseConfigs() {
 		for _, g := range trimmedNonEmpty(dbConfig.OperatorGroups) {
 			if _, ok := seen[g]; ok {
 				continue
@@ -249,7 +257,7 @@ func (c *ServerConfig) metricDatabaseAttribute(database string) string {
 	if database == "" {
 		return ""
 	}
-	if _, ok := c.Databases[database]; ok {
+	if _, ok := c.DatabaseConfigs()[database]; ok {
 		return database
 	}
 	return "unconfigured"
@@ -294,10 +302,13 @@ func (s *Service) authorizeDirectWrite(w http.ResponseWriter, r *http.Request, o
 // stored plan — the source of truth for what an apply will mutate — and then
 // enforces the per-database half of the direct-write decision. The plan must
 // exist and resolve at decision time: a missing plan rejects the request with
-// the same error the apply path reports for it, and a storage failure denies
-// — an unresolvable target must never authorize. Failing closed here (rather
-// than deferring the missing plan to the handler's own plan load) keeps the
-// authorization bound to a plan that existed when the decision was made.
+// the same 404 the apply path reports for it, and a plan-load storage failure
+// rejects it with the same 500 storage error. Neither is an authorization
+// denial; both land on the decision metric as skipped/target_unresolved, and
+// neither lets the request proceed — an unresolvable target must never
+// authorize. Failing closed here (rather than deferring the missing plan to the
+// handler's own plan load) keeps the authorization bound to a plan that existed
+// when the decision was made.
 func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *http.Request, operation, planID, environment string) bool {
 	if !s.config.scopedWriteEnabled() {
 		metrics.RecordDirectWriteAuthorization(r.Context(), operation, "",
@@ -308,23 +319,36 @@ func (s *Service) authorizeDirectWriteForStoredPlan(w http.ResponseWriter, r *ht
 	if err != nil {
 		s.logger.Error("failed to load plan for direct write authorization",
 			"operation", operation, "plan_id", planID, "environment", environment, "error", err)
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: get plan %s: %v", operation, planID, err))
+		s.recordUnresolvedDirectWriteTarget(r, operation, environment)
+		s.writeErrorCode(w, http.StatusInternalServerError, apitypes.ErrCodeStorageError, storedPlanLookupFailedMessage(operation, planID))
 		return false
 	}
 	if plan == nil {
 		s.logger.Warn("rejecting direct write because the stored plan does not exist",
 			"operation", operation, "plan_id", planID, "environment", environment)
-		s.writeError(w, http.StatusInternalServerError, fmt.Sprintf("%s failed: plan not found: %s", operation, planID))
+		s.recordUnresolvedDirectWriteTarget(r, operation, environment)
+		s.writeErrorCode(w, http.StatusNotFound, apitypes.ErrCodeNotFound, storedPlanNotFoundMessage(operation, planID))
 		return false
 	}
 	return s.authorizeDirectWrite(w, r, operation, plan.Database, environment)
 }
 
+// recordUnresolvedDirectWriteTarget counts a direct-write decision that never
+// reached an authorization outcome because the target database could not be
+// resolved. The request is rejected by the operation's own error path, but the
+// decision still lands on the metric as skipped so a run of storage failures on
+// the authorization path is visible as a rate rather than only in the logs.
+func (s *Service) recordUnresolvedDirectWriteTarget(r *http.Request, operation, environment string) {
+	metrics.RecordDirectWriteAuthorization(r.Context(), operation, "",
+		s.config.metricEnvironmentAttribute(environment), "skipped", DirectWriteReasonTargetUnresolved)
+}
+
 // authorizeDirectDatabaseWrite is authorizeDirectWrite for environment-less
-// operations (database locks).
-func (s *Service) authorizeDirectDatabaseWrite(w http.ResponseWriter, r *http.Request, operation, database string) bool {
+// operations (database locks). It also returns the decision, whose reason says
+// whether the caller holds a lock by its owner string alone.
+func (s *Service) authorizeDirectDatabaseWrite(w http.ResponseWriter, r *http.Request, operation, database string) (DirectWriteAuthorizationResult, bool) {
 	result := s.config.AuthorizeDirectDatabaseWrite(auth.UserFromContext(r.Context()), database)
-	return s.finishDirectWriteDecision(w, r, operation, database, "", result)
+	return result, s.finishDirectWriteDecision(w, r, operation, database, "", result)
 }
 
 // authorizeDirectAdminWrite enforces admin-only access for mutating endpoints
@@ -396,7 +420,7 @@ func (s *Service) directWriteDenialMessage(operation, database, environment stri
 		return fmt.Sprintf("%s requires an authenticated caller identity", operation)
 	default:
 		grantingGroups := writeGroups
-		if dbConfig, ok := s.config.Databases[database]; ok {
+		if dbConfig, ok := s.config.DatabaseConfigs()[database]; ok {
 			grantingGroups = append(slices.Clone(writeGroups), trimmedNonEmpty(dbConfig.OperatorGroups)...)
 		}
 		return fmt.Sprintf("%s on database %q requires membership in one of: %s",

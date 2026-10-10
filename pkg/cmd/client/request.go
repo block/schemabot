@@ -10,10 +10,15 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/net/html"
+
+	"github.com/block/schemabot/pkg/apitypes"
 )
 
 // authTransport injects a Bearer token on outbound requests when one is
@@ -25,11 +30,31 @@ var authTransport = &bearerTransport{base: http.DefaultTransport}
 // Uses a 30s timeout to avoid hanging indefinitely on network stalls.
 var httpClient = &http.Client{Timeout: 30 * time.Second, Transport: authTransport}
 
-// webhookOpsHTTPClient serves the webhook operator endpoints, which crawl
-// GitHub delivery history or every open PR server-side and routinely need far
-// longer than the default client timeout. Matches the server's own budget
-// for these routes.
-var webhookOpsHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: authTransport}
+// operatorHTTPClient serves the operator endpoints whose server-side work
+// routinely needs far longer than the default client timeout: the webhook
+// operations that crawl GitHub delivery history or every open PR, and the
+// storage schema convergence that runs a bootstrap against the storage
+// database. Matches the server's own budget for these routes.
+var operatorHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: authTransport}
+
+// clientForBudget builds a client for one request whose server-side work is
+// bounded by a budget the caller named, rather than by a fixed one this package
+// can know in advance.
+//
+// A client timeout below the server's budget is the worst of both: the server
+// converges to completion while the client gives up, so the operator is told
+// their command timed out and has no way to tell whether the DDL ran. The
+// margin covers the round trip and the response either side of the work.
+func clientForBudget(budget time.Duration) *http.Client {
+	return &http.Client{Timeout: budget + operatorResponseMargin, Transport: authTransport}
+}
+
+// operatorResponseMargin is the room a bounded operator request needs beyond
+// the server's own budget: the two diffs bracketing a convergence, plus the
+// round trip and the response. It is deliberately generous — overshooting means
+// waiting a little longer for an answer the server is still going to send,
+// while undershooting means not getting it at all.
+const operatorResponseMargin = 5 * time.Minute
 
 // SetAuthToken configures the Bearer token attached to every CLI request. An
 // empty token leaves requests unauthenticated, which is correct against a
@@ -37,18 +62,47 @@ var webhookOpsHTTPClient = &http.Client{Timeout: 15 * time.Minute, Transport: au
 // sourced from an environment variable or file does not break the header.
 func SetAuthToken(token string) {
 	authTransport.token = strings.TrimSpace(token)
+	authTransport.origin = ""
 }
 
 // bearerTransport sets "Authorization: Bearer <token>" on each request when a
 // token is configured and the header is not already set.
+//
+// The token belongs to the server the command addressed, so across a redirect
+// it travels only while every hop stays on the origin (scheme, host, and port)
+// of the request the command sent. That is stricter than net/http, which keeps
+// sensitive headers across a redirect to a subdomain, another port, or another
+// scheme of the same host. A redirect to another origin is still followed, as
+// net/http follows it, but without the token; once a chain has left the origin
+// it stays unauthenticated, as net/http's own stripping of sensitive headers
+// does. A redirect whose chain the base transport did not record in full is
+// treated as having left the origin, since the token's origin cannot be
+// established from what remains.
 type bearerTransport struct {
 	base  http.RoundTripper
 	token string
+	// origin, when set, is the one origin (as RequestOrigin renders it) the
+	// private local-runtime credential may be sent to; every other request
+	// is refused outright.
+	origin string
 }
 
 func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.origin != "" && RequestOrigin(req.URL) != t.origin {
+		return nil, fmt.Errorf("refusing to forward local runtime credentials to another endpoint")
+	}
+	chain, complete := redirectChain(req)
+	if !complete {
+		WarnUnauthenticatedRedirect("its origin cannot be established", "", RequestOrigin(req.URL))
+		return t.base.RoundTrip(withoutAuthorization(req))
+	}
+	first := chain[0]
+	if !StayedOnFirstOrigin(chain) {
+		WarnUnauthenticatedRedirect("it is on another origin", RequestOrigin(first.URL), RequestOrigin(req.URL))
+		return t.base.RoundTrip(withoutAuthorization(req))
+	}
 	if t.token != "" && req.Header.Get("Authorization") == "" {
-		if err := guardInsecureToken(req.URL); err != nil {
+		if err := GuardInsecureToken(req.URL); err != nil {
 			return nil, err
 		}
 		// RoundTrip must not mutate the caller's request, so clone it.
@@ -58,15 +112,113 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return t.base.RoundTrip(req)
 }
 
+// warnWriter receives the CLI's warning lines. Nil means the process's stderr
+// as it is when the warning is written, the same stream the commands use for
+// their own warnings, so an operator sees why a later 401 happened next to the
+// command output rather than in a log format they filter out. It is resolved at
+// write time rather than bound at package init, so a caller that redirects
+// os.Stderr sees the warning too.
+var warnWriter io.Writer
+
+// WarnUnauthenticatedRedirect tells the operator that a redirect is being
+// followed without the token and why, naming the origin the token belongs to
+// (when known) and the origin the redirect points at.
+func WarnUnauthenticatedRedirect(reason, tokenOrigin, redirectOrigin string) {
+	subject := "the auth token"
+	if tokenOrigin != "" {
+		subject += " for " + tokenOrigin
+	}
+	// The warning is advisory. A stderr that refuses writes leaves nowhere to
+	// report that, and the request itself is unaffected.
+	out := warnWriter
+	if out == nil {
+		out = os.Stderr
+	}
+	_, _ = fmt.Fprintf(out, "Warning: not sending %s to redirect target %s because %s; the request continues unauthenticated\n",
+		subject, redirectOrigin, reason)
+}
+
+// withoutAuthorization returns a copy of req with no Authorization header.
+// RoundTrip must not mutate the caller's request, so the header is removed
+// from a clone. The clone is the contract, not a sign the header is expected:
+// by the time a cross-host redirect reaches this transport net/http has usually
+// stripped it already, and the copy is then of a request with nothing to remove.
+func withoutAuthorization(req *http.Request) *http.Request {
+	stripped := req.Clone(req.Context())
+	stripped.Header.Del("Authorization")
+	return stripped
+}
+
+// redirectChain returns the requests net/http sent to arrive at req, oldest
+// first and ending with req itself, and whether that chain is complete. A
+// request that is not a redirect is a complete chain of one.
+//
+// net/http links each redirected request to the response that caused it, and
+// the response to the request that produced it. A base RoundTripper that omits
+// that second link leaves the earlier hops unknowable, so the chain is reported
+// incomplete rather than presenting the hop it stopped at as the first request.
+func redirectChain(req *http.Request) (chain []*http.Request, complete bool) {
+	chain = []*http.Request{req}
+	for hop := req; hop.Response != nil; hop = hop.Response.Request {
+		if hop.Response.Request == nil {
+			slices.Reverse(chain)
+			return chain, false
+		}
+		chain = append(chain, hop.Response.Request)
+	}
+	slices.Reverse(chain)
+	return chain, true
+}
+
+// StayedOnFirstOrigin reports whether every hop in a redirect chain targets the
+// origin of the request the command sent. The chain is oldest first, so an
+// http.Client CheckRedirect policy passes its via requests with the pending
+// request appended. Any CLI client that sends a credential across redirects
+// holds it to this rule, so the token stays with the origin it was sent to.
+// An empty chain has sent nothing, so it has left no origin.
+func StayedOnFirstOrigin(chain []*http.Request) bool {
+	if len(chain) == 0 {
+		return true
+	}
+	origin := RequestOrigin(chain[0].URL)
+	for _, hop := range chain[1:] {
+		if RequestOrigin(hop.URL) != origin {
+			return false
+		}
+	}
+	return true
+}
+
+// RequestOrigin renders a URL's origin as scheme://host:port, with the scheme
+// and host lowercased and the scheme's default port made explicit, so the same
+// server compares equal however a redirect spells it.
+func RequestOrigin(u *url.URL) string {
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		switch scheme {
+		case "https":
+			port = "443"
+		case "http":
+			port = "80"
+		}
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+}
+
 // ErrInsecureTokenTransport is returned when a Bearer token would be sent over
 // a plaintext connection to a non-loopback host.
 var ErrInsecureTokenTransport = errors.New("refusing to send auth token over an insecure connection")
 
-// guardInsecureToken refuses to attach a Bearer token to a plaintext connection
+// GuardInsecureToken refuses to attach a Bearer token to a plaintext connection
 // unless it targets loopback. A token sent over http:// to a remote host is
 // exposed to anyone on the network path, so this fails closed rather than
 // leaking the credential; https and local (loopback) endpoints are allowed.
-func guardInsecureToken(u *url.URL) error {
+//
+// It is exported because the rule belongs to the credential, not to this
+// transport: any CLI path that attaches a bearer token to a URL an operator's
+// environment supplied answers to it.
+func GuardInsecureToken(u *url.URL) error {
 	if u.Scheme == "https" || isLoopbackHost(u.Hostname()) {
 		return nil
 	}
@@ -88,10 +240,35 @@ type APIError struct {
 	Status    int    // HTTP status code (e.g., 404, 500)
 	ErrorCode string // Error code from API response (e.g., "not_found", "storage_error")
 	Message   string
+
+	// RetryAfterSeconds is the delay the server asked the client to wait, set
+	// only on responses that advertise one. Read it through RetryAfter rather
+	// than on its own, so a retry is never scheduled without it.
+	RetryAfterSeconds int
+
+	// RetryAfterHeader is the delay the response's Retry-After header asked
+	// for, zero when it sent none or one that could not be read. Unlike
+	// RetryAfter it does not say whether to retry: a proxy in front of the
+	// server can send it with no error code, so the caller decides from the
+	// status whether the request is worth repeating.
+	RetryAfterHeader time.Duration
 }
 
 func (e *APIError) Error() string {
 	return e.Message
+}
+
+// RetryAfter reports whether this request should be retried and how long to
+// wait first, so a caller automating against the API gets both facts from one
+// call instead of retrying on the code and ignoring the delay. Whether to retry
+// comes from the error code alone; the delay is the longer of the body's and
+// the Retry-After header's, so no caller retries sooner than either asked.
+func (e *APIError) RetryAfter() (retry bool, after time.Duration) {
+	retry, after = apitypes.ErrorResponse{ErrorCode: e.ErrorCode, RetryAfterSeconds: e.RetryAfterSeconds}.RetryAfter()
+	if !retry {
+		return false, 0
+	}
+	return true, max(after, e.RetryAfterHeader)
 }
 
 // IsNotFound reports whether the error is a 404 from the API.
@@ -108,12 +285,29 @@ func doGetInto(endpoint, path string, result any) error {
 
 // doGetIntoCtx is like doGetInto but accepts a context for timeout/cancellation control.
 func doGetIntoCtx(ctx context.Context, endpoint, path string, result any) error {
+	return doGetIntoWithClient(ctx, httpClient, endpoint, path, result)
+}
+
+// doSlowGetIntoCtx is doGetIntoCtx with the long-running operator client, for
+// read endpoints whose server-side work calls out to GitHub or reads a storage
+// catalog, and so shares the operator budget rather than the default request
+// timeout.
+func doSlowGetIntoCtx(ctx context.Context, endpoint, path string, result any) error {
+	return doGetIntoWithClient(ctx, operatorHTTPClient, endpoint, path, result)
+}
+
+func doGetIntoWithClient(ctx context.Context, client *http.Client, endpoint, path string, result any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+path, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
+		// Surface a canceled context as-is so callers can tell an operator
+		// cancellation apart from a real connection failure.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return FormatConnectionError(endpoint, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -124,7 +318,7 @@ func doGetIntoCtx(ctx context.Context, endpoint, path string, result any) error 
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -157,7 +351,7 @@ func doSendBody(endpoint, method, path string, body any) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 	return nil
 }
@@ -168,12 +362,12 @@ func doPostInto(endpoint, path string, body any, result any) error {
 	return doPostIntoWithClient(context.Background(), httpClient, endpoint, path, body, result)
 }
 
-// doSlowPostIntoCtx is doPostInto with the long-running webhook ops client and
+// doSlowPostIntoCtx is doPostInto with the long-running operator client and
 // a caller-supplied context, for operator endpoints whose server-side work
 // legitimately outlives the default timeout and that must stop promptly when
 // the operator cancels (Ctrl+C).
 func doSlowPostIntoCtx(ctx context.Context, endpoint, path string, body any, result any) error {
-	return doPostIntoWithClient(ctx, webhookOpsHTTPClient, endpoint, path, body, result)
+	return doPostIntoWithClient(ctx, operatorHTTPClient, endpoint, path, body, result)
 }
 
 func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, path string, body any, result any) error {
@@ -206,7 +400,7 @@ func doPostIntoWithClient(ctx context.Context, client *http.Client, endpoint, pa
 	// recorded and the apply owner completes it asynchronously; the body
 	// carries the same JSON shape as a 200 and is equally a success.
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-		return parseAPIError(resp.StatusCode, respBody)
+		return parseAPIError(resp, respBody)
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
@@ -266,19 +460,63 @@ func stripHTMLTags(s string) string {
 }
 
 // parseAPIError builds an APIError from a non-200 HTTP response, extracting
-// the error_code if present in the JSON body.
-func parseAPIError(statusCode int, body []byte) *APIError {
+// the error_code and any advertised retry delay from the JSON body, and the
+// Retry-After header, which a proxy or rate limiter in front of SchemaBot may
+// send with a body that carries neither.
+func parseAPIError(resp *http.Response, body []byte) *APIError {
 	apiErr := &APIError{
-		Status:  statusCode,
-		Message: FormatAPIError(statusCode, body),
+		Status:           resp.StatusCode,
+		Message:          FormatAPIError(resp.StatusCode, body),
+		RetryAfterHeader: parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now()),
 	}
-	var resp struct {
-		ErrorCode string `json:"error_code"`
-	}
-	if json.Unmarshal(body, &resp) == nil && resp.ErrorCode != "" {
-		apiErr.ErrorCode = resp.ErrorCode
+	var errResp apitypes.ErrorResponse
+	if json.Unmarshal(body, &errResp) == nil {
+		apiErr.ErrorCode = errResp.ErrorCode
+		apiErr.RetryAfterSeconds = errResp.RetryAfterSeconds
 	}
 	return apiErr
+}
+
+// maxRetryAfterHeader bounds the delay a Retry-After header can ask for. The
+// header can come from any proxy or maintenance page in front of the server,
+// which commonly asks for an hour, and a watch that honoured that would sit far
+// past the few minutes of failed polls after which it is documented to give
+// up. The server's own delay arrives in the response body and is not bounded
+// here.
+const maxRetryAfterHeader = 5 * time.Minute
+
+// parseRetryAfterHeader reads a Retry-After header value in either form RFC
+// 9110 allows: a count of seconds, or an HTTP date measured from now, bounded
+// by maxRetryAfterHeader. An absent, malformed, or negative value, or a date
+// already past, yields zero, so a header nobody can act on never delays a
+// retry. A count of seconds too large to read is still a request to wait long,
+// so it yields the bound.
+func parseRetryAfterHeader(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if isDigits(value) {
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds > int64(maxRetryAfterHeader/time.Second) {
+			return maxRetryAfterHeader
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	at, err := http.ParseTime(value)
+	if err != nil {
+		return 0
+	}
+	return min(max(at.Sub(now), 0), maxRetryAfterHeader)
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ConnectionError represents a client-side failure to reach the server
@@ -344,4 +582,17 @@ func FormatAPIError(statusCode int, body []byte) string {
 		return fmt.Sprintf("HTTP %d", statusCode)
 	}
 	return fmt.Sprintf("HTTP %d: %s", statusCode, bodyStr)
+}
+
+// SetLocalAuth binds the private runtime credential to its verified endpoint.
+// The endpoint is stored as the origin RoundTrip compares requests against, so
+// the credential goes to the same server however a request spells it. An
+// endpoint that does not parse as a URL is kept as given; nothing renders to
+// it, so every request is refused rather than one slipping through.
+func SetLocalAuth(token, endpoint string) {
+	SetAuthToken(token)
+	authTransport.origin = endpoint
+	if u, err := url.Parse(endpoint); err == nil {
+		authTransport.origin = RequestOrigin(u)
+	}
 }

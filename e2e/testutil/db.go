@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
+	_ "github.com/block/mysql"
 	"github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/statement"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,7 +21,7 @@ import (
 // plane's storage or target database. The handle is closed when the test ends.
 func OpenMySQL(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open mysql")
 	t.Cleanup(func() { utils.CloseAndLog(db) })
 	require.NoError(t, db.PingContext(t.Context()), "ping mysql")
@@ -33,7 +33,7 @@ func OpenMySQL(t *testing.T, dsn string) *sql.DB {
 // after the test context is cancelled.
 func CreateTestTable(t *testing.T, dsn, tableName, ddl string) func() {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open mysql for create table")
 	require.NoError(t, db.PingContext(t.Context()), "ping mysql for create table")
 
@@ -42,7 +42,7 @@ func CreateTestTable(t *testing.T, dsn, tableName, ddl string) func() {
 	require.NoError(t, err, "create table %s", tableName)
 
 	return func() {
-		db2, err := sql.Open("mysql", dsn)
+		db2, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			return
 		}
@@ -112,7 +112,7 @@ func SeedRows(t *testing.T, dsn, tableName, columns, valueTemplate string, rowCo
 	t.Helper()
 	require.Positive(t, rowCount, "seed row count for %s", tableName)
 	require.LessOrEqual(t, rowCount, maxSeedRows, "seed row count for %s", tableName)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open mysql for seeding")
 	defer utils.CloseAndLog(db)
 
@@ -152,7 +152,7 @@ func sequenceGenerator(rowCount int) string {
 // typically called from t.Cleanup where t.Context() is already canceled.
 func ClearAllTables(t *testing.T, dsn string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	if err != nil {
 		t.Logf("warning: could not open db to clear tables: %v", err)
 		return

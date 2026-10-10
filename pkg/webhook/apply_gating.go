@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/checkstate"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/webhook/templates"
@@ -83,10 +84,10 @@ func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
 			continue
 		}
-		if s.Status != "completed" {
+		if !checkHasFinished(s.Status) {
 			continue
 		}
-		if isPassingCheckConclusion(s.Conclusion) {
+		if checkstate.ConclusionClearsGate(s.Conclusion) {
 			continue
 		}
 		notPassing = append(notPassing, templates.BlockingCheck{
@@ -95,18 +96,6 @@ func filterNonPassingNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		})
 	}
 	return notPassing
-}
-
-// isPassingCheckConclusion reports whether a completed check's conclusion
-// allows apply to proceed. Only "success", "neutral", and "skipped" pass;
-// every other conclusion blocks apply.
-func isPassingCheckConclusion(conclusion string) bool {
-	switch conclusion {
-	case "success", "neutral", "skipped":
-		return true
-	default:
-		return false
-	}
 }
 
 // enforcePassingChecks verifies that all non-SchemaBot PR checks are passing.
@@ -250,7 +239,15 @@ func (h *Handler) flagUntrustedAggregateNamedChecks(ctx context.Context, statuse
 	}
 }
 
-// filterInProgressNonSchemaBotChecks returns checks that are still running,
+// checkHasFinished reports whether a check has reached its final state. Only
+// "completed" counts: every other status ("in_progress", "queued", "pending",
+// "waiting", "requested", or one GitHub adds later) means the check has not
+// concluded, so an unrecognized status blocks apply instead of passing it.
+func checkHasFinished(status string) bool {
+	return status == "completed"
+}
+
+// filterInProgressNonSchemaBotChecks returns checks that have not finished,
 // excluding checks created by trusted SchemaBot GitHub Apps.
 func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, config *api.ServerConfig) []templates.BlockingCheck {
 	var inProgress []templates.BlockingCheck
@@ -262,13 +259,13 @@ func filterInProgressNonSchemaBotChecks(statuses []ghclient.PRCheckStatus, confi
 		if filterRequiredChecks && !config.IsCheckRequired(s.Name) {
 			continue
 		}
-		switch s.Status {
-		case "in_progress", "queued", "pending":
-			inProgress = append(inProgress, templates.BlockingCheck{
-				Name:  s.Name,
-				State: s.Status,
-			})
+		if checkHasFinished(s.Status) {
+			continue
 		}
+		inProgress = append(inProgress, templates.BlockingCheck{
+			Name:  s.Name,
+			State: s.Status,
+		})
 	}
 	return inProgress
 }

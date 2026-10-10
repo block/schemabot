@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/block/schemabot/pkg/apitypes"
-	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/storage"
 )
 
@@ -174,8 +173,13 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 		if nsData == nil {
 			continue
 		}
-		if nsData.ChangesVSchema() {
+		if nsData.ShowsVSchemaChange() {
 			summary.VSchemaChangeCount++
+		}
+		// A finalize beside a namespace's DDL or VSchema change is part of that
+		// work, so only a namespace whose only work is the finalize counts.
+		if nsData.Finalize && !nsData.ShowsVSchemaChange() && len(nsData.Tables) == 0 {
+			summary.FinalizeCount++
 		}
 		for _, change := range nsData.Tables {
 			if summary.ChangeCounts == nil {
@@ -189,7 +193,7 @@ func planSummaryFromStorage(plan *storage.Plan) *apitypes.PlanSummaryResponse {
 			if change.IsUnsafe {
 				summary.UnsafeCount++
 			}
-			if change.ExecutionMode == engine.ExecutionModeBlocked {
+			if change.EngineBlocked() {
 				summary.BlockedCount++
 			}
 		}
@@ -204,20 +208,29 @@ func storedPlanResponseFromStorage(plan *storage.Plan) *apitypes.StoredPlanRespo
 		PlanSummaryResponse: *planSummaryFromStorage(plan),
 		SchemaPath:          plan.SchemaPath,
 		Target:              plan.Target,
-		Plan:                planContentFromStorage(plan),
+		Plan:                PlanContentFromStorage(plan),
 	}
 }
 
-// planContentFromStorage reconstructs the POST /api/plan response shape from a
-// stored plan so both render through the same code paths. Lint results and
-// errors are not persisted with a plan, so they are always empty here.
-func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
+// PlanContentFromStorage reconstructs the POST /api/plan response shape from a
+// stored plan so both render through the same code paths. It is exported so a
+// PR command that acts on a stored plan, such as rollback confirmation, can
+// render that plan without re-planning. Lint results and errors are not
+// persisted with a plan, so they are always empty here.
+//
+// The member the plan was created against is carried as both halves of its
+// identity. Reporting the deployment alone would read as the member addressing
+// the unnamed target, which is a different member than the one the row records
+// whenever that deployment addresses a named one.
+func PlanContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 	resp := &apitypes.PlanResponse{
 		PlanID:       plan.PlanIdentifier,
 		Database:     plan.Database,
 		DatabaseType: plan.DatabaseType,
 		Environment:  plan.Environment,
 		Deployment:   plan.Deployment,
+		Target:       plan.Target,
+		NarrowedTo:   plan.NarrowedTo,
 		Engine:       storage.EngineForType(plan.DatabaseType),
 		Changes:      []*apitypes.SchemaChangeResponse{},
 		LintResults:  []*apitypes.LintViolationResponse{},
@@ -230,10 +243,29 @@ func planContentFromStorage(plan *storage.Plan) *apitypes.PlanResponse {
 		}
 		change := &apitypes.SchemaChangeResponse{Namespace: namespace}
 		if nsData.ChangesVSchema() {
-			// The stored artifact is the desired VSchema document, not a
-			// rendered diff, so the namespace is flagged as carrying VSchema
-			// work without one.
 			change.Metadata = map[string]string{apitypes.VSchemaChangedMetadataKey: "true"}
+			// The diff recorded at plan time is the one the plan was reviewed
+			// with, so a stored plan shows it rather than only flagging the
+			// namespace. A plan recorded without one still reads as carrying
+			// VSchema work.
+			if diff := nsData.Metadata[storage.PlanMetadataVSchemaDiff]; diff != "" {
+				change.Metadata[apitypes.VSchemaDiffMetadataKey] = diff
+			}
+			if !nsData.ShowsVSchemaChange() {
+				// Carried so the stored plan renders the namespace the way
+				// the live plan did: by its DDL and finalize, with no VSchema
+				// change of its own.
+				change.Metadata[apitypes.VSchemaGeneratedOnlyMetadataKey] = "true"
+			}
+		}
+		if nsData.Finalize {
+			// The stored finalize request is reported under the key the
+			// engine planned it with, so a stored finalize-only plan still
+			// reads as having changes.
+			if change.Metadata == nil {
+				change.Metadata = map[string]string{}
+			}
+			change.Metadata[apitypes.NeedsFinalizerMetadataKey] = "true"
 		}
 		for _, table := range nsData.Tables {
 			tc := tableChangeResponseFromStorage(table)
@@ -264,7 +296,25 @@ func tableChangeResponseFromStorage(change storage.TableChange) *apitypes.TableC
 		UnsafeReason:  change.UnsafeReason,
 		ExecutionMode: change.ExecutionMode,
 		ModeReason:    change.ModeReason,
+		// The size estimates persist with the plan, so the stored-plan view
+		// reports the same sizes a freshly planned response does.
+		EstimatedRows:    change.EstimatedRows,
+		ShardCount:       change.ShardCount,
+		LargestShardRows: change.LargestShardRows,
+		EstimatedBytes:   change.EstimatedBytes,
+		CollationChanges: collationChangesFromStorage(change.CollationChanges),
 	}
+}
+
+func collationChangesFromStorage(changes []storage.CollationChange) []apitypes.CollationChange {
+	if len(changes) == 0 {
+		return nil
+	}
+	out := make([]apitypes.CollationChange, len(changes))
+	for i, c := range changes {
+		out[i] = apitypes.CollationChange(c)
+	}
+	return out
 }
 
 // sortedPlanNamespaces returns the plan's namespace keys in sorted order so

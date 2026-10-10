@@ -15,21 +15,26 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/spirit/pkg/utils"
-	_ "github.com/go-sql-driver/mysql"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"google.golang.org/grpc"
 
 	"github.com/block/schemabot/pkg/api"
 	"github.com/block/schemabot/pkg/auth"
+	"github.com/block/schemabot/pkg/drain"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/engine/planetscale"
 	ghclient "github.com/block/schemabot/pkg/github"
+	"github.com/block/schemabot/pkg/inventory"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/mysqlconn"
 	"github.com/block/schemabot/pkg/panicsafe"
@@ -38,6 +43,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/storage/postgresstore"
+	"github.com/block/schemabot/pkg/targetprobe"
 	"github.com/block/schemabot/pkg/tern"
 	"github.com/block/schemabot/pkg/webhook"
 )
@@ -46,11 +52,26 @@ import (
 type Option func(*options)
 
 type options struct {
-	logger  *slog.Logger
-	version string
-	commit  string
-	date    string
-	engines map[string]tern.EngineFactory
+	logger     *slog.Logger
+	version    string
+	commit     string
+	date       string
+	engines    map[string]tern.EngineFactory
+	authorizer auth.Authorizer
+	// localHosted marks a server hosted by RunLocal. It is not a config field
+	// because it is not the operator's to set: it says which entry point built
+	// this server, and the local one carries boundaries the normal one does
+	// not (AZ-6).
+	localHosted bool
+}
+
+// withLocalHosting marks the server as hosted by the local runtime. It is
+// unexported because the only caller that may claim it is RunLocal — a
+// deployment that could assert local hosting through a config file or an
+// embedder option could assert the boundaries AZ-6 grants it without accepting
+// them, and a deployment that could deny it could drop them.
+func withLocalHosting() Option {
+	return func(o *options) { o.localHosted = true }
 }
 
 // WithLogger sets the logger Run uses. A nil logger is ignored so Run keeps
@@ -88,6 +109,67 @@ func WithBuildInfo(version, commit, date string) Option {
 	}
 }
 
+const (
+	schemabotModulePath = "github.com/block/schemabot"
+	// unknownModuleVersion keeps the log field present when the module graph
+	// cannot name a version, so a query for the field never silently misses a
+	// pod that is running an unidentifiable build.
+	unknownModuleVersion = "unknown"
+)
+
+// moduleVersion reports the SchemaBot version recorded in the running binary's
+// module graph. It resolves only when SchemaBot is a dependency of the main
+// module, which is exactly the embedded case.
+func moduleVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return unknownModuleVersion
+	}
+	return versionFromBuildInfo(info)
+}
+
+// attributableVersion is the version a storage schema report may attribute
+// this binary's embedded schema files to.
+//
+// The two uses of a version want opposite things from a build the module graph
+// cannot name. A log field wants the sentinel present, so a query for the field
+// finds the pod running an unidentifiable build instead of silently missing it.
+// A report's attribution is prose an operator reads, and there "the schema
+// embedded in unknown" reads as a release named unknown — a worse answer than
+// the words the report already has for a build it cannot name, which say that
+// these are the answering binary's own files without claiming whose build it
+// is. So the sentinel stops here, at the one boundary where it would be read as
+// a version rather than as a log value.
+func attributableVersion(version string) string {
+	if version == unknownModuleVersion {
+		return ""
+	}
+	return version
+}
+
+// versionFromBuildInfo finds SchemaBot's version among the main module's
+// dependencies. A replace directive wins, so a host pinning a fork or a local
+// path is reported as what it actually runs rather than as the version it
+// nominally requires. A module graph that names no version for the module it
+// selected falls back rather than reporting an empty string, so the field is
+// worth querying however the build info was produced.
+func versionFromBuildInfo(info *debug.BuildInfo) string {
+	for _, dep := range info.Deps {
+		if dep == nil || dep.Path != schemabotModulePath {
+			continue
+		}
+		version := dep.Version
+		if dep.Replace != nil {
+			version = dep.Replace.Version
+		}
+		if version == "" {
+			return unknownModuleVersion
+		}
+		return version
+	}
+	return unknownModuleVersion
+}
+
 type webhookRuntime struct {
 	handler                         http.Handler
 	startDurableWebhookDispatch     func(context.Context)
@@ -96,14 +178,60 @@ type webhookRuntime struct {
 	reconcileMissingSummaryComments func(context.Context)
 }
 
-func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, logger *slog.Logger) {
-	if r.reconcileMissingSummaryComments == nil {
-		logger.Debug("missing summary reconciliation disabled")
+// reconcilePass is a running one-shot missing-summary reconciliation. Start
+// detaches the pass from its context on purpose — it repairs terminal PR
+// comments an interrupted process left half-written, and a request context
+// ending must not leave them that way — which makes Close the only place that
+// can put a bound on it. This handle is what gives Close something to bound.
+type reconcilePass struct {
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
+}
+
+// Reconciliation drain policy. The pass reads stored apply state and writes
+// GitHub comments, so Close waits for it before storage closes underneath it.
+//
+// The timeout covers a pass making progress against a responsive GitHub API and
+// abandons one that is not, because an abandoned pass costs nothing that lasts:
+// the comments it did not reach are still missing, which is exactly the
+// condition that makes the next process to start run the pass again. The grace
+// that follows is not a second budget — it is the moment it takes a cancelled
+// pass to unwind, so it ends on its own context rather than on a storage pool
+// that closed under it.
+const (
+	missingSummaryReconcileDrainTimeout = 5 * time.Second
+	missingSummaryReconcileCancelGrace  = 2 * time.Second
+)
+
+// stop waits for the pass, then cancels it if it has not finished. It reports
+// nothing to its caller: every outcome is either routine or already logged, and
+// none of them is a reason to fail a close.
+func (p *reconcilePass) stop(logger *slog.Logger) {
+	if p == nil {
+		return
+	}
+	if drain.Wait(&p.wg, missingSummaryReconcileDrainTimeout) {
 		return
 	}
 
-	reconcileCtx := context.WithoutCancel(ctx)
-	go func() {
+	logger.Warn("missing-summary reconciliation did not finish within the shutdown drain; it is being canceled and the comments it did not reach are reconciled by the next process to start",
+		"drain_timeout", missingSummaryReconcileDrainTimeout)
+	p.cancel()
+	if !drain.Wait(&p.wg, missingSummaryReconcileCancelGrace) {
+		logger.Warn("missing-summary reconciliation has not returned since it was canceled; its remaining storage calls will fail as the pool closes",
+			"cancel_grace", missingSummaryReconcileCancelGrace)
+	}
+}
+
+func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, logger *slog.Logger) *reconcilePass {
+	if r.reconcileMissingSummaryComments == nil {
+		logger.Debug("missing summary reconciliation disabled")
+		return nil
+	}
+
+	reconcileCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	pass := &reconcilePass{cancel: cancel}
+	pass.wg.Go(func() {
 		// The reconcile pass renders GitHub comments from stored apply state; a
 		// panic on one poisoned row must degrade only this startup pass, not
 		// kill the process that serves webhooks and drives applies.
@@ -125,7 +253,106 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 			"panic", fmt.Sprint(reconcilePanic.Value),
 			"stack", string(reconcilePanic.Stack))
 		metrics.RecordRecoveredPanic(reconcileCtx, "summary_reconciliation")
+	})
+	return pass
+}
+
+// watchForShutdownSignal returns a context cancelled when SIGINT or SIGTERM
+// arrives, the signal that did it, and a stop function that uninstalls the
+// handler. The signal is recorded before the cancellation it causes, so a
+// later reader can tell a signal apart from the caller cancelling; the two are
+// indistinguishable at the context alone.
+//
+// It is installed before the server is built rather than once it is serving.
+// Building blocks on storage, and storage boot is patient by design — it
+// retries for minutes while a database is unreachable or a credential is
+// rotating. A process signalled inside that window has to act on the signal
+// there, because nothing later in its lifecycle will run.
+func watchForShutdownSignal(ctx context.Context) (context.Context, <-chan os.Signal, func()) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	signalled := make(chan os.Signal, 1)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			signalled <- sig
+			cancel()
+		case <-runCtx.Done():
+			// The caller's cancellation may be this same signal arriving by
+			// another route: a CLI that traps it for every command cancels the
+			// context this one is derived from, and the runtime has already
+			// delivered to sigCh by then. Take the signal if it is there, so
+			// the cause is not decided by which of the two woke first.
+			select {
+			case sig := <-sigCh:
+				signalled <- sig
+			default:
+			}
+		}
 	}()
+
+	return runCtx, signalled, func() {
+		signal.Stop(sigCh)
+		cancel()
+	}
+}
+
+// logShutdownCause states why the run is ending. A signal and a cancelled
+// caller context both end the run context, so the recorded signal is what
+// separates them, and an operator needs the separation: it says whether this
+// process was told to stop or the process embedding it was.
+// grpcDrainTimeout bounds the wait for in-flight RPCs to finish before the gRPC
+// server is stopped from under them.
+const grpcDrainTimeout = 10 * time.Second
+
+// stopGRPCServer ends the gRPC server, letting in-flight RPCs finish within
+// drainTimeout and stopping them once it is spent.
+//
+// The bound is what keeps this stage from swallowing the shutdown. This runs as
+// a deferred call ahead of Server.Close, so an RPC that never returns would
+// otherwise park the whole of the rest of shutdown behind it — every bounded
+// drain below included — and the process would outlive its termination grace
+// period on the one stage that had no bound.
+//
+// What the bound buys is the rest of shutdown, not the handler returning. A
+// goroutine that ignores its context is not something Go can end, so an expired
+// drain walks away from the graceful stop and leaves it parked — the same trade
+// every wait in pkg/drain makes. Both listeners are already closed by then, so
+// nothing new arrives at a server nobody is waiting for any more, and the
+// abandoned handler goes when the process does.
+//
+// Forcing the point with grpc.Server.Stop is not available here. It takes the
+// same lock GracefulStop holds while waiting on the handlers, so calling it on
+// a graceful stop that is already parked deadlocks on the one case worth
+// forcing. Ending the wait is the part that belongs in SchemaBot; a graceful
+// stop that gave up on its own belongs upstream.
+func stopGRPCServer(grpcServer *grpc.Server, logger *slog.Logger, drainTimeout time.Duration) {
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		grpcServer.GracefulStop()
+	}()
+
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-stopped:
+	case <-timer.C:
+		logger.Warn("gRPC server still had in-flight RPCs when its drain expired; leaving them and continuing shutdown",
+			"drain_timeout", drainTimeout)
+	}
+}
+
+func logShutdownCause(ctx context.Context, logger *slog.Logger, signalled <-chan os.Signal) {
+	select {
+	case sig := <-signalled:
+		logger.Info("received shutdown signal", "signal", sig)
+	default:
+		logger.Info("context canceled, shutting down", "error", ctx.Err())
+	}
 }
 
 // Run starts the SchemaBot server with the given configuration and blocks until
@@ -134,25 +361,59 @@ func (r webhookRuntime) StartMissingSummaryReconciliation(ctx context.Context, l
 // STORAGE_DSN env var, then MYSQL_DSN);
 // PORT and GRPC_PORT are read from the environment. Prometheus metrics are
 // served on a dedicated listener at cfg.MetricsListenPort, not on the API port.
+//
+// This is the standalone path, so signals are SchemaBot's to handle: startup and
+// the listeners run under a context that ends when one arrives. The background
+// work is the exception, and Close ends it (see serveUntilShutdown). The
+// embedding seam (Build, RegisterGRPC, Start, Close) installs no handler at
+// all — a library that traps signals out from under its host is a worse defect
+// than the one that would fix.
 func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 	port := getEnv("PORT", "8080")
 	grpcPort := os.Getenv("GRPC_PORT")
 
-	srv, err := Build(ctx, cfg, opts...)
+	runCtx, signalled, stopWatching := watchForShutdownSignal(ctx)
+	defer stopWatching()
+
+	srv, err := Build(runCtx, cfg, opts...)
 	if err != nil {
+		// A build ended by a signal is a routine stop during startup rather
+		// than a fault, and this is the only place that distinction is still
+		// visible: the error below only ever reports the cancellation.
+		select {
+		case sig := <-signalled:
+			return fmt.Errorf("build server: stopped by signal %s during startup: %w", sig, err)
+		default:
+		}
 		return err
 	}
+	return serveUntilShutdown(runCtx, srv, signalled, port, grpcPort)
+}
+
+// serveUntilShutdown serves a built server on Run's listeners until runCtx ends
+// or a listener fails, then shuts it down.
+//
+// The background work runs under a context of its own rather than runCtx. The
+// operator's drives end on that context, and a drive that ends before Close
+// opens the claim drain deregisters its claim: Close then has nothing to hand
+// back, and a peer waits out the whole staleness window while this process's
+// engine may still be copying. So the signal only stops the listeners, and Close
+// ends the background work in its own order — engines down, then claims handed
+// back. The context is cancelled after Close returns, so nothing outlives Run.
+func serveUntilShutdown(runCtx context.Context, srv *Server, signalled <-chan os.Signal, port, grpcPort string) error {
+	backgroundCtx, cancelBackground := context.WithCancel(context.WithoutCancel(runCtx))
+	defer cancelBackground()
 	defer utils.CloseAndLog(srv)
 
 	// Optionally start a gRPC server for the Tern proto (used by
 	// docker-compose.grpc.yml). Embedders attach to their own server instead.
 	if grpcPort != "" {
 		grpcServer := newTernGRPCServer(srv.logger)
-		if err := srv.RegisterGRPC(ctx, grpcServer); err != nil {
+		if err := srv.RegisterGRPC(runCtx, grpcServer); err != nil {
 			return fmt.Errorf("register grpc tern service: %w", err)
 		}
 		var lc net.ListenConfig
-		listener, err := lc.Listen(ctx, "tcp", ":"+grpcPort)
+		listener, err := lc.Listen(runCtx, "tcp", ":"+grpcPort)
 		if err != nil {
 			return fmt.Errorf("listen on port %s: %w", grpcPort, err)
 		}
@@ -164,12 +425,12 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 				srv.logger.Error("gRPC server error", "port", grpcPort, "error", err)
 			}
 		}()
-		defer grpcServer.GracefulStop()
+		defer stopGRPCServer(grpcServer, srv.logger, grpcDrainTimeout)
 	}
 
 	// Start background loops (operator, health monitor, pending-drops cleaner,
 	// missing-summary reconciliation). Server.Close stops them.
-	srv.Start(ctx)
+	srv.Start(backgroundCtx)
 
 	server := &http.Server{
 		Addr:         ":" + port,
@@ -181,7 +442,7 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 
 	// Metrics get their own listener so scrapers never traverse the API port
 	// (see ServerConfig.MetricsPort).
-	metricsPort := strconv.Itoa(cfg.MetricsListenPort())
+	metricsPort := strconv.Itoa(srv.cfg.MetricsListenPort())
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("GET /metrics", srv.MetricsHandler())
 	metricsServer := &http.Server{
@@ -206,20 +467,19 @@ func Run(ctx context.Context, cfg *api.ServerConfig, opts ...Option) error {
 		}
 	}()
 
-	// Wait for a shutdown signal, context cancellation (embedded callers), or a
-	// fatal server error.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigCh)
-
+	// Wait for the run context to end — a shutdown signal or the caller
+	// cancelling — or for a fatal server error.
 	select {
-	case sig := <-sigCh:
-		srv.logger.Info("received shutdown signal", "signal", sig)
-	case <-ctx.Done():
-		srv.logger.Info("context canceled, shutting down", "error", ctx.Err())
+	case <-runCtx.Done():
+		logShutdownCause(runCtx, srv.logger, signalled)
 	case err := <-errCh:
 		return err
 	}
+
+	// The drives keep running until Close, but new claims stop here: an idle
+	// driver that claimed during the listener drains below would start an
+	// engine only for Close to halt it and hand the apply to a peer.
+	srv.svc.StopClaiming()
 
 	// Graceful shutdown of both HTTP servers; Server.Close (deferred) releases
 	// the rest.
@@ -242,6 +502,7 @@ type Server struct {
 	storage         storage.Storage
 	logger          *slog.Logger
 	dataPlaneClient tern.Client
+	targetResolver  inventory.Resolver
 	// grpcClient is the single-database client RegisterGRPC builds when no
 	// target resolver is configured. It is owned here (not by the service) so
 	// Close releases it; the resolver-backed dataPlaneClient is the service's
@@ -251,6 +512,35 @@ type Server struct {
 	telemetry  *api.Telemetry
 	authz      auth.Authorizer
 	engines    map[string]tern.EngineFactory
+	// probeCancel and probeDone are set by Start when a startup target probe is
+	// launched; Close cancels the probe and waits on probeDone so an in-flight
+	// probe never outlives the resolver and clients svc.Close tears down.
+	probeCancel context.CancelFunc
+	probeDone   chan struct{}
+	// dialect is the storage database's family, resolved once at build time so
+	// every later storage operation — including the operator-facing storage
+	// schema surface — routes to the same family the bootstrap converged.
+	dialect schema.Dialect
+	// storageDSN is the DSN the storage pool was opened with. It names the
+	// database this instance booted against, which is the only database its
+	// storage schema surface may read or converge.
+	storageDSN string
+	// storageSchema is the one adapter that answers for that database, built
+	// once by Build and shared by the HTTP routes and the gRPC service, so the
+	// two surfaces cannot come to disagree about which storage they describe.
+	storageSchema tern.StorageSchemaService
+	// localHosted marks a server the local runtime hosts, which carries
+	// boundaries a normally hosted one does not (AZ-6).
+	localHosted bool
+	// version is the build's SchemaBot version as the logs carry it, which
+	// means it may be the unidentifiable-build sentinel. Storage schema
+	// reports attribute this binary's embedded files to it, and take it
+	// through attributableVersion on the way, because a report is prose and
+	// the sentinel is a log value.
+	version string
+	// reconcile is the missing-summary pass Start kicked off, nil when Start
+	// has not run or the pass is not configured. Close bounds it.
+	reconcile *reconcilePass
 }
 
 // registerPlanetScaleMTLS registers the configured planetscale.mtls
@@ -287,12 +577,25 @@ func registerPlanetScaleMTLS(cfg *api.ServerConfig, logger *slog.Logger) error {
 // (RegisterGRPC / Handler), starts background work (Start), and releases
 // resources (Close). Run is Build plus SchemaBot's own gRPC/HTTP listeners.
 func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server, error) {
+	if err := cfg.ValidateExperimentalStrata(); err != nil {
+		return nil, err
+	}
 	o := options{logger: slog.Default()}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	logger := o.logger
-	logger.Info("building server", "version", o.version, "commit", o.commit, "built", o.date)
+	version := o.version
+	if version == "" {
+		// A host binary that embeds SchemaBot supplies its own logger and has no
+		// reason to know SchemaBot's version. Read it from the module graph, which
+		// is where an embedded dependency's version lives, so every log line
+		// identifies which SchemaBot the pod is running — and so does every
+		// storage schema report, which attributes its embedded files to a build.
+		version = moduleVersion()
+		logger = logger.With("schemabot_version", version)
+	}
+	logger.Info("building server", "version", version, "commit", o.commit, "built", o.date)
 
 	// Register PlanetScale mTLS before anything else so a worker with
 	// missing or unreadable certificate material fails startup immediately
@@ -334,7 +637,7 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// budget lets the pod wait the window out instead of crash-looping
 	// through it.
 	logger.Info("ensuring storage schema", "dialect", dialect)
-	db, err := bootStorage(ctx, cfg, dialect, logger)
+	db, storageDSN, err := bootStorage(ctx, cfg, dialect, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -428,9 +731,12 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 	// allow-all NoneAuthorizer that lets every request through (attaching an
 	// anonymous user); with "oidc" it validates Bearer JWTs and bypasses
 	// non-API paths (/webhook, health) itself.
-	authz, err := buildServerAuthorizer(ctx, cfg, logger)
-	if err != nil {
-		return nil, fmt.Errorf("setup auth: %w", err)
+	authz := o.authorizer
+	if authz == nil {
+		authz, err = buildServerAuthorizer(ctx, cfg, logger)
+		if err != nil {
+			return nil, fmt.Errorf("setup auth: %w", err)
+		}
 	}
 
 	// Initialize telemetry (OTel metrics via Prometheus /metrics endpoint).
@@ -439,18 +745,33 @@ func Build(ctx context.Context, cfg *api.ServerConfig, opts ...Option) (*Server,
 		return nil, fmt.Errorf("setup telemetry: %w", err)
 	}
 
-	success = true
-	return &Server{
+	var targetResolver inventory.Resolver
+	if router, ok := dataPlaneClient.(*tern.TargetRouter); ok {
+		targetResolver = router.Resolver()
+	}
+	srv := &Server{
 		cfg:             cfg,
 		svc:             svc,
 		storage:         store,
 		logger:          logger,
 		dataPlaneClient: dataPlaneClient,
+		targetResolver:  targetResolver,
 		webhook:         webhookRuntime,
 		telemetry:       telemetry,
 		authz:           authz,
 		engines:         o.engines,
-	}, nil
+		dialect:         dialect,
+		storageDSN:      storageDSN,
+		version:         version,
+		localHosted:     o.localHosted,
+	}
+
+	if err := srv.registerStorageSchema(svc); err != nil {
+		return nil, err
+	}
+
+	success = true
+	return srv, nil
 }
 
 // Storage boot retry policy. The budget is sized so that even a final attempt
@@ -473,15 +794,18 @@ const inProcessWebhookDrainTimeout = 25 * time.Second
 // failed attempts until the boot budget is spent. The DSN is re-resolved on
 // every attempt so file-backed references pick up credentials rotated while
 // the server waits.
-func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, error) {
+// It returns the DSN the successful attempt used alongside the pool, so the
+// rest of the server can name the storage it actually booted against rather
+// than re-resolving a value that may have moved since.
+func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, string, error) {
 	deadline := time.Now().Add(storageBootRetryBudget)
 	for attempt := 1; ; attempt++ {
-		db, err := connectStorage(ctx, cfg, dialect, logger)
+		db, dsn, err := connectStorage(ctx, cfg, dialect, logger)
 		if err == nil {
-			return db, nil
+			return db, dsn, nil
 		}
 		if time.Until(deadline) < storageBootRetryInterval {
-			return nil, fmt.Errorf("storage not ready after %d attempts over %s: %w", attempt, storageBootRetryBudget, err)
+			return nil, "", fmt.Errorf("storage not ready after %d attempts over %s: %w", attempt, storageBootRetryBudget, err)
 		}
 		logger.Warn("storage not ready, retrying",
 			"attempt", attempt,
@@ -490,53 +814,119 @@ func bootStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dial
 			"error", err)
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("storage boot canceled after %d attempts: %w", attempt, ctx.Err())
+			return nil, "", fmt.Errorf("storage boot canceled after %d attempts: %w", attempt, ctx.Err())
 		case <-time.After(storageBootRetryInterval):
 		}
 	}
 }
 
 // connectStorage runs a single storage boot attempt: resolve the DSN, apply
-// the storage schema, open the pool, and verify it with a ping.
-func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, error) {
+// the storage schema, open the pool, and verify it with a ping. It returns the
+// DSN it used so the caller holds the one this pool is dialing.
+//
+// Every step that can block ends when ctx does, so an instance told to stop
+// mid-attempt stops inside the attempt rather than at the end of it. The
+// convergence is the longest of the three and carries a budget of its own,
+// which is what makes that difference a minutes-long one — and it takes the
+// stop as a signal rather than as a context, because it is the one step where
+// only a deliberate stop may reach the work (AV-13).
+func connectStorage(ctx context.Context, cfg *api.ServerConfig, dialect schema.Dialect, logger *slog.Logger) (*sql.DB, string, error) {
 	const pingTimeout = 10 * time.Second
 	dsn, err := cfg.StorageDSN()
 	if err != nil {
-		return nil, fmt.Errorf("resolve storage DSN: %w", err)
+		return nil, "", fmt.Errorf("resolve storage DSN: %w", err)
 	}
 	if err := api.EnsureSchema(dsn, logger,
-		api.WithAllowDestructiveSchemaChanges(cfg.Storage.AllowDestructiveSchemaChanges),
+		api.WithStopSignal(ctx.Done()),
+		api.WithDestructiveSchemaChangePolicy(api.ConfiguredDestructivePolicy(cfg.Storage.AllowDestructiveSchemaChanges), false),
+		api.WithPostgresStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()),
 		api.WithDialect(dialect)); err != nil {
-		return nil, fmt.Errorf("ensure storage schema: %w", err)
+		return nil, "", fmt.Errorf("ensure storage schema: %w", err)
 	}
-	db, err := openStoragePool(dialect, dsn, cfg)
+	db, err := openStoragePool(dialect, dsn, cfg, logger)
 	if err != nil {
-		return nil, fmt.Errorf("open storage database: %w", err)
+		return nil, "", fmt.Errorf("open storage database: %w", err)
 	}
 	pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
 	defer cancel()
 	if err := db.PingContext(pingCtx); err != nil {
 		utils.CloseAndLog(db)
-		return nil, fmt.Errorf("ping storage database: %w", err)
+		return nil, "", fmt.Errorf("ping storage database: %w", err)
 	}
-	return db, nil
+	return db, dsn, nil
+}
+
+// pinnedStorageDSN is the reload callback the storage pool re-resolves through
+// after an authentication failure, narrowed to the one thing a reload is for.
+//
+// A rotated credential must be picked up without a restart, so the DSN is
+// re-read from the live configuration. The database it names must not move,
+// because everything downstream of the boot assumes it did not: the schema this
+// server bootstrapped is on the database it booted against, and nothing
+// bootstraps the new one. Without this guard an authentication failure is all
+// it takes — the pool re-resolves, a config that now names another database
+// answers the dial, and the server proceeds against storage whose schema it
+// never converged.
+//
+// So the reload refuses a DSN whose address or database name has changed and
+// keeps the pool on the database it booted against, failing the connection
+// rather than silently relocating. Adopting new storage is a restart.
+func pinnedStorageDSN(dialect schema.Dialect, bootDSN string, cfg *api.ServerConfig, logger *slog.Logger) func() (string, error) {
+	boot, bootErr := storageTargetFor(dialect, bootDSN)
+	return func() (string, error) {
+		if bootErr != nil {
+			return "", fmt.Errorf("read the storage target this server booted against: %w", bootErr)
+		}
+		next, err := cfg.StorageDSN()
+		if err != nil {
+			return "", fmt.Errorf("re-resolve storage DSN: %w", err)
+		}
+		resolved, err := storageTargetFor(dialect, next)
+		if err != nil {
+			return "", fmt.Errorf("read the storage target the current configuration names: %w", err)
+		}
+		if resolved != boot {
+			logger.Error("refusing to reconnect storage: the configured storage has moved since this server booted",
+				"booted_against", boot.String(),
+				"now_configured", resolved.String(),
+				"dialect", dialect)
+			return "", fmt.Errorf("the configured storage now names %s, but this server booted against %s; "+
+				"its storage schema was converged on the database it booted against, so restart it to adopt the new storage", resolved, boot)
+		}
+		return next, nil
+	}
 }
 
 // openStoragePool opens the long-lived reloadable storage pool for the
-// configured dialect. Both connectors re-resolve the DSN through
-// cfg.StorageDSN on authentication failure so a rotated storage credential
-// is picked up without a restart. The dispatch fails closed: a dialect
-// without a connector returns an error instead of dialing with another
-// family's driver.
-func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig) (*sql.DB, error) {
+// configured dialect. Both connectors re-resolve the DSN on authentication
+// failure so a rotated storage credential is picked up without a restart. The
+// dispatch fails closed: a dialect without a connector returns an error instead
+// of dialing with another family's driver.
+//
+// The reload callback is built here rather than passed in. Every pool this
+// opens must re-resolve through pinnedStorageDSN — a pool handed the raw
+// resolver follows a rewritten secret to a database nothing bootstrapped — and
+// a parameter is a place for the wrong callback to arrive. With none, there is
+// no caller left to get it wrong.
+func openStoragePool(dialect schema.Dialect, dsn string, cfg *api.ServerConfig, logger *slog.Logger) (*sql.DB, error) {
 	connectTimeout := cfg.Storage.Pool.ConnectTimeoutOrZero()
+	reload := pinnedStorageDSN(dialect, dsn, cfg, logger)
 	switch dialect {
 	case schema.DialectMySQL:
-		return mysqlconn.OpenReloadable(dsn, cfg.StorageDSN,
-			mysqlconn.WithConnectTimeout(connectTimeout))
+		return mysqlconn.OpenReloadable(dsn, reload,
+			mysqlconn.WithConnectTimeout(connectTimeout),
+			// Stored plans, locks, and applies scan timestamps into time.Time.
+			// This is a storage requirement, including after credential reload.
+			func(cfg *mysql.Config) { cfg.ParseTime = true })
 	case schema.DialectPostgres:
-		return postgresconn.OpenReloadable(dsn, cfg.StorageDSN,
-			postgresconn.WithConnectTimeout(connectTimeout))
+		// The storage pool carries a statement budget of its own so steady-state
+		// storage queries run under a value SchemaBot states rather than
+		// whatever the platform imposed at the role or database level. It is
+		// the ordinary-query budget, not the bootstrap's DDL budget: this pool
+		// never executes DDL.
+		return postgresconn.OpenReloadable(dsn, reload,
+			postgresconn.WithConnectTimeout(connectTimeout),
+			postgresconn.WithStatementTimeout(cfg.Postgres.StatementTimeoutOrDefault()))
 	default:
 		return nil, fmt.Errorf("no storage connector for storage dialect %q (supported: %q, %q)", dialect, schema.DialectMySQL, schema.DialectPostgres)
 	}
@@ -594,7 +984,15 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 		s.svc.SetDefaultTernClient(built)
 		client = built
 	}
-	tern.NewServer(client, s.logger).Register(gs)
+	// The storage-schema service answers for this instance's own storage
+	// database, which is the only way a control plane can read it: a data
+	// plane's storage is reachable from the data plane, and the gRPC endpoint
+	// is the connection that already exists between the two.
+	opts := []tern.ServerOption{}
+	if s.storageSchema != nil {
+		opts = append(opts, tern.WithStorageSchemaService(s.storageSchema))
+	}
+	tern.NewServer(client, s.logger, opts...).Register(gs)
 	return nil
 }
 
@@ -629,14 +1027,17 @@ func (s *Server) MetricsHandler() http.Handler {
 // Start launches the server's background work: the operator driver pool
 // (dispatches queued applies and recovers stale ones), the remote-deployment
 // health monitor, the webhook inbox monitor (emits durable-inbox depth/backlog
-// metrics), and the pending-drops cleaner — all of which run until ctx is
+// metrics), the startup target probe, and the pending-drops cleaner — all of which run until ctx is
 // canceled or Close is called. It also kicks off a one-shot missing-summary
-// reconciliation that, once started, runs to completion independently of ctx (it
-// repairs interrupted terminal comments and must not be cut short by a request
-// context); it runs before the operator so recovered applies attach observers
-// first.
+// reconciliation that, once started, runs independently of ctx (it repairs
+// interrupted terminal comments and must not be cut short by a request context)
+// until Close bounds it; it runs before the operator so recovered applies attach
+// observers first.
 func (s *Server) Start(ctx context.Context) {
-	s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
+	s.reconcile = s.webhook.StartMissingSummaryReconciliation(ctx, s.logger)
+	if s.targetResolver != nil {
+		s.startTargetProbe(ctx)
+	}
 	if s.webhook.startDurableWebhookDispatch != nil {
 		s.webhook.startDurableWebhookDispatch(ctx)
 	}
@@ -647,8 +1048,52 @@ func (s *Server) Start(ctx context.Context) {
 	s.svc.StartPendingDropsCleaner(ctx)
 }
 
+// startTargetProbe launches the startup target probe on its own goroutine
+// under a context Close can cancel. Per-target probes contain their own panics
+// on the pool workers (AV-5); the boundary here covers enumeration and pool
+// setup, which run on the probe goroutine itself. probeDone closes when the
+// goroutine exits, whichever way it exits. Enumeration and every per-target
+// step run under the prober's per-target timeout, so once the context is
+// cancelled Close's wait is bounded by that timeout whichever step is in
+// flight.
+func (s *Server) startTargetProbe(ctx context.Context) {
+	probeCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	s.probeCancel = cancel
+	s.probeDone = done
+	probe := targetprobe.New(s.targetResolver, s.logger, 0, 0)
+	go func() {
+		defer close(done)
+		probePanic, _ := panicsafe.Catch(func() error {
+			probe.Run(probeCtx)
+			return nil
+		})
+		if probePanic == nil {
+			return
+		}
+		s.logger.Error("target probe: enumeration panicked; the remaining startup work continues",
+			"panic", fmt.Sprint(probePanic.Value),
+			"stack", string(probePanic.Stack))
+		metrics.RecordRecoveredPanic(probeCtx, "target_probe")
+	}()
+}
+
+// stopTargetProbe cancels a running startup probe and waits for its goroutine
+// to exit. In-flight dials observe the cancellation through their context, and
+// the prober discards results cut short by it rather than recording them.
+func (s *Server) stopTargetProbe() {
+	if s.probeCancel == nil {
+		s.logger.Debug("target probe: no startup probe was started; nothing to stop")
+		return
+	}
+	s.probeCancel()
+	<-s.probeDone
+	s.logger.Info("target probe stopped")
+}
+
 // Close releases the resources the Server owns and returns all cleanup errors
-// encountered, joined together. It stops the pending-drops cleaner, stops the
+// encountered, joined together. It stops the startup target probe and the
+// pending-drops cleaner, stops the
 // operator (before closing the gRPC client it built, see below), shuts down
 // telemetry (best-effort: flush failures are logged, not returned), closes
 // that gRPC fallback client, and closes the service. svc.Close
@@ -656,11 +1101,25 @@ func (s *Server) Start(ctx context.Context) {
 // database pool); it repeats StopOperator, which is idempotent, so that is a
 // no-op. It does not stop any gRPC server the embedder owns. Safe to call once
 // after Start.
+//
+// Close returns whether or not the background work it waits for does. Every
+// stage that waits carries a bound of its own — the reconciliation pass, the
+// durable webhook pool, the in-process webhook drain, the driver pool, the
+// telemetry flush — so the worst case is their sum rather than the lifetime of
+// whichever goroutine is stuck. Each of those bounds is stated where it is
+// declared, alongside what its stage gives up by expiring; none of them gives up
+// anything another process cannot redo or reclaim, which is what makes stopping
+// the right move when the wait is the thing holding the process open.
 func (s *Server) Close() error {
+	s.stopTargetProbe()
 	s.svc.StopPendingDropsCleaner()
 	if s.webhook.stopDurableWebhookDispatch != nil {
 		s.webhook.stopDurableWebhookDispatch()
 	}
+	// The reconciliation pass runs on a context of its own, so nothing above has
+	// asked it to stop and nothing below would wait for it. Bound it here, while
+	// the storage it reads is still open.
+	s.reconcile.stop(s.logger)
 	// Drain the detached in-process webhook goroutines (non-durable event types)
 	// before closing storage below, since that already-acked work can still read
 	// or write the database. Run/embedders stop the HTTP server before Close, so
@@ -764,7 +1223,7 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st stora
 	if err != nil {
 		return nil, fmt.Errorf("resolve DSN for %s/%s: %w", dbName, env, err)
 	}
-	metadata, err := envConfig.DirectExecution.EngineMetadata()
+	metadata, err := config.DirectExecutionMetadata(&envConfig, dbConfig.Type)
 	if err != nil {
 		return nil, fmt.Errorf("resolve direct_execution metadata for %s/%s: %w", dbName, env, err)
 	}
@@ -782,32 +1241,19 @@ func buildGRPCTernClient(ctx context.Context, config *api.ServerConfig, st stora
 }
 
 // grpcLocalClientFactory returns a LocalClientFactory that applies server-level
-// policy (pending drops) and the embedder-supplied engine factories to every
-// LocalClient the data plane builds, so the router and single-database paths
-// share identical execution semantics and can resolve custom database types.
+// policy (pending drops, direct execution) and the embedder-supplied engine
+// factories to every LocalClient the data plane builds, so the router and
+// single-database paths share identical execution semantics and can resolve
+// custom database types.
 func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIdentifier, database, environment string), engineFactories map[string]tern.EngineFactory) tern.LocalClientFactory {
-	pendingDrops := strconv.FormatBool(config.PendingDropsEnabled())
 	return func(cfg tern.LocalConfig, st storage.Storage, logger *slog.Logger) (tern.Client, error) {
-		spiritMetadata, err := config.SpiritMetadata()
+		metadata, err := serverEngineMetadata(config, cfg.Metadata, cfg.Type)
 		if err != nil {
-			return nil, fmt.Errorf("resolve spirit config for database %q: %w", cfg.Database, err)
+			return nil, fmt.Errorf("resolve server policy for database %q: %w", cfg.Database, err)
 		}
-		if cfg.Metadata == nil {
-			cfg.Metadata = map[string]string{}
-		}
+		cfg.Metadata = metadata
 		cfg.PostgresNativeSafeTableSizeLimitBytes = config.Postgres.NativeSafeTableSizeLimit()
-		// Stated either way rather than only when disabled: a data plane that
-		// predates the opt-in default reads an absent key as "quarantine", so
-		// leaving it out during a rolling deploy would quarantine on a
-		// deployment that has turned the quarantine off.
-		cfg.Metadata["pending_drops"] = pendingDrops
-		// Server-level spirit overrides are defaults; a database's own
-		// metadata entry for the same key wins.
-		for key, value := range spiritMetadata {
-			if _, ok := cfg.Metadata[key]; !ok {
-				cfg.Metadata[key] = value
-			}
-		}
+		cfg.PostgresConcurrentIndexMaxDuration = config.Postgres.ConcurrentIndexMaxDurationOrDefault()
 		if cfg.WakeOperator == nil {
 			cfg.WakeOperator = wakeOperator
 		}
@@ -825,6 +1271,57 @@ func grpcLocalClientFactory(config *api.ServerConfig, wakeOperator func(applyIde
 	}
 }
 
+// serverEngineMetadata composes the engine metadata a data-plane LocalClient
+// runs under: the resolved target's own metadata, overlaid with this server's
+// pending drops, Spirit, and direct execution policy. It returns a new map so
+// the caller's is never mutated.
+func serverEngineMetadata(config *api.ServerConfig, resolved map[string]string, databaseType string) (map[string]string, error) {
+	spiritMetadata, err := config.SpiritMetadata()
+	if err != nil {
+		return nil, fmt.Errorf("resolve spirit config: %w", err)
+	}
+	directMetadata, err := config.DirectExecutionMetadata(nil, databaseType)
+	if err != nil {
+		return nil, fmt.Errorf("resolve direct_execution config: %w", err)
+	}
+	metadata := maps.Clone(resolved)
+	if metadata == nil {
+		metadata = map[string]string{}
+	}
+	// Stated either way rather than only when disabled: a data plane that
+	// predates the opt-in default reads an absent key as "quarantine", so
+	// leaving it out during a rolling deploy would quarantine on a deployment
+	// that has turned the quarantine off.
+	metadata["pending_drops"] = strconv.FormatBool(config.PendingDropsEnabled())
+	// Server-level spirit overrides are defaults; a database's own metadata
+	// entry for the same key wins.
+	for key, value := range spiritMetadata {
+		if _, ok := metadata[key]; !ok {
+			metadata[key] = value
+		}
+	}
+	// The direct execution keys are one policy, not independent
+	// defaults: a resolved target that states any of them states the whole
+	// policy, and the server-wide one does not apply. Merging key by key
+	// would let a target enable direct execution while taking its size bound
+	// from somewhere else, which is the pairing the bound exists to prevent.
+	if !hasDirectExecutionPolicy(metadata) {
+		maps.Copy(metadata, directMetadata)
+	}
+	return metadata, nil
+}
+
+// hasDirectExecutionPolicy reports whether resolved target metadata already
+// states a direct execution policy of its own.
+func hasDirectExecutionPolicy(metadata map[string]string) bool {
+	for _, key := range engine.DirectExecutionKeys() {
+		if _, ok := metadata[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
 	if len(serverConfig.Apps) > 0 {
 		return buildMultiAppWebhookRuntime(serverConfig, svc, logger)
@@ -833,23 +1330,24 @@ func buildWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logge
 }
 
 func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Service, logger *slog.Logger) (webhookRuntime, error) {
-	if !serverConfig.GitHub.Configured() {
-		if serverConfig.GitHub.PrivateKey != "" {
-			logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled")
-		}
-		return webhookRuntime{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			if _, err := w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`)); err != nil {
-				logger.Error("failed to write disabled webhook response", "method", r.Method, "path", r.URL.Path, "error", err)
-			}
-		})}, nil
+	// The credentials are resolved once and the outcome decides the runtime.
+	// An App that is not configured, or whose credentials are declared but not
+	// available yet, serves a disabled endpoint. A malformed app ID is a
+	// configuration error, not credentials still on their way, so it fails
+	// startup rather than serving with GitHub disabled.
+	creds, err := serverConfig.GitHub.ResolveCredentials()
+	switch {
+	case err == nil:
+	case errors.Is(err, api.ErrGitHubAppNotConfigured):
+		logger.Info("GitHub App not configured — webhook endpoint disabled")
+		return disabledWebhookRuntime(logger), nil
+	case errors.Is(err, api.ErrGitHubAppCredentialsUnavailable):
+		logger.Warn("GitHub App config found but credentials not available yet — webhook endpoint disabled", "error", err)
+		return disabledWebhookRuntime(logger), nil
+	default:
+		return webhookRuntime{}, fmt.Errorf("github: %w", err)
 	}
 
-	ghPrivateKey, err := serverConfig.GitHub.ResolvePrivateKey()
-	if err != nil {
-		return webhookRuntime{}, fmt.Errorf("resolve GitHub private key: %w", err)
-	}
 	ghWebhookSecret, err := serverConfig.GitHub.ResolveWebhookSecret()
 	if err != nil {
 		return webhookRuntime{}, fmt.Errorf("resolve GitHub webhook secret: %w", err)
@@ -863,8 +1361,7 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		return webhookRuntime{}, fmt.Errorf("resolve GitHub repo-webhook secret: %w", err)
 	}
 
-	appID := serverConfig.GitHub.ResolveAppID()
-	ghClient := ghclient.NewClient(appID, []byte(ghPrivateKey), logger,
+	ghClient := ghclient.NewClient(creds.AppID, []byte(creds.PrivateKey), logger,
 		ghclient.WithTrustedCheckAppSlugs(serverConfig.GitHub.TrustedCheckAppSlugs),
 		ghclient.WithConfigDirHints(serverConfig))
 	handlerOpts := append([]webhook.HandlerOption{
@@ -873,10 +1370,11 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
+	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
 	handler := webhook.NewHandler(svc, ghClient, []byte(ghWebhookSecret), logger, handlerOpts...)
 	svc.SetCheckRunBackfiller(handler)
 	logger.Info("GitHub webhook endpoint registered",
-		"app_id", appID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
+		"app_id", creds.AppID, "trusted_check_app_slugs", serverConfig.GitHub.TrustedCheckAppSlugs,
 		"repo_webhook_dispatch", repoWebhookSecret != "")
 	return webhookRuntime{
 		startDurableWebhookDispatch:     handler.StartDurableWebhookDispatch,
@@ -885,6 +1383,18 @@ func buildSingleAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servi
 		handler:                         handler,
 		reconcileMissingSummaryComments: handler.ReconcileMissingSummaryComments,
 	}, nil
+}
+
+// disabledWebhookRuntime serves the webhook path while GitHub is off: every
+// request is answered 503 so a delivery is refused rather than dropped.
+func disabledWebhookRuntime(logger *slog.Logger) webhookRuntime {
+	return webhookRuntime{handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if _, err := w.Write([]byte(`{"error":"GitHub App credentials not available — webhook endpoint is disabled"}`)); err != nil {
+			logger.Error("failed to write disabled webhook response", "method", r.Method, "path", r.URL.Path, "error", err)
+		}
+	})}
 }
 
 // buildMultiAppWebhookRuntime constructs a webhook handler that dispatches
@@ -950,6 +1460,7 @@ func buildMultiAppWebhookRuntime(serverConfig *api.ServerConfig, svc *api.Servic
 		webhook.WithWebhookReconciler(),
 	}, webhookReconcileSynthesisOptions(logger)...)
 	handlerOpts = append(handlerOpts, checkSuiteRecoveryOptions(logger)...)
+	handlerOpts = append(handlerOpts, webhookReconcileScanBoundsOptions(logger)...)
 	handler := webhook.NewHandlerWithDispatch(
 		svc,
 		ghclient.NewClientSet(clients),
@@ -1002,6 +1513,55 @@ func webhookReconcileSynthesisOptions(logger *slog.Logger) []webhook.HandlerOpti
 	return []webhook.HandlerOption{webhook.WithWebhookReconcileSynthesis()}
 }
 
+// webhookReconcileScanBoundsOptions returns the handler option sizing the
+// reconciler's missing-delivery scan from WEBHOOK_RECONCILE_MAX_PAGES (an
+// integer page budget per repository per pass, at least
+// webhook.MinWebhookReconcileMaxPages) and
+// WEBHOOK_RECONCILE_LOOKBACK (a positive Go duration such as 24h). Either may
+// be set alone; an unset variable keeps the package default. Unlike the kill
+// switches above, a malformed value here has no safe direction to fail in —
+// the operator is tuning, not disabling — so it is logged and ignored, and the
+// default stays in force.
+func webhookReconcileScanBoundsOptions(logger *slog.Logger) []webhook.HandlerOption {
+	maxPages, lookback := parseWebhookReconcileScanBounds(logger)
+	if maxPages == 0 && lookback == 0 {
+		return nil
+	}
+	logger.Info("webhook reconcile scan bounds configured from environment",
+		"max_pages", maxPages, "lookback", lookback)
+	return []webhook.HandlerOption{webhook.WithWebhookReconcileScanBounds(maxPages, lookback)}
+}
+
+// parseWebhookReconcileScanBounds reads the scan-bound environment variables,
+// returning zero for each that is unset or rejected.
+func parseWebhookReconcileScanBounds(logger *slog.Logger) (maxPages int, lookback time.Duration) {
+	if value := os.Getenv("WEBHOOK_RECONCILE_MAX_PAGES"); value != "" {
+		switch parsed, err := strconv.Atoi(value); {
+		case err != nil:
+			logger.Error("invalid WEBHOOK_RECONCILE_MAX_PAGES value; the default reconcile page budget stays in force",
+				"value", value, "error", err)
+		case parsed < webhook.MinWebhookReconcileMaxPages:
+			logger.Error("WEBHOOK_RECONCILE_MAX_PAGES is below the smallest page budget a pass can split between its fresh walk and resumed scan; the default reconcile page budget stays in force",
+				"value", value, "min_pages", webhook.MinWebhookReconcileMaxPages)
+		default:
+			maxPages = parsed
+		}
+	}
+	if value := os.Getenv("WEBHOOK_RECONCILE_LOOKBACK"); value != "" {
+		switch parsed, err := time.ParseDuration(value); {
+		case err != nil:
+			logger.Error("invalid WEBHOOK_RECONCILE_LOOKBACK value; the default reconcile lookback stays in force",
+				"value", value, "error", err)
+		case parsed <= 0:
+			logger.Error("WEBHOOK_RECONCILE_LOOKBACK must be a positive duration; the default reconcile lookback stays in force",
+				"value", value)
+		default:
+			lookback = parsed
+		}
+	}
+	return maxPages, lookback
+}
+
 // checkSuiteRecoveryOptions returns the handler option enabling durable
 // check_suite.requested recovery, unless the operator disabled it with
 // WEBHOOK_CHECK_SUITE_RECOVERY=false. The kill switch makes the webhook
@@ -1030,9 +1590,9 @@ func checkSuiteRecoveryOptions(logger *slog.Logger) []webhook.HandlerOption {
 
 // buildServerAuthorizer constructs the API authorizer exactly as the server
 // wires it: admin teams from PR command authorization, and the operator-group
-// union that widens forward-auth write admission. Every server build and any
-// test that claims to exercise the real authorizer wiring must go through
-// this function, so the union cannot be dropped from one without the other.
+// union that widens forward-auth write admission. Hosted server builds and tests of their configured authorization use this
+// function. The local host injects its private-token authorizer separately and
+// rejects service authentication configuration before Build.
 func buildServerAuthorizer(ctx context.Context, cfg *api.ServerConfig, logger *slog.Logger) (auth.Authorizer, error) {
 	return buildAuthorizer(ctx, cfg.Auth, cfg.PRCommandAuthorization.AdminTeams, cfg.OperatorGroupUnion(), logger)
 }
@@ -1062,7 +1622,7 @@ func buildAuthorizer(ctx context.Context, cfg api.AuthConfig, adminGroups, opera
 			return nil, err
 		}
 		if len(adminGroups) == 0 {
-			logger.Warn("OIDC authentication enabled with no admin groups configured: all write operations will be denied (read and plan still work). Set pr_command_authorization.admin_teams to allow writes.")
+			logger.Warn("OIDC authentication enabled with no admin groups configured: every write-tier operation, plan included, will be denied; read-tier operations still work. Set pr_command_authorization.admin_teams to allow writes.")
 		}
 		logger.Info("OIDC authentication enabled", "issuer", cfg.Issuer)
 		return authz, nil

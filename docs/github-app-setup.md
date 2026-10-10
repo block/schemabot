@@ -5,22 +5,14 @@
 ## Table of Contents
 
 - [1. Create a GitHub App](#1-create-a-github-app)
-  - [Basic Information](#basic-information)
-  - [Webhook](#webhook)
-  - [Permissions](#permissions)
-  - [Subscribe to Events](#subscribe-to-events)
-  - [Where Can This GitHub App Be Installed?](#where-can-this-github-app-be-installed)
-  - [Create the App](#create-the-app)
 - [2. Generate a Private Key](#2-generate-a-private-key)
 - [3. Install the App](#3-install-the-app)
 - [4. Configure SchemaBot](#4-configure-schemabot)
 - [5. Start SchemaBot](#5-start-schemabot)
 - [6. Add `schemabot.yaml` Config to Your Repository](#6-add-schemabotyaml-config-to-your-repository)
-  - [Schema File Layout](#schema-file-layout)
 - [7. Test It](#7-test-it)
 - [Environment Variables Reference](#environment-variables-reference)
 - [Webhook Ingress](#webhook-ingress)
-  - [IP Allowlisting](#ip-allowlisting)
 - [Webhook Signature Validation](#webhook-signature-validation)
 - [Repository-level Webhooks (optional)](#repository-level-webhooks-optional)
 - [Troubleshooting](#troubleshooting)
@@ -162,7 +154,17 @@ You should see:
 
 ## 6. Add `schemabot.yaml` Config to Your Repository
 
-Create a `schemabot.yaml` file in the directory containing your schema SQL files:
+You don't have to write the schema directory by hand. Once the database is registered in the
+server config (step 4), `schemabot onboard -d mydb -e staging -s ./schema` pulls the live
+schema and generates the whole directory — `schemabot.yaml`, a subdirectory per namespace
+(the schema name on MySQL, the keyspace on Vitess), and one `.sql` file per table — then
+verifies the result plans clean against the source environment. Use `--dry-run` to preview
+the files first. Onboard always generates the namespace-subdirectory layout shown under
+[Schema File Layout](#schema-file-layout) below; the flat MySQL layout there is a
+hand-maintained alternative.
+
+Create (or let `schemabot onboard` create) a `schemabot.yaml` file in the directory containing
+your schema SQL files:
 
 ```
 my-repo/
@@ -181,14 +183,25 @@ type: mysql
 | Field | Required | Description |
 |-------|----------|-------------|
 | `database` | Yes | Must match a database name in your SchemaBot server config |
-| `type` | Yes | `"mysql"` or `"vitess"` |
+| `type` | Yes | `"mysql"`, `"vitess"`, `"strata"` (experimental; requires server opt-in — see [Strata](strata-engine.md)), or `"postgres"` |
 | `ignore_namespaces` | No | Namespace subdirectories to exclude from plans, applies, and checks (see [Ignoring Namespaces](namespaces.md#ignoring-namespaces)) |
+| `ignore_tables` | No | Live table names to withhold from the planner, so an undeclared table is neither created nor dropped. An entry wrapped in slashes, such as `/^relay_[0-9]+_feed$/`, is a regular expression matched against the whole name (see [Ignoring Tables](namespaces.md#ignoring-tables)) |
 
 Environment availability and promotion order are configured on the SchemaBot server.
 
 ### Schema File Layout
 
-**MySQL** (flat structure):
+**MySQL** (schema-name subdirectory — what `schemabot onboard` generates):
+
+```
+schema/
+  schemabot.yaml
+  mydb/
+    users.sql
+    orders.sql
+```
+
+**MySQL** (flat structure, hand-maintained):
 
 ```
 schema/
@@ -246,13 +259,27 @@ schemabot plan                  # Plan for all configured environments
 schemabot plan -d mydb          # Plan for a specific database (multi-db repos)
 ```
 
+### First apply for a schema directory that is already merged
+
+SchemaBot plans a database when the PR changes a file under its schema directory. A PR that changes nothing there gets a passing `No schema files changed` check, even when the database itself is still empty. That is the usual shape of a new database: the declarative schema files merge first, and the database is configured on the SchemaBot server afterwards, so no PR diff is left to trigger the plan.
+
+Reconcile the drift with a nonce edit. Add or toggle a `# nonce` comment line in the database's `schemabot.yaml` and open the PR. The change is inert, but it sits in the schema directory, so SchemaBot plans the whole directory against the live schema and the plan shows every table to create, including the ones whose files the PR did not touch. Apply from the plan comment as usual:
+
+```
+schemabot apply -e staging
+```
+
+The same edit reconciles drift on any database, not only a new one. See [Reconciling drift with a nonce edit](pre-merge-workflow.md#reconciling-drift-with-a-nonce-edit).
+
 ## Environment Variables Reference
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `SCHEMABOT_CONFIG_FILE` | Yes | — | Path to server config YAML |
+| `STORAGE_DSN` | No | — | Fallback storage DSN if `storage.dsn` is not set in config |
 | `GITHUB_APP_ID` | No | — | Fallback if `github.app-id` is not set in config |
 | `PORT` | No | `8080` | HTTP server port |
+| `GRPC_PORT` | No | — | gRPC server port; the gRPC listener starts only when this is set |
 | `LOG_LEVEL` | No | `info` | `debug`, `info`, `warn`, `error` |
 
 GitHub credentials (`private-key`, `webhook-secret`) are configured in the YAML config file using secret references, not environment variables. This keeps all configuration in one place and supports any secret backend.
@@ -301,6 +328,8 @@ github:
 
 When `repo-webhook-secret` is set, deliveries whose `X-GitHub-Hook-Installation-Target-Type` header is `repository` are HMAC-verified against this secret. Such deliveries carry no installation id in their payload, so SchemaBot resolves the App's installation for the repo via the App JWT and caches it. Leave `repo-webhook-secret` unset to disable this path; App-installed deliveries are unaffected either way.
 
+Follow the [pre-merge workflow](pre-merge-workflow.md) to take your first schema change through review, apply, and merge.
+
 ## Troubleshooting
 
 **Webhook not receiving events**: Check that the webhook URL is reachable from GitHub. Use the **Recent Deliveries** tab on your GitHub App's settings page to see delivery attempts and response codes.
@@ -309,4 +338,14 @@ When `repo-webhook-secret` is set, deliveries whose `X-GitHub-Hook-Installation-
 
 **"No schemabot.yaml config found" comment**: SchemaBot couldn't find a `schemabot.yaml` file in the PR's changed file directories. Make sure the file exists and is committed to the PR branch.
 
-**"database not found" comment**: The `database` field in `schemabot.yaml` doesn't match any database in your SchemaBot server config. The names must match exactly.
+**"Database Not Found" comment**: A command's `-d` flag named a database that no `schemabot.yaml` in the repository declares. Check the `database` field of the intended `schemabot.yaml`; the comparison is case-insensitive. On a repository too large for GitHub to return its full tree, SchemaBot searches only the directories listed under the database's `allowed_dirs` in the server config, and the comment lists the directories it searched.
+
+**"Database Not Available to This Repository" comment**: A command's `-d` flag named a database whose `allowed_repos` in the server config does not include this repository. No `schemabot.yaml` in the repository can manage that database, so none was searched. Add the repository to the database's `allowed_repos` if it should manage the database.
+
+**"Database Not Configured" comment**: A command's `-d` flag named a database that has no key under `databases:` in your SchemaBot server config. The repository's `schemabot.yaml` may be correct; the database still has to be configured on the server before SchemaBot can plan or apply changes for it. On a repository shared by several SchemaBot deployments, only a deployment named with `-t`, or one that is not the aggregate leader, answers this way; the leader keeps searching the repository so a database no deployment serves is still reported.
+
+**"Database Not Registered" comment**: On a repository shared by several SchemaBot deployments, the PR's `schemabot.yaml` declares a database the aggregate leader has no key for under `databases:`, and its schema directory is under none of the paths the leader expects another deployment to report on. The comment speaks only for the deployment named in its header: a leader serving other environments keeps its own registry and may register the database. When several leaders split a repository's environments, only one answers: the leader serving the command's `-e` environment, or, for a command without `-e`, the leader serving the first environment in `environment_order`. The others log the decision and stay silent. When the PR carries several such configs, the one reply lists them all under "Databases Not Registered". If a database is new to SchemaBot, register it on that deployment with an `allowed_dirs` entry naming its schema directory; if it is already registered, move the `schemabot.yaml` and its schema files under the directory registered for it.
+
+**"Repository Too Large to Search" comment**: GitHub truncated the repository tree, and the server config gave SchemaBot no exhaustive set of directories to search instead. Give the database an `allowed_dirs` entry naming its schema directory so discovery can probe that directory alone.
+
+**"not configured on this SchemaBot instance" comment**: The `database` field in `schemabot.yaml` doesn't match any key under `databases:` in your SchemaBot server config. The consumer value is folded to lowercase before matching, so only the letters need to agree with the (lowercase) server key.

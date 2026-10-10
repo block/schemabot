@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -665,6 +666,24 @@ func (ic *InstallationClient) EditIssueComment(ctx context.Context, repo string,
 	return nil
 }
 
+// DeleteIssueComment removes an existing PR/issue comment from the timeline.
+// A comment GitHub no longer has (404) counts as deleted: retirement sweeps
+// retry failed deletes, and a retry after a crash — or after a human removed
+// the comment first — must converge instead of failing forever.
+func (ic *InstallationClient) DeleteIssueComment(ctx context.Context, repo string, commentID int64) error {
+	owner, repoName := splitRepo(repo)
+	resp, err := ic.client.Issues.DeleteComment(ctx, owner, repoName, commentID)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound {
+			ic.logger.Info("issue comment already gone on GitHub; treating delete as complete",
+				"repo", repo, "comment_id", commentID)
+			return nil
+		}
+		return fmt.Errorf("delete issue comment %d: %w", commentID, err)
+	}
+	return nil
+}
+
 // MinimizeComment collapses a PR comment in the GitHub timeline as outdated.
 // The comment stays expandable — minimizing hides it from the default view
 // without editing or deleting the record. GitHub exposes this only through
@@ -947,12 +966,35 @@ const maxGitHubCompareFiles = 300
 
 // FetchPRFiles gets the list of files changed in a PR.
 //
+// Like FetchPullRequest, it honours the request-scoped cache attached to ctx
+// via WithPRInfoCache, so the discovery, safety-check, and per-environment
+// schema reads within one webhook delivery share a single listing and by
+// construction see the same one. Callers without a cache on ctx fetch on every
+// call. Only a complete listing is cached: a capped one is an error, and the
+// caller that meets it fails closed rather than planning from it.
+//
 // When the PR changes more files than GitHub will report (ErrPRFilesIncomplete),
 // the returned slice still carries the visible prefix of the listing alongside
 // the error. That prefix must never be planned from — the withheld tail could
 // hold a schema change — but callers may inspect it to describe the cap, e.g.
 // whether the PR visibly touches schema at all.
 func (ic *InstallationClient) FetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
+	cache := prInfoCacheFromContext(ctx)
+	if cache == nil {
+		return ic.fetchPRFiles(ctx, repo, pr)
+	}
+	if files, ok := cache.getFiles(repo, pr); ok {
+		return slices.Clone(files), nil
+	}
+	files, err := ic.fetchPRFiles(ctx, repo, pr)
+	if err != nil {
+		return files, err
+	}
+	cache.setFiles(repo, pr, files)
+	return files, nil
+}
+
+func (ic *InstallationClient) fetchPRFiles(ctx context.Context, repo string, pr int) ([]PRFile, error) {
 	owner, repoName := splitRepo(repo)
 	opts := &gh.ListOptions{PerPage: 100}
 	var allFiles []PRFile
@@ -1042,35 +1084,13 @@ func (ic *InstallationClient) FetchChangedFilesBetween(ctx context.Context, repo
 // base branch advancing mid-check cannot make the merge-base lookup and the
 // tree reads observe different commits.
 func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Context, repo, baseRef, headSHA string, schemaPaths []string) (changed bool, baseTipSHA string, err error) {
-	owner, repoName := splitRepo(repo)
-	tip, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve base branch tip", []any{"repo", repo, "base_ref", baseRef}, func(ctx context.Context) (*gh.Reference, error) {
-		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+baseRef)
-		if err != nil {
-			return nil, fmt.Errorf("get ref heads/%s: %w", baseRef, classifyGitHubAPIError(err))
-		}
-		return ref, nil
-	})
+	baseTipSHA, err = ic.branchTipSHA(ctx, repo, baseRef)
 	if err != nil {
 		return false, "", err
 	}
-	baseTipSHA = tip.GetObject().GetSHA()
-	if baseTipSHA == "" {
-		return false, "", fmt.Errorf("ref heads/%s for %s resolved to no commit", baseRef, repo)
-	}
-
-	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "find pull request merge base", []any{"repo", repo, "base_ref", baseRef, "base_tip_sha", baseTipSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
-		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseTipSHA, headSHA, nil)
-		if err != nil {
-			return nil, fmt.Errorf("compare commits %s...%s: %w", baseTipSHA, headSHA, classifyGitHubAPIError(err))
-		}
-		return comparison, nil
-	})
+	mergeBaseSHA, err := ic.mergeBaseSHA(ctx, repo, baseTipSHA, headSHA)
 	if err != nil {
 		return false, baseTipSHA, err
-	}
-	mergeBaseSHA := comparison.GetMergeBaseCommit().GetSHA()
-	if mergeBaseSHA == "" {
-		return false, baseTipSHA, fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseTipSHA, headSHA, repo)
 	}
 
 	levelCache := make(map[string][]TreeEntry)
@@ -1092,6 +1112,432 @@ func (ic *InstallationClient) SchemaPathsChangedSinceMergeBase(ctx context.Conte
 		}
 	}
 	return false, baseTipSHA, nil
+}
+
+// maxSchemaSymlinkReads bounds how many distinct symlinks a schema change
+// comparison reads, so a directory full of links or a chain of them cannot
+// turn one comparison into an unbounded number of GitHub reads. Links with
+// the same target text share one read. The value is a safety valve, not a
+// measured limit: schema directories normally hold a handful of links (an
+// environment link, a few shared namespaces), so it leaves wide headroom
+// while keeping a comparison's reads small. A comparison that passes half of
+// it logs a warning, so a repository growing toward it is visible before its
+// earlier approvals stop counting.
+const maxSchemaSymlinkReads = 64
+
+// SchemaChangeComparison is the outcome of PRSchemaChangeUnchangedSince.
+type SchemaChangeComparison struct {
+	// Unchanged is true when the pull request's change to the schema paths is
+	// the same at both commits.
+	Unchanged bool
+	// DifferingPath names the first path where the change differs.
+	DifferingPath string
+	// BaseTipSHA, ApprovedMergeBaseSHA, and HeadMergeBaseSHA are the commits
+	// the comparison was measured against, for operator logs.
+	BaseTipSHA           string
+	ApprovedMergeBaseSHA string
+	HeadMergeBaseSHA     string
+	// BaseMovedForward is true when the head's merge base is the approved
+	// commit's merge base or a descendant of it.
+	BaseMovedForward bool
+}
+
+// PRSchemaChangeUnchangedSince reports whether the change a pull request
+// makes to paths is the same at approvedSHA as at headSHA, so an approval of
+// approvedSHA still describes the change at the head.
+//
+// Each commit is measured against its merge base with the base branch's
+// current tip: the base branch content it was built on. A path is unchanged
+// when the pull request turns the same base content into the same result at
+// both commits, or when it leaves the path as its base branch has it at both
+// commits, so any difference came from the base branch rather than from the
+// pull request. That second rule holds only when the head's base content is
+// newer than the approved commit's: the head's merge base must descend from
+// the approved commit's. A head rebuilt on older base content would otherwise
+// carry an older version of a path the pull request never touched, which
+// nobody approved for this change. Identical content on different bases is
+// not unchanged either: the head would undo or overwrite the base branch's
+// change. Rebasing onto, or
+// merging in, a newer base branch therefore leaves the change unchanged; a
+// path the pull request edits, adds, deletes, or resolves differently at the
+// head does not. Directories that satisfy neither are compared entry by entry.
+//
+// Git objects are content-addressed, so content is compared by object SHA,
+// type, and mode, and a path absent at a commit is compared as absent. A
+// symlink's object holds only its target, so every symlink at or inside a
+// path is followed and its target compared by the same rule.
+//
+// An error means the comparison could not be completed and proves nothing:
+// GitHub was unavailable, a commit or tree could not be read, a directory was
+// too large to list completely, a path runs through a symlink, a symlink
+// points outside the repository, or there were more distinct symlinks to read
+// than maxSchemaSymlinkReads.
+func (ic *InstallationClient) PRSchemaChangeUnchangedSince(ctx context.Context, repo, baseRef, approvedSHA, headSHA string, paths []string) (SchemaChangeComparison, error) {
+	var result SchemaChangeComparison
+	baseTipSHA, err := ic.branchTipSHA(ctx, repo, baseRef)
+	if err != nil {
+		return result, err
+	}
+	result.BaseTipSHA = baseTipSHA
+	if result.ApprovedMergeBaseSHA, err = ic.mergeBaseSHA(ctx, repo, baseTipSHA, approvedSHA); err != nil {
+		return result, err
+	}
+	if result.HeadMergeBaseSHA, err = ic.mergeBaseSHA(ctx, repo, baseTipSHA, headSHA); err != nil {
+		return result, err
+	}
+	if result.BaseMovedForward, err = ic.isAncestorOrSame(ctx, repo, result.ApprovedMergeBaseSHA, result.HeadMergeBaseSHA); err != nil {
+		return result, err
+	}
+
+	comparer := &schemaChangeComparer{
+		ic:               ic,
+		repo:             repo,
+		commits:          [4]string{approvedSHA, result.ApprovedMergeBaseSHA, headSHA, result.HeadMergeBaseSHA},
+		baseMovedForward: result.BaseMovedForward,
+		levelCache:       make(map[string][]TreeEntry),
+		symlinkText:      make(map[string]string),
+	}
+	differingPath, err := comparer.compare(ctx, paths)
+	if err != nil {
+		return result, fmt.Errorf("compare schema change in %s between approved commit %s and head %s: %w", repo, approvedSHA, headSHA, err)
+	}
+	result.DifferingPath = differingPath
+	result.Unchanged = differingPath == ""
+	return result, nil
+}
+
+// Sides of a schema change comparison, indexing schemaChangeComparer.commits.
+const (
+	sideApproved = iota
+	sideApprovedBase
+	sideHead
+	sideHeadBase
+)
+
+// gitSide is a path's tree entry at one commit; found is false when the path
+// is absent there.
+type gitSide struct {
+	entry TreeEntry
+	found bool
+}
+
+func sameGitObject(x, y gitSide) bool {
+	if x.found != y.found {
+		return false
+	}
+	return !x.found || (x.entry.SHA == y.entry.SHA && x.entry.Type == y.entry.Type && x.entry.Mode == y.entry.Mode)
+}
+
+type schemaChangeComparer struct {
+	ic      *InstallationClient
+	repo    string
+	commits [4]string
+	// baseMovedForward is true when the head's merge base descends from the
+	// approved commit's, so a path the pull request leaves as its base has it
+	// at both commits differs only by newer base content.
+	baseMovedForward bool
+	levelCache       map[string][]TreeEntry
+	// symlinkText caches each symlink object's target text by blob SHA, so
+	// links with the same target text cost one read.
+	symlinkText map[string]string
+	// warnedSymlinkBudget is set once the comparison has logged that it read
+	// more than half of maxSchemaSymlinkReads.
+	warnedSymlinkBudget bool
+}
+
+type schemaChangeItem struct {
+	path  string
+	sides [4]gitSide
+	// resolved is false for a top-level path or symlink target, whose sides
+	// are resolved from the commits when the item is processed.
+	resolved bool
+}
+
+// compare walks paths and returns the first one where the pull request's
+// change differs, or "" when it is unchanged everywhere.
+func (c *schemaChangeComparer) compare(ctx context.Context, paths []string) (string, error) {
+	var pending []schemaChangeItem
+	for _, p := range paths {
+		pending = append(pending, schemaChangeItem{path: path.Clean(p)})
+	}
+	visited := make(map[string]bool)
+	var unchangedDirs []string
+	for len(pending) > 0 {
+		item := pending[0]
+		pending = pending[1:]
+		if !item.resolved {
+			// An unchanged directory's verdict holds for everything inside it.
+			if visited[item.path] || pathInsideAny(item.path, unchangedDirs) {
+				continue
+			}
+			visited[item.path] = true
+			for i, commit := range c.commits {
+				entry, found, err := c.ic.resolveGitTreeEntry(ctx, c.repo, commit, item.path, c.levelCache)
+				if err != nil {
+					return "", fmt.Errorf("resolve %s at %s: %w", item.path, commit, err)
+				}
+				item.sides[i] = gitSide{entry: entry, found: found}
+			}
+		}
+
+		s := item.sides
+		identical := sameGitObject(s[sideApproved], s[sideHead])
+		switch {
+		case sameChange(s) || (c.baseMovedForward && untouchedByPR(s)):
+			sides := []gitSide{s[sideHead]}
+			if !identical {
+				sides = append(sides, s[sideApproved])
+			}
+			targets, err := c.symlinkTargets(ctx, item.path, sides)
+			if err != nil {
+				return "", err
+			}
+			for _, target := range targets {
+				pending = append(pending, schemaChangeItem{path: target})
+			}
+			if s[sideHead].entry.Type == "tree" || s[sideApproved].entry.Type == "tree" {
+				unchangedDirs = append(unchangedDirs, item.path)
+			}
+		case onlyTrees(s):
+			children, err := c.children(ctx, item.path, s)
+			if err != nil {
+				return "", err
+			}
+			pending = append(pending, children...)
+		default:
+			return item.path, nil
+		}
+	}
+	return "", nil
+}
+
+// sameChange reports whether the pull request turns the same base content
+// into the same result at both commits. Identical results on different bases
+// are not the same change: the head would then undo, or overwrite, what the
+// base branch changed there.
+func sameChange(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideApprovedBase], sides[sideHeadBase]) && sameGitObject(sides[sideApproved], sides[sideHead])
+}
+
+// untouchedByPR reports whether the pull request leaves the path as its base
+// branch has it at both commits, so any difference between them came from the
+// base branch.
+func untouchedByPR(sides [4]gitSide) bool {
+	return sameGitObject(sides[sideApproved], sides[sideApprovedBase]) && sameGitObject(sides[sideHead], sides[sideHeadBase])
+}
+
+// onlyTrees reports whether every side where the path exists is a directory,
+// so its entries can be compared one by one.
+func onlyTrees(sides [4]gitSide) bool {
+	for _, side := range sides {
+		if side.found && side.entry.Type != "tree" {
+			return false
+		}
+	}
+	return true
+}
+
+// children lists dir's entries on every side and pairs them by name, so each
+// entry is compared at all four commits.
+func (c *schemaChangeComparer) children(ctx context.Context, dir string, sides [4]gitSide) ([]schemaChangeItem, error) {
+	byName := make(map[string]*schemaChangeItem)
+	var names []string
+	for i, side := range sides {
+		if !side.found {
+			continue
+		}
+		entries, cached := c.levelCache[side.entry.SHA]
+		if !cached {
+			var err error
+			entries, _, err = c.ic.fetchGitTreeShallow(ctx, c.repo, side.entry.SHA)
+			if err != nil {
+				return nil, fmt.Errorf("list %s at %s: %w", dir, c.commits[i], err)
+			}
+			c.levelCache[side.entry.SHA] = entries
+		}
+		for _, entry := range entries {
+			child, ok := byName[entry.Path]
+			if !ok {
+				child = &schemaChangeItem{path: path.Join(dir, entry.Path), resolved: true}
+				byName[entry.Path] = child
+				names = append(names, entry.Path)
+			}
+			child.sides[i] = gitSide{entry: entry, found: true}
+		}
+	}
+	sort.Strings(names)
+	items := make([]schemaChangeItem, 0, len(names))
+	for _, name := range names {
+		items = append(items, *byName[name])
+	}
+	return items, nil
+}
+
+// symlinkTargets returns the repo-relative target of the symlink at p, or of
+// every symlink inside the directory at p, on each of sides.
+func (c *schemaChangeComparer) symlinkTargets(ctx context.Context, p string, sides []gitSide) ([]string, error) {
+	var links []TreeEntry
+	listed := make(map[string]bool)
+	for _, side := range sides {
+		if !side.found || listed[side.entry.SHA] {
+			continue
+		}
+		listed[side.entry.SHA] = true
+		switch {
+		case side.entry.Type == "tree":
+			dirLinks, err := c.ic.symlinksInTree(ctx, c.repo, p, side.entry.SHA)
+			if err != nil {
+				return nil, err
+			}
+			links = append(links, dirLinks...)
+		case side.entry.Mode == gitSymlinkMode:
+			links = append(links, TreeEntry{Path: p, Mode: side.entry.Mode, Type: side.entry.Type, SHA: side.entry.SHA})
+		}
+	}
+	return c.resolveSymlinks(ctx, links)
+}
+
+// resolveSymlinks returns the repo-relative target of each link. Every link
+// whose target text has not been read yet costs a blob read, so the budget is
+// checked for all of them before any is read.
+func (c *schemaChangeComparer) resolveSymlinks(ctx context.Context, links []TreeEntry) ([]string, error) {
+	unread := make(map[string]bool)
+	for _, link := range links {
+		if _, ok := c.symlinkText[link.SHA]; !ok {
+			unread[link.SHA] = true
+		}
+	}
+	distinct := len(c.symlinkText) + len(unread)
+	if distinct > maxSchemaSymlinkReads {
+		return nil, fmt.Errorf("schema paths in repo %s hold %d distinct symlinks, more than the %d a comparison reads",
+			c.repo, distinct, maxSchemaSymlinkReads)
+	}
+	if distinct > maxSchemaSymlinkReads/2 && !c.warnedSymlinkBudget {
+		c.warnedSymlinkBudget = true
+		c.ic.logger.Warn("review gate comparison read more than half of its symlink budget; past the budget, approvals on earlier commits stop counting",
+			"repo", c.repo, "approved_sha", c.commits[sideApproved], "head_sha", c.commits[sideHead],
+			"distinct_symlinks", distinct, "symlink_budget", maxSchemaSymlinkReads)
+	}
+	targets := make([]string, 0, len(links))
+	for _, link := range links {
+		text, ok := c.symlinkText[link.SHA]
+		if !ok {
+			var err error
+			text, err = c.ic.FetchBlobContent(ctx, c.repo, link.SHA)
+			if err != nil {
+				return nil, fmt.Errorf("read symlink %s in repo %s: %w", link.Path, c.repo, err)
+			}
+			c.symlinkText[link.SHA] = text
+		}
+		target, err := symlinkTargetPath(c.repo, link.Path, text)
+		if err != nil {
+			return nil, err
+		}
+		targets = append(targets, target)
+	}
+	return targets, nil
+}
+
+// branchTipSHA resolves branch to the commit it points at now.
+func (ic *InstallationClient) branchTipSHA(ctx context.Context, repo, branch string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	tip, err := retryGitHubUnavailableRead(ctx, ic.logger, "resolve branch tip", []any{"repo", repo, "branch", branch}, func(ctx context.Context) (*gh.Reference, error) {
+		ref, _, err := ic.client.Git.GetRef(ctx, owner, repoName, "heads/"+branch)
+		if err != nil {
+			return nil, fmt.Errorf("get ref heads/%s: %w", branch, classifyGitHubAPIError(err))
+		}
+		return ref, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	tipSHA := tip.GetObject().GetSHA()
+	if tipSHA == "" {
+		return "", fmt.Errorf("ref heads/%s for %s resolved to no commit", branch, repo)
+	}
+	return tipSHA, nil
+}
+
+// isAncestorOrSame reports whether ancestorSHA is descendantSHA or one of its
+// ancestors: their merge base is ancestorSHA itself.
+func (ic *InstallationClient) isAncestorOrSame(ctx context.Context, repo, ancestorSHA, descendantSHA string) (bool, error) {
+	if ancestorSHA == descendantSHA {
+		return true, nil
+	}
+	mergeBase, err := ic.mergeBaseSHA(ctx, repo, ancestorSHA, descendantSHA)
+	if err != nil {
+		return false, err
+	}
+	return mergeBase == ancestorSHA, nil
+}
+
+// mergeBaseSHA returns the merge base of baseSHA and headSHA.
+func (ic *InstallationClient) mergeBaseSHA(ctx context.Context, repo, baseSHA, headSHA string) (string, error) {
+	owner, repoName := splitRepo(repo)
+	comparison, err := retryGitHubUnavailableRead(ctx, ic.logger, "find merge base", []any{"repo", repo, "base_sha", baseSHA, "head_sha", headSHA}, func(ctx context.Context) (*gh.CommitsComparison, error) {
+		comparison, _, err := ic.client.Repositories.CompareCommits(ctx, owner, repoName, baseSHA, headSHA, &gh.ListOptions{PerPage: 1})
+		if err != nil {
+			return nil, fmt.Errorf("compare commits %s...%s: %w", baseSHA, headSHA, classifyGitHubAPIError(err))
+		}
+		return comparison, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	mergeBase := comparison.GetMergeBaseCommit().GetSHA()
+	if mergeBase == "" {
+		return "", fmt.Errorf("compare commits %s...%s for %s returned no merge base", baseSHA, headSHA, repo)
+	}
+	return mergeBase, nil
+}
+
+// symlinksInTree lists the directory tree treeSHA at dir and returns every
+// symlink inside it, with repo-relative paths.
+func (ic *InstallationClient) symlinksInTree(ctx context.Context, repo, dir, treeSHA string) ([]TreeEntry, error) {
+	entries, truncated, err := ic.FetchGitTree(ctx, repo, treeSHA)
+	if err != nil {
+		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, err)
+	}
+	if truncated {
+		return nil, fmt.Errorf("list schema path %s in repo %s: %w", dir, repo, ErrGitTreeTruncated)
+	}
+	var symlinks []TreeEntry
+	for _, entry := range entries {
+		if entry.Mode == gitSymlinkMode {
+			entry.Path = path.Join(dir, entry.Path)
+			symlinks = append(symlinks, entry)
+		}
+	}
+	return symlinks, nil
+}
+
+// symlinkTargetPath returns the target of the symlink at linkPath, whose
+// object holds text, as a repo-relative path. A target is relative to the
+// directory holding the link; one that is absolute or escapes the repository
+// is an error.
+func symlinkTargetPath(repo, linkPath, text string) (string, error) {
+	target := strings.TrimSpace(text)
+	if target == "" {
+		return "", fmt.Errorf("symlink %s in repo %s has an empty target", linkPath, repo)
+	}
+	if strings.HasPrefix(target, "/") {
+		return "", fmt.Errorf("symlink %s in repo %s points to absolute path %s", linkPath, repo, target)
+	}
+	resolved := path.Clean(path.Join(path.Dir(linkPath), target))
+	if resolved == ".." || strings.HasPrefix(resolved, "../") {
+		return "", fmt.Errorf("symlink %s in repo %s points outside the repository: %s", linkPath, repo, target)
+	}
+	return resolved, nil
+}
+
+// pathInsideAny reports whether p is one of dirs or lies beneath one.
+func pathInsideAny(p string, dirs []string) bool {
+	for _, dir := range dirs {
+		if dir == "." || p == dir || strings.HasPrefix(p, dir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // PRFilesProposedAgainstDefaultBranch narrows a pull request's changed files to
@@ -1378,10 +1824,14 @@ func (ic *InstallationClient) FindCheckRunByName(ctx context.Context, repo, head
 	return newest, untrustedApps, nil
 }
 
-// PRCheckStatus represents the status of a single PR check (check run or commit status).
+// PRCheckStatus represents the status of a single PR check (check run or commit
+// status). Status is "completed" once the check has concluded; any other value
+// ("in_progress", "queued", "pending", "waiting", "requested", or one GitHub
+// adds later) means it has not, and callers must treat it as unfinished rather
+// than match a fixed list.
 type PRCheckStatus struct {
 	Name        string
-	Status      string // "completed", "in_progress", "queued"
+	Status      string // "completed", or any other status GitHub reports for an unfinished check
 	Conclusion  string // "success", "failure", "neutral", "skipped", etc.
 	AppSlug     string // creating GitHub App slug; empty for commit statuses
 	IsSchemaBot bool   // true if this check was created by a trusted SchemaBot GitHub App
@@ -1667,6 +2117,9 @@ type TreeEntry struct {
 // as "blob" tree entries with this mode; their content is the target path.
 const gitSymlinkMode = "120000"
 
+// gitTreeMode is the git tree file mode for a directory.
+const gitTreeMode = "040000"
+
 // FetchGitTree fetches the entire directory tree in one API call using recursive mode.
 func (ic *InstallationClient) FetchGitTree(ctx context.Context, repo, treeSHA string) ([]TreeEntry, bool, error) {
 	owner, repoName := splitRepo(repo)
@@ -1774,19 +2227,41 @@ func (ic *InstallationClient) resolveGitTreeSHA(ctx context.Context, repo, ref, 
 }
 
 func (ic *InstallationClient) resolveGitObjectSHA(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (objectSHA, objectType string, found bool, err error) {
+	entry, found, err := ic.resolveGitTreeEntry(ctx, repo, ref, objectPath, levelCache)
+	if errors.Is(err, errGitPathThroughNonTree) {
+		return "", "", false, nil
+	}
+	if err != nil || !found {
+		return "", "", found, err
+	}
+	return entry.SHA, entry.Type, true, nil
+}
+
+// errGitPathThroughNonTree reports that a path cannot be resolved in the git
+// tree because a segment before its last is a file or symlink, not a
+// directory. The path may still reach content through that symlink, so it is
+// not the same answer as "absent".
+var errGitPathThroughNonTree = errors.New("path passes through a non-directory entry")
+
+// resolveGitTreeEntry resolves objectPath at ref to the tree entry naming it,
+// mode included, walking one shallow tree level per path segment. The repo
+// root resolves to a synthetic tree entry for the ref's root tree. found is
+// false when any path segment is absent. A non-final segment that is not a
+// tree is errGitPathThroughNonTree.
+func (ic *InstallationClient) resolveGitTreeEntry(ctx context.Context, repo, ref, objectPath string, levelCache map[string][]TreeEntry) (entry TreeEntry, found bool, err error) {
 	cleanPath := path.Clean(objectPath)
 	if cleanPath == "." {
 		_, rootTreeSHA, err := ic.fetchGitTreeShallow(ctx, repo, ref)
 		if err != nil {
-			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: %w", repo, ref, err)
+			return TreeEntry{}, false, fmt.Errorf("resolve repo root in repo %s ref %s: %w", repo, ref, err)
 		}
 		if rootTreeSHA == "" {
-			return "", "", false, fmt.Errorf("resolve repo root in repo %s ref %s: GitHub returned no tree SHA", repo, ref)
+			return TreeEntry{}, false, fmt.Errorf("resolve repo root in repo %s ref %s: GitHub returned no tree SHA", repo, ref)
 		}
-		return rootTreeSHA, "tree", true, nil
+		return TreeEntry{Path: ".", Mode: gitTreeMode, Type: "tree", SHA: rootTreeSHA}, true, nil
 	}
 	if path.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, "../") {
-		return "", "", false, fmt.Errorf("schema path %q is not repo-relative", objectPath)
+		return TreeEntry{}, false, fmt.Errorf("schema path %q is not repo-relative", objectPath)
 	}
 
 	treeSHA := ref
@@ -1796,32 +2271,32 @@ func (ic *InstallationClient) resolveGitObjectSHA(ctx context.Context, repo, ref
 		if !cached {
 			levelEntries, _, err = ic.fetchGitTreeShallow(ctx, repo, treeSHA)
 			if err != nil {
-				return "", "", false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
+				return TreeEntry{}, false, fmt.Errorf("resolve %s under %s in repo %s ref %s: %w", segment, objectPath, repo, ref, err)
 			}
 			if levelCache != nil {
 				levelCache[treeSHA] = levelEntries
 			}
 		}
 		var matched *TreeEntry
-		for _, entry := range levelEntries {
-			if entry.Path == segment {
-				entryCopy := entry
+		for _, levelEntry := range levelEntries {
+			if levelEntry.Path == segment {
+				entryCopy := levelEntry
 				matched = &entryCopy
 				break
 			}
 		}
 		if matched == nil {
-			return "", "", false, nil
+			return TreeEntry{}, false, nil
 		}
 		if i == len(segments)-1 {
-			return matched.SHA, matched.Type, true, nil
+			return *matched, true, nil
 		}
 		if matched.Type != "tree" {
-			return "", "", false, nil
+			return TreeEntry{}, false, fmt.Errorf("resolve %s in repo %s ref %s: %s is a %s: %w", objectPath, repo, ref, path.Join(segments[:i+1]...), matched.Type, errGitPathThroughNonTree)
 		}
 		treeSHA = matched.SHA
 	}
-	return "", "", false, nil
+	return TreeEntry{}, false, nil
 }
 
 // FetchBlobContent fetches file content using the Git Blob API.

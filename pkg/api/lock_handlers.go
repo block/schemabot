@@ -1,11 +1,16 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/auth"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/storage"
 )
@@ -64,6 +69,11 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	req.Database = storage.CanonicalKey(req.Database)
 	req.DatabaseType = storage.CanonicalKey(req.DatabaseType)
 	req.Repository = storage.CanonicalKey(req.Repository)
+	// The owner is a match token: release and conditional-release compare it
+	// byte-exact against the stored value, so both sides must fold or a
+	// mixed-case spelling (a CLI owner embedding a mixed-case hostname)
+	// could acquire a lock it can never release.
+	req.Owner = storage.CanonicalKey(req.Owner)
 
 	if req.Database == "" || req.DatabaseType == "" || req.Owner == "" {
 		s.writeError(w, http.StatusBadRequest, "database, database_type, and owner are required")
@@ -73,9 +83,24 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 	// A named lock is an operator control on the database itself (holding
 	// applies off), in the same family as stop/cancel, so a database's
 	// operator grant covers it. Locks have no environment dimension.
-	if !s.authorizeDirectDatabaseWrite(w, r, "lock_acquire", req.Database) {
+	authorization, allowed := s.authorizeDirectDatabaseWrite(w, r, "lock_acquire", req.Database)
+	if !allowed {
 		return
 	}
+
+	ctx := r.Context()
+	acquirer, noAcquirerReason := s.config.lockAcquirer(ctx, req.Database)
+	if acquirer == nil {
+		s.logger.Debug("lock acquire records no acquirer",
+			"database", req.Database, "database_type", req.DatabaseType, "owner", req.Owner,
+			"reason", noAcquirerReason)
+	}
+
+	// Acquiring a lock the same owner already holds succeeds, so the owner
+	// string alone would tell anyone who listed locks that they hold one. A
+	// scoped operator is held to the lock's recorded acquirer instead (see
+	// scopedLockAcquireHeld).
+	scoped := !holdsLockByOwnerAlone(authorization.Reason)
 
 	lock := &storage.Lock{
 		DatabaseName: req.Database,
@@ -83,9 +108,9 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		Owner:        req.Owner,
 		Repository:   req.Repository,
 		PullRequest:  req.PullRequest,
+		Acquirer:     acquirer,
 	}
 
-	ctx := r.Context()
 	err := s.storage.Locks().Acquire(ctx, lock)
 	if errors.Is(err, storage.ErrLockHeld) {
 		metrics.RecordLockOperation(ctx, "acquire", req.Database, "conflict")
@@ -108,21 +133,107 @@ func (s *Service) handleLockAcquire(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	metrics.RecordLockOperation(ctx, "acquire", req.Database, "success")
 
-	// Refetch to get created_at
+	// The row as it stands after the acquire is what the caller is told they
+	// hold, and what a scoped caller's claim to it is decided on. The lock is
+	// reported held only from that row: a read that fails leaves it unknown
+	// whether the row is the one this request acquired, and a row that is
+	// gone was released before this request could be told it held it.
 	acquired, err := s.storage.Locks().Get(ctx, req.Database, req.DatabaseType)
-	if err != nil || acquired == nil {
-		// Shouldn't happen, but handle gracefully
-		s.writeJSON(w, http.StatusOK, LockResponse{Lock: &LockInfo{
-			Database:     req.Database,
-			DatabaseType: req.DatabaseType,
-			Owner:        req.Owner,
-		}})
+	if err != nil {
+		s.writeLockReadBackFailed(w, r, req, lock.ID, err)
 		return
 	}
+	if acquired == nil {
+		metrics.RecordLockOperation(ctx, "acquire", req.Database, "not_found")
+		s.logger.Warn("lock acquire found the lock released before it could be read back; nothing is held",
+			"repository", req.Repository, "database", req.Database, "database_type", req.DatabaseType,
+			"owner", req.Owner)
+		s.writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("lock on database %q was released before this acquire could be confirmed; nothing is held, retry", req.Database))
+		return
+	}
+	if scoped && !s.scopedLockAcquireHeld(w, r, req, lock.ID, acquired) {
+		return
+	}
+	metrics.RecordLockOperation(ctx, "acquire", req.Database, "success")
 
 	s.writeJSON(w, http.StatusOK, LockResponse{Lock: lockToInfo(acquired)})
+}
+
+// writeLockReadBackFailed answers an acquire whose read of the lock afterwards
+// failed with readErr. The lock is not reported held, since it is unknown
+// whether the row is one the caller holds. When this acquire created the row
+// (createdID is the ID it assigned), the row stays held under the owner the
+// caller sent, so the response says so and how to clear it rather than leaving
+// the caller to assume nothing was taken.
+func (s *Service) writeLockReadBackFailed(w http.ResponseWriter, r *http.Request, req LockAcquireRequest, createdID int64, readErr error) {
+	ctx := r.Context()
+	metrics.RecordLockOperation(ctx, "acquire", req.Database, "error")
+	attrs := []any{
+		"repository", req.Repository, "database", req.Database, "database_type", req.DatabaseType,
+		"owner", req.Owner, "error", readErr,
+	}
+	if createdID == 0 {
+		s.logger.Error("lock acquire could not read the lock back after acquiring it; the lock was already held under this owner and is not reported held", attrs...)
+		s.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	s.logger.Error("lock acquire created the lock but could not read it back; the lock stays held under this owner and is not reported held", attrs...)
+	s.writeError(w, http.StatusInternalServerError,
+		fmt.Sprintf("lock on database %q was acquired but could not be read back, so it is not reported held; the lock may be held under owner %q: retry the acquire to confirm it, or release it under that owner",
+			req.Database, req.Owner))
+}
+
+// scopedLockAcquireHeld decides whether a scoped operator whose acquire
+// succeeded may be told they hold acquired, the lock row as read after it, and
+// on refusal writes the 403 and reports false. The caller holds a row this
+// request created, recognized by the ID the acquire assigned it (createdID,
+// zero when the acquire created no row) still being the ID read back; any other
+// row is one they found, and they hold it only under the rule that decides who
+// may release it (see scopedLockRefusal). Deciding after the acquire leaves a
+// refused caller's target lock as it was: this endpoint carries no pending
+// plan, so a same-owner acquire writes nothing, and deciding on the row as read
+// afterwards also covers a lock another group took under the same owner while
+// this acquire ran.
+func (s *Service) scopedLockAcquireHeld(w http.ResponseWriter, r *http.Request, req LockAcquireRequest, createdID int64, acquired *storage.Lock) bool {
+	if lockCreatedByAcquire(createdID, acquired) {
+		return true
+	}
+	ctx := r.Context()
+	user := auth.UserFromContext(ctx)
+	callerGroups := s.config.callerOperatorGroups(user, req.Database)
+	refusal := scopedLockRefusal(acquired.Acquirer, callerGroups)
+	if refusal == "" {
+		return true
+	}
+
+	subject := ""
+	if user != nil {
+		subject = user.Subject
+	}
+	metrics.RecordLockOperation(ctx, "acquire", req.Database, "not_owned")
+	attrs := []any{
+		"repository", acquired.Repository, "database", acquired.DatabaseName, "database_type", acquired.DatabaseType,
+		"owner", acquired.Owner, "subject", subject, "reason", refusal, "caller_operator_groups", callerGroups,
+	}
+	if acquired.Acquirer != nil {
+		attrs = append(attrs, "acquirer_subject", acquired.Acquirer.Subject,
+			"acquirer_operator_groups", acquired.Acquirer.OperatorGroups)
+	}
+	s.logger.Warn("scoped lock acquire refused: the lock is already held under this owner and does not belong to any of the caller's operator groups; the lock is unchanged", attrs...)
+	s.writeError(w, http.StatusForbidden, s.scopedLockDenialMessage("lock_acquire", "holding", acquired, refusal))
+	return false
+}
+
+// lockCreatedByAcquire reports whether acquired, the lock row read after an
+// acquire, is the row that acquire created: createdID is the ID the acquire
+// assigned to the row it inserted, or zero when it inserted none because the
+// owner already held the lock. A row found under the same owner, whether it
+// was there before the acquire or another request inserted it while this one
+// ran, carries a different ID or none this request assigned.
+func lockCreatedByAcquire(createdID int64, acquired *storage.Lock) bool {
+	return createdID != 0 && acquired.ID == createdID
 }
 
 // handleLockRelease handles DELETE /api/locks.
@@ -134,6 +245,9 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Database = storage.CanonicalKey(req.Database)
 	req.DatabaseType = storage.CanonicalKey(req.DatabaseType)
+	// Folded to match the folded spelling stored at acquire; see
+	// handleLockAcquire.
+	req.Owner = storage.CanonicalKey(req.Owner)
 
 	if req.Database == "" || req.DatabaseType == "" {
 		s.writeError(w, http.StatusBadRequest, "database and database_type are required")
@@ -143,13 +257,20 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	// Force release bypasses the lock ownership check, so it is an
 	// administrative override rather than an operator control on the caller's
 	// own database: a database operator grant does not cover it. Normal
-	// release keeps the ownership check, so the operator grant applies.
+	// release keeps the ownership check, so the operator grant applies, and a
+	// scoped operator's release is further held to the lock's recorded
+	// acquirer (see releaseScopedLock).
+	var authorization DirectWriteAuthorizationResult
 	if req.Force {
 		if !s.authorizeDirectForceLockRelease(w, r, req.Database) {
 			return
 		}
-	} else if !s.authorizeDirectDatabaseWrite(w, r, "lock_release", req.Database) {
-		return
+	} else {
+		var allowed bool
+		authorization, allowed = s.authorizeDirectDatabaseWrite(w, r, "lock_release", req.Database)
+		if !allowed {
+			return
+		}
 	}
 
 	ctx := r.Context()
@@ -180,6 +301,16 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The owner string is readable by anyone who can list locks, so it proves
+	// nothing about who took the lock. Only a deployment write-group member,
+	// or a caller on a deployment without scoped grants, releases by owner
+	// alone; every other allowed caller is held to the lock's recorded
+	// acquirer, so a grant added later is scoped until it is decided otherwise.
+	if !holdsLockByOwnerAlone(authorization.Reason) {
+		s.releaseScopedLock(w, r, req)
+		return
+	}
+
 	err := s.storage.Locks().Release(ctx, req.Database, req.DatabaseType, req.Owner)
 	if errors.Is(err, storage.ErrLockNotFound) {
 		metrics.RecordLockOperation(ctx, "release", req.Database, "not_found")
@@ -200,6 +331,186 @@ func (s *Service) handleLockRelease(w http.ResponseWriter, r *http.Request) {
 	metrics.RecordLockOperation(ctx, "release", req.Database, "success")
 
 	s.writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
+}
+
+// Reasons a scoped operator is refused a lock release, or a re-acquire of a
+// lock already held, although the owner matches, for the refusal log. The lock
+// operations counter records every one of them as not_owned: ownership is per
+// operator group, and the caller's group does not own the lock.
+const (
+	lockRefusalAcquirerUnrecorded         = "acquirer_unrecorded"
+	lockRefusalAcquirerNoOperatorGroup    = "acquirer_no_operator_group"
+	lockRefusalAcquirerOtherOperatorGroup = "acquirer_other_operator_group"
+)
+
+// holdsLockByOwnerAlone reports whether a caller allowed under reason holds a
+// lock, to re-acquire or release it, on the strength of its owner string. Only
+// the deployment write groups and a deployment that grants no operator groups
+// hold a lock that way; any other allowed decision, including one this
+// function has not been taught about, is held to the lock's recorded acquirer.
+func holdsLockByOwnerAlone(reason string) bool {
+	return reason == DirectWriteReasonAdminAllow || reason == DirectWriteReasonScopedLaneDisabled
+}
+
+// releaseScopedLock releases a lock for a scoped (non-admin) operator. A
+// scoped operator may release a lock only when the lock's recorded acquirer
+// shared at least one of the database's operator groups with them: ownership
+// is per operator group, so a teammate can release a lock another member of
+// the same group took, and nobody outside the group can, whatever owner string
+// they send.
+//
+// The check reads the lock, decides against the acquirer recorded on that
+// row, and then deletes only that row (ReleaseByID). The acquirer never
+// changes under a row ID, so the decision cannot go stale between the read and
+// the delete; a lock released and acquired again in between is reported, and
+// the new lock is left held.
+func (s *Service) releaseScopedLock(w http.ResponseWriter, r *http.Request, req LockReleaseRequest) {
+	ctx := r.Context()
+	user := auth.UserFromContext(ctx)
+	subject := ""
+	if user != nil {
+		subject = user.Subject
+	}
+
+	lock, err := s.storage.Locks().Get(ctx, req.Database, req.DatabaseType)
+	if err != nil {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "error")
+		s.logger.Error("scoped lock release could not read the lock; nothing was released",
+			"database", req.Database, "database_type", req.DatabaseType, "owner", req.Owner,
+			"subject", subject, "error", err)
+		s.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if lock == nil {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_found")
+		s.logger.Info("scoped lock release found no lock",
+			"database", req.Database, "database_type", req.DatabaseType, "owner", req.Owner, "subject", subject)
+		s.writeError(w, http.StatusNotFound, "lock not found")
+		return
+	}
+
+	logAttrs := []any{
+		"repository", lock.Repository, "database", lock.DatabaseName, "database_type", lock.DatabaseType,
+		"owner", lock.Owner, "subject", subject,
+	}
+	if lock.Owner != req.Owner {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
+		s.logger.Warn("scoped lock release refused: the lock is held under another owner",
+			append(logAttrs, "requested_owner", req.Owner)...)
+		s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeLockNotOwned, "lock is not owned by you")
+		return
+	}
+
+	callerGroups := s.config.callerOperatorGroups(user, req.Database)
+	if refusal := scopedLockRefusal(lock.Acquirer, callerGroups); refusal != "" {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
+		attrs := slices.Concat(logAttrs, []any{"reason", refusal, "caller_operator_groups", callerGroups})
+		if lock.Acquirer != nil {
+			attrs = append(attrs, "acquirer_subject", lock.Acquirer.Subject,
+				"acquirer_operator_groups", lock.Acquirer.OperatorGroups)
+		}
+		s.logger.Warn("scoped lock release refused: the lock does not belong to any of the caller's operator groups; the lock stays held", attrs...)
+		s.writeError(w, http.StatusForbidden, s.scopedLockDenialMessage("lock_release", "releasing", lock, refusal))
+		return
+	}
+
+	err = s.storage.Locks().ReleaseByID(ctx, lock.ID, req.Database, req.DatabaseType, req.Owner, lock.PendingPlanID)
+	if errors.Is(err, storage.ErrLockNotFound) {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_found")
+		s.logger.Info("scoped lock release found the lock already released", logAttrs...)
+		s.writeError(w, http.StatusNotFound, "lock not found")
+		return
+	}
+	if errors.Is(err, storage.ErrLockReplaced) || errors.Is(err, storage.ErrLockIntentChanged) {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "conflict")
+		s.logger.Warn("scoped lock release refused: the lock was released and acquired again after it was checked; the new lock stays held",
+			logAttrs...)
+		s.writeError(w, http.StatusConflict,
+			fmt.Sprintf("lock on database %q was released and acquired again while this release ran; nothing was released, check the lock and retry", req.Database))
+		return
+	}
+	if errors.Is(err, storage.ErrLockNotOwned) {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "not_owned")
+		s.logger.Warn("scoped lock release refused: the checked lock row is held under another owner", logAttrs...)
+		s.writeErrorCode(w, http.StatusForbidden, apitypes.ErrCodeLockNotOwned, "lock is not owned by you")
+		return
+	}
+	if err != nil {
+		metrics.RecordLockOperation(ctx, "release", req.Database, "error")
+		s.logger.Error("scoped lock release failed; the lock may still be held", append(logAttrs, "error", err)...)
+		s.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	metrics.RecordLockOperation(ctx, "release", req.Database, "success")
+	s.logger.Info("scoped lock release released the lock", logAttrs...)
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
+}
+
+// scopedLockRefusal reports why a scoped operator holding callerGroups (their
+// operator groups on the lock's database) may not release, or be told they
+// hold, a lock taken by acquirer, or "" when they may. A lock with no recorded
+// acquirer shares a group with nobody, so it is refused rather than read as
+// anyone's.
+func scopedLockRefusal(acquirer *storage.LockAcquirer, callerGroups []string) string {
+	if acquirer == nil {
+		return lockRefusalAcquirerUnrecorded
+	}
+	if len(acquirer.OperatorGroups) == 0 {
+		return lockRefusalAcquirerNoOperatorGroup
+	}
+	if !sharesOperatorGroup(acquirer.OperatorGroups, callerGroups) {
+		return lockRefusalAcquirerOtherOperatorGroup
+	}
+	return ""
+}
+
+// sharesOperatorGroup reports whether the two operator-group lists, both by
+// configured name, have a group in common.
+func sharesOperatorGroup(acquirerGroups, callerGroups []string) bool {
+	return slices.ContainsFunc(acquirerGroups, func(g string) bool { return slices.Contains(callerGroups, g) })
+}
+
+// scopedLockDenialMessage explains a scoped operation refused on a lock
+// (operation, and action as the gerund naming what the grant does not cover)
+// and names who may release the lock instead, so the caller knows who to ask.
+// Group names are visible only to callers already authenticated behind the
+// trusted proxy. A refusal is reached only once the lock's owner matched the
+// one the caller sent, so a lock that records no acquirer is named by that
+// owner: the caller can then recognize a lock taken under their own owner
+// string, for example by an earlier run of their own, rather than read the
+// refusal as someone else's lock.
+func (s *Service) scopedLockDenialMessage(operation, action string, lock *storage.Lock, refusal string) string {
+	writeGroups := strings.Join(s.config.Auth.ForwardAuth.WriteGroups, ", ")
+	database := lock.DatabaseName
+	switch refusal {
+	case lockRefusalAcquirerUnrecorded:
+		return fmt.Sprintf("%s on database %q: the lock is held under owner %q, the owner you sent, but records no verified acquirer (a lock taken by a server version that did not record acquirers, by a PR apply, or through the loopback break-glass lane records none), so no operator grant covers %s it; a deployment write group (%s) may release it",
+			operation, database, lock.Owner, action, writeGroups)
+	case lockRefusalAcquirerNoOperatorGroup:
+		return fmt.Sprintf("%s on database %q: the lock was acquired by a caller in none of the database's operator groups, so no operator grant covers %s it; a deployment write group (%s) may release it",
+			operation, database, action, writeGroups)
+	case lockRefusalAcquirerOtherOperatorGroup:
+		return fmt.Sprintf("%s on database %q: the lock was acquired under operator groups (%s), and you are a member of none of them; a member of one of those groups or of a deployment write group (%s) may release it",
+			operation, database, strings.Join(lock.Acquirer.OperatorGroups, ", "), writeGroups)
+	default:
+		return fmt.Sprintf("%s on database %q: your operator grant does not cover %s this lock; a deployment write group (%s) may release it",
+			operation, database, action, writeGroups)
+	}
+}
+
+// callerOperatorGroups returns every configured operator group of database
+// the caller is a member of, by configured name, sorted. It is empty when the
+// caller holds none, and when there is no caller or no configuration for the
+// database, since neither grants any group.
+func (c *ServerConfig) callerOperatorGroups(user *auth.User, database string) []string {
+	if user == nil {
+		return []string{}
+	}
+	dbConfig, ok := c.DatabaseConfigs()[database]
+	if !ok {
+		return []string{}
+	}
+	return auth.MatchedGroups(user.Groups, trimmedNonEmpty(dbConfig.OperatorGroups))
 }
 
 // handleLockGet handles GET /api/locks/{database}/{dbtype}.
@@ -242,6 +553,32 @@ func (s *Service) handleLockList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, LockListResponse{Locks: infos})
+}
+
+// lockAcquirer returns the verified caller to record on a lock being acquired
+// on database: the caller's subject and every operator group of that database
+// they are a member of, by configured name. Whether a scoped operator shares a
+// grant with a lock's acquirer is decided against this record, so it holds all
+// of the caller's operator groups for the database, not only the one that
+// authorized the acquire, and an empty list when they hold none (a deployment
+// admin acting through a write group alone shares a grant with no operator).
+//
+// It returns nil, with the reason, when there is no verified caller to record:
+// on a deployment with no scoped operator grants configured there is no grant
+// to share, and a request without an authenticated identity names nobody.
+func (c *ServerConfig) lockAcquirer(ctx context.Context, database string) (*storage.LockAcquirer, string) {
+	if !c.scopedWriteEnabled() {
+		return nil, DirectWriteReasonScopedLaneDisabled
+	}
+	subject, ok := auth.VerifiedSubject(ctx)
+	if !ok {
+		if _, authenticated := auth.AuthenticatedSubject(ctx); authenticated {
+			return nil, DirectWriteReasonUnverifiedIdentity
+		}
+		return nil, DirectWriteReasonMissingIdentity
+	}
+	groups := c.callerOperatorGroups(auth.UserFromContext(ctx), database)
+	return &storage.LockAcquirer{Subject: subject, OperatorGroups: groups}, ""
 }
 
 // lockToInfo converts a storage.Lock to an API LockInfo.

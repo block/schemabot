@@ -18,6 +18,16 @@ func pershardTargets() []routing.ExecutionTarget {
 	return []routing.ExecutionTarget{{DatabaseType: storage.DatabaseTypeStrata, Deployment: "cdb-resolute", Target: "cdb-resolute"}}
 }
 
+// pershardMembers is the single rollout member these tests build operations
+// for, paired with the plan its work comes from.
+func pershardMembers(plan *storage.Plan) []applyMember {
+	members := make([]applyMember, 0, 1)
+	for _, target := range pershardTargets() {
+		members = append(members, applyMember{Target: target, Plan: plan})
+	}
+	return members
+}
+
 func pershardTestTime() time.Time { return time.Unix(1700000000, 0).UTC() }
 
 // operationKeys returns each group's operation key paired with its tasks' DDLs,
@@ -56,7 +66,7 @@ func TestBuildShardedApplyOperationGroupsUsesPerShardDDL(t *testing.T) {
 		},
 	}
 
-	groups, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), newMemberOperationKeys(pershardMembers(plan)), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 
 	got := operationDDLByKey(groups)
@@ -86,7 +96,7 @@ func TestBuildShardedApplyOperationGroupsSkipsShardsWithoutChanges(t *testing.T)
 		},
 	}
 
-	groups, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), newMemberOperationKeys(pershardMembers(plan)), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 
 	assert.Equal(t, map[string][]string{
@@ -130,7 +140,7 @@ func TestBuildShardedApplyOperationGroupsFailsClosedOnMalformedChange(t *testing
 			Changes: []storage.TableChange{{Namespace: pershardNamespace, Table: "", DDL: "ALTER TABLE `mutes` ADD INDEX (`x`)", Operation: "alter"}},
 		}},
 	}
-	_, err := buildShardedApplyOperationGroups(plan, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	_, err := buildShardedApplyOperationGroups(plan, pershardMembers(plan), newMemberOperationKeys(pershardMembers(plan)), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "empty table")
 }
@@ -169,7 +179,7 @@ func TestBuildApplyOperationGroupsVSchemaOnlyPlanBuildsFinalizer(t *testing.T) {
 		},
 	}
 
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 	assert.False(t, shardedFanout)
 	require.Len(t, groups, 1)
@@ -192,7 +202,7 @@ func TestBuildApplyOperationGroupsVSchemaOnlyPlanMultiNamespaceSingleFinalizer(t
 		},
 	}
 
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 	assert.False(t, shardedFanout)
 	require.Len(t, groups, 1)
@@ -217,11 +227,86 @@ func TestBuildApplyOperationGroupsTableDDLKeepsWorkShape(t *testing.T) {
 	taskChanges := plan.FlatDDLChanges()
 	require.Len(t, taskChanges, 1)
 
-	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, pershardTargets(), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, taskChanges, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
 	require.NoError(t, err)
 	assert.False(t, shardedFanout)
 	require.Len(t, groups, 1)
 	assert.Equal(t, storage.ApplyOperationKindWork, groups[0].Operation.OperationKind)
 	require.Len(t, groups[0].Tasks, 1)
 	assert.Equal(t, mutesDDL, groups[0].Tasks[0].DDL)
+}
+
+// A plan whose only work is a finalize the engine asked for — no table DDL and
+// no VSchema document — is shaped like a VSchema-only plan: one
+// deployment-scoped task-less group_finalizer. Without it the apply would have
+// no operation to drive and the finalize would never run.
+func TestBuildApplyOperationGroupsFinalizeOnlyPlanBuildsFinalizer(t *testing.T) {
+	plan := &storage.Plan{
+		Database: "commerce",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Finalize: true},
+		},
+	}
+
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, nil, pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+	assert.False(t, shardedFanout)
+	require.Len(t, groups, 1)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, groups[0].Operation.OperationKind)
+	assert.Equal(t, "group_finalizer", groups[0].Operation.OperationKey)
+	assert.Empty(t, groups[0].Tasks)
+}
+
+// A sharded plan adds a table to a keyspace whose VSchema document is
+// unchanged, and the engine asks to finalize that keyspace once the table
+// exists. The shard work is followed by the keyspace's group_finalizer, the
+// same shape a VSchema change produces, so the finalize runs after the DDL.
+func TestBuildApplyOperationGroupsShardedPlanSchedulesRequestedFinalize(t *testing.T) {
+	createDDL := "CREATE TABLE `refunds` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+	plan := &storage.Plan{
+		Database: "commerce",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {
+				Tables:   []storage.TableChange{{Namespace: "commerce", Table: "refunds", DDL: createDDL, Operation: "create"}},
+				Finalize: true,
+			},
+		},
+		Shards: []storage.ShardPlan{{Namespace: "commerce", Shard: "-", Changes: []storage.TableChange{
+			{Namespace: "commerce", Table: "refunds", DDL: createDDL, Operation: "create"},
+		}}},
+	}
+
+	groups, shardedFanout, err := buildApplyOperationGroups(plan, plan.FlatDDLChanges(), pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.NoError(t, err)
+	assert.True(t, shardedFanout)
+	assert.Equal(t, map[string][]string{
+		"commerce/-/refunds":       {createDDL},
+		"commerce/group_finalizer": {},
+	}, operationDDLByKey(groups))
+	for _, g := range groups {
+		if g.Operation.OperationKey == "commerce/group_finalizer" {
+			assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, g.Operation.OperationKind)
+		}
+	}
+}
+
+// A plan with table DDL but no per-shard plan runs as one work operation per
+// target, a shape with nowhere to run a finalize. If its engine asked to
+// finalize a namespace, the apply is refused rather than created without the
+// finalize.
+func TestBuildApplyOperationGroupsRefusesFinalizeWithoutShardPlan(t *testing.T) {
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-finalize-unsharded",
+		Database:       "commerce",
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {
+				Tables:   []storage.TableChange{{Namespace: "commerce", Table: "refunds", DDL: "ALTER TABLE `refunds` ADD COLUMN `note` text", Operation: "alter"}},
+				Finalize: true,
+			},
+		},
+	}
+
+	_, _, err := buildApplyOperationGroups(plan, plan.FlatDDLChanges(), pershardMembers(plan), "production", storage.ApplyOptions{}, "", "", pershardTestTime())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plan plan-finalize-unsharded asks to finalize namespaces [commerce]")
 }

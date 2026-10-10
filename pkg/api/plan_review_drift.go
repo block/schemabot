@@ -7,46 +7,51 @@ import (
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/tern"
 )
 
-// RollupReviewTimeDrift computes the review-time drift rollup for a
-// database/environment: it diffs every configured deployment against the
-// reviewed primary plan and classifies each as match, diverged, or errored.
+// RollupReviewTimeDrift computes the review-time rollup for a
+// database/environment, classifying every configured rollout member.
 //
-// primaryPlan is the just-reviewed primary plan proto, reused as the rollup's
-// baseline so the comparison is against exactly what the user reviewed rather
+// What a member is classified against depends on the environment's member
+// planning, which is resolved here. Where members mirror each other, each is
+// diffed against the primary plan and classified match, diverged, or
+// errored. Where members hold their own schemas, none is compared to the
+// primary plan or to another member: each is classified planned, or errored
+// when it could not be planned at all.
+//
+// primaryPlan is the primary plan proto just produced, reused as the rollup's
+// baseline so the comparison is against exactly what the comment shows for the
+// primary rather
 // than a fresh read of the primary's live schema (which could have drifted and
-// tripped a spurious primary-vs-primary mismatch). primaryDeployment is the
-// deployment that plan was created against; the producer fails closed if it no
-// longer maps to rollout index 0 at rollup time.
+// tripped a spurious primary-vs-primary mismatch). primaryMember is the
+// deployment and target that plan was created against; the producer fails
+// closed if that pair no longer maps to rollout index 0 at rollup time.
 //
-// The database/environment is resolved once here to the configured deployment
-// set in rollout order, then shared with the producer. The resolved order is
-// also passed to RollupDeploymentDiffs as the expected set so the rollup can
-// enforce that the producer returned one diff per deployment in that order — a
-// missing, extra, or reordered result fails closed rather than being mistaken
-// for agreement. The returned rollup is Clean only when every deployment
-// matches.
-func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryDeployment string) (PlanRollup, error) {
+// Namespace coverage is not checked again here. primaryPlan comes from
+// ExecutePlanProto, which refuses a request declaring a namespace no member
+// selects, and an environment's members cannot change while the server runs:
+// registration only adds databases and environments.
+//
+// The database/environment is resolved once here to the configured member set
+// in rollout order, then shared with the producer. The resolved order is also
+// passed to RollupDeploymentDiffs as the expected set so the rollup can enforce
+// that the producer returned one diff per member in that order — a missing,
+// extra, or reordered result fails closed rather than being mistaken for
+// agreement. The returned rollup is Clean only when every member passed the
+// contract it was classified under, and carries that contract so a caller can
+// describe the result without re-deriving it.
+func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryMember routing.ExecutionTarget) (PlanRollup, error) {
 	targets, err := s.config.ResolveDatabaseTargets(req.Database, req.Environment)
 	if err != nil {
 		return PlanRollup{}, fmt.Errorf("resolve deployment targets for %s/%s: %w", req.Database, req.Environment, err)
 	}
-	expectedDeployments := make([]string, len(targets))
-	for i, t := range targets {
-		expectedDeployments[i] = t.Deployment
-	}
-
-	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryDeployment, targets)
+	rollup, err := s.planRolloutMembers(ctx, req, primaryPlan, primaryMember, targets)
 	if err != nil {
-		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
+		return PlanRollup{}, err
 	}
-
-	rollup, err := RollupDeploymentDiffs(diffs, expectedDeployments)
-	if err != nil {
-		return PlanRollup{}, fmt.Errorf("roll up deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
-	}
+	planning := rollup.Planning
 
 	// Include repo/pr/head SHA so an operator can tell which PR is blocked from
 	// the drift warn log alone.
@@ -62,7 +67,7 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 		metrics.RecordReviewDrift(ctx, req.Database, req.Environment, entry.Deployment, entry.Class.String())
 		switch entry.Class {
 		case DeploymentDiverged:
-			s.logger.Warn("review-time drift: deployment diverged from the reviewed plan; the plan check will block the PR until reconciled",
+			s.logger.Warn("review-time drift: deployment diverged from the primary target's plan; the plan check will block the PR until reconciled",
 				append([]any{
 					"repository", req.Repository,
 					"pr", pr,
@@ -81,6 +86,7 @@ func (s *Service) RollupReviewTimeDrift(ctx context.Context, req PlanRequest, pr
 				"environment", req.Environment,
 				"deployment", entry.Deployment,
 				"target", entry.Target,
+				"member_planning", planning.String(),
 				"error", entry.Err)
 		}
 	}
@@ -95,7 +101,7 @@ const maxDriftDiffLogItems = 5
 
 // driftDiffLogAttrs renders a diverged deployment's change-set diff as log
 // attributes so an operator can tell from the warn log alone what the
-// deployment would run that the reviewed plan does not say (and vice versa).
+// deployment would run that the primary plan does not say (and vice versa).
 // Each item names the namespace, shard when set, table, and operation — never
 // the DDL body, which can be long and belongs on the producer's own logs.
 // Empty lists are omitted.
@@ -112,6 +118,12 @@ func driftDiffLogAttrs(diff tern.ChangeSetDiff) []any {
 	}
 	if ns := capDriftList(diff.UnexpectedVSchema); len(ns) > 0 {
 		attrs = append(attrs, "diff_unexpected_vschema", ns)
+	}
+	if ns := capDriftList(diff.MissingFinalize); len(ns) > 0 {
+		attrs = append(attrs, "diff_missing_finalize", ns)
+	}
+	if ns := capDriftList(diff.UnexpectedFinalize); len(ns) > 0 {
+		attrs = append(attrs, "diff_unexpected_finalize", ns)
 	}
 	return attrs
 }
@@ -143,4 +155,39 @@ func capDriftList(values []string) []string {
 	capped = append(capped, values[:maxDriftDiffLogItems]...)
 	capped = append(capped, fmt.Sprintf("+%d more", len(values)-maxDriftDiffLogItems))
 	return capped
+}
+
+// planRolloutMembers plans every rollout member of targets, classifies each
+// under the environment's member planning, and stores a plan row for each
+// member planned against its own live schema, so an apply created from the
+// primary's plan has a plan to run on every member.
+//
+// Members planned on their own each need a plan row of their own, since an
+// apply has no single plan that covers them. Storing them here, before the
+// rollup is reported, keeps "the rollup says this member is fine" and "this
+// member has a plan to run" from being separately true.
+//
+// Namespace coverage is not checked again here: every caller passes a
+// primaryPlan from ExecutePlanProto, which refuses a request declaring a
+// namespace no member selects.
+func (s *Service) planRolloutMembers(ctx context.Context, req PlanRequest, primaryPlan *ternv1.PlanResponse, primaryMember routing.ExecutionTarget, targets []routing.ExecutionTarget) (PlanRollup, error) {
+	planning, err := s.config.MemberPlanningFor(req.Database, req.Environment)
+	if err != nil {
+		return PlanRollup{}, fmt.Errorf("resolve member planning for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
+	diffs, err := s.PlanDeploymentDiffs(ctx, req, primaryPlan, primaryMember, targets)
+	if err != nil {
+		return PlanRollup{}, fmt.Errorf("plan deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
+	rollup, err := RollupDeploymentDiffs(diffs, targets, planning)
+	if err != nil {
+		return PlanRollup{}, fmt.Errorf("roll up deployment diffs for %s/%s: %w", req.Database, req.Environment, err)
+	}
+
+	if err := s.persistMemberPlans(ctx, req, planning, primaryPlan.GetPlanId(), diffs, &rollup); err != nil {
+		return PlanRollup{}, fmt.Errorf("persist member plans for %s/%s: %w", req.Database, req.Environment, err)
+	}
+	return rollup, nil
 }

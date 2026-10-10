@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/block/schemabot/pkg/drain"
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/panicsafe"
 	"github.com/block/schemabot/pkg/state"
@@ -30,15 +31,6 @@ const (
 	// is min(operatorPollInterval, ApplyOperationHeartbeatInterval).
 	ApplyOperationHeartbeatInterval = 10 * time.Second
 
-	// ApplyDriveStallAfter bounds how long a drive may go without mirroring any
-	// task progress to storage before its driver presumes the drive goroutine
-	// is wedged and cancels the run. A healthy drive's poll loop writes every
-	// task row on every poll tick, so legitimate silence is far shorter than
-	// this window; the window is kept generous so slow pre-poll phases (target
-	// schema pulls, re-planning, engine acceptance) have the full window before
-	// their first mirror write.
-	ApplyDriveStallAfter = 5 * time.Minute
-
 	// DefaultDrivers is the number of concurrent operator drivers
 	// when not configured via drivers in the server config.
 	DefaultDrivers = 4
@@ -47,6 +39,11 @@ const (
 	// operator claim, so a slow or hung storage layer cannot delay the resume
 	// the claim is about to drive.
 	ApplyClaimLogTimeout = 5 * time.Second
+
+	// finishedClaimReleaseTimeout bounds the lease clear a drive performs on its
+	// way out. It runs detached from the driver context, so the bound is what
+	// keeps a hung storage layer from holding the drive open.
+	finishedClaimReleaseTimeout = 5 * time.Second
 )
 
 // StartOperator starts the background operator driver pool.
@@ -74,14 +71,19 @@ func (s *Service) StartOperator(ctx context.Context) {
 
 	stop := make(chan struct{})
 	wake := make(chan struct{}, driverCount)
-	driverCtx, cancel := context.WithCancel(ctx)
+	driverCtx, cancel := tern.NewOperatorContext(ctx)
 	reaperEvery := s.strandedReaperEvery
 	if reaperEvery <= 0 {
 		reaperEvery = StrandedReaperInterval
 	}
+	expiryEvery := s.retryableExpiryEvery
+	if expiryEvery <= 0 {
+		expiryEvery = RetryableExpiryInterval
+	}
 	s.stopRecovery = stop
 	s.cancelRecovery = cancel
 	s.operatorWake = wake
+	s.claimingStopped = false
 	s.operatorMu.Unlock()
 
 	// Seed both occupancy gauges before any driver claims so the pool's
@@ -97,11 +99,14 @@ func (s *Service) StartOperator(ctx context.Context) {
 		})
 	}
 
-	// The reaper is maintenance, not claim work, so it runs on its own slow
-	// cadence outside the driver pool. It shares the driver lifecycle: one
-	// goroutine per process, stopped by StopOperator.
-	s.recoveryWg.Go(func() {
-		s.strandedReaperLoop(driverCtx, stop, reaperEvery)
+	// The reaper is maintenance, not claim work, so it runs outside the driver
+	// pool on cadences of its own. It shares the driver lifecycle: one goroutine
+	// per pass per process, stopped by StopOperator.
+	s.maintenanceWg.Go(func() {
+		s.reaperLoop(driverCtx, stop, reaperEvery, "stranded rows", s.runStrandedReaperPass)
+	})
+	s.maintenanceWg.Go(func() {
+		s.reaperLoop(driverCtx, stop, expiryEvery, "retryable expiry", s.runRetryableExpiryPass)
 	})
 
 	// The fan-out cap only means something relative to the pool it bounds, and
@@ -112,27 +117,100 @@ func (s *Service) StartOperator(ctx context.Context) {
 		"drivers", driverCount,
 		"max_drivers_per_apply", storage.BuildOptions(storage.WithMaxDriversPerApply(s.config.MaxDriversPerApply)).MaxDriversPerApply,
 		"interval", s.operatorPollInterval,
-		"stranded_reaper_interval", reaperEvery)
+		"stranded_reaper_interval", reaperEvery,
+		"retryable_expiry_interval", expiryEvery)
 }
 
-// StopOperator stops the background operator and waits for all drivers to finish.
-// Safe to call multiple times.
+// driverDrainTimeout bounds how long StopOperator waits for the cancelled
+// drives to return. A drive inside a cooperative wait returns as soon as its
+// context ends, so the drain is normally over in well under this; the bound is
+// for the drive that does not return at all, blocked in a call that takes no
+// context or in an engine that does not stop when asked.
+//
+// Waiting longer than this does not make such an apply safer. Its lease stops
+// being renewed the moment this process stops driving it, and a peer's stranded
+// reaper reclaims it once the lease expires — so the only thing an unbounded
+// wait buys is a process that cannot exit, which is what delays the reclaim it
+// is waiting for. The value is well inside a typical termination grace period,
+// leaving room for the rest of the shutdown path.
+const driverDrainTimeout = 10 * time.Second
+
+// logAbandonedDrives records the claims left registered by drives that did not
+// return within driverDrainTimeout, naming each apply and operation so an
+// operator can tell which work this process walked away from and which peer
+// picked it up.
+func (s *Service) logAbandonedDrives() {
+	applies := s.heldClaimsSnapshot()
+	operations := s.heldOperationClaimsSnapshot()
+
+	s.logger.Error("drivers did not return within the shutdown drain; their claims are left to expire rather than released, and a peer's stranded reaper reclaims the work once the lease does",
+		"drain_timeout", driverDrainTimeout,
+		"abandoned_applies", len(applies),
+		"abandoned_operations", len(operations))
+
+	for _, claim := range applies {
+		s.logger.Error("abandoned an apply whose driver did not return", append(claim.logAttrs, "deployment", claim.deployment)...)
+	}
+	for _, claim := range operations {
+		s.logger.Error("abandoned an apply operation whose driver did not return", append(claim.logAttrs, "operation_deployment", claim.deployment)...)
+	}
+}
+
+// StopClaiming closes the operator's claim gate without ending its drives. Idle
+// drivers return and the reaper passes stop, so this process claims no new
+// apply from here on, while every drive already in flight keeps running, and
+// its lease renewed, until StopOperator brings it down and hands its claim back.
+//
+// A process that has been told to shut down calls this at the signal, ahead of
+// the listener drains that run before StopOperator. Without it an idle driver
+// on the terminating process can claim a pending apply during those drains and
+// start its engine, only for StopOperator to halt it seconds later and hand it
+// to a peer, which restarts the schema change from its checkpoint. Safe to call
+// multiple times, and StopOperator calls it first.
+func (s *Service) StopClaiming() {
+	s.operatorMu.Lock()
+	defer s.operatorMu.Unlock()
+	s.stopClaimingLocked()
+}
+
+// stopClaimingLocked closes the claim gate at most once per StartOperator. The
+// caller holds operatorMu.
+func (s *Service) stopClaimingLocked() {
+	if s.stopRecovery == nil || s.claimingStopped {
+		return
+	}
+	s.claimingStopped = true
+	close(s.stopRecovery)
+	s.logger.Info("operator stopped claiming new applies; in-flight drives continue until the operator stops")
+}
+
+// StopOperator stops the background operator and waits for all drivers to
+// finish, up to driverDrainTimeout. Safe to call multiple times.
+//
+// The stages after the drain — halting engines, collecting claims, handing them
+// back — all assume no drive is still running, so a drain that times out stops
+// there rather than running them against a live drive. What it gives up is
+// releasing the claims promptly; the claims then go stale on their own and are
+// reclaimed the way any lease whose holder disappeared is.
+//
+// Only the drives decide that. The reaper passes stop on the same signal but
+// hold nothing those stages touch, so they are waited on separately and a
+// reaper that overruns its own bound does not hold the drives' cleanup hostage.
 func (s *Service) StopOperator() {
 	s.operatorMu.Lock()
 	if s.stopRecovery == nil {
 		s.operatorMu.Unlock()
 		return
 	}
-	stop := s.stopRecovery
+	// Stop claiming first, so no driver picks up new work while the in-flight
+	// drives are being brought down. The gate may already be closed by
+	// StopClaiming at the shutdown signal.
+	s.stopClaimingLocked()
 	cancel := s.cancelRecovery
 	s.stopRecovery = nil
 	s.cancelRecovery = nil
 	s.operatorWake = nil
 	s.operatorMu.Unlock()
-
-	// Stop claiming first, so no driver picks up new work while the in-flight
-	// drives are being brought down.
-	close(stop)
 
 	// From here on a drive that returns leaves its claim registered. A drive
 	// already past its stop-channel check can still take a claim after this
@@ -147,7 +225,21 @@ func (s *Service) StopOperator() {
 	if cancel != nil {
 		cancel()
 	}
-	s.recoveryWg.Wait()
+	drivesReturned := drain.Wait(&s.recoveryWg, driverDrainTimeout)
+	if !drivesReturned {
+		s.logAbandonedDrives()
+	}
+
+	// The reaper passes hold no claim and drive nothing, so the stages below have
+	// nothing to run against one that is still going. Wait for them apart from
+	// the drives, and let a reaper that does not return cost only its own bound:
+	// deciding the drives' fate on a stuck maintenance pass would leave this
+	// process's engines copying and its healthy claims to expire for nothing.
+	s.drainMonitor(&s.maintenanceWg, "operator_reapers")
+
+	if !drivesReturned {
+		return
+	}
 
 	// A drive returning does not stop the engine it started. An engine that runs
 	// its schema change in this process keeps copying and keeps the target's
@@ -542,7 +634,17 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 
 	s.logger.Debug("operator driver started", "driver", driverID)
 
-	s.driveTick(ctx, driverID)
+	// A driver that finds the gate closed returns rather than skipping a pass:
+	// skipping would only wait for the next select to pick stop. The check is a
+	// non-blocking read, so a pass that starts just before closure still runs;
+	// the ladder re-reads the gate before each of its claim queries, and a
+	// claim that lands in the instant after the last read is captured by
+	// StopOperator's claim drain.
+	if claimGateClosed(stop) {
+		s.logger.Debug("operator driver stopping before its first claim; claiming has stopped", "driver", driverID)
+		return
+	}
+	s.driveTick(ctx, driverID, stop)
 
 	for {
 		select {
@@ -553,11 +655,36 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 			s.logger.Debug("operator driver context cancelled", "driver", driverID)
 			return
 		case <-wake:
+			// select picks at random among ready cases, so a wake or tick
+			// queued before claiming stopped can still be chosen over stop.
+			if claimGateClosed(stop) {
+				s.logger.Debug("operator driver stopping instead of a woken claim; claiming has stopped", "driver", driverID)
+				return
+			}
 			s.logger.Debug("operator driver woke for queued apply", "driver", driverID)
-			s.driveTick(ctx, driverID)
+			s.driveTick(ctx, driverID, stop)
 		case <-ticker.C:
-			s.driveTick(ctx, driverID)
+			if claimGateClosed(stop) {
+				s.logger.Debug("operator driver stopping instead of a polled claim; claiming has stopped", "driver", driverID)
+				return
+			}
+			s.driveTick(ctx, driverID, stop)
 		}
+	}
+}
+
+// claimGateClosed reports, without blocking, whether StopClaiming has closed
+// the driver pool's claim gate. The read is ordered against the close on its
+// own, so it needs no lock; what no read can do is order a claim that follows
+// it against a closure that lands in between, which is why the ladder re-reads
+// the gate as late as it can before each claim query and StopOperator's claim
+// drain covers the instant that remains.
+func claimGateClosed(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -568,9 +695,26 @@ func (s *Service) operatorDriver(ctx context.Context, driverID int, stop <-chan 
 // resumeClaimedApply seam, so a panic reaching this boundary comes from the
 // claim or projection machinery itself and leaves no apply marked failed —
 // that work is retried on a later tick.
-func (s *Service) driveTick(ctx context.Context, driverID int) {
+//
+// The pass honours the claim gate as well as the context: a tick admitted
+// while claiming was still open re-reads the gate here, and the ladder reads
+// it again before each claim query, so a pass overlapping StopClaiming claims
+// nothing after the closure it can observe (AV-14).
+func (s *Service) driveTick(ctx context.Context, driverID int, stop <-chan struct{}) {
+	// The driver's select can pick a ready ticker over an equally ready
+	// ctx.Done(), so a tick can start after the operator has already been told
+	// to stop. Every claim it made would fail against the cancelled context and
+	// report a failure the successor driver is about to retry.
+	if ctx.Err() != nil {
+		s.logger.Debug("operator: skipping the claim ladder; the operator is shutting down", "driver", driverID)
+		return
+	}
+	if claimGateClosed(stop) {
+		s.logger.Debug("operator: skipping the claim ladder; claiming has stopped", "driver", driverID)
+		return
+	}
 	err := panicsafe.Call(func() error {
-		s.recoverApplies(ctx, driverID)
+		s.recoverApplies(ctx, driverID, stop)
 		return nil
 	})
 	if err == nil {
@@ -591,47 +735,32 @@ func (s *Service) driveTick(ctx context.Context, driverID int) {
 	metrics.RecordRecoveredPanic(ctx, "operator_tick")
 }
 
-// expireRetryableApplies runs the retryable-apply expiry maintenance pass,
-// terminalizing failed_retryable applies that have exhausted their attempts or
-// freshness window. It is best-effort: a storage error is logged and recorded
-// but not returned, so the caller can still claim new work in the same tick.
-func (s *Service) expireRetryableApplies(ctx context.Context, driverID int) {
-	expired, err := s.storage.Applies().ExpireRetryable(ctx)
-	if err != nil {
-		s.logger.Error("operator: failed to expire retryable applies", "driver", driverID, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "expire_retryable_error")
+// logClaimFailure reports a failed claim, separating the two ways a rung of the
+// ladder fails. A pass cut short by shutdown is a
+// routine deploy: the driver context is cancelled between polls, so whichever
+// rung was mid-query reports it and the rungs behind it report the same
+// cancellation moments later, while a successor driver reclaims all of it. Like
+// the reaper's sweeps, that ending may not tick the claim-failure counter
+// operators alert on, and there is no operator action it could name. Every
+// other failure keeps its own reason and stays an error.
+//
+// The shutdown test is the driver context rather than the error, so a
+// cancellation that did not come from shutdown still reports as a real failure.
+//
+// The shutdown branch logs at Debug, not Warn, because every deploy cancels
+// every rung of every driver mid-ladder — any louder level rebuilds the noise
+// floor this split exists to remove. The cost is that a failure which
+// manifests only under shutdown leaves no default-level trace; a genuine,
+// persisting failure is not that case, because the successor's claim replays
+// it on a live context and reports it at Error with the counter. Chasing the
+// shutdown-only class means enabling Debug, not promoting this branch.
+func (s *Service) logClaimFailure(ctx context.Context, msg, reason string, attrs ...any) {
+	if ctx.Err() != nil {
+		s.logger.Debug(msg+"; the operator is shutting down and a successor driver will retry the claim", attrs...)
 		return
 	}
-	for _, expiration := range expired {
-		apply := expiration.Apply
-		s.logger.Error("operator: retryable apply expired",
-			append(apply.LogAttrs(),
-				"driver", driverID,
-				"attempt", apply.Attempt,
-				"reason", expiration.Reason)...)
-		metrics.RecordOperatorResumeFailure(ctx, apply.Database, apply.Deployment, apply.Environment, string(expiration.Reason))
-		s.logApplyExpiration(ctx, apply, expiration.Reason)
-	}
-}
-
-// logApplyExpiration appends a durable apply log entry recording that operator
-// recovery gave up on the apply. Expiry is what makes a retryable failure
-// permanent, so without it the apply log ends on the last paused attempt and an
-// operator reading the CLI or the PR summary sees the apply reach a terminal
-// state with nothing stating why. Best-effort: a failed append must not stop
-// the driver from expiring the remaining applies.
-func (s *Service) logApplyExpiration(ctx context.Context, apply *storage.Apply, reason storage.RetryableExpirationReason) {
-	s.appendApplyLog(ctx, s.logger, &storage.ApplyLog{
-		ApplyID:   apply.ID,
-		Level:     storage.LogLevelError,
-		EventType: storage.LogEventError,
-		Source:    storage.LogSourceSchemaBot,
-		Message: fmt.Sprintf("Operator recovery gave up on the apply after %d of %d attempts (%s); it will not be retried automatically",
-			apply.Attempt, storage.MaxRecoveryAttempts, reason),
-		OldState:  state.Apply.FailedRetryable,
-		NewState:  state.Apply.Failed,
-		CreatedAt: s.clock.Now(),
-	}, "why recovery stopped", apply.LogAttrs()...)
+	s.logger.Error(msg, attrs...)
+	metrics.RecordOperatorClaimFailure(ctx, reason)
 }
 
 // appendApplyLog writes one entry to the apply's own log stream, bounded so a
@@ -669,13 +798,12 @@ func (s *Service) markDriverBusy(ctx context.Context) func() {
 // recoverApplies claims and resumes work that needs attention. Each call
 // claims at most one unit — a pending-stop reconciliation, a barrier-parked
 // cutover, or an apply operation — to keep the drive loop responsive.
-func (s *Service) recoverApplies(ctx context.Context, driverID int) {
-	// Retryable-apply expiry is best-effort maintenance: run it first, but a
-	// storage failure here must not stop the driver from claiming new pending
-	// work in the same tick, or a transient expiry error would starve every
-	// queued apply behind it.
-	s.expireRetryableApplies(ctx, driverID)
-
+//
+// The gate is re-read before each rung's claim query rather than once at the
+// top: a rung's query can find nothing to claim, and the next rung then runs
+// after time in which StopClaiming may have closed the gate. Each rung
+// therefore reads the gate as late as it can before its own query (AV-14).
+func (s *Service) recoverApplies(ctx context.Context, driverID int, stop <-chan struct{}) {
 	owner := driverLeaseOwner(driverID)
 
 	// Service a pending stop with no claimable operation to carry it before
@@ -689,6 +817,9 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 	// before claiming new copy work, so the high-risk ordered swaps make
 	// progress ahead of starting more copy phases. Dormant until the
 	// multi-deployment fan-out lands (nothing parks at the barrier today).
+	if s.claimGateClosedBeforeRung(stop, driverID, "cutover") {
+		return
+	}
 	if s.recoverApplyOperationCutover(ctx, driverID, owner) {
 		return
 	}
@@ -698,10 +829,27 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 	// rather than merely tidying a row. It matches nothing while any
 	// operation is still non-terminal or any driver is still heartbeating,
 	// so on a healthy plane this is a cheap no-op.
+	if s.claimGateClosedBeforeRung(stop, driverID, "projection") {
+		return
+	}
 	if s.recoverApplyOperationProjection(ctx, driverID, owner) {
 		return
 	}
+	if s.claimGateClosedBeforeRung(stop, driverID, "operation") {
+		return
+	}
 	s.recoverApplyOperation(ctx, driverID, owner)
+}
+
+// claimGateClosedBeforeRung reports whether StopClaiming closed the claim gate
+// while an earlier rung of the ladder was running, logging the rung the pass
+// stops short of so a shutdown trace shows where claiming ceased.
+func (s *Service) claimGateClosedBeforeRung(stop <-chan struct{}, driverID int, rung string) bool {
+	if !claimGateClosed(stop) {
+		return false
+	}
+	s.logger.Debug("operator: leaving the claim ladder before a rung; claiming has stopped", "driver", driverID, "rung", rung)
+	return true
 }
 
 // recoverApplyOperation claims work at the apply_operations (per-deployment)
@@ -716,8 +864,8 @@ func (s *Service) recoverApplies(ctx context.Context, driverID int) {
 func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner string) {
 	op, err := s.storage.ApplyOperations().FindNextApplyOperation(ctx, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim apply_operation", "driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_storage_error")
+		s.logClaimFailure(ctx, "operator: failed to claim apply_operation", "operation_storage_error",
+			"driver", driverID, "lease_owner", owner, "error", err)
 		return
 	}
 	if op == nil {
@@ -742,6 +890,10 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	// Registered once here, before the branch: every drive below runs under this
 	// operation lease, and shutdown has to hand it back whichever path it took.
 	defer s.trackHeldOperationClaim(op, opLease)()
+	// Registered after the tracker so it runs first: the lease is handed back
+	// while this drive still owns it, and the tracker then deregisters a claim
+	// that is already clear.
+	defer s.releaseFinishedOperationClaim(ctx, driverID, op, opLease)
 
 	// Choose the drive mode. A single-operation apply keeps the legacy
 	// parent-lease drive byte-for-byte. A multi-operation apply — by attached
@@ -750,10 +902,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	// lease, and the parent applies.state is moved solely by the projection CAS.
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to list operations for claimed apply; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to list operations for claimed apply; operation will not be driven", "operation_set_list_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_set_list_error")
 		return
 	}
 	if !operationSetContainsID(ops, op.ID) {
@@ -776,10 +927,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	// then be refused against the terminal apply.
 	apply, err := s.storage.Applies().Get(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to load parent apply for the drive-mode decision; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to load parent apply for the drive-mode decision; operation will not be driven", "operation_parent_load_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
 		return
 	}
 	if apply == nil {
@@ -802,10 +952,9 @@ func (s *Service) recoverApplyOperation(ctx context.Context, driverID int, owner
 	}
 	hasTasks, err := s.claimedOperationHasTasks(ctx, op)
 	if err != nil {
-		s.logger.Error("operator: failed to inspect claimed operation tasks; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to inspect claimed operation tasks; operation will not be driven", "operation_task_inspect_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_task_inspect_error")
 		return
 	}
 	if !hasTasks {
@@ -854,12 +1003,11 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 	// operation lease alone does not authorize parent-apply writes.
 	apply, err := s.storage.Applies().ClaimApplyByID(ctx, op.ApplyID, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim parent apply for operation",
+		s.logClaimFailure(ctx, "operator: failed to claim parent apply for operation", "operation_parent_claim_error",
 			append(op.LogAttrs(),
 				"driver", driverID,
 				"lease_owner", owner,
 				"error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_claim_error")
 		return
 	}
 	if apply == nil {
@@ -884,6 +1032,33 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 				"apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment)...)
 		metrics.RecordOperatorClaimFailure(ctx, "missing_lease_token")
+		return
+	}
+
+	// The parent claim above is a second transaction, so a peer can rotate this
+	// operation's lease onto itself between the two. Driving on would run engine
+	// work under a capability this driver no longer holds, and surface as
+	// whichever operation-scoped write happened to be attempted first — a
+	// re-plan, a task transition — rather than as the claim race it is. Confirm
+	// the operation lease survived the gap and hand the parent back when it did
+	// not, so the peer holding it drives instead.
+	if verdict := s.recheckOperationLease(ctx, driverID, op, opLease); verdict != operationLeaseHeld {
+		s.releaseParentApplyClaim(ctx, driverID, apply, op)
+		// An unproven lease is still this driver's: storage could not answer,
+		// but nothing showed the lease gone. Hand it back rather than sit on a
+		// row this drive is abandoning, or the claim query's heartbeat gate
+		// holds the operation for a full staleness window over one failed read.
+		//
+		// It goes back second because releasing it backdates the row past the
+		// staleness window, which makes the operation claimable again. Released
+		// first, a peer would take it while this driver still held a fresh
+		// parent lease, get nothing from ClaimApplyByID, and hand the row
+		// straight back — a wasted round trip recorded as parent contention.
+		// The reverse order leaves nothing claimable in between: the operation's
+		// heartbeat is fresh until this driver gives it up.
+		if verdict == operationLeaseUnproven {
+			s.releaseOperationClaimBeforeDrive(ctx, driverID, op, opLease)
+		}
 		return
 	}
 
@@ -1050,10 +1225,9 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 
 	apply, err := s.storage.Applies().Get(operationLeaseCtx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to load parent apply for operation drive; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to load parent apply for operation drive; operation will not be driven", "operation_parent_load_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
 		return
 	}
 	if apply == nil {
@@ -1126,6 +1300,13 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		s.failOperationWithoutTasks(operationLeaseCtx, operationLeaseCtx, driverID, op, failApply)
 		return
 	}
+	if !resumed && errors.Is(resumeErr, tern.ErrApplyTaskRowMissing) {
+		// The drive failed closed: a task it loaded has no row, so the rows that
+		// remain would derive a verdict the vanished task never earned. Leave
+		// the operation row as found and claimable; resumeClaimedApply already
+		// logged and counted the cause.
+		return
+	}
 
 	// Persist the operation row from its OWN tasks — even when the drive returned
 	// an error. Unlike the single-op path, a multi-op drive has no
@@ -1185,19 +1366,22 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 		return
 	}
 
-	// Publish the apply-level terminal summary if this drive's projection won the
-	// swap that terminalized the parent. Do this before control-request cleanup:
-	// the summary depends only on the apply being terminal, and a later cleanup
-	// error must not suppress it.
-	s.publishTerminalSummaryIfWon(operationLeaseCtx, driverID, finalApply, result)
-
+	// Settle what the apply resolved before the summary is published: a command
+	// the apply outran is disclosed by the summary, which is published once and
+	// never re-rendered, so a request still pending here yields a summary that
+	// says nothing about it. A settle failure is logged and the summary published
+	// anyway — an unsettled request is recoverable by a later drive, a summary
+	// this projection alone owed is not.
 	if err := s.completePendingControlRequestsIfApplyResolved(operationLeaseCtx, driverID, finalApply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending control requests for resolved apply",
+		s.logger.Error("operator: failed to complete pending control requests for resolved apply; terminal summary will omit the command",
 			append(finalApply.LogAttrs(),
 				"driver", driverID, "apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment, "error", err)...)
-		return
 	}
+
+	// Publish the apply-level terminal summary if this drive's projection won the
+	// swap that terminalized the parent.
+	s.publishTerminalSummaryIfWon(operationLeaseCtx, driverID, finalApply, result)
 }
 
 // recoverApplyOperationCutover claims the next barrier-parked operation whose
@@ -1216,8 +1400,8 @@ func (s *Service) driveClaimedMultiOperation(ctx context.Context, driverID int, 
 func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int, owner string) bool {
 	op, err := s.storage.ApplyOperations().FindNextApplyOperationCutover(ctx, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim apply_operation cutover", "driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_storage_error")
+		s.logClaimFailure(ctx, "operator: failed to claim apply_operation cutover", "operation_cutover_storage_error",
+			"driver", driverID, "lease_owner", owner, "error", err)
 		return true
 	}
 	if op == nil {
@@ -1236,6 +1420,13 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 		metrics.RecordOperatorClaimFailure(ctx, "missing_operation_cutover_lease_token")
 		return true
 	}
+	// The cutover drive holds an operation lease exactly as the copy drive does,
+	// so it hands it back the same way: registered for shutdown to drain, and
+	// cleared when the drive ends so the row does not read as driven to the
+	// lease-only expiry gate. Registered after the tracker so LIFO runs the
+	// release first, while this drive still owns the lease.
+	defer s.trackHeldOperationClaim(op, opLease)()
+	defer s.releaseFinishedOperationClaim(ctx, driverID, op, opLease)
 
 	// The cutover predicate already gates to multi-operation barrier applies, but
 	// the operation-lease-only drive (and its parent-write suppression) is only
@@ -1243,10 +1434,9 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 	// driving rather than trusting the claim alone.
 	ops, err := s.storage.ApplyOperations().ListByApply(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to list operations for claimed cutover; operation will not be driven",
+		s.logClaimFailure(ctx, "operator: failed to list operations for claimed cutover; operation will not be driven", "operation_cutover_set_list_error",
 			append(op.LogAttrs(),
 				"driver", driverID, "lease_owner", owner, "error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_cutover_set_list_error")
 		return true
 	}
 	if len(ops) <= 1 || !operationSetContainsID(ops, op.ID) {
@@ -1284,9 +1474,8 @@ func (s *Service) recoverApplyOperationCutover(ctx context.Context, driverID int
 func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, owner string) bool {
 	apply, err := s.storage.Applies().FindNextApplyForStopReconciliation(ctx, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim apply for stop reconciliation",
+		s.logClaimFailure(ctx, "operator: failed to claim apply for stop reconciliation", "stop_reconciliation_claim_error",
 			"driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "stop_reconciliation_claim_error")
 		return false
 	}
 	if apply == nil {
@@ -1361,17 +1550,18 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 		return true
 	}
 
+	// Settle first so the summary below can disclose a command this apply outran;
+	// see recoverApplyOperation for why a settle failure does not hold it back.
+	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation; terminal summary will omit the command",
+			append(finalApply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+	}
+
 	// A multi-operation apply that settles terminal here (stop reconciliation has
 	// no operation drive to publish on its behalf) still owes its single terminal
 	// summary; publish it if this projection won the terminal swap.
 	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, finalApply, result)
-
-	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, finalApply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending control requests after stop reconciliation",
-			append(finalApply.LogAttrs(),
-				"driver", driverID, "error", err)...)
-		return true
-	}
 	return true
 }
 
@@ -1402,9 +1592,8 @@ func (s *Service) recoverApplyPendingStop(ctx context.Context, driverID int, own
 func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID int, owner string) bool {
 	apply, err := s.storage.Applies().FindNextApplyForOperationProjection(ctx, owner)
 	if err != nil {
-		s.logger.Error("operator: failed to claim apply for operation projection",
+		s.logClaimFailure(ctx, "operator: failed to claim apply for operation projection", "operation_projection_claim_error",
 			"driver", driverID, "lease_owner", owner, "error", err)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_projection_claim_error")
 		return true
 	}
 	if apply == nil {
@@ -1447,6 +1636,19 @@ func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID 
 				"driver", driverID, "operation_count", result.OperationCount)...)
 		return false
 	}
+	if !result.Swapped && result.HeldByResumableChild {
+		// Every operation is terminal, which is what the claim predicate matches
+		// on, but one of them is stopped and an operator can start it again. The
+		// parent is already showing the state that says so, and holding it open
+		// is what keeps that start claimable, so there is nothing to repair here
+		// and no warning to raise. The claim refreshed the heartbeat; this
+		// driver's tick moves on to claim real work.
+		s.logger.Info("operator: claimed apply is held open by an operation an operator can start again; it stays open for that start and needs no repair",
+			append(apply.LogAttrs(),
+				"driver", driverID, "derived_state", result.DerivedState,
+				"operation_count", result.OperationCount)...)
+		return false
+	}
 	if !result.Swapped {
 		// The claim refreshed the heartbeat, so this apply is not reconsidered
 		// until the staleness window elapses again. Warn rather than debug: a
@@ -1461,16 +1663,17 @@ func (s *Service) recoverApplyOperationProjection(ctx context.Context, driverID 
 	}
 	metrics.RecordOperatorOperationProjectionRepair(ctx, apply.Database, apply.Deployment, apply.Environment, result.DerivedState)
 
+	// Settle first so the summary below can disclose a command this apply outran;
+	// see recoverApplyOperation for why a settle failure does not hold it back.
+	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, apply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests after deriving apply state from its settled operations; terminal summary will omit the command",
+			append(apply.LogAttrs(),
+				"driver", driverID, "error", err)...)
+	}
+
 	// No operation drive is left to publish on this apply's behalf, so this
 	// projection owes the single terminal summary if it won the terminal swap.
 	s.publishTerminalSummaryIfWon(applyLeaseCtx, driverID, apply, result)
-
-	if err := s.completePendingControlRequestsIfApplyResolved(applyLeaseCtx, driverID, apply.ID); err != nil {
-		s.logger.Error("operator: failed to complete pending control requests after deriving apply state from its settled operations",
-			append(apply.LogAttrs(),
-				"driver", driverID, "error", err)...)
-		return true
-	}
 	return true
 }
 
@@ -1513,10 +1716,11 @@ func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int
 // the requests do not stay pending forever after the rollout resolves. The
 // apply is reloaded because the derived-state write operates on a copy and
 // does not mutate the caller's row. A pending stop completes at any terminal
-// state. A pending cancel completes only when the terminal state is not
-// stopped: a stopped apply remains cancellable, so its pending cancel must
-// stay deliverable for the next drive. No-op when the apply is still
-// non-terminal or nothing is pending.
+// state. A pending cancel is handed to the shared settlement, which decides
+// whether the cancel took effect or the schema change outran it, so this path
+// discloses the same outcome as every other drive shape. A still-non-terminal
+// apply resolves only its stop, and only once that stop has reached every
+// operation. No-op when nothing is pending.
 func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, driverID int, applyID int64) error {
 	apply, err := s.storage.Applies().Get(ctx, applyID)
 	if err != nil {
@@ -1526,26 +1730,74 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 		return fmt.Errorf("reload apply %d before completing pending control requests: %w", applyID, storage.ErrApplyNotFound)
 	}
 	if !state.IsTerminalApplyState(apply.State) {
-		return nil
+		return s.completeLandedStopForHeldOpenApply(ctx, driverID, apply)
 	}
 
 	if err := s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop); err != nil {
 		return err
 	}
-	if state.IsState(apply.State, state.Apply.Stopped) {
-		s.logger.Debug("operator: leaving pending cancel request deliverable for stopped apply",
-			append(apply.LogAttrs(),
-				"driver", driverID)...)
+	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, s.logger.With("driver", driverID), apply)
+}
+
+// completeLandedStopForHeldOpenApply completes a pending stop request on an
+// apply the rollout projection is still holding open.
+//
+// A stopped operation still holds its target, so a rollout an operator stopped
+// can carry a running-family verdict with every one of its operations already
+// terminal. The stop has landed all the same, and its request is what start
+// consults: leaving it pending refuses the very start that resumes the stopped
+// operation, which is the only way that rollout ever settles. Cancel is not
+// completed here — the apply is not resolved, and the cancel is still
+// deliverable to the next drive.
+//
+// Fails closed on an incomplete generation. While the manifest still declares
+// operations that have not attached, a later dispatch can bring work this stop
+// must halt, so the request stays pending for it.
+func (s *Service) completeLandedStopForHeldOpenApply(ctx context.Context, driverID int, apply *storage.Apply) error {
+	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, storage.ControlOperationStop)
+	if err != nil {
+		return fmt.Errorf("load pending stop request for held-open apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if controlReq == nil {
 		return nil
 	}
-	return s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationCancel)
+
+	ops, err := s.storage.ApplyOperations().ListByApply(ctx, apply.ID)
+	if err != nil {
+		return fmt.Errorf("list apply_operations for held-open apply %s (%d): %w", apply.ApplyIdentifier, apply.ID, err)
+	}
+	if len(ops) == 0 {
+		s.logger.Debug("operator: leaving pending stop request for held-open apply with no operation rows",
+			append(apply.LogAttrs(), "driver", driverID)...)
+		return nil
+	}
+	if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
+		s.logger.Debug("operator: leaving pending stop request deliverable for operations the generation manifest still expects",
+			append(apply.LogAttrs(),
+				"driver", driverID, "missing_operation_keys", missing)...)
+		return nil
+	}
+	for _, op := range ops {
+		if !state.IsApplyOperationTerminal(op.State) {
+			s.logger.Debug("operator: leaving pending stop request for held-open apply with an operation the stop has not reached",
+				append(apply.LogAttrs(),
+					"driver", driverID, "operation_deployment", op.Deployment,
+					"operation_state", op.State)...)
+			return nil
+		}
+	}
+	return s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop)
 }
 
 // completePendingRequestForResolvedApply completes one pending control request
 // for an apply the caller has already established as resolved for that
 // operation. No-op when no request of that operation is pending.
 func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, driverID int, apply *storage.Apply, op storage.ControlOperation) error {
-	controlReq, err := s.storage.ControlRequests().GetPending(ctx, apply.ID, op)
+	requests := s.storage.ControlRequests()
+	if requests == nil {
+		return fmt.Errorf("complete pending %s request for resolved apply %s (%d): control request store is not available", op, apply.ApplyIdentifier, apply.ID)
+	}
+	controlReq, err := requests.GetPending(ctx, apply.ID, op)
 	if err != nil {
 		return fmt.Errorf("load pending %s request for resolved apply %s (%d): %w", op, apply.ApplyIdentifier, apply.ID, err)
 	}
@@ -1553,13 +1805,197 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 		return nil
 	}
 
-	if err := s.storage.ControlRequests().CompletePending(ctx, apply.ID, op); err != nil {
+	if err := requests.CompletePending(ctx, apply.ID, op); err != nil {
 		return fmt.Errorf("complete pending %s request for resolved apply %s (%d): %w", op, apply.ApplyIdentifier, apply.ID, err)
 	}
 	s.logger.Info("operator: completed pending control request for resolved apply",
 		append(apply.LogAttrs(),
 			"driver", driverID, "operation", op)...)
 	return nil
+}
+
+// operationLeaseVerdict is what a pre-drive lease re-check concluded. The three
+// answers differ in what this driver still holds, which is what decides whether
+// it has an operation lease to hand back.
+type operationLeaseVerdict int
+
+const (
+	// operationLeaseHeld: the row still carries this drive's token.
+	operationLeaseHeld operationLeaseVerdict = iota
+	// operationLeaseUnproven: storage could not answer. Nothing showed the lease
+	// gone, so this driver still holds it and owes a release.
+	operationLeaseUnproven
+	// operationLeaseLost: a successful read showed the lease is no longer this
+	// driver's — the row is gone, a peer rotated the token onto itself, or a
+	// peer released it. There is nothing left to release.
+	operationLeaseLost
+)
+
+// recheckOperationLease re-reads the operation row to see whether it still
+// carries this drive's lease token. It spans the gap between the operation claim
+// and the parent apply claim, so a peer that rotated the token in that gap is
+// detected before any engine work runs rather than through the first refused
+// write.
+//
+// It narrows that race rather than closing it: the read takes no row lock, so a
+// peer can still rotate between this read and the drive's first write, where the
+// lease-guarded write catches it (OW-2). What the claim query's own heartbeat
+// gate closes is the window that produced the rotation in the first place; this
+// re-check is what turns the remainder into an early, correctly named claim race
+// instead of a late failure attributed to whichever write ran first.
+//
+// Uncertainty is not displacement (OW-4): a storage failure answers unproven,
+// not lost, so the caller hands the lease back for an immediate retry instead of
+// treating a blip as a peer.
+func (s *Service) recheckOperationLease(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) operationLeaseVerdict {
+	current, err := s.storage.ApplyOperations().Get(ctx, op.ID)
+	if err != nil {
+		s.logClaimFailure(ctx, "operator: could not re-read the claimed operation to confirm its lease survived the parent claim; operation will not be driven", "operation_lease_recheck_error",
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"error", err)...)
+		return operationLeaseUnproven
+	}
+	if current == nil {
+		s.logger.Error("operator: claimed operation disappeared before its drive started; operation will not be driven",
+			append(op.LogAttrs(), "driver", driverID)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_recheck_missing")
+		return operationLeaseLost
+	}
+	// An empty token is a peer that released the row rather than one that took
+	// it, and the two need different log lines: nobody is driving the operation
+	// now, so the truthful outcome is that the next poll offers it again.
+	if current.LeaseToken == "" {
+		s.logger.Warn("operator: a peer released the operation lease between this driver's operation claim and its parent apply claim; the operation is offered again on the next poll",
+			append(op.LogAttrs(), "driver", driverID)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_released_by_peer")
+		return operationLeaseLost
+	}
+	if current.LeaseToken != opLease.Token {
+		s.logger.Warn("operator: a peer rotated the operation lease between this driver's operation claim and its parent apply claim; the peer drives the operation",
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"current_lease_owner", current.LeaseOwner)...)
+		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_rotated")
+		return operationLeaseLost
+	}
+	return operationLeaseHeld
+}
+
+// releaseOperationClaimBeforeDrive hands back an operation lease this driver
+// holds but will not drive under, so the next poll can offer the row
+// immediately. Without it the claim query's heartbeat gate — refreshed by this
+// driver's own claim — keeps the row unclaimable for a full staleness window,
+// which is the stall the release exists to avoid.
+func (s *Service) releaseOperationClaimBeforeDrive(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
+	if err != nil {
+		s.logClaimFailure(ctx, "operator: failed to release the operation lease this driver will not drive under; the operation is retried once its lease goes stale", "operation_lease_release_error",
+			append(op.LogAttrs(),
+				"driver", driverID,
+				"error", err)...)
+		return
+	}
+	if !released {
+		s.logger.Warn("operator: operation lease already rotated before this driver could release it; the new lease owner drives the operation",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+	s.logger.Info("operator: released the operation lease this driver will not drive under; the operation is offered on the next poll",
+		append(op.LogAttrs(), "driver", driverID)...)
+}
+
+// releaseFinishedOperationClaim clears the operation lease a drive leaves
+// behind when it ends.
+//
+// A drive that has ended is finished with the row, but its lease stays fresh
+// for a full staleness window, and for that window nothing can tell the
+// leftover apart from the lease a driver just took: same state, same shape of
+// owner, same recent heartbeat. Any reader that consults the lease to ask
+// whether a drive is in progress has to assume the pessimistic answer. Clearing
+// the lease at the point the drive actually ends makes a fresh lease mean what
+// it says.
+//
+// This runs as the drive returns rather than inside the state write, because
+// the multi-operation drive projects the parent apply's state under this same
+// operation lease after the operation reaches its own state.
+//
+// A no-op on every other way out: the store write is guarded on the ended
+// states and on this driver's lease token, so an operation a driver may still
+// resume, or one a peer has re-leased, is left alone.
+func (s *Service) releaseFinishedOperationClaim(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
+	// Shutdown owns the handback from the moment the drain opens. A drive
+	// returning now is one StopOperator cancelled, and its engine is still up:
+	// the halt runs after every drive has returned. Clearing the lease here
+	// would advertise the operation as undriven while this process still holds
+	// the target's lock, and with the expiry gate reading the lease alone that
+	// is enough for a peer to settle the tree mid-change. The claim stays
+	// registered instead, and releaseHeldOperationClaims hands it back after
+	// the halt, refusing any deployment that did not come down cleanly.
+	if s.claimDrainInProgress() {
+		s.logger.Debug("operator: leaving this operation's lease registered for shutdown to hand back after its engine is halted",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+
+	// Detached from the driver context: an ordinary drive can return with its
+	// context already cancelled, and the clear is what keeps the row from
+	// deferring expiry for a staleness window.
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), finishedClaimReleaseTimeout)
+	defer cancel()
+
+	released, err := s.storage.ApplyOperations().ReleaseFinishedClaim(releaseCtx, opLease)
+	if err != nil {
+		s.logger.Warn("operator: failed to clear the lease on the operation this driver finished; the leftover lease defers this apply's retryable expiry until it goes stale",
+			append(op.LogAttrs(), "driver", driverID, "error", err)...)
+		return
+	}
+	if !released {
+		s.logger.Debug("operator: no finished lease to clear for this operation; it is not in an ended state under this driver's lease",
+			append(op.LogAttrs(), "driver", driverID)...)
+		return
+	}
+	s.logger.Info("operator: cleared the lease on an operation this driver is no longer driving",
+		append(op.LogAttrs(), "driver", driverID)...)
+}
+
+// claimDrainInProgress reports whether shutdown has taken ownership of handing
+// this process's operation claims back.
+func (s *Service) claimDrainInProgress() bool {
+	s.heldOperationClaimsMu.Lock()
+	defer s.heldOperationClaimsMu.Unlock()
+	return s.heldOperationClaimsDraining
+}
+
+// releaseParentApplyClaim hands back a parent apply lease this driver acquired
+// but will not drive under, so the peer that owns the operation can claim it on
+// its next poll instead of waiting out the staleness window. A parent left
+// leased here is exactly the stall the release avoids: the operation claim only
+// re-offers the row while the parent's heartbeat is stale.
+func (s *Service) releaseParentApplyClaim(ctx context.Context, driverID int, apply *storage.Apply, op *storage.ApplyOperation) {
+	released, err := s.storage.Applies().ReleaseClaim(ctx, apply.Lease())
+	if err != nil {
+		s.logClaimFailure(ctx, "operator: failed to release the parent apply claim this driver will not drive; the parent is retried once its lease goes stale", "operation_parent_release_error",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment,
+				"error", err)...)
+		return
+	}
+	if !released {
+		s.logger.Warn("operator: parent apply lease already rotated before this driver could release it; the new lease owner drives the apply",
+			append(apply.LogAttrs(),
+				"driver", driverID,
+				"apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment)...)
+		return
+	}
+	s.logger.Info("operator: released the parent apply claim for an operation this driver no longer leases",
+		append(apply.LogAttrs(),
+			"driver", driverID,
+			"apply_operation_id", op.ID,
+			"operation_deployment", op.Deployment)...)
 }
 
 // reconcileUnclaimableParent handles a claimed operation whose parent apply
@@ -1574,11 +2010,10 @@ func (s *Service) completePendingRequestForResolvedApply(ctx context.Context, dr
 func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, op *storage.ApplyOperation, opLease storage.OperationLease) {
 	parent, err := s.storage.Applies().Get(ctx, op.ApplyID)
 	if err != nil {
-		s.logger.Error("operator: failed to load unclaimable parent apply; operation will be retried once its lease goes stale",
+		s.logClaimFailure(ctx, "operator: failed to load unclaimable parent apply; operation will be retried once its lease goes stale", "operation_parent_load_error",
 			append(op.LogAttrs(),
 				"driver", driverID,
 				"error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_parent_load_error")
 		return
 	}
 	if parent == nil {
@@ -1595,13 +2030,12 @@ func (s *Service) reconcileUnclaimableParent(ctx context.Context, driverID int, 
 	metrics.RecordOperatorClaimFailure(ctx, "operation_parent_not_claimable")
 	released, err := s.storage.ApplyOperations().ReleaseClaim(ctx, opLease)
 	if err != nil {
-		s.logger.Error("operator: parent apply not claimable and operation lease release failed; operation will be retried once its lease goes stale",
+		s.logClaimFailure(ctx, "operator: parent apply not claimable and operation lease release failed; operation will be retried once its lease goes stale", "operation_lease_release_error",
 			append(parent.LogAttrs(),
 				"driver", driverID,
 				"apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment,
 				"error", err)...)
-		metrics.RecordOperatorClaimFailure(ctx, "operation_lease_release_error")
 		return
 	}
 	if !released {
@@ -1669,6 +2103,17 @@ func (s *Service) failOperationWithoutTasks(opCtx, applyCtx context.Context, dri
 				"driver", driverID, "apply_operation_id", op.ID,
 				"operation_deployment", op.Deployment, "error", err)...)
 		return
+	}
+
+	// A failure the operator did not ask for still answers the command they did:
+	// this path resolves the apply, so it owes any pending stop or cancel the
+	// same settlement every other resolving path gives, before the summary that
+	// discloses it is published.
+	if err := s.completePendingControlRequestsIfApplyResolved(applyCtx, driverID, apply.ID); err != nil {
+		s.logger.Error("operator: failed to complete pending control requests after failing task-less operation; terminal summary will omit the command",
+			append(apply.LogAttrs(),
+				"driver", driverID, "apply_operation_id", op.ID,
+				"operation_deployment", op.Deployment, "error", err)...)
 	}
 
 	// A task-less operation failure that terminalizes a multi-operation apply
@@ -1847,6 +2292,20 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			logger.Error("operator: apply owns task rows the drive did not load; refusing task-less completion and leaving the apply claimable",
 				"error", err)
 			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "apply_tasks_not_loaded")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
+		if errors.Is(err, tern.ErrApplyTaskRowMissing) {
+			// Fail-closed: a task the drive loaded has no row when re-read before
+			// it starts, so the rows that remain cannot stand in for the apply's
+			// verdict. The drive wrote no verdict; the apply stays claimable and
+			// each re-claim fails here, so the stuck work stays visible on this
+			// counter until the row is restored or an operator intervenes.
+			logger.Error("operator: apply task row vanished before its drive; refusing to derive a verdict from the remaining tasks and leaving the apply claimable",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "apply_task_row_missing")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}
@@ -2099,7 +2558,7 @@ func (s *Service) operationHeartbeatFailureStopsDrive(ctx context.Context, drive
 // stopped making observable progress while its heartbeat stays fresh. The
 // drive's poll loop mirrors every task row to storage on every poll tick, so
 // task updated_at advances continuously while the drive goroutine is alive. A
-// drive that has mirrored nothing for the full ApplyDriveStallAfter window is
+// drive that has mirrored nothing for the full storage.ApplyDriveStallAfter window is
 // wedged — for example blocked in a target-database read that outlives its
 // cancelled context — and will never finish on its own, yet its heartbeat
 // keeps the operation lease fresh so no peer driver can reclaim the work.
@@ -2122,7 +2581,7 @@ func (s *Service) operationDriveStalled(ctx context.Context, driverID int, op *s
 		return false
 	}
 	now := s.clock.Now()
-	if now.Sub(driveStart) < ApplyDriveStallAfter {
+	if now.Sub(driveStart) < storage.ApplyDriveStallAfter {
 		return false
 	}
 	logAttrs := append(append(op.LogAttrs(), apply.IdentityLogAttrs()...),
@@ -2145,14 +2604,14 @@ func (s *Service) operationDriveStalled(ctx context.Context, driverID int, op *s
 			lastMirror = task.UpdatedAt
 		}
 	}
-	if now.Sub(lastMirror) < ApplyDriveStallAfter {
+	if now.Sub(lastMirror) < storage.ApplyDriveStallAfter {
 		return false
 	}
 	s.logger.Warn("operator: drive has mirrored no task progress for the full stall window while its heartbeat stayed fresh; the run will be cancelled so the operation can be re-claimed",
 		append(logAttrs,
 			"drive_started", driveStart,
 			"last_task_mirror", lastMirror,
-			"stall_window", ApplyDriveStallAfter)...)
+			"stall_window", storage.ApplyDriveStallAfter)...)
 	metrics.RecordOperatorResumeFailure(ctx, apply.Database, op.Deployment, apply.Environment, "drive_stalled")
 	return true
 }
@@ -2339,7 +2798,9 @@ func (s *Service) persistOperationState(ctx context.Context, driverID int, op *s
 
 // failedApplyReopenPolicy controls whether updateApplyStateFromOperations may
 // reopen a terminal-failed parent apply back to running when the rollout
-// projection legitimately holds it active under on_failure "continue".
+// projection legitimately holds it active: under on_failure "continue" because
+// later siblings still get their turn, and under a fail-closed policy because a
+// sibling that a driver already started is still working.
 //
 // The reopen write is only safe when the caller holds the parent apply lease:
 // reviving a failed parent through an unscoped, last-write-wins Applies().Update
@@ -2355,7 +2816,7 @@ const (
 	// unscoped reconcileUnclaimableParent path, which holds no parent lease.
 	rejectFailedApplyReopen failedApplyReopenPolicy = false
 	// allowLeaseScopedFailedReopen permits a failed parent to reopen to running
-	// when the continue projection holds it active. Used only by callers that
+	// when the rollout projection holds it active. Used only by callers that
 	// pass a lease-scoped context, so the write fails closed after ownership
 	// changes.
 	allowLeaseScopedFailedReopen failedApplyReopenPolicy = true
@@ -2392,6 +2853,11 @@ type applyProjectionResult struct {
 	// a healthy deployment-keyed rollout awaiting its remaining dispatches,
 	// not a stranded parent.
 	ManifestHeld bool
+	// HeldByResumableChild is true when every child reached a terminal state but
+	// the derived parent stayed non-terminal because one of them can still be
+	// started again. The apply is waiting on the operator who stopped it, not
+	// stranded behind a projection that never ran.
+	HeldByResumableChild bool
 }
 
 // anyPauseOnFailure reports whether any operation uses the on_failure=pause
@@ -2415,15 +2881,16 @@ func projectionOwnsActiveAppliesGauge(apply *storage.Apply, ops []*storage.Apply
 	return len(ops) > 1 || len(apply.MissingExpectedOperationKeys(ops)) > 0
 }
 
-// manifestGatedVerdict reports whether a derived apply state asserts a
-// whole-generation outcome: completed claims every declared operation applied,
-// and reverted claims every declared operation was unwound. Neither claim is
-// honest while manifest-declared operations have not attached, so the
-// generation-manifest hold gates both. Failure verdicts are not gated: a
-// failed generation must not wait for siblings that may never dispatch.
-func manifestGatedVerdict(derived string) bool {
-	return state.IsState(derived, state.Apply.Completed) ||
-		state.IsState(derived, state.Apply.Reverted)
+// manifestHoldSuccessor returns the apply that took over the work of an apply
+// held open for its generation manifest, or "" when none has. It reads the
+// marker from storage rather than from the caller's copy, which can predate the
+// admission that recorded it.
+func (s *Service) manifestHoldSuccessor(ctx context.Context, apply *storage.Apply) (string, error) {
+	successor, err := s.storage.Applies().GetSupersededBy(ctx, apply.ID)
+	if err != nil {
+		return "", fmt.Errorf("read the successor of apply %s held open for its manifest: %w", apply.ApplyIdentifier, err)
+	}
+	return successor, nil
 }
 
 // updateApplyStateFromOperations re-derives applies.state from the apply's child
@@ -2436,7 +2903,9 @@ func manifestGatedVerdict(derived string) bool {
 // longer terminalizes the apply while other siblings are still in flight; the
 // apply is held running until the rollout settles, then takes the failed verdict.
 // Every other policy (halt, pause, unrecognized) fails closed to the failed
-// verdict. While an apply has exactly one operation the derived value equals the
+// verdict, and holds the apply degraded until any sibling that a driver already
+// started settles, because refusing new claims does not stop work already under
+// way. While an apply has exactly one operation the derived value equals the
 // value ResumeApply already persisted, so this is a no-op until the
 // multi-deployment fan-out makes an apply own more than one operation.
 //
@@ -2444,7 +2913,7 @@ func manifestGatedVerdict(derived string) bool {
 // lease-scoped context so the write fails closed after ownership changes; the
 // terminal-parent reconciliation path passes an unscoped context. The reopen
 // parameter encodes the matching authority — a terminal parent may only be
-// reopened (failed → running, for the continue hold-active projection) by a
+// reopened (failed → running, for the hold-active rollout projection) by a
 // caller that holds the parent lease (allowLeaseScopedFailedReopen). The
 // unscoped reconciliation path passes rejectFailedApplyReopen so it never
 // revives a terminal parent through a last-write-wins update; every other
@@ -2479,19 +2948,15 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	}
 
 	childStates := make([]string, len(ops))
-	children := make([]state.RolloutChild, len(ops))
+	rolloutOps := make([]state.RolloutOperation, len(ops))
 	for i, op := range ops {
 		childStates[i] = op.State
-		isContinue := op.OnFailure == storage.OnFailureContinue
-		isPause := op.OnFailure == storage.OnFailurePause
-		children[i] = state.RolloutChild{
-			State:             op.State,
-			ContinueOnFailure: isContinue || (isPause && released),
-			PauseOnFailure:    isPause && !released,
-		}
+		rolloutOps[i] = op.RolloutOperation(released)
 	}
+	children := state.RolloutChildren(rolloutOps)
 	base := state.DeriveApplyState(childStates)
 	derived := state.DeriveRolloutApplyState(children)
+	heldByResumableChild := state.RolloutHeldByResumableChild(derived, children)
 
 	// A deployment-keyed apply's operations attach one dispatch at a time, so
 	// the attached rows alone cannot prove the generation is done. The stored
@@ -2502,34 +2967,55 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// the work the dispatcher declared is still on its way, and terminalizing
 	// early would make later dispatches refuse to attach, silently diverging
 	// the declared shards from the recorded outcome.
+	//
+	// A newer generation taking over this apply's work ends the wait.
+	// Admission lets one in beside this apply only once everything attached
+	// here has settled, records the handoff on this apply (SupersededBy), and
+	// from then on refuses the missing operations, so they can no longer arrive
+	// and the verdict is the one over what did.
 	manifestHeld := false
-	if manifestGatedVerdict(derived) {
+	if state.IsManifestGatedVerdict(derived) {
 		if missing := apply.MissingExpectedOperationKeys(ops); len(missing) > 0 {
-			derived = state.Apply.Running
-			manifestHeld = true
-			s.logger.Debug("operator: holding apply open; manifest operations have not attached yet",
-				append(apply.LogAttrs(),
-					"driver", driverID,
-					"missing_operation_keys", missing,
-					"operation_count", len(ops))...)
-			metrics.RecordApplyManifestHold(ctx, apply.Database, apply.Deployment, apply.Environment)
+			successor, err := s.manifestHoldSuccessor(ctx, apply)
+			if err != nil {
+				return applyProjectionResult{}, err
+			}
+			if successor != "" {
+				s.logger.Warn("operator: settling apply held open for manifest operations that never attached; a newer apply took over its work, so they can no longer arrive",
+					append(apply.LogAttrs(),
+						"driver", driverID,
+						"missing_operation_keys", missing,
+						"successor_apply_id", successor,
+						"derived_state", derived)...)
+			} else {
+				derived = state.Apply.Running
+				manifestHeld = true
+				s.logger.Debug("operator: holding apply open; manifest operations have not attached yet",
+					append(apply.LogAttrs(),
+						"driver", driverID,
+						"missing_operation_keys", missing,
+						"operation_count", len(ops))...)
+				metrics.RecordApplyManifestHold(ctx, apply.Database, apply.Deployment, apply.Environment)
+			}
 		}
 	}
 
-	// A failed parent is the one terminal state the continue projection can
-	// legitimately reopen: a continuable sibling failure may have terminalized
-	// the parent before the rollout settled, and re-deriving over the operation
-	// rows holds it running until every sibling is terminal. Gate the exception
-	// narrowly — the parent must be failed, the child base must still be failed
-	// (a real continuable failure, not a stale parent over non-failed children),
-	// the derived projection must be the held-running degraded state, and the
-	// caller must hold the lease.
-	reopensContinuableFailedRollout := bool(reopen) &&
+	// A failed parent is the one terminal state the rollout projection can
+	// legitimately reopen: a sibling failure may have terminalized the parent
+	// before the rollout settled, and re-deriving over the operation rows holds
+	// it degraded until every sibling settles. This covers both policies
+	// that hold — continue, which lets later siblings still run, and a
+	// fail-closed policy whose verdict landed while an already-started sibling
+	// was working. Gate the exception narrowly: the parent must be failed, the
+	// child base must still be failed (a real failure, not a stale parent over
+	// non-failed children), the derived projection must be the held degraded
+	// state, and the caller must hold the lease.
+	reopensHeldFailedRollout := bool(reopen) &&
 		state.IsState(apply.State, state.Apply.Failed) &&
 		state.IsState(base, state.Apply.Failed) &&
 		state.IsState(derived, state.Apply.RunningDegraded)
 
-	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) && !reopensContinuableFailedRollout {
+	if state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived) && !reopensHeldFailedRollout {
 		return applyProjectionResult{}, fmt.Errorf("derive apply state for terminal apply %s (%d): child operations derive non-terminal state %q from parent state %q",
 			apply.ApplyIdentifier, apply.ID, derived, apply.State)
 	}
@@ -2548,7 +3034,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		s.logger.Debug("operator: derived apply state matches current; no update",
 			append(apply.LogAttrs(),
 				"driver", driverID, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild}, nil
 	}
 
 	var completedAt *time.Time
@@ -2589,7 +3075,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 		s.logger.Info("operator: derived apply state write lost a race; skipping",
 			append(apply.LogAttrs(),
 				"driver", driverID, "derived_state", derived, "operation_count", len(ops))...)
-		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld}, nil
+		return applyProjectionResult{PreviousState: apply.State, DerivedState: derived, OperationCount: len(ops), ManifestHeld: manifestHeld, HeldByResumableChild: heldByResumableChild}, nil
 	}
 	s.logger.Info("operator: updated derived apply state from apply_operations",
 		append(apply.LogAttrs(),
@@ -2624,7 +3110,7 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// operation-lease-only drives suppress the parent-level metric, so the
 	// projection that wins the parent transition is the single point that must
 	// release it: -1 when the rollout first reaches a terminal state, and +1
-	// if a continuable failure reopens the parent to keep it running, so the
+	// if a held rollout reopens the parent to keep it running, so the
 	// gauge tracks whether the apply is still in flight. A legacy
 	// single-operation apply keeps decrementing in its direct parent-lease
 	// drive and is left untouched here.
@@ -2638,12 +3124,13 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	}
 
 	return applyProjectionResult{
-		Swapped:        true,
-		PreviousState:  apply.State,
-		DerivedState:   derived,
-		BecameTerminal: !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
-		OperationCount: len(ops),
-		ManifestHeld:   manifestHeld,
+		Swapped:              true,
+		PreviousState:        apply.State,
+		DerivedState:         derived,
+		BecameTerminal:       !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived),
+		OperationCount:       len(ops),
+		ManifestHeld:         manifestHeld,
+		HeldByResumableChild: heldByResumableChild,
 	}, nil
 }
 

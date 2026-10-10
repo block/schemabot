@@ -47,6 +47,11 @@ type EtreResolverConfig struct {
 	// Assembler turns the resolved endpoint and credentials into the
 	// engine-specific connection, and determines the resolved target's type.
 	Assembler inventory.ConnectionAssembler
+
+	// TableOwner is the PostgreSQL role new tables are created as on every
+	// target this resolver serves. Optional: empty creates them as the
+	// connected role. Only valid for postgres.
+	TableOwner string
 }
 
 // EtreResolver resolves targets through Etre, delegating the engine-specific
@@ -55,7 +60,17 @@ type EtreResolver struct {
 	cfg EtreResolverConfig
 }
 
-var _ inventory.Resolver = (*EtreResolver)(nil)
+var (
+	_ inventory.Resolver     = (*EtreResolver)(nil)
+	_ inventory.TypeReporter = (*EtreResolver)(nil)
+)
+
+// DatabaseType names the one engine this resolver serves: the type its
+// assembler builds connections for, and the type ResolveTarget refuses to
+// deviate from.
+func (r *EtreResolver) DatabaseType() string {
+	return r.cfg.Assembler.DatabaseType()
+}
 
 // NewEtreResolver validates the config and builds a resolver.
 func NewEtreResolver(cfg EtreResolverConfig) (*EtreResolver, error) {
@@ -68,6 +83,9 @@ func NewEtreResolver(cfg EtreResolverConfig) (*EtreResolver, error) {
 		return nil, fmt.Errorf("credential resolver is required")
 	case cfg.Assembler == nil:
 		return nil, fmt.Errorf("connection assembler is required")
+	}
+	if err := inventory.ValidateTableOwner(cfg.Assembler.DatabaseType(), cfg.TableOwner); err != nil {
+		return nil, fmt.Errorf("etre resolver: %w", err)
 	}
 	// Fixed labels must not collide with the target or env predicates, which
 	// would let a misconfigured label silently override them and resolve the
@@ -139,5 +157,6 @@ func (r *EtreResolver) ResolveTarget(ctx context.Context, req inventory.Request)
 		DatabaseType: r.cfg.Assembler.DatabaseType(),
 		DSN:          dsn,
 		Metadata:     metadata,
+		TableOwner:   r.cfg.TableOwner,
 	}, nil
 }

@@ -1,0 +1,554 @@
+package tern
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/schema"
+	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/storage"
+)
+
+// A pending grouped progress report only signals lost work when at least one
+// stored task is genuinely in flight. Resting states — stopped,
+// failed_retryable — have no active engine work by design, terminal states are
+// never re-verified, and an apply with no tasks has nothing to settle.
+func TestEngineReportsLostApplyWork(t *testing.T) {
+	cases := []struct {
+		name            string
+		engineTaskState string
+		taskStates      []string
+		want            bool
+	}{
+		{"running task with pending engine report is lost work", state.Task.Pending, []string{state.Task.Running, state.Task.Completed}, true},
+		{"cutting-over task with pending engine report is lost work", state.Task.Pending, []string{state.Task.CuttingOver}, true},
+		{"all tasks at rest is not divergence", state.Task.Pending, []string{state.Task.FailedRetryable, state.Task.Stopped}, false},
+		{"all tasks terminal is never re-verified", state.Task.Pending, []string{state.Task.Completed, state.Task.Cancelled}, false},
+		{"running engine report is not lost work", state.Task.Running, []string{state.Task.Running}, false},
+		{"no tasks means nothing to settle", state.Task.Pending, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tasks := make([]*storage.Task, len(tc.taskStates))
+			for i, s := range tc.taskStates {
+				tasks[i] = &storage.Task{State: s}
+			}
+			assert.Equal(t, tc.want, engineReportsLostApplyWork(tc.engineTaskState, tasks))
+		})
+	}
+}
+
+// lostWorkAtomicPollFixture builds a running grouped (Vitess) apply with two
+// running tasks and a LocalClient polling the given engine with a fast poll
+// cadence, so lost-work scenarios can drive many polls without waiting out the
+// real cadence. trustBudget sets how long the drive keeps trusting an engine
+// reporting no active schema change: a tiny budget reaches target
+// verification, and a large one proves a short pending run is tolerated.
+func lostWorkAtomicPollFixture(eng engine.Engine, trustBudget time.Duration) (*LocalClient, *storage.Apply, []*storage.Task, *stateRecordingTaskStore) {
+	return lostWorkAtomicPollFixtureInState(eng, trustBudget, state.Task.Running)
+}
+
+// lostWorkAtomicPollFixtureInState is lostWorkAtomicPollFixture with the
+// tasks' stored state chosen by the caller, for the states whose settlement
+// rules differ.
+func lostWorkAtomicPollFixtureInState(eng engine.Engine, trustBudget time.Duration, taskState string) (*LocalClient, *storage.Apply, []*storage.Task, *stateRecordingTaskStore) {
+	apply := &storage.Apply{
+		ID: 1, PlanID: 7, ApplyIdentifier: "apply-1", Database: "appdb",
+		DatabaseType: storage.DatabaseTypeVitess, Environment: "staging",
+		State: state.Apply.Running,
+	}
+	tasks := []*storage.Task{
+		{
+			ID: 1, ApplyID: 1, PlanID: 7, TaskIdentifier: "task-orders",
+			Database: "appdb", DatabaseType: storage.DatabaseTypeVitess,
+			Namespace: "appdb", TableName: "orders",
+			Environment: "staging", State: taskState,
+		},
+		{
+			ID: 2, ApplyID: 1, PlanID: 7, TaskIdentifier: "task-payments",
+			Database: "appdb", DatabaseType: storage.DatabaseTypeVitess,
+			Namespace: "appdb", TableName: "payments",
+			Environment: "staging", State: taskState,
+		},
+	}
+	taskStore := &stateRecordingTaskStore{
+		exactProgressTaskStore: &exactProgressTaskStore{tasks: tasks},
+	}
+	client := &LocalClient{
+		config:            LocalConfig{Database: "appdb", Type: storage.DatabaseTypeVitess},
+		planetscaleEngine: eng,
+		storage: &exactProgressStorage{
+			applies:         &snapshotApplyStore{stored: *apply},
+			tasks:           taskStore,
+			controlRequests: &testControlRequestStore{},
+			logs:            &mockApplyLogStore{},
+			plans:           &scriptedPlanStore{plan: &storage.Plan{ID: 7, SchemaFiles: schema.SchemaFiles{}}},
+		},
+		logger:                              slog.Default(),
+		taskPollIntervalOverride:            time.Millisecond,
+		lostEngineWorkPendingBudgetOverride: trustBudget,
+	}
+	return client, apply, tasks, taskStore
+}
+
+// An engine can complete a grouped apply's work and then lose all record of it
+// — after that, every progress poll reports no active schema change while
+// durable storage still says the tasks are running. Once the tolerated
+// staleness window is exhausted the drive must verify the target directly: a
+// target that already has the desired schema means the change landed and only
+// its outcome was lost, so every task completes and the apply terminalizes
+// instead of polling forever and holding the database's active-apply slot.
+func TestPollForCompletionAtomic_LostEngineWorkTargetConverged(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StateRunning},
+			{State: engine.StatePending},
+		}},
+		// The re-plan reports no remaining change for any table: the target
+		// already has the desired schema.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Apply.Completed, apply.State, "a converged target settles the apply through the normal completed flow")
+	require.NotNil(t, apply.CompletedAt)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Completed, task.State, "table %s", task.TableName)
+		assert.Equal(t, 100, task.ProgressPercent, "table %s", task.TableName)
+		require.NotNil(t, task.CompletedAt, "table %s", task.TableName)
+	}
+	assert.Equal(t, 1, eng.planCalls, "one shared re-plan verifies the target for every task of the grouped apply")
+	assert.GreaterOrEqual(t, eng.calls, 3, "a single pending report never settles the apply; the engine is polled again first")
+}
+
+// An engine that never had (or irrecoverably lost) grouped work reports no
+// active schema change forever while the target still needs some of it. The
+// drive settles each task on its own verification verdict: a table whose
+// change already landed completes, a table the target still needs rests
+// retryable — never permanently failed, because nothing about the target is
+// broken — and the apply pauses for a fresh claim to re-drive the rest.
+func TestPollForCompletionAtomic_LostEngineWorkTargetNotConverged(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// The re-plan still contains orders but not payments: the target has
+		// payments' change and still needs orders'.
+		planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "appdb",
+			TableChanges: []engine.TableChange{{
+				Table: "orders",
+				DDL:   "ALTER TABLE `orders` ADD COLUMN `note` VARCHAR(255)",
+			}},
+		}}},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "a lost change the target still needs pauses the apply for retry, never fails it permanently")
+	assert.Nil(t, apply.CompletedAt, "a retryable apply carries no completion timestamp")
+	orders, payments := tasks[0], tasks[1]
+	assert.Equal(t, state.Task.FailedRetryable, orders.State, "the table the target still needs is retryable")
+	assert.Contains(t, orders.ErrorMessage, "orders")
+	assert.Contains(t, orders.ErrorMessage, "still needs the change")
+	assert.Nil(t, orders.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.Equal(t, state.Task.Completed, payments.State, "the table whose change already landed completes")
+	require.NotNil(t, payments.CompletedAt)
+}
+
+// When the engine reports no active schema change and the target plan cannot
+// be read either, neither side can answer what happened to the work. The drive
+// must not spin between the two forever: each failed verification counts
+// against the same bounded error budget as a failed poll, and exhausting it
+// pauses the apply retryable for a fresh claim to re-drive — never permanently
+// failed, because nothing proved the target is broken.
+func TestPollForCompletionAtomic_LostEngineWorkVerificationErrorsAreBounded(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+	client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "an unverifiable target pauses the apply retryable, never permanently failed")
+	assert.Contains(t, apply.ErrorMessage, "could not be verified")
+	assert.Contains(t, apply.ErrorMessage, "consecutive errors")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.FailedRetryable, task.State, "table %s", task.TableName)
+		assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp (table %s)", task.TableName)
+	}
+	assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing; the engine re-plan is never reached")
+}
+
+// A freshly restarted engine can serve a stale snapshot that omits in-flight
+// grouped work for a few polls before it catches up. A short run of pending
+// reports inside the tolerated window must self-heal: the drive keeps polling,
+// never distrusts the engine, and the apply completes through the normal flow.
+func TestPollForCompletionAtomic_StaleEngineSnapshotSelfHeals(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+			{State: engine.StatePending},
+			{State: engine.StatePending},
+			{State: engine.StateRunning},
+			{State: engine.StateCompleted},
+		}},
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, taskStore := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Apply.Completed, apply.State)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Completed, task.State, "table %s", task.TableName)
+	}
+	assert.Equal(t, 0, eng.planCalls, "a self-healing stale snapshot never triggers target verification")
+	assert.NotContains(t, taskStore.states, state.Task.FailedRetryable)
+	assert.NotContains(t, taskStore.states, state.Task.Failed)
+}
+
+// Settlement touches only the tasks whose stored state says work is in
+// flight. A task that already reached its terminal state — here a table that
+// cut over and completed before the engine lost the rest of the apply — is a
+// durable final answer: the target read must not re-settle it or rewrite its
+// completion record.
+func TestPollForCompletionAtomic_LostEngineWorkLeavesSettledTasksUntouched(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// The re-plan still contains orders: only the in-flight task is settled
+		// from it; the already-completed payments is not consulted at all.
+		planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "appdb",
+			TableChanges: []engine.TableChange{{
+				Table: "orders",
+				DDL:   "ALTER TABLE `orders` ADD COLUMN `note` VARCHAR(255)",
+			}},
+		}}},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+	orders, payments := tasks[0], tasks[1]
+	completedEarlier := time.Now().Add(-time.Hour)
+	payments.State = state.Task.Completed
+	payments.CompletedAt = &completedEarlier
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Task.FailedRetryable, orders.State, "the in-flight task still settles from the target read")
+	assert.Equal(t, state.Task.Completed, payments.State, "a terminal task is never re-settled")
+	require.NotNil(t, payments.CompletedAt)
+	assert.Equal(t, completedEarlier, *payments.CompletedAt, "a terminal task's completion record is never rewritten by settlement")
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State)
+}
+
+// Once a grouped schema change has cut over, the live schema matches the
+// reviewed target whether or not the revert that was undoing it ever ran — so
+// tasks in their revert phase can never be settled by reading the target. An
+// engine that loses a revert must leave them retryable for a fresh claim to
+// re-drive; completing them would report the apply as a successful schema
+// change while the change it was reverting is still in place.
+func TestPollForCompletionAtomic_LostEngineWorkNeverCompletesRevertPhaseTasks(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// A converged target is exactly what a post-cutover re-plan reports, and
+		// it must not be read as the revert having finished.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixtureInState(eng, lostWorkTrustBudgetReached, state.Task.Reverting)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "a lost revert pauses the apply for retry, never completes it")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.FailedRetryable, task.State, "a lost revert is retryable, never a completed schema change (table %s)", task.TableName)
+		assert.Nil(t, task.CompletedAt, "a retryable task carries no completion timestamp (table %s)", task.TableName)
+		assert.Contains(t, task.ErrorMessage, "revert phase")
+	}
+	assert.Equal(t, 0, eng.planCalls, "the target schema is never consulted for revert-phase tasks")
+}
+
+// A revert-phase task needs no target read to settle, so a plan the drive
+// cannot read must not strand it alongside the tasks that do need verifying.
+// The revert rests retryable on its own reason while the forward task falls to
+// the bounded error budget — an operator re-driving the apply has to be able to
+// tell a lost revert from a forward change whose target could not be read.
+func TestPollForCompletionAtomic_LostEngineWorkSettlesRevertPhaseTasksWhenVerificationFails(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixtureInState(eng, lostWorkTrustBudgetReached, state.Task.Reverting)
+	reverting, forward := tasks[0], tasks[1]
+	forward.State = state.Task.Running
+	client.storage.(*exactProgressStorage).plans = &scriptedPlanStore{err: fmt.Errorf("storage read failed")}
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "an unverifiable target pauses the apply retryable, never permanently failed")
+	assert.Equal(t, state.Task.FailedRetryable, reverting.State, "a lost revert rests retryable without ever reading the target")
+	assert.Contains(t, reverting.ErrorMessage, "revert phase", "the revert-phase task keeps the reason that names its phase")
+	assert.Nil(t, reverting.CompletedAt, "a retryable task carries no completion timestamp")
+	assert.Equal(t, state.Task.FailedRetryable, forward.State, "the task that needed verifying falls to the bounded error budget")
+	assert.Contains(t, forward.ErrorMessage, "could not be verified")
+	assert.Equal(t, 0, eng.planCalls, "a failed plan read settles nothing by re-plan; the engine is never consulted")
+}
+
+// A peer takes the lease while this drive is settling work its engine lost.
+// The settlement write is refused because the lease is gone, not because the
+// target could not be read, so the drive exits at that write instead of
+// counting the refusal against the verification budget and going on to pause
+// an apply another driver now owns.
+func TestPollForCompletionAtomic_LostWorkSettlementRefusedByLeaseLossExits(t *testing.T) {
+	for name, taskState := range map[string]string{
+		"verified settlement":     state.Task.Running,
+		"revert-phase settlement": state.Task.Reverting,
+	} {
+		t.Run(name, func(t *testing.T) {
+			eng := &lostWorkEngine{
+				phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StatePending}}},
+				planResult:          &engine.PlanResult{NoChanges: true},
+			}
+			client, apply, tasks, recording := lostWorkAtomicPollFixtureInState(eng, lostWorkTrustBudgetReached, taskState)
+			refusing := &settlementRefusingTaskStore{
+				stateRecordingTaskStore: recording,
+				err:                     fmt.Errorf("task update: %w", storage.ErrApplyLeaseLost),
+				refusals:                -1,
+			}
+			st := client.storage.(*exactProgressStorage)
+			st.tasks = refusing
+
+			require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false),
+				"a drive displaced by lease loss hands the apply back without an error")
+
+			// The ticks inside the trust budget still project the tasks' own
+			// in-flight state onto the apply; what a displaced driver must never
+			// write is the retryable pause its budget would have reached.
+			stored, err := st.applies.Get(t.Context(), apply.ID)
+			require.NoError(t, err)
+			assert.NotEqual(t, state.Apply.FailedRetryable, stored.State, "a displaced driver never pauses the apply for retry")
+			assert.False(t, state.IsTerminalApplyState(stored.State), "a displaced driver never finalizes the apply; stored state was %q", stored.State)
+			assert.NotEqual(t, state.Apply.FailedRetryable, apply.State, "the drive's own apply claims no verdict either")
+			assert.Equal(t, 1, refusing.refused, "the drive stops at the first refused settlement instead of retrying it as a verification failure")
+			for _, task := range tasks {
+				assert.Equal(t, taskState, task.State, "the in-memory tasks are left as stored")
+			}
+		})
+	}
+}
+
+// A shard-scoped dispatch tags its tasks with the shard they ran on, while
+// re-planning the reviewed schema set describes whole namespaces. A converged
+// whole-namespace re-plan therefore never mentions a shard, and reading its
+// silence as proof would report a shard's change as made on evidence that
+// never covered that shard. Those tasks rest retryable for a fresh claim to
+// re-drive instead.
+func TestPollForCompletionAtomic_LostEngineWorkNeverCompletesShardTasksOnWholeNamespaceReplan(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		// What every engine's re-plan of the reviewed schema set reports: whole
+		// namespaces, no shard dimension.
+		planResult: &engine.PlanResult{NoChanges: true},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+	tasks[0].Shard = "-80"
+	tasks[1].Shard = "80-"
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "an unattributable shard settles the apply retryable, never completed")
+	assert.Nil(t, apply.CompletedAt, "a retryable apply carries no completion timestamp")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.FailedRetryable, task.State, "shard %s", task.Shard)
+		assert.Nil(t, task.CompletedAt, "shard %s", task.Shard)
+		assert.NotEqual(t, 100, task.ProgressPercent, "an unsettled shard never renders a finished bar (shard %s)", task.Shard)
+		assert.Contains(t, task.ErrorMessage, task.Shard, "the reason names the shard the target could not be verified for")
+	}
+}
+
+// The guard is on what the re-plan covered, not on the task carrying a shard:
+// a re-plan that does describe a namespace one shard at a time settles that
+// shard's tasks the same way a whole-namespace plan settles namespace-wide
+// ones. The table the shard still needs rests retryable, and its sibling on
+// the same shard completes.
+func TestPollForCompletionAtomic_LostEngineWorkSettlesShardTasksOnPerShardReplan(t *testing.T) {
+	eng := &lostWorkEngine{
+		phaseSequenceEngine: phaseSequenceEngine{results: []*engine.ProgressResult{
+			{State: engine.StatePending},
+		}},
+		planResult: &engine.PlanResult{Changes: []engine.SchemaChange{{
+			Namespace: "appdb",
+			Shard:     engine.Shard{Name: "-80"},
+			TableChanges: []engine.TableChange{{
+				Table: "orders",
+				DDL:   "ALTER TABLE `orders` ADD COLUMN `note` VARCHAR(255)",
+			}},
+		}}},
+	}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetReached)
+	orders, payments := tasks[0], tasks[1]
+	orders.Shard = "-80"
+	payments.Shard = "-80"
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, state.Apply.FailedRetryable, apply.State, "the shard still needing a change pauses the apply for retry")
+	assert.Equal(t, state.Task.FailedRetryable, orders.State, "the table this shard still needs is retryable")
+	assert.Contains(t, orders.ErrorMessage, "still needs the change")
+	assert.Equal(t, state.Task.Completed, payments.State, "a shard-keyed re-plan settles the table whose change landed on that shard")
+	require.NotNil(t, payments.CompletedAt)
+	assert.Equal(t, 100, payments.ProgressPercent)
+}
+
+// A grouped engine refused the target because another run of a schema change
+// still holds it has not failed the schema change. The drive hands the apply
+// back with every row as it stands, so no retry attempt is spent, and the
+// driver that next claims it starts the work again once the holder lets go.
+func TestPollForCompletionAtomic_TargetHeldHandsBackWithoutAFailure(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{
+		State: engine.StateFailed, TargetHeld: true,
+		ErrorMessage: "could not acquire advisory lock: lock is held by another connection",
+	}}}
+	client, apply, tasks, recording := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	assert.Equal(t, 1, eng.calls, "the drive hands back at the refusal")
+	assert.Equal(t, state.Apply.Running, apply.State, "the apply is not paused or failed")
+	assert.Nil(t, apply.CompletedAt)
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Running, task.State, "table %s", task.TableName)
+		assert.Empty(t, task.ErrorMessage, "table %s", task.TableName)
+	}
+	assert.Empty(t, recording.states, "no failure verdict is written")
+	assertApplyLogContains(t, client, "held by another run of a schema change")
+}
+
+// A grouped start that gets past a refusal ends that hold. A later refusal is
+// a new hold, measured from its own start, so it neither reports the earlier
+// hold's duration nor has its escalation suppressed by the earlier one.
+func TestPollForCompletionAtomic_StartedWorkEndsTheHold(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{
+		{State: engine.StateRunning},
+		{State: engine.StateFailed, TargetHeld: true, ErrorMessage: "could not acquire advisory lock: lock is held by another connection"},
+	}}
+	client, apply, tasks, _ := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	earlier := time.Now().Add(-90 * time.Second)
+	client.targetHeld.waits = map[targetHeldKey]*targetHeldWait{{applyID: apply.ID}: {since: earlier, lastSeen: earlier, escalated: true}}
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+	require.Equal(t, 2, eng.calls, "the drive polls the started work, then hands back at the refusal")
+	hold := client.targetHeld.waits[targetHeldKey{applyID: apply.ID}]
+	require.NotNil(t, hold, "the later refusal is recorded")
+	assert.Less(t, time.Since(hold.since), time.Minute, "the new hold is measured from its own refusal")
+	assert.False(t, hold.escalated, "the earlier hold's escalation does not carry over")
+}
+
+// Every grouped tick persists each task row, and the operator reads those rows
+// as the drive's liveness. A write that storage refuses outright, or one that
+// keeps failing, ends the drive with its own error instead of polling on until
+// the frozen rows read as a stalled drive. The apply is left active for a later
+// drive.
+func TestPollForCompletionAtomic_ProgressWriteThatCannotLandEndsTheDrive(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantPolls int
+	}{
+		{"rejected value", fmt.Errorf("update task: %w: out of range value for column 'eta_seconds'", storage.ErrValueRejected), 1},
+		{"persistent failure", errors.New("storage down"), maxConsecutiveProgressPollErrors},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}}}
+			client, apply, tasks, recording := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+			refusing := &progressRefusingTaskStore{stateRecordingTaskStore: recording, err: tc.err, refusals: -1}
+			client.storage.(*exactProgressStorage).tasks = refusing
+
+			require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false))
+
+			assert.Equal(t, tc.wantPolls, eng.calls)
+			assert.Equal(t, tc.wantPolls*len(tasks), refusing.refused, "every task's write is attempted on every tick")
+			assert.Equal(t, state.Apply.Running, apply.State, "the apply stays active for a later drive")
+			assert.Empty(t, recording.states)
+			assertApplyLogContains(t, client, "Task progress could not be recorded")
+		})
+	}
+}
+
+// A peer takes the lease while a grouped apply is copying. The next tick's
+// progress writes are refused because the lease is gone, though storage would
+// still accept a terminal write. The drive exits at that tick without an
+// error. It must not count the refusal as a failed write and poll on, and it
+// must not complete, fail, or pause the apply or its tasks, since another
+// driver now owns them.
+func TestPollForCompletionAtomic_ProgressWriteRefusedByLeaseLossExits(t *testing.T) {
+	eng := &phaseSequenceEngine{results: []*engine.ProgressResult{{State: engine.StateRunning}, {State: engine.StateCompleted}}}
+	client, apply, tasks, recording := lostWorkAtomicPollFixture(eng, lostWorkTrustBudgetAmple)
+	refusing := &progressRefusingTaskStore{
+		stateRecordingTaskStore: recording,
+		err:                     fmt.Errorf("task update: %w", storage.ErrApplyLeaseLost),
+		refusals:                -1,
+	}
+	st := client.storage.(*exactProgressStorage)
+	st.tasks = refusing
+
+	require.NoError(t, client.pollForCompletionAtomic(t.Context(), apply, tasks, nil, nil, map[string]string{}, false),
+		"a drive displaced by lease loss hands the apply back without an error")
+
+	assert.Equal(t, 1, eng.calls, "no further poll after the refused tick")
+	assert.GreaterOrEqual(t, refusing.refused, 1, "the refused tick did attempt its progress writes")
+	assert.LessOrEqual(t, refusing.refused, len(tasks), "no write is attempted beyond the one tick")
+	assert.Empty(t, recording.states, "no task write lands, terminal or otherwise")
+	for _, task := range tasks {
+		assert.Equal(t, state.Task.Running, task.State, "the in-memory tasks are left in flight")
+		assert.Nil(t, task.CompletedAt)
+	}
+	assert.Equal(t, state.Apply.Running, apply.State, "the drive's own apply claims no verdict")
+	stored, err := st.applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Running, stored.State, "a displaced driver never completes, fails, or pauses the stored apply")
+	assert.Nil(t, stored.CompletedAt)
+	logs := st.logs.(*mockApplyLogStore)
+	for _, entry := range logs.logs {
+		assert.NotContains(t, entry.Message, "Task progress could not be recorded", "a lease loss is not reported as a write failure")
+	}
+}
+
+// An engine's throttle reason is display text whose length the engine does not
+// bound. Copied onto a task, it always fits its column, so a long reason can
+// never refuse the progress write that carries it.
+func TestApplyEngineTableDisplayFields_BoundsTheThrottleReason(t *testing.T) {
+	task := &storage.Task{}
+	reason := "replica lag\n| " + strings.Repeat("x", 1000)
+
+	applyEngineTableDisplayFields(task, &engine.TableProgress{Throttled: true, ThrottleReason: reason})
+
+	assert.True(t, task.Throttled)
+	assert.Equal(t, engine.SanitizeThrottleReason(reason), task.ThrottleReason)
+	assert.LessOrEqual(t, len(task.ThrottleReason), 255, "the reason fits the throttle_reason column")
+	assert.True(t, strings.HasPrefix(task.ThrottleReason, "replica lag / x"))
+}

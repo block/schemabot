@@ -2,6 +2,7 @@ package auth
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -46,11 +47,11 @@ var readPaths = map[string]bool{
 }
 
 // TierForRequest classifies an API request into the access tier it requires.
-// GET/HEAD requests and the explicit read-only endpoints are read; everything
-// else is write, so a newly added mutating-looking endpoint fails closed
-// (requires authorization) until it is classified here. Exported so the
-// route authorization sweep test enforces per-database scoping against the
-// same rule the middleware admits with.
+// GET/HEAD requests are read, the explicit read-only endpoints are read, and
+// everything else is write — so a newly added mutating-looking endpoint fails
+// closed (requires authorization) until it is classified here. Exported so the
+// route authorization sweep test enforces per-database scoping against the same
+// rule the middleware admits with.
 func TierForRequest(method, path string) Tier {
 	if readPaths[path] {
 		return TierRead
@@ -109,6 +110,25 @@ func MatchedGroup(callerGroups, configured []string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// MatchedGroups returns every configured group any of the caller's groups
+// matches (see groupMatches), by configured name, sorted and deduplicated.
+// It is MatchedGroup for callers that need the whole membership rather than
+// one granting principal: two callers share a configured group exactly when
+// their MatchedGroups against the same configured list intersect.
+func MatchedGroups(callerGroups, configured []string) []string {
+	matched := make([]string, 0, len(configured))
+	for _, want := range configured {
+		if slices.Contains(matched, want) {
+			continue
+		}
+		if slices.ContainsFunc(callerGroups, func(cg string) bool { return groupMatches(cg, want) }) {
+			matched = append(matched, want)
+		}
+	}
+	slices.Sort(matched)
+	return matched
 }
 
 // authDecision records an API auth decision metric for the request.

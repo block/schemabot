@@ -496,7 +496,7 @@ func TestE2EAggregateCheckStaleCleanupBlocksStartedApply(t *testing.T) {
 	}
 
 	installClient := ghclient.NewInstallationClientWithSlug(client, h.logger, "schemabot")
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "newsha222", nil)
 	select {
 	case cr := <-checkRuns:
 		require.NotEqual(t, checkConclusionSuccess, cr.Conclusion, "passing aggregate must not be published while a started apply blocks the PR")
@@ -622,7 +622,7 @@ func TestE2EPassingAggregateOnNonSchemaPR(t *testing.T) {
 
 // An aggregate participant does not own the required check on a repo — the
 // leader does. On a PR that touches none of its schema, a participant posts no
-// check run at all (rather than a passing "No managed schema changes" aggregate
+// check run at all (rather than a passing "No schema files changed" aggregate
 // that would add a per-tenant row near the merge button).
 func TestE2EParticipantSilentOnNonSchemaPR(t *testing.T) {
 	svc := setupE2EServiceWithConfig(t, &api.ServerConfig{
@@ -1039,7 +1039,7 @@ func TestE2EDisabledRepoChecksSkipAggregatePublishing(t *testing.T) {
 	installClient := ghclient.NewInstallationClient(client, h.logger)
 
 	h.updateAggregateCheck(ctx, installClient, "octocat/hello-world", 1, "abc123")
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", nil)
 	h.postFailingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", map[string]string{
 		"staging": "Plan failed",
 	})
@@ -1085,7 +1085,7 @@ func TestE2EPassingAggregateRequiresGitHubHeadVerification(t *testing.T) {
 
 	h := newE2EHandler(t, svc, client)
 	installClient := ghclient.NewInstallationClient(client, h.logger)
-	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123")
+	h.postPassingAggregates(ctx, installClient, "octocat/hello-world", 1, "abc123", nil)
 
 	// Without head verification, SchemaBot must not publish or store a passing
 	// aggregate check that could incorrectly unblock branch protection.
@@ -1263,6 +1263,8 @@ func TestE2EPassingAggregateWithoutAllowedEnvs(t *testing.T) {
 // TestE2EFailingAggregateOnPlanError verifies that when a plan fails for all
 // environments (e.g., database not configured), a failing aggregate check is
 // posted so branch protection shows a clear failure instead of waiting forever.
+// The database here is discovered from the PR's own schemabot.yaml, not named
+// by -d, so the failing aggregate, not a registry answer, is what reports it.
 func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	svc := setupE2EServiceWithAllowedEnvs(t, []string{"staging"})
 
@@ -1300,8 +1302,8 @@ func TestE2EFailingAggregateOnPlanError(t *testing.T) {
 	// Should get a comment with the error
 	select {
 	case body := <-result.comments:
-		assert.Contains(t, body, "Error")
-		assert.Contains(t, body, "unconfigured-db")
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`unconfigured-db`")
 	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for error comment")
 	}

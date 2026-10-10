@@ -6,14 +6,18 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/state"
+	"github.com/block/schemabot/pkg/ui"
 )
 
 const mutesDDL = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);"
 
-func mutesCell(shard string) ShardCell { return ShardCell{Shard: shard, Table: "mutes", DDL: mutesDDL} }
+func mutesCell(shard string) ShardCell {
+	return ShardCell{Shard: shard, Table: "mutes", Statements: []string{mutesDDL}}
+}
 
 // oneKeyspace wraps a single keyspace's shards and cells the way the webhook
 // builder shapes a single-keyspace apply.
@@ -21,9 +25,17 @@ func oneKeyspace(shards []ShardStatus, cells []ShardCell) []ShardedKeyspace {
 	return []ShardedKeyspace{{Keyspace: "cdb_resolute_sharded", Shards: shards, Cells: cells}}
 }
 
+// withTables gives a single-keyspace apply the per-table rollup lines the
+// webhook builder derives from its shard operations, which the DDL renders under.
+func withTables(keyspaces []ShardedKeyspace, tables ...string) []ShardedKeyspace {
+	for _, table := range tables {
+		keyspaces[0].Tables = append(keyspaces[0].Tables, ShardedTableStatus{Table: table, Status: state.Task.Pending})
+	}
+	return keyspaces
+}
+
 // A uniform sharded apply (every shard the same single change) renders one
-// status table and no per-shard grouping. The DDL is not repeated in the applied
-// comment — it is shown in the plan and apply-gate comments.
+// status table and no per-shard grouping.
 func TestRenderShardedApplyComment_UniformSingleTable(t *testing.T) {
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
@@ -37,7 +49,31 @@ func TestRenderShardedApplyComment_UniformSingleTable(t *testing.T) {
 	assert.Contains(t, out, "**Shards**: 1 running table copy, 1 queued")
 	assert.Contains(t, out, "| Shard | Status |")
 	assert.NotContains(t, out, "grouped by change", "a uniform apply is not grouped")
-	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
+}
+
+// A sharded apply shows each table's DDL under its rollup line, as a MySQL or
+// Vitess apply does, so the operator sees what is running without going back to
+// the plan. A table running the same statement on every shard shows it once.
+func TestRenderShardedApplyComment_ShowsEachTablesDDLOnce(t *testing.T) {
+	keyspaces := withTables(oneKeyspace([]ShardStatus{
+		{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+		{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+	}, []ShardCell{mutesCell("-40"), mutesCell("80-")}), "mutes")
+	data := ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x", Keyspaces: keyspaces,
+	}
+
+	for name, out := range map[string]string{
+		"status":  RenderShardedApplyComment(data),
+		"summary": RenderShardedApplySummaryComment(data),
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, 1, strings.Count(out, "```sql"), "a uniform table's DDL renders once:\n%s", out)
+			assert.Contains(t, out, "**`mutes`**: ⏳ Queued\n\n```sql\nALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)",
+				"the DDL follows the table's rollup line")
+		})
+	}
 }
 
 // A failed shard's error is lifted to the top and shown in its status row.
@@ -78,30 +114,33 @@ func TestRenderShardedApplyComment_FailedRetryableSurfacesErrorAndStop(t *testin
 	assert.Contains(t, out, "schemabot stop apply-x")
 }
 
-// When shards diverge, they are still grouped by change signature so the applied
-// comment shows which shards moved together — but the DDL itself is not repeated
-// here (it lives in the plan and apply-gate comments).
+// When shards diverge, they are grouped by change signature so the applied
+// comment shows which shards moved together, and the table's DDL names the
+// shards each distinct statement runs on, as the plan comment does.
 func TestRenderShardedApplyComment_DivergentGroupsByVariant(t *testing.T) {
 	const driftDDL = "ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`), ADD COLUMN `reason` varchar(255);"
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
 		ApplyID: "apply-x",
-		Keyspaces: oneKeyspace([]ShardStatus{
+		Keyspaces: withTables(oneKeyspace([]ShardStatus{
 			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
 			{Shard: "40-80", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
 			{Shard: "80-c0", Emoji: "⏳", Label: "waiting for -40", State: state.ApplyOperation.Pending},
 		}, []ShardCell{
 			mutesCell("-40"),
-			{Shard: "40-80", Table: "mutes", DDL: driftDDL}, // different signature → its own group
+			{Shard: "40-80", Table: "mutes", Statements: []string{driftDDL}}, // different signature → its own group
 			mutesCell("80-c0"),
-		}),
+		}), "mutes"),
 	})
 
 	assert.Contains(t, out, "Shards diverge — grouped by change:")
 	assert.Contains(t, out, "**shards `-40`, `80-c0`**", "shards sharing the standard change are one group")
 	assert.Contains(t, out, "**shard `40-80`**", "the drifted shard is its own group")
-	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
-	assert.NotContains(t, out, driftDDL, "the DDL is not repeated in the applied comment")
+	assert.Equal(t, 2, strings.Count(out, "```sql"), "each distinct statement renders once:\n%s", out)
+	assert.Contains(t, out, "**shards `-40`, `80-c0`**\n```sql\nALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`)",
+		"the standard statement is headed by the shards that run it")
+	assert.Contains(t, out, "**shard `40-80`**\n```sql\nALTER TABLE `mutes`\n    ADD INDEX `created_at`(`created_at`),\n    ADD COLUMN `reason` varchar(255);\n```",
+		"the drifted statement is headed by its shard")
 }
 
 // A wide divergence group states its coverage against the keyspace's shard
@@ -118,7 +157,7 @@ func TestRenderShardedApplyComment_DivergentWideGroupStatesCoverage(t *testing.T
 		cells = append(cells, mutesCell(shard))
 	}
 	shards = append(shards, ShardStatus{Shard: "s15", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending})
-	cells = append(cells, ShardCell{Shard: "s15", Table: "mutes", DDL: driftDDL})
+	cells = append(cells, ShardCell{Shard: "s15", Table: "mutes", Statements: []string{driftDDL}})
 
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
@@ -133,10 +172,10 @@ func TestRenderShardedApplyComment_DivergentWideGroupStatesCoverage(t *testing.T
 }
 
 // A uniform multi-table change set is one group (no spurious "grouped by change"
-// header), and the applied comment shows status only — no DDL.
+// header), and each table's DDL renders once under its own line.
 func TestRenderShardedApplyComment_UniformMultiTableIsOneGroup(t *testing.T) {
 	blocks := func(shard string) ShardCell {
-		return ShardCell{Shard: shard, Table: "blocks", DDL: "ALTER TABLE `blocks` ADD INDEX `created_at`(`created_at`);"}
+		return ShardCell{Shard: shard, Table: "blocks", Statements: []string{"ALTER TABLE `blocks` ADD INDEX `created_at`(`created_at`);"}}
 	}
 	out := RenderShardedApplyComment(ShardedApplyData{
 		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
@@ -149,7 +188,19 @@ func TestRenderShardedApplyComment_UniformMultiTableIsOneGroup(t *testing.T) {
 
 	assert.NotContains(t, out, "grouped by change", "identical multi-table change sets are one group")
 	assert.Contains(t, out, "| Shard | Status |")
-	assert.NotContains(t, out, "```sql", "the applied comment shows status only, not DDL")
+
+	withRollups := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: withTables(oneKeyspace([]ShardStatus{
+			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+		}, []ShardCell{mutesCell("-40"), blocks("-40"), mutesCell("80-"), blocks("80-")}), "mutes", "blocks"),
+	})
+	assert.Equal(t, 2, strings.Count(withRollups, "```sql"), "one DDL block per table:\n%s", withRollups)
+	assert.Less(t, strings.Index(withRollups, "ADD INDEX `created_at`(`created_at`)"), strings.Index(withRollups, "**`blocks`**"),
+		"the mutes DDL renders under the mutes line, before the blocks line")
+	assert.Contains(t, withRollups, "**`blocks`**: ⏳ Queued\n\n```sql\nALTER TABLE `blocks` ADD INDEX", "the blocks DDL renders under its line")
 }
 
 // An apply spanning several keyspaces renders one section per keyspace in
@@ -163,7 +214,7 @@ func TestRenderShardedApplyComment_MultiKeyspaceSections(t *testing.T) {
 			{
 				Keyspace: "cdb_resolute",
 				Shards:   []ShardStatus{{Shard: "-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}},
-				Cells:    []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+				Cells:    []ShardCell{{Shard: "-", Table: "outcomes", Statements: []string{"ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}}},
 			},
 			{
 				Keyspace: "cdb_resolute_sharded",
@@ -198,7 +249,7 @@ func TestRenderShardedApplyComment_MultiKeyspaceFailureLifted(t *testing.T) {
 			{
 				Keyspace: "cdb_resolute",
 				Shards:   []ShardStatus{{Shard: "-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}},
-				Cells:    []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}},
+				Cells:    []ShardCell{{Shard: "-", Table: "outcomes", Statements: []string{"ALTER TABLE `outcomes` ADD COLUMN `verdict` varchar(32);"}}},
 			},
 			{
 				Keyspace: "cdb_resolute_sharded",
@@ -502,8 +553,224 @@ func TestRenderShardedApplyComment_TableLinesReplaceShardTable(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "**`mutes`**: 🔄 Row copy in progress")
-	assert.Contains(t, out, "└ shards: ◐ -40 45% · ⏳ 80-", "the in-flight table carries the compact shard summary")
+	assert.Contains(t, out, "- Shards: 2 (1 copying, 1 queued)\n  - ◉ `-40`: 45%\n  - ○ `80-`: queued\n", "the in-flight table lists its shards")
 	assert.NotContains(t, out, "| Shard | Status |", "a healthy uniform keyspace renders no per-shard table")
+}
+
+// A copying table with every shard reporting renders the same progress bar,
+// rows line, and ETA a single-target apply shows, with the compact shard
+// summary underneath — the operator reads real copy progress, not just a
+// state word.
+func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
+				ShardsReporting: 2,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 71},
+					{Shard: "80-", Status: state.Task.Running, PercentComplete: 54},
+				},
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62%")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- Shards: 2 (2 copying)\n  - ◉ `80-`: 54%\n  - ◉ `-40`: 71%\n",
+		"the shard list sits below the rows line, the shard furthest behind first")
+	assert.NotContains(t, out, "Row copy in progress", "the bar replaces the state phrase")
+	assert.NotContains(t, out, "across", "full coverage needs no disclosure")
+	assert.NotContains(t, out, "62% (", "full coverage carries no headline qualifier")
+}
+
+// While later dispatch waves have yet to start, the summed figures cover only
+// the reporting shards; the headline and rows line both name that coverage
+// and the ETA renders as a floor, so a wave's fraction is never passed off as
+// the whole table's.
+func TestRenderShardedApplyComment_TableCopyPartialCoverageDisclosed(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
+				ShardsReporting: 1,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
+					{Shard: "80-", Status: state.Task.Pending},
+				},
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62% (1 of 2 shards)")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ETA: ≥ 3m 15s")
+	assert.Contains(t, out, "- Shards: 2 (1 copying, 1 queued)\n  - ◉ `-40`: 62%\n  - ○ `80-`: queued\n", "the shard list sits below the rows line")
+}
+
+// A copying table carries its planned size beside its rows. With every shard
+// reporting the line matches the single-deployment one; while later waves
+// have yet to start, the size names the whole table's shard span so it does
+// not read as the size of the reporting shards alone. The coverage and the
+// span both count the plan's shards, which can exceed the shard operations
+// attached so far.
+func TestRenderShardedApplyComment_TableCopyShowsPlannedSize(t *testing.T) {
+	render := func(reporting, plannedShards int, second ShardProgressData) string {
+		return RenderShardedApplyComment(ShardedApplyData{
+			State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+			ApplyID: "apply-x",
+			Keyspaces: []ShardedKeyspace{{
+				Keyspace: "cdb_resolute_sharded",
+				Tables: []ShardedTableStatus{{
+					Table: "mutes", Status: state.Task.Running,
+					RowsCopied: 914707, RowsTotal: 1466232, ETASeconds: 195,
+					ShardsReporting: reporting,
+					EstimatedBytes:  new(int64(23_400_000_000)),
+					PlannedShards:   plannedShards,
+					Shards: []ShardProgressData{
+						{Shard: "-40", Status: state.Task.Running, PercentComplete: 62},
+						second,
+					},
+				}},
+			}},
+		})
+	}
+
+	full := render(2, 2, ShardProgressData{Shard: "80-", Status: state.Task.Running, PercentComplete: 54})
+	assert.Contains(t, full, "- Rows: 914,707 / 1,466,232 · ~23.4 GB · ETA: 3m 15s\n")
+
+	partial := render(1, 2, ShardProgressData{Shard: "80-", Status: state.Task.Pending})
+	assert.Contains(t, partial, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ~23.4 GB across all 2 shards · ETA: ≥ 3m 15s\n")
+
+	stillAttaching := render(1, 4, ShardProgressData{Shard: "40-80", Status: state.Task.Pending})
+	assert.Contains(t, stillAttaching, "**`mutes`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62% (1 of 4 shards)\n")
+	assert.Contains(t, stillAttaching, "- Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s\n",
+		"the rows and the size name the plan's shards, not the operations attached so far")
+
+	attachedAllReporting := render(2, 4, ShardProgressData{Shard: "40-80", Status: state.Task.Running, PercentComplete: 54})
+	assert.Contains(t, attachedAllReporting, "- Rows: 914,707 / 1,466,232 across 2 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s\n",
+		"every attached shard reporting is not full coverage while the plan's other shards have yet to attach")
+
+	unrecorded := render(1, 0, ShardProgressData{Shard: "80-", Status: state.Task.Pending})
+	assert.Contains(t, unrecorded, "· ~23.4 GB across all shards ·",
+		"a plan without a shard count names no number")
+}
+
+// A copy past its estimated total with later waves still unreported names the
+// coverage on the finalizing headline too — "Finalizing copy" alone would
+// read as the whole table wrapping up while most shards have not started.
+func TestRenderShardedApplyComment_TableCopyFinalizingPartialCoverage(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 1600000, RowsTotal: 1466232,
+				ShardsReporting: 1,
+				Shards: []ShardProgressData{
+					{Shard: "-40", Status: state.Task.Running, PercentComplete: 99},
+					{Shard: "40-80", Status: state.Task.Pending},
+					{Shard: "80-", Status: state.Task.Pending},
+					{Shard: "c0-", Status: state.Task.Pending},
+				},
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarActivity()+" Finalizing copy (1 of 4 shards)")
+	assert.Contains(t, out, "- Rows copied: 1,600,000 so far")
+}
+
+// Before the first progress poll lands the copied count is still zero; the
+// table line says the copy is starting rather than showing an empty bar.
+func TestRenderShardedApplyComment_TableCopyStarting(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 0, RowsTotal: 1466232,
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: ⏳ Starting copy...")
+	assert.Contains(t, out, "- Rows: 0 / 1,466,232")
+}
+
+// A huge table early in its copy has real rows copied but a fraction that
+// rounds down to zero percent; the line shows a 1% floor so live progress is
+// never misread as a copy that has not begun.
+func TestRenderShardedApplyComment_TableCopySubPercentFloorsAtOne(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 4200, RowsTotal: 1466232, ETASeconds: 5400,
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(1)+" 1%")
+	assert.Contains(t, out, "- Rows: 4,200 / 1,466,232")
+	assert.NotContains(t, out, "Starting copy", "rows are already flowing")
+}
+
+// When copied rows exceed the estimated total, the table shows the activity
+// bar and honest "so far" count instead of a >100% fraction.
+func TestRenderShardedApplyComment_TableCopyEstimateExceeded(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{{
+				Table: "mutes", Status: state.Task.Running,
+				RowsCopied: 1600000, RowsTotal: 1466232, ETASeconds: 30,
+			}},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarActivity()+" Finalizing copy")
+	assert.Contains(t, out, "- Rows copied: 1,600,000 so far")
+	assert.Contains(t, out, "More rows than initially estimated", "the estimate tooltip explains the missing percentage")
+	assert.NotContains(t, out, "ETA:", "an exceeded estimate has no trustworthy ETA")
+}
+
+// Row figures only qualify a table in the copy phase: a running table without
+// a total (progress not yet reported) and non-copy in-flight phases keep their
+// state phrases even when rows are present, so a checksum phase never renders
+// a misleading copy bar.
+func TestRenderShardedApplyComment_TableRowsGatedToRunning(t *testing.T) {
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: []ShardedKeyspace{{
+			Keyspace: "cdb_resolute_sharded",
+			Tables: []ShardedTableStatus{
+				{Table: "mutes", Status: state.Task.Running},
+				{Table: "outbox_pending", Status: state.Task.Checksumming, RowsCopied: 1466232, RowsTotal: 1466232, ETASeconds: 10},
+			},
+		}},
+	})
+
+	assert.Contains(t, out, "**`mutes`**: 🔄 Row copy in progress", "no reported total keeps the state phrase")
+	assert.Contains(t, out, "**`outbox_pending`**: 🔍 Checksumming to verify data...")
+	assert.NotContains(t, out, "- Rows:", "rows lines never accompany state phrases")
 }
 
 // A shard in a failure state promotes the keyspace's per-shard status table
@@ -559,7 +826,7 @@ func TestRenderShardedApplyComment_DivergenceKeepsGroupedShardTables(t *testing.
 			},
 			Cells: []ShardCell{
 				mutesCell("-40"),
-				{Shard: "80-", Table: "mutes", DDL: driftDDL},
+				{Shard: "80-", Table: "mutes", Statements: []string{driftDDL}},
 			},
 		}},
 	})
@@ -583,7 +850,7 @@ func TestRenderShardedApplyComment_StatusLineChangeFraction(t *testing.T) {
 		Keyspaces: []ShardedKeyspace{
 			{Keyspace: "cdb_resolute", Tables: []ShardedTableStatus{tbl("outcomes", state.Task.Completed), tbl("verdicts", state.Task.RevertWindow)},
 				Shards: []ShardStatus{{Shard: "-", Emoji: "✅", Label: "completed", State: state.ApplyOperation.Completed}},
-				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", DDL: "ALTER ..."}}},
+				Cells:  []ShardCell{{Shard: "-", Table: "outcomes", Statements: []string{"ALTER ..."}}}},
 			{Keyspace: "cdb_resolute_sharded", Tables: []ShardedTableStatus{tbl("mutes", state.Task.Running)},
 				Shards: []ShardStatus{{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running}},
 				Cells:  []ShardCell{mutesCell("-40")}},
@@ -770,7 +1037,7 @@ func TestRenderShardedApplyComment_FailurePromotesSiblingKeyspaceShardTables(t *
 					Shards: []ShardProgressData{{Shard: "-", Status: state.Task.Pending}},
 				}},
 				Shards: []ShardStatus{{Shard: "-", Emoji: "⏸", Label: "halted — -40 failed", State: state.ApplyOperation.Pending}},
-				Cells:  []ShardCell{{Shard: "-", Table: "aliases", DDL: "ALTER TABLE `aliases` ADD COLUMN `region` varchar(32);"}},
+				Cells:  []ShardCell{{Shard: "-", Table: "aliases", Statements: []string{"ALTER TABLE `aliases` ADD COLUMN `region` varchar(32);"}}},
 			},
 		},
 	})
@@ -819,5 +1086,77 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 	inFlight := RenderShardedApplyComment(mixed(state.Task.Running, state.Task.Running))
 	assert.NotContains(t, inFlight, "applied on",
 		"an in-flight aggregate's shard summary already carries the breakdown")
-	assert.Contains(t, inFlight, "└ shards:")
+	assert.Contains(t, inFlight, "- Shards: 4 (")
+}
+
+// A table that changes on only some of the keyspace's shards names them above
+// its DDL, so the statement never reads as running on every shard.
+func TestRenderShardedApplyComment_NamesTheShardsOfAPartialTable(t *testing.T) {
+	blocks := ShardCell{Shard: "-40", Table: "blocks", Statements: []string{"ALTER TABLE `blocks` ADD INDEX `created_at`(`created_at`);"}}
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x",
+		Keyspaces: withTables(oneKeyspace([]ShardStatus{
+			{Shard: "-40", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+			{Shard: "80-", Emoji: "⏳", Label: "queued — next in order", State: state.ApplyOperation.Pending},
+		}, []ShardCell{mutesCell("-40"), blocks, mutesCell("80-")}), "mutes", "blocks"),
+	})
+
+	assert.Contains(t, out, "**`mutes`**: ⏳ Queued\n\n```sql\nALTER TABLE `mutes`", "a table on every shard shows its DDL without a heading")
+	assert.Contains(t, out, "**`blocks`**: ⏳ Queued\n\n**shard `-40`**\n```sql\nALTER TABLE `blocks`", "a table on some shards names them")
+}
+
+// A table copying across shards reads like a Vitess apply: the progress bar
+// aggregated across the shards, the DDL right under it, then the summed rows
+// and the per-shard breakdown.
+func TestRenderShardedApplyComment_CopyingTableReadsLikeVitess(t *testing.T) {
+	keyspaces := oneKeyspace([]ShardStatus{
+		{Shard: "-80", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+		{Shard: "80-", Emoji: "🔄", Label: "running table copy", State: state.ApplyOperation.Running},
+	}, []ShardCell{mutesCell("-80"), mutesCell("80-")})
+	keyspaces[0].Tables = []ShardedTableStatus{{
+		Table: "mutes", Status: state.Task.Running,
+		RowsCopied: 500, RowsTotal: 1000, ETASeconds: 60, ShardsReporting: 2,
+		Shards: []ShardProgressData{
+			{Shard: "-80", Status: state.Task.Running, PercentComplete: 40},
+			{Shard: "80-", Status: state.Task.Running, PercentComplete: 60},
+		},
+	}}
+
+	out := RenderShardedApplyComment(ShardedApplyData{
+		State: state.Apply.Running, Environment: "staging", Database: "cdb_resolute",
+		ApplyID: "apply-x", Keyspaces: keyspaces,
+	})
+
+	bar := strings.Index(out, "**`mutes`**: 🟦")
+	ddl := strings.Index(out, "```sql\nALTER TABLE `mutes` ADD INDEX")
+	rows := strings.Index(out, "- Rows: 500 / 1,000")
+	shards := strings.Index(out, "- Shards:")
+	require.NotEqual(t, -1, bar, "the aggregated progress bar renders:\n%s", out)
+	assert.Contains(t, out, "50%", "the bar aggregates both shards' rows")
+	assert.Less(t, bar, ddl, "the DDL follows the progress bar")
+	assert.Less(t, ddl, rows, "the rows line follows the DDL")
+	assert.Less(t, rows, shards, "the per-shard breakdown comes last")
+}
+
+// The sharded comment formats each statement set once, however many passes it
+// takes to fit the comment, and hands later passes the same blocks.
+func TestShardedDDLFormatterFormatsEachStatementSetOnce(t *testing.T) {
+	formatter := newShardedDDLFormatter("apply-x")
+	statements := []string{"ALTER TABLE `mutes` ADD COLUMN `note` varchar(255);"}
+
+	first := formatter.format(statements)
+	require.Len(t, first, 1)
+	assert.Contains(t, first[0], "ALTER TABLE `mutes`")
+	assert.Contains(t, first[0], "`note`")
+
+	second := formatter.format(statements)
+	require.Len(t, second, 1)
+	assert.Same(t, &first[0], &second[0], "a later pass reuses the blocks already formatted")
+	assert.Len(t, formatter.blocks, 1)
+
+	other := formatter.format([]string{"ALTER TABLE `blocks` ADD INDEX `created_at`(`created_at`);"})
+	require.Len(t, other, 1)
+	assert.Contains(t, other[0], "ALTER TABLE `blocks`")
+	assert.Len(t, formatter.blocks, 2)
 }

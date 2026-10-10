@@ -62,8 +62,12 @@ func (g *remoteControlSendGate) recordSend(controlReqID int64, now time.Time) (f
 	return !seen
 }
 
-// clear forgets a control request once it is completed or failed, so the map
-// does not accumulate entries for resolved requests.
+// clear forgets a control request once it is completed or failed. This is not
+// only map hygiene: there is one request row per apply and operation, and
+// re-requesting an operation reuses that row, so a resolved request's entry
+// would still be keyed to the id a re-issued command arrives under. Without
+// this the operator's next stop or cancel for the same apply would be throttled
+// behind the resolved one instead of transmitting immediately.
 func (g *remoteControlSendGate) clear(controlReqID int64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -88,8 +92,8 @@ func logRemoteControlResend(ctx context.Context, logger *slog.Logger, apply *sto
 	)
 	if pendingFor >= remoteControlStaleThreshold {
 		metrics.RecordRemoteControlRequestStale(ctx, string(controlReq.Operation), apply.Database, apply.Deployment, apply.Environment)
-		logger.Warn("remote control request accepted but still unconsumed by the data plane; driver keeps re-sending and polling — check data-plane logs for the failing consume", attrs...)
+		logger.WarnContext(ctx, "remote control request accepted but still unconsumed by the data plane; driver keeps re-sending and polling — check data-plane logs for the failing consume", attrs...)
 		return
 	}
-	logger.Info("re-sent pending remote control request to the data plane", attrs...)
+	logger.InfoContext(ctx, "re-sent pending remote control request to the data plane", attrs...)
 }

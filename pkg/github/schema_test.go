@@ -3,9 +3,82 @@ package github
 import (
 	"testing"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestEmptiedPRNamespaces covers the two steps that turn a pull request's
+// changed-file list into the namespaces it emptied: vacatedSchemaFiles picks
+// the schema paths the pull request deleted or renamed away, and
+// emptiedPRNamespaces keeps those whose namespace no file at head declares.
+func TestEmptiedPRNamespaces(t *testing.T) {
+	grouped := map[string]*ternv1.SchemaFiles{
+		"surviving": {Files: map[string]string{"users.sql": "CREATE TABLE users (id bigint)"}},
+	}
+	tests := []struct {
+		name        string
+		ignored     []string
+		files       []PRFile
+		environment string
+		want        []string
+	}{
+		{name: "one namespace emptied among two", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "removed"}}, want: []string{"removed"}},
+		{name: "two namespaces emptied", files: []PRFile{{Filename: "schema/removed_b/orders.sql", Status: "removed"}, {Filename: "schema/removed_a/items.sql", Status: "removed"}}, want: []string{"removed_a", "removed_b"}},
+		{name: "removed file has surviving sibling", files: []PRFile{{Filename: "schema/surviving/orders.sql", Status: "removed"}}},
+		{name: "removed non-schema file", files: []PRFile{{Filename: "schema/notes/README.md", Status: "removed"}}},
+		{name: "removed empty-namespace declaration", files: []PRFile{{Filename: "schema/removed/empty.sql", Status: "removed"}}, want: []string{"removed"}},
+		{name: "removed file nested below a namespace", files: []PRFile{{Filename: "schema/payments/archive/backfill.sql", Status: "removed"}}},
+		{name: "outside schema root", files: []PRFile{{Filename: "other/removed/orders.sql", Status: "removed"}}},
+		{name: "ignored namespace", ignored: []string{"removed_$ENV"}, environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}},
+		{name: "ignored brace namespace", ignored: []string{"removed_{env}"}, environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}},
+		{name: "flat file", files: []PRFile{{Filename: "schema/orders.sql", Status: "removed"}}},
+		{name: "renamed out of its namespace", files: []PRFile{{Filename: "schema/surviving/orders.sql", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
+		{name: "renamed within its namespace", files: []PRFile{{Filename: "schema/surviving/orders_v2.sql", PreviousFilename: "schema/surviving/orders.sql", Status: "renamed"}}},
+		{name: "renamed in from another namespace", files: []PRFile{{Filename: "schema/removed/orders.sql", PreviousFilename: "schema/surviving/orders.sql", Status: "renamed"}}},
+		{name: "renamed without a previous path", files: []PRFile{{Filename: "schema/removed/orders.sql", Status: "renamed"}}},
+		{name: "renamed to a non-schema file", files: []PRFile{{Filename: "schema/removed/orders.txt", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"}}, want: []string{"removed"}},
+		{name: "environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_$ENV/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
+		{name: "brace environment suffix", environment: "test", files: []PRFile{{Filename: "schema/removed_{env}/orders.sql", Status: "removed"}}, want: []string{"removed_test"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vacated := vacatedSchemaFiles(tt.files, "schema")
+			assert.Equal(t, tt.want, emptiedPRNamespaces(grouped, tt.ignored, vacated, "schema", tt.environment))
+		})
+	}
+}
+
+func TestGroupFilesByNamespace_BraceEnvironment(t *testing.T) {
+	files := []GitHubFile{
+		{Path: "schema/orders_{env}/users.sql", Name: "users.sql", Content: "CREATE TABLE users (id bigint);"},
+		{Path: "schema/fixtures_{env}/widgets.sql", Name: "widgets.sql", Content: "CREATE TABLE widgets (id bigint);"},
+	}
+	grouped, ignored, err := groupFilesByNamespace(files, "schema", "staging", []string{"fixtures_{env}"})
+	require.NoError(t, err)
+	assert.Contains(t, grouped, "orders_staging")
+	assert.NotContains(t, grouped, "fixtures_staging")
+	assert.Equal(t, []string{"fixtures_staging"}, ignored)
+}
+
+// TestVacatedSchemaFilesReportsDeletionsOfTheVacatedPath pins the shape the
+// narrowing receives: a renamed file is reported as a deletion of its previous
+// path, not as the rename GitHub listed, and a nested path is dropped before
+// any tree read is spent on it.
+func TestVacatedSchemaFilesReportsDeletionsOfTheVacatedPath(t *testing.T) {
+	vacated := vacatedSchemaFiles([]PRFile{
+		{Filename: "schema/surviving/orders.sql", PreviousFilename: "schema/removed/orders.sql", Status: "renamed"},
+		{Filename: "schema/removed/vschema.json", Status: "removed"},
+		{Filename: "schema/payments/archive/backfill.sql", Status: "removed"},
+		{Filename: "schema/added/new.sql", Status: "added"},
+	}, "schema/")
+
+	assert.Equal(t, []PRFile{
+		{Filename: "schema/removed/orders.sql", Status: "removed"},
+		{Filename: "schema/removed/vschema.json", Status: "removed"},
+	}, vacated)
+}
 
 // Flat layout tests — the webhook strips the schemaPath prefix, leaving bare
 // filenames. path.Base(schemaPath) becomes the defaultNamespace.

@@ -42,13 +42,28 @@ func TestFormatProgressComment(t *testing.T) {
 	assert.Contains(t, body, "staging")
 	assert.Contains(t, body, "`users`")
 	assert.Contains(t, body, "`orders`")
-	assert.Contains(t, body, "45%")
+	assert.Contains(t, body, "45.00%")
 	assert.Contains(t, body, "Schema Change Status")
 	// The running state is communicated on the always-present Status line.
 	assert.Contains(t, body, "**Status**: In Progress")
 	// Should NOT contain the old table format
 	assert.NotContains(t, body, "| Table |")
 	assert.NotContains(t, body, "|-------|")
+}
+
+// The progress comment reads each table's planned size from its stored task,
+// so the size appears beside the row counts on the comment operators watch.
+func TestFormatProgressComment_ShowsStoredTableSize(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply-abc123", Database: "testdb", Environment: "staging", Engine: "spirit", State: state.Apply.Running}
+	bytes := int64(23_400_000_000)
+	tasks := []*storage.Task{{
+		TableName: "orders", DDL: "ALTER TABLE orders ADD INDEX idx_status (status)", State: state.Task.Running,
+		RowsCopied: 1_234_567, RowsTotal: 48_200_000, ProgressPercent: 2, EstimatedBytes: &bytes,
+	}}
+
+	body := formatProgressComment(apply, tasks, nil, "")
+
+	assert.Contains(t, body, "- Rows: 1,234,567 / 48,200,000 · ~23.4 GB\n")
 }
 
 func TestFormatProgressComment_NoTasks(t *testing.T) {

@@ -5,13 +5,13 @@ SchemaBot exposes metrics via OpenTelemetry. All metrics are available at `GET /
 ## Custom Metrics
 
 Every SchemaBot-owned metric emits a non-empty `environment` attribute. Metrics
-that are not scoped to one schema-change environment use `environment="unknown"`.
+that are not scoped to one schema change environment use `environment="unknown"`.
 Some attributes listed below are optional and only appear when that context is
 available, such as `repository`, `github_app`, and `installation_id`.
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
-| `schemabot.plans.total` | Counter | repository, database, environment, status | Total plan operations |
+| `schemabot.plans.total` | Counter | repository, database, deployment, environment, status | Plan attempts, each counted once by the API; `success` only once the plan is stored |
 | `schemabot.plan.duration_seconds` | Histogram | repository, database, environment, status | Plan execution time |
 | `schemabot.applies.total` | Counter | repository, database, environment, status | Total apply operations |
 | `schemabot.apply.duration_seconds` | Histogram | repository, database, environment, status | Apply API call time |
@@ -40,14 +40,19 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.github.rate_limit.remaining` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests remaining for the observed API resource |
 | `schemabot.github.rate_limit.used` | Gauge | environment, operation, resource, repository, github_app, installation_id | GitHub primary rate limit requests used for the observed API resource |
 | `schemabot.control_operations_total` | Counter | operation, database, environment, status | Control operations (cutover, stop, start, etc.) |
+| `schemabot.target.probe.total` | Counter | database_type, environment, outcome | Startup connectivity probes of enumerated targets, by outcome. This counter sits below the volume bar in [Does it belong in a metric?](#does-it-belong-in-a-metric) — one observation per target per process start — and earns its place as a deploy-time alert instead: a fleet-wide rollout produces a burst of observations at once, and any non-`success` outcome in that burst is a rotated credential, dropped grant, or unreachable target found before the first schema change reaches it. Alert on `outcome != success` per environment after each deploy. Target is omitted to bound cardinality; the paired warn log names it |
 | `schemabot.remote_control_requests.rejected_total` | Counter | operation, engine, database, deployment, environment | Control requests a remote data plane accepted and its own driver then failed, mirrored back so the operator learns the command never took effect — see [Control Operations](#control-operations) |
 | `schemabot.remote_control_requests.stale_resends_total` | Counter | operation, database, deployment, environment | Retransmissions of a stop/cancel request the data plane accepted but has not consumed past the stale threshold — see [Control Operations](#control-operations) |
+| `schemabot.target.client_evictions.total` | Counter | database_type, environment, reason | Data-plane client generations the target router replaced. `dsn_changed` is a resolver returning a new connection identity for a route (a credential rotation under `dsn_from`); a rate well above the rotation cadence means the resolver's DSN is unstable and clients are being rebuilt per request. `auth_invalid_credentials`, `auth_no_access`, and `auth_no_database` are a routed read failing target authentication on the generation, which the router evicts before its single retry; alert on these as well as `dsn_changed` to see credential failures. Target is omitted to bound cardinality; the paired info log names it |
+| `schemabot.target.auth_retries.total` | Counter | operation, database_type, environment, classification, outcome | Single automatic retries of routed reads after an authentication-classified target failure, by outcome: `success`, `failed`, `resolve_error` (the target could not be re-resolved or its client rebuilt), or `suppressed` (a failed retry armed the route's cooldown and this read returned the failure without retrying). A sustained `failed` or `suppressed` rate means target credentials or grants are unstable; target is omitted to bound cardinality and the paired log names it |
 | `schemabot.remote_apply_dedup_total` | Counter | database, environment, outcome | Idempotency-keyed dispatches replayed against their existing operation on the keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.remote_apply_attach_total` | Counter | database, environment, outcome | Sibling dispatches resolved into an existing deployment-keyed apply — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.remote_apply_key_echo_mismatch_total` | Counter | database, environment | Remote dispatches refused fail-closed because the data plane's accepted response echoed a different operation key than the dispatch derives — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.remote_apply_deployment_id_conflict_total` | Counter | database, environment, deployment | Remote dispatch results refused fail-closed because the deployment already correlates to a different remote apply id — see [Remote Apply Attaches](#remote-apply-attaches) |
 | `schemabot.lock_operations_total` | Counter | operation, database, environment, status | Lock acquire/release operations |
+| `schemabot.auth_decisions.total` | Counter | tier, decision, reason | Every `/api` request's admission decision at the auth middleware. See [API Auth Decisions](#api-auth-decisions) |
 | `schemabot.direct_write_authorization.total` | Counter | operation, database, environment, status, reason | Per-database direct-write (CLI/API) authorization decisions at the handler layer |
+| `schemabot.rate_limit_decisions.total` | Counter | endpoint, scope, environment, decision | API request-budget decisions on rate-limited endpoints. `scope` is which budget was consulted (`caller` or `target`) and `decision` is `allow` or `limit`, so the limited rate has a denominator and a client approaching its budget is visible before it is turned away. The caller identity and target database are deliberately absent (hundreds of each); a limited request logs both — see [Rate Limits](#rate-limits) |
 | `schemabot.operator.resumed_total` | Counter | database, environment, previous_state | Applies resumed by the operator |
 | `schemabot.operator.resume_failures_total` | Counter | database, environment, reason | Operator resume attempts that failed |
 | `schemabot.operator.claim_failures_total` | Counter | environment, reason | Operator claim attempts that failed |
@@ -55,7 +60,8 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.operator.stuck_pending_applies` | Gauge | environment | Pending applies past the stuck threshold that a driver should have claimed (sampled; capped at 500, so a value of 500 means "at least 500") |
 | `schemabot.operator.stuck_pending_scan_failures` | Counter | environment | Failed stuck-pending apply scans (liveness signal for the gauge above) |
 | `schemabot.operator.stranded_operations_reaped_total` | Counter | database, deployment, environment, parent_state | Pending apply operations the reaper settled from an already-settled parent apply. `deployment` is the reaped operation's own. A one-time burst is the historical backlog draining; a climbing rate means a producer is terminalizing parents without settling their children |
-| `schemabot.storage_schema.destructive_refusals_total` | Counter | table, operation, scope, environment | Destructive storage-schema DDL statements the startup bootstrap (`EnsureSchema`) refused to execute. `scope` says whether the safe clauses of the statement still ran. A nonzero rate means a starting binary's embedded schema no longer declares a table or column that exists in the storage database — expected briefly from older pods during a rolling deploy or rollback. `environment` is always `unknown`: the bootstrap precedes any schema-change environment |
+| `schemabot.engine.unrecognized_task_status_total` | Counter | database, database_type, engine, environment | Engine- or data-plane-reported task statuses with no task-state mapping. The fail-open default renders the affected work as Running, so any sustained rate means an engine or data-plane version introduced a status SchemaBot cannot classify — add an explicit mapping in `pkg/state`. The status itself is not an attribute: it is engine-controlled text with no bound on distinct values, and this counter fires only during a mapping gap. The paired drive warn carries the raw status with the task identifiers |
+| `schemabot.storage_schema.destructive_refusals_total` | Counter | table, operation, environment | Destructive storage-schema DDL statements the startup bootstrap (`EnsureSchema`) refused to execute. A refused statement does not run at all, so this counts statements the storage schema is still missing. A nonzero rate means a starting binary's embedded schema no longer declares a table, column, index, or constraint that exists in the storage database — expected briefly from older pods during a rolling deploy or rollback. `environment` is always `unknown`: the bootstrap precedes any schema change environment |
 | `schemabot.drop_table.already_absent_total` | Counter | database, environment | DROP TABLE targets that were already absent when the apply reached them |
 | `schemabot.pending_drops.tables_moved_total` | Counter | database, environment | Dropped tables quarantined into the pending drops database |
 | `schemabot.pending_drops.cleanup_dropped_total` | Counter | database, environment | Expired quarantined tables permanently dropped by the cleaner |
@@ -96,7 +102,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (PR command actor authorization): `allowed`, `denied`, `error`, `skipped`, `unknown`
 
-**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
+**reason** (PR command actor authorization): `disabled`, `allowed_admin_team`, `allowed_admin_user`, `allowed_repo_admin_team`, `allowed_repo_admin_user`, `allowed_operator_team`, `allowed_operator_user`, `missing_actor`, `missing_server_config`, `missing_database_config`, `no_configured_principal`, `not_authorized`, `github_error`, `unknown`
 
 **operation** (check ownership): `apply_finished`, `apply_cancelled_finished`, `rollback_finished`
 
@@ -132,13 +138,11 @@ available, such as `repository`, `github_app`, and `installation_id`.
 
 **status** (GitHub API): `success`, `error`, `not_found` (a 404 answer to a read operation — an expected "no" from probes like schemabot.yaml lookups; 404s on auth and write operations stay `error`), `transport_error` (no HTTP response: dial/TLS failure or deadline — the signature of GitHub being unreachable), `cancelled` (SchemaBot cancelled the request itself, e.g. during shutdown), `unknown`
 
-**reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_lease_release_error`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `unknown`
+**reason** (operator claim failures): `expire_retryable_error`, `missing_lease_token`, `operation_storage_error`, `missing_operation_lease_token`, `operation_set_list_error`, `operation_set_missing`, `operation_task_inspect_error`, `operation_cutover_storage_error`, `missing_operation_cutover_lease_token`, `operation_cutover_set_list_error`, `operation_cutover_set_invalid`, `operation_parent_load_error`, `operation_parent_missing`, `operation_parent_claim_error`, `operation_parent_not_claimable`, `operation_parent_release_error`, `operation_lease_release_error`, `operation_lease_recheck_error`, `operation_lease_recheck_missing`, `operation_lease_rotated`, `operation_lease_released_by_peer`, `missing_operation_deployment`, `stop_reconciliation_claim_error`, `stop_reconciliation_missing_lease_token`, `operation_projection_claim_error`, `operation_projection_missing_lease_token`, `stranded_reaper_error`, `stranded_task_reaper_error`, `unknown`
 
 **reason** (operator resume failures): `missing_deployment`, `no_client`, `resume_error`, `lease_lost`, `retry_budget_exhausted`, `recovery_window_expired`
 
-**operation** (storage schema refusals): `alter`, `drop` — the statement types Spirit's unsafe vocabulary can flag
-
-**scope** (storage schema refusals): `split` (a mixed ALTER executed its safe clauses and refused only the destructive remainder), `whole` (nothing in the statement ran — either the whole statement was destructive or its clauses could not be partitioned)
+**operation** (storage schema refusals): `alter`, `drop` — the statement types the plan's linters can flag as unsafe
 
 ### Webhook Ownership Rejections
 
@@ -374,6 +378,36 @@ Operation values:
 | `acquire` | Try to acquire the database lock for a plan/apply workflow. |
 | `release` | Try to release the database lock, either by owner or administrative override. |
 
+### API Auth Decisions
+
+`schemabot.auth_decisions.total` records the auth middleware's decision for
+every `/api` request, before any handler runs. It is the top of the funnel:
+[Direct Write Authorization](#direct-write-authorization) below only sees the
+write-tier requests this counter has already admitted. Exempt paths (`/livez`,
+`/health`, `/tern-health/*`, `/webhook`) are not counted.
+
+`tier` is `read` or `write` (see [auth.md](../../docs/auth.md#the-two-tier-api-model)
+for how a route is classified), `decision` is `allow` or `deny`, and `reason`
+says why. Allows carry an empty reason on a normally authenticated request;
+the two named allow reasons are the ones an operator should watch:
+
+| Reason | Decision | Meaning |
+|---|---|---|
+| `auth_disabled` | allow | `auth.type` is `none`. A non-zero `tier=write` rate here is unauthenticated mutation. |
+| `loopback_source` | allow | A forward-auth request whose trust anchor was satisfied from a loopback address, so the identity headers were caller-supplied. The break-glass path. |
+| `unauthenticated` | deny | No usable credential (OIDC: missing or invalid token). |
+| `not_admin` | deny | Write-tier request whose groups grant no write access: under OIDC no admin team, under forward-auth neither `write_groups` nor any database's `operator_groups`. |
+| `untrusted_proxy` | deny | Forward-auth request that did not arrive through a trusted proxy. |
+| `no_identity` | deny | Trusted proxy, but the user header was empty. |
+| `not_authorized` | deny | Forward-auth read-tier request from a caller in none of `read_groups`, `write_groups`, or `operator_groups` while `read_groups` narrows reads. |
+| `no_service_identity` | deny | Gateway lane: a listed gateway forwarded no caller SPIFFE ID. |
+| `service_not_authorized` | deny | Gateway lane: the forwarded caller is not in `read_service_spiffe`. |
+| `service_caller_write` | deny | Gateway lane: a service caller attempted a write-tier request. |
+
+A rising `deny` rate under one reason is either a probe or a missing grant.
+Every deny is also logged with the subject and path, so a single denied
+request is triaged from the log line, not from the counter.
+
 ### Direct Write Authorization
 
 `schemabot.direct_write_authorization.total` tracks per-database direct-write
@@ -383,15 +417,21 @@ forward-auth middleware has admitted the caller to the write tier. A spike in
 grant — the `reason` attribute says whether the target database, the
 environment, or the group membership mismatched.
 
-Status values: `allowed`, `denied`, and `skipped` (the decision could not reach
-an authorization outcome — for example the stored plan lookup failed — and the
-request was rejected by the operation's own error path instead).
+Status values: `allowed`, `denied`, and `skipped`. A `skipped` decision made no
+per-database ruling: either the scoped lane is disabled and the plain admin gate
+applied (`scoped_lane_disabled`), or the target database could not be resolved
+and the request was rejected by the operation's own error path instead
+(`target_unresolved`). A sustained `target_unresolved` rate means stored-plan
+lookups are failing on the authorization path. The paired log names the plan id
+in both cases: an ERROR carrying the storage error when the lookup failed, or a
+WARN when the plan does not exist.
 
 Reason values:
 
 | Reason | Meaning |
 |---|---|
 | `scoped_lane_disabled` | No database has `operator_groups`; the decision is the plain admin gate. |
+| `target_unresolved` | The stored plan named by the request failed to load or does not exist, so no target database was available to authorize against. |
 | `admin_allow` | Allowed via deployment `write_groups` membership. |
 | `scoped_allow` | Allowed via the target database's `operator_groups` grant. |
 | `missing_identity` | No authenticated user in the request context. |
@@ -409,6 +449,38 @@ when the operation has no such dimension (admin-only operations have no single
 target database; lock operations have no environment) or when the request
 failed before the target resolved.
 
+### Rate Limits
+
+`schemabot.rate_limit_decisions.total` tracks the request-budget decisions made
+by `POST /api/pull` and `GET /api/checks/inspect`. Both outcomes are counted, so
+`decision=limit` has a denominator and a client approaching its budget shows up
+as a rising share of one endpoint's traffic before any request is refused.
+
+`scope` says which budget was consulted. Pull requests consult both scopes;
+check inspection has only a caller budget.
+
+| Scope | Keyed on | A sustained `limit` rate means |
+|---|---|---|
+| `caller` | The authenticated subject (an operator's identity, or a service caller's SPIFFE ID) | One client is looping. Find it in the paired WARN log's `caller` attribute before raising the budget. |
+| `target` | The database and environment being read | A database is absorbing more schema reads than the budget allows, from any number of clients. Check whether the reads are legitimate before raising it. |
+
+The caller identity and target database are deliberately not metric
+attributes — there are hundreds of each, and the counter would carry a series
+per client per database. Every limited request logs both alongside the
+advertised retry delay, so a spike on this counter is triaged from the WARN
+logs, not by slicing the metric.
+
+`environment` is clamped to a configured environment before it is recorded and
+appears as `unconfigured` otherwise. Pull budgets are still keyed on the
+environment the request named, so a rising `unconfigured` share on that
+endpoint means clients are asking for environments this server does not serve.
+Check inspection validates the environment before recording or spending its
+budget. The unclamped name is in the log.
+
+Budgets are enforced per server process, so a fleet-wide `limit` rate is the sum
+across replicas and the effective ceiling is `replicas ×` the configured rate.
+See [Rate Limits](../../docs/configuration.md#rate-limits) for the config.
+
 ## HTTP Server Metrics
 
 The `otelhttp` middleware automatically produces standard HTTP metrics for every endpoint:
@@ -420,7 +492,7 @@ The `otelhttp` middleware automatically produces standard HTTP metrics for every
 | `http.server.response.body.size` | Histogram | environment | Response body sizes |
 
 SchemaBot attaches `environment="unknown"` to these process-wide HTTP metrics
-because routing-level request metrics do not belong to one schema-change
+because routing-level request metrics do not belong to one schema change
 environment. Environment-specific operation metrics use the real environment.
 
 ## Adding New Metrics

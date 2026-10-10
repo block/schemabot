@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/block/mysql"
 	"github.com/block/schemabot/e2e/testutil"
+	"github.com/block/schemabot/pkg/e2eutil"
 	"github.com/block/schemabot/pkg/state"
-	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
-	"github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -117,7 +117,7 @@ func multiDeployTernMySQLDSN(t *testing.T, deployment string) string {
 func multiDeployCreateTestTable(t *testing.T, deployment, tableName, ddl string) {
 	t.Helper()
 	dsn := multiDeployTernMySQLDSN(t, deployment)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
 	// Defer close immediately so the handle is reclaimed even if the create
 	// below fails a require.* assertion, and so close errors are logged.
@@ -126,7 +126,7 @@ func multiDeployCreateTestTable(t *testing.T, deployment, tableName, ddl string)
 	require.NoErrorf(t, err, "create table %s on %s", tableName, deployment)
 
 	t.Cleanup(func() {
-		db2, err := sql.Open("mysql", dsn)
+		db2, err := sql.Open("block-mysql", dsn)
 		if err != nil {
 			t.Logf("cleanup: open tern mysql (%s): %v", deployment, err)
 			return
@@ -153,7 +153,7 @@ func multiDeployCreateTestTable(t *testing.T, deployment, tableName, ddl string)
 func multiDeploySeedRows(t *testing.T, deployment, tableName, columns, valueTemplate string, rowCount int) {
 	t.Helper()
 	dsn := multiDeployTernMySQLDSN(t, deployment)
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
 	defer utils.CloseAndLog(db)
 
@@ -228,7 +228,7 @@ func multiDeployTernStorageDSN(t *testing.T, deployment string) string {
 func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
 	t.Helper()
 	for _, d := range deployments {
-		db, err := sql.Open("mysql", multiDeployTernStorageDSN(t, d))
+		db, err := sql.Open("block-mysql", multiDeployTernStorageDSN(t, d))
 		require.NoErrorf(t, err, "cleanup: open tern storage db (%s)", d)
 		func() {
 			defer utils.CloseAndLog(db)
@@ -267,71 +267,6 @@ func multiDeployClearTernStorage(t *testing.T, deployments ...string) {
 			}
 		}()
 	}
-}
-
-// multiDeploySpendRecoveryBudget spends the recovery budget on the apply this
-// test just dispatched to a deployment's remote Tern. The engine classifies
-// the induced duplicate-row failure retryable, so the remote operator would
-// re-run the whole engine attempt until the budget is spent while the control
-// plane correctly keeps the operation open through each pause — a bounded
-// sequence of engine runs and recovery waits far longer than a test deadline
-// should cover. With the budget spent, the failed_retryable apply goes through
-// the real expiry pass immediately, settling the operation to the same
-// terminal state exhaustion would reach, with the engine error intact.
-//
-// The spend must not race the remote driver: a drive holds the apply row in
-// memory and writes attempt back on finalize, so an out-of-band write while a
-// drive is live gets clobbered. failed_retryable is the one window with no
-// live drive — the failing drive has finalized and released the row, and a
-// spent budget makes the row ineligible for another recovery claim — so the
-// spend waits for that state and writes with a state guard. A zero-row write
-// means a recovery claim flipped the row first; the next retryable failure
-// reopens the window, so the poll simply tries again.
-//
-// Each test starts from multiDeployEnsureNoActiveChange, which clears every
-// deployment's Tern storage, so the apply this test dispatched is the only
-// applies row on the deployment's Tern.
-func multiDeploySpendRecoveryBudget(t *testing.T, deployment string) {
-	t.Helper()
-	db, err := sql.Open("mysql", multiDeployTernStorageDSN(t, deployment))
-	require.NoErrorf(t, err, "open tern storage db (%s)", deployment)
-	t.Cleanup(func() { utils.CloseAndLog(db) })
-	require.NoErrorf(t, db.PingContext(t.Context()), "ping tern storage db (%s)", deployment)
-
-	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
-		func() bool {
-			rows, err := db.QueryContext(t.Context(),
-				"SELECT apply_identifier, state FROM `applies`")
-			require.NoErrorf(t, err, "read dispatched applies on %s", deployment)
-			defer utils.CloseAndLog(rows)
-			var applyIdentifier, applyState string
-			var found int
-			for rows.Next() {
-				require.NoError(t, rows.Scan(&applyIdentifier, &applyState))
-				found++
-			}
-			require.NoError(t, rows.Err())
-			if found == 0 {
-				// The control plane dispatches to the remote asynchronously
-				// after accepting the apply.
-				return false
-			}
-			require.Equalf(t, 1, found,
-				"expected exactly the apply this test dispatched on %s", deployment)
-			if !state.IsState(applyState, state.Apply.FailedRetryable) {
-				return false
-			}
-			result, err := db.ExecContext(t.Context(),
-				"UPDATE `applies` SET attempt = ? WHERE apply_identifier = ? AND state = ?",
-				storage.MaxRecoveryAttempts, applyIdentifier, applyState)
-			require.NoErrorf(t, err, "spend the recovery budget on %s apply %s", deployment, applyIdentifier)
-			spent, err := result.RowsAffected()
-			require.NoError(t, err, "read spent recovery budget rows")
-			return spent == 1
-		},
-		func() string {
-			return fmt.Sprintf("timeout waiting to spend the recovery budget on the %s apply between recovery claims", deployment)
-		})
 }
 
 // multiDeployEnsureNoActiveChange clears any active schema change for the
@@ -520,11 +455,6 @@ func TestGRPCMultiDeploy_FailureHaltsRollout(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
-	// The duplicate-row failure is retryable, so the earlier deployment would
-	// otherwise pause and re-run its engine attempt until the recovery budget
-	// is spent before settling failed.
-	multiDeploySpendRecoveryBudget(t, first)
-
 	// Wait for the earlier deployment to fail, asserting throughout that the
 	// later deployment never reaches completed — the halt policy must keep it
 	// from cutting over once a sibling has failed.
@@ -710,11 +640,6 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 	apply := grpcApply(t, plan.PlanID, env, nil)
 	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
 
-	// The duplicate-row failure is retryable, so the earlier deployment would
-	// otherwise pause and re-run its engine attempt until the recovery budget
-	// is spent before settling failed.
-	multiDeploySpendRecoveryBudget(t, first)
-
 	// Wait until both deployments are terminal: the earlier failed, the later
 	// completed. Under continue, the later sibling must not be blocked by the
 	// earlier failure.
@@ -749,6 +674,147 @@ func TestGRPCMultiDeploy_OnFailureContinue(t *testing.T) {
 		},
 		func() string {
 			return fmt.Sprintf("aggregate apply state should be failed, was %q", prog.State)
+		},
+	)
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+}
+
+// pauseHoldWindow is how long the pause test keeps checking that the later
+// deployment stays short of completed after the aggregate has reported paused
+// and before the operator releases it. Under cutover_policy: barrier the later
+// deployment parks at waiting_for_cutover behind its predecessor whatever
+// on_failure says, so a single read taken the moment the aggregate shows paused
+// cannot tell a held rollout from one about to cut over; watching across
+// several poll intervals can. The stretch before that — from apply acceptance
+// to the aggregate turning paused — is guarded inside the phase-1 poll itself,
+// so this window only has to cover the pause-to-release gap.
+const pauseHoldWindow = 3 * time.Second
+
+// TestGRPCMultiDeploy_OnFailurePauseRelease verifies that on_failure: pause
+// holds a fan-out rollout at the first failed deployment until an operator
+// releases it, and that the release lets the remaining deployment finish
+// without changing the apply's verdict.
+//
+// Scenario: testapp/production-pause fans out to [eu, us] with deployment_order
+// [eu, us], cutover_policy: barrier, and on_failure: pause. The earlier
+// deployment (eu) is seeded with duplicate data so adding a UNIQUE key fails its
+// copy; the later deployment (us) is healthy. Under pause, eu's failure holds
+// the rollout: the aggregate apply reports the non-terminal paused state and the
+// later deployment does not complete until a human releases it. After a release
+// control request, us proceeds and completes; the apply still settles to failed
+// — pause governs rollout continuation, not the pass/fail verdict.
+func TestGRPCMultiDeploy_OnFailurePauseRelease(t *testing.T) {
+	requireMultiDeploy(t)
+
+	const (
+		database = "testapp"
+		env      = "production-pause"
+	)
+	// Matches deployment_order in grpc-schemabot-multideploy.yaml.
+	first, second := "eu", "us"
+
+	tableName := uniqueGRPCTableName("md_pause")
+	createDDL := fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT)", tableName)
+	for _, d := range []string{first, second} {
+		multiDeployCreateTestTable(t, d, tableName, createDDL)
+	}
+	// The earlier deployment gets identical names so adding UNIQUE(name) fails
+	// during its copy; the later deployment gets unique names so it completes.
+	multiDeploySeedRows(t, first, tableName, "name, data", "'dup', REPEAT('x', 200)", 2)
+	multiDeploySeedRows(t, second, tableName, "name, data", "CONCAT('user_', seq), REPEAT('x', 200)", 2)
+
+	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+
+	plan := grpcPlan(t, database, env, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, data TEXT, UNIQUE KEY uniq_name (name));", tableName),
+	})
+	require.Empty(t, plan.Errors, "plan errors: %v", plan.Errors)
+	require.NotEmpty(t, plan.PlanID, "plan_id")
+
+	apply := grpcApply(t, plan.PlanID, env, nil)
+	require.True(t, apply.Accepted, "apply not accepted: %s", apply.ErrorMessage)
+
+	// Phase 1: eu fails and the rollout pauses. The aggregate settles to the
+	// non-terminal paused state; the later deployment must not complete while
+	// the rollout is held. The later deployment is checked on every tick, so
+	// the hold is guarded continuously from acceptance to paused rather than
+	// only sampled once the aggregate reports it.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			prog := grpcProgressByApplyID(t, apply.ApplyID)
+			require.Falsef(t, state.IsState(ops[second].State, state.Apply.Completed),
+				"pause violated: %s completed before the rollout was released (%s=%q apply=%q)",
+				second, first, ops[first].State, prog.State)
+			return failedApplyState(ops[first].State) &&
+				state.IsState(prog.State, state.Apply.Paused)
+		},
+		func() string {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			prog := grpcProgressByApplyID(t, apply.ApplyID)
+			return fmt.Sprintf("waiting for %s failed + apply paused; %s=%q %s=%q apply=%q",
+				first, first, ops[first].State, second, ops[second].State, prog.State)
+		},
+	)
+
+	// Keep watching the held deployment for a while after the aggregate turns
+	// paused and before the release: a rollout that cuts over shortly after
+	// reporting paused is a pause that did not hold.
+	for holdUntil := time.Now().Add(pauseHoldWindow); time.Now().Before(holdUntil); time.Sleep(testutil.PollInterval) {
+		held := multiDeployOps(t, apply.ApplyID, first, second)
+		require.Falsef(t, state.IsState(held[second].State, state.Apply.Completed),
+			"%s must not complete while the rollout is paused, was %q", second, held[second].State)
+	}
+
+	// Release the paused rollout so the remaining deployment proceeds.
+	releaseResp := grpcPost(t, "/api/release", map[string]string{
+		"environment": env,
+		"apply_id":    apply.ApplyID,
+	})
+	defer releaseResp.Body.Close()
+	var releaseResult grpcSimpleResponse
+	grpcDecodeJSON(t, releaseResp, &releaseResult)
+	require.Truef(t, releaseResult.Accepted, "release not accepted: %s", releaseResult.ErrorMessage)
+
+	// Phase 2: after release, us proceeds and completes; the apply settles to
+	// failed even though a sibling completed — pause governs rollout
+	// continuation, not the verdict.
+	testutil.Poll(t, orderedCutoverDeadline, testutil.PollInterval,
+		func() bool {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			return failedApplyState(ops[first].State) &&
+				state.IsState(ops[second].State, state.Apply.Completed)
+		},
+		func() string {
+			ops := multiDeployOps(t, apply.ApplyID, first, second)
+			return fmt.Sprintf("waiting for %s failed + %s completed after release; %s=%q %s=%q",
+				first, second, first, ops[first].State, second, ops[second].State)
+		},
+	)
+
+	final := multiDeployOps(t, apply.ApplyID, first, second)
+	assert.Truef(t, failedApplyState(final[first].State), "%s should be failed, was %q", first, final[first].State)
+	assert.Truef(t, state.IsState(final[second].State, state.Apply.Completed),
+		"%s should complete after release under on_failure: pause, was %q", second, final[second].State)
+
+	// The aggregate is projected by a parent-row CAS that runs after the
+	// per-deployment op rows are persisted, so it can briefly lag the terminal
+	// op states above; poll for it rather than asserting once. A released
+	// rollout stays released: every read between the release and the settled
+	// verdict must be something other than paused.
+	var prog grpcProgressResponse
+	testutil.Poll(t, testutil.PollDeadline, testutil.PollInterval,
+		func() bool {
+			prog = grpcProgressByApplyID(t, apply.ApplyID)
+			require.Falsef(t, state.IsState(prog.State, state.Apply.Paused),
+				"a released rollout must not return to paused, was %q", prog.State)
+			return failedApplyState(prog.State)
+		},
+		func() string {
+			return fmt.Sprintf("aggregate apply state should be failed after release, was %q", prog.State)
 		},
 	)
 
@@ -882,4 +948,99 @@ func TestGRPCMultiDeploy_BarrierReleaseBounded(t *testing.T) {
 	)
 
 	multiDeployEnsureNoActiveChange(t, database, env, first, second)
+}
+
+// TestGRPCMultiDeploy_TargetsRolloutThroughCLI runs a multi-target rollout
+// through the CLI end to end.
+//
+// Scenario: testapp/production-targets addresses one target in each of the
+// eu and us deployments through a targets list, so each member is planned
+// against its own live schema. The two targets hold different versions of the
+// same table, so the plan says what applies where: eu adds one column, us adds
+// two. The CLI applies the environment as one rollout, each target runs its
+// own plan, and progress reports one completed section per deployment.
+func TestGRPCMultiDeploy_TargetsRolloutThroughCLI(t *testing.T) {
+	requireMultiDeploy(t)
+	bin := grpcCLIBuildOrFind(t)
+	endpoint := grpcSchemabotURL(t)
+
+	const (
+		database = "testapp"
+		env      = "production-targets"
+	)
+	tableName := uniqueGRPCTableName("md_targets")
+	multiDeployCreateTestTable(t, "eu", tableName, fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL)", tableName))
+	multiDeployCreateTestTable(t, "us", tableName, fmt.Sprintf(
+		"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY)", tableName))
+	multiDeployEnsureNoActiveChange(t, database, env, "eu", "us")
+
+	schemaDir := grpcCLISchemaDir(t, map[string]string{
+		tableName + ".sql": fmt.Sprintf(
+			"CREATE TABLE %s (id INT NOT NULL AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) DEFAULT NULL);", tableName),
+	})
+
+	out := e2eutil.RunCLIInDir(t, bin, schemaDir, "plan",
+		"-s", ".",
+		"-e", env,
+		"--endpoint", endpoint,
+	)
+	e2eutil.AssertContains(t, out, "▸ target eu")
+	e2eutil.AssertContains(t, out, "▸ target us")
+	e2eutil.AssertContains(t, out, "ADD COLUMN")
+	e2eutil.AssertContains(t, out, "`email`")
+	e2eutil.AssertContains(t, out, "`name`")
+
+	out = e2eutil.RunCLIInDir(t, bin, schemaDir, "apply",
+		"-s", ".",
+		"-e", env,
+		"--endpoint", endpoint,
+		"-y",
+		"--watch=false",
+	)
+	e2eutil.AssertContains(t, out, "Apply started")
+	applyID := parseApplyID(t, out)
+
+	testutil.WaitForState(t, endpoint, applyID, state.Apply.Completed, orderedCutoverDeadline)
+
+	out = e2eutil.RunCLIInDir(t, bin, schemaDir, "progress",
+		applyID,
+		"--endpoint", endpoint,
+		"--watch=false",
+	)
+	// Each deployment addresses one target, so each is its own section naming
+	// that target; a deployment of several targets rolls up instead, which
+	// TestProgressCmd_MultiTargetDeploymentsRenderAsRollups covers.
+	e2eutil.AssertContains(t, out, "Deployments:  2 completed")
+	e2eutil.AssertContains(t, out, "✅ eu — completed (testapp)")
+	e2eutil.AssertContains(t, out, "✅ us — completed (testapp)")
+	e2eutil.AssertContains(t, out, "~ "+tableName+":")
+
+	for _, deployment := range []string{"eu", "us"} {
+		for _, column := range []string{"name", "email"} {
+			assert.Truef(t, multiDeployColumnExists(t, deployment, tableName, column),
+				"expected column %s.%s on %s after the rollout", tableName, column, deployment)
+		}
+	}
+
+	multiDeployEnsureNoActiveChange(t, database, env, "eu", "us")
+}
+
+// multiDeployColumnExists reports whether a column exists on one deployment's
+// target MySQL.
+func multiDeployColumnExists(t *testing.T, deployment, tableName, columnName string) bool {
+	t.Helper()
+	db, err := sql.Open("block-mysql", multiDeployTernMySQLDSN(t, deployment))
+	require.NoErrorf(t, err, "open tern mysql (%s)", deployment)
+	defer utils.CloseAndLog(db)
+	require.NoErrorf(t, db.PingContext(t.Context()), "ping tern mysql (%s)", deployment)
+
+	var count int
+	err = db.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM information_schema.COLUMNS
+		 WHERE TABLE_SCHEMA = 'testapp' AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+		tableName, columnName,
+	).Scan(&count)
+	require.NoErrorf(t, err, "check column %s.%s on %s", tableName, columnName, deployment)
+	return count > 0
 }

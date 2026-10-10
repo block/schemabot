@@ -9,6 +9,7 @@ import (
 	"github.com/block/schemabot/pkg/api"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/metrics"
+	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/templates"
 )
@@ -306,6 +307,52 @@ func (h *Handler) updateAggregateCheckOnce(ctx context.Context, client *ghclient
 	return aggregateFoldClearParticipantRefoldBudget, nil
 }
 
+// anyApplyOwnedInProgress reports whether any contribution is an in-progress
+// row an apply owns — the only kind of row a stopped apply can be holding open.
+func anyApplyOwnedInProgress(checks []*storage.Check) bool {
+	for _, c := range checks {
+		if c.Status == checkStatusInProgress && c.ApplyID != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// stoppedAppliesForPR resolves which of a PR's applies are stopped, so the fold
+// can name a paused apply rather than report it as work in progress.
+//
+// Folds run on every webhook event and re-fold, and the set is consulted only
+// for in-progress apply-owned rows, so a fold with none — the steady state once
+// a PR's contributions have all completed — skips the read entirely rather than
+// paying for a result it would discard.
+//
+// A lookup failure returns no set rather than an error: the aggregate's status
+// and conclusion do not depend on it, so failing the whole fold would trade a
+// less precise title for a check that does not get published at all. The title
+// falls back to the state-agnostic wording and the error is logged.
+func (h *Handler) stoppedAppliesForPR(ctx context.Context, repo string, pr int, checks []*storage.Check) stoppedApplyIDs {
+	if !anyApplyOwnedInProgress(checks) {
+		return nil
+	}
+	applies, err := h.service.Storage().Applies().GetByPR(ctx, repo, pr)
+	if err != nil {
+		h.logger.Warn("aggregate title will not distinguish stopped applies; failed to load the PR's applies",
+			"repo", repo, "pr", pr, "error", err)
+		return nil
+	}
+	var stopped stoppedApplyIDs
+	for _, a := range applies {
+		if !state.IsState(a.State, state.Apply.Stopped) {
+			continue
+		}
+		if stopped == nil {
+			stopped = stoppedApplyIDs{}
+		}
+		stopped[a.ID] = true
+	}
+	return stopped
+}
+
 // prFilePaths extracts the changed-file paths from a PR file listing for
 // expected-participant matching.
 func prFilePaths(files []ghclient.PRFile) []string {
@@ -378,7 +425,7 @@ func (h *Handler) upsertAggregateCheckRunOnce(
 
 	contributions, staleCount := normalizeStaleContributions(dbChecks, headSHA)
 	conclusion, status := computeAggregate(contributions)
-	title, summary := aggregateSummary(contributions, conclusion)
+	title, summary := aggregateSummary(contributions, conclusion, h.stoppedAppliesForPR(ctx, repo, pr, contributions))
 	if staleCount > 0 {
 		h.logger.Info("aggregate fold holds rows recorded for another commit as blocking until results land for the current commit",
 			"repo", repo, "pr", pr, "check_name", checkName,
@@ -569,12 +616,10 @@ func rewindsConcludedCheckRun(run *ghclient.CheckRunResult, status string) bool 
 // touch schema files, or because the databases don't have environments this instance
 // manages. Without this, branch protection would block indefinitely waiting for a
 // check that would never come. It does not publish success over existing
-// per-database state that still needs operator attention.
-func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string) {
-	const (
-		title   = "No managed schema changes"
-		summary = "This PR does not contain schema changes managed by SchemaBot."
-	)
+// per-database state that still needs operator attention. unmanaged lists the
+// schema configs the PR changes that this deployment does not manage; when it
+// is non-empty the check says so instead of claiming no schema files changed.
+func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.InstallationClient, repo string, pr int, headSHA string, unmanaged []templates.UnmanagedSchemaConfigNoticeData) {
 	if !h.shouldPublishChecks(ctx, repo, "aggregate_check_sync") {
 		return
 	}
@@ -613,6 +658,7 @@ func (h *Handler) postPassingAggregates(ctx context.Context, client *ghclient.In
 			continue
 		}
 
+		title, summary := passingAggregateOutput(ec.environment, unmanaged)
 		opts := ghclient.CheckRunOptions{
 			Name:       checkName,
 			Status:     checkStatusCompleted,
@@ -999,4 +1045,18 @@ func (h *Handler) clearAggregateBlocksForVerifiedPR(ctx context.Context, client 
 			"head_sha", headSHA, "blocked_head_sha", existing.HeadSHA,
 			"blocking_reason", existing.BlockingReason)
 	}
+}
+
+// passingAggregateOutput is the title and summary of a passing aggregate for
+// one environment's check: "No schema files changed" when the PR changes no
+// schema at all, or a summary of the unmanaged schema it does change. The
+// aggregate sentinel environment is a deployment serving every environment.
+func passingAggregateOutput(environment string, unmanaged []templates.UnmanagedSchemaConfigNoticeData) (title, summary string) {
+	if len(unmanaged) == 0 {
+		return "No schema files changed", "SchemaBot found no changes to managed schema files in this PR."
+	}
+	if environment == aggregateSentinel {
+		environment = ""
+	}
+	return templates.RenderUnmanagedSchemaPassingCheck(environment, unmanaged)
 }

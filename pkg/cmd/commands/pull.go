@@ -130,7 +130,48 @@ func filterPullSchemaTables(resp *apitypes.PullSchemaResponse, filter string) er
 		}
 	}
 	resp.TableCount = kept
+	filterPullTargetDivergence(resp.Targets, needle, kept)
 	return nil
+}
+
+// filterPullTargetDivergence narrows a multi-target pull's divergence report to
+// the same tables the filter kept, so the report describes the schema printed
+// beside it rather than the whole database. Left unfiltered it would name
+// divergence in tables the operator did not ask about, while the header and the
+// pulled DDL described a different set.
+//
+// Each target's table count is recomputed over what remains, which the filtered
+// response already determines: a target holds the tables the primary holds,
+// less the ones only the primary has and plus the ones only it has.
+func filterPullTargetDivergence(targets []*apitypes.TargetDivergence, needle string, primaryKept int32) {
+	for _, target := range targets {
+		if target.Primary {
+			target.TableCount = primaryKept
+			continue
+		}
+		kept := make([]apitypes.DivergedTable, 0, len(target.DivergedTables))
+		count := primaryKept
+		for _, table := range target.DivergedTables {
+			if !strings.Contains(strings.ToLower(table.Table), needle) {
+				continue
+			}
+			kept = append(kept, table)
+			switch table.Difference {
+			case apitypes.DivergenceOnlyOnPrimary:
+				count--
+			case apitypes.DivergenceOnlyOnTarget:
+				count++
+			}
+		}
+		if len(kept) == 0 {
+			// Absent rather than empty: a target with nothing left to report
+			// holds the same filtered schema as the primary, which is what an
+			// unset list already says.
+			kept = nil
+		}
+		target.DivergedTables = kept
+		target.TableCount = count
+	}
 }
 
 // errNoTableMatches names the filter, the database, and the environment, and

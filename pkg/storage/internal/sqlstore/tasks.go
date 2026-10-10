@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/state"
@@ -21,7 +24,7 @@ import (
 const taskColumns = `id, task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
-	rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
+	rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
@@ -44,10 +47,18 @@ var terminalTaskStatesSQL = func() string {
 
 // taskStore implements storage.TaskStore using MySQL.
 type taskStore struct {
-	db       *rebindDB
-	dialect  Dialect
-	identity identityInserter
-	locker   namedlock.Locker
+	db         *rebindDB
+	dialect    Dialect
+	identity   identityInserter
+	locker     namedlock.Locker
+	classifier ErrorClassifier
+}
+
+func canonicalizeTaskIdentity(task *storage.Task) {
+	task.Database = storage.CanonicalKey(task.Database)
+	task.DatabaseType = storage.CanonicalKey(task.DatabaseType)
+	task.Repository = storage.CanonicalKey(task.Repository)
+	task.Environment = storage.CanonicalKey(task.Environment)
 }
 
 // Create stores a new task.
@@ -56,6 +67,9 @@ func (s *taskStore) Create(ctx context.Context, task *storage.Task) (int64, erro
 }
 
 func insertTask(ctx context.Context, exec queryExecer, identity identityInserter, task *storage.Task) (int64, error) {
+	canonicalizeTaskIdentity(task)
+	boundEngineReportedFields(task)
+
 	// Ensure options has valid JSON (empty object if nil)
 	options := task.Options
 	if len(options) == 0 {
@@ -67,16 +81,16 @@ func insertTask(ctx context.Context, exec queryExecer, identity identityInserter
 			task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 			namespace, table_name, shard, ddl, ddl_action,
 			engine, repository, pull_request, environment, state, error_message, options, attempt,
-			rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
+			rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 			is_instant, engine_migration_id,
 			started_at, completed_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 		task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 		task.Engine, task.Repository, task.PullRequest, task.Environment,
 		task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
+		task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 		task.IsInstant, nullString(task.EngineMigrationID),
 		task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 	)
@@ -98,58 +112,185 @@ func (s *taskStore) Get(ctx context.Context, taskIdentifier string) (*storage.Ta
 	return scanTask(row)
 }
 
+// maxStoredETASeconds is the largest value the tasks.eta_seconds column holds,
+// a signed 32-bit integer in every dialect.
+const maxStoredETASeconds = math.MaxInt32
+
+// maxStoredThrottleReasonChars is the width of the tasks.throttle_reason
+// column, in characters in every dialect.
+const maxStoredThrottleReasonChars = 255
+
+// boundEngineReportedFields fits the task's engine-reported display fields to
+// the columns that hold them, on the caller's task, so the task a drive keeps
+// in memory and the row it reads back agree. These values come from an engine
+// and have no bound of their own; written unbounded, one would refuse every
+// progress write for the task and freeze the row over a display value.
+func boundEngineReportedFields(task *storage.Task) {
+	task.ETASeconds = storedETASeconds(task.ETASeconds)
+	task.ThrottleReason = storedThrottleReason(task.ThrottleReason)
+}
+
+// storedETASeconds bounds an engine-reported ETA to what the column holds. The
+// ETA is an engine's estimate and has no upper bound of its own: one paced on
+// key distance rather than rows reports decades for a table whose keys have a
+// wide gap, so a larger value is stored as the column's maximum, which still
+// reads as far beyond any useful estimate. A negative estimate means nothing,
+// and is stored as no estimate.
+func storedETASeconds(eta int) int {
+	return max(0, min(eta, maxStoredETASeconds))
+}
+
+// storedThrottleReason cuts an engine's throttle reason to the column's width
+// on a character boundary, marking the cut with an ellipsis.
+func storedThrottleReason(reason string) string {
+	if utf8.RuneCountInString(reason) <= maxStoredThrottleReasonChars {
+		return reason
+	}
+	runes := []rune(reason)
+	return string(runes[:maxStoredThrottleReasonChars-1]) + "…"
+}
+
+// taskUpdateAssignments is the SET list Update writes from the caller's task.
+// Each column binds one placeholder, in this order, ahead of the WHERE clause's
+// placeholders; taskUpdateStatement appends the updated_at stamp.
+var taskUpdateAssignments = []JoinedUpdateAssignment{
+	{Column: "state", Expr: "?"},
+	{Column: "error_message", Expr: "?"},
+	{Column: "options", Expr: "?"},
+	{Column: "attempt", Expr: "?"},
+	{Column: "rows_copied", Expr: "?"},
+	{Column: "rows_total", Expr: "?"},
+	{Column: "progress_percent", Expr: "?"},
+	{Column: "eta_seconds", Expr: "?"},
+	{Column: "checksum_rows_checked", Expr: "?"},
+	{Column: "checksum_rows_total", Expr: "?"},
+	{Column: "throttled", Expr: "?"},
+	{Column: "throttle_reason", Expr: "?"},
+	{Column: "execution_mode", Expr: "?"},
+	{Column: "mode_reason", Expr: "?"},
+	{Column: "cutover_attempts", Expr: "?"},
+	{Column: "is_instant", Expr: "?"},
+	{Column: "engine_migration_id", Expr: "?"},
+	{Column: "ddl", Expr: "?"},
+	{Column: "started_at", Expr: "?"},
+	{Column: "completed_at", Expr: "?"},
+}
+
+// taskLeaseGuard selects the lease check Update's statement carries.
+type taskLeaseGuard int
+
+const (
+	// taskGuardNone writes without a lease check: no lease is on the context.
+	taskGuardNone taskLeaseGuard = iota
+	// taskGuardOperation checks the token on the task's own apply_operations row.
+	taskGuardOperation
+	// taskGuardApply checks the token on the task's parent applies row.
+	taskGuardApply
+	// taskGuardOperationAbsent holds no lease: it admits the write only while
+	// no drive holds a fresh lease on the task's operation, read through
+	// unleasedOperationGate so a repair write and the reapers agree on what
+	// "unleased" means.
+	taskGuardOperationAbsent
+)
+
+// taskUpdateStatement renders Update's statement for guard. The lease token
+// lives on a different row from the task, so the leased renderings join that
+// row and check it through LeaseTokenFence; the unguarded and absence-guarded
+// renderings are portable single-table UPDATEs. Every rendering binds the SET
+// placeholders, then the task ID, then the guard's own: the operation ID and
+// token for an operation lease, the token for an apply lease, the apply ID and
+// operation ID for an absence guard. Every rendering also stamps updated_at,
+// the task's drive liveness signal the stranded-task sweeps read; stamping it
+// is the application's job on every dialect.
+func taskUpdateStatement(d Dialect, guard taskLeaseGuard) string {
+	// Clip so the append copies rather than writing the updated_at stamp into
+	// spare capacity behind the shared package-level slice.
+	assignments := append(slices.Clip(taskUpdateAssignments), JoinedUpdateAssignment{Column: "updated_at", Expr: "NOW()"})
+	switch guard {
+	case taskGuardOperation:
+		return d.JoinedUpdate(
+			"tasks", "t", "apply_operations", "ao", "ao.id = t.apply_operation_id",
+			assignments,
+			"t.id = ? AND ao.id = ? AND "+d.LeaseTokenFence("apply_operations", "ao", "id", "lease_token"),
+		)
+	case taskGuardApply:
+		return d.JoinedUpdate(
+			"tasks", "t", "applies", "a", "a.id = t.apply_id",
+			assignments,
+			"t.id = ? AND "+d.LeaseTokenFence("applies", "a", "id", "lease_token"),
+		)
+	case taskGuardNone, taskGuardOperationAbsent:
+		sets := make([]string, len(assignments))
+		for i, assignment := range assignments {
+			sets[i] = assignment.Column + " = " + assignment.Expr
+		}
+		statement := "UPDATE tasks SET " + strings.Join(sets, ", ") + " WHERE id = ?"
+		if guard == taskGuardOperationAbsent {
+			statement += " AND apply_id = ? AND apply_operation_id = ? AND " + unleasedOperationGate(d)
+		}
+		return statement
+	default:
+		panic(fmt.Sprintf("sqlstore: unknown task lease guard %d", guard))
+	}
+}
+
 // Update updates an existing task.
 //
 // The write is guarded by whichever lease is on the context: an operation lease
 // takes precedence over the parent apply lease so the operator can move to
 // operation-scoped writes while callers that have not adopted operation leases
 // keep falling back to the apply lease. An operation lease scopes the write to
-// the task's own operation; the apply lease scopes it to the parent apply.
+// the task's own operation; the apply lease scopes it to the parent apply. An
+// operation lease absence guard takes precedence over both: it is the repair
+// write of a caller that holds no lease and must land only while no drive holds
+// the task's operation, and it fails with ErrOperationLeaseActive when one does.
+//
+// A token check that did not lock the lease row would read it from the
+// statement's snapshot: a driver displaced by a steal that had not yet
+// committed would pass against the token the steal was replacing, and its write
+// would land after the new driver took over. The fence taskUpdateStatement
+// renders instead waits out the steal and fails, or wins the row lock and holds
+// the steal off until the task write commits.
 func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
+	boundEngineReportedFields(task)
 	args := []any{
 		task.State, nullString(task.ErrorMessage), nullJSON(task.Options), task.Attempt,
-		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
-		task.IsInstant, nullString(task.EngineMigrationID),
+		task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
+		task.IsInstant, nullString(task.EngineMigrationID), task.DDL,
 		task.StartedAt, task.CompletedAt,
 		task.ID,
 	}
 
-	leasePredicate := ""
+	guard := taskGuardNone
 	var verifyLeaseStillOwned func() error
-	if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
+	if absence, ok := storage.OperationLeaseAbsenceFromContext(ctx); ok {
+		if absence.ApplyID != task.ApplyID || task.ApplyOperationID == nil || *task.ApplyOperationID != absence.OperationID {
+			return fmt.Errorf("invalid operation lease absence guard for task %d: %w", task.ID, storage.ErrOperationLeaseActive)
+		}
+		guard = taskGuardOperationAbsent
+		args = append(args, absence.ApplyID, absence.OperationID)
+		verifyLeaseStillOwned = func() error { return storage.ErrOperationLeaseActive }
+	} else if opLease, ok := storage.OperationLeaseFromContext(ctx); ok {
 		if !opLease.Valid() {
 			return fmt.Errorf("invalid operation lease for task %d: %w", task.ID, storage.ErrApplyLeaseLost)
 		}
-		leasePredicate = `
-			AND tasks.apply_operation_id = ?
-			AND EXISTS (
-				SELECT 1 FROM apply_operations ao
-				WHERE ao.id = ? AND ao.lease_token = ?
-			)`
-		args = append(args, opLease.OperationID, opLease.OperationID, opLease.Token)
+		guard = taskGuardOperation
+		args = append(args, opLease.OperationID, opLease.Token)
 		verifyLeaseStillOwned = func() error { return ensureOperationLeaseStillOwned(ctx, s.db, opLease) }
 	} else if lease, hasLease, err := applyLeaseFromContext(ctx, task.ApplyID); err != nil {
 		return err
 	} else if hasLease {
-		leasePredicate = `
-			AND EXISTS (
-				SELECT 1 FROM applies a
-				WHERE a.id = tasks.apply_id AND a.lease_token = ?
-			)`
+		guard = taskGuardApply
 		args = append(args, lease.Token)
 		verifyLeaseStillOwned = func() error { return ensureApplyLeaseStillOwned(ctx, s.db, lease) }
 	}
 
-	result, err := s.db.ExecContext(ctx, `
-		UPDATE tasks SET
-			state = ?, error_message = ?, options = ?, attempt = ?,
-			rows_copied = ?, rows_total = ?, progress_percent = ?, eta_seconds = ?, checksum_rows_checked = ?, checksum_rows_total = ?, throttled = ?, throttle_reason = ?, cutover_attempts = ?,
-			is_instant = ?, engine_migration_id = ?,
-			started_at = ?, completed_at = ?, updated_at = NOW()
-		WHERE id = ?`+leasePredicate+`
-	`, args...)
+	result, err := s.db.ExecContext(ctx, taskUpdateStatement(s.dialect, guard), args...)
 	if err != nil {
-		return err
+		if s.classifier != nil && s.classifier.IsValueRejected(err) {
+			return fmt.Errorf("update task %d (%s): %w: %w", task.ID, task.TaskIdentifier, storage.ErrValueRejected, err)
+		}
+		return fmt.Errorf("update task %d (%s): %w", task.ID, task.TaskIdentifier, err)
 	}
 	if verifyLeaseStillOwned == nil {
 		return nil
@@ -178,8 +319,11 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 // the insert is gated on the matching lease token so a displaced operator fails
 // closed (ErrApplyLeaseLost) instead of writing stale rows. The update path
 // reuses the lease-guarded Update, which applies the same lease precedence. On
-// conflict only the progress fields change; identity and DDL are preserved.
+// conflict identity is preserved and the statement text follows the caller's
+// task like every other mutable column.
 func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task) error {
+	canonicalizeTaskIdentity(task)
+
 	if task.ApplyOperationID == nil {
 		return fmt.Errorf("upsert shard progress for %s.%s shard %q requires apply_operation_id", task.Namespace, task.TableName, task.Shard)
 	}
@@ -274,29 +418,43 @@ const shardTaskInsertColumns = `
 	task_identifier, apply_id, apply_operation_id, plan_id, database_name, database_type,
 	namespace, table_name, shard, ddl, ddl_action,
 	engine, repository, pull_request, environment, state, error_message, options, attempt,
-	rows_copied, rows_total, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, cutover_attempts,
+	rows_copied, rows_total, estimated_bytes, progress_percent, eta_seconds, checksum_rows_checked, checksum_rows_total, throttled, throttle_reason, execution_mode, mode_reason, cutover_attempts,
 	is_instant, engine_migration_id,
 	started_at, completed_at, created_at, updated_at`
 
 // shardTaskInsertValues returns the placeholder list and value args for a
-// per-shard task INSERT ... SELECT, matching shardTaskInsertColumns. The caller
-// appends its own lease-guard ("FROM <lease table> WHERE ... lease_token = ?")
-// and the guard's args.
+// per-shard task INSERT ... SELECT, matching shardTaskInsertColumns.
+// shardTaskInsertStatement renders the lease guard; the caller appends the
+// guard's args.
 func shardTaskInsertValues(task *storage.Task) (string, []any) {
+	boundEngineReportedFields(task)
 	options := task.Options
 	if len(options) == 0 {
 		options = []byte("{}")
 	}
-	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
+	return `?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?`,
 		[]any{
 			task.TaskIdentifier, task.ApplyID, nullInt64Ptr(task.ApplyOperationID), task.PlanID, task.Database, task.DatabaseType,
 			task.Namespace, nullString(task.TableName), task.Shard, nullString(task.DDL), nullString(task.DDLAction),
 			task.Engine, task.Repository, task.PullRequest, task.Environment,
 			task.State, nullString(task.ErrorMessage), string(options), task.Attempt,
-			task.RowsCopied, task.RowsTotal, task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.CutoverAttempts,
+			task.RowsCopied, task.RowsTotal, nullInt64Ptr(task.EstimatedBytes), task.ProgressPercent, task.ETASeconds, task.ChecksumRowsChecked, task.ChecksumRowsTotal, task.Throttled, task.ThrottleReason, task.ExecutionMode, nullString(task.ModeReason), task.CutoverAttempts,
 			task.IsInstant, nullString(task.EngineMigrationID),
 			task.StartedAt, task.CompletedAt, task.CreatedAt, task.UpdatedAt,
 		}
+}
+
+// shardTaskInsertStatement renders a lease-guarded per-shard INSERT … SELECT
+// whose only source row is the lease row, reached through leaseAlias over
+// leaseTable. It binds the values' placeholders, then the lease row's ID, then
+// the lease token. The token check goes through LeaseSourceFence so it
+// serializes against a concurrent steal instead of passing against a token the
+// statement's snapshot still holds, at whatever isolation level the storage
+// session runs.
+func shardTaskInsertStatement(d Dialect, values, leaseTable, leaseAlias string) string {
+	return "INSERT INTO tasks (" + shardTaskInsertColumns + ") SELECT " + values +
+		" FROM " + leaseTable + " " + leaseAlias +
+		" WHERE " + leaseAlias + ".id = ? AND " + d.LeaseSourceFence(leaseTable, leaseAlias, "id", "lease_token")
 }
 
 // insertShardTaskGuarded inserts a new per-shard task row only while the
@@ -306,19 +464,21 @@ func shardTaskInsertValues(task *storage.Task) (string, []any) {
 func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Task, opLease storage.OperationLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, opLease.OperationID, opLease.Token)
-	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
-		INSERT INTO tasks (`+shardTaskInsertColumns+`)
-		SELECT `+values+`
-		FROM apply_operations ao
-		WHERE ao.id = ? AND ao.lease_token = ?
-	`, args...)
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db,
+		shardTaskInsertStatement(s.dialect, values, "apply_operations", "ao"), args...)
 	if err != nil {
 		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q: %w",
 			opLease.OperationID, task.Namespace, task.TableName, task.Shard, err)
 	}
 	if !inserted {
-		// Zero rows inserted means the operation lease is no longer current.
-		return ensureOperationLeaseStillOwned(ctx, s.db, opLease)
+		// Zero rows inserted means the operation lease is no longer current. A
+		// miss while the lease still reads as current wrote nothing, so it is an
+		// error rather than a success with no row behind it.
+		if err := ensureOperationLeaseStillOwned(ctx, s.db, opLease); err != nil {
+			return err
+		}
+		return fmt.Errorf("insert shard task for operation %d %s.%s shard %q matched no rows despite current lease",
+			opLease.OperationID, task.Namespace, task.TableName, task.Shard)
 	}
 	task.ID = id
 	return nil
@@ -332,19 +492,21 @@ func (s *taskStore) insertShardTaskGuarded(ctx context.Context, task *storage.Ta
 func (s *taskStore) insertShardTaskGuardedByApply(ctx context.Context, task *storage.Task, lease storage.ApplyLease) error {
 	values, args := shardTaskInsertValues(task)
 	args = append(args, lease.ApplyID, lease.Token)
-	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db, `
-		INSERT INTO tasks (`+shardTaskInsertColumns+`)
-		SELECT `+values+`
-		FROM applies a
-		WHERE a.id = ? AND a.lease_token = ?
-	`, args...)
+	id, inserted, err := s.identity.InsertGuardedID(ctx, s.db,
+		shardTaskInsertStatement(s.dialect, values, "applies", "a"), args...)
 	if err != nil {
 		return fmt.Errorf("insert shard task for apply %d %s.%s shard %q: %w",
 			lease.ApplyID, task.Namespace, task.TableName, task.Shard, err)
 	}
 	if !inserted {
-		// Zero rows inserted means the apply lease is no longer current.
-		return ensureApplyLeaseStillOwned(ctx, s.db, lease)
+		// Zero rows inserted means the apply lease is no longer current. A miss
+		// while the lease still reads as current wrote nothing, so it is an
+		// error rather than a success with no row behind it.
+		if err := ensureApplyLeaseStillOwned(ctx, s.db, lease); err != nil {
+			return err
+		}
+		return fmt.Errorf("insert shard task for apply %d %s.%s shard %q matched no rows despite current lease",
+			lease.ApplyID, task.Namespace, task.TableName, task.Shard)
 	}
 	task.ID = id
 	return nil
@@ -486,6 +648,8 @@ func (s *taskStore) GetShardProgressByApplyOperationID(ctx context.Context, appl
 // Results are ordered by created_at DESC, then by id DESC as a tiebreaker
 // (since created_at only has second precision).
 func (s *taskStore) GetByDatabase(ctx context.Context, database string) ([]*storage.Task, error) {
+	database = storage.CanonicalKey(database)
+
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+taskColumns+`
 		FROM tasks
@@ -518,6 +682,8 @@ func (s *taskStore) GetActive(ctx context.Context) ([]*storage.Task, error) {
 
 // GetByPR returns all tasks for a repository and pull request.
 func (s *taskStore) GetByPR(ctx context.Context, repo string, pr int) ([]*storage.Task, error) {
+	repo = storage.CanonicalKey(repo)
+
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT `+taskColumns+`
 		FROM tasks
@@ -546,6 +712,10 @@ const tableOwnerLookupLimit = 20
 // is on the plan path: one query per table the plan would drop, served by the
 // tasks index on (database_name, database_type, environment, table_name).
 func (s *taskStore) FindTableOwners(ctx context.Context, ref storage.TableRef) ([]storage.TableOwner, error) {
+	ref.Database = storage.CanonicalKey(ref.Database)
+	ref.DatabaseType = storage.CanonicalKey(ref.DatabaseType)
+	ref.Environment = storage.CanonicalKey(ref.Environment)
+
 	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT repository, pull_request, MAX(created_at)
 		FROM tasks
@@ -579,6 +749,8 @@ func (s *taskStore) FindTableOwners(ctx context.Context, ref storage.TableRef) (
 
 // List returns tasks matching the filter criteria.
 func (s *taskStore) List(ctx context.Context, filter storage.TaskFilter) ([]*storage.Task, error) {
+	filter.Repository = storage.CanonicalKey(filter.Repository)
+
 	query := `
 		SELECT ` + taskColumns + `
 		FROM tasks
@@ -676,9 +848,10 @@ func (s *taskStore) reapStrandedRetryable(ctx context.Context, limit int) ([]*st
 		FROM tasks
 		WHERE state = ?
 			AND %s
+			AND %s
 		ORDER BY created_at, id
 		LIMIT ?
-	`, taskColumns, parentGate), selectArgs...)
+	`, taskColumns, parentGate, unleasedOperationGate(s.dialect)), selectArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("query stranded retryable tasks: %w", err)
 	}
@@ -715,9 +888,9 @@ func (s *taskStore) reapStrandedRetryable(ctx context.Context, limit int) ([]*st
 			return reaped, err
 		}
 		if !settled {
-			// The row left failed_retryable (or the parent left the settled set)
-			// between the read and the guarded write, so it belongs to whoever
-			// moved it.
+			// The row left failed_retryable, a driver took its operation's lease, or
+			// the parent left the settled set, between the read and the guarded
+			// write, so it belongs to whoever moved it.
 			slog.DebugContext(ctx, "stranded retryable task changed before it could be reaped; skipping",
 				task.LogAttrs()...)
 			continue
@@ -732,9 +905,11 @@ func (s *taskStore) reapStrandedRetryable(ctx context.Context, limit int) ([]*st
 // kept — its failure is real; only the dead retry promise is retired — and
 // completed_at is stamped because failed is terminal.
 //
-// The write re-asserts the parent gate rather than trusting the sweep's read:
-// the guarded UPDATE re-verifies the parent it was chosen for, so a write never
-// lands on the strength of a read that may be seconds old.
+// The write re-asserts the parent and lease gates rather than trusting the
+// sweep's read: the guarded UPDATE re-verifies the parent it was chosen for and
+// re-reads the operation lease, so a write never lands on the strength of a read
+// that may be seconds old, and a driver that claims the operation in between
+// keeps the row.
 func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage.Task) (bool, error) {
 	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedRetryableQuiescence)
 	args := []any{state.Task.Failed, task.ID, state.Task.FailedRetryable}
@@ -745,6 +920,7 @@ func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage
 		SET state = ?, completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
 		WHERE id = ? AND state = ?
 			AND `+parentGate+`
+			AND `+unleasedOperationGate(s.dialect)+`
 	`, args...)
 	if err != nil {
 		return false, fmt.Errorf("reap stranded retryable task %s (table %q): %w",
@@ -766,6 +942,253 @@ func (s *taskStore) reapStrandedRetryableTask(ctx context.Context, task *storage
 	task.UpdatedAt = now
 	if task.CompletedAt == nil {
 		task.CompletedAt = &now
+	}
+	return true, nil
+}
+
+// strandedActiveTaskReaperLockName is the advisory lock that elects one
+// active-task reaper per pass. It is separate from the retryable-task reaper's
+// so the two never serialize: they select disjoint row sets on very different
+// quiescence windows, and the retryable sweep frees a blocked remote drive.
+const strandedActiveTaskReaperLockName = "schemabot_stranded_active_task_reaper"
+
+// strandedActiveTaskQuiescence is how long a task row must have gone untouched
+// before the sweep settles it. It is measured on the task row, not the parent,
+// because the task row is the one a live drive writes: every tick mirrors its
+// tasks unconditionally, so tasks.updated_at tracks a drive's activity closely
+// enough to say when a row is worth looking at. The parent applies row is not a
+// substitute — a drive holding only an operation lease is forbidden from bumping
+// it, so it can sit quiet while that drive works.
+//
+// Three drive shapes make that unconditional write, and all three say so where
+// they make it: syncAtomicTaskProgress (local grouped drives),
+// pollTaskToCompletion (local sequential drives), and
+// syncStoredTasksFromRemoteTasks (gRPC drives against remote Tern). A change
+// that makes any of them write only on a field change breaks this window, which
+// is why they are named here rather than left to be rediscovered.
+//
+// The window covers the operator's whole recovery budget rather than just its
+// stall bound, because the two actions are not equally recoverable. The
+// operator crossing that bound cancels the run so a peer can reclaim the
+// operation and finish the work; the reaper crossing it writes a terminal
+// verdict the operator cannot undo. So the reaper waits for that recovery to
+// have played out and failed: the stall bound itself, plus a lease-staleness
+// window for the cancelled drive's lease to become re-claimable, plus a poll
+// interval for a peer to claim it. Half again the stall bound clears that
+// budget, so a drive the operator would have cancelled is always cancelled
+// first and the reaper cleans up after that path rather than racing it.
+//
+// The window is not what makes the sweep safe. The operation lease is
+// (unleasedOperationGate), and it has to be, because this window rests on a
+// premise no length can guarantee: the remote sync skips a stored task the
+// remote stopped reporting, so a row can miss ticks while its drive is alive.
+// The lease does not depend on the drive having mirrored anything. What the
+// window adds on top is that a row is only reaped once the operator's own
+// recovery has had its chance and not taken it.
+//
+// All timestamps compared are database-side, so there is no clock skew to
+// absorb, and the guarded write re-asserts the window anyway: a drive that
+// mirrors the row before the write lands keeps it whatever the scan concluded.
+const strandedActiveTaskQuiescence = 3 * storage.ApplyDriveStallAfter / 2
+
+// strandedActiveParentQuiescence is how long the parent apply must have been
+// settled before the sweep considers its task rows. It is far shorter than the
+// operation reaper's window because it is not what makes the sweep safe. What is
+// left for the parent to prove is that its verdict is final and no driver holds
+// the apply itself, which two lease-staleness windows establish — a lease that
+// has not been heartbeated that long is already re-claimable, so an apply row
+// quiet for twice that has no live driver by the claim path's own reckoning.
+// That is the apply-level half of what unleasedOperationGate does per operation.
+const strandedActiveParentQuiescence = 2 * storage.ApplyLeaseStaleAfter
+
+// strandedActiveTaskGate renders the condition admitting only task rows no
+// drive has touched for strandedActiveTaskQuiescence. Both the sweep's SELECT
+// and its guarded per-row UPDATE assert it, so a drive that mirrors the row
+// between the two loses the write rather than having its progress overwritten.
+func strandedActiveTaskGate(d Dialect) string {
+	return "tasks.updated_at < " + d.RelativeTime(TimestampPrecisionDefault, BeforeCurrentTime,
+		LiteralIntervalAmount(uint64(strandedActiveTaskQuiescence.Microseconds())), IntervalMicrosecond)
+}
+
+// strandedActiveTaskSweep identifies the active-task sweep to the shared
+// election wrapper.
+var strandedActiveTaskSweep = strandedSweep{
+	lockName: strandedActiveTaskReaperLockName,
+	busy:     storage.ErrStrandedActiveTaskReaperBusy,
+	subject:  "stranded active tasks",
+}
+
+// ReapStrandedActive elects one reaper per pass and reaps under the lock.
+// See storage.TaskStore for the contract.
+func (s *taskStore) ReapStrandedActive(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
+	return reapUnderElection(ctx, s.db, s.locker, strandedActiveTaskSweep,
+		func(ctx context.Context) ([]*storage.ReapedTask, error) {
+			return s.reapStrandedActive(ctx, limit)
+		})
+}
+
+// reapStrandedActive mirrors settled parents' outcomes onto their task rows that
+// are still in an active state, without electing a reaper. ReapStrandedActive is
+// the entry point that holds the lock; this is separate so the reaping itself
+// can be exercised on its own.
+//
+// A driver that settles an apply and exits before closing its task rows leaves
+// them describing work that will never resume: the parent's verdict is final, so
+// no path revisits the children. The row then reads as live work forever, which
+// is what makes a completed apply render a table still copying.
+//
+// A settled parent alone is not enough to call a row stranded, and neither is a
+// quiescent one. Under a fan-out rollout a halt-policy deployment that fails
+// projects the apply to failed immediately, by design, while its sibling
+// deployments are still driving; and a sibling drive holding only an operation
+// lease is forbidden from bumping the parent applies row, so the parent can look
+// settled and quiescent while real work continues underneath it. No window on
+// the parent detects that, because the parent is not the row the live drive
+// touches.
+//
+// The operation the drive holds is what rules that out: the sweep takes only
+// rows whose operation carries no live lease (unleasedOperationGate), reading
+// that lease the way the claim path reads one it may take from a peer. On top
+// of that it gates on the task's own quiescence, so a row is settled only after
+// the operator's stalled-drive recovery has had its window and left it behind.
+//
+// failed_retryable is deliberately excluded. It is active by the task state
+// machine, but it belongs to the retryable sweep, which waits out a far longer
+// window because a retry may still be admitted against the parent. Reaping it
+// here would harden a retry promise the recovery path could still dispatch.
+//
+// Each row is settled by its own committed write, so a mid-pass failure returns
+// the settlements that already landed alongside the error: they are durable
+// whatever the caller does next, and dropping them would leave real state
+// changes with no log line and no count behind them.
+func (s *taskStore) reapStrandedActive(ctx context.Context, limit int) ([]*storage.ReapedTask, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("reap stranded active tasks: limit must be positive, got %d", limit)
+	}
+
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedActiveParentQuiescence)
+
+	excluded := append(append([]string{}, state.TerminalTaskStates...), state.Task.FailedRetryable)
+	selectArgs := stringArgs(excluded)
+	selectArgs = append(selectArgs, parentGateArgs...)
+	selectArgs = append(selectArgs, limit)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM tasks
+		WHERE state NOT IN (%s)
+			AND %s
+			AND %s
+			AND %s
+		ORDER BY created_at, id
+		LIMIT ?
+	`, taskColumns, placeholders(len(excluded)), strandedActiveTaskGate(s.dialect), parentGate,
+		unleasedOperationGate(s.dialect)), selectArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query stranded active tasks: %w", err)
+	}
+	stranded, err := scanTasks(rows)
+	utils.CloseAndLog(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scan stranded active tasks: %w", err)
+	}
+	if len(stranded) == 0 {
+		return nil, nil
+	}
+
+	applyIDs := make([]int64, 0, len(stranded))
+	for _, task := range stranded {
+		applyIDs = append(applyIDs, task.ApplyID)
+	}
+	parents, err := loadSettledParents(ctx, s.db, applyIDs, "stranded active tasks")
+	if err != nil {
+		return nil, err
+	}
+
+	reaped := make([]*storage.ReapedTask, 0, len(stranded))
+	for _, task := range stranded {
+		parent, ok := parents[task.ApplyID]
+		if !ok {
+			// The parent was deleted between the two reads (PR cleanup races the
+			// reaper). Its rows go with it, so there is nothing left to settle.
+			slog.WarnContext(ctx, "parent apply disappeared while reaping a stranded active task; the row is being deleted with it",
+				task.LogAttrs()...)
+			continue
+		}
+		settled, err := s.reapStrandedActiveTask(ctx, task, parent)
+		if err != nil {
+			return reaped, err
+		}
+		if !settled {
+			// The row left the state it was read in, a drive mirrored it and
+			// refreshed its liveness, a driver took its operation's lease, or the
+			// parent left the settled set, between the read and the guarded write.
+			// Any of the four means the row belongs to a live writer rather than to
+			// the sweep.
+			slog.DebugContext(ctx, "stranded active task changed before it could be reaped; skipping",
+				task.LogAttrs()...)
+			continue
+		}
+		reaped = append(reaped, &storage.ReapedTask{Task: task, Parent: parent})
+	}
+	return reaped, nil
+}
+
+// reapStrandedActiveTask writes one task row from its settled parent, reporting
+// whether the guarded write landed. It takes the parent's verdict rather than
+// deciding one: every settled parent state is a terminal task state, and a task
+// whose outcome was never recorded is never assumed to have succeeded — under a
+// failed parent it settles failed, carrying the parent's explanation, exactly as
+// the operation reaper does.
+//
+// completed_at is stamped because every settled parent state is non-resumable.
+//
+// The write re-asserts the row's state, its quiescence, the parent gate and the
+// operation lease rather than trusting the sweep's read, so it does not
+// overwrite a row a driver moved, mirrored, or claimed after the scan selected
+// it.
+func (s *taskStore) reapStrandedActiveTask(ctx context.Context, task *storage.Task, parent *storage.Apply) (bool, error) {
+	taskState := state.NormalizeState(parent.State)
+	setClause := "state = ?, completed_at = COALESCE(completed_at, NOW())"
+	args := []any{taskState}
+	if state.IsState(parent.State, state.Apply.Failed) {
+		setClause = "state = ?, error_message = COALESCE(NULLIF(error_message, ''), ?), completed_at = COALESCE(completed_at, NOW())"
+		args = []any{taskState, nullString(parent.ErrorMessage)}
+	}
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "tasks.apply_id", strandedActiveParentQuiescence)
+	args = append(args, task.ID, task.State)
+	args = append(args, parentGateArgs...)
+
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE tasks
+		SET `+setClause+`, updated_at = NOW()
+		WHERE id = ? AND state = ?
+			AND `+strandedActiveTaskGate(s.dialect)+`
+			AND `+parentGate+`
+			AND `+unleasedOperationGate(s.dialect)+`
+	`, args...)
+	if err != nil {
+		return false, fmt.Errorf("reap stranded active task %s (table %q) from %s parent apply: %w",
+			task.TaskIdentifier, task.TableName, parent.State, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read reaped rows for stranded active task %s (table %q): %w",
+			task.TaskIdentifier, task.TableName, err)
+	}
+	if changed == 0 {
+		return false, nil
+	}
+
+	// Mirror the write onto the returned row so a caller reporting the
+	// settlement reads what is now stored, not the pre-write values.
+	now := time.Now()
+	task.State = taskState
+	task.UpdatedAt = now
+	if task.CompletedAt == nil {
+		task.CompletedAt = &now
+	}
+	if state.IsState(parent.State, state.Apply.Failed) && task.ErrorMessage == "" {
+		task.ErrorMessage = parent.ErrorMessage
 	}
 	return true, nil
 }
@@ -795,10 +1218,11 @@ func scanTasks(rows *sql.Rows) ([]*storage.Task, error) {
 // scanTaskInto scans task data from a scanner (works with both *sql.Row and *sql.Rows).
 func scanTaskInto(s scanner) (*storage.Task, error) {
 	var task storage.Task
-	var tableName, ddl, ddlAction, errorMsg, engineMigrationID sql.NullString
+	var tableName, ddl, ddlAction, errorMsg, engineMigrationID, modeReason sql.NullString
 	var options []byte
 	var applyOperationID, etaSeconds sql.NullInt64
 	var startedAt, completedAt sql.NullTime
+	var estimatedBytes sql.NullInt64
 
 	err := s.Scan(
 		&task.ID,
@@ -823,12 +1247,15 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 		&task.Attempt,
 		&task.RowsCopied,
 		&task.RowsTotal,
+		&estimatedBytes,
 		&task.ProgressPercent,
 		&etaSeconds,
 		&task.ChecksumRowsChecked,
 		&task.ChecksumRowsTotal,
 		&task.Throttled,
 		&task.ThrottleReason,
+		&task.ExecutionMode,
+		&modeReason,
 		&task.CutoverAttempts,
 		&task.IsInstant,
 		&engineMigrationID,
@@ -848,10 +1275,15 @@ func scanTaskInto(s scanner) (*storage.Task, error) {
 	task.Options = options
 	task.ETASeconds = int(etaSeconds.Int64)
 	task.EngineMigrationID = engineMigrationID.String
+	task.ModeReason = modeReason.String
 	task.State = state.NormalizeTaskStatus(task.State)
 	if applyOperationID.Valid {
 		v := applyOperationID.Int64
 		task.ApplyOperationID = &v
+	}
+	if estimatedBytes.Valid {
+		v := estimatedBytes.Int64
+		task.EstimatedBytes = &v
 	}
 	if startedAt.Valid {
 		task.StartedAt = &startedAt.Time

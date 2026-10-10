@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,9 +14,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
+	"github.com/block/schemabot/pkg/apitypes"
 	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestWebhookRollbackDispatch(t *testing.T) {
@@ -271,6 +274,16 @@ func TestWebhookRollbackRejectsDeferCutoverOnPlanningCommand(t *testing.T) {
 // store and logger, plus a channel that captures posted PR comments.
 func newRollbackConfirmNoopHandler(t *testing.T, locks *actorAuthLockStore, logger *slog.Logger) (*Handler, chan string) {
 	t.Helper()
+	return newRollbackConfirmHandler(t, locks, logger, nil, nil)
+}
+
+// newRollbackConfirmHandler builds a handler whose rollback-confirm resolves
+// the pinned rollback plan "rollback-plan-noop" for orders in staging,
+// carrying the given namespace-level and per-shard changes, backed by the
+// supplied lock store and logger, plus a channel that captures posted PR
+// comments.
+func newRollbackConfirmHandler(t *testing.T, locks *actorAuthLockStore, logger *slog.Logger, tables []storage.TableChange, shards []storage.ShardPlan) (*Handler, chan string) {
+	t.Helper()
 	client, mux := setupGitHubServer(t)
 	comments := make(chan string, 2)
 	mux.HandleFunc("POST /repos/octocat/hello-world/issues/1/comments", commentRecorder(t, comments))
@@ -279,23 +292,211 @@ func newRollbackConfirmNoopHandler(t *testing.T, locks *actorAuthLockStore, logg
 		cfg.PRCommandAuthorization.AdminUsers = []string{"hubot"}
 	})
 	installClient := ghclient.NewInstallationClient(client, logger)
-	svc := api.New(&actorAuthStorage{
-		locks: locks,
-		plan: &storage.Plan{
-			PlanIdentifier: "rollback-plan-noop",
-			Database:       "orders",
-			DatabaseType:   storage.DatabaseTypeMySQL,
-			Repository:     "octocat/hello-world",
-			PullRequest:    1,
-			Environment:    "staging",
-			Deployment:     "orders",
-		},
-	}, cfg, nil, logger)
+	plan := &storage.Plan{
+		PlanIdentifier: "rollback-plan-noop",
+		Database:       "orders",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Repository:     "octocat/hello-world",
+		PullRequest:    1,
+		Environment:    "staging",
+		Deployment:     "orders",
+		Shards:         shards,
+	}
+	if len(tables) > 0 {
+		plan.Namespaces = map[string]*storage.NamespacePlanData{"orders": {Tables: tables}}
+	}
+	svc := api.New(&actorAuthStorage{locks: locks, plan: plan}, cfg, nil, logger)
 	return &Handler{
 		service:   svc,
 		ghClients: ghclient.NewSingleClientSet(defaultAppName, &fakeClientFactory{client: installClient}),
 		logger:    logger,
 	}, comments
+}
+
+// assertRollbackLockPinKept checks that a refused rollback-confirm left the
+// lock exactly as it found it, still pinning the rollback plan, so re-issuing
+// the command with --allow-unsafe confirms the same plan.
+func assertRollbackLockPinKept(t *testing.T, locks *actorAuthLockStore) {
+	t.Helper()
+	assert.Empty(t, locks.released, "refused rollback-confirm must not release the lock")
+	assert.Empty(t, locks.releasedIfPending, "refused rollback-confirm must not release the pinned rollback lock")
+	assert.Empty(t, locks.releasedByID, "refused rollback-confirm must not release the lock")
+	assert.Empty(t, locks.acquired, "refused rollback-confirm must not re-pin the lock")
+	require.Len(t, locks.locks, 1)
+	assert.Equal(t, rollbackPendingPlanID("rollback-plan-noop"), locks.locks[0].PendingPlanID)
+}
+
+// A rollback whose plan drops a table is refused when rollback-confirm is
+// given without --allow-unsafe: the refusal names the dropped table and the
+// exact rollback-confirm command that consents to it, no rollback apply is
+// created (the fake apply store cannot create one), and the lock keeps
+// pinning the rollback plan so the re-issued command confirms it.
+func TestHandleRollbackConfirmBlocksUnsafeChangesWithoutAllowUnsafe(t *testing.T) {
+	locks := &actorAuthLockStore{locks: []*storage.Lock{prOwnedRollbackLock()}}
+	h, comments := newRollbackConfirmHandler(t, locks, testLogger(), []storage.TableChange{{
+		Table:     "audit_log",
+		DDL:       "DROP TABLE `audit_log`",
+		Operation: "drop",
+	}}, nil)
+
+	retry, err := h.rollbackConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", 12345, "hubot",
+		CommandResult{Action: action.RollbackConfirm, Environment: "staging"})
+	require.NoError(t, err)
+	assert.False(t, retry, "an unsafe-changes refusal is the command's answer, not a retryable failure")
+
+	body := requireComment(t, comments, "rollback unsafe-changes refusal")
+	assert.Contains(t, body, "**⛔ Rollback rejected**: 1 unsafe change detected")
+	assert.Contains(t, body, "1. `audit_log`: DROP TABLE removes all data")
+	assert.Contains(t, body, "DROP TABLE `audit_log`")
+	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --allow-unsafe\n```")
+	assert.NotContains(t, body, "schemabot apply")
+	assertRollbackLockPinKept(t, locks)
+}
+
+// An operator who asked for a deferred cutover and is refused for unsafe
+// changes is told to re-issue a command that still defers the cutover, so
+// adding the consent does not also switch the rollback to automatic cutover.
+func TestHandleRollbackConfirmBlockKeepsDeferCutoverInTheRetry(t *testing.T) {
+	locks := &actorAuthLockStore{locks: []*storage.Lock{prOwnedRollbackLock()}}
+	h, comments := newRollbackConfirmHandler(t, locks, testLogger(), []storage.TableChange{{
+		Table:     "audit_log",
+		DDL:       "DROP TABLE `audit_log`",
+		Operation: "drop",
+	}}, nil)
+
+	retry, err := h.rollbackConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", 12345, "hubot",
+		CommandResult{Action: action.RollbackConfirm, Environment: "staging", DeferCutover: true})
+	require.NoError(t, err)
+	assert.False(t, retry)
+
+	body := requireComment(t, comments, "rollback unsafe-changes refusal")
+	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --allow-unsafe --defer-cutover\n```")
+	assertRollbackLockPinKept(t, locks)
+}
+
+// A rollback of a sharded keyspace whose shards diverge carries a column drop
+// only one shard needs. The namespace-level view shows only the safe column
+// add, so the refusal must read the per-shard changes: it names the drop with
+// the shard that carries it before any consent is asked for.
+func TestHandleRollbackConfirmBlocksShardOnlyUnsafeChange(t *testing.T) {
+	addNote := storage.TableChange{Namespace: "orders", Table: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)", Operation: "alter"}
+	dropLegacy := storage.TableChange{Namespace: "orders", Table: "orders", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy`", Operation: "alter",
+		IsUnsafe: true, UnsafeReason: `Column "legacy" is dropped`}
+	locks := &actorAuthLockStore{locks: []*storage.Lock{prOwnedRollbackLock()}}
+	h, comments := newRollbackConfirmHandler(t, locks, testLogger(), []storage.TableChange{addNote}, []storage.ShardPlan{
+		{Namespace: "orders", Shard: "-80", Changes: []storage.TableChange{addNote}},
+		{Namespace: "orders", Shard: "80-", Changes: []storage.TableChange{dropLegacy}},
+	})
+
+	retry, err := h.rollbackConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", 12345, "hubot",
+		CommandResult{Action: action.RollbackConfirm, Environment: "staging"})
+	require.NoError(t, err)
+	assert.False(t, retry)
+
+	body := requireComment(t, comments, "rollback shard-only unsafe-changes refusal")
+	assert.Contains(t, body, "**⛔ Rollback rejected**: 1 unsafe change detected")
+	assert.Contains(t, body, "1. `orders` (shard `80-`)")
+	assert.Contains(t, body, "`legacy`")
+	assert.Contains(t, body, "```\nschemabot rollback-confirm -e staging --allow-unsafe\n```")
+	assertRollbackLockPinKept(t, locks)
+}
+
+// The rollback plan comment names each unsafe change the rollback carries —
+// a divergent shard's included — and states that confirming it takes
+// --allow-unsafe. A rollback with no unsafe changes carries no warning.
+func TestRollbackPlanCommentData_ListsUnsafeChanges(t *testing.T) {
+	apply := &storage.Apply{ApplyIdentifier: "apply_5d2e8a", Database: "orders", Environment: "staging", DatabaseType: "mysql"}
+	addNote := &apitypes.TableChangeResponse{TableName: "orders", Namespace: "orders", DDL: "ALTER TABLE `orders` ADD COLUMN `note` varchar(255)", ChangeType: "alter"}
+	dropLegacy := &apitypes.TableChangeResponse{TableName: "orders", Namespace: "orders", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy`", ChangeType: "alter",
+		IsUnsafe: true, UnsafeReason: `Column "legacy" is dropped`}
+	planResp := &apitypes.PlanResponse{
+		PlanID:  "plan_rb_7c41f9",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{addNote}}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "orders", Shard: "-80", Changes: []*apitypes.TableChangeResponse{addNote}},
+			{Namespace: "orders", Shard: "80-", Changes: []*apitypes.TableChangeResponse{dropLegacy}},
+		},
+	}
+
+	data := (&Handler{}).rollbackPlanCommentData(apply, planResp, "testuser")
+	require.True(t, data.HasUnsafeChanges)
+	require.Len(t, data.UnsafeChanges, 1)
+	assert.Equal(t, "orders", data.UnsafeChanges[0].Table)
+	assert.Equal(t, []string{"80-"}, data.UnsafeChanges[0].Shards)
+
+	body := templates.RenderRollbackPlanComment(data)
+	assert.Contains(t, body, "**Issues**: 1 unsafe change detected")
+	assert.Contains(t, body, "1. `orders` (shard `80-`)")
+	assert.Contains(t, body, "To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change")
+
+	// A plan mixing a shard-only drop in one namespace with a drop in an
+	// unsharded namespace lists both: the shard view stands in for its own
+	// namespace only.
+	dropAudit := &apitypes.TableChangeResponse{TableName: "audit_log", Namespace: "audit", DDL: "DROP TABLE `audit_log`", ChangeType: "drop",
+		IsUnsafe: true, UnsafeReason: "DROP TABLE removes all data"}
+	mixed := *planResp
+	mixed.Changes = append([]*apitypes.SchemaChangeResponse{{Namespace: "audit", TableChanges: []*apitypes.TableChangeResponse{dropAudit}}}, planResp.Changes...)
+	mixedData := (&Handler{}).rollbackPlanCommentData(apply, &mixed, "testuser")
+	require.Len(t, mixedData.UnsafeChanges, 2)
+	assert.Equal(t, "orders", mixedData.UnsafeChanges[0].Table)
+	assert.Equal(t, []string{"80-"}, mixedData.UnsafeChanges[0].Shards)
+	assert.Equal(t, "audit_log", mixedData.UnsafeChanges[1].Table)
+	assert.Empty(t, mixedData.UnsafeChanges[1].Shards)
+
+	safe := (&Handler{}).rollbackPlanCommentData(apply, &apitypes.PlanResponse{
+		PlanID:  "plan_rb_safe",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{addNote}}},
+	}, "testuser")
+	assert.False(t, safe.HasUnsafeChanges)
+	assert.NotContains(t, templates.RenderRollbackPlanComment(safe), "unsafe")
+}
+
+// A rollback that drops a column on every shard carries the drop both on the
+// namespace-level view and on each shard row. The comment lists it once, from
+// the shard rows, rather than counting the collapsed duplicate as a second
+// unsafe change.
+func TestPlanUnsafeChangesListsAUniformShardDropOnce(t *testing.T) {
+	dropLegacy := &apitypes.TableChangeResponse{TableName: "orders", Namespace: "orders", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy`", ChangeType: "alter",
+		IsUnsafe: true, UnsafeReason: `Column "legacy" is dropped`}
+	planResp := &apitypes.PlanResponse{
+		PlanID:  "plan_rb_uniform",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "orders", TableChanges: []*apitypes.TableChangeResponse{dropLegacy}}},
+		Shards: []*apitypes.ShardPlanResponse{
+			{Namespace: "orders", Shard: "-80", Changes: []*apitypes.TableChangeResponse{dropLegacy}},
+			{Namespace: "orders", Shard: "80-", Changes: []*apitypes.TableChangeResponse{dropLegacy}},
+		},
+	}
+
+	unsafe := planUnsafeChanges(planResp)
+	require.Len(t, unsafe, 1)
+	assert.Equal(t, "orders", unsafe[0].Table)
+	assert.Equal(t, []string{"-80", "80-"}, unsafe[0].Shards)
+}
+
+// A rollback whose stored plan removes a vindex is refused without
+// --allow-unsafe: the refusal names the VSchema change the stored plan's own
+// unsafe gate reports, once, under its namespace.
+func TestRollbackPlanUnsafeChangesNamesVSchemaRemoval(t *testing.T) {
+	plan := &storage.Plan{
+		PlanIdentifier: "rollback-plan-vschema",
+		Database:       "payments",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"payments": {
+				Artifacts: map[string]string{storage.VSchemaArtifactName: `{"sharded": true}`},
+				Metadata: map[string]string{
+					storage.PlanMetadataVSchemaChanged:   "true",
+					storage.PlanMetadataVSchemaDeletions: `[{"kind":"vindex","name":"email_idx","reason":"removing vindex email_idx changes query routing"}]`,
+				},
+			},
+		},
+	}
+
+	unsafe := rollbackPlanUnsafeChanges(plan)
+	require.Len(t, unsafe, 1)
+	assert.Equal(t, "payments/vschema.json", unsafe[0].Table)
+	assert.Equal(t, "payments", unsafe[0].VSchemaNamespace)
+	assert.Equal(t, "removing vindex email_idx changes query routing", unsafe[0].Reason)
 }
 
 // prOwnedRollbackLock returns a lock held by the PR that issues the
@@ -377,4 +578,43 @@ func TestWebhookApplyDispatch(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "apply started")
+}
+
+// A rollback plan comment carries the stored rollback plan's identifier, so
+// reversal DDL cut to fit the comment names the command that prints the
+// rollback plan in full rather than the schema files, which hold the desired
+// schema and not the statements that reverse it.
+func TestRollbackPlanCommentData_CarriesPlanID(t *testing.T) {
+	apply := &storage.Apply{
+		ApplyIdentifier: "apply_5d2e8a",
+		Database:        "orders",
+		Environment:     "production",
+		DatabaseType:    "mysql",
+	}
+	columns := make([]string, 4000)
+	for i := range columns {
+		columns[i] = "DROP COLUMN `note_" + strings.Repeat("x", 8) + "`"
+	}
+	planResp := &apitypes.PlanResponse{
+		PlanID: "plan_rb_7c41f9",
+		Changes: []*apitypes.SchemaChangeResponse{{
+			Namespace: "orders",
+			TableChanges: []*apitypes.TableChangeResponse{{
+				TableName:  "orders",
+				DDL:        "ALTER TABLE `orders` " + strings.Join(columns, ", "),
+				ChangeType: "alter",
+			}},
+		}},
+	}
+
+	data := (&Handler{}).rollbackPlanCommentData(apply, planResp, "testuser")
+	assert.Equal(t, "plan_rb_7c41f9", data.PlanID)
+
+	// The body holds the whole cut statement, so the markers are checked by
+	// presence rather than dumped on failure.
+	body := templates.RenderRollbackPlanComment(data)
+	assert.True(t, strings.Contains(body, "the full plan is available from the CLI with `schemabot list-plans -e production plan_rb_7c41f9`."),
+		"cut rollback DDL names the stored rollback plan")
+	assert.False(t, strings.Contains(body, "the desired schema is in this PR's schema files"),
+		"cut rollback DDL does not point at the schema files")
 }

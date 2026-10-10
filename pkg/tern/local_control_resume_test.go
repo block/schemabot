@@ -36,9 +36,9 @@ func TestReplanShardTableDDLKeysPerNamespaceAndShard(t *testing.T) {
 	got := replanShardTableDDL(result)
 
 	require.Len(t, got, 3, "same table across shards and keyspaces must produce three distinct keys")
-	assert.Equal(t, ddlA, got[shardTableKey{namespace: "ks1", shard: "-80", table: "mutes"}])
-	assert.Equal(t, ddlB, got[shardTableKey{namespace: "ks1", shard: "80-", table: "mutes"}])
-	assert.Equal(t, ddlC, got[shardTableKey{namespace: "ks2", shard: "-80", table: "mutes"}], "the same shard+table in another keyspace is not conflated")
+	assert.Equal(t, []string{ddlA}, got[shardTableKey{namespace: "ks1", shard: "-80", table: "mutes"}])
+	assert.Equal(t, []string{ddlB}, got[shardTableKey{namespace: "ks1", shard: "80-", table: "mutes"}])
+	assert.Equal(t, []string{ddlC}, got[shardTableKey{namespace: "ks2", shard: "-80", table: "mutes"}], "the same shard+table in another keyspace is not conflated")
 }
 
 // For a non-sharded engine the shard name is empty, so keying degrades to
@@ -54,7 +54,29 @@ func TestReplanShardTableDDLNonShardedDegradesToTable(t *testing.T) {
 	got := replanShardTableDDL(result)
 
 	require.Len(t, got, 1)
-	assert.Equal(t, ddl, got[shardTableKey{namespace: "commerce", table: "mutes"}])
+	assert.Equal(t, []string{ddl}, got[shardTableKey{namespace: "commerce", table: "mutes"}])
+}
+
+// A table can carry several statements in one plan, each its own task. The
+// re-plan index must keep every statement for the table, in plan order, so each
+// task can be matched against its own statement rather than the table's last.
+func TestReplanShardTableDDLKeepsEveryStatementForATable(t *testing.T) {
+	createDDL := "CREATE TABLE public.users (id bigint PRIMARY KEY)"
+	indexDDL := "CREATE INDEX users_email_idx ON public.users (email)"
+	result := &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "app",
+			TableChanges: []engine.TableChange{
+				{Table: "users", DDL: createDDL},
+				{Table: "users", DDL: indexDDL},
+			},
+		}},
+	}
+
+	got := replanShardTableDDL(result)
+
+	require.Len(t, got, 1)
+	assert.Equal(t, []string{createDDL, indexDDL}, got[shardTableKey{namespace: "app", table: "users"}])
 }
 
 // On resume, replanAndFilterTasks recomputes each deployment's delta against its
@@ -77,39 +99,370 @@ func TestVerifyReplannedTaskDDL(t *testing.T) {
 
 	t.Run("matching re-plan passes", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		ddl, _, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, nil)
 		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
 	})
 
 	t.Run("incidental formatting differences pass", func(t *testing.T) {
 		// Unquoted identifiers and extra whitespace canonicalize to the same form
 		// as the reviewed DDL, so they are not drift.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE   users   ADD COLUMN email varchar(255)")
+		ddl, _, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE   users   ADD COLUMN email varchar(255)"}, nil)
 		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE   users   ADD COLUMN email varchar(255)", ddl, "the re-planned text is what the task will run")
 	})
 
 	t.Run("divergent re-plan fails closed", func(t *testing.T) {
 		// The deployment drifted: the re-plan would apply a different column type
 		// than the one reviewed. This unreviewed DDL must be refused.
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(100)")
+		_, _, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(100)"}, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 		assert.Contains(t, err.Error(), "commerce[-80].users/alter")
+	})
+
+	t.Run("the task's statement is matched among the table's several statements", func(t *testing.T) {
+		// Three statements remain for the table; this task's is the middle
+		// one, in different formatting. It must resolve to its own statement,
+		// not the table's first or last.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		ddl, _, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE users ADD COLUMN email varchar(255)",
+			"ALTER TABLE `users` ADD INDEX (`email`)",
+		}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE users ADD COLUMN email varchar(255)", ddl)
+	})
+
+	sibling := func(id, reviewed, taskState string) *storage.Task {
+		s := task(reviewed)
+		s.TaskIdentifier = id
+		s.State = taskState
+		return s
+	}
+
+	t.Run("no match with no pending siblings is drift", func(t *testing.T) {
+		// The table still has pending statements, none is this task's, and no
+		// other pending task was reviewed with them either: unreviewed DDL.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD INDEX (`name`)",
+		}, []*storage.Task{tk})
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "lists 2 pending statements for commerce[-80].users/alter")
+		assert.Contains(t, err.Error(), "including 2 statements that neither task task_abc123 nor any pending sibling task was reviewed with")
+	})
+
+	t.Run("statement absent while pending siblings vouch for every remaining statement is landed", func(t *testing.T) {
+		// The table still has two pending statements and neither is this
+		// task's, but both are the reviewed DDL of sibling tasks that have not
+		// run yet. The only statement that can have left the diff is this
+		// task's own, so it landed and there is nothing to run.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE users ADD COLUMN name varchar(255)", state.Task.Stopped),
+			sibling("task_idx", "ALTER TABLE `users` ADD INDEX (`name`)", state.Task.Pending),
+		}
+		ddl, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD INDEX (`name`)",
+		}, siblings)
+		require.NoError(t, err)
+		assert.True(t, landed)
+		assert.Empty(t, ddl, "a landed task has no statement to run")
+	})
+
+	t.Run("a terminal sibling's leftover statement is refused without calling it drift", func(t *testing.T) {
+		// The only remaining statement is the reviewed DDL of a sibling that
+		// already settled (here it failed and never ran). The schema has not
+		// drifted, but no pending task will run that statement, and this task
+		// must not run another task's DDL in place of its own. The refusal
+		// names the sibling and its state so the operator examines that task
+		// instead of hunting for drift.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Failed),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "cannot run task task_abc123")
+		assert.Contains(t, err.Error(), "absent from the re-plan for commerce[-80].users/alter")
+		assert.Contains(t, err.Error(), "sibling task task_name (failed)")
+		assert.NotContains(t, err.Error(), "has drifted")
+	})
+
+	t.Run("only a sibling that will still run its statement vouches for it", func(t *testing.T) {
+		// The one remaining statement is a sibling's reviewed DDL. Whether that
+		// settles this task as landed depends solely on whether the sibling
+		// will still run the statement forward: a pending, running or stopped
+		// sibling will, so it vouches; a terminal sibling never will, and a
+		// sibling in a revert phase is unwinding it, so neither may vouch and
+		// the resume refuses, naming the sibling and its state.
+		cases := []struct {
+			siblingState string
+			vouches      bool
+		}{
+			{state.Task.Pending, true},
+			{state.Task.Running, true},
+			{state.Task.Stopped, true},
+			{state.Task.RevertWindow, false},
+			{state.Task.Reverting, false},
+			{state.Task.Reverted, false},
+			{state.Task.Completed, false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.siblingState, func(t *testing.T) {
+				tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+				siblings := []*storage.Task{
+					tk,
+					sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", tc.siblingState),
+				}
+				ddl, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+					"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+				}, siblings)
+				if tc.vouches {
+					require.NoError(t, err)
+					assert.True(t, landed)
+					assert.Empty(t, ddl)
+					return
+				}
+				require.Error(t, err)
+				assert.False(t, landed)
+				assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
+				assert.Contains(t, err.Error(), "sibling task task_name ("+tc.siblingState+")")
+				assert.Contains(t, err.Error(), "which will not run it")
+			})
+		}
+	})
+
+	t.Run("a terminal sibling explains one statement but unreviewed DDL beside it is still drift", func(t *testing.T) {
+		// One remaining statement is a completed sibling's reviewed DDL, the
+		// other was reviewed by nobody. The unreviewed statement decides: this
+		// is drift, and only the unreviewed statement is reported as such.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Completed),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD COLUMN `nickname` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "has drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "including 1 statement that neither task task_abc123 nor any pending sibling task was reviewed with")
+		assert.Contains(t, err.Error(), "nickname")
+		assert.NotContains(t, err.Error(), "`name`", "the terminal sibling's statement is not reported as unreviewed")
+	})
+
+	t.Run("one unvouched statement among vouched siblings is drift, not landed", func(t *testing.T) {
+		// Two statements remain: one is a pending sibling's, the other was
+		// reviewed by nobody. The task's own statement may well have landed,
+		// but the diff also carries unreviewed DDL, so the resume refuses.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD COLUMN `nickname` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "lists 2 pending statements for commerce[-80].users/alter")
+		assert.Contains(t, err.Error(), "including 1 statement that neither task task_abc123 nor its pending sibling task task_name was reviewed with")
+		assert.Contains(t, err.Error(), "nickname")
+		assert.NotContains(t, err.Error(), "`name`", "the vouched statement is not reported as unreviewed")
+	})
+
+	t.Run("several pending siblings are named in the drift refusal", func(t *testing.T) {
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped),
+			sibling("task_idx", "ALTER TABLE `users` ADD INDEX (`name`)", state.Task.Pending),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD INDEX (`name`)",
+			"ALTER TABLE `users` ADD COLUMN `nickname` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "lists 3 pending statements for commerce[-80].users/alter")
+		assert.Contains(t, err.Error(), "neither task task_abc123 nor its 2 pending sibling tasks task_name, task_idx was reviewed with")
+	})
+
+	t.Run("a pending sibling vouches for one occurrence of its statement", func(t *testing.T) {
+		// The re-plan lists the sibling's statement twice. The sibling was
+		// reviewed with it once, so the second occurrence is unreviewed.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "has drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "including 1 statement that neither task task_abc123 nor its pending sibling task task_name was reviewed with")
+	})
+
+	t.Run("a sibling in the same apply operation vouches", func(t *testing.T) {
+		// A multi-deployment apply scopes its tasks by operation. Both tasks
+		// carry the same operation, so the sibling's reviewed DDL vouches for
+		// the remaining statement and this task is landed.
+		opID := int64(7)
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		tk.ApplyOperationID = &opID
+		sameOp := sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped)
+		sameOpID := opID
+		sameOp.ApplyOperationID = &sameOpID
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, []*storage.Task{tk, sameOp})
+		require.NoError(t, err)
+		assert.True(t, landed)
+	})
+
+	t.Run("siblings on another shard, operation or apply do not vouch", func(t *testing.T) {
+		// Same table name, but the other tasks belong to a different shard, a
+		// different apply operation, or a different apply altogether. None
+		// shares this task's scope, so the remaining statement is unreviewed
+		// here.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		otherShard := sibling("task_shard", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped)
+		otherShard.Shard = "80-"
+		otherOp := sibling("task_op", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped)
+		opID := int64(7)
+		otherOp.ApplyOperationID = &opID
+		otherApply := sibling("task_apply", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped)
+		otherApply.ApplyID = tk.ApplyID + 1
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, []*storage.Task{tk, otherShard, otherOp, otherApply})
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "re-planned \"ALTER TABLE `users` ADD COLUMN `name` VARCHAR(255)\"",
+			"with no sibling in scope the refusal reads as plain single-statement drift")
+	})
+
+	t.Run("a terminal sibling explains one occurrence of its statement", func(t *testing.T) {
+		// The re-plan lists a completed sibling's statement twice. The sibling
+		// accounts for one; the other was reviewed by nobody and is drift.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Completed),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "has drifted from the reviewed plan")
+	})
+
+	t.Run("each terminal sibling explains its own occurrence of a shared statement", func(t *testing.T) {
+		// Two failed siblings were each reviewed with the same statement and
+		// the re-plan lists it twice. Both occurrences are reviewed plan DDL
+		// that nothing pending will run, so the refusal names both siblings
+		// and does not call the schema drifted.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_t1", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Failed),
+			sibling("task_t2", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Failed),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "sibling tasks task_t1 (failed), task_t2 (failed)")
+		assert.NotContains(t, err.Error(), "has drifted")
+	})
+
+	t.Run("a shared statement listed once names every terminal sibling reviewed with it", func(t *testing.T) {
+		// Two terminal siblings were reviewed with the same statement and the
+		// re-plan lists it once. The one occurrence is reviewed plan DDL, not
+		// drift, and the operator cannot tell from the statement alone which
+		// sibling's outcome left it behind, so the refusal names both.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_t1", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Failed),
+			sibling("task_t2", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Cancelled),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, siblings)
+		require.Error(t, err)
+		assert.False(t, landed)
+		assert.Contains(t, err.Error(), "has not drifted from the reviewed plan")
+		assert.Contains(t, err.Error(), "sibling tasks task_t1 (failed), task_t2 (cancelled)")
+		assert.NotContains(t, err.Error(), "has drifted")
+	})
+
+	t.Run("a sibling with no reviewed DDL neither vouches nor blocks", func(t *testing.T) {
+		// A legacy synthetic sibling carries no DDL. It has nothing to compare
+		// against, so it is left out of the sibling set: it must not fail the
+		// resume on an empty statement, and the pending sibling that does
+		// carry the remaining statement still vouches for it.
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		siblings := []*storage.Task{
+			tk,
+			sibling("task_vschema", "", state.Task.Stopped),
+			sibling("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", state.Task.Stopped),
+		}
+		_, landed, err := c.verifyReplannedTaskDDL(tk, []string{
+			"ALTER TABLE `users` ADD COLUMN `name` varchar(255)",
+		}, siblings)
+		require.NoError(t, err)
+		assert.True(t, landed)
+	})
+
+	t.Run("no re-planned statements is an error", func(t *testing.T) {
+		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		_, _, err := c.verifyReplannedTaskDDL(tk, nil, nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "re-plan emitted no statements")
 	})
 
 	t.Run("empty reviewed DDL is left to the caller", func(t *testing.T) {
 		// Only legacy synthetic VSchema tasks carry no reviewed DDL; they have no
 		// reference to compare against and are handled downstream, not here.
 		tk := task("")
-		err := c.verifyReplannedTaskDDL(tk, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
+		ddl, _, err := c.verifyReplannedTaskDDL(tk, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, nil)
 		require.NoError(t, err)
+		assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
 	})
 
 	t.Run("unparseable re-planned DDL fails closed", func(t *testing.T) {
 		tk := task("ALTER TABLE `users` ADD COLUMN `email` varchar(255)")
-		err := c.verifyReplannedTaskDDL(tk, "this is not valid sql")
+		_, _, err := c.verifyReplannedTaskDDL(tk, []string{"this is not valid sql"}, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "re-planned DDL for task task_abc123")
 	})
@@ -150,11 +503,11 @@ func TestReplanAndFilterTasks_FailsClosedOnDrift(t *testing.T) {
 }
 
 // The sequential resume loop re-plans each table right before applying it to
-// catch a cutover that raced the resume. tableStillNeedsChange must return the
-// DDL that re-plan would now apply so the loop can confirm it still matches the
+// catch a cutover that raced the resume. The re-plan must return the DDL it
+// would now apply so the loop can confirm it still matches the
 // reviewed DDL before applying — closing the window between the resume-entry
 // re-plan and this later per-task apply.
-func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
+func TestResumeTaskReplan_ReturnsReplannedDDL(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
 
@@ -168,17 +521,20 @@ func TestTableStillNeedsChange_ReturnsReplannedDDL(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
+	verdict, key := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
+	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	assert.True(t, needsChange)
-	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ddl)
-	require.NoError(t, c.verifyReplannedTaskDDL(task, ddl), "matching re-plan is not drift")
+	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `email` varchar(255)"}, replanned)
+	_, _, err = c.verifyReplannedTaskDDL(task, replanned, []*storage.Task{task})
+	require.NoError(t, err, "matching re-plan is not drift")
 }
 
 // When the table has dropped out of the re-plan diff (its cutover completed) the
-// sequential loop treats it as already applied, so tableStillNeedsChange must
-// report that no change remains.
-func TestTableStillNeedsChange_TableAbsentReportsDone(t *testing.T) {
+// sequential loop treats it as already applied, so the re-plan must report that
+// no change remains.
+func TestResumeTaskReplan_TableAbsentReportsDone(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	// Re-plan for a different table only: the task's table is no longer in the diff.
 	otherTablePlan := &engine.PlanResult{
@@ -203,17 +559,19 @@ func TestTableStillNeedsChange_TableAbsentReportsDone(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
+	verdict, key := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
+	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	assert.False(t, needsChange)
-	assert.Empty(t, ddl)
+	assert.Empty(t, replanned)
 }
 
 // If live drifts between resume entry and a later per-task apply, the re-plan the
 // sequential loop performs returns DDL that no longer matches the reviewed DDL.
-// tableStillNeedsChange surfaces that DDL and verifyReplannedTaskDDL fails closed
+// The re-plan surfaces that DDL and verifyReplannedTaskDDL fails closed
 // so the loop refuses to apply unreviewed DDL.
-func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
+func TestResumeTaskReplan_DriftFailsClosed(t *testing.T) {
 	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
 	drifted := &engine.PlanResult{
 		Changes: []engine.SchemaChange{{
@@ -237,10 +595,12 @@ func TestTableStillNeedsChange_DriftFailsClosed(t *testing.T) {
 		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
 	}
 
-	ddl, needsChange, err := c.tableStillNeedsChange(t.Context(), apply, plan, task)
+	replanDDL, err := c.replanTargetSchema(t.Context(), apply, plan)
 	require.NoError(t, err)
+	verdict, key := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
+	needsChange, replanned := verdict == replanNeedsChange, replanDDL[key]
 	require.True(t, needsChange)
-	err = c.verifyReplannedTaskDDL(task, ddl)
+	_, _, err = c.verifyReplannedTaskDDL(task, replanned, []*storage.Task{task})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "drifted from the reviewed plan")
 	assert.Contains(t, err.Error(), "testapp.users/alter")
@@ -412,7 +772,7 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
 	assert.ErrorContains(t, err, "apply-recover-plan")
@@ -423,15 +783,67 @@ func TestResumeApplyPlanLoadStorageErrorStaysRecoverable(t *testing.T) {
 	assert.Empty(t, observer.terminal, "a transient plan-load failure must not notify the terminal observer")
 }
 
+func TestResumeStoppedGroupedApplyHandlesPendingStartBeforeFailedTasks(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{err: storageErr})
+	apply.State = state.Apply.Stopped
+	applyStore.apply = &storage.Apply{}
+	*applyStore.apply = *apply
+	applyStore.apply.State = state.Apply.Resuming
+	tasks[0].State = state.Task.Failed
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	client.storage.(*exactProgressStorage).controlRequests = requests
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.Equal(t, state.Apply.Resuming, applyStore.apply.State,
+		"the stopped snapshot must not overwrite the stored start transition")
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, requests.requests[0].Status,
+		"the start remains deliverable after a recoverable plan read failure")
+}
+
+// A resume claim that finds a pending cancel against a schema change already
+// holding its revert window refuses the cancel — and then keeps going. The
+// refusal resolved the operator's request but paused nothing, so the claim
+// still owes the apply the resume it was admitted for; a drive that exited on
+// the refusal would strand a live revert window with no drive watching it
+// (CO-5). The resume is proven to have continued by the plan-load failure it
+// runs into, which a drive that had stood down would never reach.
+func TestResumeApplyContinuesPastARefusedCancelInTheRevertWindow(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	client, apply, tasks, _ := recoveryPlanLoadFixture(&scriptedPlanStore{err: storageErr})
+	tasks[0].State = state.Task.RevertWindow
+	requests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:     apply.ID,
+		Operation:   storage.ControlOperationCancel,
+		Status:      storage.ControlRequestPending,
+		RequestedBy: "operator",
+	}}}
+	client.storage.(*exactProgressStorage).controlRequests = requests
+
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr, "the resume must have continued past the refusal to reach the plan load")
+	assert.Equal(t, state.Task.RevertWindow, tasks[0].State, "the cut-over task keeps its revert window")
+	resolved, err := requests.GetByOperation(t.Context(), apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, resolved)
+	assert.Equal(t, storage.ControlRequestFailed, resolved.Status, "the operator's cancel is refused, not left pending")
+}
+
 // A confirmed-missing plan row (a nil plan with no read error) is
 // unrecoverable — the reviewed DDL cannot be rebuilt — so recovery fails the
 // apply with an operator-facing reason and notifies its terminal observer.
 func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	client, apply, tasks, applyStore := recoveryPlanLoadFixture(&scriptedPlanStore{})
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationRevert)
+	client.storage.(*exactProgressStorage).controlRequests = requests
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.NoError(t, err)
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Failed),
@@ -441,6 +853,9 @@ func TestResumeApplyMissingPlanFailsApply(t *testing.T) {
 	assert.True(t, state.IsState(tasks[0].State, state.Task.Failed),
 		"in-flight task must fail with its apply, got %s", tasks[0].State)
 	assert.Equal(t, "plan not found during recovery", tasks[0].ErrorMessage)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestCompleted, requests.requests[0].Status,
+		"the terminal outcome moots the pending revert")
 	require.Len(t, observer.terminal, 1)
 	assert.True(t, state.IsState(observer.terminal[0].State, state.Apply.Failed))
 }
@@ -459,7 +874,7 @@ func TestResumeApplyMissingPlanAdoptsConcurrentTerminalState(t *testing.T) {
 	observer := &terminalRecordingObserver{}
 	client.SetObserver(apply.ID, observer)
 
-	err := client.resumeApplyWithTasks(t.Context(), apply, tasks, nil, false, false)
+	err := client.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.NoError(t, err)
 	assert.True(t, state.IsState(applyStore.apply.State, state.Apply.Stopped),
@@ -501,6 +916,61 @@ func TestReplanAndFilterTasks_SettledTaskPersistsCompleted(t *testing.T) {
 	assert.EqualValues(t, 100, tasks[0].ProgressPercent)
 	assert.NotNil(t, tasks[0].CompletedAt)
 	assert.True(t, hasLogMessageContaining(logs.logs, "Task task_1 already completed (live schema matches the reviewed target)"),
+		"a landed settlement records its transition in the apply's durable log")
+}
+
+// A multi-statement table whose driver crashed after executing one statement
+// but before recording its outcome resumes with that statement gone from the
+// re-plan diff while its sibling statements remain. Because every remaining
+// statement is the reviewed DDL of a sibling task that has not run, the
+// re-plan settles the landed task completed without re-executing it and keeps
+// only the siblings active, each on its own reviewed statement.
+func TestReplanAndFilterTasks_LandedStatementSettlesCompleted(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	remaining := &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace: "testapp",
+			TableChanges: []engine.TableChange{
+				{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD COLUMN `name` varchar(255)"},
+				{Table: "users", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `users` ADD INDEX (`name`)"},
+			},
+		}},
+	}
+	c := newPlanMaterializeClientWithPlan(store, remaining)
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{plans: store, tasks: &exactProgressTaskStore{}, logs: logs}
+
+	apply := &storage.Apply{ID: 21, ApplyIdentifier: "apply-replan-landed", Database: "testapp"}
+	usersTask := func(id, reviewed string) *storage.Task {
+		return &storage.Task{
+			TaskIdentifier: id,
+			Namespace:      "testapp",
+			TableName:      "users",
+			DDLAction:      "alter",
+			DDL:            reviewed,
+			State:          state.Task.Stopped,
+		}
+	}
+	tasks := []*storage.Task{
+		usersTask("task_email", "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"),
+		usersTask("task_name", "ALTER TABLE `users` ADD COLUMN `name` varchar(255)"),
+		usersTask("task_idx", "ALTER TABLE `users` ADD INDEX (`name`)"),
+	}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), apply, tasks, &storage.Plan{})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), rp.CompletedCount)
+	require.Len(t, rp.ActiveTasks, 2)
+	assert.Equal(t, "task_name", rp.ActiveTasks[0].TaskIdentifier)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `name` varchar(255)", rp.ActiveTasks[0].DDL)
+	assert.Equal(t, "task_idx", rp.ActiveTasks[1].TaskIdentifier)
+	assert.Equal(t, "ALTER TABLE `users` ADD INDEX (`name`)", rp.ActiveTasks[1].DDL)
+
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Completed),
+		"the task whose statement landed is settled completed, got %s", tasks[0].State)
+	assert.EqualValues(t, 100, tasks[0].ProgressPercent)
+	assert.NotNil(t, tasks[0].CompletedAt)
+	assert.True(t, hasLogMessageContaining(logs.logs, "Task task_email already completed (its statement landed before its outcome was recorded)"),
 		"a landed settlement records its transition in the apply's durable log")
 }
 
@@ -583,7 +1053,7 @@ func TestResumeApplySequential_AbortsWhenRacedCutoverSettlementRefused(t *testin
 		logs:            logs,
 	}
 
-	c.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{}, nil)
+	require.NoError(t, c.resumeApplySequential(t.Context(), apply, []*storage.Task{task}, &storage.Plan{}, nil))
 
 	stored, err := applies.Get(t.Context(), apply.ID)
 	require.NoError(t, err)
@@ -593,6 +1063,259 @@ func TestResumeApplySequential_AbortsWhenRacedCutoverSettlementRefused(t *testin
 		"the apply must not terminalize over a task row that durably stays non-terminal")
 	assert.Nil(t, stored.CompletedAt)
 	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
+}
+
+// landedSiblingEngine re-plans to a fixed remaining diff and completes any
+// statement it is asked to apply on the first progress poll, recording what it
+// was asked to run so a test can assert which statements executed.
+type landedSiblingEngine struct {
+	fakePlanEngine
+	applied []string
+}
+
+func (e *landedSiblingEngine) Apply(_ context.Context, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	for _, change := range req.Changes {
+		for _, tc := range change.TableChanges {
+			e.applied = append(e.applied, tc.DDL)
+		}
+	}
+	return &engine.ApplyResult{Accepted: true}, nil
+}
+
+func (e *landedSiblingEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{State: engine.StateCompleted}, nil
+}
+
+// newLandedSiblingResume builds a sequential resume over two tasks on one
+// table whose per-task re-plan lists only the second task's statement: the
+// first task's statement landed on the table after the resume's initial
+// re-plan handed it over as active.
+func newLandedSiblingResume(t *testing.T, taskStore storage.TaskStore, logs *mockApplyLogStore) (*LocalClient, *landedSiblingEngine, *storage.Apply, *snapshotApplyStore, []*storage.Task) {
+	t.Helper()
+	const (
+		emailDDL = "ALTER TABLE `users` ADD COLUMN `email` varchar(255)"
+		nameDDL  = "ALTER TABLE `users` ADD COLUMN `name` varchar(255)"
+	)
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, &engine.PlanResult{
+		Changes: []engine.SchemaChange{{
+			Namespace:    "testapp",
+			TableChanges: []engine.TableChange{{Table: "users", Operation: ddl.StatementAlterTable, DDL: nameDDL}},
+		}},
+	})
+	eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
+	c.spiritEngine = eng
+	c.heartbeatInterval = time.Hour
+	c.taskPollIntervalOverride = time.Millisecond
+
+	apply := &storage.Apply{
+		ID:              21,
+		ApplyIdentifier: "apply-sequential-landed",
+		Database:        "testapp",
+		Environment:     "staging",
+		State:           state.Apply.Running,
+	}
+	usersTask := func(id int64, identifier, reviewed string) *storage.Task {
+		return &storage.Task{
+			ID:             id,
+			ApplyID:        apply.ID,
+			TaskIdentifier: identifier,
+			Database:       "testapp",
+			Namespace:      "testapp",
+			TableName:      "users",
+			DDLAction:      "alter",
+			DDL:            reviewed,
+			State:          state.Task.Running,
+		}
+	}
+	tasks := []*storage.Task{
+		usersTask(1, "task_email", emailDDL),
+		usersTask(2, "task_name", nameDDL),
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	c.storage = &exactProgressStorage{
+		plans:           store,
+		applies:         applies,
+		tasks:           taskStore,
+		controlRequests: &testControlRequestStore{},
+		logs:            logs,
+	}
+	return c, eng, apply, applies, tasks
+}
+
+// The sequential resume loop re-plans freshly before each task, so a statement
+// can leave the diff between the resume's initial re-plan and the task's own
+// turn. When the table's remaining statements are all the reviewed DDL of a
+// sibling that has not run, the task's own statement is what landed: the loop
+// settles it completed without handing it to the engine, records the
+// settlement in the apply log, and runs only the sibling's statement, so the
+// apply completes with each statement executed at most once.
+func TestResumeApplySequential_SettlesLandedStatementWithoutReexecution(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	taskStore.tasks = tasks
+
+	require.NoError(t, c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil))
+
+	landed, sibling := tasks[0], tasks[1]
+	assert.True(t, state.IsState(landed.State, state.Task.Completed),
+		"the task whose statement landed is settled completed, got %s", landed.State)
+	assert.EqualValues(t, 100, landed.ProgressPercent)
+	assert.NotNil(t, landed.CompletedAt)
+	assert.Equal(t, "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", landed.DDL, "a landed task keeps the DDL it was reviewed with")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Task task_email already completed (its statement landed before its outcome was recorded)"),
+		"the landed settlement records its transition in the apply's durable log")
+	assert.False(t, hasLogMessageContaining(logs.logs, "Task task_email resumed"),
+		"a landed task is never handed to the engine")
+
+	assert.True(t, state.IsState(sibling.State, state.Task.Completed), "the sibling runs to completion, got %s", sibling.State)
+	assert.Equal(t, []string{"ALTER TABLE `users` ADD COLUMN `name` varchar(255)"}, eng.applied,
+		"only the sibling's statement reaches the engine")
+
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.Completed), "stored apply state was %q", stored.State)
+	assert.NotNil(t, stored.CompletedAt)
+}
+
+// A landed-statement settlement on the sequential path is only real once the
+// task row's completed state durably lands. When the task store refuses the
+// write — a lease-guarded update that lost the drive's lease to a peer — the
+// loop must abort before running the sibling or finalizing, leaving the apply
+// claimable so a later drive redoes the settlement under a current lease, and
+// the durable log records no transition the task row does not carry.
+func TestResumeApplySequential_AbortsWhenLandedStatementSettlementRefused(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &updateFailingTaskStore{exactProgressTaskStore: &exactProgressTaskStore{}, updateErr: storage.ErrApplyLeaseLost}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	taskStore.tasks = tasks
+
+	require.NoError(t, c.resumeApplySequential(t.Context(), apply, tasks, &storage.Plan{}, nil))
+
+	assert.False(t, state.IsTerminalTaskState(tasks[0].State),
+		"a refused settlement write restores the task's in-memory state, got %s", tasks[0].State)
+	assert.Empty(t, eng.applied, "the resume must abort before handing the sibling to the engine")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.Running),
+		"a refused settlement write must abort the resume before finalization, leaving the apply claimable; stored state was %q", stored.State)
+	assert.Nil(t, stored.CompletedAt)
+	assert.Empty(t, logs.logs, "the durable log must not claim a transition the task row does not carry")
+}
+
+// A task in an engine-monitored revert phase carries no evidence a schema
+// comparison can settle: post-cutover the live schema matches the reviewed
+// target until the revert lands. Revert-phase states never reach a sequential
+// resume today, so if one does the resume refuses before it writes the apply
+// running, compares schemas, runs the engine, or finalizes — leaving the task
+// in its revert-phase state and the apply row exactly as the claim found it,
+// so the apply stays claimable and each re-claim fails the same way — rather
+// than settle the task completed and report a reverting change as applied.
+func TestResumeApplyWithTasks_RefusesSequentialResumeOfRevertPhaseTask(t *testing.T) {
+	cases := []struct {
+		name       string
+		taskState  string
+		applyState string
+	}{
+		{name: "revert window open", taskState: state.Task.RevertWindow, applyState: state.Apply.RevertWindow},
+		{name: "revert in flight", taskState: state.Task.Reverting, applyState: state.Apply.Reverting},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &mockApplyLogStore{}
+			taskStore := &exactProgressTaskStore{}
+			c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+			plan := &storage.Plan{ID: 5}
+			apply.PlanID = plan.ID
+			apply.State = tc.applyState
+			applies.stored = *apply
+			c.storage.(*exactProgressStorage).plans = &fakePlanStore{
+				getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil },
+			}
+			tasks[0].State = tc.taskState
+			taskStore.tasks = tasks
+
+			err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+			require.ErrorIs(t, err, errRevertPhaseTaskInSequentialResume)
+			assert.True(t, state.IsState(tasks[0].State, tc.taskState),
+				"a revert-phase task keeps its state through the refused resume, got %s", tasks[0].State)
+			assert.Nil(t, tasks[0].CompletedAt)
+			assert.True(t, state.IsState(tasks[1].State, state.Task.Running),
+				"the sibling task is left as found, got %s", tasks[1].State)
+			assert.Empty(t, eng.applied, "the resume must refuse before handing any task to the engine")
+			stored, err := applies.Get(t.Context(), apply.ID)
+			require.NoError(t, err)
+			assert.True(t, state.IsState(stored.State, tc.applyState),
+				"the resume must refuse before writing the apply running; stored state was %q", stored.State)
+			assert.Nil(t, stored.CompletedAt)
+			for _, entry := range logs.logs {
+				assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
+					"the durable log must not record a transition the rows do not carry: %q", entry.Message)
+			}
+		})
+	}
+}
+
+// A resume mid-revert can find one task's statement back in the re-plan diff
+// while another's is not: the engine unwinds statement by statement. The task
+// whose statement is absent must not be settled completed on the strength of a
+// sibling that is unwinding the statement still listed — that sibling will not
+// run it forward — so the re-plan refuses before any task row, apply row, or
+// durable state transition is written, on the sequential and the grouped path
+// alike.
+func TestResumeApplyWithTasks_RevertPhaseSiblingDoesNotVouchForLandedStatement(t *testing.T) {
+	for _, siblingState := range []string{state.Task.RevertWindow, state.Task.Reverting} {
+		t.Run(siblingState, func(t *testing.T) {
+			logs := &mockApplyLogStore{}
+			taskStore := &exactProgressTaskStore{}
+			c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+			plan := &storage.Plan{ID: 5}
+			apply.PlanID = plan.ID
+			apply.State = state.Apply.Reverting
+			applies.stored = *apply
+			c.storage.(*exactProgressStorage).plans = &fakePlanStore{
+				getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil },
+			}
+			// task_email's statement is absent from the re-plan; the only
+			// statement listed is task_name's, and task_name is unwinding it.
+			tasks[1].State = siblingState
+			taskStore.tasks = tasks
+
+			err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "sibling task task_name ("+siblingState+"), which will not run it")
+			assert.True(t, state.IsState(tasks[0].State, state.Task.Running),
+				"the task whose statement is absent is left as found, got %s", tasks[0].State)
+			assert.Nil(t, tasks[0].CompletedAt)
+			assert.True(t, state.IsState(tasks[1].State, siblingState),
+				"the revert-phase sibling keeps its state, got %s", tasks[1].State)
+			assert.Empty(t, eng.applied, "nothing is handed to the engine")
+			stored, err := applies.Get(t.Context(), apply.ID)
+			require.NoError(t, err)
+			assert.True(t, state.IsState(stored.State, state.Apply.Reverting),
+				"the apply row is left as found; stored state was %q", stored.State)
+			for _, entry := range logs.logs {
+				assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
+					"the durable log must not record a settlement the re-plan refused: %q", entry.Message)
+			}
+		})
+	}
+}
+
+// sameApplyOperation scopes sibling vouching to one apply operation. Two legacy
+// tasks with no operation share the same (absent) operation; a task with an
+// operation shares it only with tasks carrying the same identifier, never with
+// a legacy task or a task from another operation.
+func TestSameApplyOperation(t *testing.T) {
+	seven, alsoSeven, eight := int64(7), int64(7), int64(8)
+	assert.True(t, sameApplyOperation(nil, nil), "two legacy tasks share the absent operation")
+	assert.True(t, sameApplyOperation(&seven, &alsoSeven), "equal identifiers held in different pointers are the same operation")
+	assert.False(t, sameApplyOperation(&seven, &eight), "different operations")
+	assert.False(t, sameApplyOperation(&seven, nil), "an operation-scoped task never shares with a legacy task")
+	assert.False(t, sameApplyOperation(nil, &seven), "a legacy task never shares with an operation-scoped task")
 }
 
 // A reverted task is terminal: the revert already landed for it, so the resume
@@ -748,4 +1471,396 @@ func TestStartDeferredDeployRejectsMixedNamespaces(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "tasks span multiple namespaces")
 	assert.ErrorContains(t, err, apply.ApplyIdentifier)
+}
+
+// planWithheldBookkeepingTable is a stored plan reviewed under an ignore_tables
+// config naming a live bookkeeping table. The table has no declaring schema
+// file, so it is absent from the plan's captured files.
+func planWithheldBookkeepingTable() *storage.Plan {
+	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{
+		"testapp": {Tables: []storage.TableChange{{Namespace: "testapp", Table: "users", Operation: "alter"}}},
+	}}
+	plan.RecordIgnoreTables([]string{bookkeepingTable})
+	return plan
+}
+
+// A resume re-plans the reviewed schema set against the live target to decide
+// which tasks still owe work. That re-plan has to be asked for the same
+// exclusions the plan was reviewed under, or it diffs a live schema the
+// reviewed plan never saw: the withheld table has no declaring file, so it
+// comes back as a DROP the reviewed plan cannot contain, and the resume is
+// judging its tasks against a delta that no longer describes the same target.
+func TestReplanTargetSchema_WithheldTablesTravelToTheReplan(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	replanned, err := c.replanTargetSchema(t.Context(), &storage.Apply{Database: "testapp"}, planWithheldBookkeepingTable())
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{bookkeepingTable}, shown,
+		"the re-plan is asked for the exclusions the plan was reviewed under")
+	assert.NotContains(t, replanned, shardTableKey{namespace: "testapp", table: bookkeepingTable},
+		"the withheld table is not remaining work the apply owes")
+}
+
+// The task-reconciling half of resume re-plans the same way and needs the same
+// exclusions, for the same reason: it settles or keeps each task by whether its
+// table is still in the delta, so the delta has to be the reviewed one.
+func TestReplanAndFilterTasks_WithheldTablesTravelToTheReplan(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	tasks := []*storage.Task{{
+		TaskIdentifier: "task_1",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+	}}
+
+	rp, err := c.replanAndFilterTasks(t.Context(), &storage.Apply{Database: "testapp"}, tasks, planWithheldBookkeepingTable())
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{bookkeepingTable}, shown,
+		"the re-plan is asked for the exclusions the plan was reviewed under")
+	require.Len(t, rp.ActiveTasks, 1)
+	assert.Zero(t, rp.CompletedCount)
+}
+
+// The local drive resolves the plan from the operation it drives, so a rollout
+// member planned against its own live schema runs its own DDL rather than the
+// reviewed primary's.
+func TestLocalClientDrivePlanID(t *testing.T) {
+	c := &LocalClient{}
+	apply := &storage.Apply{ApplyIdentifier: "apply-1", PlanID: 10}
+
+	t.Run("a whole-apply drive runs the apply's plan", func(t *testing.T) {
+		planID, err := c.drivePlanID(apply, nil)
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), planID)
+	})
+
+	t.Run("a member that shares the reviewed plan runs the apply's plan", func(t *testing.T) {
+		planID, err := c.drivePlanID(apply, &storage.ApplyOperation{ID: 1, Target: "testapp-001"})
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), planID)
+	})
+
+	t.Run("a member planned on its own runs its own plan", func(t *testing.T) {
+		planID, err := c.drivePlanID(apply, &storage.ApplyOperation{ID: 2, Target: "testapp-002", PlanID: 11})
+		require.NoError(t, err)
+		assert.Equal(t, int64(11), planID)
+	})
+
+	t.Run("an operation with no plan on either row is not drivable", func(t *testing.T) {
+		_, err := c.drivePlanID(&storage.Apply{ApplyIdentifier: "apply-2"}, &storage.ApplyOperation{ID: 3, Deployment: "eu"})
+		require.Error(t, err)
+	})
+
+	t.Run("a whole-apply drive with no plan is not drivable", func(t *testing.T) {
+		_, err := c.drivePlanID(&storage.Apply{ApplyIdentifier: "apply-3"}, nil)
+		require.Error(t, err)
+	})
+}
+
+// A retryable failure paused the apply mid-copy of `users`, and a driver claims
+// it to retry. The drive requeues the failed_retryable task to pending before
+// driving it, and that write fails. The task row is still at rest, so the drive
+// must exit with an error before writing the apply running or handing anything
+// to the engine: running the DDL while storage records the task at rest would
+// leave a copy no stored state accounts for. The apply stays retryable so the
+// next claim retries the requeue.
+func TestResumeApplyWithTasks_RetryStaysPendingWhenRetryableTaskRequeueFails(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
+	eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
+	c.spiritEngine = eng
+	c.heartbeatInterval = time.Hour
+
+	plan := &storage.Plan{ID: 5}
+	apply := &storage.Apply{
+		ID:              22,
+		ApplyIdentifier: "apply-retry-requeue-refused",
+		PlanID:          plan.ID,
+		Database:        "testapp",
+		Environment:     "staging",
+		State:           state.Apply.FailedRetryable,
+		ErrorMessage:    "engine connection reset",
+	}
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task_email",
+		Database:       "testapp",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.FailedRetryable,
+		ErrorMessage:   "engine connection reset",
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	logs := &mockApplyLogStore{}
+	c.storage = &exactProgressStorage{
+		plans:   &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }},
+		applies: applies,
+		tasks: &updateFailingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			updateErr:              storageErr,
+		},
+		controlRequests: &testControlRequestStore{},
+		logs:            logs,
+	}
+
+	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorContains(t, err, "requeue retryable task task_email for retry of apply apply-retry-requeue-refused")
+	assert.True(t, state.IsState(task.State, state.Task.FailedRetryable), "the refused requeue leaves the task retryable, got %s", task.State)
+	assert.Empty(t, eng.applied, "nothing is handed to the engine")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.FailedRetryable),
+		"the drive exits before writing the apply running; stored state was %q", stored.State)
+	assert.Equal(t, "engine connection reset", stored.ErrorMessage, "the stored apply keeps the failure it paused on")
+	assert.Equal(t, "engine connection reset", apply.ErrorMessage, "the drive's own apply matches the row it never rewrote")
+	for _, entry := range logs.logs {
+		assert.NotEqual(t, storage.LogEventStateTransition, entry.EventType,
+			"the durable log must not record a transition the rows do not carry: %q", entry.Message)
+	}
+}
+
+// An operator stopped the apply mid-copy of `users` and then asked to start it
+// again. The drive requeues the stopped task to pending before driving it, and
+// that write fails. The task row is still stopped, so the drive must exit with
+// an error before writing the apply running or handing anything to the engine,
+// and the start request stays pending for the next claim.
+func TestResumeApplyWithTasks_StartStaysPendingWhenStoppedTaskRequeueFails(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	c := newPlanMaterializeClientWithPlan(store, alterUsersEmailPlan())
+	eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
+	c.spiritEngine = eng
+	c.heartbeatInterval = time.Hour
+
+	plan := &storage.Plan{ID: 5}
+	apply := &storage.Apply{
+		ID:              23,
+		ApplyIdentifier: "apply-start-requeue-refused",
+		PlanID:          plan.ID,
+		Database:        "testapp",
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	task := &storage.Task{
+		ID:             1,
+		ApplyID:        apply.ID,
+		TaskIdentifier: "task_email",
+		Database:       "testapp",
+		Namespace:      "testapp",
+		TableName:      "users",
+		DDLAction:      "alter",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		State:          state.Task.Stopped,
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	c.storage = &exactProgressStorage{
+		plans:   &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }},
+		applies: applies,
+		tasks: &updateFailingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			updateErr:              storageErr,
+		},
+		controlRequests: controlRequests,
+		logs:            &mockApplyLogStore{},
+	}
+
+	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorContains(t, err, "requeue stopped task task_email for start of apply apply-start-requeue-refused")
+	assert.True(t, state.IsState(task.State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", task.State)
+	assert.Empty(t, eng.applied, "nothing is handed to the engine")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.Stopped), "the drive exits before writing the apply running; stored state was %q", stored.State)
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, startReq, "the start request stays pending for the next claim")
+}
+
+// selectiveUpdateFailingTaskStore refuses the update of one task, named by its
+// identifier, and lets every other task's update through, so a test can land
+// one requeue and refuse the next.
+type selectiveUpdateFailingTaskStore struct {
+	*exactProgressTaskStore
+	failIdentifier string
+	updateErr      error
+}
+
+func (s *selectiveUpdateFailingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	if task.TaskIdentifier == s.failIdentifier {
+		return s.updateErr
+	}
+	return s.exactProgressTaskStore.Update(ctx, task)
+}
+
+// A grouped Vitess apply over `users` and `orders` was stopped and the operator
+// asked to start it again. The first task's requeue lands and the second's is
+// refused. The requeue happens above the grouped branch, so the same exit
+// applies: the start stays pending, the apply row stays stopped, and nothing is
+// handed to the engine. The requeue that landed stays pending, so the next
+// claim skips it and requeues only the task still stopped.
+func TestResumeApplyWithTasks_StartStaysPendingWhenGroupedStoppedTaskRequeueFails(t *testing.T) {
+	storageErr := errors.New("storage unavailable")
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }}
+	enginePlan := alterUsersEmailPlan()
+	enginePlan.Changes[0].TableChanges = append(enginePlan.Changes[0].TableChanges, engine.TableChange{
+		Table:     "orders",
+		Operation: ddl.StatementAlterTable,
+		DDL:       "ALTER TABLE `orders` ADD COLUMN `name` varchar(255)",
+	})
+	c := newPlanMaterializeClientWithPlan(store, enginePlan)
+	eng := &landedSiblingEngine{fakePlanEngine: c.spiritEngine.(fakePlanEngine)}
+	c.spiritEngine = eng
+	c.heartbeatInterval = time.Hour
+
+	plan := &storage.Plan{ID: 5}
+	apply := &storage.Apply{
+		ID:              24,
+		ApplyIdentifier: "apply-grouped-start-requeue-refused",
+		PlanID:          plan.ID,
+		Database:        "testapp",
+		DatabaseType:    storage.DatabaseTypeVitess,
+		Environment:     "staging",
+		State:           state.Apply.Stopped,
+	}
+	tasks := []*storage.Task{
+		{
+			ID:             1,
+			ApplyID:        apply.ID,
+			TaskIdentifier: "task_email",
+			Database:       "testapp",
+			Namespace:      "testapp",
+			TableName:      "users",
+			DDLAction:      "alter",
+			DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+			State:          state.Task.Stopped,
+		},
+		{
+			ID:             2,
+			ApplyID:        apply.ID,
+			TaskIdentifier: "task_name",
+			Database:       "testapp",
+			Namespace:      "testapp",
+			TableName:      "orders",
+			DDLAction:      "alter",
+			DDL:            "ALTER TABLE `orders` ADD COLUMN `name` varchar(255)",
+			State:          state.Task.Stopped,
+		},
+	}
+	applies := &snapshotApplyStore{stored: *apply}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{{
+		ApplyID:   apply.ID,
+		Operation: storage.ControlOperationStart,
+		Status:    storage.ControlRequestPending,
+	}}}
+	c.storage = &exactProgressStorage{
+		plans:   &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }},
+		applies: applies,
+		tasks: &selectiveUpdateFailingTaskStore{
+			exactProgressTaskStore: &exactProgressTaskStore{tasks: tasks},
+			failIdentifier:         "task_name",
+			updateErr:              storageErr,
+		},
+		controlRequests: controlRequests,
+		logs:            &mockApplyLogStore{},
+	}
+
+	err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
+
+	require.ErrorIs(t, err, storageErr)
+	assert.ErrorContains(t, err, "requeue stopped task task_name for start of apply apply-grouped-start-requeue-refused")
+	assert.True(t, state.IsState(tasks[0].State, state.Task.Pending), "the requeue that landed stays pending, got %s", tasks[0].State)
+	assert.True(t, state.IsState(tasks[1].State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", tasks[1].State)
+	assert.Empty(t, eng.applied, "nothing is handed to the engine")
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.True(t, state.IsState(stored.State, state.Apply.Stopped), "the drive exits before writing the apply running; stored state was %q", stored.State)
+	assert.Nil(t, stored.CompletedAt)
+	startReq, err := controlRequests.GetPending(t.Context(), apply.ID, storage.ControlOperationStart)
+	require.NoError(t, err)
+	assert.NotNil(t, startReq, "the start request stays pending for the next claim")
+}
+
+// A never-started finalizer settles for a pending command the way the database
+// type's stop settles: a stop that pauses leaves it resumable, a stop that
+// cannot pause cancels it, and a cancel always cancels it.
+func TestFinalizerSettledStateForControl(t *testing.T) {
+	cases := []struct {
+		operation    storage.ControlOperation
+		databaseType string
+		want         string
+	}{
+		{storage.ControlOperationStop, storage.DatabaseTypeStrata, state.ApplyOperation.Stopped},
+		{storage.ControlOperationStop, storage.DatabaseTypeMySQL, state.ApplyOperation.Stopped},
+		{storage.ControlOperationStop, storage.DatabaseTypeVitess, state.ApplyOperation.Cancelled},
+		{storage.ControlOperationCancel, storage.DatabaseTypeStrata, state.ApplyOperation.Cancelled},
+		{storage.ControlOperationCancel, storage.DatabaseTypeVitess, state.ApplyOperation.Cancelled},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.operation)+"/"+tc.databaseType, func(t *testing.T) {
+			assert.Equal(t, tc.want, finalizerSettledStateForControl(tc.operation, tc.databaseType))
+		})
+	}
+}
+
+// A finalizer re-drive resumes from what the engine reported, and re-applies
+// from the plan when the only stored state is the drive's own handoff record.
+func TestFinalizerEngineResumeState(t *testing.T) {
+	cases := []struct {
+		name   string
+		stored *storage.EngineResumeState
+		want   *engine.ResumeState
+	}{
+		{
+			name:   "handoff record only",
+			stored: &storage.EngineResumeState{Metadata: finalizerEngineHandoffMetadata},
+			want:   nil,
+		},
+		{
+			// A JSON storage column hands the record back re-serialized.
+			name:   "handoff record as a JSON column returns it",
+			stored: &storage.EngineResumeState{Metadata: `{"group_finalizer_engine_handoff": "true"}`},
+			want:   nil,
+		},
+		{
+			name:   "engine deploy state",
+			stored: &storage.EngineResumeState{MigrationContext: "deploy-ns-0", Metadata: `{"branch_name":"orders-ns-0"}`},
+			want:   &engine.ResumeState{MigrationContext: "deploy-ns-0", Metadata: `{"branch_name":"orders-ns-0"}`},
+		},
+		{
+			name:   "engine context alongside the handoff metadata",
+			stored: &storage.EngineResumeState{MigrationContext: "deploy-ns-0", Metadata: finalizerEngineHandoffMetadata},
+			want:   &engine.ResumeState{MigrationContext: "deploy-ns-0", Metadata: finalizerEngineHandoffMetadata},
+		},
+		{
+			name:   "empty engine metadata",
+			stored: &storage.EngineResumeState{Metadata: "{}"},
+			want:   &engine.ResumeState{Metadata: "{}"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, finalizerEngineResumeState(tc.stored))
+		})
+	}
 }

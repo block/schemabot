@@ -135,6 +135,58 @@ func dispatchQueuedApply(t *testing.T, stor storage.Storage, client *LocalClient
 	return apply
 }
 
+// A stored plan is admitted only when every step is executable; rejection
+// happens before apply or task rows are created.
+func TestLocalClientApplyRejectsWholePlanWithBlockedStepBeforeCreatingWork(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	_, dsn := setupMySQLContainer(t)
+	setupStorageSchema(t, dsn)
+	cleanupTasks(t, dsn)
+	cleanupTestTables(t, dsn)
+	stor := createStorage(t, dsn)
+	defer utils.CloseAndLog(stor)
+	client, engineRecorder := newTasklessControlClient(t, dsn, stor)
+	ctx := t.Context()
+	reason := "requires privileges unavailable to the engine"
+	plan := &storage.Plan{
+		PlanIdentifier: fmt.Sprintf("plan-blocked-admission-%d", time.Now().UnixNano()),
+		Database:       "testdb",
+		DatabaseType:   storage.DatabaseTypeMySQL,
+		Deployment:     "testdb",
+		Environment:    localClientTestEnvironment,
+		CreatedAt:      time.Now(),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"testdb": {Tables: []storage.TableChange{
+				{Table: "users", DDL: "ALTER TABLE users ADD COLUMN name VARCHAR(255)", Operation: "alter"},
+				{Table: "users", DDL: "ALTER TABLE users ADD COLUMN email VARCHAR(255)", Operation: "alter", ExecutionMode: engine.ExecutionModeBlocked, ModeReason: reason},
+			}},
+		},
+	}
+	planID, err := stor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	plan.ID = planID
+
+	resp, err := client.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId: plan.PlanIdentifier, Database: "testdb", Type: storage.DatabaseTypeMySQL,
+		Environment: localClientTestEnvironment,
+	})
+	require.NoError(t, err)
+	assert.False(t, resp.Accepted)
+	assert.Equal(t, plan.BlockedApplyError().Error(), resp.ErrorMessage)
+	assert.Empty(t, engineRecorder.recorded())
+	storedApply, err := stor.Applies().GetByPlan(ctx, plan.ID)
+	require.NoError(t, err)
+	assert.Nil(t, storedApply)
+
+	cleanApply := dispatchQueuedApply(t, stor, client, []storage.TableChange{
+		{Table: "accounts", DDL: "ALTER TABLE accounts ADD COLUMN name VARCHAR(255)", Operation: "alter"},
+	})
+	assert.Equal(t, state.Apply.Pending, cleanApply.State)
+}
+
 // requireControlRequestStatus asserts the durable control request for the apply
 // operation reached the given status — the signal that the operator retry loop
 // has stopped re-running the request.
@@ -144,6 +196,21 @@ func requireControlRequestStatus(t *testing.T, stor storage.Storage, applyID int
 	require.NoError(t, err)
 	require.NotNil(t, req, "the %s control request must exist", operation)
 	assert.Equal(t, want, req.Status, "the %s control request must be %s", operation, want)
+}
+
+// requireOutrunCancelSettled asserts a cancel the schema change outran resolved
+// as a command that did not take effect, carrying the reason the PR comment's
+// not-applied notice renders. Resolving it as applied would tell the operator
+// the change was taken back when it is live on the target.
+func requireOutrunCancelSettled(t *testing.T, stor storage.Storage, applyID int64) {
+	t.Helper()
+	req, err := stor.ControlRequests().GetByOperation(t.Context(), applyID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	require.NotNil(t, req, "the cancel control request must exist")
+	assert.Equal(t, storage.ControlRequestFailed, req.Status,
+		"a cancel the schema change outran must not resolve as applied")
+	assert.Contains(t, req.ErrorMessage, "the schema change completed before the cancel could take effect")
+	assert.Contains(t, req.ErrorMessage, "the change is live on the target")
 }
 
 // A queued apply can be claimed by an operator driver before its first drive
@@ -305,9 +372,9 @@ func TestLocalClient_CancelTasklessApplyWithLostApplyLeaseSettlesOperationRow(t 
 	reloaded, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reloaded)
-	handled, err := client.processPendingCancelControlRequest(opCtx, reloaded)
+	standDown, err := client.processPendingCancelControlRequest(opCtx, reloaded)
 	require.NoError(t, err)
-	require.True(t, handled, "the drive must consume the pending cancel")
+	require.True(t, standDown, "the drive must consume the pending cancel")
 
 	settledOp, err := stor.ApplyOperations().Get(ctx, op.ID)
 	require.NoError(t, err)
@@ -371,9 +438,9 @@ func TestLocalClient_StopTasklessApplyWithLostApplyLeaseSettlesOperationRow(t *t
 	reloaded, err := stor.Applies().Get(ctx, apply.ID)
 	require.NoError(t, err)
 	require.NotNil(t, reloaded)
-	handled, err := client.processPendingStopControlRequest(opCtx, reloaded)
+	standDown, err := client.processPendingStopControlRequest(opCtx, reloaded)
 	require.NoError(t, err)
-	require.True(t, handled, "the drive must consume the pending stop")
+	require.True(t, standDown, "the drive must consume the pending stop")
 
 	settledOp, err := stor.ApplyOperations().Get(ctx, op.ID)
 	require.NoError(t, err)

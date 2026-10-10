@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/mysqlerr"
 )
 
 // applyTableChange starts a schema change for one table's DDL through the
@@ -119,7 +120,8 @@ func TestEngine_Progress_DrainedFailedChangeReportsFailure(t *testing.T) {
 	result, err := eng.Progress(t.Context(), &engine.ProgressRequest{})
 	require.NoError(t, err, "Progress()")
 	assert.Equal(t, engine.StateFailed, result.State)
-	assert.Contains(t, result.ErrorMessage, "nonexistent_column")
+	assert.Equal(t, mysqlerr.ReasonFromText("(errno 1091)"), result.ErrorMessage)
+	assert.NotContains(t, result.ErrorMessage, "nonexistent_column")
 	assert.True(t, result.Retryable)
 }
 

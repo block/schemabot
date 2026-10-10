@@ -162,7 +162,14 @@ func showCreateAllFromConn(ctx context.Context, conn *sql.Conn, opts ...table.Fi
 			return nil, fmt.Errorf("show create table %s: %w", name, err)
 		}
 		if optSet[table.WithStrippedAutoIncrement] {
-			createStmt = table.StripAutoIncrement(createStmt)
+			// An unstrippable counter is an error rather than a passthrough:
+			// returning the statement as-is would write one shard's counter
+			// into the schema this read produces.
+			stripped, err := table.StripAutoIncrement(createStmt)
+			if err != nil {
+				return nil, fmt.Errorf("strip auto-increment from %s: %w", name, err)
+			}
+			createStmt = stripped
 		}
 		result = append(result, table.TableSchema{Name: tbl, Schema: createStmt})
 	}
@@ -176,8 +183,17 @@ func hasVSchemaData(s sql.NullString) bool {
 
 // buildDDLStrategy constructs the Vitess online DDL strategy string.
 // If instantDDL is true, --prefer-instant-ddl is used; otherwise --postpone-completion.
+//
+// --analyze-table is deliberately absent. It runs ANALYZE TABLE on the shadow
+// table inside the cutover preparation, which replicates and briefly blocks
+// the table for writes, so the stream the cutover is about to wait on falls
+// behind. A stream that is behind at that moment reads the sentry table's DDL
+// after the cutover has locked the tables, reloads its schema, and blocks on
+// the locked table -- and the cutover is waiting on that same stream. The
+// statistics it produces are there for a replica promoted right after a
+// production cutover, which is not what this local backend is for.
 func buildDDLStrategy(instantDDL bool) string {
-	const baseFlags = " --in-order-completion --allow-zero-in-date --analyze-table" +
+	const baseFlags = " --in-order-completion --allow-zero-in-date" +
 		" --force-cut-over-after=1ms --cut-over-threshold=15s" +
 		" --singleton-context --allow-concurrent"
 
@@ -250,7 +266,15 @@ func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend,
 		return nil, nil, fmt.Errorf("invalid shard %s: %w", shard, err)
 	}
 
-	conn, err := backend.unscopedVtgateDB.Conn(ctx)
+	// Acquiring the connection and targeting the shard are both round trips to
+	// vtgate, so they carry their own deadline rather than the caller's lifetime:
+	// a vtgate that accepts a connection and then stops answering must not hold
+	// the caller indefinitely before it has a statement to time out. A shorter
+	// deadline already on ctx still wins.
+	setupCtx, cancel := context.WithTimeout(ctx, vitessQueryTimeout)
+	defer cancel()
+
+	conn, err := backend.unscopedVtgateDB.Conn(setupCtx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get vtgate connection: %w", err)
 	}
@@ -262,7 +286,7 @@ func (s *Server) vtgateTargetConn(ctx context.Context, backend *databaseBackend,
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("invalid shard target %s: %w", target, err)
 	}
-	if _, err := conn.ExecContext(ctx, "USE "+quoteIdentifier(target)); err != nil {
+	if _, err := conn.ExecContext(setupCtx, "USE "+quoteIdentifier(target)); err != nil {
 		utils.CloseAndLog(conn)
 		return nil, nil, fmt.Errorf("target shard %s: %w", target, err)
 	}
@@ -320,7 +344,7 @@ func (s *Server) getBranchSchemaFromBackend(ctx context.Context, backend *databa
 }
 
 func (s *Server) getBranchSchemaWithDSN(ctx context.Context, dsnBase, branch, keyspace string) ([]string, error) {
-	db, err := sql.Open("mysql", dsnBase+branchDBName(branch, keyspace))
+	db, err := openMySQL(dsnBase, branchDBName(branch, keyspace))
 	if err != nil {
 		return nil, fmt.Errorf("open branch db %s/%s: %w", branch, keyspace, err)
 	}
@@ -578,7 +602,7 @@ func (s *Server) getDeployRequestInfo(ctx context.Context, ref deployRequest) (*
 // and shuts down any TCP proxy associated with the branch. Branches live on
 // the backend's mysqld (not the metadata DB), so we connect there for the DROP.
 func (s *Server) dropBranchDatabases(ctx context.Context, backend *databaseBackend, branch string) {
-	db, err := sql.Open("mysql", backend.mysqlDSNBase)
+	db, err := openMySQL(backend.mysqlDSNBase, "")
 	if err != nil {
 		s.logger.Error("dropBranchDatabases: open backend", "branch", branch, "error", err)
 		return
@@ -759,8 +783,7 @@ func (s *Server) openBranchDB(ctx context.Context, branch, keyspace string) (*sq
 		return nil, fmt.Errorf("find backend for branch %s (%s/%s): %w", branch, org, database, err)
 	}
 
-	dsn := backend.mysqlDSNBase + branchDBName(branch, keyspace)
-	db, err := sql.Open("mysql", dsn)
+	db, err := openMySQL(backend.mysqlDSNBase, branchDBName(branch, keyspace))
 	if err != nil {
 		return nil, fmt.Errorf("open branch db %s/%s: %w", branch, keyspace, err)
 	}
@@ -859,7 +882,7 @@ const onlineDDLSidecarTable = "schema_migrations"
 func (s *Server) waitForOnlineDDLReady(ctx context.Context) error {
 	deadline := time.Now().Add(onlineDDLReadyTimeout)
 	for key, backend := range s.backends {
-		db, err := sql.Open("mysql", backend.mysqlDSNBase)
+		db, err := openMySQL(backend.mysqlDSNBase, "")
 		if err != nil {
 			return fmt.Errorf("connect to mysqld for %s/%s: %w", key.org, key.database, err)
 		}

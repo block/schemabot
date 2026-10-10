@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestFormatSplitRoundTrip(t *testing.T) {
@@ -169,4 +170,58 @@ func TestPullRequestURL(t *testing.T) {
 func TestPullRequestMarkdownLink(t *testing.T) {
 	assert.Equal(t, "[acme/shop#412](https://github.com/acme/shop/pull/412)",
 		PullRequestMarkdownLink("acme/shop", 412))
+}
+
+func TestParsePullRequestReference(t *testing.T) {
+	accepted := []struct {
+		name      string
+		reference string
+		repo      string
+		pr        int
+	}{
+		{"the rendered URL round-trips", PullRequestURL("acme/shop", 412), "acme/shop", 412},
+		{"without a scheme", "github.com/acme/shop/pull/412", "acme/shop", 412},
+		{"an enterprise host", "https://git.example.com/acme/shop/pull/412", "acme/shop", 412},
+		{"a host with a path prefix", "https://example.com/git/acme/shop/pull/412", "acme/shop", 412},
+		{"the files view", "https://github.com/acme/shop/pull/412/files", "acme/shop", 412},
+		{"a commit view", "https://github.com/acme/shop/pull/412/commits/3f9a1c2", "acme/shop", 412},
+		{"a trailing slash", "https://github.com/acme/shop/pull/412/", "acme/shop", 412},
+		{"a comment fragment", "https://github.com/acme/shop/pull/412#issuecomment-98217", "acme/shop", 412},
+		{"a query string", "https://github.com/acme/shop/pull/412/files?w=1", "acme/shop", 412},
+		{"the plural path GitHub also serves", "https://github.com/acme/shop/pulls/412", "acme/shop", 412},
+		{"the comment form", "acme/shop#412", "acme/shop", 412},
+		{"surrounding whitespace", "  https://github.com/acme/shop/pull/412  ", "acme/shop", 412},
+		{"a bare repository carries no number", "acme/shop", "acme/shop", 0},
+	}
+	for _, tc := range accepted {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, pr, err := ParsePullRequestReference(tc.reference)
+			require.NoError(t, err)
+			assert.Equal(t, tc.repo, repo)
+			assert.Equal(t, tc.pr, pr)
+		})
+	}
+
+	refused := []struct {
+		name      string
+		reference string
+	}{
+		{"empty", ""},
+		{"whitespace only", "   "},
+		{"a bare number names no repository", "412"},
+		{"a fragment names no repository", "#412"},
+		{"an owner with no repository", "acme"},
+		{"an owner with an empty repository", "acme/"},
+		{"a URL with no pull request number", "https://github.com/acme/shop/pulls"},
+		{"a pull request number that is not a number", "https://github.com/acme/shop/pull/head"},
+		{"a zero pull request number", "acme/shop#0"},
+		{"a negative pull request number", "acme/shop#-3"},
+		{"a repository page", "https://github.com/acme/shop"},
+	}
+	for _, tc := range refused {
+		t.Run("refuses "+tc.name, func(t *testing.T) {
+			_, _, err := ParsePullRequestReference(tc.reference)
+			require.Error(t, err)
+		})
+	}
 }

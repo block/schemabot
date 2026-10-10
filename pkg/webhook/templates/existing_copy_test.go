@@ -34,7 +34,7 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	plan := RenderPlanComment(data)
 	assert.Contains(t, plan, "⚠️ **Applying destroys work in progress**: 1 unfinished copy on the target\n")
 	assert.Contains(t, plan, "- `orders` in `testapp` (last progress 3h 12m ago): the schema change differs from the one that started it, "+
-		"which was `ALTER TABLE orders ADD INDEX idx_user_created (user_id, created_at)`",
+		"which was `` ALTER TABLE `orders` ADD INDEX `idx_user_created` (`user_id`, `created_at`) ``",
 		"a cause that is a comparison names the side the operator cannot see from the plan above")
 	assert.NotContains(t, plan, "3h 12m of copying",
 		"the copy's age dates its last checkpoint, so it can never be read as elapsed copying")
@@ -48,7 +48,7 @@ func TestRenderPlanComment_DiscardedCopyWarnsWhileTheDecisionIsTheOperators(t *t
 	// copy is still there and confirming is what destroys it, so the warning
 	// and its remedy belong on the comment the confirmation acts on.
 	data.IsLocked = true
-	data.AutoConfirmDowngradeReason = "Applying destroys work in progress on the target"
+	data.PendingManualConfirmation = true
 	paused := RenderPlanComment(data)
 	assert.Contains(t, paused, "⚠️ **Applying destroys work in progress**")
 	assert.Contains(t, paused, "apply the schema change that started it")
@@ -91,10 +91,9 @@ func TestRenderPlanComment_DiscardedCopyReadsAsARecordOnceApplying(t *testing.T)
 // shared inline-code sanitizer. A quoted identifier may legally carry a
 // backtick or a newline, and either would end a code span early or split the
 // entry across lines in the one section an operator reads to decide whether
-// hours of copying are expendable. The sanitizer drops the backtick rather than
-// escaping it, so a name that carries one is shown closed up; a readable entry
-// that survives is worth more here than byte fidelity for a name no target
-// realistically has.
+// hours of copying are expendable. The sanitizer widens the span's delimiter
+// past any backtick run in the name, so the name is shown as written and still
+// cannot close the span.
 func TestRenderPlanComment_DiscardedCopyKeepsHostileIdentifiersOnOneLine(t *testing.T) {
 	out := RenderPlanComment(PlanCommentData{
 		Database: "testapp", Environment: "staging", IsMySQL: true,
@@ -109,10 +108,8 @@ func TestRenderPlanComment_DiscardedCopyKeepsHostileIdentifiersOnOneLine(t *test
 		},
 	})
 
-	assert.Contains(t, out, "- `orders`, `line items` in `app db` (last progress 3h 12m ago): `futurereason value`\n",
-		"identifiers and an untranslated reason render as one entry on one line")
-	assert.NotContains(t, out, "ord`ers", "a backtick in an identifier cannot end the code span early")
-	assert.NotContains(t, out, "future`reason", "a backtick in a reason cannot end the code span early")
+	assert.Contains(t, out, "- `` ord`ers ``, `line items` in `` app` db `` (last progress 3h 12m ago): `` future`reason value ``\n",
+		"identifiers and an untranslated reason render as one entry on one line, each inside a span its backtick cannot close")
 }
 
 // The statement a copy was started for is read off a live target, so an entry
@@ -131,8 +128,8 @@ func TestRenderPlanComment_DiscardedCopyClampsTheStartingStatement(t *testing.T)
 	})
 
 	entry := entryLine(t, out, "- `orders` in `testapp`:")
-	assert.Contains(t, entry, "which was `ALTER TABLE orders ADD INDEX idx_")
-	assert.Contains(t, entry, "…`", "an over-long statement is truncated with an ellipsis inside the code span")
+	assert.Contains(t, entry, "which was `` ALTER TABLE `orders` ADD INDEX `idx_")
+	assert.Contains(t, entry, "… ``", "an over-long statement is truncated with an ellipsis inside the code span")
 	assert.LessOrEqual(t, len([]rune(entry)), 300, "the entry stays scannable next to the others in its section")
 }
 
@@ -509,4 +506,58 @@ func TestRenderPlanComment_NoCopySectionOnCleanTarget(t *testing.T) {
 	})
 
 	assert.NotContains(t, out, "work in progress")
+}
+
+// Every paused comment closes on the same sentence, and every warning on it
+// sits in the disclosure region above the plan. This pins both halves: the
+// footer never varies with what paused the apply, and the cause is marked once
+// whether a disclosure already covers it or the paused-cause section supplies
+// it.
+func TestRenderPlanComment_PausedCommentsCloseTheSameWayAndWarnOnce(t *testing.T) {
+	base := PlanCommentData{
+		Database: "testapp", Environment: "staging", IsMySQL: true, IsLocked: true,
+		Changes: []KeyspaceChangeData{{
+			Keyspace:   "testapp",
+			Statements: []string{"ALTER TABLE `orders` ADD INDEX `idx_user_id` (`user_id`)"},
+		}},
+	}
+	const footer = "**Confirmation required** — review the plan above, then confirm manually:"
+
+	// A disclosure above already explains the pause, so no paused-cause
+	// section is set and the comment warns once.
+	disclosed := base
+	disclosed.PendingManualConfirmation = true
+	disclosed.DiscardedCopies = []ExistingCopyData{
+		{Namespace: "testapp", Tables: []string{"orders"}, Reason: engine.DiscardStatementDiffers, Age: "3h 12m"},
+	}
+	out := RenderPlanComment(disclosed)
+	assert.Contains(t, out, footer)
+	assert.NotContains(t, out, "**Applying automatically**",
+		"a nil cause means the reason is disclosed above, never that the apply is proceeding")
+	assert.Equal(t, 1, strings.Count(out, "⚠️"),
+		"the cause is surfaced once, by the section that explains it in full")
+
+	// Nothing above explains the pause, so the cause is its own disclosure —
+	// same region, same marker, same footer.
+	alone := base
+	alone.PendingManualConfirmation = true
+	alone.PausedApplyCause = &PausedApplyCauseData{
+		Heading: "The plan this apply would be checked against could not be read",
+		Entries: []string{"`orders` (alter) is in this plan"},
+	}
+	out = RenderPlanComment(alone)
+	assert.Contains(t, out, "⚠️ **The plan this apply would be checked against could not be read**\n"+
+		"- `orders` (alter) is in this plan\n")
+	assert.Contains(t, out, footer)
+	assert.Equal(t, 1, strings.Count(out, "⚠️"))
+	assert.NotContains(t, out, "**Applying automatically**")
+	assert.Less(t, strings.Index(out, "⚠️"), strings.Index(out, footer),
+		"the warning belongs above the plan with the other disclosures, not in the footer")
+
+	// An apply already under way asks nothing, so neither the closing sentence
+	// nor a cause reaches the reader.
+	out = RenderPlanComment(base)
+	assert.Contains(t, out, "**Applying automatically**")
+	assert.NotContains(t, out, "review the plan above, then confirm manually")
+	assert.NotContains(t, out, "Confirmation required")
 }

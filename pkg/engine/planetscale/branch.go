@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	ps "github.com/planetscale/planetscale-go/planetscale"
 
 	"github.com/block/spirit/pkg/statement"
@@ -47,7 +47,7 @@ const foreignKeyRefusalReason = "foreign key constraints are not supported"
 // MySQL (real-time) and fails fast on mismatch. Only VSchema errors are
 // retried, since GetKeyspaceVSchema may return stale data after
 // UpdateKeyspaceVSchema.
-func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword) error {
+func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
 	const maxAttempts = 18
 	const pollInterval = 5 * time.Second
 
@@ -63,7 +63,7 @@ func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client
 			}
 		}
 
-		lastErr = e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, password)
+		lastErr = e.verifyBranchMatchesDesired(ctx, client, org, database, branch, keyspaces, schemaFiles, ignored, password)
 		if lastErr == nil {
 			if attempt > 0 {
 				e.logger.Info("branch schema validated after retry",
@@ -89,11 +89,14 @@ func (e *Engine) verifyBranchMatchesDesiredWithRetry(ctx context.Context, client
 // MySQL (LoadSchemaFromDB) to avoid PlanetScale's GetBranchSchema API, which
 // returns stale schema until an asynchronous schema snapshot completes after
 // DDL execution.
-func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, password *ps.DatabaseBranchPassword) error {
+func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient.PSClient, org, database, branch string, keyspaces []string, schemaFiles schema.SchemaFiles, ignored engine.IgnoredTables, password *ps.DatabaseBranchPassword) error {
 	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
 	if err != nil {
 		return fmt.Errorf("fetch branch schema via MySQL for validation: %w", err)
 	}
+	// The branch is a copy of main, so it carries the tables ignore_tables
+	// withheld from the plan; they are not part of what is validated.
+	branchSchema = withoutIgnoredTables(branchSchema, ignored)
 
 	for _, ks := range keyspaces {
 		ns := schemaFiles[ks]
@@ -101,10 +104,11 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 			continue
 		}
 
-		ddlChanges, vschemaChanged, _, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
+		diff, err := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, branchSchema)
 		if err != nil {
 			return fmt.Errorf("validate keyspace %s: %w", ks, err)
 		}
+		ddlChanges, vschemaChanged := diff.tableChanges, diff.vschemaChanged
 
 		if len(ddlChanges) > 0 {
 			var summaries []string
@@ -143,6 +147,26 @@ func (e *Engine) verifyBranchMatchesDesired(ctx context.Context, client psclient
 	return nil
 }
 
+// withoutIgnoredTables drops the tables ignore_tables withholds from a live
+// schema, so a comparison against the declared schema leaves them out the way
+// the plan did.
+func withoutIgnoredTables(live map[string][]table.TableSchema, ignored engine.IgnoredTables) map[string][]table.TableSchema {
+	if ignored.Empty() {
+		return live
+	}
+	kept := make(map[string][]table.TableSchema, len(live))
+	for keyspace, tables := range live {
+		kept[keyspace] = make([]table.TableSchema, 0, len(tables))
+		for _, ts := range tables {
+			if ignored.Withholds(ts.Name) {
+				continue
+			}
+			kept[keyspace] = append(kept[keyspace], ts)
+		}
+	}
+	return kept
+}
+
 // fetchBranchSchemaViaMySQL connects to the branch via MySQL using the branch
 // password and loads table schemas with LoadSchemaFromDB. This returns the
 // real-time schema, bypassing PlanetScale's cached GetBranchSchema API.
@@ -167,7 +191,7 @@ func (e *Engine) fetchBranchSchemaViaMySQL(ctx context.Context, password *ps.Dat
 		g.Go(func() error {
 			ksCfg := mysqlCfg.Clone()
 			ksCfg.DBName = ks
-			db, err := sql.Open("mysql", ksCfg.FormatDSN())
+			db, err := sql.Open("block-mysql", ksCfg.FormatDSN())
 			if err != nil {
 				return fmt.Errorf("open branch MySQL for keyspace %s: %w", ks, err)
 			}
@@ -193,11 +217,26 @@ func (e *Engine) fetchBranchSchemaViaMySQL(ctx context.Context, password *ps.Dat
 	return result, nil
 }
 
+// keyspaceDiff is the result of diffing one keyspace's desired schema files
+// against its current schema.
+type keyspaceDiff struct {
+	// tableChanges holds one entry per planned DDL statement.
+	tableChanges []engine.TableChange
+	// violations holds the lint findings on the planned statements, in
+	// statement order.
+	violations []engine.LintViolation
+	// vschemaChanged reports whether the desired VSchema differs from the
+	// current one.
+	vschemaChanged bool
+	// currentVSchemaRaw is the current VSchema fetched for the comparison,
+	// empty when the keyspace has none or no VSchema is desired.
+	currentVSchemaRaw string
+}
+
 // diffKeyspace diffs a single keyspace's schema between a branch and the
-// desired schema files. Returns DDL changes, whether VSchema differs, and the
-// current VSchema content fetched for that diff.
+// desired schema files, linting the planned statements in the same pass.
 // Shared by Plan() and verifyBranchMatchesDesired().
-func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) ([]engine.TableChange, bool, string, error) {
+func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) (keyspaceDiff, error) {
 	var currentTableSchemas []table.TableSchema
 	if tables, ok := currentSchema[ks]; ok {
 		currentTableSchemas = append(currentTableSchemas, tables...)
@@ -205,12 +244,12 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 
 	desiredTableSchemas, parseErr := parseDesiredSchemas(ks, ns)
 	if parseErr != nil {
-		return nil, false, "", parseErr
+		return keyspaceDiff{}, parseErr
 	}
 
 	plan, planErr := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
 	if planErr != nil {
-		return nil, false, "", fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
+		return keyspaceDiff{}, fmt.Errorf("plan changes for keyspace %s: %w", ks, planErr)
 	}
 
 	if len(plan.Changes) > 0 {
@@ -243,24 +282,19 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 	}
 
 	var tableChanges []engine.TableChange
+	var violations []engine.LintViolation
 	for _, pc := range plan.Changes {
+		violations = append(violations, lint.PlannedChangeViolations(pc)...)
 		stmtType, _, classifyErr := ddl.ClassifyStatement(pc.Statement)
 		if classifyErr != nil {
-			return nil, false, "", fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
+			return keyspaceDiff{}, fmt.Errorf("classify statement in keyspace %s: %w", ks, classifyErr)
 		}
 		change := engine.TableChange{
 			Table:     pc.TableName,
 			Operation: stmtType,
 			DDL:       pc.Statement,
 		}
-		if errViolations := pc.Errors(); len(errViolations) > 0 {
-			change.IsUnsafe = true
-			msgs := make([]string, len(errViolations))
-			for i, v := range errViolations {
-				msgs[i] = v.Message
-			}
-			change.UnsafeReason = strings.Join(msgs, "; ")
-		}
+		change.UnsafeReason, change.IsUnsafe = lint.PlannedChangeUnsafeReason(pc)
 		// Only a CREATE TABLE or an ALTER TABLE can declare a foreign key.
 		// Gating on the type keeps the verdict — an informational field — off
 		// the statement types the refusal check's own parser rejects outright.
@@ -271,7 +305,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 		if stmtType == ddl.StatementCreateTable || stmtType == ddl.StatementAlterTable {
 			declaresFK, fkErr := ddl.DeclaresForeignKey(pc.Statement)
 			if fkErr != nil {
-				return nil, false, "", fmt.Errorf("foreign key check for table %s in keyspace %s: %w", pc.TableName, ks, fkErr)
+				return keyspaceDiff{}, fmt.Errorf("foreign key check for table %s in keyspace %s: %w", pc.TableName, ks, fkErr)
 			}
 			if declaresFK {
 				change.ExecutionMode = engine.ExecutionModeBlocked
@@ -296,7 +330,7 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 		if fetchErr != nil {
 			var psErr *ps.Error
 			if !errors.As(fetchErr, &psErr) || psErr.Code != ps.ErrNotFound {
-				return nil, false, "", fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
+				return keyspaceDiff{}, fmt.Errorf("fetch VSchema for keyspace %s: %w", ks, fetchErr)
 			}
 			// Keyspace has no VSchema on this branch yet — either it has
 			// never had one, or the API has not converged after a recent
@@ -320,7 +354,12 @@ func (e *Engine) diffKeyspace(ctx context.Context, client psclient.PSClient, org
 		}
 	}
 
-	return tableChanges, vschemaChanged, currentVSchemaRaw, nil
+	return keyspaceDiff{
+		tableChanges:      tableChanges,
+		violations:        violations,
+		vschemaChanged:    vschemaChanged,
+		currentVSchemaRaw: currentVSchemaRaw,
+	}, nil
 }
 
 // verifyBranchMatchesMain uses Spirit's differ to compare the branch schema
@@ -358,13 +397,13 @@ func (e *Engine) verifyBranchMatchesMain(ctx context.Context, client psclient.PS
 			mainNS.Files[t.Name+".sql"] = t.Schema + ";"
 		}
 
-		changes, _, _, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
+		diff, diffErr := e.diffKeyspace(ctx, client, org, database, branchName, ks, mainNS, branchSchema)
 		if diffErr != nil {
 			return fmt.Errorf("diff branch vs main for %s: %w", ks, diffErr)
 		}
-		if len(changes) > 0 {
+		if len(diff.tableChanges) > 0 {
 			return fmt.Errorf("keyspace %s: branch has %d DDL differences from main after refresh — branch has stale state from a previous apply",
-				ks, len(changes))
+				ks, len(diff.tableChanges))
 		}
 	}
 
@@ -512,20 +551,41 @@ func (e *Engine) createBranch(ctx context.Context, client psclient.PSClient, org
 	return branch, nil
 }
 
-func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClient, org, database, branchName string) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+// branchReadyPollInterval paces the readiness polls while a branch is being
+// prepared. It is a variable so tests can shorten it.
+var branchReadyPollInterval = 2 * time.Second
+
+// branchReadyWait bounds how long an apply waits for one branch to become
+// ready before failing.
+const branchReadyWait = 30 * time.Minute
+
+// waitForBranchReady polls until the branch reports ready. A large sharded
+// database can take many minutes to branch, so the wait reports itself through
+// a waitHeartbeat. The wait is bounded by branchReadyWait, so the heartbeat
+// cannot keep a drive alive indefinitely.
+//
+// The error says which of three things ended the wait, because they call for
+// different recoveries: the caller's context ending (the drive was cancelled),
+// the branch not being found, or the wait running out.
+func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClient, org, database, branchName string, emitEvent func(engine.ApplyEvent)) error {
+	waitCtx, cancel := context.WithTimeout(ctx, branchReadyWait)
 	defer cancel()
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(branchReadyPollInterval)
 	defer ticker.Stop()
+	heartbeat := newWaitHeartbeat(emitEvent, fmt.Sprintf("Waiting for branch %s to be ready", branchName), map[string]string{"branch": branchName})
 
 	var consecutiveErrors int
 	for {
 		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timeout waiting for branch %s", branchName)
+		case <-waitCtx.Done():
+			if ctx.Err() != nil {
+				return fmt.Errorf("stopped waiting for branch %s: %w", branchName, ctx.Err())
+			}
+			return fmt.Errorf("timeout waiting for branch %s after %s", branchName, branchReadyWait)
 		case <-ticker.C:
-			branch, err := client.GetBranch(ctx, &ps.GetDatabaseBranchRequest{
+			heartbeat.beat()
+			branch, err := client.GetBranch(waitCtx, &ps.GetDatabaseBranchRequest{
 				Organization: org,
 				Database:     database,
 				Branch:       branchName,
@@ -545,6 +605,12 @@ func (e *Engine) waitForBranchReady(ctx context.Context, client psclient.PSClien
 			}
 		}
 	}
+}
+
+// isNotFound reports whether err carries a PlanetScale not-found response.
+func isNotFound(err error) bool {
+	var psErr *ps.Error
+	return errors.As(err, &psErr) && psErr.Code == ps.ErrNotFound
 }
 
 func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClient, org, database, branchName, intoBranch string, autoDeleteBranch bool) (*ps.DeployRequest, error) {
@@ -567,6 +633,27 @@ func (e *Engine) createDeployRequest(ctx context.Context, client psclient.PSClie
 		AutoCutover:      false,
 		AutoDeleteBranch: autoDeleteBranch,
 	})
+}
+
+// operatorBranch returns the development branch the operator supplied for this
+// apply, or "" when SchemaBot creates its own. The apply's options are stored
+// with the apply and handed back on every resume, so a fresh drive and a
+// resumed one read the same answer.
+func operatorBranch(options map[string]string) string {
+	return options["branch"]
+}
+
+// deployRequestDeletesBranch reports whether the deploy request should delete
+// its branch once it deploys. Only a branch SchemaBot created is handed to the
+// deploy request for teardown; an operator-supplied branch belongs to the
+// operator and outlives the deploy.
+//
+// Absent options mean SchemaBot created the branch, so the default answer is
+// the destructive one. Callers must pass the apply's stored options as a whole,
+// never a subset built for another purpose: a map that happens to omit
+// "branch" hands an operator's branch to the deploy request for deletion.
+func deployRequestDeletesBranch(options map[string]string) bool {
+	return operatorBranch(options) == ""
 }
 
 // deployRequestCreatedEvent states, on the operator's timeline, the cutover
@@ -721,7 +808,11 @@ func (e *Engine) getDeployRequest(ctx context.Context, client psclient.PSClient,
 // transient-error retry bound, which validation routinely outlives. Transient
 // API errors retry with backoff up to maxRetries. Any other rejection fails
 // immediately.
-func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64, instantDDL bool) (*ps.DeployRequest, error) {
+//
+// The validation wait reports itself through a waitHeartbeat; emitEvent may be
+// nil outside a drive.
+func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClient, org, database string, number uint64, instantDDL bool, emitEvent func(engine.ApplyEvent)) (*ps.DeployRequest, error) {
+	heartbeat := newWaitHeartbeat(emitEvent, fmt.Sprintf("Waiting for PlanetScale to finish validating deploy request #%d", number), nil)
 	var validationDeadline time.Time
 	validationWaitLogged := false
 	transientAttempts := 0
@@ -745,6 +836,7 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 			if validationDeadline.IsZero() {
 				validationDeadline = time.Now().Add(deployValidationWait)
 			}
+			heartbeat.beat()
 			if time.Now().After(validationDeadline) {
 				return nil, fmt.Errorf("deploy deploy request #%d: PlanetScale was still validating the deploy request after waiting %s: %w", number, deployValidationWait, err)
 			}
@@ -785,7 +877,20 @@ func (e *Engine) deployDeployRequest(ctx context.Context, client psclient.PSClie
 // deploy request number is held in a local so a transient poll error never
 // dereferences a nil deploy request, and the poll honors context cancellation so
 // a deploy stuck in pending does not block indefinitely.
-func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclient.PSClient, org, database string, dr *ps.DeployRequest) (*ps.DeployRequest, error) {
+//
+// A poll that fails with a retryable PlanetScale error (a 5xx, a rate limit, a
+// malformed response) is retried on the next tick rather than failing the
+// apply: the deploy request already exists, so giving up here would abandon it
+// on PlanetScale while the caller either fails the apply or forks a fresh
+// request beside it. The tolerance is bounded to maxRetries consecutive
+// failures so an API that stays down still surfaces; a poll that succeeds
+// resets the count. Any other error is returned at once.
+//
+// The wait reports itself through a waitHeartbeat and gives up after
+// deployRequestPendingWait, so a deploy request PlanetScale never finishes
+// diffing fails the apply instead of holding the drive forever. emitEvent may
+// be nil outside a drive.
+func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclient.PSClient, org, database string, dr *ps.DeployRequest, emitEvent func(engine.ApplyEvent)) (*ps.DeployRequest, error) {
 	// A nil deploy request means an upstream caller never created or fetched it;
 	// poll has nothing to track, so surface the invariant violation rather than
 	// dereferencing it below.
@@ -797,17 +902,31 @@ func (e *Engine) waitForDeployRequestPending(ctx context.Context, client psclien
 
 	ticker := time.NewTicker(deployRequestPollInterval)
 	defer ticker.Stop()
+	heartbeat := newWaitHeartbeat(emitEvent, fmt.Sprintf("Waiting for PlanetScale to compute the schema diff of deploy request #%d", number), nil)
+	deadline := time.Now().Add(deployRequestPendingWait)
 
+	consecutiveFailures := 0
 	for dr.DeploymentState == deployState.Pending {
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("context cancelled waiting for deploy request %d: %w", number, ctx.Err())
 		case <-ticker.C:
 		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("deploy request #%d was still pending after %s; PlanetScale did not finish computing its schema diff", number, deployRequestPendingWait)
+		}
+		heartbeat.beat()
 		next, err := e.getDeployRequest(ctx, client, org, database, number)
 		if err != nil {
-			return nil, fmt.Errorf("poll deploy request %d: %w", number, err)
+			consecutiveFailures++
+			if !isRetryablePSError(err) || consecutiveFailures >= maxRetries {
+				return nil, fmt.Errorf("poll deploy request %d: %w", number, err)
+			}
+			e.logger.Warn("transient error polling the pending deploy request; polling again",
+				"database", database, "deploy_request", number, "consecutive_failures", consecutiveFailures, "error", err)
+			continue
 		}
+		consecutiveFailures = 0
 		dr = next
 	}
 	return dr, nil

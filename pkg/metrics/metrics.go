@@ -89,6 +89,25 @@ func recordHistogram(ctx context.Context, name string, value float64, descriptio
 	hist.Record(ctx, value, otelmetric.WithAttributes(attrs...))
 }
 
+// recordCountHistogram records a small integer count into a named
+// Int64Histogram with the given unit and explicit bucket boundaries, logging
+// and skipping if the instrument cannot be created. Counts need their own
+// boundaries: the default duration buckets lump every healthy small count
+// together with the first few degraded ones.
+func recordCountHistogram(ctx context.Context, name string, value int64, description, unit string, boundaries []float64, attrs ...attribute.KeyValue) {
+	meter := otel.Meter(meterName)
+	hist, err := meter.Int64Histogram(name,
+		otelmetric.WithDescription(description),
+		otelmetric.WithUnit(unit),
+		otelmetric.WithExplicitBucketBoundaries(boundaries...),
+	)
+	if err != nil {
+		slog.Warn("failed to create count histogram", "metric", name, "error", err)
+		return
+	}
+	hist.Record(ctx, value, otelmetric.WithAttributes(attrs...))
+}
+
 // recordGauge records value into a named Int64Gauge with the given attributes,
 // logging and skipping if the instrument cannot be created.
 func recordGauge(ctx context.Context, name string, value int64, description, unit string, attrs ...attribute.KeyValue) {
@@ -139,17 +158,22 @@ func RecordPlan(ctx context.Context, repo, database, deployment, environment, st
 	)
 }
 
-// RecordPlanCommentMinimize counts the outcome of retiring one superseded plan
-// comment. Outcomes: "minimized" (hidden on GitHub and marked in storage),
-// "apply_owned" (kept expanded because an apply owns the plan's head),
-// "guard_error" (apply-ownership lookup failed, comment kept expanded fail
-// closed — investigate storage), "minimize_error" (GitHub minimize call
-// failed; retried on the next supersede — investigate GitHub API health),
-// "mark_error" (hidden on GitHub but the storage mark failed; the next
-// supersede re-minimizes it idempotently — investigate storage).
-func RecordPlanCommentMinimize(ctx context.Context, repo, outcome string) {
-	addCounter(ctx, "schemabot.plan_comment_minimize.total",
-		"Total number of superseded plan-comment minimize attempts by outcome", "{comment}",
+// RecordPlanCommentRetirement counts the outcome of retiring one superseded
+// plan comment. Outcomes: "minimized" (hidden on GitHub but still expandable
+// as the record of what was planned), "deleted" (no apply ever acted on the
+// plan and the deployment uses the default delete-based policy, so the comment
+// is removed from the timeline), "apply_owned" (kept fully expanded because an
+// apply owns the plan's head and the deployment opted out to the
+// minimize-based policy),
+// "guard_error" (apply-ownership lookup failed, comment left untouched fail
+// closed — investigate storage), "minimize_error" / "delete_error" (the
+// GitHub call failed; retried on the next supersede — investigate GitHub API
+// health), "minimize_mark_error" / "delete_mark_error" (GitHub succeeded but
+// the storage mark failed; the next supersede retries the mark idempotently —
+// investigate storage).
+func RecordPlanCommentRetirement(ctx context.Context, repo, outcome string) {
+	addCounter(ctx, "schemabot.plan_comment_retirement.total",
+		"Total number of superseded plan-comment retirement attempts by outcome", "{comment}",
 		attribute.String("repository", repo),
 		attribute.String("outcome", outcome),
 	)
@@ -369,17 +393,33 @@ func RecordTransientPlanRetry(ctx context.Context, database, environment, outcom
 
 var knownReviewDriftClassifications = map[string]bool{
 	"match":    true,
+	"planned":  true,
 	"diverged": true,
 	"errored":  true,
 }
 
-// RecordReviewDrift increments the counter for a deployment's review-time drift
-// classification against the reviewed primary plan. A spike with
-// classification="diverged" means a deployment's live schema no longer matches
-// what was reviewed — an operator must reconcile that deployment before the PR
-// can apply. classification="errored" means the deployment could not be diffed
-// or compared and is failing the check closed; investigate connectivity to that
-// deployment or the plan input.
+// KnownReviewDriftClassification reports whether the review-drift counter
+// records a classification under its own label rather than collapsing it into
+// "unknown". It exists so the package that owns the classifications can prove
+// every one of them is recognized here; nothing on a request path needs to ask.
+func KnownReviewDriftClassification(classification string) bool {
+	return knownReviewDriftClassifications[classification]
+}
+
+// RecordReviewDrift increments the counter for a rollout member's review-time
+// classification. A spike with classification="diverged" means a deployment's
+// live schema no longer matches what was reviewed — an operator must reconcile
+// that deployment before the PR can apply. classification="errored" means the
+// member could not be diffed, compared, or planned and is failing the check
+// closed; investigate connectivity to that member or the plan input.
+//
+// classification="planned" is the healthy outcome for a member that holds its
+// own schema: it was planned against that schema and never compared to the
+// primary plan, so it is the independent counterpart of "match" and not a
+// signal to alert on. It has to be listed here rather than left to the unknown
+// bucket, which is reserved for a classification the code emits and this
+// contract does not know about — a coding gap, which normal independent
+// planning is not.
 func RecordReviewDrift(ctx context.Context, database, environment, deployment, classification string) {
 	if !knownReviewDriftClassifications[classification] {
 		// An unrecognized classification is a coding gap, not a drift signal.
@@ -388,7 +428,7 @@ func RecordReviewDrift(ctx context.Context, database, environment, deployment, c
 		classification = "unknown"
 	}
 	addCounter(ctx, "schemabot.review_drift.total",
-		"review-time per-deployment drift classifications against the reviewed primary plan", "{deployment}",
+		"review-time per-member classifications: against the primary target's plan where members mirror it, against the member's own schema where they do not", "{deployment}",
 		attribute.String("database", database),
 		EnvironmentAttribute(environment),
 		attribute.String("deployment", deployment),
@@ -430,33 +470,22 @@ func RecordSourcePolicyBlock(ctx context.Context, operation, database, environme
 	)
 }
 
-// Scope values for RecordStorageSchemaDestructiveRefusal: whether the whole
-// statement was refused or only the destructive clauses split out of a mixed
-// ALTER (whose safe clauses still executed).
-const (
-	StorageSchemaRefusalWhole = "whole"
-	StorageSchemaRefusalSplit = "split"
-)
-
 // RecordStorageSchemaDestructiveRefusal increments the counter for destructive
 // storage-schema DDL statements EnsureSchema refused to execute at startup.
 // A nonzero rate means a starting binary's embedded schema no longer declares
-// a table or column that exists in the storage database — expected briefly
-// from older pods during a rolling deploy or rollback. The scope attribute
-// says whether the safe clauses of the statement still ran: "split" means a
-// mixed ALTER executed its safe clauses and refused only the destructive
-// remainder; "whole" means nothing in the statement ran. Operator action: if
-// the removal is intended and every pod runs a binary without the table or
-// column, set storage.allow_destructive_schema_changes to true for one
-// deploy; otherwise investigate which binary is starting against newer
-// storage state.
-func RecordStorageSchemaDestructiveRefusal(ctx context.Context, table, operation, scope string) {
+// a table, column, index, or constraint that exists in the storage database —
+// expected briefly from older pods during a rolling deploy or rollback. The
+// refused statement did not run at all, so the count is a count of statements
+// the storage schema is still missing. Operator action: if the removal is
+// intended and every pod runs a binary without the object, set
+// storage.allow_destructive_schema_changes to true for one deploy; otherwise
+// investigate which binary is starting against newer storage state.
+func RecordStorageSchemaDestructiveRefusal(ctx context.Context, table, operation string) {
 	addCounter(ctx, "schemabot.storage_schema.destructive_refusals_total",
 		"Total destructive storage-schema DDL statements refused by EnsureSchema", "{statement}",
 		attribute.String("table", table),
 		attribute.String("operation", operation),
-		attribute.String("scope", scope),
-		// The storage-schema bootstrap precedes any schema-change
+		// The storage-schema bootstrap precedes any schema change
 		// environment, so the counter carries the canonical unknown value.
 		EnvironmentAttribute(""),
 	)
@@ -487,6 +516,8 @@ var knownPRCommandActorAuthReasons = map[string]bool{
 	"disabled":                true,
 	"allowed_admin_team":      true,
 	"allowed_admin_user":      true,
+	"allowed_repo_admin_team": true,
+	"allowed_repo_admin_user": true,
 	"allowed_operator_team":   true,
 	"allowed_operator_user":   true,
 	"missing_actor":           true,
@@ -542,6 +573,9 @@ var knownDirectWriteAuthOperations = map[string]bool{
 	"checks_repos":       true,
 	"webhook_redrive":    true,
 	"settings_set":       true,
+
+	"storage_schema_plan":  true,
+	"storage_schema_apply": true,
 }
 
 var knownDirectWriteAuthStatuses = map[string]bool{
@@ -552,6 +586,7 @@ var knownDirectWriteAuthStatuses = map[string]bool{
 
 var knownDirectWriteAuthReasons = map[string]bool{
 	"scoped_lane_disabled":    true,
+	"target_unresolved":       true,
 	"admin_allow":             true,
 	"scoped_allow":            true,
 	"missing_identity":        true,
@@ -610,6 +645,27 @@ func RecordAuthDecision(ctx context.Context, tier, decision, reason string) {
 		attribute.String("tier", tier),
 		attribute.String("decision", decision),
 		attribute.String("reason", reason),
+	)
+}
+
+// RecordRateLimitDecision increments the counter for request-budget decisions
+// on the API's rate-limited endpoints. Both outcomes are counted, so the
+// limited rate has a denominator and an operator can see a client approaching
+// its budget before it is turned away.
+//
+// Labels are deliberately fixed sets: endpoint is the route, scope is which
+// budget was consulted (the caller's or the target's), decision is allow/limit,
+// and environment is the target environment of the request. The caller identity
+// and the target database are the useful triage details but there are hundreds
+// of each, so they belong in the log line that accompanies a limited request,
+// not in metric attributes.
+func RecordRateLimitDecision(ctx context.Context, endpoint, scope, decision, environment string) {
+	addCounter(ctx, "schemabot.rate_limit_decisions.total",
+		"Total API request-budget decisions on rate-limited endpoints", "{decision}",
+		attribute.String("endpoint", endpoint),
+		attribute.String("scope", scope),
+		attribute.String("decision", decision),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -776,6 +832,45 @@ func RecordControlOperation(ctx context.Context, operation, database, deployment
 	)
 }
 
+// RecordTargetClientEviction counts data-plane client generations the target
+// router replaced, by reason. A rotated credential surfaces as `dsn_changed`
+// once per route and namespace, so a rate on one environment far above its
+// rotation cadence means a resolver is returning an unstable DSN and the
+// router is rebuilding clients on every request; the paired info log names
+// the target and both connection identity hashes. Target is omitted to bound
+// cardinality.
+func RecordTargetClientEviction(ctx context.Context, databaseType, environment, reason string) {
+	addCounter(ctx, "schemabot.target.client_evictions.total",
+		"Target router client generations replaced, by reason", "{eviction}",
+		attribute.String("database_type", databaseType),
+		EnvironmentAttribute(environment),
+		attribute.String("reason", reason),
+	)
+}
+
+// RecordTargetProbe increments startup connectivity probe outcomes. Target is
+// omitted to bound cardinality; the paired log names it.
+func RecordTargetProbe(ctx context.Context, databaseType, environment, outcome string) {
+	addCounter(ctx, "schemabot.target.probe.total",
+		"Startup connectivity probes of enumerated targets, by outcome", "{probe}",
+		attribute.String("database_type", databaseType),
+		EnvironmentAttribute(environment),
+		attribute.String("outcome", outcome),
+	)
+}
+
+// RecordTargetAuthRetry counts bounded target authentication recovery attempts.
+func RecordTargetAuthRetry(ctx context.Context, operation, databaseType, environment, classification, outcome string) {
+	addCounter(ctx, "schemabot.target.auth_retries.total",
+		"Single automatic retries of routed reads after an authentication-classified target failure, by outcome", "{retry}",
+		attribute.String("operation", operation),
+		attribute.String("database_type", databaseType),
+		EnvironmentAttribute(environment),
+		attribute.String("classification", classification),
+		attribute.String("outcome", outcome),
+	)
+}
+
 // RecordRemoteControlRequestStale counts retransmissions of a durable
 // stop/cancel control request that the data plane accepted but has not
 // consumed within the stale threshold. A non-zero rate means an accepted
@@ -893,10 +988,34 @@ func RecordEngineTerminalTruthReconcile(ctx context.Context, database, deploymen
 //     sustained rate means new applies are repeatedly dispatched against a
 //     target that already has actively driven work — check who is submitting
 //     the duplicates.
+//   - "fresh_operation_lease": a live drive holds the lease of the operation
+//     that owns the task, even though the apply's own lease reads stale, so
+//     the local engine probe was skipped and the live drive stays
+//     authoritative. Read it the same way as "fresh_lease".
+//   - "operation_lease_unreadable": the lease of the operation that owns the
+//     task could not be read, so a live drive could not be ruled out and the
+//     task kept blocking. Any sustained rate is a storage problem, not a
+//     workload one.
 //   - "foreign_terminal_report": the lease is stale and this process's engine
 //     memory reports terminal, but the lease was last held by another process,
 //     so the report was refused. Driver stale-claim recovery settles the task;
 //     investigate if the same task repeats here without converging.
+//   - "unattributed_terminal_report": this process's engine memory reports
+//     terminal for an in-flight task, but the apply records no lease holder
+//     (its lease was released, or its work runs under an operation lease), so
+//     the report cannot be attributed to this process and was refused. The
+//     driver that claims the apply or its operation settles the task;
+//     investigate if the same task repeats here without converging.
+//   - "terminal_report_other_table": this process's engine memory reports
+//     terminal for tables that do not include the in-flight task's, so the
+//     report is a later run's on the same database and was refused. The driver
+//     that owns the task settles it; investigate if the same task repeats here
+//     without converging.
+//   - "unattributed_no_active_report": this process's engine memory reports no
+//     active work for an in-flight task, but the apply records no lease holder,
+//     so the report cannot distinguish abandoned work from work driven under an
+//     operation lease. The task remains blocking until its driver or the elected
+//     reaper settles it.
 //   - "pending_control_request": a stopped task's apply carries an operator
 //     command a driver has not delivered yet, so the task still holds its
 //     database. A sustained rate means commands are queued but not being
@@ -927,6 +1046,32 @@ func RecordPlanetScaleUnclassifiedCancelRejection(ctx context.Context, database,
 		"Total PlanetScale cancel rejections observed in a deployment state with no explicit classification", "{rejection}",
 		attribute.String("database", database),
 		attribute.String("deployment_state", deploymentState),
+	)
+}
+
+// RecordUnrecognizedEngineTaskStatus counts engine- or data-plane-reported
+// task statuses that have no mapping in pkg/state. An unknown status
+// normalizes to Running so the work stays visible and blocking, but that
+// fallback is a guess: every surface renders the affected work as Running
+// regardless of what the engine is actually doing. A sustained rate here means
+// an engine or data-plane version introduced a status SchemaBot cannot
+// classify — add an explicit mapping in pkg/state.
+//
+// Which status went unmapped is deliberately not an attribute. The value is
+// engine-controlled text, so a status carrying variable data — a host name, an
+// identifier, an error tail — would mint a series per sighting, and this
+// counter fires only when there is a mapping gap: exactly the moment a
+// cardinality explosion would land on top of an incident. The paired drive
+// warn carries the raw status alongside the task identifiers, deduped per task
+// and status, so triage reads the status from the log while the counter stays
+// alertable on a bounded set of dimensions.
+func RecordUnrecognizedEngineTaskStatus(ctx context.Context, database, databaseType, engineName, environment string) {
+	addCounter(ctx, "schemabot.engine.unrecognized_task_status_total",
+		"Total engine- or data-plane-reported task statuses with no task-state mapping, rendered as Running by the fail-open default", "{status}",
+		attribute.String("database", database),
+		attribute.String("database_type", databaseType),
+		attribute.String("engine", engineName),
+		EnvironmentAttribute(environment),
 	)
 }
 
@@ -1149,7 +1294,12 @@ var knownOperatorClaimFailureReasons = map[string]bool{
 	"operation_parent_missing":                 true,
 	"operation_parent_claim_error":             true,
 	"operation_parent_not_claimable":           true,
+	"operation_parent_release_error":           true,
 	"operation_lease_release_error":            true,
+	"operation_lease_recheck_error":            true,
+	"operation_lease_recheck_missing":          true,
+	"operation_lease_rotated":                  true,
+	"operation_lease_released_by_peer":         true,
 	"missing_operation_deployment":             true,
 	"stop_reconciliation_claim_error":          true,
 	"stop_reconciliation_missing_lease_token":  true,
@@ -1290,6 +1440,7 @@ var knownRecoveredPanicOperations = map[string]bool{
 	"summary_reconciliation": true,
 	"observer_poll":          true,
 	"grpc_handler":           true,
+	"target_probe":           true,
 }
 
 // RecordRecoveredPanic increments the recovered-panic counter for a background
@@ -1397,6 +1548,7 @@ const (
 	GitHubOperationCreateCheckRun                = "create_check_run"
 	GitHubOperationCreateIssueComment            = "create_issue_comment"
 	GitHubOperationCreateInstallationAccessToken = "create_installation_access_token"
+	GitHubOperationDeleteIssueComment            = "delete_issue_comment"
 	GitHubOperationEditIssueComment              = "edit_issue_comment"
 	GitHubOperationFetchAppSlug                  = "fetch_app_slug"
 	GitHubOperationFetchBlob                     = "fetch_blob"
@@ -1595,6 +1747,7 @@ func isKnownGitHubOperation(operation string) bool {
 		GitHubOperationCreateCheckRun,
 		GitHubOperationCreateIssueComment,
 		GitHubOperationCreateInstallationAccessToken,
+		GitHubOperationDeleteIssueComment,
 		GitHubOperationEditIssueComment,
 		GitHubOperationFetchAppSlug,
 		GitHubOperationFetchBlob,
@@ -2024,6 +2177,41 @@ func RecordWebhookCheckSuiteRecovery(ctx context.Context, repo string, outcome s
 		attribute.String("outcome", outcome))
 }
 
+// RecordWebhookReconcileScanTruncated counts reconcile passes whose
+// missing-delivery scan ran out of page budget before reaching the lookback
+// cutoff for a repository. The scan resumes from its persisted cursor next
+// pass, so occasional truncation on a busy repository is expected and heals;
+// a sustained rate combined with high reconcile_scan_cycle_passes means the
+// page budget is too small for the repository's open-PR volume — raise the
+// budget with WEBHOOK_RECONCILE_MAX_PAGES or shorten the lookback with
+// WEBHOOK_RECONCILE_LOOKBACK so the backstop covers its window promptly.
+func RecordWebhookReconcileScanTruncated(ctx context.Context, repo string) {
+	addCounter(ctx, "schemabot.webhook.reconcile_scan_truncated_total",
+		"Total number of reconcile passes whose missing-delivery scan was truncated by the page budget", "{pass}",
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
+// webhookReconcileScanCyclePassBoundaries buckets the pass count of a scan
+// cycle so the healthy single-pass cycle, a cycle that needed a few passes,
+// and a chronically truncated cycle land in different buckets.
+var webhookReconcileScanCyclePassBoundaries = []float64{1, 2, 3, 5, 8, 13, 21}
+
+// RecordWebhookReconcileScanCycleCompleted records how many reconcile passes
+// one full missing-delivery scan cycle took to reach the lookback cutoff for
+// a repository. One pass is the healthy case; a growing pass count means the
+// scan is chronically truncated and recovery of lost deliveries deep in the
+// listing is delayed by roughly passes × reconcile interval — the bound to
+// alert on when delivery-gap healing must complete within a target time. The
+// remedies are the same as for reconcile_scan_truncated_total.
+func RecordWebhookReconcileScanCycleCompleted(ctx context.Context, repo string, passes int64) {
+	recordCountHistogram(ctx, "schemabot.webhook.reconcile_scan_cycle_passes", passes,
+		"Reconcile passes needed for one full missing-delivery scan cycle to reach the lookback cutoff", "{pass}",
+		webhookReconcileScanCyclePassBoundaries,
+		EnvironmentAttribute(""),
+		attribute.String("repository", repo))
+}
+
 // RecordWebhookReconcileStuckTerminated counts webhook inbox rows the
 // reconciler terminated because they were parked in processing with an expired
 // lease at the attempt cap — a driver hard-killed on its final attempt. A
@@ -2157,22 +2345,28 @@ func RecordDropTableAlreadyAbsent(ctx context.Context, database string) {
 // completed, failed, or stopped; refused statements the policy does not route
 // directly are blocked with the reason encoded in the outcome.
 var knownDirectExecutionOutcomes = map[string]bool{
-	"completed":               true,
-	"failed":                  true,
-	"stopped":                 true,
-	"blocked_policy_disabled": true,
-	"blocked_size_limit":      true,
-	"blocked_size_unknown":    true,
+	"completed":                      true,
+	"failed":                         true,
+	"stopped":                        true,
+	"blocked_policy_disabled":        true,
+	"blocked_size_limit":             true,
+	"blocked_size_unknown":           true,
+	"blocked_force_kill_unavailable": true,
+	"blocked_force_kill_unknown":     true,
 }
 
 // RecordDirectExecution increments the counter for a statement the
-// schema-change engine refused and the direct execution policy resolved — to a
+// schema change engine refused and the direct execution policy resolved — to a
 // native MySQL DDL execution (completed/failed/stopped) or to a block
 // (blocked_*). Direct executions are rare, operator-consented events: a spike
 // in failed means native DDL is erroring on the target (check the apply logs
 // for the statement and MySQL error), and a spike in blocked_size_unknown
 // means row estimates are unavailable (check target connectivity and
-// information_schema access).
+// information_schema access). blocked_force_kill_unavailable means the target
+// user lacks a grant the kill needs (grant SELECT on performance_schema.*,
+// PROCESS, and CONNECTION_ADMIN or SUPER, or on RDS EXECUTE on mysql.rds_kill);
+// blocked_force_kill_unknown means checking those grants failed (check target
+// connectivity).
 func RecordDirectExecution(ctx context.Context, database, outcome string) {
 	if !knownDirectExecutionOutcomes[outcome] {
 		outcome = "unknown"

@@ -69,6 +69,8 @@ func storedTestPlans(now time.Time) []*storage.Plan {
 			PlanIdentifier: "plan-100",
 			Database:       "commerce",
 			DatabaseType:   storage.DatabaseTypeVitess,
+			Deployment:     "commerce-a",
+			Target:         "commerce-001",
 			Environment:    "production",
 			CreatedAt:      now.Add(-time.Minute),
 			Namespaces: map[string]*storage.NamespacePlanData{
@@ -213,6 +215,11 @@ func TestPlanGetHandler(t *testing.T) {
 	assert.Equal(t, "commerce", resp.Database)
 	require.NotNil(t, resp.Plan)
 	assert.Equal(t, storage.EnginePlanetScale, resp.Plan.Engine)
+	// A member is the deployment and the target together, so a stored plan must
+	// report both halves of the member it was created against. The deployment on
+	// its own would name the member addressing the unnamed target.
+	assert.Equal(t, "commerce-a", resp.Plan.Deployment)
+	assert.Equal(t, "commerce-001", resp.Plan.Target)
 	require.Len(t, resp.Plan.Changes, 1)
 
 	change := resp.Plan.Changes[0]
@@ -228,6 +235,126 @@ func TestPlanGetHandler(t *testing.T) {
 	assert.Equal(t, "-80", resp.Plan.Shards[0].Shard)
 	require.Len(t, resp.Plan.Shards[0].Changes, 1)
 	assert.Equal(t, "carts", resp.Plan.Shards[0].Changes[0].TableName)
+}
+
+// A stored Vitess plan shows the VSchema diff it was reviewed with, so
+// reading the plan back later shows the same routing change the PR comment
+// did. A plan recorded without a diff still reads as changing its VSchema.
+func TestPlanGetHandlerCarriesTheRecordedVSchemaDiff(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	const diff = "--- a/commerce.json\n+++ b/commerce.json\n+    \"carts_seq\": {\n+      \"type\": \"sequence\"\n+    },\n"
+	cases := []struct {
+		name     string
+		metadata map[string]string
+		wantDiff string
+	}{
+		{
+			name:     "diff recorded at plan time",
+			metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDiff: diff},
+			wantDiff: diff,
+		},
+		{
+			name:     "no diff recorded",
+			metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			wantDiff: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := storedTestPlans(now)[1]
+			plan.Namespaces["commerce"].Metadata = tc.metadata
+			mux := newPlansTestServer(t, &mockPlanLookupStore{plan: plan})
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/plans/plan-100", nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var resp apitypes.StoredPlanResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			require.NotNil(t, resp.Plan)
+			require.Len(t, resp.Plan.Changes, 1)
+			change := resp.Plan.Changes[0]
+			assert.True(t, change.ShowsVSchemaChange(), "a stored VSchema change must still show as one")
+			assert.Equal(t, tc.wantDiff, change.Metadata[apitypes.VSchemaDiffMetadataKey])
+		})
+	}
+}
+
+// A stored plan narrowed to one rollout member reads back as narrowed, so it
+// is never mistaken for a plan of the whole rollout; a plan of the whole
+// rollout reads back with no narrowing.
+func TestPlanGetHandlerCarriesNarrowing(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	cases := []struct {
+		name       string
+		narrowedTo string
+	}{
+		{name: "narrowed to one member", narrowedTo: "commerce-a/commerce-001"},
+		{name: "whole rollout", narrowedTo: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := storedTestPlans(now)[1]
+			plan.NarrowedTo = tc.narrowedTo
+			mux := newPlansTestServer(t, &mockPlanLookupStore{plan: plan})
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/plans/plan-100", nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var resp apitypes.StoredPlanResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			require.NotNil(t, resp.Plan)
+			assert.Equal(t, tc.narrowedTo, resp.Plan.NarrowedTo)
+		})
+	}
+}
+
+// A stored plan's per-table size estimates survive the read path, so a plan
+// fetched later reports the same sizes as the response that planned it.
+func TestPlanGetHandlerCarriesStoredSizeEstimates(t *testing.T) {
+	rows, largest, sizeBytes := int64(13_100_000), int64(3_400_000), int64(6_200_000_000)
+	plan := &storage.Plan{
+		PlanIdentifier: "plan-sized",
+		Database:       "commerce",
+		DatabaseType:   storage.DatabaseTypeVitess,
+		Environment:    "production",
+		CreatedAt:      time.Now().UTC().Truncate(time.Second),
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{{
+				Table:            "carts",
+				DDL:              "ALTER TABLE `carts` ADD INDEX `idx_note`(`note`);",
+				Operation:        "alter",
+				EstimatedRows:    &rows,
+				LargestShardRows: &largest,
+				EstimatedBytes:   &sizeBytes,
+				ShardCount:       4,
+			}}},
+		},
+	}
+	mux := newPlansTestServer(t, &mockPlanLookupStore{plan: plan})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/plans/plan-sized", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.StoredPlanResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	require.NotNil(t, resp.Plan)
+	require.Len(t, resp.Plan.Changes, 1)
+	require.Len(t, resp.Plan.Changes[0].TableChanges, 1)
+	change := resp.Plan.Changes[0].TableChanges[0]
+	require.NotNil(t, change.EstimatedRows)
+	assert.Equal(t, rows, *change.EstimatedRows)
+	require.NotNil(t, change.LargestShardRows)
+	assert.Equal(t, largest, *change.LargestShardRows)
+	require.NotNil(t, change.EstimatedBytes)
+	assert.Equal(t, sizeBytes, *change.EstimatedBytes)
+	assert.Equal(t, 4, change.ShardCount)
 }
 
 // TestPlanGetHandlerDistinguishesMissingFromStorageError verifies the two

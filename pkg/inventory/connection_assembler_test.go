@@ -4,7 +4,7 @@ import (
 	"net/url"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -210,7 +210,7 @@ func TestVitessConnectionAssemblerCustomDatabaseAttribute(t *testing.T) {
 
 // The PlanetScale database name attribute is required: without it every API
 // call would fall back to addressing the database by its registered
-// identifier, which is an arbitrary routing key rather than a PlanetScale name.
+// identifier, which is an arbitrary routing key rather than a PlanetScale name. sadscan:disable kingfisher.planetscale.2
 func TestVitessConnectionAssemblerRequiresDatabase(t *testing.T) {
 	_, _, err := VitessConnectionAssembler{}.Assemble(
 		"",
@@ -339,7 +339,7 @@ func TestPostgresConnectionAssemblerBuildsLibpqURL(t *testing.T) {
 		&Credentials{Username: "pgsprite_engine", Password: "s3cret"},
 	)
 	require.NoError(t, err)
-	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn)
+	assert.Equal(t, "postgresql://pgsprite_engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", dsn) // sadscan:disable np.postgres.1
 	assert.Equal(t, map[string]string{
 		"extra":               "field",
 		MetadataPostgresCARef: PostgresCARefEmbeddedRDSGlobal,
@@ -571,4 +571,105 @@ func TestPostgresConnectionAssemblerRequiredInputs(t *testing.T) {
 
 	_, _, err = a.Assemble("db.example.rds.amazonaws.com", nil, creds)
 	assert.ErrorContains(t, err, `requires the "dbname" endpoint attribute`)
+}
+
+// ConnectionMetadataKeys is complete for every assembler: with no configured
+// pass-through metadata, the keys an assembler writes from the resolved
+// endpoint and credentials are exactly the keys listed for its database type,
+// so a comparison of two resolutions over those keys misses no field that
+// changes what the client reaches or authenticates as.
+func TestConnectionMetadataKeysCoverEveryAssembledKey(t *testing.T) {
+	cases := []struct {
+		name      string
+		assembler ConnectionAssembler
+		host      string
+		attrs     map[string]string
+		creds     *Credentials
+	}{
+		{
+			name:      "mysql",
+			assembler: MySQLConnectionAssembler{DefaultPort: "3306"},
+			host:      "orders.example",
+			creds:     &Credentials{Username: "ddl", Password: "secret"},
+		},
+		{
+			name:      "vitess",
+			assembler: VitessConnectionAssembler{APIURL: "https://localscale.test"},
+			attrs:     map[string]string{MetadataOrganization: "acme", DefaultDatabaseAttribute: "acme_main"},
+			creds:     &Credentials{Metadata: map[string]string{MetadataTokenName: "tok-id", MetadataTokenValue: "tok-secret"}},
+		},
+		{
+			name:      "postgres",
+			assembler: PostgresConnectionAssembler{DefaultPort: "5432"},
+			host:      "orders.cluster-abc.us-east-1.rds.amazonaws.com",
+			attrs:     map[string]string{PostgresDBNameAttribute: "orders"},
+			creds:     &Credentials{Username: "ddl", Password: "secret"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, meta, err := tc.assembler.Assemble(tc.host, tc.attrs, tc.creds)
+			require.NoError(t, err)
+			assembled := make([]string, 0, len(meta))
+			for key := range meta {
+				assembled = append(assembled, key)
+			}
+			assert.ElementsMatch(t, ConnectionMetadataKeys(tc.assembler.DatabaseType()), assembled,
+				"every key the assembler writes is a connection identity key, and every listed key is written")
+		})
+	}
+}
+
+// An inventory that records no database name still resolves when the
+// credential secret names the database, as AWS RDS database secrets do.
+func TestPostgresConnectionAssemblerDatabaseNameSources(t *testing.T) {
+	host := "orders.cluster-abc.us-east-1.rds.amazonaws.com"
+	fromSecret := &Credentials{Username: "ddl", Password: "secret", Metadata: map[string]string{MetadataPostgresDBName: "orders"}}
+
+	dsn, _, err := PostgresConnectionAssembler{}.Assemble(host, nil, fromSecret)
+	require.NoError(t, err)
+	assert.Equal(t, "postgresql://ddl:secret@"+host+"/orders?sslmode=verify-full", dsn) // sadscan:disable np.postgres.1
+
+	// The same name from both sources is not a conflict.
+	_, _, err = PostgresConnectionAssembler{}.Assemble(host, map[string]string{PostgresDBNameAttribute: "orders"}, fromSecret)
+	require.NoError(t, err)
+}
+
+// A target whose inventory and credential secret name different databases is
+// ambiguous: connecting to either could run a schema change against the wrong
+// database, so assembly fails and names both values.
+func TestPostgresConnectionAssemblerRejectsConflictingDatabaseNames(t *testing.T) {
+	creds := &Credentials{Username: "ddl", Password: "secret", Metadata: map[string]string{MetadataPostgresDBName: "orders"}}
+	_, _, err := PostgresConnectionAssembler{}.Assemble(
+		"orders.cluster-abc.us-east-1.rds.amazonaws.com",
+		map[string]string{PostgresDBNameAttribute: "billing"},
+		creds,
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ambiguous")
+	assert.Contains(t, err.Error(), `"billing"`)
+	assert.Contains(t, err.Error(), `"orders"`)
+}
+
+func TestDecodePostgresSecret(t *testing.T) {
+	creds, err := DecodePostgresSecret(`{"username":"ddl","password":"secret","engine":"postgres","host":"elsewhere.example","port":5432,"dbname":"orders"}`)
+	require.NoError(t, err)
+	// host and port are ignored: the inventory endpoint decides where to connect.
+	assert.Equal(t, &Credentials{Username: "ddl", Password: "secret", Metadata: map[string]string{MetadataPostgresDBName: "orders"}}, creds)
+
+	creds, err = DecodePostgresSecret(`{"username":"ddl","password":"secret"}`)
+	require.NoError(t, err)
+	assert.Equal(t, &Credentials{Username: "ddl", Password: "secret"}, creds)
+
+	for name, raw := range map[string]string{
+		"plain password":   "hunter2",
+		"missing username": `{"password":"hunter2","dbname":"orders"}`,
+		"missing password": `{"username":"ddl","dbname":"orders"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := DecodePostgresSecret(raw)
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "hunter2", "the decode error must not echo the password")
+		})
+	}
 }

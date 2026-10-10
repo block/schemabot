@@ -1,10 +1,37 @@
 package templates
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestWriteEngineReasonItem(t *testing.T) {
+	single := "planner refused the statement; rewrite the column type"
+	var sb strings.Builder
+	writeEngineReasonItem(&sb, "`users`", single)
+	assert.Equal(t, "- `users`: "+single+"\n", sb.String())
+
+	multiple := engine.JoinBlockedCauses([]string{single, "table exceeds the native-safe size ceiling; use an online path"})
+	sb.Reset()
+	writeEngineReasonItem(&sb, "`users`", multiple)
+	assert.Equal(t, "- `users`: "+single+"\n  - table exceeds the native-safe size ceiling; use an online path\n", sb.String())
+
+	// A reason made only of characters the sanitizer strips is empty for
+	// rendering purposes: the table line stands alone rather than ending in a
+	// colon with nothing after it.
+	sb.Reset()
+	writeEngineReasonItem(&sb, "`users`", "\u200b\u202e")
+	assert.Equal(t, "- `users`\n", sb.String())
+
+	// The same applies per cause: a stripped-to-empty second cause is dropped
+	// rather than rendered as an empty nested bullet.
+	sb.Reset()
+	writeEngineReasonItem(&sb, "`users`", engine.JoinBlockedCauses([]string{single, "\u200b"}))
+	assert.Equal(t, "- `users`: "+single+"\n", sb.String())
+}
 
 // A statement the engine refuses is disclosed in its own ⛔ section, naming the
 // table and the engine's reason verbatim, separate from unsafe warnings. Unlike
@@ -24,7 +51,7 @@ func TestRenderPlanComment_BlockedShownOnPlanAndApply(t *testing.T) {
 	}
 
 	plan := RenderPlanComment(data)
-	assert.Contains(t, plan, "⛔ **Cannot apply**: 1 change the schema-change engine refuses to execute")
+	assert.Contains(t, plan, "⛔ **Cannot apply**: 1 change the engine refuses to execute")
 	assert.Contains(t, plan, "`users`: dropping primary key is not supported")
 	assert.Contains(t, plan, "An apply will fail on these statements.")
 
@@ -81,7 +108,7 @@ func TestRenderPlanComment_BlockedForeignKey(t *testing.T) {
 		},
 	})
 
-	assert.Contains(t, out, "⛔ **Cannot apply**: 1 change the schema-change engine refuses to execute")
+	assert.Contains(t, out, "⛔ **Cannot apply**: 1 change the engine refuses to execute")
 	assert.Contains(t, out, "`orders`: adding foreign key constraints is not supported")
 	assert.Contains(t, out, "An apply will fail on these statements.")
 }

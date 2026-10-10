@@ -2,8 +2,10 @@ package ddl
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
+	"github.com/block/spirit/pkg/dbconn/sqlescape"
 	"github.com/block/spirit/pkg/parser"
 	"github.com/block/spirit/pkg/parser/ast"
 	"github.com/block/spirit/pkg/parser/format"
@@ -36,6 +38,11 @@ type StatementParser interface {
 	// cannot hide behind the classification of the first one.
 	Classify(stmt string) (StatementType, string, error)
 
+	// DropTargets reports how many tables, columns and indexes exactly one
+	// statement drops, so operator guidance can name what an application must
+	// stop relying on. Statements that drop nothing report zeros.
+	DropTargets(stmt string) (DropTargets, error)
+
 	// CreateTableColumns returns the declared column names from exactly one
 	// CREATE TABLE statement. Table-level constraints are not columns.
 	CreateTableColumns(stmt string) ([]string, error)
@@ -46,9 +53,55 @@ type StatementParser interface {
 	// name without an error.
 	CreateIndex(stmt string) (indexName, tableName string, unique bool, err error)
 
+	// SynthesizeAddColumn builds an ALTER TABLE ... ADD COLUMN statement for
+	// the named column of exactly one CREATE TABLE statement, carrying the
+	// column's declaration verbatim at the parse-tree level: its type and all
+	// column-level constraints. Table-level constraints (PRIMARY KEY (...),
+	// UNIQUE (...), CHECK (...)) are not part of a column declaration and are
+	// not carried. The result is the parser's normalized rendering of the
+	// synthesized statement, not a textual slice of the input DDL.
+	//
+	// The seam is faithful by design and judges nothing: a NOT NULL column
+	// without a DEFAULT synthesizes exactly as declared even though PostgreSQL
+	// rejects that ALTER on a populated table. Whether the synthesized
+	// statement can be applied is the caller's decision.
+	//
+	// columnName is matched against the parser-folded column name — the
+	// values CreateTableColumns returns — so an unquoted "Email" in the DDL
+	// is found as "email", and only a quoted identifier keeps its case.
+	SynthesizeAddColumn(createTableDDL, columnName string) (string, error)
+
+	// CostScalesWithTableSize reports whether exactly one DDL statement's
+	// execution cost grows with the size of an existing table: an index
+	// build, a table copy or rebuild, or a full-table scan to validate a
+	// constraint. Whether a given ALTER runs as instant DDL is decided by the
+	// server at execution time, so this is a conservative statement-level
+	// judgement: it reports false only for clause shapes that are provably
+	// metadata-only, and true for anything it cannot prove cheap. Statements
+	// that don't touch an existing table's data (CREATE TABLE, DROP TABLE,
+	// ...) report false without an error.
+	CostScalesWithTableSize(stmt string) (bool, error)
+
 	// Canonicalize normalizes a single DDL statement's formatting, returning
 	// the input unchanged when it cannot be parsed.
 	Canonicalize(ddl string) string
+
+	// CanonicalizeUnqualified normalizes a single DDL statement like
+	// Canonicalize and additionally removes the schema qualifier from every
+	// relation the statement names in the schema of the relation it changes,
+	// so the same change rendered against differently named physical schemas
+	// canonicalizes to one form while a reference into any other schema stays
+	// qualified. It is for
+	// comparisons that already key on the relation's namespace separately;
+	// used anywhere else it would conflate relations that differ only by
+	// schema. It returns the input unchanged when it cannot be parsed.
+	CanonicalizeUnqualified(ddl string) string
+}
+
+type DropTargets struct {
+	Tables  int
+	Columns int
+	Indexes int
 }
 
 // defaultParser backs the package-level SplitStatements, ClassifyStatement, and
@@ -74,6 +127,163 @@ func ParserForDialect(dialect schema.Dialect) (StatementParser, error) {
 	}
 }
 
+// CreateSet is a parsed greenfield create set, or a single statement of any
+// type. Statements preserves the parser's statement order.
+type CreateSet struct {
+	Statements []string
+	Type       StatementType
+	Table      string
+}
+
+// StatementType reports the type of Statements[i] as ParseCreateSet admitted
+// it: a lone statement carries its own classification, and every statement
+// after the first in a multi-statement set is a CREATE INDEX, because
+// admission refuses any other shape. Callers read the type from here instead
+// of classifying the statement again.
+func (s CreateSet) StatementType(i int) StatementType {
+	if i == 0 {
+		return s.Type
+	}
+	return StatementCreateIndex
+}
+
+// ParseCreateSet splits and classifies a DDL script, admitting either one
+// statement or a greenfield create set: one CREATE TABLE followed only by
+// CREATE INDEX statements on that same table.
+//
+// Multi-statement create sets are currently a PostgreSQL-parser capability.
+// The MySQL parser classifies CREATE INDEX as ALTER TABLE, so a MySQL script
+// of a CREATE TABLE followed by CREATE INDEX statements is refused at its
+// second statement with that cause.
+func ParseCreateSet(p StatementParser, script string) (CreateSet, error) {
+	statements, err := p.Split(script)
+	if err != nil {
+		return CreateSet{}, fmt.Errorf("split DDL script: %w", err)
+	}
+	if len(statements) == 0 {
+		return CreateSet{}, fmt.Errorf("DDL script contains no statements")
+	}
+
+	firstType, table, err := p.Classify(statements[0])
+	if err != nil && len(statements) == 1 {
+		return CreateSet{}, fmt.Errorf("classify DDL statement: %w", err)
+	}
+	if err != nil {
+		return CreateSet{}, fmt.Errorf("classify statement 1 of %d in multi-statement DDL script: %w", len(statements), err)
+	}
+	result := CreateSet{Statements: statements, Type: firstType, Table: table}
+	if len(statements) == 1 {
+		return result, nil
+	}
+
+	if firstType != StatementCreateTable {
+		return CreateSet{}, fmt.Errorf("statement 1 is %s; a multi-statement DDL script must start with CREATE TABLE", firstType)
+	}
+	createTarget, err := createSetRelation(p, statements[0], table)
+	if err != nil {
+		return CreateSet{}, fmt.Errorf("identify CREATE TABLE target: %w", err)
+	}
+	for i, stmt := range statements[1:] {
+		stmtType, indexTable, err := p.Classify(stmt)
+		if err != nil {
+			return CreateSet{}, fmt.Errorf("classify statement %d in multi-statement DDL script: %w", i+2, err)
+		}
+		if stmtType != StatementCreateIndex {
+			return CreateSet{}, fmt.Errorf("statement %d is %s; a multi-statement DDL script must be a CREATE TABLE followed only by CREATE INDEX statements on that table", i+2, stmtType)
+		}
+		indexTarget, err := createSetRelation(p, stmt, indexTable)
+		if err != nil {
+			return CreateSet{}, fmt.Errorf("identify statement %d index target: %w", i+2, err)
+		}
+		if indexTarget.qualified() != createTarget.qualified() {
+			return CreateSet{}, fmt.Errorf("statement %d creates an index on %s while CREATE TABLE targets %s; a create set cannot resolve an unqualified name against a search_path, so both must name the schema the same way", i+2, indexTarget, createTarget)
+		}
+		if indexTarget != createTarget {
+			return CreateSet{}, fmt.Errorf("statement %d creates an index on table %s, not CREATE TABLE target %s", i+2, indexTarget, createTarget)
+		}
+	}
+	return result, nil
+}
+
+// relationIdentity is the parsed (schema, name) pair naming a relation. The
+// two parts are compared as a pair, never as one joined string, so a relation
+// whose bare name contains a dot can never be mistaken for a schema-qualified
+// one. Schema is empty when the statement did not qualify the name.
+type relationIdentity struct {
+	Schema string
+	Name   string
+}
+
+func (r relationIdentity) qualified() bool { return r.Schema != "" }
+
+// String renders the identity for error messages, quoting each part so that
+// a dot inside a bare name reads differently from a schema qualifier.
+func (r relationIdentity) String() string {
+	if !r.qualified() {
+		return fmt.Sprintf("%q", r.Name)
+	}
+	return fmt.Sprintf("%q.%q", r.Schema, r.Name)
+}
+
+// createSetRelationParser is implemented by a StatementParser whose grammar
+// carries a schema qualifier on CREATE TABLE and CREATE INDEX targets.
+type createSetRelationParser interface {
+	createSetRelation(stmt string) (relationIdentity, error)
+}
+
+// createSetRelation identifies the relation a create-set statement targets.
+// The identity is taken exactly as written — an unqualified name is never
+// resolved against a search_path — so a create set is only admitted when
+// every statement qualifies its target the same way. Every ParseCreateSet
+// caller today hands it plan-emitted DDL, which the planner qualifies
+// uniformly; an operator-authored set that mixes qualified and unqualified
+// names is refused with a message naming that cause rather than guessed at.
+// A parser without a schema-aware seam falls back to Classify's bare table
+// name, which is the whole identity its grammar can express.
+func createSetRelation(p StatementParser, stmt, classifiedTable string) (relationIdentity, error) {
+	if relationParser, ok := p.(createSetRelationParser); ok {
+		return relationParser.createSetRelation(stmt)
+	}
+	return relationIdentity{Name: classifiedTable}, nil
+}
+
+// CreateTargetQualifier returns the schema qualifier written on a CREATE TABLE
+// or CREATE INDEX statement's target relation, and whether the parser's grammar
+// can carry one at all.
+//
+// The two results are separate on purpose. A parser with no schema-aware seam
+// reports carried=false rather than an empty qualifier, so a caller can never
+// read "this grammar cannot tell me" as "the statement named no schema" — which
+// is the reading that turns a missing capability into a silent pass. Classify
+// returns the bare relation name by contract, so a caller that compares only
+// that name accepts a statement targeting an entirely different relation.
+//
+// The qualifier is reported exactly as written and is never resolved against a
+// search_path, because the parser has no session to resolve it against.
+func CreateTargetQualifier(p StatementParser, stmt string) (qualifier string, carried bool, err error) {
+	relationParser, ok := p.(createSetRelationParser)
+	if !ok {
+		return "", false, nil
+	}
+	identity, err := relationParser.createSetRelation(stmt)
+	if err != nil {
+		return "", true, err
+	}
+	return identity.Schema, true, nil
+}
+
+// CreateSetStatements has the same admission rules as ParseCreateSet. It is
+// retained for callers that need only the split statements. Multi-statement
+// create sets are a PostgreSQL-parser capability; see ParseCreateSet for why
+// the MySQL parser refuses them.
+func CreateSetStatements(p StatementParser, script string) ([]string, error) {
+	createSet, err := ParseCreateSet(p, script)
+	if err != nil {
+		return nil, err
+	}
+	return createSet.Statements, nil
+}
+
 // tidbStatementParser implements StatementParser over the TiDB parser via
 // Spirit's statement package — the behavior pkg/ddl has always had.
 type tidbStatementParser struct{}
@@ -90,12 +300,16 @@ func (tidbStatementParser) Split(content string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse SQL statements %q: %w", statementPreview(content), err)
 	}
-	var stmts []string
-	for _, s := range parsed {
-		stmt := strings.TrimSpace(s.Statement)
-		if stmt != "" {
-			stmts = append(stmts, stmt)
+	stmts := make([]string, 0, len(parsed))
+	for i, s := range parsed {
+		// Each parsed entry is its own statement, so a node with no text
+		// would be a statement silently missing from the output. Callers plan
+		// and lint from this list, so that is an error rather than a skip.
+		stmt := strings.TrimSpace((*s.StmtNode).Text())
+		if stmt == "" {
+			return nil, fmt.Errorf("statement %d of %q parsed with no text", i+1, statementPreview(content))
 		}
+		stmts = append(stmts, stmt)
 	}
 	return stmts, nil
 }
@@ -118,6 +332,34 @@ func (tidbStatementParser) Classify(stmt string) (StatementType, string, error) 
 	return statementTypeFromSpirit(results[0].Type), results[0].Table, nil
 }
 
+func (tidbStatementParser) DropTargets(stmt string) (DropTargets, error) {
+	parsed, err := statement.New(stmt)
+	if err != nil {
+		return DropTargets{}, fmt.Errorf("parse drop targets from statement %q: %w", statementPreview(stmt), err)
+	}
+	if len(parsed) != 1 {
+		return DropTargets{}, fmt.Errorf("expected one statement for drop targets, got %d", len(parsed))
+	}
+
+	// A standalone DROP INDEX arrives here as the ALTER TABLE ... DROP INDEX
+	// Spirit rewrites it into, so the ALTER branch counts both spellings.
+	var targets DropTargets
+	switch node := (*parsed[0].StmtNode).(type) {
+	case *ast.DropTableStmt:
+		targets.Tables = len(node.Tables)
+	case *ast.AlterTableStmt:
+		for _, spec := range node.Specs {
+			switch spec.Tp {
+			case ast.AlterTableDropColumn:
+				targets.Columns++
+			case ast.AlterTableDropIndex:
+				targets.Indexes++
+			}
+		}
+	}
+	return targets, nil
+}
+
 // CreateTableColumns implements StatementParser.
 func (tidbStatementParser) CreateTableColumns(stmt string) ([]string, error) {
 	createTable, err := statement.ParseCreateTable(stmt)
@@ -135,6 +377,110 @@ func (tidbStatementParser) CreateTableColumns(stmt string) ([]string, error) {
 // currently needed only by the PostgreSQL storage bootstrapper.
 func (tidbStatementParser) CreateIndex(string) (string, string, bool, error) {
 	return "", "", false, fmt.Errorf("CREATE INDEX inspection is not supported by the MySQL statement parser")
+}
+
+// SynthesizeAddColumn implements StatementParser. This synthesis operation is
+// currently needed only by the PostgreSQL storage bootstrapper; the MySQL
+// bootstrapper diffs schemas with Spirit instead.
+func (tidbStatementParser) SynthesizeAddColumn(string, string) (string, error) {
+	return "", fmt.Errorf("ADD COLUMN synthesis is not supported by the MySQL statement parser")
+}
+
+// CostScalesWithTableSize implements StatementParser. A standalone CREATE
+// INDEX always scans the table. An ALTER TABLE scales when any clause is not
+// provably metadata-only: index-backed constraint adds build an index, FOREIGN
+// KEY and CHECK adds validate every row, and column type changes, charset
+// conversions, and table-option rebuilds copy the table. Clause shapes MySQL
+// executes on metadata alone — plain column adds, renames, default changes,
+// constraint and index drops, visibility toggles, partition drops and
+// truncations, and comment-only option changes — report false.
+func (tidbStatementParser) CostScalesWithTableSize(stmt string) (bool, error) {
+	p := parser.New()
+	stmtNodes, _, err := p.Parse(stmt, "", "")
+	if err != nil {
+		return false, fmt.Errorf("parse statement %q: %w", statementPreview(stmt), err)
+	}
+	if len(stmtNodes) != 1 {
+		return false, fmt.Errorf(
+			"expected a single statement but %q parsed as %d statements; split with SplitStatements first",
+			statementPreview(stmt), len(stmtNodes),
+		)
+	}
+	switch node := stmtNodes[0].(type) {
+	case *ast.CreateIndexStmt:
+		return true, nil
+	case *ast.AlterTableStmt:
+		if slices.ContainsFunc(node.Specs, alterSpecScalesWithTableSize) {
+			return true, nil
+		}
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+// alterSpecScalesWithTableSize reports whether one ALTER TABLE clause forces
+// work proportional to the table's row count. The metadata-only cases are an
+// allowlist: a clause shape this function doesn't recognize is assumed to
+// scale, so a new or exotic clause over-reports size context rather than
+// hiding it on an expensive change.
+//
+// DROP CONSTRAINT is metadata-only whichever constraint it names: MySQL
+// resolves it against the table's CHECK, FOREIGN KEY and UNIQUE constraints,
+// and dropping any of the three is a metadata change.
+func alterSpecScalesWithTableSize(spec *ast.AlterTableSpec) bool {
+	switch spec.Tp { //nolint:exhaustive
+	case ast.AlterTableRenameColumn, ast.AlterTableRenameTable,
+		ast.AlterTableRenameIndex, ast.AlterTableAlterColumn, ast.AlterTableDropIndex,
+		ast.AlterTableDropForeignKey, ast.AlterTableDropCheck,
+		ast.AlterTableDropConstraint, ast.AlterTableIndexInvisible,
+		ast.AlterTableDropPartition, ast.AlterTableTruncatePartition:
+		return false
+	case ast.AlterTableAddPartitions:
+		// ADD PARTITION is two operations sharing one clause type, and the
+		// statement shows which: with partition definitions
+		// (ADD PARTITION (PARTITION p ...), the RANGE/LIST form) it attaches
+		// a new empty partition on metadata alone, while without them
+		// (ADD PARTITION PARTITIONS n, the HASH/KEY form) it changes the
+		// partition count and redistributes every existing row.
+		return len(spec.PartDefinitions) == 0
+	case ast.AlterTableAddColumns:
+		// A plain column add is metadata-only, but an inline PRIMARY KEY or
+		// UNIQUE builds an index and a STORED generated column is computed
+		// for every existing row.
+		for _, col := range spec.NewColumns {
+			for _, opt := range col.Options {
+				switch opt.Tp { //nolint:exhaustive
+				case ast.ColumnOptionPrimaryKey, ast.ColumnOptionUniqKey:
+					return true
+				case ast.ColumnOptionGenerated:
+					if opt.Stored {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	case ast.AlterTableOption:
+		// A table COMMENT change is metadata-only; other options (ENGINE=,
+		// ROW_FORMAT=, CONVERT TO CHARACTER SET, ...) can rebuild the table.
+		for _, opt := range spec.Options {
+			if opt.Tp != ast.TableOptionComment {
+				return true
+			}
+		}
+		return false
+	default:
+		// Index-backed constraint adds build an index; FOREIGN KEY and CHECK
+		// adds validate every existing row; MODIFY/CHANGE COLUMN can rebuild
+		// (a VARCHAR widening that crosses the length-byte boundary copies the
+		// table, and that boundary isn't visible from the statement alone).
+		// DROP COLUMN lands here too: it is instant only on MySQL 8.0.29+,
+		// only while the table's instant-change row-header budget lasts, not
+		// on ROW_FORMAT=COMPRESSED, and not without rebuilding any index on
+		// the column — none of which the statement shows.
+		return true
+	}
 }
 
 // statementTypeFromSpirit translates Spirit's parser-owned statement type into
@@ -188,13 +534,21 @@ func (tidbStatementParser) Canonicalize(ddl string) string {
 	// For ALTER TABLE, reconstruct from the normalized Alter field.
 	if stmt.Alter != "" {
 		if stmt.Schema != "" {
-			return fmt.Sprintf("ALTER TABLE `%s`.`%s` %s", stmt.Schema, stmt.Table, stmt.Alter)
+			return fmt.Sprintf("ALTER TABLE %s.%s %s", sqlescape.EscapeIdentifier(stmt.Schema), sqlescape.EscapeIdentifier(stmt.Table), stmt.Alter)
 		}
-		return fmt.Sprintf("ALTER TABLE `%s` %s", stmt.Table, stmt.Alter)
+		return fmt.Sprintf("ALTER TABLE %s %s", sqlescape.EscapeIdentifier(stmt.Table), stmt.Alter)
 	}
 
 	// For CREATE TABLE and DROP TABLE, use TiDB's Restore for canonical format.
 	return restoreCanonical(ddl)
+}
+
+// CanonicalizeUnqualified implements StatementParser. MySQL-family targets
+// select their physical schema through the connection rather than in the
+// DDL, so the engine's statements carry no schema qualifier to remove and the
+// canonical form is Canonicalize's.
+func (p tidbStatementParser) CanonicalizeUnqualified(ddl string) string {
+	return p.Canonicalize(ddl)
 }
 
 // restoreCanonical uses TiDB parser to restore a statement in canonical

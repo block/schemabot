@@ -1,7 +1,10 @@
 package apitypes
 
 import (
+	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +66,86 @@ func TestPlanResponse_UnsafeChangesToleratesNilEntries(t *testing.T) {
 	require.Len(t, changes, 1)
 	assert.Equal(t, "users", changes[0].Table)
 	assert.Equal(t, "DROP TABLE removes all data", changes[0].Reason)
+}
+
+// A keyspace whose shards diverged carries the drop only one shard needs in
+// Shards; the namespace-level Changes, one entry per table, keep the safe
+// ALTER its sibling runs. The unsafe set has to include that shard's drop,
+// or a consent gate built on it consents to a change it never showed.
+func TestPlanResponse_UnsafeChangesIncludesShardOnlyChanges(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace: "shop",
+			TableChanges: []*TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);"},
+			},
+		}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "shop", Shard: "-80", Changes: []*TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` ADD INDEX `idx_status` (`status`);"},
+			}},
+			{Namespace: "shop", Shard: "80-", Changes: []*TableChangeResponse{
+				{TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` DROP COLUMN `legacy`;", IsUnsafe: true, UnsafeReason: `Column "legacy" is dropped`},
+			}},
+		},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "orders", changes[0].Table)
+	assert.Equal(t, "ALTER TABLE `orders` DROP COLUMN `legacy`;", changes[0].DDL)
+	assert.Equal(t, `Column "legacy" is dropped`, changes[0].Reason)
+}
+
+// A drop uniform across shards appears at the namespace level and in every
+// shard; it is one change and is reported once, so the operator is not told
+// the plan drops a table three times.
+func TestPlanResponse_UnsafeChangesReportsAUniformShardChangeOnce(t *testing.T) {
+	drop := &TableChangeResponse{TableName: "refunds", ChangeType: "drop", DDL: "DROP TABLE `refunds`;"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{Namespace: "shop", TableChanges: []*TableChangeResponse{drop}}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "shop", Shard: "-80", Changes: []*TableChangeResponse{drop}},
+			{Namespace: "shop", Shard: "80-", Changes: []*TableChangeResponse{drop}},
+		},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "refunds", changes[0].Table)
+}
+
+// The same statement against a same-named table in two keyspaces is two
+// changes: deduplication is per namespace, not per statement text.
+func TestPlanResponse_UnsafeChangesKeepsSameStatementInTwoNamespaces(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "commerce", TableChanges: []*TableChangeResponse{{TableName: "audit", ChangeType: "drop", DDL: "DROP TABLE `audit`;"}}},
+			{Namespace: "payments", TableChanges: []*TableChangeResponse{{TableName: "audit", ChangeType: "drop", DDL: "DROP TABLE `audit`;"}}},
+		},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 2)
+	assert.Equal(t, "audit", changes[0].Table)
+	assert.Equal(t, "audit", changes[1].Table)
+}
+
+// Nil shard rows and nil shard changes are skipped, as nil namespace rows are.
+func TestPlanResponse_UnsafeChangesToleratesNilShardEntries(t *testing.T) {
+	resp := &PlanResponse{
+		Shards: []*ShardPlanResponse{
+			nil,
+			{Namespace: "shop", Shard: "80-", Changes: []*TableChangeResponse{
+				nil,
+				{TableName: "refunds", ChangeType: "drop", DDL: "DROP TABLE `refunds`;"},
+			}},
+		},
+	}
+
+	changes := resp.UnsafeChanges()
+	require.Len(t, changes, 1)
+	assert.Equal(t, "refunds", changes[0].Table)
 }
 
 func TestPlanResponse_UnsafeChanges_None(t *testing.T) {
@@ -170,6 +253,14 @@ func TestPlanResponse_HasChanges(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "finalize request only",
+			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
+				Namespace: "payments",
+				Metadata:  map[string]string{NeedsFinalizerMetadataKey: "true"},
+			}}},
+			want: true,
+		},
+		{
 			name: "table changes and vschema",
 			resp: &PlanResponse{Changes: []*SchemaChangeResponse{{
 				Namespace:    "boardgames_sharded",
@@ -255,6 +346,29 @@ func TestPlanResponse_HasBlockedChanges(t *testing.T) {
 	}
 }
 
+// FirstBlockedChange returns the change a refusal names: the first blocked
+// namespace-level change, else the first blocked per-shard change, so a
+// verdict only a divergent shard carries is still named with its reason.
+func TestPlanResponse_FirstBlockedChange(t *testing.T) {
+	shardBlocked := &TableChangeResponse{TableName: "mutes", ExecutionMode: "blocked", ModeReason: "exact row count unavailable"}
+	nsBlocked := &TableChangeResponse{TableName: "users", ExecutionMode: "blocked", ModeReason: "direct execution is disabled"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace:    "testdb",
+			TableChanges: []*TableChangeResponse{{TableName: "orders", ExecutionMode: "direct"}, nsBlocked},
+		}},
+		Shards: []*ShardPlanResponse{{Shard: "-40", Changes: []*TableChangeResponse{shardBlocked}}},
+	}
+	assert.Same(t, nsBlocked, resp.FirstBlockedChange())
+
+	resp.Changes = nil
+	assert.Same(t, shardBlocked, resp.FirstBlockedChange())
+
+	resp.Shards = nil
+	assert.Nil(t, resp.FirstBlockedChange())
+	assert.Nil(t, (*PlanResponse)(nil).FirstBlockedChange())
+}
+
 // DirectChanges collects direct-execution verdicts across namespace-level and
 // per-shard changes, and only those.
 func TestPlanResponse_DirectChanges(t *testing.T) {
@@ -262,7 +376,7 @@ func TestPlanResponse_DirectChanges(t *testing.T) {
 		Changes: []*SchemaChangeResponse{{
 			Namespace: "testdb",
 			TableChanges: []*TableChangeResponse{
-				{TableName: "users", ExecutionMode: "direct", ModeReason: "dropping primary key is not supported; runs as native MySQL DDL on a table with ~40 rows"},
+				{TableName: "users", ExecutionMode: "direct", ModeReason: "the table has ~40 rows"},
 				{TableName: "orders"},
 				{TableName: "items", ExecutionMode: "blocked"},
 			},
@@ -285,7 +399,7 @@ func TestPlanResponse_DirectChanges(t *testing.T) {
 
 // AllChangesDirect holds only when the plan has at least one table change and
 // every one carries the direct verdict — a mixed or empty plan still has
-// engine-driven work, and a VSchema change is never direct.
+// engine-driven work, and neither a VSchema change nor a finalize is direct.
 func TestPlanResponse_AllChangesDirect(t *testing.T) {
 	direct := func(table string) *TableChangeResponse {
 		return &TableChangeResponse{TableName: table, ExecutionMode: "direct"}
@@ -321,12 +435,34 @@ func TestPlanResponse_AllChangesDirect(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "direct shard changes under an engine-driven collapsed namespace row",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{Namespace: "testdb", TableChanges: []*TableChangeResponse{{TableName: "orders"}}}},
+				Shards: []*ShardPlanResponse{
+					{Namespace: "testdb", Shard: "-80", Changes: []*TableChangeResponse{direct("orders")}},
+					{Namespace: "testdb", Shard: "80-", Changes: []*TableChangeResponse{direct("orders")}},
+				},
+			},
+			want: true,
+		},
+		{
 			name: "vschema change alongside a direct change",
 			resp: &PlanResponse{
 				Changes: []*SchemaChangeResponse{{
 					Namespace:    "testdb",
 					TableChanges: []*TableChangeResponse{direct("users")},
 					Metadata:     map[string]string{"vschema": "{}"},
+				}},
+			},
+			want: false,
+		},
+		{
+			name: "finalize request alongside a direct change",
+			resp: &PlanResponse{
+				Changes: []*SchemaChangeResponse{{
+					Namespace:    "testdb",
+					TableChanges: []*TableChangeResponse{direct("users")},
+					Metadata:     map[string]string{NeedsFinalizerMetadataKey: "true"},
 				}},
 			},
 			want: false,
@@ -384,4 +520,227 @@ func TestPlanResponseDiscardedCopiesCountsUnknownDisposition(t *testing.T) {
 func TestPlanResponseDiscardedCopiesEmpty(t *testing.T) {
 	assert.Empty(t, (&PlanResponse{}).DiscardedCopies())
 	assert.Empty(t, (*PlanResponse)(nil).DiscardedCopies())
+}
+
+// A refused request always advertises a wait a client can act on: whole
+// seconds, never zero, and the same value in the message and the field.
+func TestNewRateLimitedResponseAdvertisesAWholeSecondWait(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		retryAfter time.Duration
+		want       int
+	}{
+		{"zero rounds up", 0, 1},
+		{"negative rounds up", -time.Second, 1},
+		{"sub-second rounds up", 500 * time.Millisecond, 1},
+		{"partial second rounds up", 1500 * time.Millisecond, 2},
+		{"whole seconds are kept", 30 * time.Second, 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := NewRateLimitedResponse(PullRateLimitTargetReason, tc.retryAfter)
+
+			assert.Equal(t, tc.want, resp.RetryAfterSeconds)
+			assert.Equal(t, ErrCodeRateLimited, resp.ErrorCode)
+			assert.True(t, IsRetryableErrorCode(resp.ErrorCode), "a limited caller should retry rather than fail the command")
+			assert.Equal(t, fmt.Sprintf("%s; retry in %ds", PullRateLimitTargetReason, tc.want), resp.Error)
+		})
+	}
+}
+
+// The two reasons name the budget that ran out, so a limited client can tell
+// whether its own request rate or the load on one database refused it.
+func TestPullRateLimitReasonsNameTheirBudget(t *testing.T) {
+	assert.NotEqual(t, PullRateLimitCallerReason, PullRateLimitTargetReason)
+	assert.Contains(t, PullRateLimitCallerReason, "caller")
+	assert.Contains(t, PullRateLimitTargetReason, "database and environment")
+}
+
+// A retryable refusal answers both questions at once: whether to retry, and
+// how long to wait first. Retrying on the code alone would ignore a delay the
+// server expects a client to observe.
+func TestErrorResponseRetryAfterPairsTheCodeWithTheDelay(t *testing.T) {
+	limited := NewRateLimitedResponse(PullRateLimitCallerReason, 3*time.Second)
+	retry, after := limited.RetryAfter()
+	assert.True(t, retry)
+	assert.Equal(t, 3*time.Second, after)
+
+	// A retryable code with no advertised delay leaves the backoff to the
+	// client rather than implying it may retry immediately in a tight loop.
+	retryable := ErrorResponse{ErrorCode: ErrCodeEngineErrorRetryable}
+	retry, after = retryable.RetryAfter()
+	assert.True(t, retry)
+	assert.Zero(t, after)
+
+	// A permanent failure is never retryable, whatever delay it carries.
+	permanent := ErrorResponse{ErrorCode: ErrCodeNotFound, RetryAfterSeconds: 30}
+	retry, after = permanent.RetryAfter()
+	assert.False(t, retry)
+	assert.Zero(t, after)
+}
+
+// A sharded namespace collapses to one change per table at the namespace
+// level, so the shard rows are what an operator surface renders and counts:
+// a shard that creates a table its sibling alters adds a change, a change
+// uniform across shards appears once, and every change names its namespace.
+func TestPlanResponse_RenderedTablesUsesShardRowsForAShardedNamespace(t *testing.T) {
+	createUsers := &TableChangeResponse{TableName: "users", DDL: "CREATE TABLE users (id BIGINT)", ChangeType: "create"}
+	alterUsers := &TableChangeResponse{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN email TEXT", ChangeType: "alter"}
+	alterOrders := &TableChangeResponse{TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN note TEXT", ChangeType: "alter"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace:    "commerce",
+			TableChanges: []*TableChangeResponse{createUsers, alterOrders},
+		}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{createUsers, alterOrders}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{alterUsers, alterOrders}},
+		},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 3)
+	assert.Equal(t, createUsers.DDL, tables[0].DDL)
+	assert.Equal(t, alterOrders.DDL, tables[1].DDL)
+	assert.Equal(t, alterUsers.DDL, tables[2].DDL)
+	for _, tbl := range tables {
+		assert.Equal(t, "commerce", tbl.Namespace, "%s", tbl.DDL)
+	}
+	assert.Empty(t, createUsers.Namespace, "the plan's own change is left as received")
+}
+
+// Without shard rows the namespace-level changes are the rendered set, so an
+// unsharded plan reads exactly as its changes arrived.
+func TestPlanResponse_RenderedTablesIsFlatTablesWithoutShards(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "app_a", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", ChangeType: "alter"}}},
+			{Namespace: "app_b", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN b INT", ChangeType: "alter"}}},
+		},
+	}
+
+	assert.Equal(t, resp.FlatTables(), resp.RenderedTables())
+}
+
+// Shard rows belong to their own namespace: one sharded namespace does not
+// replace the changes of an unsharded sibling in the same plan.
+func TestPlanResponse_RenderedTablesKeepsUnshardedNamespacesBesideShardedOnes(t *testing.T) {
+	unsharded := &TableChangeResponse{TableName: "audit", DDL: "CREATE TABLE audit (id BIGINT)", ChangeType: "create", Namespace: "lookup"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "commerce", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", ChangeType: "alter"}}},
+			{Namespace: "lookup", TableChanges: []*TableChangeResponse{unsharded}},
+		},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", ChangeType: "alter"}}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{{TableName: "users", DDL: "ALTER TABLE users ADD COLUMN b INT", ChangeType: "alter"}}},
+		},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 3)
+	assert.Equal(t, "ALTER TABLE users ADD COLUMN a INT", tables[0].DDL)
+	assert.Equal(t, "ALTER TABLE users ADD COLUMN b INT", tables[1].DDL)
+	assert.Same(t, unsharded, tables[2])
+}
+
+func TestPlanResponse_RenderedTablesSkipsAChangeWithNoDDL(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{
+			Namespace:    "commerce",
+			TableChanges: []*TableChangeResponse{{TableName: "users", DDL: "CREATE TABLE users (id BIGINT)", ChangeType: "create"}},
+		}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: "CREATE TABLE users (id BIGINT)", ChangeType: "create"}}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{{TableName: "orders", DDL: "", ChangeType: "alter"}}},
+		},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 1)
+	assert.Equal(t, "users", tables[0].TableName)
+}
+
+func TestPlanResponse_RenderedTablesDoesNotMergeChangesWithNoDDL(t *testing.T) {
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{Namespace: "commerce"}},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "commerce", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: "", ChangeType: "create"}}},
+			{Namespace: "commerce", Shard: "80-", Changes: []*TableChangeResponse{{TableName: "orders", DDL: "", ChangeType: "alter"}}},
+		},
+	}
+
+	assert.Empty(t, resp.RenderedTables())
+}
+
+func TestPlanResponse_RenderedTablesDedupesWithinANamespaceOnly(t *testing.T) {
+	stmt := "ALTER TABLE users ADD COLUMN a INT"
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{
+			{Namespace: "app_a", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: stmt, ChangeType: "alter"}}},
+			{Namespace: "app_b", TableChanges: []*TableChangeResponse{{TableName: "users", DDL: stmt, ChangeType: "alter"}}},
+		},
+		Shards: []*ShardPlanResponse{
+			{Namespace: "app_a", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: stmt, ChangeType: "alter"}}},
+			{Namespace: "app_b", Shard: "-80", Changes: []*TableChangeResponse{{TableName: "users", DDL: stmt, ChangeType: "alter"}}},
+		},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 2)
+	assert.Equal(t, "app_a", tables[0].Namespace)
+	assert.Equal(t, "app_b", tables[1].Namespace)
+}
+
+func TestPlanResponse_RenderedTablesPreservesExplicitShardNamespace(t *testing.T) {
+	explicit := &TableChangeResponse{Namespace: "reported", TableName: "users", DDL: "ALTER TABLE users ADD COLUMN a INT", ChangeType: "alter"}
+	implicit := &TableChangeResponse{TableName: "orders", DDL: "ALTER TABLE orders ADD COLUMN a INT", ChangeType: "alter"}
+	resp := &PlanResponse{
+		Changes: []*SchemaChangeResponse{{Namespace: "grouped"}},
+		Shards:  []*ShardPlanResponse{{Namespace: "grouped", Shard: "-80", Changes: []*TableChangeResponse{explicit, implicit}}},
+	}
+
+	tables := resp.RenderedTables()
+	require.Len(t, tables, 2)
+	assert.Same(t, explicit, tables[0])
+	assert.Equal(t, "reported", tables[0].Namespace)
+	assert.NotSame(t, implicit, tables[1])
+	assert.Equal(t, "grouped", tables[1].Namespace)
+	assert.Empty(t, implicit.Namespace)
+}
+
+func TestPlanResponse_RenderedTablesHandlesNilInputs(t *testing.T) {
+	var nilResponse *PlanResponse
+	assert.Empty(t, nilResponse.RenderedTables())
+
+	resp := &PlanResponse{Changes: []*SchemaChangeResponse{nil, {Namespace: "app"}}}
+	assert.Empty(t, resp.RenderedTables())
+}
+
+// A rollout block lists the members an apply runs on, needs attention for, or
+// refuses, so a null entry in any of those lists fails the decode of the whole
+// plan response rather than reaching a reader as an entry with no member.
+func TestPlanResponse_RolloutBlockWithANullEntryFailsToDecode(t *testing.T) {
+	for _, tc := range []struct {
+		list, want string
+	}{
+		{list: "groups", want: "group 1 is null"},
+		{list: "attention", want: "attention entry 1 is null"},
+		{list: "refused", want: "refusal 1 is null"},
+		{list: "table_sizes", want: "table size 1 is null"},
+	} {
+		t.Run(tc.list, func(t *testing.T) {
+			body := fmt.Sprintf(`{"plan_id":"plan-orders-1","rollout":{"members":2,%q:[{"member":"prod/payments-001","members":["prod/payments-001"]},null]}}`, tc.list)
+			var resp PlanResponse
+			err := json.Unmarshal([]byte(body), &resp)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "decode rollout block: "+tc.want)
+		})
+	}
+
+	var resp PlanResponse
+	require.NoError(t, json.Unmarshal([]byte(`{"plan_id":"plan-orders-1","rollout":{"members":2,"groups":[{"members":["prod/payments-001","prod/payments-002"],"primary":true,"changes":[]}]}}`), &resp))
+	require.NotNil(t, resp.Rollout)
+	assert.Equal(t, 2, resp.Rollout.Members)
+	require.Len(t, resp.Rollout.Groups, 1)
+	assert.Equal(t, []string{"prod/payments-001", "prod/payments-002"}, resp.Rollout.Groups[0].Members)
 }

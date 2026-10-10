@@ -21,6 +21,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/cmd/client"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
@@ -197,6 +198,25 @@ func TestPlanFingerprint_DifferentPlans(t *testing.T) {
 	assert.NotEqual(t, fp1, fp2, "Expected different fingerprints for different plans")
 }
 
+func TestPlanFingerprint_IncludesShardOnlyStatements(t *testing.T) {
+	const baseDDL = "ALTER TABLE users ADD COLUMN email VARCHAR(255)"
+	base := &apitypes.TableChangeResponse{Namespace: "commerce", TableName: "users", DDL: baseDDL, ChangeType: "ALTER"}
+	shardOnly := &apitypes.TableChangeResponse{Namespace: "commerce", TableName: "users", DDL: baseDDL + ", ADD INDEX idx_email (email)", ChangeType: "ALTER"}
+	plan := func(extra bool) *apitypes.PlanResponse {
+		changes := []*apitypes.TableChangeResponse{base}
+		if extra {
+			changes = append(changes, shardOnly)
+		}
+		return &apitypes.PlanResponse{
+			Changes: []*apitypes.SchemaChangeResponse{{Namespace: "commerce", TableChanges: []*apitypes.TableChangeResponse{base}}},
+			Shards:  []*apitypes.ShardPlanResponse{{Namespace: "commerce", Shard: "-80", Changes: changes}},
+		}
+	}
+
+	assert.Equal(t, planFingerprint(plan(false)), planFingerprint(plan(false)))
+	assert.NotEqual(t, planFingerprint(plan(false)), planFingerprint(plan(true)))
+}
+
 func TestPlanFingerprint_VSchemaOnlyPlans(t *testing.T) {
 	vschemaOnly := func(diff string) *apitypes.PlanResponse {
 		return &apitypes.PlanResponse{
@@ -214,6 +234,28 @@ func TestPlanFingerprint_VSchemaOnlyPlans(t *testing.T) {
 	assert.NotEqual(t, "no-changes", fp1, "a VSchema-only plan carries work and must not fingerprint as no-changes")
 	assert.Equal(t, fp1, fp2, "identical VSchema-only plans must dedupe")
 	assert.NotEqual(t, fp1, fpOther, "plans with differing VSchema diffs must not dedupe")
+}
+
+// Two environments whose plans differ only in which keyspaces the engine asks
+// to finalize do different work, so they are rendered separately rather than
+// collapsed into one plan. A plan that only finalizes is not a clean one.
+func TestPlanFingerprint_FinalizeRequests(t *testing.T) {
+	finalizing := func(namespaces ...string) *apitypes.PlanResponse {
+		plan := &apitypes.PlanResponse{}
+		for _, ns := range namespaces {
+			plan.Changes = append(plan.Changes, &apitypes.SchemaChangeResponse{
+				Namespace: ns,
+				Metadata:  map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"},
+			})
+		}
+		return plan
+	}
+
+	payments := planFingerprint(finalizing("payments"))
+	assert.NotEqual(t, "no-changes", payments, "a finalize-only plan carries work and must not fingerprint as no-changes")
+	assert.Equal(t, payments, planFingerprint(finalizing("payments")), "identical finalize-only plans must dedupe")
+	assert.Equal(t, planFingerprint(finalizing("ledger", "payments")), planFingerprint(finalizing("payments", "ledger")), "order is not work")
+	assert.NotEqual(t, payments, planFingerprint(finalizing("ledger")), "plans finalizing different keyspaces must not dedupe")
 }
 
 func TestPlanFingerprint_NoChanges(t *testing.T) {
@@ -347,6 +389,153 @@ func TestOutputMultiEnvPlanResult_BothNoChanges(t *testing.T) {
 	assert.Equal(t, 2, noChangesCount, "Expected 2 'No schema changes detected' messages")
 }
 
+// Staging and production share a plan but a third environment drops a column.
+// The plan renders one section per environment so the third environment's
+// DROP COLUMN is shown rather than folded under the shared plan's heading.
+// When all three plans match, they still collapse into one combined section.
+func TestOutputMultiEnvPlanResult_ThreeEnvironments(t *testing.T) {
+	addIndex := func() *apitypes.PlanResponse {
+		return planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+			DDL:        "ALTER TABLE users ADD INDEX idx_email (email)",
+			ChangeType: "ALTER",
+			TableName:  "users",
+		})
+	}
+	dropColumn := planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		DDL:        "ALTER TABLE users DROP COLUMN nickname",
+		ChangeType: "ALTER",
+		TableName:  "users",
+	})
+
+	t.Run("one environment differs", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    addIndex(),
+			"production": addIndex(),
+			"sandbox":    dropColumn,
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.NotContains(t, output, "Staging & Production & Sandbox")
+		assert.Contains(t, output, "\nSandbox\n     ~ users\n       ALTER TABLE users DROP COLUMN nickname;")
+		assert.Equal(t, 2, strings.Count(output, "ADD INDEX idx_email (email)"), "staging and production each render their own ADD INDEX")
+	})
+
+	t.Run("all environments match", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    addIndex(),
+			"production": addIndex(),
+			"sandbox":    addIndex(),
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.Contains(t, output, "Staging & Production & Sandbox")
+		assert.Equal(t, 1, strings.Count(output, "ADD INDEX idx_email (email)"), "the shared plan renders once")
+	})
+
+	t.Run("an environment with no plan renders as not configured", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    addIndex(),
+			"production": addIndex(),
+			"sandbox":    nil,
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.NotContains(t, output, "Staging & Production & Sandbox")
+		assert.Contains(t, output, "\nSandbox\n(not configured)\n")
+		assert.Equal(t, 2, strings.Count(output, "ADD INDEX idx_email (email)"), "staging and production each render their own ADD INDEX")
+	})
+
+	t.Run("staging with no plan still names the engine from the next environment", func(t *testing.T) {
+		results := map[string]*apitypes.PlanResponse{
+			"staging":    nil,
+			"production": addIndex(),
+			"sandbox":    addIndex(),
+		}
+
+		output := stripAnsi(captureStdout(func() {
+			outputMultiEnvPlanResult(results, "testapp", "testapp")
+		}))
+
+		assert.Contains(t, output, "\nStaging\n(not configured)\n")
+		assert.Equal(t, 2, strings.Count(output, "ADD INDEX idx_email (email)"), "production and sandbox each render their own ADD INDEX")
+	})
+}
+
+func dropIndexPlan(unsafeReason string) *apitypes.PlanResponse {
+	return planWithTablesAndEngine("mysql", &apitypes.TableChangeResponse{
+		DDL:          "ALTER TABLE users DROP INDEX idx_email",
+		ChangeType:   "ALTER",
+		TableName:    "users",
+		IsUnsafe:     unsafeReason != "",
+		UnsafeReason: unsafeReason,
+	})
+}
+
+// Staging made idx_email invisible before the drop; production and sandbox
+// did not. All three plan the same DROP INDEX, but only staging's plan is
+// clean, so production's and sandbox's unsafe finding must still be shown
+// rather than folded under staging's section.
+func TestOutputMultiEnvPlanResult_SameDDLDifferentUnsafeVerdict(t *testing.T) {
+	const reason = `Index "idx_email" should be made invisible before dropping to ensure it's not needed`
+	results := map[string]*apitypes.PlanResponse{
+		"staging":    dropIndexPlan(""),
+		"production": dropIndexPlan(reason),
+		"sandbox":    dropIndexPlan(reason),
+	}
+
+	output := stripAnsi(captureStdout(func() { outputMultiEnvPlanResult(results, "testapp", "testapp") }))
+
+	assert.NotContains(t, output, "Staging & Production & Sandbox")
+	assert.Equal(t, 2, strings.Count(output, reason), "production and sandbox each disclose their own unsafe finding")
+}
+
+// Only sandbox's plan carries an advisory lint finding; it must not be folded
+// under staging's clean plan.
+func TestOutputMultiEnvPlanResult_SameDDLDifferentLint(t *testing.T) {
+	sandbox := dropIndexPlan("")
+	sandbox.LintResults = []*apitypes.LintViolationResponse{{Message: "sandbox-only advisory finding", Table: "users", Severity: "warning", Linter: "probe"}}
+	results := map[string]*apitypes.PlanResponse{
+		"staging":    dropIndexPlan(""),
+		"production": dropIndexPlan(""),
+		"sandbox":    sandbox,
+	}
+
+	output := stripAnsi(captureStdout(func() { outputMultiEnvPlanResult(results, "testapp", "testapp") }))
+
+	assert.NotContains(t, output, "Staging & Production & Sandbox")
+	assert.Contains(t, output, "sandbox-only advisory finding")
+}
+
+// The same statement under a different keyspace is a different section: a
+// sandbox that alters the table in a second keyspace is not folded under the
+// staging section that names only the first.
+func TestOutputMultiEnvPlanResult_SameDDLDifferentNamespace(t *testing.T) {
+	inKeyspace := func(namespace string) *apitypes.PlanResponse {
+		alter := &apitypes.TableChangeResponse{Namespace: namespace, DDL: "ALTER TABLE users ADD INDEX idx_email (email)", ChangeType: "ALTER", TableName: "users"}
+		return &apitypes.PlanResponse{Engine: "planetscale", Changes: []*apitypes.SchemaChangeResponse{{Namespace: namespace, TableChanges: []*apitypes.TableChangeResponse{alter}}}}
+	}
+	results := map[string]*apitypes.PlanResponse{
+		"staging":    inKeyspace("commerce"),
+		"production": inKeyspace("commerce"),
+		"sandbox":    inKeyspace("archive"),
+	}
+
+	output := stripAnsi(captureStdout(func() { outputMultiEnvPlanResult(results, "testapp", "testapp") }))
+
+	assert.NotContains(t, output, "Staging & Production & Sandbox")
+	assert.Contains(t, output, "archive")
+	assert.Equal(t, 3, strings.Count(output, "ADD INDEX idx_email (email)"), "each environment renders its own section")
+}
+
 func TestSortEnvironments(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -434,7 +623,7 @@ func TestWriteSQLChanges(t *testing.T) {
 	}
 
 	output := captureStdout(func() {
-		templates.WriteSQLChanges(changes)
+		templates.WriteSQLChanges(changes, schema.DialectMySQL)
 	})
 
 	// Check table names with symbols on their own line, DDL indented below
@@ -447,6 +636,8 @@ func TestWriteSQLChanges(t *testing.T) {
 	assert.Contains(t, plainOutput, "DROP TABLE", "Expected DROP TABLE DDL")
 }
 
+// The plan summary counts tables, not statements: the rows here name distinct
+// tables so each one is a table to create, alter, or drop.
 func TestWritePlanSummary(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -456,55 +647,63 @@ func TestWritePlanSummary(t *testing.T) {
 		{
 			name: "single create",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
+				{ChangeType: "CREATE", TableName: "users"},
 			},
 			expected: "1 table to create",
 		},
 		{
 			name: "multiple creates",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
-				{ChangeType: "CREATE"},
+				{ChangeType: "CREATE", TableName: "users"},
+				{ChangeType: "CREATE", TableName: "orders"},
 			},
 			expected: "2 tables to create",
 		},
 		{
 			name: "single alter",
 			changes: []templates.DDLChange{
-				{ChangeType: "ALTER"},
+				{ChangeType: "ALTER", TableName: "users"},
 			},
 			expected: "1 table to alter",
 		},
 		{
 			name: "multiple alters",
 			changes: []templates.DDLChange{
-				{ChangeType: "ALTER"},
-				{ChangeType: "ALTER"},
+				{ChangeType: "ALTER", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "orders"},
 			},
 			expected: "2 tables to alter",
 		},
 		{
+			name: "repeated alters on one table",
+			changes: []templates.DDLChange{
+				{ChangeType: "ALTER", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "users"},
+			},
+			expected: "1 table to alter",
+		},
+		{
 			name: "single drop",
 			changes: []templates.DDLChange{
-				{ChangeType: "DROP"},
+				{ChangeType: "DROP", TableName: "legacy"},
 			},
 			expected: "1 table to drop",
 		},
 		{
 			name: "multiple drops",
 			changes: []templates.DDLChange{
-				{ChangeType: "DROP"},
-				{ChangeType: "DROP"},
-				{ChangeType: "DROP"},
+				{ChangeType: "DROP", TableName: "legacy"},
+				{ChangeType: "DROP", TableName: "archive"},
+				{ChangeType: "DROP", TableName: "staging_copy"},
 			},
 			expected: "3 tables to drop",
 		},
 		{
 			name: "mixed changes",
 			changes: []templates.DDLChange{
-				{ChangeType: "CREATE"},
-				{ChangeType: "ALTER"},
-				{ChangeType: "DROP"},
+				{ChangeType: "CREATE", TableName: "users"},
+				{ChangeType: "ALTER", TableName: "orders"},
+				{ChangeType: "DROP", TableName: "legacy"},
 			},
 			expected: "1 table to create, 1 table to alter, 1 table to drop",
 		},
@@ -600,7 +799,7 @@ func TestWriteMultiTablePlanOutput(t *testing.T) {
 			{ChangeType: "ALTER", TableName: "products", DDL: "ALTER TABLE `products` ADD INDEX `idx_category` (`category`)"},
 		}
 
-		templates.WriteSQLChanges(changes)
+		templates.WriteSQLChanges(changes, schema.DialectMySQL)
 		templates.WritePlanSummary(changes)
 	})
 
@@ -674,7 +873,7 @@ func TestWriteNamespaceChanges_CollapseIdenticalKeyspaces(t *testing.T) {
 	}
 
 	output := captureStdout(func() {
-		templates.WriteNamespaceChanges(namespaces, false, "commerce")
+		templates.WriteNamespaceChanges(namespaces, false, "commerce", schema.DialectMySQL)
 	})
 
 	plainOutput := stripAnsi(output)
@@ -707,7 +906,7 @@ func TestWriteNamespaceChanges_NoCollapseUnderThreshold(t *testing.T) {
 	}
 
 	output := captureStdout(func() {
-		templates.WriteNamespaceChanges(namespaces, false, "db")
+		templates.WriteNamespaceChanges(namespaces, false, "db", schema.DialectMySQL)
 	})
 
 	plainOutput := stripAnsi(output)
@@ -718,4 +917,93 @@ func TestWriteNamespaceChanges_NoCollapseUnderThreshold(t *testing.T) {
 	}
 	assert.NotContains(t, plainOutput, "more keyspaces")
 	assert.Equal(t, 4, strings.Count(plainOutput, "ADD COLUMN"), "each keyspace should show DDL")
+}
+
+// Plan output retains the target grammar and each statement while leaving
+// the supplied API response unchanged, including for unknown database types.
+func TestPlanOutputPreservesTargetDialect(t *testing.T) {
+	for _, databaseType := range []string{"postgres", "custom"} {
+		t.Run(databaseType, func(t *testing.T) {
+			first := `ALTER TABLE "OrderHistory" ADD COLUMN "DeliveryNote" text DEFAULT 'Leave at reception, ring bell';`
+			second := `ALTER TABLE "OrderHistory" ADD COLUMN "Archived" boolean DEFAULT false;`
+			table := &apitypes.TableChangeResponse{TableName: "OrderHistory", ChangeType: "alter", DDL: first}
+			result := &apitypes.PlanResponse{Database: "shop", DatabaseType: databaseType, Changes: []*apitypes.SchemaChangeResponse{{Namespace: "public", TableChanges: []*apitypes.TableChangeResponse{table, {TableName: "OrderHistory", ChangeType: "alter", DDL: second}}}}}
+			output := captureOutput(t, func() { writePlanBody(result, false) })
+			assert.Contains(t, stripANSI(output), first)
+			assert.Contains(t, stripANSI(output), second)
+			assert.Equal(t, first, table.DDL)
+		})
+	}
+}
+
+func TestWritePlanHeaderPostgres(t *testing.T) {
+	for _, engine := range []string{"postgres", "PostgreSQL"} {
+		output := captureStdout(func() {
+			templates.WritePlanHeader(templates.PlanHeaderData{Database: "shop", Engine: engine, IsMySQL: true})
+		})
+		assert.Contains(t, output, "PostgreSQL Schema Change Plan")
+		assert.NotContains(t, output, "MySQL Schema Change Plan")
+	}
+}
+
+// Two environments plan the same table create in keyspace payments. In one the
+// engine generated the VSchema change from the DDL, and the plan shows only the
+// DDL; in the other the VSchema change has no diff and no marker, and the plan
+// shows a VSchema change beside the DDL. They render differently, so they are not
+// deduplicated into one section.
+func TestPlanFingerprint_GeneratedVSchemaChangeDiffersFromAVSchemaChange(t *testing.T) {
+	mk := func(metadata map[string]string) *apitypes.PlanResponse {
+		plan := planWithTables(&apitypes.TableChangeResponse{DDL: "CREATE TABLE refunds (id BIGINT PRIMARY KEY)", ChangeType: "CREATE", TableName: "refunds"})
+		plan.Changes[0].Namespace = "payments"
+		plan.Changes[0].Metadata = metadata
+		return plan
+	}
+	generated := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.VSchemaGeneratedOnlyMetadataKey: "true", apitypes.NeedsFinalizerMetadataKey: "true"})
+	unmarked := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.NeedsFinalizerMetadataKey: "true"})
+
+	assert.NotEqual(t, planFingerprint(generated), planFingerprint(unmarked))
+}
+
+// Two environments change keyspace payments' VSchema with no DDL, and only one
+// engine asks to finalize the keyspace. Both print the same VSchema change and
+// no finalize line, so they are deduplicated into one section.
+func TestPlanFingerprint_FinalizeBesideVSchemaChangeRendersTheSame(t *testing.T) {
+	mk := func(metadata map[string]string) *apitypes.PlanResponse {
+		return &apitypes.PlanResponse{Database: "commerce", Changes: []*apitypes.SchemaChangeResponse{{Namespace: "payments", Metadata: metadata}}}
+	}
+	diff := "+  \"refunds\": {}"
+	finalized := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.VSchemaDiffMetadataKey: diff, apitypes.NeedsFinalizerMetadataKey: "true"})
+	plain := mk(map[string]string{apitypes.VSchemaChangedMetadataKey: "true", apitypes.VSchemaDiffMetadataKey: diff})
+
+	assert.Equal(t, planFingerprint(plain), planFingerprint(finalized))
+}
+
+// Two environments plan the same table create in keyspace payments, and only
+// one engine asks to finalize the keyspace. The finalize is part of the DDL's
+// work, so both render the same and are deduplicated into one section.
+func TestPlanFingerprint_FinalizeBesideDDLRendersTheSame(t *testing.T) {
+	cases := []struct {
+		name            string
+		tableNamespace  string
+		changeNamespace string
+	}{
+		{name: "keyspace", tableNamespace: "payments", changeNamespace: "payments"},
+		// A table with no namespace is listed under the database itself.
+		{name: "database", tableNamespace: "", changeNamespace: "payments"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mk := func(metadata map[string]string) *apitypes.PlanResponse {
+				plan := planWithTables(&apitypes.TableChangeResponse{DDL: "CREATE TABLE refunds (id BIGINT PRIMARY KEY)", ChangeType: "CREATE", TableName: "refunds", Namespace: tc.tableNamespace})
+				plan.Database = "payments"
+				plan.Changes[0].Namespace = tc.changeNamespace
+				plan.Changes[0].Metadata = metadata
+				return plan
+			}
+			finalized := mk(map[string]string{apitypes.NeedsFinalizerMetadataKey: "true"})
+			plain := mk(nil)
+
+			assert.Equal(t, planFingerprint(plain), planFingerprint(finalized))
+		})
+	}
 }

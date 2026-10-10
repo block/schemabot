@@ -63,7 +63,7 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 	// An unscoped fan-out apply-confirm for a database this deployment does not
 	// own is a deliberate silent no-op, not a failure.
 	t.Run("unowned unscoped fan-out is terminal and silent", func(t *testing.T) {
-		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		h, mux, comments := newFanOutSkipHandler(t, aggregateParticipantConfig())
 		serveSchemaConfigForDatabase(t, mux, "orders")
 
 		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
@@ -71,6 +71,23 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "a non-owning fan-out skip is the command's terminal answer, not a retryable failure")
 		assert.Empty(t, comments, "the terminal skip must stay silent")
+	})
+
+	// The aggregate leader answers for a database its registry lacks, and
+	// that answer is as terminal as the silent skip: the same config stays
+	// unregistered until an operator registers the database, so re-driving
+	// would only re-post the comment.
+	t.Run("leader answer for an unregistered database is terminal", func(t *testing.T) {
+		h, mux, comments := newFanOutSkipHandler(t, aggregateLeaderConfig())
+		serveSchemaConfigForDatabase(t, mux, "orders")
+
+		retry, err := h.applyConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", "", 12345, "hubot", CommandResult{Action: action.ApplyConfirm})
+
+		require.NoError(t, err)
+		assert.False(t, retry, "the leader's answer is the command's terminal answer, not a retryable failure")
+		body := requireComment(t, comments, "database-not-registered answer")
+		assert.Contains(t, body, "Database Not Registered")
+		assert.Contains(t, body, "`orders`")
 	})
 
 	// A schema-request rejection (database not configured on this server) posts
@@ -85,7 +102,8 @@ func TestApplyConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, retry, "a config-shape rejection is the command's answer, not a transient failure")
 		body := requireComment(t, comments, "database-not-configured apply-confirm error")
-		assert.Contains(t, body, `database &#34;orders&#34; is not configured on this server`)
+		assert.Contains(t, body, "Database Not Configured")
+		assert.Contains(t, body, "`orders`")
 	})
 
 	// Requesting an environment the database does not configure is a targeting

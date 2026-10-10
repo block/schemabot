@@ -11,6 +11,12 @@ import (
 // RenderRollbackPlanComment renders the rollback plan comment markdown.
 // Reuses PlanCommentData since rollback plans have the same structure as regular plans.
 func RenderRollbackPlanComment(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderRollbackPlanComment(data, budget)
+	})
+}
+
+func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) string {
 	var sb strings.Builder
 
 	// Header
@@ -21,8 +27,8 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	sb.WriteString("\n")
 
 	// Count changes
-	totalStatements, keyspacesWithVSchema := countChanges(data.Changes)
-	totalChanges := totalStatements + keyspacesWithVSchema
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	totalChanges := totalStatements + keyspaceUpdates
 
 	// Summary
 	if totalChanges == 0 {
@@ -31,10 +37,13 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	}
 
 	// Detailed changes
-	writeKeyspaceChanges(&sb, data)
+	writeKeyspaceChanges(&sb, data, budget)
 
-	// Unsafe warning — rollback typically produces DROP operations
-	sb.WriteString("> **Warning**: Rollback may include destructive changes (e.g., DROP INDEX, DROP COLUMN). These will be applied automatically.\n\n")
+	// The rollback's unsafe changes are named here, because confirming them
+	// takes --allow-unsafe and the operator should see what that destroys.
+	if data.HasUnsafeChanges && len(data.UnsafeChanges) > 0 {
+		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL, true)
+	}
 
 	// Lint violations
 	if len(data.LintViolations) > 0 {
@@ -47,16 +56,65 @@ func RenderRollbackPlanComment(data PlanCommentData) string {
 	}
 
 	// Summary (after DDL, matching CLI layout)
-	writePlanSummary(&sb, data, totalStatements, keyspacesWithVSchema)
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
 
-	// Footer
+	// Footer. Like the apply instruction, the consent requirement leads into
+	// the command and the flag stays out of the pasteable command, so
+	// consenting to destroy data takes typing it.
 	sb.WriteString("---\n\n")
-	sb.WriteString("To confirm this rollback, comment:\n")
+	if consent, ok := planUnsafeConsent(data); ok {
+		fmt.Fprintf(&sb, "To confirm this rollback, %s:\n", consent.instruction())
+	} else {
+		sb.WriteString("To confirm this rollback, comment:\n")
+	}
 	fmt.Fprintf(&sb, "```\n%s\n```\n\n", tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
-	sb.WriteString("To cancel, comment:\n")
-	fmt.Fprintf(&sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock", data.Tenant))
+	writeRollbackCancel(&sb, data.Tenant)
 
 	return appendAgentHint(sb.String(), data.AgentHint)
+}
+
+func writeRollbackCancel(sb *strings.Builder, tenant string) {
+	sb.WriteString("To cancel, comment:\n")
+	fmt.Fprintf(sb, "```\n%s\n```\n", appendTenantFlag("schemabot unlock", tenant))
+}
+
+// RenderRollbackUnsafeChangesBlocked renders the refusal posted when
+// rollback-confirm is given without `--allow-unsafe` and the pinned rollback
+// plan carries unsafe changes. It mirrors the apply refusal: the rollback plan,
+// each unsafe change, and the exact rollback-confirm command that consents to
+// them. Nothing ran and the lock still pins the rollback plan, so the
+// re-issued command confirms the same plan, and unlock cancels it.
+func RenderRollbackUnsafeChangesBlocked(data PlanCommentData) string {
+	return renderWithinCommentLimit(countPlanDDLBlocks(data.Changes), 0, func(budget *ddlBlockBudget) string {
+		return renderRollbackUnsafeChangesBlocked(data, budget)
+	})
+}
+
+func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) string {
+	var sb strings.Builder
+
+	writeEnvironmentTitle(&sb, "Schema Rollback Plan", data.Environment)
+	writePlanMetadata(&sb, data)
+	writeRequesterOrTimestamp(&sb, data.RequestedBy)
+	sb.WriteString("\n")
+
+	totalStatements, keyspaceUpdates := countChanges(data.Changes)
+	if totalStatements+keyspaceUpdates > 0 {
+		writeKeyspaceChanges(&sb, data, budget)
+	}
+	writePlanSummary(&sb, data, totalStatements, keyspaceUpdates)
+
+	// The retry keeps every option the rejected command carried, so following
+	// it changes only the consent, never how the rollback runs.
+	retryCommand := tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant) + " --allow-unsafe"
+	if data.DeferCutover {
+		retryCommand += " --defer-cutover"
+	}
+	writeUnsafeChangesRejection(&sb, data, "Rollback rejected", retryCommand)
+	sb.WriteString("\nThe lock still pins this rollback plan, so the command above confirms it.\n\n")
+	writeRollbackCancel(&sb, data.Tenant)
+
+	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
 }
 
 // RenderRollbackConfirmNoLock renders a message when rollback-confirm is run
@@ -78,14 +136,18 @@ func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
 
 // RenderRollbackMissingApplyID renders the message posted when `schemabot rollback`
 // is invoked without an apply ID argument. Tenant is the deployment's own
-// tenant; when set, the suggested commands carry it so pasting a hint
-// addresses this deployment.
-func RenderRollbackMissingApplyID(tenant string) string {
+// tenant; when set, the rollback usage lines carry it so pasting a hint
+// addresses this deployment. The status lookup is a CLI command, so it starts
+// with cliName and is scoped to the environment the rollback named, or to the
+// placeholder when it named none. It never carries --tenant: the tenant routes
+// PR comments, the CLI has no such flag, and the CLI reaches this deployment
+// through its endpoint or profile, which cliName's wrapper selects.
+func RenderRollbackMissingApplyID(cliName, environment, tenant string) string {
 	return offerSupportChannel("## Missing Apply ID\n\n" +
 		fmt.Sprintf("Usage: `%s`\n\n", tenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
 		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", tenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
 		"You can find the apply ID in the summary comment of a completed apply, " +
-		fmt.Sprintf("or by running `%s`.", appendTenantFlag("schemabot status", tenant)))
+		fmt.Sprintf("or by running `%s`.", cliCommand(cliName, "status "+environmentFlag(environment))))
 }
 
 // RenderRollbackApplyNotFound renders the message posted when the supplied apply ID
@@ -142,16 +204,16 @@ func sanitizedRollbackRejectionReason(reason string) string {
 // lockPR are populated, the holder is rendered as a PR link; otherwise the bare
 // owner string is shown. Tenant is the deployment's own tenant; when set, the
 // suggested unlock command carries it so pasting the hint addresses this
-// deployment.
-func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo string, lockPR int, tenant string) string {
+// deployment. lockedApply is what SchemaBot found running on the locked
+// database.
+func RenderRollbackBlockedByLock(database, environment, lockOwner, lockRepo string, lockPR int, tenant string, lockedApply LockedDatabaseApply) string {
 	if lockPR > 0 && lockRepo != "" {
 		return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
 			"**Database**: `%s` | **Environment**: `%s`\n\n"+
-			"A lock is currently held by %s.\n\n"+
-			"Wait for that operation to complete, or ask the lock owner to run `%s`.",
+			"A lock is currently held by %s.\n\n%s",
 			database, environment,
 			caller.PullRequestMarkdownLink(lockRepo, lockPR),
-			appendTenantFlag("schemabot unlock", tenant)))
+			otherPRLockReleaseHint(appendTenantFlag("schemabot unlock", tenant), lockedApply)))
 	}
 	return offerSupportChannel(fmt.Sprintf("## Rollback Blocked\n\n"+
 		"**Database**: `%s` | **Environment**: `%s`\n\n"+

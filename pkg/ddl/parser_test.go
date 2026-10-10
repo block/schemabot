@@ -6,6 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/block/schemabot/pkg/schema"
 )
 
 // The default parser must be the TiDB/Spirit implementation so MySQL and Vitess
@@ -38,6 +40,10 @@ func (f fakeStatementParser) Classify(string) (StatementType, string, error) {
 	return f.classifyType, f.classifyTable, f.classifyErr
 }
 
+func (f fakeStatementParser) DropTargets(string) (DropTargets, error) {
+	return DropTargets{}, nil
+}
+
 func (f fakeStatementParser) CreateTableColumns(string) ([]string, error) {
 	return nil, nil
 }
@@ -46,7 +52,19 @@ func (f fakeStatementParser) CreateIndex(string) (string, string, bool, error) {
 	return "", "", false, nil
 }
 
+func (f fakeStatementParser) SynthesizeAddColumn(string, string) (string, error) {
+	return "", nil
+}
+
+func (f fakeStatementParser) CostScalesWithTableSize(string) (bool, error) {
+	return false, nil
+}
+
 func (f fakeStatementParser) Canonicalize(string) string {
+	return f.canonicalized
+}
+
+func (f fakeStatementParser) CanonicalizeUnqualified(string) string {
 	return f.canonicalized
 }
 
@@ -108,6 +126,15 @@ func TestSeamClassifyRejectsMultiStatement(t *testing.T) {
 	_, _, err := ClassifyStatement("CREATE TABLE `a` (`id` INT); DROP TABLE `b`;")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "split with SplitStatements before classifying")
+}
+
+func TestTiDBSplitReturnsEachStatementText(t *testing.T) {
+	statements, err := SplitStatements("CREATE TABLE `a` (`id` INT); DROP TABLE `b`;")
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"CREATE TABLE `a` (`id` INT);",
+		"DROP TABLE `b`;",
+	}, statements)
 }
 
 // The TiDB implementation must translate every Spirit statement type it can
@@ -221,4 +248,144 @@ func TestRestoreCanonicalMultiStatementUnchanged(t *testing.T) {
 			assert.Equal(t, tt.input, restoreCanonical(tt.input))
 		})
 	}
+}
+
+// CostScalesWithTableSize scopes the plan comment's table-size section: a
+// statement reports true when it builds an index, copies or rebuilds the
+// table, or scans it to validate a constraint, so a size line renders exactly
+// for the changes whose cost grows with the table. Provably metadata-only
+// clauses stay quiet.
+func TestTiDBCostScalesWithTableSize(t *testing.T) {
+	p := tidbStatementParser{}
+
+	tests := []struct {
+		name string
+		stmt string
+		want bool
+	}{
+		{"add index", "ALTER TABLE `mutes` ADD INDEX `idx_created_at` (`created_at`)", true},
+		{"add key", "ALTER TABLE `mutes` ADD KEY `idx_created_at` (`created_at`)", true},
+		{"add unique key", "ALTER TABLE `mutes` ADD UNIQUE KEY `uniq_slug` (`slug`)", true},
+		{"add fulltext index", "ALTER TABLE `mutes` ADD FULLTEXT INDEX `ft_body` (`body`)", true},
+		{"add spatial index", "ALTER TABLE `mutes` ADD SPATIAL INDEX `sp_location` (`location`)", true},
+		{"add primary key", "ALTER TABLE `mutes` ADD PRIMARY KEY (`id`)", true},
+		{"index add among metadata-only clauses", "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255), ADD INDEX `idx_reason` (`reason`)", true},
+		{"standalone create index", "CREATE INDEX `idx_created_at` ON `mutes` (`created_at`)", true},
+		{"modify column widening", "ALTER TABLE `mutes` MODIFY COLUMN `reason` varchar(500)", true},
+		{"modify column type change", "ALTER TABLE `mutes` MODIFY COLUMN `count` bigint", true},
+		{"change column", "ALTER TABLE `mutes` CHANGE COLUMN `reason` `cause` varchar(255)", true},
+		{"add foreign key", "ALTER TABLE `mutes` ADD CONSTRAINT `fk_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)", true},
+		{"add check constraint", "ALTER TABLE `mutes` ADD CONSTRAINT `chk_positive` CHECK (`count` > 0)", true},
+		{"convert charset", "ALTER TABLE `mutes` CONVERT TO CHARACTER SET utf8mb4", true},
+		{"engine rebuild", "ALTER TABLE `mutes` ENGINE=InnoDB", true},
+		{"add column with inline unique", "ALTER TABLE `mutes` ADD COLUMN `slug` varchar(64) UNIQUE", true},
+		{"add stored generated column", "ALTER TABLE `mutes` ADD COLUMN `total` int AS (`a` + `b`) STORED", true},
+		{"drop column", "ALTER TABLE `mutes` DROP COLUMN `reason`", true},
+		{"add hash partitions", "ALTER TABLE `mutes` ADD PARTITION PARTITIONS 4", true},
+		{"add range partition", "ALTER TABLE `mutes` ADD PARTITION (PARTITION `p2027` VALUES LESS THAN (2028))", false},
+		{"drop partition", "ALTER TABLE `mutes` DROP PARTITION `p2020`", false},
+		{"truncate partition", "ALTER TABLE `mutes` TRUNCATE PARTITION `p2020`", false},
+		{"add column only", "ALTER TABLE `mutes` ADD COLUMN `reason` varchar(255)", false},
+		{"add virtual generated column", "ALTER TABLE `mutes` ADD COLUMN `total` int AS (`a` + `b`) VIRTUAL", false},
+		{"rename column", "ALTER TABLE `mutes` RENAME COLUMN `reason` TO `cause`", false},
+		{"rename table", "ALTER TABLE `mutes` RENAME TO `silences`", false},
+		{"set default", "ALTER TABLE `mutes` ALTER COLUMN `count` SET DEFAULT 0", false},
+		{"drop index", "ALTER TABLE `mutes` DROP INDEX `idx_created_at`", false},
+		{"drop foreign key", "ALTER TABLE `mutes` DROP FOREIGN KEY `fk_user`", false},
+		{"drop check constraint", "ALTER TABLE `mutes` DROP CHECK `chk_positive`", false},
+		// DROP CONSTRAINT resolves against the table's CHECK, FOREIGN KEY and
+		// UNIQUE constraints, and dropping any of the three is metadata-only.
+		{"drop named constraint", "ALTER TABLE `mutes` DROP CONSTRAINT `uq_name`", false},
+		{"index invisible", "ALTER TABLE `mutes` ALTER INDEX `idx_created_at` INVISIBLE", false},
+		{"comment only", "ALTER TABLE `mutes` COMMENT='muted things'", false},
+		{"create table with index", "CREATE TABLE `mutes` (`id` bigint, KEY `idx_id` (`id`))", false},
+		{"drop table", "DROP TABLE `mutes`", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.CostScalesWithTableSize(tt.stmt)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+
+	t.Run("unparseable statement is an error", func(t *testing.T) {
+		_, err := p.CostScalesWithTableSize("ALTER TABLE ADD INDEX WHAT")
+		assert.Error(t, err)
+	})
+
+	t.Run("multi-statement input is an error", func(t *testing.T) {
+		_, err := p.CostScalesWithTableSize("ALTER TABLE `a` ADD INDEX `i` (`c`); DROP TABLE `b`")
+		assert.Error(t, err)
+	})
+}
+
+func TestTiDBDropTargets(t *testing.T) {
+	p := tidbStatementParser{}
+	tests := []struct {
+		name string
+		stmt string
+		want DropTargets
+		err  bool
+	}{
+		{"drop tables", "DROP TABLE a, b", DropTargets{Tables: 2}, false},
+		{"drop index", "DROP INDEX idx ON t", DropTargets{Indexes: 1}, false},
+		{"alter drops", "ALTER TABLE t DROP COLUMN c, DROP INDEX i", DropTargets{Columns: 1, Indexes: 1}, false},
+		{"alter drops two indexes", "ALTER TABLE t DROP INDEX a, DROP INDEX b", DropTargets{Indexes: 2}, false},
+		{"drop column shorthand", "ALTER TABLE t DROP c", DropTargets{Columns: 1}, false},
+		{"drop primary key", "ALTER TABLE t DROP PRIMARY KEY", DropTargets{}, false},
+		{"create table", "CREATE TABLE t (id bigint)", DropTargets{}, false},
+		// Spirit rejects a compound whose statements are not all ALTER TABLE
+		// before the single-statement guard runs; the all-ALTER compound is
+		// the input that reaches the guard.
+		{"multiple statements", "DROP TABLE a; DROP TABLE b", DropTargets{}, true},
+		{"multiple alters", "ALTER TABLE a DROP COLUMN x; ALTER TABLE b DROP COLUMN y", DropTargets{}, true},
+		{"garbage", "this is not SQL", DropTargets{}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := p.DropTargets(tt.stmt)
+			if tt.err {
+				assert.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// The qualifier and whether the grammar carries one at all are separate
+// answers, so a parser that cannot see a schema qualifier never reports the
+// absence of one. Conflating the two is what turns a missing capability into a
+// silent pass for a statement targeting a relation nobody asked about.
+func TestCreateTargetQualifier(t *testing.T) {
+	postgres, err := ParserForDialect(schema.DialectPostgres)
+	require.NoError(t, err)
+
+	qualifier, carried, err := CreateTargetQualifier(postgres, "CREATE TABLE archive.settings (id bigint)")
+	require.NoError(t, err)
+	assert.True(t, carried)
+	assert.Equal(t, "archive", qualifier)
+
+	qualifier, carried, err = CreateTargetQualifier(postgres, "CREATE TABLE settings (id bigint)")
+	require.NoError(t, err)
+	assert.True(t, carried)
+	assert.Empty(t, qualifier, "an unqualified name is reported as written, never resolved against a search_path")
+
+	qualifier, carried, err = CreateTargetQualifier(postgres, "CREATE INDEX idx ON archive.settings (id)")
+	require.NoError(t, err)
+	assert.True(t, carried)
+	assert.Equal(t, "archive", qualifier)
+
+	mysql, err := ParserForDialect(schema.DialectMySQL)
+	require.NoError(t, err)
+	qualifier, carried, err = CreateTargetQualifier(mysql, "CREATE TABLE `settings` (`id` BIGINT UNSIGNED PRIMARY KEY)")
+	require.NoError(t, err)
+	assert.False(t, carried, "a grammar with no schema-aware seam says so rather than reporting no qualifier")
+	assert.Empty(t, qualifier)
+
+	_, carried, err = CreateTargetQualifier(postgres, "CREATE TABLE (")
+	assert.True(t, carried)
+	require.Error(t, err, "a parse failure is an error, not an unqualified answer")
 }

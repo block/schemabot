@@ -197,3 +197,54 @@ func TestLogOperationDriveLeavesParent_LogsCarryApplyIdentity(t *testing.T) {
 		assert.Equal(t, "remote-op-1", line.attrs["remote_apply_id"])
 	})
 }
+
+// Settling an operator's cancel against one undispatched deployment of a
+// fan-out is the line an operator pulls up when asking what happened to the
+// command on that deployment, so it has to stay reachable by the `deployment`
+// facet every other apply log carries. The apply's routing deployment and its
+// state come from MutableLogAttrs; the operation's own deployment — which can
+// differ from the apply row's — is named unambiguously as operation_deployment
+// on both the per-task skip line and the settlement line.
+func TestTerminalizeUndispatchedApplyOperation_LogsCarryBothDeployments(t *testing.T) {
+	apply := driveLoggerTestApply(state.Apply.Running)
+	apply.Deployment = "deploy-primary"
+	opID := int64(7)
+	op := &storage.ApplyOperation{ID: opID, ApplyID: apply.ID, Deployment: "deploy-eu", State: state.ApplyOperation.Pending}
+	scope := applyTaskScope{applyOperationID: opID, operation: op, multiOperation: true}
+	tasks := []*storage.Task{
+		{ID: 1, TaskIdentifier: "task-done", ApplyID: apply.ID, ApplyOperationID: &opID, TableName: "orders", State: state.Task.Completed},
+		{ID: 2, TaskIdentifier: "task-pending", ApplyID: apply.ID, ApplyOperationID: &opID, TableName: "users", State: state.Task.Pending},
+	}
+
+	var records []capturedLog
+	client := &GRPCClient{
+		logger: slog.New(captureHandler{records: &records}),
+		storage: &mockStorage{
+			applies:    &mockApplyStore{apply: apply},
+			tasks:      &mockTaskStore{tasks: tasks},
+			operations: &mockApplyOperationStore{ops: map[int64]*storage.ApplyOperation{opID: op}},
+			logs:       &mockApplyLogStore{},
+		},
+	}
+
+	require.NoError(t, client.terminalizeUndispatchedApplyOperation(t.Context(), apply, "alice", scope, cancelUndispatchedTerminalization()))
+
+	for _, msg := range []string{
+		"leaving terminal gRPC task unchanged while settling an undispatched operation's control request",
+		"settled undispatched multi-operation gRPC apply operation; apply-level control request remains pending for siblings",
+	} {
+		line := requireCapturedLog(t, records, msg)
+		assertLogCarriesApplyIdentity(t, line)
+		assert.Equal(t, "deploy-primary", line.attrs["deployment"], "%s: the apply's routing deployment stays filterable", msg)
+		assert.Equal(t, "deploy-eu", line.attrs["operation_deployment"], "%s: the operation's own deployment is named unambiguously", msg)
+		assert.Equal(t, state.Apply.Running, line.attrs["state"], msg)
+		assert.Equal(t, opID, line.attrs["apply_operation_id"], msg)
+		assert.Equal(t, storage.ControlOperationCancel, line.attrs["control_operation"], msg)
+	}
+	skip := requireCapturedLog(t, records, "leaving terminal gRPC task unchanged while settling an undispatched operation's control request")
+	assert.Equal(t, "task-done", skip.attrs["task_id"])
+	settled := requireCapturedLog(t, records, "settled undispatched multi-operation gRPC apply operation; apply-level control request remains pending for siblings")
+	assert.Equal(t, "alice", settled.attrs["requested_by"])
+	assert.Equal(t, state.ApplyOperation.Pending, settled.attrs["old_operation_state"])
+	assert.Equal(t, state.ApplyOperation.Cancelled, settled.attrs["new_operation_state"])
+}

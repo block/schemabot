@@ -129,7 +129,6 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		assert.Equal(t, int64(45000), users.RowsCopied)
 		assert.Equal(t, int64(100000), users.RowsTotal)
 		assert.Equal(t, 45, users.Progress)
-		assert.Equal(t, "45000/100000 45% copyRows", users.ProgressDetail)
 		assert.Equal(t, int64(90), users.ETASeconds)
 
 		orders := got[1]
@@ -147,7 +146,6 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		require.Len(t, got, 1)
 		assert.Equal(t, int64(0), got[0].ETASeconds, "no row total means no ETA")
 		assert.Equal(t, 0, got[0].Progress)
-		assert.Empty(t, got[0].ProgressDetail)
 	})
 
 	// A completed copy is a count, not an estimate: the reported total is
@@ -167,7 +165,6 @@ func TestBuildSpiritTableProgress(t *testing.T) {
 		assert.Equal(t, int64(3261100506), estimateHigh.RowsCopied)
 		assert.Equal(t, int64(3261100506), estimateHigh.RowsTotal)
 		assert.Equal(t, 100, estimateHigh.Progress)
-		assert.Equal(t, "3261100506/3261100506 100% copyRows", estimateHigh.ProgressDetail)
 
 		estimateLow := got[1]
 		assert.Equal(t, int64(1200), estimateLow.RowsCopied)
@@ -311,4 +308,21 @@ func TestRegistersWorkSynchronously(t *testing.T) {
 		"Spirit publishes the tracked schema change before Apply returns")
 	assert.True(t, engine.RegistersWorkSynchronously(eng),
 		"the package helper resolves Spirit's declaration")
+}
+
+// An engine that tracks no schema change — a fresh process whose predecessor
+// held the work, or one that has released its last outcome — must answer a
+// progress poll with pending and no error. Control resolution probes exactly
+// such an engine to decide whether work it can no longer reach is still live,
+// and pending is the only answer that lets a stop or cancel settle durably.
+// Any other state, or an error, reads as unresolved work and keeps the control
+// request retrying against an engine that will never run it.
+func TestIdleEngineReportsPending(t *testing.T) {
+	eng := New(Config{})
+
+	result := pollProgress(t, eng)
+
+	assert.Equal(t, engine.StatePending, result.State,
+		"an engine tracking no schema change reports the idle sentinel control resolution reads")
+	assert.Equal(t, "No active schema change", result.Message)
 }

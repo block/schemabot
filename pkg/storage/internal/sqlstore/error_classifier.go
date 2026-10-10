@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	gomysql "github.com/go-sql-driver/mysql"
+	"github.com/block/schemabot/pkg/mysqlerr"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -15,18 +15,33 @@ const (
 	mysqlErrLockWaitTimeout = 1205
 	mysqlErrDuplicateKey    = 1062
 
+	// MySQL refuses a value its column cannot hold with one of these, the same
+	// way on every attempt.
+	mysqlErrWarnDataOutOfRange  = 1264
+	mysqlErrDataTooLong         = 1406
+	mysqlErrTruncatedWrongValue = 1292
+	mysqlErrIncorrectValue      = 1366
+
 	// PostgreSQL rolls back the failed transaction for deadlocks and
 	// serialization failures. Lock-not-available reports an unacquired lock.
 	postgresErrDeadlock             = "40P01"
 	postgresErrSerializationFailure = "40001"
 	postgresErrLockNotAvailable     = "55P03"
 	postgresErrUniqueViolation      = "23505"
+
+	// postgresDataExceptionClass is the SQLSTATE class for a value its column
+	// cannot hold, refused the same way on every attempt.
+	postgresDataExceptionClass = "22"
 )
 
 // ErrorClassifier identifies database errors that affect shared storage flow.
 type ErrorClassifier interface {
 	IsRetryableConflict(error) bool
 	IsDuplicateKey(error) bool
+	// IsValueRejected reports a write refused because a value does not fit
+	// its column. Unlike a transport or lock failure, retrying the same write
+	// is refused again.
+	IsValueRejected(error) bool
 }
 
 type mysqlErrorClassifier struct{}
@@ -36,21 +51,27 @@ func NewMySQLErrorClassifier() ErrorClassifier {
 	return mysqlErrorClassifier{}
 }
 
+// The codes are read through mysqlerr.Number rather than by asserting a
+// driver's error type. Asserting a type is what silently broke here before: the
+// credential-reloading storage pool went through a hot-swap DSN driver that
+// embedded upstream go-sql-driver, so it returned a *mysql.MySQLError of a type
+// no errors.As against block/mysql's could match — and the failure mode was
+// every deadlock from that pool classified as non-retryable, not an error
+// anyone would see. See mysqlerr.Number.
 func (mysqlErrorClassifier) IsRetryableConflict(err error) bool {
-	var mysqlErr *gomysql.MySQLError
-	if !errors.As(err, &mysqlErr) {
-		return false
-	}
-	return mysqlErr.Number == mysqlErrDeadlock || mysqlErr.Number == mysqlErrLockWaitTimeout
+	return mysqlerr.Is(err, mysqlErrDeadlock, mysqlErrLockWaitTimeout)
 }
 
 func (mysqlErrorClassifier) IsDuplicateKey(err error) bool {
-	var mysqlErr *gomysql.MySQLError
-	if errors.As(err, &mysqlErr) && mysqlErr.Number == mysqlErrDuplicateKey {
+	if mysqlerr.Is(err, mysqlErrDuplicateKey) {
 		return true
 	}
 	// Defend against driver errors flattened to strings with %v in a call path.
 	return err != nil && strings.Contains(err.Error(), "Duplicate entry")
+}
+
+func (mysqlErrorClassifier) IsValueRejected(err error) bool {
+	return mysqlerr.Is(err, mysqlErrWarnDataOutOfRange, mysqlErrDataTooLong, mysqlErrTruncatedWrongValue, mysqlErrIncorrectValue)
 }
 
 type postgresErrorClassifier struct{}
@@ -77,4 +98,9 @@ func (postgresErrorClassifier) IsDuplicateKey(err error) bool {
 	}
 	// Defend against driver errors flattened to strings with %v in a call path.
 	return err != nil && strings.Contains(err.Error(), "duplicate key value violates unique constraint")
+}
+
+func (postgresErrorClassifier) IsValueRejected(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, postgresDataExceptionClass)
 }

@@ -77,11 +77,7 @@ func userFacingConfigNotAuthorizedError(err error) (string, bool) {
 	if !errors.As(err, &configErr) {
 		return "", false
 	}
-	return strings.Join([]string{
-		"SchemaBot found a `schemabot.yaml` configuration, but this SchemaBot instance is not configured to manage its schema directory.",
-		"Schema directory: `" + configErr.SchemaPath + "`.",
-		"Ask a SchemaBot operator to add this directory to `databases." + configErr.Database + ".allowed_dirs` in the server config, or move the schema config and files under an allowed directory.",
-	}, " "), true
+	return templates.RenderConfigNotAuthorizedLine(configErr.Database, configErr.SchemaPath), true
 }
 
 func userFacingErrorDetail(errorDetail string) string {

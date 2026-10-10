@@ -108,7 +108,6 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 	}
 
 	headSHA := prInfo.HeadSHA
-	timestamp := templates.NowFunc().UTC().Format("2006-01-02 15:04:05")
 
 	// Stale plan-only checks from commits whose schema changes were since
 	// reverted would keep the aggregate blocked, so clean them up first —
@@ -129,7 +128,7 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 		h.updateAggregateCheck(ctx, client, repo, pr, headSHA)
 		h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChangesChecksRefreshed(templates.NoManagedSchemaChangesChecksRefreshedData{
 			RequestedBy:    requestedBy,
-			Timestamp:      timestamp,
+			Repository:     repo,
 			HeadSHA:        headSHA,
 			GatedOnTenants: true,
 		}))
@@ -138,10 +137,12 @@ func (h *Handler) convergeAggregatesForNoManagedSchemaChanges(ctx context.Contex
 
 	h.logger.Info("plan found no managed schema changes; refreshing passing aggregate checks",
 		"repo", repo, "pr", pr, "head_sha", headSHA, "requested_by", requestedBy)
-	h.postPassingAggregates(ctx, client, repo, pr, headSHA)
+	// Reached only when the PR carries no SchemaBot files at all, so there is
+	// no unmanaged schema to name.
+	h.postPassingAggregates(ctx, client, repo, pr, headSHA, nil)
 	h.postComment(repo, pr, installationID, templates.RenderNoManagedSchemaChangesChecksRefreshed(templates.NoManagedSchemaChangesChecksRefreshedData{
 		RequestedBy: requestedBy,
-		Timestamp:   timestamp,
+		Repository:  repo,
 		HeadSHA:     headSHA,
 	}))
 	return nil

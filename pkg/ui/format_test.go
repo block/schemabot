@@ -8,6 +8,68 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestFormatApproxRows(t *testing.T) {
+	tests := []struct {
+		n    int64
+		want string
+	}{
+		{0, "~0"},
+		{842, "~842"},
+		{1_000, "~1k"},
+		{15_249, "~15.2k"},
+		{999_949, "~999.9k"},
+		{999_950, "~1M"},
+		{1_000_000, "~1M"},
+		{2_340_000, "~2.3M"},
+		{48_200_000, "~48.2M"},
+		{999_950_000, "~1B"},
+		{5_100_000_000, "~5.1B"},
+		{999_950_000_000, "~1T"},
+		{5_100_000_000_000, "~5.1T"},
+		{-5, "~0"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, FormatApproxRows(tt.n), "n=%d", tt.n)
+	}
+}
+
+func TestFormatApproxBytes(t *testing.T) {
+	tests := []struct {
+		b    int64
+		want string
+	}{
+		{0, "~0 B"},
+		{812, "~812 B"},
+		{1_000, "~1.0 KB"},
+		{112_640, "~113 KB"},
+		{99_949, "~99.9 KB"},
+		{99_950, "~100 KB"},
+		{999_499_999, "~999 MB"},
+		{999_500_000, "~1.0 GB"},
+		{1_130_000_000, "~1.1 GB"},
+		{23_400_000_000, "~23.4 GB"},
+		{186_000_000_000, "~186 GB"},
+		{186_400_000_000, "~186 GB"},
+		{999_500_000_000, "~1.0 TB"},
+		{48_000_000_000_000, "~48.0 TB"},
+		{999_500_000_000_000, "~1.0 PB"},
+		{-5, "~0 B"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, FormatApproxBytes(tt.b), "b=%d", tt.b)
+	}
+}
+
+// A copy line carries the table's planned size after its row counts, and
+// nothing when the plan had no estimate.
+func TestFormatTableSizeClause(t *testing.T) {
+	bytes := int64(23_400_000_000)
+	assert.Equal(t, " · ~23.4 GB", FormatTableSizeClause(&bytes))
+	zero := int64(0)
+	assert.Equal(t, " · ~0 B", FormatTableSizeClause(&zero))
+	assert.Empty(t, FormatTableSizeClause(nil))
+}
+
 func TestTableStatePriority(t *testing.T) {
 	tests := []struct {
 		state    string
@@ -86,6 +148,41 @@ func TestRowCopyDisplayPercent(t *testing.T) {
 	assert.Equal(t, 1, RowCopyDisplayPercent(-3, 42))
 	assert.Equal(t, 2, RowCopyDisplayPercent(2, 42))
 	assert.Equal(t, 100, RowCopyDisplayPercent(145, 42))
+}
+
+func TestRowCopyFraction(t *testing.T) {
+	assert.InDelta(t, 45.37, RowCopyFraction(45, 453_700, 1_000_000), 0.0001)
+	assert.InDelta(t, 100, RowCopyFraction(99, 1_100_000, 1_000_000), 0.0001)
+	assert.InDelta(t, 45, RowCopyFraction(45, 0, 0), 0.0001)
+	assert.InDelta(t, 100, RowCopyFraction(145, 0, 0), 0.0001)
+}
+
+func TestFormatRowCopyPercent(t *testing.T) {
+	// Row counts are the source of truth: the percent is recomputed from them
+	// at two-decimal precision, whatever the whole-number percent says.
+	assert.Equal(t, "45.00%", FormatRowCopyPercent(45, 450_000, 1_000_000))
+	assert.Equal(t, "45.37%", FormatRowCopyPercent(45, 453_700, 1_000_000))
+	assert.Equal(t, "0.03%", FormatRowCopyPercent(0, 13_186_540, 43_234_523_345))
+	assert.Equal(t, "0.19%", FormatRowCopyPercent(0, 3_000, 1_604_159))
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(100, 1_000_000, 1_000_000))
+
+	// Floored at 0.01% once copying has begun, and capped at 100% when the
+	// copied count overshoots the estimated total.
+	assert.Equal(t, "0.01%", FormatRowCopyPercent(0, 1, 1_000_000))
+	assert.Equal(t, "100.00%", FormatRowCopyPercent(99, 1_100_000, 1_000_000))
+
+	// Capped at 99.99% while copied rows still trail the total: "100.00%"
+	// reads as done, and a copy in its final stretch is not.
+	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 999_999_999, 1_000_000_000))
+	assert.Equal(t, "99.99%", FormatRowCopyPercent(100, 43_234_523_344, 43_234_523_345))
+	assert.Equal(t, "99.99%", FormatRowCopyPercent(99, 99_999, 100_000))
+
+	// Without row counts, the engine's whole-number percent renders clamped;
+	// a copy that has begun with no total falls back to "<1%".
+	assert.Equal(t, "0%", FormatRowCopyPercent(0, 0, 1_000_000))
+	assert.Equal(t, "45%", FormatRowCopyPercent(45, 0, 0))
+	assert.Equal(t, "100%", FormatRowCopyPercent(145, 0, 0))
+	assert.Equal(t, "<1%", FormatRowCopyPercent(0, 42, 0))
 }
 
 func TestLintReasons(t *testing.T) {
@@ -203,9 +300,38 @@ func TestCodeQuoteIdentifiers(t *testing.T) {
 	}
 }
 
+// An engine-reported statement renders as a single line of bounded width on
+// every surface: line breaks, tabs, and control bytes fold into single spaces,
+// text within the bound passes through untouched, and text past it is cut to
+// exactly the bound with a trailing ellipsis.
+func TestClampStatement(t *testing.T) {
+	atBound := strings.Repeat("x", MaxStatementRunes)
+	tests := []struct {
+		name   string
+		input  string
+		expect string
+	}{
+		{name: "empty", input: "", expect: ""},
+		{name: "plain statement unchanged", input: "CREATE INDEX idx ON t (c)", expect: "CREATE INDEX idx ON t (c)"},
+		{name: "newlines tabs and control bytes fold to one space", input: "CREATE INDEX\r\n\tidx\x1b[31m ON t (c)", expect: "CREATE INDEX idx [31m ON t (c)"},
+		{name: "surrounding whitespace dropped", input: "  ALTER TABLE t ADD c int \n", expect: "ALTER TABLE t ADD c int"},
+		{name: "exactly at the bound passes through", input: atBound, expect: atBound},
+		{name: "one past the bound is cut with an ellipsis", input: atBound + "y", expect: strings.Repeat("x", MaxStatementRunes-1) + "…"},
+		{name: "cut counts runes not bytes", input: strings.Repeat("é", MaxStatementRunes+5), expect: strings.Repeat("é", MaxStatementRunes-1) + "…"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ClampStatement(tt.input)
+			assert.Equal(t, tt.expect, got)
+			assert.LessOrEqual(t, len([]rune(got)), MaxStatementRunes)
+		})
+	}
+}
+
 // A byte count reads as a magnitude: bytes below a kibibyte, and one decimal
 // place with a binary unit above it, so a table's footprint is scannable.
-func TestFormatBytes(t *testing.T) {
+func TestFormatBytesBinary(t *testing.T) {
 	tests := []struct {
 		name   string
 		input  int64
@@ -224,7 +350,7 @@ func TestFormatBytes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expect, FormatBytes(tt.input))
+			assert.Equal(t, tt.expect, FormatBytesBinary(tt.input))
 		})
 	}
 }

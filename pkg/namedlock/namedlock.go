@@ -48,6 +48,16 @@ type Locker interface {
 	// held by this session (already released or expired). err is non-nil for
 	// any driver or SQL failure.
 	Release(ctx context.Context, conn *sql.Conn, name string) (released bool, err error)
+	// HeldByAnySession reports whether any session anywhere holds the named
+	// lock, including conn's own. It takes nothing and waits for nothing, so
+	// it answers while a holder is mid-work — which is the only time the
+	// answer is interesting.
+	//
+	// The answer is a fact about the instant it was read, not a reservation:
+	// a holder can release immediately after, and a caller can take the lock
+	// immediately after a false. Use it to report what is happening, never to
+	// decide whether to proceed — Acquire is what decides that, atomically.
+	HeldByAnySession(ctx context.Context, conn *sql.Conn, name string) (held bool, err error)
 }
 
 // MySQL implements Locker with MySQL's GET_LOCK / RELEASE_LOCK. The lock is
@@ -92,4 +102,17 @@ func (MySQL) Release(ctx context.Context, conn *sql.Conn, name string) (bool, er
 		return false, fmt.Errorf("release named lock %q: %w", name, err)
 	}
 	return result.Valid && result.Int64 == 1, nil
+}
+
+// HeldByAnySession runs IS_USED_LOCK(name), which returns the connection id of
+// the session holding the lock and NULL when no session holds it. The identity
+// of the holder is deliberately not returned: it is a connection id on one
+// server, which means nothing to an operator and nothing at all to a caller
+// reading a different server.
+func (MySQL) HeldByAnySession(ctx context.Context, conn *sql.Conn, name string) (bool, error) {
+	var holder sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT IS_USED_LOCK(?)", name).Scan(&holder); err != nil {
+		return false, fmt.Errorf("check whether named lock %q is held: %w", name, err)
+	}
+	return holder.Valid, nil
 }

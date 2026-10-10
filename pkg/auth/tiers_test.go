@@ -26,10 +26,28 @@ func TestTierForRequest(t *testing.T) {
 		{http.MethodPost, "/api/checks/synthesize", TierWrite},
 		{http.MethodPost, "/api/settings", TierWrite},
 		{http.MethodDelete, "/api/locks", TierWrite},
+		// SchemaBot's own storage schema is admin territory on both halves:
+		// the diff exposes the internal shape of its bookkeeping database, and
+		// its sibling route converges it. On a deployment configured with only
+		// read and write groups this tier is the whole admin decision.
+		{http.MethodPost, "/api/storage/schema/plan", TierWrite},
+		{http.MethodPost, "/api/storage/schema/apply", TierWrite},
 	}
 	for _, c := range cases {
 		assert.Equalf(t, c.want, TierForRequest(c.method, c.path), "%s %s", c.method, c.path)
 	}
+}
+
+// Only the listed read-only endpoints escape the write tier by name. Every
+// other non-GET path is a write, including one nobody has classified, so a new
+// mutating endpoint is admitted at the write tier before anyone remembers to
+// think about it.
+func TestUnclassifiedNonGetPathsAreWrites(t *testing.T) {
+	for _, path := range []string{"/api/storage/schema/plan", "/api/newly/added/endpoint", "/api/pull/subresource"} {
+		assert.Equalf(t, TierWrite, TierForRequest(http.MethodPost, path), "POST %s", path)
+	}
+	assert.Equal(t, TierRead, TierForRequest(http.MethodPost, "/api/pull"),
+		"the read-only endpoints are listed by exact path")
 }
 
 func TestMatchesAnyGroup(t *testing.T) {
@@ -46,4 +64,21 @@ func TestMatchesAnyGroup(t *testing.T) {
 	// names with the same slug only match on an exact string.
 	assert.False(t, matchesAnyGroup([]string{"other-org/schema-admins"}, admin),
 		"same slug under a different org must not match")
+}
+
+func TestMatchedGroups(t *testing.T) {
+	configured := []string{"octocat/orders-oncall", "orders-operators", "octocat/orders-operators"}
+
+	assert.Equal(t, []string{"octocat/orders-oncall", "octocat/orders-operators", "orders-operators"},
+		MatchedGroups([]string{"orders-operators", "orders-oncall"}, configured),
+		"every matched configured group is returned by its configured name, sorted")
+	assert.Equal(t, []string{"orders-operators"},
+		MatchedGroups([]string{"other-org/orders-operators"}, configured),
+		"an org-qualified caller group matches a bare configured slug but not another org's name")
+	assert.Equal(t, []string{"orders-operators"},
+		MatchedGroups([]string{"orders-operators"}, []string{"orders-operators", "orders-operators"}),
+		"a group configured twice is returned once")
+	assert.Empty(t, MatchedGroups([]string{"payments-team"}, configured))
+	assert.Empty(t, MatchedGroups(nil, configured))
+	assert.Empty(t, MatchedGroups([]string{"orders-operators"}, nil))
 }

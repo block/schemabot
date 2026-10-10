@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
@@ -48,6 +48,18 @@ func (h *msgSignalHandler) Handle(ctx context.Context, r slog.Record) error {
 		h.once.Do(func() { close(h.ch) })
 	}
 	return h.Handler.Handle(ctx, r)
+}
+
+// WithAttrs and WithGroup re-wrap the derived handler so the signal survives a
+// caller deriving its own logger from this one. Returning the inner handler's
+// result directly would hand back a plain handler, and the test would wait for
+// an event it can no longer observe.
+func (h *msgSignalHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &msgSignalHandler{Handler: h.Handler.WithAttrs(attrs), msg: h.msg, once: h.once, ch: h.ch}
+}
+
+func (h *msgSignalHandler) WithGroup(name string) slog.Handler {
+	return &msgSignalHandler{Handler: h.Handler.WithGroup(name), msg: h.msg, once: h.once, ch: h.ch}
 }
 
 // newRetrySignalLogger returns a logger for serve.Build plus a channel that is

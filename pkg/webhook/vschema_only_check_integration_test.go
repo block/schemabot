@@ -30,7 +30,7 @@ import (
 func TestUpsertPlanCheckRecord_VSchemaOnlyPlanRequiresApply(t *testing.T) {
 	ctx := t.Context()
 
-	db, err := sql.Open("mysql", e2eSchemabotDSN)
+	db, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	require.NoError(t, db.PingContext(ctx))
 	t.Cleanup(func() { assert.NoError(t, db.Close()) })

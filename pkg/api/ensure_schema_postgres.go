@@ -7,51 +7,52 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
 )
 
-// ensurePostgresSchema converges SchemaBot's storage schema on PostgreSQL by
-// creating every storage table whose embedded schema file has no matching
-// table in the current schema. Existing tables are checked for every expected
-// column and standalone unique index, but are never altered; extra columns are
-// tolerated, and a missing non-unique index is tolerated with a startup
-// warning naming it. The column check is presence-only:
-// type, length, and nullability drift are outside its scope and are not detected.
-// That bound is deliberate — PostgreSQL has
-// no in-process diff/apply mechanism here (Spirit is MySQL-only), and
-// create-only convergence is sufficient to bootstrap a fresh storage
-// database. Evolving an already-bootstrapped PostgreSQL storage schema
-// requires a schema diff mechanism, which lands separately.
+// ensurePostgresSchema converges additive drift in SchemaBot's PostgreSQL
+// storage schema. It creates missing tables, columns, and standalone indexes.
+// Extra objects are tolerated for binary rollback, and column comparison is
+// presence-only: type, length, and nullability drift are outside its scope.
 //
-// Because the flow only ever creates missing tables, it can never destroy
-// existing data, so the destructive-change refusal that guards the MySQL flow
-// (WithAllowDestructiveSchemaChanges) does not apply here.
+// The flow never destroys or alters existing objects, so the destructive-change
+// refusal that guards the MySQL flow does not apply here.
 //
-// Concurrency-safe across pods: checks table existence first without a lock
-// (read-only, the common case on 99% of deploys), and returns immediately when
-// every table exists. When tables are missing, acquires a PostgreSQL advisory
-// lock to serialize creation across pods, then re-checks under the lock —
-// another pod may have created the tables while we waited. Each table's file
-// executes inside one transaction, so a killed pod leaves either the whole
-// table with its indexes or nothing.
-func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Locker) error {
-	ctx, cancel := context.WithTimeout(context.Background(), EnsureSchemaTimeout)
+// Concurrency-safe across pods: discovers drift without a lock, acquires the
+// PostgreSQL advisory lock only when needed, then re-discovers under the lock.
+// A change that needs manual remediation aborts the whole convergence before
+// any DDL executes. Each transaction bounds its lock wait with lock_timeout
+// and its execution with statement_timeout.
+//
+// Three statement classes run under three different budgets, because they fail
+// for different reasons and a single value cannot serve all of them:
+//
+//	catalog reads      o.postgresStatementTimeout   ordinary queries
+//	convergence DDL    postgresBootstrapDDLBudget (per transaction)
+//	advisory-lock wait none — must be free to block for the leader
+func ensurePostgresSchema(parent context.Context, dsn string, logger *slog.Logger, o ensureSchemaOptions, locker namedlock.Locker) error {
+	ctx, cancel := context.WithTimeout(parent, o.convergenceTimeout)
 	defer cancel()
 
-	tables, files, err := readEmbeddedPostgresSchemaFiles()
+	// Nil is the embedded files, so a boot reads its own schema through the
+	// same call an operator converging a named release reads theirs.
+	tables, files, err := o.schemaSource.postgresSchemaFiles()
 	if err != nil {
 		return err
 	}
 
-	db, err := postgresconn.Open(dsn)
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(o.postgresStatementTimeout))
 	if err != nil {
 		return fmt.Errorf("open storage database: %w", err)
 	}
@@ -75,41 +76,75 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 			"dialect", schema.DialectPostgres,
 			"database", database,
 			"schema", schemaName,
-			"embedded_tables", len(tables),
+			"schema_source", o.schemaSource.Describe(),
+			"declared_tables", len(tables),
 		)
 	}
 
-	// Fast path: check existence without a lock. If every table exists,
-	// return immediately.
-	missing, err := missingPostgresTables(ctx, db, tables)
-	if err != nil {
-		return fmt.Errorf("check storage tables: %w", err)
+	// Every cross-instance guarantee on the PostgreSQL path — this bootstrap's
+	// lock, the apply target lock, and reaper election — is one session-scoped
+	// advisory lock, so prove that a connection keeps its session before
+	// relying on any of them. The check runs ahead of the fast path because a
+	// converged pod that skips the lock still drives applies afterwards.
+	if err := verifyStorageSessionAffinity(ctx, db, locker, database); err != nil {
+		return err
 	}
-	if len(missing) == 0 {
+
+	// Fast path: discover drift without a lock. This is the common case and
+	// avoids advisory-lock overhead when the schema is already converged.
+	drift, err := postgresSchemaDriftFor(ctx, db, tables, files)
+	if err != nil {
+		return fmt.Errorf("inspect storage schema: %w", err)
+	}
+	if len(drift) == 0 {
 		if err := verifyAndLogPostgresSchemaShape(ctx, db, tables, files, logger, database, schemaName); err != nil {
 			return fmt.Errorf("validate existing storage tables: %w", err)
 		}
 		logger.Info("storage schema up-to-date", "database", database)
 		return nil
 	}
-	logger.Info("storage tables missing (pre-lock); acquiring EnsureSchema advisory lock to create them",
+	// Log every change the fast-path scan found before deciding anything about
+	// it: on a manual-remediation refusal these lines are the only place the
+	// operator sees the DDL behind each named problem.
+	for _, table := range tables {
+		for _, change := range drift[table] {
+			logger.Info("schema change detected (pre-lock)",
+				"table", table,
+				"operation", change.operation,
+				"object", change.object,
+				"ddl", change.ddl,
+			)
+		}
+	}
+	// Refuse manual-remediation drift before the lock: the decision is a pure
+	// function of the scan, and a pod that will fail anyway must not announce
+	// that it is about to converge or queue behind the lock.
+	if err := postgresManualRemediation(tables, drift); err != nil {
+		return err
+	}
+	logger.Info("storage schema drift detected (pre-lock); acquiring EnsureSchema advisory lock to converge it",
 		"database", database,
-		"tables", missing,
+		"change_count", drift.changeCount(),
+		"table_count", len(drift),
 	)
 
-	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, locker)
+	lockConn, err := acquirePostgresEnsureSchemaLock(ctx, dsn, logger, locker, o.convergenceTimeout)
 	if err != nil {
 		return fmt.Errorf("acquire schema lock: %w", err)
 	}
-	defer utils.CloseAndLog(lockConn)
+	defer releaseEnsureSchemaLock(ctx, locker, lockConn, logger, schema.DialectPostgres, database)
 
-	// Re-check under the lock — another pod may have created the tables
-	// while we waited.
-	missing, err = missingPostgresTables(ctx, db, tables)
-	if err != nil {
-		return fmt.Errorf("check storage tables: %w", err)
+	if err := ensureSchemaBudgetAfterLock(ctx, logger, schema.DialectPostgres, database, o.convergenceTimeout); err != nil {
+		return err
 	}
-	if len(missing) == 0 {
+
+	// Re-check under the lock — another pod may have converged the schema while
+	// this pod waited.
+	drift, err = postgresSchemaDriftFor(ctx, db, tables, files)
+	if err != nil {
+		return fmt.Errorf("inspect storage schema under lock: %w", err)
+	}
+	if len(drift) == 0 {
 		if err := verifyAndLogPostgresSchemaShape(ctx, db, tables, files, logger, database, schemaName); err != nil {
 			return fmt.Errorf("validate storage tables after lock: %w", err)
 		}
@@ -117,16 +152,85 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 		return nil
 	}
 
-	createStart := time.Now()
-	for _, table := range missing {
-		if err := createPostgresTable(ctx, db, table, files[table], logger); err != nil {
-			return fmt.Errorf("create storage table %q: %w", table, err)
+	// Gate on manual remediation across the whole drift set before touching
+	// any table, so a change that cannot run automatically never leaves the
+	// schema half-converged.
+	if err := postgresManualRemediation(tables, drift); err != nil {
+		return err
+	}
+
+	applyStart := time.Now()
+	ddlBudget := postgresBootstrapDDLBudget(o.convergenceTimeout)
+	// Progress here is counted in statements finished, because that is what
+	// this convergence knows. Each table's changes run inside one transaction
+	// that either lands or rolls back, so there is no partial state to report
+	// — but which table is in flight is the answer an operator waiting on a
+	// long CREATE INDEX is actually after.
+	totalChanges := drift.changeCount()
+	var doneChanges int
+	for _, table := range tables {
+		changes := drift[table]
+		if len(changes) == 0 {
+			logger.Debug("storage table already converged", "table", table)
+			continue
 		}
+		o.report(postgresConvergenceProgress(table, postgresConvergenceRunning, doneChanges, totalChanges))
+		tableStart := time.Now()
+		if err := applyPostgresTableChanges(ctx, db, table, changes, logger, ddlBudget); err != nil {
+			// A statement killed by the overall deadline surfaces as a context
+			// cancellation carrying no budget, so name the deadline that ended
+			// it the way the advisory-lock wait names its own. Logged as well
+			// as returned, like the MySQL bootstrap's twin: a crashlooping pod
+			// leaves nothing but the log.
+			//
+			// The two durations are what separate the causes. This branch runs
+			// only once the context is done, so the total is always about the
+			// whole deadline and says nothing on its own. Time spent on the
+			// table that ran out is the discriminator: near the deadline means
+			// that one table's work is pathological, while a small share of a
+			// spent deadline means the earlier tables consumed it and the
+			// deadline is simply too short for the drift set.
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				logger.Error("storage schema change did not complete within the convergence budget; SchemaBot storage will not initialize",
+					"database", database,
+					"table", table,
+					"timeout", o.convergenceTimeout,
+					"elapsed", time.Since(applyStart),
+					"table_elapsed", time.Since(tableStart),
+					"error", err,
+				)
+				return fmt.Errorf("converge storage table %q: convergence did not finish within its budget (%s): %w",
+					table, o.convergenceTimeout, err)
+			}
+			if ctx.Err() != nil {
+				// Stopped by the operator watching it, which only the deliberate
+				// path can do. No budget is named, because none fired — naming
+				// one sends them looking for a timeout that did not happen.
+				//
+				// A table is not one transaction. Its column changes commit
+				// together and each of its indexes commits on its own, so a
+				// stop rolls back the batch in flight and leaves every batch
+				// that already committed — including earlier batches of this
+				// same table. Saying the table is untouched would send an
+				// operator to a half-converged one believing it clean.
+				logger.Warn("storage schema convergence stopped by its caller",
+					"database", database,
+					"table", table,
+					"elapsed", time.Since(applyStart),
+				)
+				return fmt.Errorf("converge storage table %q: convergence stopped; the batch in flight rolled back whole, and changes to this table that had already committed are still applied, as is every table converged before it, so plan the storage schema again to see what is left: %w",
+					table, err)
+			}
+			return fmt.Errorf("converge storage table %q: %w", table, err)
+		}
+		doneChanges += len(changes)
+		o.report(postgresConvergenceProgress(table, postgresConvergenceComplete, doneChanges, totalChanges))
 	}
 	logger.Info("storage schema applied successfully",
 		"database", database,
-		"tables_created", len(missing),
-		"duration", time.Since(createStart),
+		"change_count", drift.changeCount(),
+		"table_count", len(drift),
+		"duration", time.Since(applyStart),
 	)
 	if err := verifyAndLogPostgresSchemaShape(ctx, db, tables, files, logger, database, schemaName); err != nil {
 		return fmt.Errorf("validate converged storage tables: %w", err)
@@ -134,8 +238,316 @@ func ensurePostgresSchema(dsn string, logger *slog.Logger, locker namedlock.Lock
 	return nil
 }
 
+// The phases a PostgreSQL convergence reports a table in. There is no third:
+// each table's changes run in one transaction, so a table is either being
+// converged or converged, never partway.
+//
+// The finished one is the shared terminal state rather than a word of this
+// dialect's own. A reader of these observations has to be able to tell that a
+// subject is finished without knowing which dialect produced it — that is what
+// decides whether there is anything left to report about it — and a dialect
+// spelling the end differently makes that a lookup table instead of a check.
+const (
+	postgresConvergenceRunning  = "running"
+	postgresConvergenceComplete = string(engine.StateCompleted)
+)
+
+// postgresConvergenceProgress is one observation of the per-table convergence,
+// counted in statements rather than tables: a convergence creating one table
+// and adding six columns to another is not half done when the first lands.
+func postgresConvergenceProgress(table, state string, done, total int) StorageConvergenceProgress {
+	p := StorageConvergenceProgress{
+		DDLCount: total,
+		State:    state,
+		Tables:   []StorageConvergenceTableProgress{{Table: table, State: state}},
+	}
+	if total > 0 {
+		p.Percent = done * 100 / total
+	}
+	return p
+}
+
+// The additive convergence's change kinds. Every producer tags a change with
+// one of these and postgresManualProblem phrases each by kind, so the operator
+// text and the drift scan can never disagree on a spelling.
+const (
+	postgresOpCreateTable = "create_table"
+	postgresOpAddColumn   = "add_column"
+	postgresOpCreateIndex = "create_index"
+)
+
+type postgresSchemaChange struct {
+	operation string
+	object    string
+	ddl       string
+	// manualReason is non-empty when the change cannot run automatically and
+	// names why plus the remediation. Any non-empty reason aborts convergence
+	// before any DDL executes.
+	manualReason string
+}
+
+type postgresSchemaDrift map[string][]postgresSchemaChange
+
+// changeCount returns the total number of planned changes across all tables.
+func (d postgresSchemaDrift) changeCount() int {
+	total := 0
+	for _, changes := range d {
+		total += len(changes)
+	}
+	return total
+}
+
+// postgresIndexExpectation is one standalone CREATE INDEX statement's
+// expectation: an index under this name must exist, and must be unique when
+// unique is set. Indexes are matched by name only — column composition is
+// not compared, so a same-named index over different columns reads as
+// converged.
+type postgresIndexExpectation struct {
+	name   string
+	unique bool
+	ddl    string
+}
+
+// postgresTableExpectations is the shape one embedded schema file declares
+// for its table: the CREATE TABLE statement followed by named standalone
+// CREATE INDEX statements.
+type postgresTableExpectations struct {
+	createTable string
+	columns     []string
+	indexes     []postgresIndexExpectation
+}
+
+// refuseQualifiedRelation refuses a CREATE statement that names a schema on its
+// target relation. The convergence resolves every relation through the
+// connection's own current schema, so it has no way to act on a qualifier: it
+// would run the qualified DDL and then keep checking the unqualified name,
+// leaving the table the file is named for missing on every boot.
+//
+// Refusing is the only safe disposition. Resolving the qualifier would mean
+// deciding which of the two relations the file meant, and both readings write
+// to a database — one creating a table nobody asked for, the other silently
+// converging a different one.
+func refuseQualifiedRelation(parser ddl.StatementParser, statement, table, subject string) error {
+	qualifier, carried, err := ddl.CreateTargetQualifier(parser, statement)
+	if err != nil {
+		return fmt.Errorf("read the target relation of the schema file for table %q: %w", table, err)
+	}
+	if !carried || qualifier == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"schema file for table %q declares %s in schema %q; a storage schema file names its relations unqualified, because the convergence resolves them through the connection's own current schema",
+		table, subject, qualifier)
+}
+
+// postgresExpectationsFor parses one table's embedded schema file into the
+// expectations the drift scan and the shape verification both consume. A
+// trailing statement that is not a named standalone CREATE INDEX on the
+// file's own table fails closed: the additive convergence could neither
+// create nor verify it, so a schema file carrying one would silently stop
+// being the source of truth for the live schema.
+func postgresExpectationsFor(parser ddl.StatementParser, table, file string) (postgresTableExpectations, error) {
+	statements, err := parser.Split(file)
+	if err != nil {
+		return postgresTableExpectations{}, fmt.Errorf("split schema file for table %q: %w", table, err)
+	}
+	if len(statements) == 0 {
+		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q has no statements", table)
+	}
+	// The convergence takes a file's table identity from its name, so a file
+	// that creates a different relation than it is named for would have every
+	// later check — columns, indexes, existence — run against one table while
+	// the CREATE TABLE it would run created another. The index check below
+	// holds standalone indexes to the same rule; this holds the table itself.
+	statementType, created, err := parser.Classify(statements[0])
+	if err != nil {
+		return postgresTableExpectations{}, fmt.Errorf("classify the first statement of the schema file for table %q: %w", table, err)
+	}
+	if statementType != ddl.StatementCreateTable {
+		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q must begin with CREATE TABLE; it begins with %s", table, statementType)
+	}
+	if created != table {
+		return postgresTableExpectations{}, fmt.Errorf("schema file for table %q declares table %q", table, created)
+	}
+	// Classify returns the bare relation name by contract, so the comparison
+	// above passes for a CREATE TABLE that qualifies its target. The
+	// convergence has no such qualifier anywhere: it checks existence, columns
+	// and indexes against the connection's current schema, so a qualified
+	// CREATE TABLE would create one relation while every later check read
+	// another — and the table the file is named for would stay missing.
+	if err := refuseQualifiedRelation(parser, statements[0], table, "table "+table); err != nil {
+		return postgresTableExpectations{}, err
+	}
+	columns, err := parser.CreateTableColumns(statements[0])
+	if err != nil {
+		return postgresTableExpectations{}, fmt.Errorf("extract expected columns for table %q: %w", table, err)
+	}
+	expectations := postgresTableExpectations{createTable: statements[0], columns: columns}
+	for _, statement := range statements[1:] {
+		indexName, indexTable, unique, err := parser.CreateIndex(statement)
+		if err != nil {
+			return postgresTableExpectations{}, fmt.Errorf("extract expected indexes for table %q: %w", table, err)
+		}
+		if indexName == "" {
+			return postgresTableExpectations{}, fmt.Errorf(
+				"schema file for table %q contains a statement the additive convergence cannot track: %q; only named standalone CREATE INDEX statements may follow CREATE TABLE",
+				table, statement)
+		}
+		if indexTable != table {
+			return postgresTableExpectations{}, fmt.Errorf("schema file for table %q declares index %q on table %q", table, indexName, indexTable)
+		}
+		if err := refuseQualifiedRelation(parser, statement, table, fmt.Sprintf("index %s", indexName)); err != nil {
+			return postgresTableExpectations{}, err
+		}
+		expectations.indexes = append(expectations.indexes, postgresIndexExpectation{name: indexName, unique: unique, ddl: statement})
+	}
+	return expectations, nil
+}
+
+func postgresSchemaDriftFor(ctx context.Context, db *sql.DB, tables []string, files map[string]string) (postgresSchemaDrift, error) {
+	missingTables, err := missingPostgresTables(ctx, db, tables)
+	if err != nil {
+		return nil, err
+	}
+	missingTable := make(map[string]bool, len(missingTables))
+	for _, table := range missingTables {
+		missingTable[table] = true
+	}
+
+	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
+	if err != nil {
+		return nil, fmt.Errorf("select PostgreSQL statement parser: %w", err)
+	}
+	drift := make(postgresSchemaDrift)
+	for _, table := range tables {
+		expected, err := postgresExpectationsFor(parser, table, files[table])
+		if err != nil {
+			return nil, err
+		}
+		if missingTable[table] {
+			drift[table] = []postgresSchemaChange{{operation: postgresOpCreateTable, object: table, ddl: files[table]}}
+			continue
+		}
+
+		existingColumns, err := postgresTableColumns(ctx, db, table)
+		if err != nil {
+			return nil, err
+		}
+		for _, column := range expected.columns {
+			if existingColumns[column] {
+				continue
+			}
+			statement, err := parser.SynthesizeAddColumn(expected.createTable, column)
+			if err != nil {
+				return nil, fmt.Errorf("synthesize ADD COLUMN for %q.%q: %w", table, column, err)
+			}
+			manualReason, err := ddl.PostgresAddColumnManualReason(expected.createTable, column)
+			if err != nil {
+				return nil, fmt.Errorf("classify ADD COLUMN safety for %q.%q: %w", table, column, err)
+			}
+			drift[table] = append(drift[table], postgresSchemaChange{
+				operation:    postgresOpAddColumn,
+				object:       column,
+				ddl:          statement,
+				manualReason: manualReason,
+			})
+		}
+
+		existingIndexes, err := postgresTableIndexes(ctx, db, table)
+		if err != nil {
+			return nil, err
+		}
+		for _, index := range expected.indexes {
+			live, present := existingIndexes[index.name]
+			if !present {
+				drift[table] = append(drift[table], postgresSchemaChange{operation: postgresOpCreateIndex, object: index.name, ddl: index.ddl})
+				continue
+			}
+			manualReason := postgresLiveIndexManualReason(index, live)
+			if manualReason == "" {
+				continue
+			}
+			// The live index occupies the expected name, so CREATE INDEX would
+			// collide rather than repair it. Carry the change as manual so the
+			// gate reports it alongside every other problem before any DDL runs.
+			drift[table] = append(drift[table], postgresSchemaChange{
+				operation:    postgresOpCreateIndex,
+				object:       index.name,
+				ddl:          index.ddl,
+				manualReason: manualReason,
+			})
+		}
+	}
+	return drift, nil
+}
+
+// postgresLiveIndexManualReason reports why the live index under an expected
+// index's name cannot satisfy that expectation, or "" when it does. A live
+// index satisfies a non-unique expectation under either uniqueness, since a
+// unique index answers the same reads. Only a valid index counts: the planner
+// never uses an invalid index and it may not cover every existing row, so its
+// presence says nothing about the reads or the uniqueness the embedded schema
+// relies on.
+//
+// pg_index alone cannot tell a failed CREATE INDEX CONCURRENTLY from one that
+// is still building — both are indisvalid=false — so the live state carries
+// whether a build is in progress and the reason names which situation this
+// is: an in-flight build needs no operator action beyond waiting, while a
+// failed one needs its cause removed (duplicate keys under a unique build make
+// every recovery fail again) before the index is dropped or reindexed. Each
+// reason starts with a possessed noun so postgresManualProblem's "has index
+// %q whose ..." template reads as a sentence.
+func postgresLiveIndexManualReason(expected postgresIndexExpectation, live postgresLiveIndex) string {
+	if !live.valid {
+		if live.building {
+			return "live state is invalid because a CREATE INDEX CONCURRENTLY is still building it; no action is needed — startup succeeds once that build completes"
+		}
+		return "live state is invalid and no CREATE INDEX CONCURRENTLY is visible building it, so an earlier concurrent build failed part-way (a build owned by another role is only visible with pg_read_all_stats — confirm from a privileged session first); remove the cause (a unique build keeps failing while duplicate keys remain), then DROP INDEX it so startup recreates it or REINDEX INDEX CONCURRENTLY it manually"
+	}
+	if expected.unique && !live.unique {
+		return "live state is non-unique where the embedded schema requires a unique index; replace it manually"
+	}
+	return ""
+}
+
+// postgresManualRemediation returns an error naming every planned change that
+// needs manual remediation, or nil when all planned changes can run
+// automatically. It scans the whole drift set so the gate fires before any
+// table's DDL executes — an operator sees every problem at once rather than
+// one per crashloop restart.
+func postgresManualRemediation(tables []string, drift postgresSchemaDrift) error {
+	var problems []string
+	for _, table := range tables {
+		for _, change := range drift[table] {
+			if change.manualReason == "" {
+				continue
+			}
+			problems = append(problems, postgresManualProblem(table, change))
+		}
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(problems, "; "))
+}
+
+// postgresManualProblem phrases one manual change for the operator: the
+// table, the object, and the situation the reason describes. An operation the
+// drift scan does not classify still surfaces, so a new change kind can never
+// slip past the gate unnamed.
+func postgresManualProblem(table string, change postgresSchemaChange) string {
+	switch change.operation {
+	case postgresOpAddColumn:
+		return fmt.Sprintf("storage table %q is missing column %q whose %s", table, change.object, change.manualReason)
+	case postgresOpCreateIndex:
+		return fmt.Sprintf("storage table %q has index %q whose %s", table, change.object, change.manualReason)
+	default:
+		return fmt.Sprintf("storage table %q needs %s of %q which requires manual remediation: %s", table, change.operation, change.object, change.manualReason)
+	}
+}
+
 func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger, database, schemaName string) error {
-	if err := verifyPostgresSchemaShape(ctx, db, tables, files, logger); err != nil {
+	if err := verifyPostgresSchemaShape(ctx, db, tables, files); err != nil {
 		logger.Error("PostgreSQL storage schema shape check failed",
 			"dialect", schema.DialectPostgres,
 			"database", database,
@@ -148,28 +560,19 @@ func verifyAndLogPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []s
 	return nil
 }
 
-// verifyPostgresSchemaShape checks expected columns by presence only; it does
-// not detect type, length, or nullability drift. It requires standalone
-// unique indexes because losing their constraints can change write semantics.
-// A missing non-unique index never alters results, so it does not fail
-// startup — but it is warned about by name, because the queries it serves run
-// unindexed until an operator creates it by hand (see docs/configuration.md).
-func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string, logger *slog.Logger) error {
+// verifyPostgresSchemaShape checks the additive convergence result. Columns
+// remain presence-only; type, length, and nullability drift are not detected.
+// Indexes are matched by name, validity, and uniqueness only, not column
+// composition.
+func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string, files map[string]string) error {
 	parser, err := ddl.ParserForDialect(schema.DialectPostgres)
 	if err != nil {
 		return fmt.Errorf("select PostgreSQL statement parser: %w", err)
 	}
 	for _, table := range tables {
-		statements, err := parser.Split(files[table])
+		expected, err := postgresExpectationsFor(parser, table, files[table])
 		if err != nil {
-			return fmt.Errorf("split schema file for table %q: %w", table, err)
-		}
-		if len(statements) == 0 {
-			return fmt.Errorf("schema file for table %q has no statements", table)
-		}
-		expected, err := parser.CreateTableColumns(statements[0])
-		if err != nil {
-			return fmt.Errorf("extract expected columns for table %q: %w", table, err)
+			return err
 		}
 		existing, err := postgresTableColumns(ctx, db, table)
 		if err != nil {
@@ -177,7 +580,7 @@ func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string,
 		}
 
 		var missing []string
-		for _, column := range expected {
+		for _, column := range expected.columns {
 			if !existing[column] {
 				missing = append(missing, column)
 			}
@@ -186,52 +589,26 @@ func verifyPostgresSchemaShape(ctx context.Context, db *sql.DB, tables []string,
 			return fmt.Errorf("storage table %q is missing expected columns: %s", table, strings.Join(missing, ", "))
 		}
 
-		expectedUnique := make([]string, 0)
-		expectedNonUnique := make([]string, 0)
-		for _, statement := range statements[1:] {
-			indexName, indexTable, unique, err := parser.CreateIndex(statement)
-			if err != nil {
-				return fmt.Errorf("extract expected indexes for table %q: %w", table, err)
-			}
-			if indexName == "" {
-				// Not a standalone CREATE INDEX statement, so it declares no
-				// index expectation.
-				continue
-			}
-			if indexTable != table {
-				return fmt.Errorf("schema file for table %q declares index %q on table %q", table, indexName, indexTable)
-			}
-			if unique {
-				expectedUnique = append(expectedUnique, indexName)
-			} else {
-				expectedNonUnique = append(expectedNonUnique, indexName)
-			}
-		}
 		existingIndexes, err := postgresTableIndexes(ctx, db, table)
 		if err != nil {
 			return err
 		}
-		missing = nil
-		for _, indexName := range expectedUnique {
-			if !existingIndexes[indexName] {
-				missing = append(missing, indexName)
+		// Each unsatisfied expectation carries its own cause: an absent index
+		// and a present-but-unusable one need different operator action, and
+		// this error is the only thing the crashloop shows.
+		var unsatisfied []string
+		for _, index := range expected.indexes {
+			live, present := existingIndexes[index.name]
+			if !present {
+				unsatisfied = append(unsatisfied, index.name+" (missing)")
+				continue
+			}
+			if reason := postgresLiveIndexManualReason(index, live); reason != "" {
+				unsatisfied = append(unsatisfied, fmt.Sprintf("%s (%s)", index.name, reason))
 			}
 		}
-		if len(missing) > 0 {
-			return fmt.Errorf("storage table %q is missing expected unique indexes: %s", table, strings.Join(missing, ", "))
-		}
-		var missingNonUnique []string
-		for _, indexName := range expectedNonUnique {
-			if _, present := existingIndexes[indexName]; !present {
-				missingNonUnique = append(missingNonUnique, indexName)
-			}
-		}
-		if len(missingNonUnique) > 0 {
-			logger.Warn("storage table is missing non-unique indexes the embedded schema declares; the queries they serve run unindexed until an operator creates them by hand (see docs/configuration.md)",
-				"dialect", schema.DialectPostgres,
-				"table", table,
-				"indexes", strings.Join(missingNonUnique, ", "),
-			)
+		if len(unsatisfied) > 0 {
+			return fmt.Errorf("storage table %q has expected indexes that are missing, invalid, or mismatched: %s", table, strings.Join(unsatisfied, "; "))
 		}
 	}
 	return nil
@@ -259,13 +636,33 @@ func postgresTableColumns(ctx context.Context, db *sql.DB, table string) (map[st
 	return existing, nil
 }
 
-// postgresTableIndexes returns the table's live indexes as a name→uniqueness
-// map. A unique expectation requires its name to map to true; a non-unique
-// expectation is satisfied by presence under either uniqueness, since a
-// unique index answers the same reads.
-func postgresTableIndexes(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+// postgresLiveIndex is what the server reports about one live index: whether
+// it enforces uniqueness, whether PostgreSQL considers it usable, and whether
+// a CREATE INDEX CONCURRENTLY is building it right now. An invalid index
+// still occupies its name in pg_index and is still maintained on writes, but
+// the planner never consults it and it may not cover every existing row; only
+// the in-progress build distinguishes one that will become valid on its own
+// from one a failed build abandoned.
+type postgresLiveIndex struct {
+	unique   bool
+	valid    bool
+	building bool
+}
+
+// postgresTableIndexes returns the table's live indexes keyed by name, with
+// each index's in-progress build read from pg_stat_progress_create_index.
+// That view hides other roles' sessions from a caller without
+// pg_read_all_stats, so a build owned by another role reads as absent; the
+// manual reason for that case says so. postgresLiveIndexManualReason decides
+// whether a live index satisfies an expectation; this only reports what the
+// server shows this session.
+func postgresTableIndexes(ctx context.Context, db *sql.DB, table string) (map[string]postgresLiveIndex, error) {
 	rows, err := db.QueryContext(ctx, `
-		SELECT index_class.relname, index_info.indisunique
+		SELECT index_class.relname, index_info.indisunique, index_info.indisvalid,
+		       EXISTS (
+		           SELECT 1 FROM pg_stat_progress_create_index AS build
+		           WHERE build.index_relid = index_info.indexrelid
+		       )
 		FROM pg_index AS index_info
 		JOIN pg_class AS table_class ON table_class.oid = index_info.indrelid
 		JOIN pg_namespace AS table_namespace ON table_namespace.oid = table_class.relnamespace
@@ -277,14 +674,14 @@ func postgresTableIndexes(ctx context.Context, db *sql.DB, table string) (map[st
 	}
 	defer utils.CloseAndLog(rows)
 
-	existing := make(map[string]bool)
+	existing := make(map[string]postgresLiveIndex)
 	for rows.Next() {
 		var indexName string
-		var unique bool
-		if err := rows.Scan(&indexName, &unique); err != nil {
+		var live postgresLiveIndex
+		if err := rows.Scan(&indexName, &live.unique, &live.valid, &live.building); err != nil {
 			return nil, fmt.Errorf("scan index for table %q: %w", table, err)
 		}
-		existing[indexName] = unique
+		existing[indexName] = live
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate indexes for table %q: %w", table, err)
@@ -354,16 +751,122 @@ func missingPostgresTables(ctx context.Context, db *sql.DB, want []string) ([]st
 	return missing, nil
 }
 
-// createPostgresTable executes one embedded schema file — a CREATE TABLE
-// followed by its CREATE INDEX statements — inside a single transaction.
-// PostgreSQL DDL is transactional, so the table appears with all of its
-// indexes or not at all; an interrupted bootstrap never leaves a
-// partially-indexed table behind.
+// postgresDDLLockTimeout bounds how long a convergence DDL statement waits
+// for its table lock. Without it, one long-running reader queues the ALTER
+// TABLE's AccessExclusiveLock request indefinitely, and every later reader
+// queues behind that request — a table-wide stall. With it, the statement
+// fails, the transaction rolls back, and the startup attempt retries or
+// fails visibly instead.
+const postgresDDLLockTimeout = 10 * time.Second
+
+// postgresBootstrapDDLBudget bounds how long a convergence DDL statement may
+// run once its lock is granted. lock_timeout bounds only the wait for the lock;
+// without a statement budget a CREATE INDEX against a large storage table runs
+// until something outside SchemaBot stops it.
 //
-// The file executes whole in one Exec: pgx uses the simple query protocol for
-// zero-argument Execs, and the simple protocol runs a multi-statement string
-// natively, so no client-side statement splitting is needed.
-func createPostgresTable(ctx context.Context, db *sql.DB, table, content string, logger *slog.Logger) error {
+// The value is derived from the convergence's own budget rather than chosen,
+// and the derivation is the safety argument. That budget already bounds the
+// whole convergence through the context every statement runs under, so a
+// statement that outlives this one was going to be cancelled by that context
+// anyway — its transaction began after the context did, so the context deadline
+// is always the earlier of the two. No statement that converges today fails
+// once this budget exists; the only statements it affects are ones that would
+// have died at the context deadline, and they now die a little sooner with an
+// error naming a budget instead of a bare cancellation. That is what keeps a
+// short budget from turning a slow-but-healthy boot into a crashloop: the boot
+// path's real ceiling is unchanged.
+//
+// Deriving it per convergence rather than once per process is what makes the
+// budget follow the caller. An operator who raises the ceiling to finish an
+// index build a boot could not raises this with it; a boot keeps the ceiling it
+// has always had. A single package-level value would silently re-impose the
+// boot budget on every statement of a convergence that had asked for longer,
+// which is the whole ceiling the deliberate path exists to escape.
+//
+// The margin decides which of the two bounds reports the failure, and it does
+// so by start time rather than by remaining time. statement_timeout is armed
+// per statement, so a statement beginning at offset s from the convergence's
+// start fires server-side at s+budget while the context fires at the ceiling —
+// the server wins only while s is under the margin. Convergence runs each index
+// in its own transaction, so on any convergence whose cumulative work passes
+// the margin, every later statement reports the context error instead of a
+// 57014 naming the budget. Winning is the narrow case, not the common one. That
+// costs only error quality: the caller's deadline branch names the ceiling, so
+// neither outcome is a bare cancellation.
+//
+// The subtraction must stay positive. Once the ceiling reaches the margin it
+// yields a budget of 0, which PostgreSQL reads as *disabled* rather than as
+// very short — the budget would silently cease to exist instead of becoming
+// strict, the one failure this whole mechanism exists to prevent. A ceiling
+// too short to hold the margin therefore derives a short budget instead: the
+// floor, or half the ceiling when the ceiling is shorter than twice the floor.
+// The halving is what keeps the budget strictly under the ceiling at every
+// length a caller can name, so that the first statement's failure names a
+// budget rather than arriving as a bare cancellation — a fixed floor sits at
+// or above the shortest ceilings and would bound nothing under them. Both
+// cases are reachable, because the ceiling is a caller's value: a convergence
+// asked to run in ten seconds gets the floor, and one asked to run in four
+// gets two.
+//
+// The ceiling is one EnsureSchema admitted, so it is at least
+// MinConvergenceTimeout. That lower bound is what lets the halving be the
+// whole story: statement_timeout is set in whole milliseconds, and half of any
+// admissible ceiling is hundreds of them — strictly under the ceiling, and
+// nowhere near the 0 that disables the budget.
+func postgresBootstrapDDLBudget(ceiling time.Duration) time.Duration {
+	if budget := ceiling - postgresBootstrapDDLTimeoutMargin; budget >= postgresBootstrapDDLFloor {
+		return budget
+	}
+	return min(postgresBootstrapDDLFloor, ceiling/2)
+}
+
+const (
+	postgresBootstrapDDLTimeoutMargin = 15 * time.Second
+	postgresBootstrapDDLFloor         = 5 * time.Second
+)
+
+// applyPostgresTableChanges executes one table's additive changes. A CREATE
+// TABLE change contains its complete embedded schema file, including indexes,
+// executed as one transaction; pgx's simple query protocol executes that
+// multi-statement string. For an existing table, column changes share one
+// transaction — each is metadata-only after the manual-remediation gate — and
+// each index builds in its own transaction. Plain CREATE INDEX holds a SHARE
+// lock for the full build and blocks writes; lock_timeout bounds only the wait
+// to acquire that lock, while ddlBudget — derived from the convergence's own
+// ceiling — bounds the build itself.
+// CREATE INDEX CONCURRENTLY cannot run inside these transactions, so the write
+// block is the accepted cost. Cross-transaction atomicity is unnecessary: a
+// startup killed between transactions leaves additive drift the next run
+// re-discovers and converges.
+func applyPostgresTableChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger, ddlBudget time.Duration) error {
+	if changes[0].operation == postgresOpCreateTable {
+		return execPostgresChanges(ctx, db, table, changes, logger, ddlBudget)
+	}
+	var columnChanges []postgresSchemaChange
+	var indexChanges []postgresSchemaChange
+	for _, change := range changes {
+		if change.operation == postgresOpCreateIndex {
+			indexChanges = append(indexChanges, change)
+		} else {
+			columnChanges = append(columnChanges, change)
+		}
+	}
+	if len(columnChanges) > 0 {
+		if err := execPostgresChanges(ctx, db, table, columnChanges, logger, ddlBudget); err != nil {
+			return err
+		}
+	}
+	for _, index := range indexChanges {
+		if err := execPostgresChanges(ctx, db, table, []postgresSchemaChange{index}, logger, ddlBudget); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// execPostgresChanges executes one batch of changes in a single transaction
+// with a bounded lock wait.
+func execPostgresChanges(ctx context.Context, db *sql.DB, table string, changes []postgresSchemaChange, logger *slog.Logger, ddlBudget time.Duration) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -376,16 +879,124 @@ func createPostgresTable(ctx context.Context, db *sql.DB, table, content string,
 		}
 	}()
 
-	logger.Info("schema change",
-		"table", table,
-		"operation", "create",
-		"ddl", content,
-	)
-	if _, err := tx.ExecContext(ctx, content); err != nil {
-		return fmt.Errorf("execute schema file: %w", err)
+	if _, err := tx.ExecContext(ctx, "SELECT set_config('lock_timeout', $1, true)",
+		strconv.FormatInt(postgresDDLLockTimeout.Milliseconds(), 10)); err != nil {
+		return fmt.Errorf("set lock_timeout for table %q: %w", table, err)
+	}
+	// DDL runs under a budget of its own, raised from the connection's ordinary
+	// query budget: an index build legitimately takes far longer than a catalog
+	// read. Transaction-local like lock_timeout above, so the connection
+	// returns to the pool on its session default.
+	if _, err := tx.ExecContext(ctx, "SELECT set_config('statement_timeout', $1, true)",
+		strconv.FormatInt(ddlBudget.Milliseconds(), 10)); err != nil {
+		return fmt.Errorf("set statement_timeout for table %q: %w", table, err)
+	}
+	for _, change := range changes {
+		logger.Info("schema change",
+			"table", table,
+			"operation", change.operation,
+			"object", change.object,
+			"ddl", change.ddl,
+			"statement_timeout", ddlBudget,
+			"lock_timeout", postgresDDLLockTimeout,
+		)
+		start := time.Now()
+		if _, err := tx.ExecContext(ctx, change.ddl); err != nil {
+			elapsed := time.Since(start)
+			err = postgresStatementTimeoutError(err, ddlBudget, elapsed)
+			// Logged as well as returned: on the boot path a crashloop's only
+			// artifact is the log, and the structured budget and elapsed fields
+			// are what separate a platform-imposed cancellation from a genuinely
+			// slow statement.
+			logger.Error("storage schema change failed",
+				"table", table,
+				"operation", change.operation,
+				"object", change.object,
+				"statement_timeout", ddlBudget,
+				"elapsed", elapsed,
+				"error", err,
+			)
+			return fmt.Errorf("execute %s for %q: %w", change.operation, change.object, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// postgresQueryCanceled is the SQLSTATE PostgreSQL raises when a statement is
+// cancelled. statement_timeout expiring and an operator's pg_cancel_backend
+// both produce it, which is why elapsed time has to disambiguate them.
+const postgresQueryCanceled = "57014"
+
+// postgresStatementTimeoutError names the budget that ended a cancelled
+// bootstrap statement, so an operator reading the failure sees a statement
+// timeout rather than a bare "change failed" and knows which budget to look at.
+//
+// SQLSTATE 57014 alone does not say who did the cancelling: statement_timeout
+// firing and an operator's pg_cancel_backend raise the same code. Elapsed time
+// corroborates, as it does in pg-sprite's executor. The budget in force cannot
+// fire before it has elapsed, so a cancellation that arrives earlier came from
+// outside the budget — an operator cancelling the backend, an administrative
+// termination, or a shorter budget imposed somewhere SchemaBot did not set it.
+// Saying so is the point: an operator who cancelled nothing learns that
+// something else is cancelling SchemaBot's bootstrap DDL, which is the finding,
+// not a detail.
+//
+// Errors that are not statement cancellations pass through untouched.
+func postgresStatementTimeoutError(err error, budget, elapsed time.Duration) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != postgresQueryCanceled {
+		return err
+	}
+	if budget > 0 && elapsed < budget {
+		return fmt.Errorf("statement cancelled after %s, before its %s statement_timeout could fire — "+
+			"something outside SchemaBot cancelled it (an operator cancelling the backend, or a shorter "+
+			"statement_timeout imposed at the role or database level): %w",
+			elapsed.Round(time.Millisecond), budget, err)
+	}
+	return fmt.Errorf("statement timed out after %s, exhausting its %s statement_timeout: %w",
+		elapsed.Round(time.Millisecond), budget, err)
+}
+
+// pooledStorageRefusal is the startup refusal an operator reads when the
+// storage connection turns out not to keep one PostgreSQL session. It names
+// what SchemaBot loses, why nothing else would have reported it, and the two
+// endpoints that fix it, because a pod that refuses to boot has no other
+// surface to say it on.
+const pooledStorageRefusal = "refusing to bootstrap storage database %q: the storage connection does not keep one PostgreSQL session per connection, " +
+	"which is the signature of a transaction-mode connection pooler (PgBouncer pool_mode=transaction, a hosted platform's pooled endpoint, " +
+	"or a proxy that has stopped pinning sessions). SchemaBot serializes this bootstrap across pods, and one apply per deployment at runtime, " +
+	"with session-scoped advisory locks that such a pooler grants without excluding anyone, so two pods would converge this schema and later " +
+	"drive the same apply at once. Point the storage DSN at the database's direct session endpoint (on hosted platforms this is usually the " +
+	"standard PostgreSQL port rather than the pooled one), or run the pooler in session pool mode: %w"
+
+// sessionAffinityVerifier is implemented by a locker that can prove, on a
+// given pool, that the session its locks live on is the session its caller
+// keeps reaching. A locker without the method cannot make that claim, so the
+// bootstrap refuses it rather than assume it.
+type sessionAffinityVerifier interface {
+	VerifySessionAffinity(ctx context.Context, db *sql.DB) error
+}
+
+// verifyStorageSessionAffinity refuses to bootstrap PostgreSQL storage over a
+// connection whose session does not survive a transaction. SchemaBot has no
+// second mechanism behind the advisory lock: converging storage without it
+// means two pods executing DDL against the same database, and the runtime
+// locks that keep one apply per deployment fail the same way, so an operator
+// who lands on a pooled connection string gets a startup refusal naming the
+// fix rather than silence.
+func verifyStorageSessionAffinity(ctx context.Context, db *sql.DB, locker namedlock.Locker, database string) error {
+	verifier, ok := locker.(sessionAffinityVerifier)
+	if !ok {
+		return fmt.Errorf("storage locker %T cannot verify that its advisory locks hold one PostgreSQL session; refusing to bootstrap storage database %q without cross-instance exclusion", locker, database)
+	}
+	if err := verifier.VerifySessionAffinity(ctx, db); err != nil {
+		if errors.Is(err, namedlock.ErrNoSessionAffinity) {
+			return fmt.Errorf(pooledStorageRefusal, database, err)
+		}
+		return fmt.Errorf("verify storage session affinity for database %q: %w", database, err)
 	}
 	return nil
 }
@@ -396,8 +1007,21 @@ func createPostgresTable(ctx context.Context, db *sql.DB, table, content string,
 // is closed before returning, so closing the returned connection terminates
 // the underlying session and releases the advisory lock — returning the
 // connection to a shared pool would leave the session (and the lock) alive.
-func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker) (*sql.Conn, error) {
-	db, err := postgresconn.Open(dsn)
+// Callers hand the connection to releaseEnsureSchemaLock, which releases the
+// lock explicitly before that close so the release has an answer to report.
+//
+// The connection also runs with statement_timeout explicitly disabled.
+// Acquiring the lock means blocking inside SELECT pg_advisory_lock() until the
+// leader finishes its bootstrap — up to the convergence's whole budget, which
+// is the wait this call is handed. A statement budget shorter than that wait,
+// whether SchemaBot's own or one the platform imposed at the role or database
+// level, would cancel a trailing pod's legitimate queue and fail its startup
+// while the leader was still converging normally. Disabling the budget is not
+// an unbounded wait: the wait is bounded
+// server-side by the lock_timeout namedlock scopes to the acquisition, and
+// client-side by ctx.
+func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *slog.Logger, locker namedlock.Locker, wait time.Duration) (*sql.Conn, error) {
+	db, err := postgresconn.Open(dsn, postgresconn.WithStatementTimeout(0))
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
@@ -409,18 +1033,26 @@ func acquirePostgresEnsureSchemaLock(ctx context.Context, dsn string, logger *sl
 		return nil, fmt.Errorf("get connection: %w", err)
 	}
 
-	// Wait up to the full timeout for the lock — a trailing pod must outwait
-	// the leader's table creation, after which it re-checks and finds every
-	// table present.
-	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, EnsureSchemaTimeout)
+	// Wait up to this convergence's whole budget for the lock — a trailing pod
+	// must outwait the leader's table creation, after which it re-checks and
+	// finds every table present. A pod waits out a boot; it does not wait out an
+	// operator's longer convergence, whose budget is its own and larger.
+	acquired, err := locker.Acquire(ctx, conn, ensureSchemaLockName, wait)
 	if err != nil {
 		utils.CloseAndLog(conn)
 		// The overall EnsureSchema deadline expires before the server-side
 		// lock wait (which starts later, with the same duration), so a
 		// contended timeout surfaces here as a context error — name the
 		// likely cause instead of reporting only the raw cancellation.
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, fmt.Errorf("timed out waiting for advisory lock %q (another pod may be running EnsureSchema): %w", ensureSchemaLockName, err)
+		}
+		if ctx.Err() != nil {
+			// Stopped by the operator watching it, before the lock was ever
+			// taken. Nothing ran, and saying so is the whole answer: the run
+			// they stopped changed nothing, and the one they were queued
+			// behind is still going.
+			return nil, fmt.Errorf("stopped while waiting for advisory lock %q; this run changed nothing, and the convergence it was queued behind is still running: %w", ensureSchemaLockName, err)
 		}
 		return nil, fmt.Errorf("acquire advisory lock: %w", err)
 	}

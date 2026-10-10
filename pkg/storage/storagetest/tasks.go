@@ -13,6 +13,99 @@ import (
 
 // TestTasks runs the behavioral parity suite for storage.TaskStore.
 func TestTasks(t *testing.T, h Harness) {
+	t.Run("IdentityKeys_AreCaseInsensitive", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_mixed_case_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_mixed_case", 810)
+		task := newTask(apply, "task_mixed_case", "CaseSensitiveTable", time.Now().UTC().Truncate(time.Second))
+		task.Database = "MixedCase_DB"
+		task.DatabaseType = "MySQL"
+		task.Repository = "MixedCase/Sample-Repo"
+		task.PullRequest = 813
+		task.Environment = "StAgInG"
+		id, err := store.Tasks().Create(ctx, task)
+		require.NoError(t, err)
+		require.Equal(t, "mixedcase_db", task.Database)
+		require.Equal(t, "mysql", task.DatabaseType)
+		require.Equal(t, "mixedcase/sample-repo", task.Repository)
+		require.Equal(t, "staging", task.Environment)
+
+		byDatabase, err := store.Tasks().GetByDatabase(ctx, "MIXEDCASE_DB")
+		require.NoError(t, err)
+		require.Len(t, byDatabase, 1)
+		assert.Equal(t, id, byDatabase[0].ID)
+		assert.Equal(t, "mixedcase_db", byDatabase[0].Database)
+		assert.Equal(t, "mysql", byDatabase[0].DatabaseType)
+		assert.Equal(t, "mixedcase/sample-repo", byDatabase[0].Repository)
+		assert.Equal(t, "staging", byDatabase[0].Environment)
+		assert.Equal(t, "CaseSensitiveTable", byDatabase[0].TableName)
+
+		byPR, err := store.Tasks().GetByPR(ctx, "MIXEDCASE/SAMPLE-REPO", 813)
+		require.NoError(t, err)
+		require.Len(t, byPR, 1)
+		assert.Equal(t, id, byPR[0].ID)
+
+		listed, err := store.Tasks().List(ctx, storage.TaskFilter{
+			Repository: "mixedCASE/sample-REPO", PullRequest: 813, IncludeCompleted: true,
+		})
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		assert.Equal(t, id, listed[0].ID)
+
+		owners, err := store.Tasks().FindTableOwners(ctx, storage.TableRef{
+			Database: "MIXEDCASE_DB", DatabaseType: "MYSQL", Environment: "STAGING", TableName: "CaseSensitiveTable",
+		})
+		require.NoError(t, err)
+		require.Len(t, owners, 1)
+		assert.Equal(t, "mixedcase/sample-repo", owners[0].Repository)
+		assert.Equal(t, 813, owners[0].PullRequest)
+	})
+
+	// A task's planned table size is written once when the task is created
+	// and read back with it. Progress updates rewrite the task's live figures
+	// but never its size, so a drive that does not carry the size cannot
+	// clear it.
+	t.Run("EstimatedBytes_WrittenAtCreate_SurvivesUpdate", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "task_bytes_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_task_bytes", 902)
+		now := time.Now().UTC().Truncate(time.Second)
+
+		sized := newTask(apply, "task_bytes_sized", "orders", now)
+		bytes := int64(23_400_000_000)
+		sized.EstimatedBytes = &bytes
+		_, err := store.Tasks().Create(ctx, sized)
+		require.NoError(t, err)
+		unsized := newTask(apply, "task_bytes_unsized", "users", now)
+		_, err = store.Tasks().Create(ctx, unsized)
+		require.NoError(t, err)
+
+		got, err := store.Tasks().Get(ctx, sized.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, got)
+		require.NotNil(t, got.EstimatedBytes)
+		assert.Equal(t, bytes, *got.EstimatedBytes)
+
+		got.EstimatedBytes = nil
+		got.State = state.Task.Running
+		got.RowsCopied = 500
+		got.RowsTotal = 1000
+		require.NoError(t, store.Tasks().Update(ctx, got))
+		updated, err := store.Tasks().Get(ctx, sized.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, updated)
+		assert.Equal(t, int64(500), updated.RowsCopied)
+		require.NotNil(t, updated.EstimatedBytes, "a progress update never clears the planned size")
+		assert.Equal(t, bytes, *updated.EstimatedBytes)
+
+		gotUnsized, err := store.Tasks().Get(ctx, unsized.TaskIdentifier)
+		require.NoError(t, err)
+		require.NotNil(t, gotUnsized)
+		assert.Nil(t, gotUnsized.EstimatedBytes, "a task created without an estimate reads back without one")
+	})
+
 	t.Run("Create_Get_Update", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -65,6 +158,7 @@ func TestTasks(t *testing.T, h Harness) {
 		got.CutoverAttempts = 3
 		got.IsInstant = true
 		got.EngineMigrationID = "engine-task-1"
+		got.DDL = "ALTER TABLE `app_b`.`users` ADD COLUMN `email` varchar(255)"
 		got.StartedAt = &started
 		got.CompletedAt = &completed
 		require.NoError(t, store.Tasks().Update(ctx, got))
@@ -85,6 +179,9 @@ func TestTasks(t *testing.T, h Harness) {
 		assert.Equal(t, 3, updated.CutoverAttempts)
 		assert.True(t, updated.IsInstant)
 		assert.Equal(t, "engine-task-1", updated.EngineMigrationID)
+		assert.Equal(t, "ALTER TABLE `app_b`.`users` ADD COLUMN `email` varchar(255)", updated.DDL,
+			"a task's statement follows Update so an adopted deployment rendering survives the next read")
+		assert.Equal(t, "alter", updated.DDLAction)
 		require.NotNil(t, updated.StartedAt)
 		assert.WithinDuration(t, started, *updated.StartedAt, time.Second)
 		require.NotNil(t, updated.CompletedAt)
@@ -279,7 +376,7 @@ func TestTasks(t *testing.T, h Harness) {
 			require.True(t, released)
 		}
 
-		expired, err := store.Applies().ExpireRetryable(ctx)
+		expired, err := store.Applies().ExpireRetryable(ctx, 10)
 		require.NoError(t, err)
 		require.Len(t, expired, 1)
 		assert.Equal(t, storage.RetryableExpirationAttemptBudget, expired[0].Reason)
@@ -386,6 +483,18 @@ func TestTasks(t *testing.T, h Harness) {
 	t.Run("ReapStrandedRetryable_DBError", func(t *testing.T) {
 		store := h.NewUnreachableStorage(t)
 		_, err := store.Tasks().ReapStrandedRetryable(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("ReapStrandedActive_DBError", func(t *testing.T) {
+		store := h.NewUnreachableStorage(t)
+		_, err := store.Tasks().ReapStrandedActive(t.Context(), 1)
+		require.Error(t, err)
+	})
+
+	t.Run("ReapStrandedActive_RejectsNonPositiveLimit", func(t *testing.T) {
+		store := h.NewStorage(t)
+		_, err := store.Tasks().ReapStrandedActive(t.Context(), 0)
 		require.Error(t, err)
 	})
 }

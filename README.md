@@ -1,97 +1,125 @@
-# <a href="./assets/schemabot-avatar.svg"><img src="./assets/schemabot-avatar.svg" alt="SchemaBot" style="height: 1em; max-width: 100%;"></a> SchemaBot
+<p align="center">
+  <img src="./assets/schemabot-avatar.svg" alt="SchemaBot" width="140" />
+</p>
 
-![MySQL: GA](https://img.shields.io/badge/MySQL-GA-brightgreen)
-![Vitess: GA](https://img.shields.io/badge/Vitess-GA-brightgreen)
-![PostgreSQL: early alpha](https://img.shields.io/badge/PostgreSQL-early_alpha-orange)
+<h1 align="center">SchemaBot</h1>
 
-GitOps for database schemas. Define your desired schema in SQL files, open a PR, and SchemaBot plans and executes your schema changes safely.
+<p align="center"><b>Ship schema changes as fast as your code, with the safety net your database deserves</b></p>
 
-## Schema Changes via Pull Request
+<p align="center">
+  <img alt="MySQL: GA" src="https://img.shields.io/badge/MySQL-GA-brightgreen" />
+  <img alt="Vitess: GA" src="https://img.shields.io/badge/Vitess-GA-brightgreen" />
+  <img alt="PostgreSQL: early alpha" src="https://img.shields.io/badge/PostgreSQL-early_alpha-orange" />
+</p>
 
-Open a PR with schema changes and SchemaBot handles the rest — plan, apply, and verify across environments:
+<p align="center">
+  <a href="./docs/vision.md">Vision</a> ·
+  <a href="#the-pr-workflow">PR workflow</a> ·
+  <a href="#from-your-terminal">CLI</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#docs">Docs</a>
+</p>
 
-![SchemaBot PR Demo](./assets/pr-demo.gif)
+---
 
-## Interactive CLI
+SchemaBot is declarative and GitOps-driven: SQL files in your repository provide a shared source of truth across environments. It compares those files with the live database, shows the exact change, and applies it through pull requests or a CLI.
 
-SchemaBot provides a fully interactive CLI for planning, applying, and monitoring schema changes:
+## The PR workflow
 
-![SchemaBot CLI Demo](./assets/cli-demo.gif)
+[![SchemaBot PR workflow: plan, apply, progress, completion, checks, and merge](./assets/pr-workflow-demo.gif)](./docs/pre-merge-workflow.md)
 
-## How It Works
+[Walk through the illustrated PR workflow](./docs/pre-merge-workflow.md#the-pr-workflow-step-by-step)
 
-SchemaBot uses **declarative schema** — you describe the desired end state in SQL files, and SchemaBot figures out the DDL needed to get there:
+## From your terminal
 
-```sql
--- schema/testapp/users.sql
-CREATE TABLE users (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) NOT NULL,       -- add a column: just edit this file
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-```
+**Plan and apply a change.** Review the SQL, apply the change, and follow it to completion.
 
-SchemaBot diffs your schema files against the live database, computes the DDL, and applies it:
+<img src="./assets/cli-plan-apply.gif" width="800" alt="Plan and apply a schema change through the CLI">
 
-```
-$ schemabot plan -s ./schema -e staging
+**Know your database fleet.** Explore live schemas, spot lint issues, and follow changes through their logs.
 
-  ALTER TABLE `users` ADD COLUMN `email` VARCHAR(255) NOT NULL
+<img src="./assets/cli-ops.gif" width="800" alt="Inspect fleet status, follow one change, and read its logs">
 
-Plan: 1 table to alter
+[Get started with the CLI](./docs/cli.md) · [Explore your database fleet](./docs/schema-intelligence.md)
 
-$ schemabot apply -s ./schema -e staging -y
+Block runs SchemaBot for the majority of its production schema changes, including MySQL tables spanning terabytes and Vitess databases with hundreds of shards.
 
-Apply started: apply-a1b2c3d4
-status=running  progress=45%  table=users  rows=1.2M/2.7M  eta=3m
-status=completed
-```
+## Your policies, enforced
 
-SchemaBot handles the full lifecycle:
-- **Plan** — diff desired vs current schema → compute DDL
-- **Apply** — execute DDL online using [Spirit](https://github.com/block/spirit) (MySQL), [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) (Vitess), or [pg-sprite](https://github.com/block/pg-sprite) (PostgreSQL)
-- **Progress** — track row copy progress, ETA, per-table/per-shard status
-- **Control** — `stop` (pause), `start` (resume), `cutover` (trigger table swap), `revert` (roll back)
+Review the proposed SQL before it runs. Configure who can apply it and which environments it must pass through.
 
-Simple changes (e.g., adding a column) use instant DDL and complete in milliseconds. Operations that require a row copy (e.g., adding an index) run online without blocking reads or writes.
+| Protection | How it works |
+|---|---|
+| **Require a review before apply** | Enable the [review gate](./docs/configuration.md#review-gate) to require approval from a configured reviewer before PR changes run. The author's own approval does not count |
+| **Prove the change in earlier environments** | Set the [promotion order](./docs/pre-merge-workflow.md#promotion-order), such as staging → production. PR applies are blocked until the earlier environment's check passes |
+| **Keep destructive changes explicit** | Lint findings flag unsafe changes. Applying them requires acknowledgment of the exact plan; a changed plan needs a new acknowledgment |
+| **Merge what is already live** | Configure SchemaBot's checks as [required checks](./docs/check-runs.md#branch-protection-setup). They pass when the managed live schema matches the PR, so unfinished changes cannot merge |
+
+These are PR workflow gates. Direct CLI and API calls use [server permissions](./docs/auth.md); they do not require PR review or enforce promotion order.
+
+These boundaries matter just as much for a coding agent as for a person. Give agents [schema context and scoped access](./docs/ai-agents.md) while keeping policy on the server.
 
 ## Quick Start
 
+Grab the CLI from [Releases](#releases). From your application’s project directory, run:
+
 ```bash
-make demo    # Start services, apply schema, seed data
-make test    # Run all tests (unit + integration + e2e)
+schemabot init
 ```
 
-Connect to databases:
-```bash
-make mysql              # SchemaBot storage DB (port 13371)
-make mysql DB=staging   # Staging testapp (port 13372)
-make mysql DB=production # Production testapp (port 13373)
-```
+![Choose a PostgreSQL sample, edit its schema, review and apply the change, then verify the result](./assets/init-sample-demo.gif)
 
-## Architecture
+The wizard connects to your MySQL or PostgreSQL database, imports its schema into declarative `.sql` files, and verifies a no-change plan before it finishes. It reads your application's schema and never changes it. SchemaBot keeps its own plans and progress in a separate database, which can live on the same server. Make your first edit and run `schemabot plan` to preview changes. Run `schemabot apply` when you’re ready to apply them. [docs/init.md](./docs/init.md) walks through each step, including the flag form for agents and scripts.
 
-See [docs/architecture.md](./docs/architecture.md) for the full documentation.
+For more local examples, see the [examples guide](./examples/README.md).
 
-## Configuration
+To run the PR workflow for your team, deploy the server from [Releases](#releases) (binary, container image, or Helm chart), then follow [docs/github-app-setup.md](./docs/github-app-setup.md) to wire up GitHub and [docs/configuration.md](./docs/configuration.md) for the server config. [`schemabot onboard`](./docs/github-app-setup.md#6-add-schemabotyaml-config-to-your-repository) pulls a live database's schema into a new declarative schema directory against that server, so you start from your real tables rather than writing them out by hand.
 
-See [docs/configuration.md](./docs/configuration.md) for setup instructions (local mode, gRPC mode, secret resolution).
+## Supported databases
+
+| Database | Status | How changes run |
+|---|---|---|
+| MySQL | Generally available | [Spirit](https://github.com/block/spirit), with instant DDL where supported and online copying when needed |
+| Vitess on PlanetScale | Generally available | [Deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests), with per-shard progress |
+| PostgreSQL | Early alpha | [pg-sprite](https://github.com/block/pg-sprite); see the [support envelope](./docs/postgresql.md) |
+
+Follow progress, choose cutover timing, and pause, resume, cancel, or roll back where the engine supports it. Execution methods, throttling, and recovery differ by engine; the [capability matrix](./docs/engines.md) explains the choices.
 
 ## Docs
 
-General design docs are in the [docs](./docs/) folder.
+Guides and reference:
+
+- [Vision](./docs/vision.md): See what we’re building toward
+- [Quick start](#quick-start): Try it on your machine
+- [Initialize a database](./docs/init.md): Connect a database you already have and start from its live schema
+- [Local examples](./examples/README.md): Run the demo and [connect to its MySQL databases](./examples/README.md#connect-to-mysql)
+- [Pre-merge workflow](./docs/pre-merge-workflow.md): Take a schema change from your first edit to a merged PR
+- [CLI guide](./docs/cli.md): Set up the CLI, inspect your databases, and run changes
+- [Schema intelligence](./docs/schema-intelligence.md): Get to know your fleet and what’s changing
+- [Engines](./docs/engines.md): See how changes run on your database engine
+- [PostgreSQL](./docs/postgresql.md): Find out what’s supported today
+- [Vitess on PlanetScale](./docs/vitess.md): Grant the service token the permissions SchemaBot needs
+- [Configuration](./docs/configuration.md): Set things up for your environment
+- [Storage schema](./docs/storage-schema.md): Keep SchemaBot’s own bookkeeping database converged across deploys
+- [Authentication](./docs/auth.md): Choose who can read and change your databases
+- [AI agents](./docs/ai-agents.md): Set clear boundaries for your assistants
+- [Safety invariants](./docs/invariants.md): Understand the guardrails behind each change
+- [Architecture](./docs/architecture.md): Follow a change from start to finish
+- [Target credential self-heal](./docs/target-credential-self-heal.md): Understand target probes and credential rotation recovery
+- [Partition-aware index builds](./docs/partitioned-parent-index-flow.md): See the decision for online indexes on partitioned PostgreSQL tables
+- [Ideas behind SchemaBot](./docs/inspiration.md): The projects that helped shape it
+- [Contributing](./CONTRIBUTING.md): Come build with us
 
 ## Releases
 
 Releases are published as binaries on the [GitHub Releases page](https://github.com/block/schemabot/releases), as container images at `ghcr.io/block/schemabot`, and, if you run Kubernetes, as a Helm chart at `oci://ghcr.io/block/charts/schemabot`.
 
-We run what we ship. Every tag is deployed to production at Block, where SchemaBot runs the majority of Block's schema change traffic across a large fleet of MySQL and Vitess databases (with PostgreSQL planned). We actively use SchemaBot to run schema changes against tables of many shapes and sizes, with some spanning many terabytes in MySQL and 100s of shards in Vitess. Our release cadence keeps the project continuously validated against real production workloads and gets fixes out fast. Because SchemaBot is pre-1.0, the release notes are the compatibility contract: give them a read before upgrading.
+Every release tag is deployed to production at Block. SchemaBot is pre-1.0, so read the release notes before upgrading: they describe compatibility changes.
 
 See [docs/release.md](./docs/release.md) for how releases are cut and what is checked before a tag is published.
 
 ## Contributing
 
-Contributors are welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md).
+Contributors are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 For feature requests and bugs, [open an issue](https://github.com/block/schemabot/issues).

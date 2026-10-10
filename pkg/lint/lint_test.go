@@ -1,9 +1,11 @@
 package lint
 
 import (
+	"strings"
 	"sync"
 	"testing"
 
+	spiritlint "github.com/block/spirit/pkg/lint"
 	"github.com/block/spirit/pkg/table"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -143,6 +145,29 @@ func TestLintSchema_InvalidSQL(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// A schema file that declares two tables has both of them linted: the
+// `orders` table with an INT primary key and the `events` table with a latin1
+// charset each report their own finding against their own table.
+func TestLintSchema_MultipleCreateTablesInOneFile(t *testing.T) {
+	linter := New()
+
+	results, err := linter.LintSchema(map[string]string{
+		"tables.sql": "CREATE TABLE `orders` (`id` int NOT NULL, PRIMARY KEY (`id`)) " +
+			"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;\n" +
+			"CREATE TABLE `events` (`id` bigint unsigned NOT NULL, PRIMARY KEY (`id`)) " +
+			"ENGINE=InnoDB DEFAULT CHARSET=latin1;\n",
+	})
+	require.NoError(t, err)
+
+	byTable := make(map[string][]string)
+	for _, r := range results {
+		byTable[r.Table] = append(byTable[r.Table], r.Linter)
+	}
+	assert.Equal(t, []string{"primary_key"}, byTable["orders"], "results: %+v", results)
+	assert.Equal(t, []string{"allow_charset"}, byTable["events"], "results: %+v", results)
+	assert.Len(t, byTable, 2, "results: %+v", results)
+}
+
 func TestPlanChangesConcurrent(t *testing.T) {
 	current := []table.TableSchema{{
 		Name:   "users",
@@ -182,4 +207,174 @@ func TestToEngineWarnings(t *testing.T) {
 	assert.Equal(t, "users", warnings[0].Table)
 	assert.Equal(t, "email", warnings[0].Column)
 	assert.Equal(t, "orders", warnings[1].Table)
+}
+
+// A declared column written as `boolean NOT NULL DEFAULT FALSE` is stored by
+// MySQL as `tinyint(1) NOT NULL DEFAULT '0'`, so the planner has to read the
+// keyword and the integer as the same default. Reading them as different is the
+// worst shape of planner bug in front of a live database: every plan emits an
+// ALTER that re-stores the value it already holds, the ALTER succeeds, and the
+// next plan emits it again — a schema that never converges and a merge gate
+// that never clears on its own.
+//
+// Integer columns are the ones that store the keyword as exactly 1/0, and they
+// are the only ones that converge here. Other types read the keyword through
+// their own rules — a `year` stores TRUE as 2001, a scaled `decimal` pads it to
+// '1.00', a `bit` stores b'1' — so on those the declared keyword and the stored
+// value stay genuinely different.
+func TestPlanChangesBooleanKeywordDefaultConverges(t *testing.T) {
+	converges := []struct {
+		name     string
+		declared string
+		live     string
+	}{
+		{
+			name:     "FALSE against the stored 0",
+			declared: "`flag` boolean NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "TRUE against the stored 1",
+			declared: "`flag` boolean NOT NULL DEFAULT TRUE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '1'",
+		},
+		{
+			name:     "the keyword in lower case",
+			declared: "`flag` boolean not null default false",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "the bool synonym",
+			declared: "`flag` bool NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '0'",
+		},
+		{
+			name:     "a wider integer type",
+			declared: "`flag` int NOT NULL DEFAULT FALSE",
+			live:     "`flag` int NOT NULL DEFAULT '0'",
+		},
+	}
+	for _, tt := range converges {
+		t.Run(tt.name, func(t *testing.T) {
+			current := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.live)}}
+			desired := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.declared)}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			assert.Empty(t, plan.Statements())
+		})
+	}
+
+	// Reading the keyword and the integer as the same default must not go so far
+	// as to read two genuinely different defaults as the same one. That failure
+	// skips a required ALTER instead of emitting a spurious one, so the column
+	// keeps a value the schema no longer declares — worse than the loop above,
+	// and invisible, because nothing is left for a later plan to re-emit.
+	plans := []struct {
+		name     string
+		declared string
+		live     string
+		want     string
+	}{
+		{
+			name:     "a default that really did change",
+			declared: "`flag` boolean NOT NULL DEFAULT FALSE",
+			live:     "`flag` tinyint(1) NOT NULL DEFAULT '1'",
+			want:     "MODIFY COLUMN `flag` tinyint(1) NOT NULL DEFAULT FALSE",
+		},
+		{
+			name:     "a quoted string default against the stored 0",
+			declared: "`flag` varchar(8) NOT NULL DEFAULT 'FALSE'",
+			live:     "`flag` varchar(8) NOT NULL DEFAULT '0'",
+			want:     "MODIFY COLUMN `flag` varchar(8) NOT NULL DEFAULT 'FALSE'",
+		},
+	}
+	for _, tt := range plans {
+		t.Run(tt.name+" still plans an alter", func(t *testing.T) {
+			current := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.live)}}
+			desired := []table.TableSchema{{Name: "widgets", Schema: tableWithColumn(tt.declared)}}
+
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			require.Len(t, plan.Statements(), 1)
+			assert.Contains(t, plan.Statements()[0], tt.want)
+		})
+	}
+}
+
+// tableWithColumn wraps the column definition under test in a table with a
+// primary key, so each case states only the column it is about.
+func tableWithColumn(column string) string {
+	return "CREATE TABLE `widgets` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, " + column +
+		", PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+}
+
+// Every table SchemaBot creates must stay changeable through an online schema
+// change later. The MySQL and Vitess engines both plan through PlanChanges with
+// this linter's Spirit config, so a CREATE TABLE that Spirit could not alter is
+// reported there at error severity, which blocks the apply unless the operator
+// passes --allow-unsafe. A table with a usable primary key and no foreign keys
+// is not flagged.
+func TestPlanChangesFlagsTablesSpiritCannotAlter(t *testing.T) {
+	const suffix = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+	current := []table.TableSchema{{
+		Name:   "customers",
+		Schema: "CREATE TABLE `customers` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))" + suffix,
+	}}
+	incompatible := []struct {
+		name   string
+		create string
+	}{
+		{
+			name:   "no primary key",
+			create: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL, `note` varchar(64) NOT NULL)" + suffix,
+		},
+		{
+			name:   "a FLOAT primary key",
+			create: "CREATE TABLE `events` (`id` float NOT NULL, PRIMARY KEY (`id`))" + suffix,
+		},
+		{
+			name: "a foreign key",
+			create: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, `customer_id` bigint unsigned NOT NULL, " +
+				"PRIMARY KEY (`id`), KEY `customer_id` (`customer_id`), " +
+				"CONSTRAINT `events_customer` FOREIGN KEY (`customer_id`) REFERENCES `customers` (`id`))" + suffix,
+		},
+	}
+	for _, tt := range incompatible {
+		t.Run(tt.name, func(t *testing.T) {
+			desired := append(append([]table.TableSchema{}, current...), table.TableSchema{Name: "events", Schema: tt.create})
+			plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+			require.NoError(t, err)
+			assert.Equal(t, []string{"error"}, spiritCompatibleSeverities(plan, "events"))
+		})
+	}
+
+	t.Run("a bigint primary key and no foreign keys", func(t *testing.T) {
+		desired := append(append([]table.TableSchema{}, current...), table.TableSchema{
+			Name:   "events",
+			Schema: "CREATE TABLE `events` (`id` bigint unsigned NOT NULL AUTO_INCREMENT, PRIMARY KEY (`id`))" + suffix,
+		})
+		plan, err := PlanChanges(current, desired, nil, New().SpiritConfig())
+		require.NoError(t, err)
+		require.Len(t, plan.Statements(), 1)
+		assert.Contains(t, plan.Statements()[0], "CREATE TABLE `events`")
+		assert.Empty(t, spiritCompatibleSeverities(plan, "events"))
+	})
+}
+
+// spiritCompatibleSeverities returns the severity of each spirit_compatible
+// violation the plan reports against tableName.
+func spiritCompatibleSeverities(plan *spiritlint.Plan, tableName string) []string {
+	var severities []string
+	for _, change := range plan.Changes {
+		if change.TableName != tableName {
+			continue
+		}
+		for _, v := range change.Violations {
+			if v.Linter.Name() == "spirit_compatible" {
+				severities = append(severities, strings.ToLower(v.Severity.String()))
+			}
+		}
+	}
+	return severities
 }

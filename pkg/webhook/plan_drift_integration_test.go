@@ -3,7 +3,7 @@
 // Review-time deployment drift webhook integration tests. These exercise the
 // full plan flow against real MySQL deployments: a database that fans out to
 // several deployments is planned once against the primary, every deployment's
-// live schema is diffed against that reviewed plan, and any deployment whose
+// live schema is diffed against that primary plan, and any deployment whose
 // live schema diverges — or that cannot be diffed — fails the plan check closed
 // before an apply is ever attempted.
 
@@ -12,21 +12,15 @@ package webhook
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
-	"net/url"
 	"os"
 	"testing"
 
-	mysql "github.com/go-sql-driver/mysql"
-	gh "github.com/google/go-github/v86/github"
+	mysql "github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/api"
-	ghclient "github.com/block/schemabot/pkg/github"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
 	"github.com/block/schemabot/pkg/tern"
@@ -60,6 +54,9 @@ type deploymentSpec struct {
 	name         string
 	liveSchema   string
 	dropDatabase bool
+	// engineMetadata is forwarded to the deployment's LocalClient, enabling
+	// per-deployment engine settings such as the direct execution policy.
+	engineMetadata map[string]string
 }
 
 // openDriftDB opens a MySQL connection for the drift fixtures, verifies it with
@@ -68,7 +65,7 @@ type deploymentSpec struct {
 // leaks the handle.
 func openDriftDB(t *testing.T, dsn string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 	require.NoError(t, db.PingContext(t.Context()))
@@ -96,6 +93,23 @@ func driftDSN(t *testing.T, dbName string) string {
 // own registered tern LocalClient. The first spec is the primary (rollout index
 // 0). Returns the service; physical databases are dropped on cleanup.
 func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentSpec) *api.Service {
+	t.Helper()
+	return setupE2ERolloutService(t, dbName, specs, api.PlanMirrored)
+}
+
+// setupE2ERolloutService is setupE2EReviewDriftService with the environment's
+// member planning under test control. Independent planning spells each
+// deployment's routing as a targets list, the shape that tells SchemaBot the
+// members hold schemas of their own.
+func setupE2ERolloutService(t *testing.T, dbName string, specs []deploymentSpec, planning api.MemberPlanning) *api.Service {
+	t.Helper()
+	return setupE2ERolloutServiceWithStorage(t, dbName, specs, planning, nil)
+}
+
+// setupE2ERolloutServiceWithStorage is setupE2ERolloutService with the
+// service's storage passed through wrapStorage, so a test can fault a store the
+// handler writes through. A nil wrapStorage uses the storage unchanged.
+func setupE2ERolloutServiceWithStorage(t *testing.T, dbName string, specs []deploymentSpec, planning api.MemberPlanning, wrapStorage func(storage.Storage) storage.Storage) *api.Service {
 	t.Helper()
 	ctx := t.Context()
 
@@ -143,7 +157,7 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 		// by the time cleanup runs, which would otherwise leave databases behind.
 		t.Cleanup(func() {
 			dropCtx := context.WithoutCancel(t.Context())
-			db, err := sql.Open("mysql", adminDSN)
+			db, err := sql.Open("block-mysql", adminDSN)
 			if err != nil {
 				t.Logf("drift cleanup: open admin db to drop %s: %v", physicalDB, err)
 				return
@@ -165,11 +179,17 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 			Database:  dbName,
 			Type:      "mysql",
 			TargetDSN: physicalDSN,
+			Metadata:  spec.engineMetadata,
 		}, st, logger)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = client.Close() })
 
-		deployments[spec.name] = api.DeploymentTarget{Target: dbName + "-" + spec.name + "-target"}
+		target := dbName + "-" + spec.name + "-target"
+		if planning == api.PlanIndependent {
+			deployments[spec.name] = api.DeploymentTarget{Targets: []api.TargetEntry{{Target: target}}}
+		} else {
+			deployments[spec.name] = api.DeploymentTarget{Target: target}
+		}
 		order = append(order, spec.name)
 		ternClients[spec.name+"/"+driftEnv] = client
 	}
@@ -191,7 +211,11 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 		},
 	}
 
-	svc := api.New(st, serverConfig, ternClients, logger)
+	var svcStorage storage.Storage = st
+	if wrapStorage != nil {
+		svcStorage = wrapStorage(st)
+	}
+	svc := api.New(svcStorage, serverConfig, ternClients, logger)
 	t.Cleanup(func() { _ = svc.Close() })
 	return svc
 }
@@ -200,44 +224,18 @@ func setupE2EReviewDriftService(t *testing.T, dbName string, specs []deploymentS
 // drift fixtures and returns the service so the caller can assert stored state.
 func runDriftPlan(t *testing.T, svc *api.Service, dbName string) {
 	t.Helper()
-
-	mux := http.NewServeMux()
-	server := httptest.NewServer(mux)
-	t.Cleanup(server.Close)
-
-	client := gh.NewClient(nil)
-	baseURL, err := url.Parse(server.URL + "/")
-	require.NoError(t, err)
-	client.BaseURL = baseURL
-
-	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
-	schemaFiles := map[string]string{"users.sql": usersWithEmailSchema}
-	setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
-
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	installClient := ghclient.NewInstallationClient(client, logger)
-	factory := &fakeClientFactory{client: installClient}
-	h := NewHandler(svc, factory, nil, logger)
-
-	req := buildWebhookRequest(t, webhookPayloadOpts{
-		comment: "schemabot plan -e " + driftEnv,
-		isPR:    true,
-	}, nil)
-
-	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-	require.Equal(t, http.StatusOK, rr.Code)
+	runRolloutCommand(t, svc, dbName, "schemabot plan -e "+driftEnv)
 }
 
 // A non-primary deployment whose live schema already carries the reviewed change
 // diffs to a no-op while the primary plans the change, so the deployment
-// diverges from the reviewed plan and the plan check fails closed with a
+// diverges from the primary plan and the plan check fails closed with a
 // review-time deployment drift block.
 func TestE2EReviewDriftBlocksWhenDeploymentDiverges(t *testing.T) {
 	dbName := "webhook_drift_diverge"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},      // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},      // matches the reviewed plan
+		{name: "au", liveSchema: usersBaseSchema},      // matches this plan
 		{name: "us", liveSchema: usersWithEmailSchema}, // drifted: already has email
 	})
 
@@ -253,13 +251,13 @@ func TestE2EReviewDriftBlocksWhenDeploymentDiverges(t *testing.T) {
 }
 
 // A deployment that cannot be diffed (its physical database is gone) cannot be
-// confirmed to match the reviewed plan, so it is treated as blocking rather than
+// confirmed to match the primary plan, so it is treated as blocking rather than
 // agreement and the plan check fails closed.
 func TestE2EReviewDriftBlocksWhenDeploymentUnreachable(t *testing.T) {
 	dbName := "webhook_drift_unreachable"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},                     // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},                     // matches the reviewed plan
+		{name: "au", liveSchema: usersBaseSchema},                     // matches this plan
 		{name: "us", liveSchema: usersBaseSchema, dropDatabase: true}, // undiffable
 	})
 
@@ -274,7 +272,7 @@ func TestE2EReviewDriftBlocksWhenDeploymentUnreachable(t *testing.T) {
 		"the check must carry a durable review-time deployment drift block")
 }
 
-// When every deployment's live schema matches the reviewed plan, the rollup is
+// When every deployment's live schema matches the primary plan, the rollup is
 // clean: the plan check reflects the reviewed change (action_required, changes
 // pending) with no drift block, so drift never spuriously blocks a uniform
 // rollout.
@@ -307,7 +305,7 @@ func TestE2EReviewDriftClearsBlockAfterDeploymentReconciled(t *testing.T) {
 	dbName := "webhook_drift_unblock"
 	svc := setupE2EReviewDriftService(t, dbName, []deploymentSpec{
 		{name: "eu", liveSchema: usersBaseSchema},      // primary: will plan ADD email
-		{name: "au", liveSchema: usersBaseSchema},      // matches the reviewed plan
+		{name: "au", liveSchema: usersBaseSchema},      // matches this plan
 		{name: "us", liveSchema: usersWithEmailSchema}, // drifted: already has email
 	})
 

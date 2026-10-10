@@ -57,6 +57,7 @@ const (
 	issueCommentGateAutoConfirm         issueCommentGateBlockReason = "auto-confirm flag unsupported for command"
 	issueCommentGateDeferCutover        issueCommentGateBlockReason = "defer-cutover flag unsupported for command"
 	issueCommentGateDatabase            issueCommentGateBlockReason = "database flag unsupported for command"
+	issueCommentGateTarget              issueCommentGateBlockReason = "target flag unsupported for command"
 )
 
 // issueCommentGateBlock evaluates the routing and usage gates shared by the
@@ -101,6 +102,9 @@ func (h *Handler) issueCommentGateBlock(repo string, result CommandResult, parse
 	if !commandSupportsDatabaseFlag(result.Action) && parser.HasDatabaseFlag(commentBody) {
 		return issueCommentGateDatabase
 	}
+	if !commandSupportsTargetFlag(result.Action) && parser.HasTargetFlag(commentBody) {
+		return issueCommentGateTarget
+	}
 	return issueCommentGatePass
 }
 
@@ -123,6 +127,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		})
 		return
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 
 	var payloadInstallationID int64
 	if payload.Installation != nil {
@@ -165,6 +170,10 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	result.DeliveryID = deliveryID
 
 	if !result.IsMention {
+		if result.ProseMention {
+			h.logger.Debug("ignoring comment that names SchemaBot in a sentence without addressing a command to it",
+				"repo", repo, "pr", pr, "comment_id", result.CommentID, "requested_by", requestedBy)
+		}
 		h.writeJSON(w, http.StatusOK, map[string]string{
 			"message": "no SchemaBot command found",
 		})
@@ -244,6 +253,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			return
 		}
 		h.logger.Info("processing help command", "repo", repo, "pr", pr)
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
 		return
@@ -280,7 +290,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 	// exactly one deployment: participants defer to the leader on an aggregate
 	// repo, and the respond_to_unscoped policy picks one responder otherwise.
 	if gateReason == issueCommentGateMissingEnvironment {
-		if result.Action == action.Plan {
+		if result.Action == action.Plan && result.Target == "" {
 			// Plan without -e: run for all configured environments. The same
 			// acknowledgment split as scoped commands applies: repos without an
 			// aggregate role and -t-scoped plans acknowledge at dispatch, while
@@ -291,7 +301,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 				h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 			}
 			h.goSafe(repo, pr, installationID, deliveryID, func() {
-				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, true, result.CommentID)
+				h.handleMultiEnvPlan(repo, pr, result.Database, result.Tenant, installationID, requestedBy, false, 0, true, result.CommentID, nil)
 			})
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "multi-env plan started"})
 			return
@@ -308,6 +318,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		if result.Action == action.Rollback {
 			if result.ApplyID == "" {
 				h.postComment(repo, pr, installationID, templates.RenderRollbackMissingArguments())
@@ -320,6 +331,13 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 		}
 		if result.Action == action.RollbackConfirm {
 			h.postComment(repo, pr, installationID, templates.RenderRollbackMissingEnv())
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
+			return
+		}
+		if result.Target != "" {
+			// A target is a member of one environment's rollout, so a
+			// narrowed command never fans out across environments.
+			h.postComment(repo, pr, installationID, templates.RenderTargetMissingEnv(result.Action, result.Target))
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing environment flag"})
 			return
 		}
@@ -373,18 +391,22 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
-		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.deploymentTenant()))
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
+		h.postComment(repo, pr, installationID, templates.RenderRollbackMissingApplyID(h.cliName(), result.Environment, h.deploymentTenant()))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "missing apply ID"})
 		return
 	}
 
-	// Handle invalid command (schemabot mentioned but command not recognized)
+	// Handle invalid command (schemabot mentioned but command not recognized).
+	// The reply is this deployment's answer to the comment, so it carries the
+	// acknowledgment like every other answer.
 	if gateReason == issueCommentGateCommandNotFound {
 		if result.Tenant == "" && h.service != nil && !h.service.Config().ShouldRespondToUnscoped() {
 			h.logger.Debug("skipping invalid command response (respond_to_unscoped is false)", "repo", repo, "pr", pr)
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "unscoped command skipped"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderInvalidCommand())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "invalid command"})
 		return
@@ -398,6 +420,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedAutoConfirm(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return
@@ -409,6 +432,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postCommandError(repo, pr, installationID, action.Rollback, result.Environment, requestedBy,
 			"`--defer-cutover` belongs on `schemabot rollback-confirm`, after reviewing the rollback plan.")
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
@@ -422,7 +446,21 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
 			return
 		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
 		h.postComment(repo, pr, installationID, templates.RenderUnsupportedDatabaseFlag(result.Action))
+		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
+		return
+	}
+
+	if gateReason == issueCommentGateTarget {
+		if h.silentUsageErrorOnUnscopedFanOut(repo, result.Tenant) {
+			h.logger.Info("skipping unsupported target flag reply for unscoped fan-out; the leader posts it once",
+				"repo", repo, "pr", pr, "action", result.Action)
+			h.writeJSON(w, http.StatusOK, map[string]string{"message": "usage error deferred to leader"})
+			return
+		}
+		h.acknowledgeCommand(repo, pr, installationID, deliveryID, result.CommentID)
+		h.postComment(repo, pr, installationID, templates.RenderUnsupportedTargetFlag(result.Action))
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "unsupported flag"})
 		return
 	}
@@ -458,7 +496,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, metricApp string, w ht
 
 	switch result.Action {
 	case action.Plan:
-		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Tenant, installationID, deliveryID, requestedBy, result.CommentID)
+		h.handlePlanCommand(w, repo, pr, result.Environment, result.Database, result.Target, result.Tenant, installationID, deliveryID, requestedBy, result.CommentID)
 	case action.Help:
 		h.postComment(repo, pr, installationID, templates.RenderHelpComment())
 		h.writeJSON(w, http.StatusOK, map[string]string{"message": "help posted"})
@@ -621,7 +659,7 @@ func (h *Handler) postCommentReportingError(repo string, pr int, installationID 
 		return fmt.Errorf("create GitHub client to comment on %s#%d: %w", repo, pr, err)
 	}
 
-	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body)); err != nil {
+	if _, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, "", body)); err != nil {
 		return fmt.Errorf("post comment on %s#%d: %w", repo, pr, err)
 	}
 	return nil
@@ -650,7 +688,7 @@ func (h *Handler) postAndTrackComment(
 		return
 	}
 
-	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(body))
+	commentID, _, err := client.CreateIssueComment(ctx, repo, pr, h.renderPRComment(repo, pr, apply.Environment, body))
 	if err != nil {
 		h.logger.Error("failed to post tracked comment",
 			"repo", repo, "pr", pr, "commentState", commentState, "error", err)
@@ -738,7 +776,7 @@ func (h *Handler) postInitialProgressComment(ctx context.Context, repo string, p
 		return
 	}
 	finalBody := formatProgressComment(apply, nil, nil, h.deploymentTenant())
-	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, h.renderPRComment(finalBody)); err != nil {
+	if err := client.EditIssueComment(ctx, repo, comment.GitHubCommentID, h.renderPRComment(repo, pr, apply.Environment, finalBody)); err != nil {
 		h.logger.Error("failed to finalize progress comment for already-terminal apply",
 			append(apply.LogAttrs(), "github_comment_id", comment.GitHubCommentID, "error", err)...)
 		return
@@ -788,6 +826,11 @@ func (h *Handler) acknowledgeCommandEarlyIfOwned(ctx context.Context, client *gh
 		err       error
 	)
 	if databaseName != "" {
+		if h.unregisteredDatabaseError(repo, databaseName) != nil {
+			h.logger.Debug("early ownership probe: database is not configured on this deployment; nothing to acknowledge",
+				"repo", repo, "pr", pr, "database", databaseName)
+			return false
+		}
 		sbConfig, configDir, err = client.FindConfigByDatabaseName(ctx, repo, pr, databaseName)
 	} else {
 		sbConfig, configDir, err = client.FindConfigForPR(ctx, repo, pr)
@@ -838,8 +881,25 @@ func (h *Handler) acknowledgeCommand(repo string, pr int, installationID int64, 
 	})
 }
 
-func (h *Handler) renderPRComment(body string) string {
-	return appendSupportChannelFooter(body, h.supportChannel())
+// renderPRComment finishes a comment body for posting on repo's PR: an
+// oversized body is replaced with the notice that fits, then the support
+// footer is appended. environment is the one environment the comment is about,
+// which scopes the notice's CLI hint; empty when it names none or several.
+func (h *Handler) renderPRComment(repo string, pr int, environment, body string) string {
+	return appendSupportChannelFooter(fitPRComment(h.logger, repo, pr, environment, body, h.cliName()), h.supportChannel())
+}
+
+// fitPRComment returns body when GitHub will accept it and otherwise the
+// oversized-comment notice, logging the rendered size with the identifiers an
+// operator needs to find the comment that was replaced. cliName starts the
+// notice's CLI command hint and environment scopes it.
+func fitPRComment(logger interface{ Error(msg string, args ...any) }, repo string, pr int, environment, body, cliName string) string {
+	fitted, replaced := templates.FitGitHubComment(body, cliName, environment)
+	if replaced {
+		logger.Error("comment exceeds GitHub's size cap; posting the oversized-comment notice in its place",
+			"repo", repo, "pr", pr, "environment", environment, "rendered_bytes", len(body), "limit_bytes", templates.GitHubIssueCommentMaxChars)
+	}
+	return fitted
 }
 
 func (h *Handler) supportChannel() api.SupportChannelConfig {
@@ -848,6 +908,12 @@ func (h *Handler) supportChannel() api.SupportChannelConfig {
 		return api.SupportChannelConfig{}
 	}
 	return cfg.SupportChannel
+}
+
+// cliName is the tool name the CLI command hints in this server's PR comments
+// start with: the configured cli_name, or the CLI's own default.
+func (h *Handler) cliName() string {
+	return h.config().HintCLIName()
 }
 
 func (h *Handler) agentHint() string {
@@ -942,6 +1008,7 @@ func (h *Handler) processDurableIssueComment(ctx context.Context, event *storage
 			"repo", event.Repository, "pr", event.PullRequest)
 		return false, nil
 	}
+	payload.Repository.FullName = storage.CanonicalKey(payload.Repository.FullName)
 	if payload.Comment.User != nil && payload.Comment.User.Type == "Bot" {
 		h.logger.Info("durable issue_comment delivery ignored because the comment author is a bot",
 			"delivery_id", event.DeliveryID, "repo", event.Repository, "pr", event.PullRequest)
@@ -1058,14 +1125,15 @@ func durableIssueCommentCommand(event *storage.WebhookEvent) (CommandResult, str
 	if err != nil {
 		return CommandResult{}, "", 0, 0, "", err
 	}
-	if payload.Repository.FullName == "" || payload.Issue.Number == 0 {
+	repo := storage.CanonicalKey(payload.Repository.FullName)
+	if repo == "" || payload.Issue.Number == 0 {
 		return CommandResult{}, "", 0, 0, "", fmt.Errorf("durable issue_comment terminal notification %s is missing repo or PR", event.DeliveryID)
 	}
 	requestedBy := ""
 	if payload.Comment.User != nil {
 		requestedBy = payload.Comment.User.Login
 	}
-	return result, payload.Repository.FullName, payload.Issue.Number, installationID, requestedBy, nil
+	return result, repo, payload.Issue.Number, installationID, requestedBy, nil
 }
 
 // durableIssueCommentCommandReady reports whether the driver implements the

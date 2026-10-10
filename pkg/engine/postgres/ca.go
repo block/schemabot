@@ -33,9 +33,16 @@ const (
 
 // caCertPath resolves the credentials' CA reference to the bundle path
 // pg-sprite's pool trusts. An absent reference and the embedded RDS bundle
-// both resolve to no path: pg-sprite auto-verifies RDS/Aurora endpoints with
-// its embedded bundle when no path is set, and non-RDS targets keep whatever
-// trust their DSN asked for. A reference the engine cannot honor is refused —
+// both resolve to no path: the pool then keeps the trust the normalized DSN
+// asks for. pg-sprite honors explicit sslmode in URL and keyword DSNs,
+// including spaces around the keyword assignment. Its RDS host matching is
+// case-insensitive. Common explicit modes are preserved, but detection is
+// not identical: an empty URL sslmode or sslmode text inside a quoted keyword
+// value can make the layers disagree about whether a mode was supplied.
+// Their coverage of non-commercial RDS suffixes also differs. Both layers
+// complete verify-full without an sslrootcert with the embedded RDS bundle;
+// verify-ca carries pgx's own verifier and is left to the roots the DSN
+// names. A reference the engine cannot honor is refused —
 // an unrecognized CA must never silently downgrade to a different trust root.
 // A file reference must be absolute: a relative path would resolve against
 // the server's working directory and could name an unintended file. A file
@@ -69,12 +76,30 @@ func caCertPath(creds *engine.Credentials) (string, error) {
 	}
 }
 
-// spritePoolConfig builds the pg-sprite pool configuration both the plan and
-// apply dial sites share: the normalized DSN plus the CA bundle path the pool
+// ConnectionOptions resolves the credentials' CA reference into the
+// postgresconn options a SchemaBot-managed connection to the target dials
+// with. It is the trust policy the engine applies before every plan, apply,
+// and pull, exported so a caller that opens the target outside the engine (the
+// startup probe) verifies the server under the same roots rather than under
+// whatever the DSN alone would trust. A reference the engine would refuse is
+// refused here too.
+func ConnectionOptions(creds *engine.Credentials) ([]postgresconn.Option, error) {
+	caPath, err := caCertPath(creds)
+	if err != nil {
+		return nil, err
+	}
+	return validationRootCAs(caPath)
+}
+
+// spritePoolConfig builds the pg-sprite pool configuration the plan, apply,
+// and pull dial sites share: the normalized DSN plus the CA bundle path the pool
 // verifies the target against — empty when the embedded RDS trust or the
 // DSN's own settings apply. Routing every pool through one constructor keeps
-// the two dial sites from drifting apart in what they trust.
+// the dial sites from drifting apart in what they trust.
 func spritePoolConfig(dsn, caPath string) (dbconn.Config, error) {
+	if err := postgresconn.WarnNonVerifyingRDSTLS(dsn); err != nil {
+		return dbconn.Config{}, fmt.Errorf("judge PostgreSQL DSN for pg-sprite pool: %w", err)
+	}
 	normalized, err := postgresconn.ConnectionDSN(dsn)
 	if err != nil {
 		return dbconn.Config{}, fmt.Errorf("normalize PostgreSQL DSN for pg-sprite pool: %w", err)
@@ -85,10 +110,10 @@ func spritePoolConfig(dsn, caPath string) (dbconn.Config, error) {
 // validationRootCAs builds the postgresconn options that pin the validation
 // connection to the bundle a file: reference names — the same path handed to
 // the pg-sprite pool, so the two connection paths cannot verify against
-// different roots. With no bundle path there is nothing to pin: the
-// validation connection keeps the trust its DSN and the connection layer
-// provide, and the pg-sprite pool applies its own RDS auto-trust. A bundle
-// that cannot be read or parsed is refused here, before any dial.
+// different roots. With no bundle path there is nothing to pin: both the
+// validation connection and the pg-sprite pool keep the trust the normalized
+// DSN and the connection layer provide. A bundle that cannot be read or
+// parsed is refused here, before any dial.
 func validationRootCAs(caPath string) ([]postgresconn.Option, error) {
 	if caPath == "" {
 		return nil, nil

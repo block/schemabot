@@ -24,14 +24,28 @@ const maxPollInterval = 30 * time.Second
 
 var callStartAPI = client.CallStartAPI
 
+// fetchErrorBackoff is the wait before the next progress poll after this many
+// consecutive failed fetches: the base interval doubled per failure, capped at
+// maxPollInterval. Every watch surface backs off on the same schedule.
+func fetchErrorBackoff(consecutiveErrors int) time.Duration {
+	return min(pollInterval<<min(consecutiveErrors, 4), maxPollInterval)
+}
+
 func (m WatchModel) tick() tea.Cmd {
-	d := pollInterval
-	if m.consecutiveErrors > 0 {
-		d = min(pollInterval<<min(m.consecutiveErrors, 4), maxPollInterval)
-	}
-	return tea.Tick(d, func(t time.Time) tea.Msg {
+	return tea.Tick(m.nextPollDelay(), func(t time.Time) tea.Msg {
 		return tickMsg(t)
 	})
+}
+
+// nextPollDelay is the wait before the next progress poll: the base interval
+// while polls succeed, and after a failure the fetch-error backoff stretched to
+// any delay the failed response asked for, the same rule the log and JSON
+// watches follow.
+func (m WatchModel) nextPollDelay() time.Duration {
+	if m.consecutiveErrors == 0 {
+		return pollInterval
+	}
+	return max(fetchErrorBackoff(m.consecutiveErrors), m.requestedRetryDelay)
 }
 
 func (m WatchModel) fetchProgress() tea.Cmd {
@@ -39,9 +53,10 @@ func (m WatchModel) fetchProgress() tea.Cmd {
 		result, err := client.GetProgress(m.endpoint, m.applyID)
 		if err != nil {
 			return progressMsg{
-				errorMsg:  err.Error(),
-				failed:    true,
-				retryable: isRetryableFetchError(err),
+				errorMsg:   err.Error(),
+				failed:     true,
+				retryable:  isRetryableFetchError(err),
+				retryAfter: requestedRetryDelay(err),
 			}
 		}
 
@@ -132,16 +147,17 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 	data := templates.ParseProgressResponse(result)
 
 	return progressMsg{
-		state:       data.State,
-		tables:      data.Tables,
-		operations:  data.Operations,
-		released:    data.Released,
-		errorMsg:    data.ErrorMessage,
-		applyID:     result.ApplyID,
-		database:    result.Database,
-		environment: result.Environment,
-		engine:      result.Engine,
-		metadata:    result.Metadata,
+		state:        data.State,
+		tables:       data.Tables,
+		operations:   data.Operations,
+		released:     data.Released,
+		deferCutover: data.Options["defer_cutover"] == "true",
+		errorMsg:     data.ErrorMessage,
+		applyID:      result.ApplyID,
+		database:     result.Database,
+		environment:  result.Environment,
+		engine:       result.Engine,
+		metadata:     result.Metadata,
 	}
 }
 
@@ -165,6 +181,16 @@ func sortStoppedByProgress(tables []templates.TableProgress) {
 
 func isTableStopped(s string) bool {
 	return state.IsState(s, state.Apply.Stopped)
+}
+
+// watchHasEnded reports whether the apply has reached a state the watch
+// exits on: it finished, failed, stopped, or was cancelled, or there is no
+// active schema change to follow.
+func (m WatchModel) watchHasEnded() bool {
+	return state.IsState(m.state,
+		state.Apply.Completed, state.Apply.Failed,
+		state.Apply.Stopped, state.Apply.Cancelled,
+		state.NoActiveChange)
 }
 
 // isEffectivelyStopped returns true if the apply is effectively stopped.

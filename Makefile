@@ -32,7 +32,7 @@ E2E_GRPC_MD_RUN ?= TestGRPCMultiDeploy
 # reproducing on CI runners.
 export COMPOSE_BAKE := false
 
-.PHONY: help lint lint-fix setup test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
+.PHONY: help lint lint-fix setup docs-toc check-docs-toc docs-assets templates check-templates check-terminology check-vulnerabilities test test-unit test-consumer-module test-e2e test-e2e-grpc test-e2e-grpc-multideploy test-e2e-k8s test-e2e-local-down test-e2e-mysql test-e2e-vitess test-integration test-localscale build-localscale-image test-coverage build install clean proto up up-telemetry up-grpc down down-grpc status mysql logs logs-grpc test-endpoints plan-testapp apply-testapp seed-testapp seed-testapp-large seed-vitess demo demo-full demo-vitess demo-grpc demo-grpc-logs wait-healthy wait-healthy-grpc wait-localscale cli
 
 # Multi-line message definitions
 define HELP_HEADER
@@ -136,7 +136,7 @@ help: ## Show this help message
 	@echo "$$HELP_HEADER"
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-lint: check-closeandlog check-webhookheaders ## Run all linters (golangci-lint + custom analyzers)
+lint: check-closeandlog check-webhookheaders check-severityglyphs ## Run all linters (golangci-lint + custom analyzers)
 	@echo "Running golangci-lint..."
 	@docker run --rm -v $$(pwd):/app -w /app golangci/golangci-lint:latest golangci-lint run --timeout=5m
 	@echo "Running golangci-lint (consumer module)..."
@@ -151,6 +151,23 @@ check-webhookheaders: ## Run webhookheaders analyzer (flags inline `## ...` mark
 	@echo "Running webhookheaders analyzer..."
 	@go run ./cmd/webhookheaders-check $$(go list ./pkg/webhook/... | grep -v '/templates$$')
 
+# pkg/glyph is the vocabulary's home and pkg/analyzers/severityglyphs names the
+# glyphs in its own diagnostics, so both are excluded the same way the
+# pre-commit hook excludes them.
+#
+# A build only analyzes the files its constraints select, so one pass is not the
+# whole surface. The default build leaves out the packages whose non-test files
+# all sit behind a test build tag, which the second pass picks up by carrying
+# both tags. The tags have to travel in GOFLAGS: the checker's own -tags flag is
+# registered by the analysis driver as deprecated and does nothing. What stays
+# unchecked either way is a file that only builds for another GOOS, since the
+# constraint excludes it from every pass the host can run.
+check-severityglyphs: ## Run severityglyphs analyzer (flags severity glyph literals outside pkg/glyph)
+	@echo "Running severityglyphs analyzer..."
+	@go run ./cmd/severityglyphs-check $$(go list ./... | grep -v '/pkg/glyph$$' | grep -v '/pkg/analyzers/severityglyphs')
+	@echo "Running severityglyphs analyzer (test build tags)..."
+	@GOFLAGS=-tags=e2e,integration go run ./cmd/severityglyphs-check $$(GOFLAGS=-tags=e2e,integration go list ./... | grep -v '/pkg/glyph$$' | grep -v '/pkg/analyzers/severityglyphs')
+
 lint-fix: ## Run golangci-lint with auto-fix enabled
 	@echo "Running golangci-lint with auto-fix..."
 	@docker run --rm -v $$(pwd):/app -w /app golangci/golangci-lint:latest golangci-lint run --fix --timeout=5m
@@ -164,8 +181,30 @@ clean: ## Clean build artifacts
 	@rm -rf bin/
 	@rm -f coverage.out
 
-docs-toc: ## Regenerate the Table of Contents in docs/*.md
+docs-toc: ## Refresh the Table of Contents in docs files that have TOC markers
 	@python3 scripts/gen-doc-toc.py
+
+check-docs-toc: ## Fail if a Table of Contents behind TOC markers is stale
+	@python3 -B -m unittest discover -s scripts -p 'test_gen_doc_toc.py'
+	@python3 scripts/gen-doc-toc.py --check
+
+docs-assets: templates ## Re-render the PR mock-ups and animations the docs embed (needs gh, Chrome, ImageMagick, Node.js/Playwright)
+	@python3 scripts/prepare-pr-demo.py
+	@python3 scripts/render-pr-mockups.py --prepared
+	@bash scripts/render-pr-demo.sh
+	@python3 scripts/render-animation.py assets/src/pipeline-never-waits.html assets/pipeline-never-waits.gif
+
+templates: build ## Regenerate TEMPLATES.md from the current binary
+	@scripts/update-templates.sh
+
+check-templates: build ## Fail if TEMPLATES.md is stale
+	@scripts/update-templates.sh --check
+
+check-terminology: ## Fail if "schema change" appears hyphenated in prose
+	@scripts/check-terminology.sh
+
+check-vulnerabilities: ## Fail if the code calls into a known vulnerability
+	@scripts/check-vulnerabilities.sh
 
 # Generate protobuf code (only if .proto is newer than generated .pb.go)
 proto: ## Generate protobuf code
@@ -202,11 +241,23 @@ ifeq ($(FRESH),1)
 endif
 	docker compose -f deploy/local/docker-compose.yml -f deploy/local/docker-compose.telemetry.yml up --build
 
-# Start services, apply testapp schema, then show logs (full demo workflow)
-#   make demo              # Start and apply MySQL + Vitess schema (wipes data)
-#   make demo KEEP_DATA=1  # Restart without wiping data (preserves seeded rows)
-#   make demo SKIP_APPLY=1 # Start server only, skip schema applies (for debugging)
-demo:
+# Start a sample through the same onboarding path as an installed CLI.
+#   make demo                 # Create a sample MySQL project
+#   make demo ENGINE=postgres # Create a sample PostgreSQL project
+# Reuses one project per engine under .schemabot-demo/.
+demo: build
+	@engine="$(or $(ENGINE),mysql)"; \
+	case "$$engine" in mysql|postgres) ;; *) echo "Choose ENGINE=mysql or ENGINE=postgres"; exit 1 ;; esac; \
+	demo_dir="$(if $(DEMO_DIR),$(abspath $(DEMO_DIR)),$(CURDIR)/.schemabot-demo/$$engine)"; \
+	mkdir -p "$$demo_dir"; \
+	echo "Demo project: $$demo_dir"; \
+	cd "$$demo_dir" && "$(CURDIR)/bin/schemabot" init --sample --type "$$engine"
+
+# Full developer environment, including LocalScale and multiple deployments.
+#   make demo-full              # Start and apply MySQL + Vitess schema (wipes data)
+#   make demo-full KEEP_DATA=1   # Preserve seeded rows
+#   make demo-full SKIP_APPLY=1  # Start services without applying schemas
+demo-full:
 	@# Reset schema files to baseline so the demo starts clean.
 	@./scripts/generate-schema-change.sh reset 2>/dev/null || true
 	@./scripts/generate-schema-change.sh reset --vitess 2>/dev/null || true
@@ -412,7 +463,7 @@ test-e2e-grpc: build ## Run gRPC e2e tests in isolated environment
 	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
 	E2E_TERN_STAGING_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
 	E2E_TERN_PRODUCTION_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
-	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m ./e2e/grpc/... ; \
+	$(GOTEST) -count=1 -v -tags=e2e -timeout=$(E2E_TEST_TIMEOUT) ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
 	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
 		echo "Capturing gRPC e2e container logs before teardown..."; \
@@ -470,7 +521,7 @@ test-e2e-grpc-multideploy: build ## Run multi-deployment fan-out gRPC e2e fixtur
 	E2E_SCHEMABOT_MYSQL_DSN="root:testpassword@tcp(localhost:15371)/schemabot" \
 	E2E_TERN_EU_MYSQL_DSN="root:testpassword@tcp(localhost:15372)/testapp" \
 	E2E_TERN_US_MYSQL_DSN="root:testpassword@tcp(localhost:15373)/testapp" \
-	$(GOTEST) -count=1 -v -tags=e2e -timeout=10m -run '$(E2E_GRPC_MD_RUN)' ./e2e/grpc/... ; \
+	$(GOTEST) -count=1 -v -tags=e2e -timeout=$(E2E_TEST_TIMEOUT) -run '$(E2E_GRPC_MD_RUN)' ./e2e/grpc/... ; \
 	TEST_EXIT_CODE=$$?; \
 	if [ $$TEST_EXIT_CODE -ne 0 ]; then \
 		echo "Capturing multi-deployment gRPC e2e container logs before teardown..."; \

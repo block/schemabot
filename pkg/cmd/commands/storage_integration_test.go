@@ -30,7 +30,22 @@ func startResyncStorage(t *testing.T) (string, *sql.DB) {
 			`INSERT INTO settings (id, setting_key, setting_value) VALUES ($1, $2, '')`, id, key)
 		require.NoError(t, err)
 	}
+	requireHostileStatementTimeout(t, db)
 	return dsn, db
+}
+
+// requireHostileStatementTimeout parks a statement budget on the database that
+// no real query can finish inside, the way a hosted provider tunes one for API
+// traffic. These subcommands are operator-supervised one-shots that must run to
+// completion under ctx alone, so each opens its pool with the budget disabled
+// outright; without that, the catalog reads over every storage table are
+// cancelled part-way and the command fails. The caller's existing handle keeps
+// its own session, since a database default reaches new sessions only.
+func requireHostileStatementTimeout(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.ExecContext(t.Context(),
+		`ALTER DATABASE schemabot SET statement_timeout = '1ms'`)
+	require.NoError(t, err)
 }
 
 // requireDefaultInsertResumes asserts that a default insert into settings
@@ -84,4 +99,39 @@ storage:
 	require.NoError(t, cmd.Run(t.Context(), &Globals{Version: "test"}))
 
 	requireDefaultInsertResumes(t, db)
+}
+
+// During the upgrade to a release that folds identity strings at the write
+// boundaries, the operator runs the canonicalization subcommand with the
+// storage DSN passed directly; afterwards rows written by earlier releases
+// carry the canonical lowercase spelling the folded lookups expect.
+func TestCanonicalizeIdentityKeysCmd_DSNFlag(t *testing.T) {
+	dsn, db := testutil.StartPostgres(t, "schemabot")
+	require.NoError(t, api.EnsureSchema(dsn, slog.New(slog.DiscardHandler), api.WithDialect(schema.DialectPostgres)))
+	_, err := db.ExecContext(t.Context(),
+		`INSERT INTO locks (database_name, database_type, repository, pull_request, owner)
+		 VALUES ('MyDB', 'MySQL', 'Org/Repo', 42, 'Org/Repo#42')`)
+	require.NoError(t, err)
+
+	// Enough rows that the fold's own UPDATE cannot finish inside the hostile
+	// budget below. The distinct numeric suffix survives the fold, so no two
+	// rows collide on the unique (database_name, database_type) index.
+	_, err = db.ExecContext(t.Context(),
+		`INSERT INTO locks (database_name, database_type, repository, pull_request, owner)
+		 SELECT 'MyDB' || i, 'MySQL', 'Org/Repo', i, 'Org/Repo#' || i
+		 FROM generate_series(1000, 21000) AS i`)
+	require.NoError(t, err)
+	requireHostileStatementTimeout(t, db)
+
+	cmd := &CanonicalizeIdentityKeysCmd{DSN: dsn, AutoApprove: true}
+	require.NoError(t, cmd.Run(t.Context(), &Globals{Version: "test"}))
+
+	var databaseName, databaseType, repository, owner string
+	require.NoError(t, db.QueryRowContext(t.Context(),
+		`SELECT database_name, database_type, repository, owner FROM locks WHERE pull_request = 42`).
+		Scan(&databaseName, &databaseType, &repository, &owner))
+	require.Equal(t, "mydb", databaseName)
+	require.Equal(t, "mysql", databaseType)
+	require.Equal(t, "org/repo", repository)
+	require.Equal(t, "org/repo#42", owner)
 }

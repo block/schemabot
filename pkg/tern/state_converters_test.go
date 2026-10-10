@@ -8,6 +8,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
+	"github.com/block/schemabot/pkg/proto/ternconv"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/stretchr/testify/assert"
@@ -32,10 +33,10 @@ func TestChangeTypeProtoRoundTrip(t *testing.T) {
 		ddl.StatementTypeToOp(ddl.StatementCreateView),
 		"vschema_update",
 	} {
-		assert.Equal(t, op, protoChangeTypeToDDLAction(ddlActionToProtoChangeType(op)),
+		assert.Equal(t, op, protoChangeTypeToDDLAction(ternconv.OpToChangeType(op)),
 			"round-trip failed for op %q", op)
 	}
-	assert.Equal(t, ternv1.ChangeType_CHANGE_TYPE_OTHER, ddlActionToProtoChangeType("unknown"))
+	assert.Equal(t, "unknown", protoChangeTypeToDDLAction(ternv1.ChangeType_CHANGE_TYPE_OTHER))
 }
 
 // The reverting state round-trips across the engine, task, and proto boundaries

@@ -7,6 +7,7 @@ import (
 
 	"github.com/block/schemabot/pkg/cmd/cliname"
 
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 )
 
@@ -20,9 +21,9 @@ func previewSeqPendingOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-10 * time.Second).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Pending},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Apply.Pending},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Pending},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Apply.Pending},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
@@ -40,6 +41,7 @@ func previewSeqFirstRunOutput() {
 		Tables: []TableProgress{
 			{
 				TableName:       "users",
+				Dialect:         schema.DialectMySQL,
 				DDL:             seqDDLs[0].ddl,
 				Status:          state.Apply.Running,
 				RowsCopied:      875000,
@@ -47,8 +49,8 @@ func previewSeqFirstRunOutput() {
 				PercentComplete: 35,
 				ETASeconds:      510, // 8m 30s
 			},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Apply.Pending},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Apply.Pending},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
@@ -64,9 +66,10 @@ func previewSeqSecondRunOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-12 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
 			{
 				TableName:       "orders",
+				Dialect:         schema.DialectMySQL,
 				DDL:             seqDDLs[1].ddl,
 				Status:          state.Apply.Running,
 				RowsCopied:      3000000,
@@ -74,7 +77,7 @@ func previewSeqSecondRunOutput() {
 				PercentComplete: 60,
 				ETASeconds:      735, // 12m 15s
 			},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
@@ -90,10 +93,11 @@ func previewSeqThirdRunOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-20 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Apply.Completed},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Apply.Completed},
 			{
 				TableName:       "products",
+				Dialect:         schema.DialectMySQL,
 				DDL:             seqDDLs[2].ddl,
 				Status:          state.Apply.Running,
 				RowsCopied:      160000,
@@ -116,11 +120,11 @@ func previewSeqThrottledOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-20 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.Running,
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Task.Running,
 				RowsCopied: 3100000, RowsTotal: 5000000, PercentComplete: 62,
 				Throttled: true, ThrottleReason: "commit-latency 112.4ms >= 100ms"},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
@@ -136,9 +140,9 @@ func previewSeqCatchingUpOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-25 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.CatchingUp, RowsCopied: 5000000, RowsTotal: 5000000, PercentComplete: 100},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Task.CatchingUp, RowsCopied: 5000000, RowsTotal: 5000000, PercentComplete: 100},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
@@ -154,9 +158,9 @@ func previewSeqPostChecksumOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-30 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.PostChecksum, RowsCopied: 5000000, RowsTotal: 5000000, PercentComplete: 100},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Task.PostChecksum, RowsCopied: 5000000, RowsTotal: 5000000, PercentComplete: 100},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
@@ -172,9 +176,9 @@ func previewSeqChecksummingOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-25 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Task.Checksumming, ChecksumRowsChecked: 3000000, ChecksumRowsTotal: 5000000},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Task.Checksumming, ChecksumRowsChecked: 3000000, ChecksumRowsTotal: 5000000},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Pending},
 		},
 	}
 	WriteProgress(data)
@@ -191,9 +195,9 @@ func previewSeqAllDoneOutput() {
 		StartedAt:   previewTime.Add(-25 * time.Minute).Format(time.RFC3339),
 		CompletedAt: previewTime.Add(-30 * time.Second).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Apply.Completed},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Completed},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Apply.Completed},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Completed},
 		},
 	}
 	WriteProgress(data)
@@ -212,9 +216,9 @@ func previewSeqFirstFailOutput() {
 		CompletedAt:  previewTime.Add(-30 * time.Second).Format(time.RFC3339),
 		ErrorMessage: "lock wait timeout exceeded; try restarting transaction",
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Failed, PercentComplete: 65},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: TaskCancelled},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: TaskCancelled},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Failed, PercentComplete: 65},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: TaskCancelled},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: TaskCancelled},
 		},
 	}
 	WriteProgress(data)
@@ -232,9 +236,9 @@ func previewSeqMidFailOutput() {
 		CompletedAt:  previewTime.Add(-30 * time.Second).Format(time.RFC3339),
 		ErrorMessage: "Lost connection to MySQL server during query (MySQL error 2013)",
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
-			{TableName: "orders", DDL: seqDDLs[1].ddl, Status: state.Apply.Failed, PercentComplete: 45},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: TaskCancelled},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "orders", Dialect: schema.DialectMySQL, DDL: seqDDLs[1].ddl, Status: state.Apply.Failed, PercentComplete: 45},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: TaskCancelled},
 		},
 	}
 	WriteProgress(data)
@@ -250,16 +254,17 @@ func previewSeqStoppedOutput() {
 		ApplyID:   "apply-a1b2c3d4e5f6",
 		StartedAt: previewTime.Add(-5 * time.Minute).Format(time.RFC3339),
 		Tables: []TableProgress{
-			{TableName: "users", DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
+			{TableName: "users", Dialect: schema.DialectMySQL, DDL: seqDDLs[0].ddl, Status: state.Apply.Completed},
 			{
 				TableName:       "orders",
+				Dialect:         schema.DialectMySQL,
 				DDL:             seqDDLs[1].ddl,
 				Status:          state.Apply.Stopped,
 				RowsCopied:      112045,
 				RowsTotal:       266383,
 				PercentComplete: 42,
 			},
-			{TableName: "products", DDL: seqDDLs[2].ddl, Status: state.Apply.Stopped, PercentComplete: 0},
+			{TableName: "products", Dialect: schema.DialectMySQL, DDL: seqDDLs[2].ddl, Status: state.Apply.Stopped, PercentComplete: 0},
 		},
 	}
 	WriteProgress(data)

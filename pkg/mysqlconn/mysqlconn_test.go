@@ -1,15 +1,187 @@
 package mysqlconn
 
 import (
+	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"errors"
+	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/go-sql-driver/mysql"
+	"github.com/block/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const nonVerifyingRDSWarning = "MySQL RDS connection uses a non-verifying TLS mode; the configured mode is honored for compatibility"
+
+// captureWarnings routes the default logger into a buffer for the test and
+// clears the per-process warning set so the test observes the first warning
+// for its endpoints regardless of test order or -count.
+func captureWarnings(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	warnedNonVerifyingRDS.Clear()
+	t.Cleanup(func() {
+		slog.SetDefault(originalLogger)
+		warnedNonVerifyingRDS.Clear()
+	})
+	return &logs
+}
+
+func TestConnectionDSNWarnsForNonVerifyingRDSTLS(t *testing.T) {
+	tests := []struct {
+		name        string
+		host        string
+		tlsMode     string
+		opts        []Option
+		wantWarning bool
+		wantMode    string
+		wantTLS     string
+	}{
+		{name: "disabled TLS on RDS", host: "disabled.cluster-abc123.us-west-2.rds.amazonaws.com:3306", tlsMode: "false", wantWarning: true, wantTLS: "false"},
+		{name: "unverified TLS on RDS", host: "unverified.cluster-abc123.us-west-2.rds.amazonaws.com:3306", tlsMode: "skip-verify", wantWarning: true, wantTLS: "skip-verify"},
+		{name: "preferred TLS on RDS", host: "preferred.cluster-abc123.us-west-2.rds.amazonaws.com:3306", tlsMode: "preferred", wantWarning: true, wantTLS: "preferred"},
+		{name: "disabled TLS on uppercase RDS endpoint", host: "Disabled.Cluster-ABC123.US-WEST-2.RDS.AMAZONAWS.COM:3306", tlsMode: "false", wantWarning: true, wantTLS: "false"},
+		{
+			name: "option weakens implicit verified TLS on RDS",
+			host: "weakened.cluster-abc123.us-west-2.rds.amazonaws.com:3306",
+			opts: []Option{func(cfg *mysql.Config) { cfg.TLSConfig = "skip-verify" }},
+			// The option runs after the RDS enhancement, so the mode that is
+			// dialed — and warned about — is the option's, not the injected one.
+			wantWarning: true,
+			wantMode:    "skip-verify",
+			wantTLS:     "skip-verify",
+		},
+		{name: "implicit verified TLS on RDS", host: "verified.cluster-abc123.us-west-2.rds.amazonaws.com:3306", wantTLS: "rds"},
+		{name: "disabled TLS off RDS", host: "database.example.com:3306", tlsMode: "false", wantTLS: "false"},
+		{name: "disabled TLS on GovCloud RDS", host: "gov.cluster-abc123.us-gov-west-1.rds.amazonaws.com:3306", tlsMode: "false", wantTLS: "false"},
+		{name: "verified TLS on RDS", host: "explicit.cluster-abc123.us-west-2.rds.amazonaws.com:3306", tlsMode: "true", wantTLS: "true"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureWarnings(t)
+
+			dsn := "schemabot:secret@tcp(" + tt.host + ")/app"
+			if tt.tlsMode != "" {
+				dsn += "?tls=" + tt.tlsMode
+			}
+			got, err := ConnectionDSN(dsn, tt.opts...)
+			require.NoError(t, err)
+
+			cfg, err := mysql.ParseDSN(got)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantTLS, cfg.TLSConfig, "the explicit TLS mode must be preserved")
+			if !tt.wantWarning {
+				assert.Empty(t, logs.String())
+				return
+			}
+			wantMode := tt.wantMode
+			if wantMode == "" {
+				wantMode = tt.tlsMode
+			}
+			assert.Contains(t, logs.String(), nonVerifyingRDSWarning)
+			assert.Contains(t, logs.String(), "host="+tt.host)
+			assert.Contains(t, logs.String(), "tls_mode="+wantMode)
+			assert.NotContains(t, logs.String(), "secret", "the warning must not carry credentials")
+			_, err = ConnectionDSN(dsn, tt.opts...)
+			require.NoError(t, err)
+			assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "the same endpoint and mode warns once")
+		})
+	}
+}
+
+// The warning is keyed on the endpoint and mode, not on the DSN: a rotated
+// password or a different database on the same endpoint is the same posture
+// and does not warn again, while a different mode on the same endpoint is a
+// different posture and does.
+func TestNonVerifyingRDSTLSWarningDedupesPerEndpointAndMode(t *testing.T) {
+	logs := captureWarnings(t)
+	host := "shared.cluster-abc123.us-west-2.rds.amazonaws.com:3306"
+
+	for _, dsn := range []string{
+		"schemabot:secret@tcp(" + host + ")/app?tls=false",
+		"schemabot:rotated@tcp(" + host + ")/app?tls=false",
+		"schemabot:secret@tcp(" + host + ")/other?tls=false",
+	} {
+		_, err := ConnectionDSN(dsn)
+		require.NoError(t, err)
+	}
+	assert.Equal(t, 1, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "one endpoint and mode warns once across DSNs")
+
+	_, err := ConnectionDSN("schemabot:secret@tcp(" + host + ")/app?tls=skip-verify")
+	require.NoError(t, err)
+	assert.Equal(t, 2, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a different mode on the same endpoint warns again")
+	assert.Contains(t, logs.String(), "tls_mode=skip-verify")
+
+	const other = "other.cluster-abc123.us-west-2.rds.amazonaws.com:3306"
+	_, err = ConnectionDSN("schemabot:secret@tcp(" + other + ")/app?tls=false")
+	require.NoError(t, err)
+	assert.Equal(t, 3, bytes.Count(logs.Bytes(), []byte(nonVerifyingRDSWarning)), "a second endpoint in the same mode warns on its own")
+	assert.Contains(t, logs.String(), "host="+other)
+}
+
+// A tls= value that names a config registered with the Go MySQL driver is
+// judged by what that config verifies, not by its name: encryption without
+// server authentication warns like skip-verify does, while a config that
+// authenticates the server — through the default verification or through its
+// own peer verifier — does not, whatever it is called.
+func TestConnectionDSNJudgesRegisteredTLSConfigsByWhatTheyVerify(t *testing.T) {
+	tests := []struct {
+		name        string
+		config      *tls.Config
+		wantWarning bool
+	}{
+		{
+			name:        "encrypts without authenticating the server",
+			config:      &tls.Config{InsecureSkipVerify: true},
+			wantWarning: true,
+		},
+		{
+			name:        "authenticates the server with the default verification",
+			config:      &tls.Config{RootCAs: x509.NewCertPool()},
+			wantWarning: false,
+		},
+		{
+			name: "authenticates the chain through its own peer verifier",
+			config: &tls.Config{
+				InsecureSkipVerify:    true,
+				VerifyPeerCertificate: func([][]byte, [][]*x509.Certificate) error { return nil },
+			},
+			wantWarning: false,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureWarnings(t)
+			configName := fmt.Sprintf("registered-%d", i)
+			require.NoError(t, mysql.RegisterTLSConfig(configName, tt.config))
+			t.Cleanup(func() { mysql.DeregisterTLSConfig(configName) })
+
+			host := fmt.Sprintf("registered%d.cluster-abc123.us-west-2.rds.amazonaws.com:3306", i)
+			got, err := ConnectionDSN("schemabot:secret@tcp(" + host + ")/app?tls=" + configName)
+			require.NoError(t, err)
+			cfg, err := mysql.ParseDSN(got)
+			require.NoError(t, err)
+			assert.Equal(t, configName, cfg.TLSConfig, "the registered name must be preserved")
+
+			if !tt.wantWarning {
+				assert.Empty(t, logs.String())
+				return
+			}
+			assert.Contains(t, logs.String(), nonVerifyingRDSWarning)
+			assert.Contains(t, logs.String(), "host="+host)
+			assert.Contains(t, logs.String(), "tls_mode="+configName)
+		})
+	}
+}
 
 func TestConnectionDSN(t *testing.T) {
 	tests := []struct {
@@ -69,6 +241,12 @@ func TestConnectionDSN(t *testing.T) {
 			// every SchemaBot-managed connection, so parameterized queries
 			// never create server-side prepared statements.
 			assert.True(t, cfg.InterpolateParams)
+			// A signed tinyint(1) is read as the number stored in it rather
+			// than as a Go bool. The driver keeps the parsed field unexported,
+			// so the assertion is on the DSN the pool is opened with — which is
+			// also what a driver that stopped emitting the parameter would
+			// change, rather than reverting the behavior silently.
+			assert.Contains(t, got, "tinyInt1IsBool=false")
 			// Caller-supplied params survive the reassembly.
 			assert.Equal(t, tt.wantParseTime, cfg.ParseTime)
 			_, err = mysql.NewConnector(cfg)
@@ -195,56 +373,12 @@ func TestOpenNormalizesRDSDSNBeforeOpening(t *testing.T) {
 	_, err := Open("spirit:secret@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app?parseTime=true")
 
 	require.ErrorIs(t, err, openErr)
-	assert.Equal(t, "mysql", gotDriver)
+	// Not "mysql": that name belongs to upstream go-sql-driver. Nothing in
+	// SchemaBot's graph registers it any more, so opening under it would fail
+	// outright — but a dependency that reaches upstream again would make it
+	// resolve to the wrong driver silently, which is what this pins.
+	assert.Equal(t, "block-mysql", gotDriver)
 	cfg, parseErr := mysql.ParseDSN(gotDSN)
 	require.NoError(t, parseErr)
 	assert.Equal(t, "rds", cfg.TLSConfig)
-}
-
-func TestOpenReloadableUsesHotswapDriver(t *testing.T) {
-	originalOpenSQL := openSQL
-	t.Cleanup(func() { openSQL = originalOpenSQL })
-
-	openErr := errors.New("stop before network connection")
-	var gotDriver string
-	openSQL = func(driverName, _ string) (*sql.DB, error) {
-		gotDriver = driverName
-		return nil, openErr
-	}
-
-	_, err := OpenReloadable("spirit:secret@tcp(127.0.0.1:3306)/app", func() (string, error) {
-		return "", nil
-	})
-
-	require.ErrorIs(t, err, openErr)
-	assert.Equal(t, hotswapDriverName, gotDriver)
-}
-
-func TestReloadConnectionDSN(t *testing.T) {
-	t.Run("re-applies RDS transport to the reloaded DSN", func(t *testing.T) {
-		got := reloadConnectionDSN(func() (string, error) {
-			return "spirit:rotated@tcp(database.cluster-abc123.us-west-2.rds.amazonaws.com:3306)/app", nil
-		})
-
-		cfg, err := mysql.ParseDSN(got)
-		require.NoError(t, err)
-		assert.Equal(t, "rotated", cfg.Passwd)
-		assert.Equal(t, "rds", cfg.TLSConfig)
-	})
-
-	t.Run("keeps current DSN when reload fails", func(t *testing.T) {
-		got := reloadConnectionDSN(func() (string, error) {
-			return "", errors.New("secret file unreadable")
-		})
-
-		assert.Empty(t, got)
-	})
-
-	t.Run("keeps current DSN when the reloaded DSN is unparseable", func(t *testing.T) {
-		got := reloadConnectionDSN(func() (string, error) {
-			return "not-a-valid-dsn", nil
-		})
-
-		assert.Empty(t, got)
-	})
 }

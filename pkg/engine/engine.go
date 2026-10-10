@@ -13,6 +13,8 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/block/schemabot/pkg/ddl"
@@ -27,8 +29,9 @@ import (
 //  3. Progress() - Check current status (poll this)
 //  4. Control operations: Stop/Start/Cutover/Revert/SkipRevert
 //
-// Engines must support resume: if the server restarts mid-schema-change, the engine
-// must be able to resume from where it left off using stored state.
+// Engines must support resume: if the server restarts part-way through a schema
+// change, the engine must be able to resume from where it left off using stored
+// state.
 type Engine interface {
 	// Name returns the engine identifier (e.g., "planetscale", "spirit").
 	Name() string
@@ -70,17 +73,19 @@ type Engine interface {
 // schema change's goroutine has fully exited (releasing DB connections) before
 // checking whether the next table still needs changes.
 type Drainer interface {
-	// Drain waits for any in-flight background work to complete and clears it.
-	Drain()
+	// DrainContext waits for any in-flight background work to complete and
+	// clears it. When ctx ends first it returns an error and leaves the work
+	// tracked.
+	DrainContext(ctx context.Context) error
 }
 
-// ShutdownHalter is an optional capability for engines whose schema-change work
+// ShutdownHalter is an optional capability for engines whose schema change work
 // runs inside this process. Such an engine holds resources on the target — for
 // Spirit, an advisory lock on the table it is copying — for exactly as long as
 // its in-process work lives, and that work outlives the drive that started it.
-// Without a way to bring it down, a shutting-down process stops renewing the
-// apply's lease while still holding the target, and peer drivers reclaim work
-// they cannot execute.
+// Without a way to bring it down, a process that stops renewing the apply's
+// lease, because it is shutting down or because its drive was displaced, keeps
+// holding the target, and peer drivers reclaim work they cannot execute.
 //
 // An engine whose work runs elsewhere (a remote online-DDL service) must not
 // implement this: its schema change is unaffected by this process going away,
@@ -91,11 +96,28 @@ type ShutdownHalter interface {
 	// no longer holds the target's resources. It is not an operator stop: it
 	// records no operator intent and leaves the apply active for reclaim.
 	// It returns an error if the work has not come down by the time ctx expires,
-	// so a caller can report that the target may still be held.
+	// so a caller can report that the target may still be held. Work that has
+	// already ended leaves nothing to halt.
 	HaltForShutdown(ctx context.Context) error
 }
 
-// HaltEngineForShutdown brings eng's in-process schema-change work down when it
+// OwnedWorkHalter is an optional capability, alongside ShutdownHalter, for an
+// engine that can halt one drive's in-process work without touching another's.
+// A drive that hands its apply back halts through it, so its run does not keep
+// holding the target under nobody's claim.
+//
+// It is separate from ShutdownHalter so an engine that only halts for shutdown
+// keeps that halt. Such an engine's drives hand the apply back without halting
+// anything, as they did before this capability existed.
+type OwnedWorkHalter interface {
+	// HaltWorkOwnedBy halts like HaltForShutdown, but only the work started
+	// under owner (see WithWorkOwner). One engine serves every drive of a
+	// target in this process, so the drive that hands an apply back must not
+	// bring down the run a later drive has already started in its place.
+	HaltWorkOwnedBy(ctx context.Context, owner string) error
+}
+
+// HaltEngineForShutdown brings eng's in-process schema change work down when it
 // has any, and reports whether the engine implements the capability at all. An
 // engine that does not is one whose work is unaffected by this process exiting,
 // so there is nothing to halt and nothing to wait for.
@@ -105,6 +127,33 @@ func HaltEngineForShutdown(ctx context.Context, eng Engine) (supported bool, err
 		return false, nil
 	}
 	return true, halter.HaltForShutdown(ctx)
+}
+
+// HaltEngineWorkOwnedBy halts the work eng started under owner when eng
+// implements OwnedWorkHalter, and reports whether it does.
+func HaltEngineWorkOwnedBy(ctx context.Context, eng Engine, owner string) (supported bool, err error) {
+	halter, ok := eng.(OwnedWorkHalter)
+	if !ok {
+		return false, nil
+	}
+	return true, halter.HaltWorkOwnedBy(ctx, owner)
+}
+
+type workOwnerContextKey struct{}
+
+// WithWorkOwner names the owner of the engine work started under ctx. An
+// engine that runs its work in this process records the owner on the work
+// when it accepts an Apply or a Start, and HaltWorkOwnedBy halts by it. Work
+// started with no owner belongs to the empty owner.
+func WithWorkOwner(ctx context.Context, owner string) context.Context {
+	return context.WithValue(ctx, workOwnerContextKey{}, owner)
+}
+
+// WorkOwnerFromContext returns the owner WithWorkOwner attached to ctx, or
+// the empty owner.
+func WorkOwnerFromContext(ctx context.Context) string {
+	owner, _ := ctx.Value(workOwnerContextKey{}).(string)
+	return owner
 }
 
 // DeferredCutoverSignalChecker is an optional capability for engines that can
@@ -185,11 +234,149 @@ func RegistersWorkSynchronously(eng Engine) bool {
 	return ok && reg.RegistersWorkSynchronously()
 }
 
+// ShardKeyedPlanning is an optional interface for engines whose Plan describes
+// each shard of a sharded namespace on its own, and lists every shard that
+// still needs a change.
+//
+// This decides how a driver reads a re-plan that does not mention a task that
+// ran on one shard. An engine that fans a change out to its shards behind one
+// endpoint reports a namespace as a unit, so a shard missing from its plan says
+// nothing about that shard. An engine that plans each shard itself leaves a
+// shard out exactly when that shard already has the reviewed schema. That
+// includes the namespace whose every shard has it, which such a plan does not
+// mention at all, so the driver cannot tell the two kinds of plan apart from
+// the plan alone. Only the engine knows which kind it produces.
+//
+// Engines that do not implement this interface are treated as reporting
+// namespaces as a unit. A shard-tagged task the plan does not mention is then
+// never settled as completed on that evidence; the driver runs its reviewed
+// statement again instead.
+type ShardKeyedPlanning interface {
+	// PlansEachShard reports whether Plan lists every shard that still needs a
+	// change, so a shard it leaves out already has the reviewed schema.
+	PlansEachShard() bool
+}
+
+// PlansEachShard reports whether eng declares that its Plan lists every shard
+// that still needs a change. Engines that do not implement ShardKeyedPlanning
+// are treated as reporting namespaces as a unit, so their silence about a
+// shard is never read as the shard having the reviewed schema.
+func PlansEachShard(eng Engine) bool {
+	planner, ok := eng.(ShardKeyedPlanning)
+	return ok && planner.PlansEachShard()
+}
+
 // DeferredCutoverSignalRequest identifies the target database whose deferred
 // cutover signal should be inspected.
 type DeferredCutoverSignalRequest struct {
 	Database    string
 	Credentials *Credentials
+}
+
+// CancelledArtifactReleaser is an optional capability for engines that leave
+// their unfinished work on the target database as tables the engine itself
+// owns. Such an engine copies rows into its own tables, and cancelling the
+// schema change abandons them: nothing in the engine's own lifecycle reclaims
+// them, and they can outlive the process, the apply, and the pull request that
+// created them.
+//
+// An engine whose unfinished work lives in the service it drives (a remote
+// online-DDL service) must not implement this. Cancelling there releases the
+// work server-side and there is nothing locally to reclaim, so implementing the
+// capability would claim a responsibility the engine does not have.
+//
+// The release is stateless by design. It reclaims work belonging to a schema
+// change this process may never have run — one cancelled days later, on an
+// instance that has restarted since — so it takes the target and the tables
+// from the caller rather than from anything held in memory.
+type CancelledArtifactReleaser interface {
+	// ReleaseCancelledArtifacts reclaims what a cancelled schema change left on
+	// the target and reports what it reclaimed. Data the schema change copied
+	// is kept somewhere recoverable where the deployment offers one; the
+	// metadata describing where the copy had got to is always discarded.
+	//
+	// Callers must hold the mechanisms that keep another writer off the target
+	// for as long as the release runs — the claim on the apply being cancelled,
+	// and the apply-target lock that keeps a second apply off that target.
+	// Having read that nothing was running is not the same thing: the read is
+	// true of the instant it happened, and the release destroys tables for
+	// however long it takes after that.
+	//
+	// Those mechanisms cover the schema changes the caller can see. They do not
+	// cover one started outside it, so the engine defends the artifacts that a
+	// schema change other than the cancelled one can own: the schema-scoped
+	// ones, shared by every schema change in the schema, one of which can be a
+	// cutover gate. Reclaiming that gate on a cancelled change's behalf releases
+	// the cutover a live change is still waiting on. Where the schema holds an
+	// artifact the request's tables do not account for, those shared artifacts
+	// are retained rather than reclaimed, and reported as retained. Artifacts
+	// derived from the request's own tables are always reclaimed.
+	//
+	// Tables must not be empty. Every schema change names at least one table, so
+	// an empty list is a lost one, and the schema-scoped artifacts above would
+	// be reclaimed regardless of it.
+	//
+	// A release that fails part-way returns what it reclaimed before failing
+	// alongside the error, or nil when it failed before reclaiming anything. A
+	// caller must not read the error as nothing having been reclaimed: by then
+	// the copy may already be in quarantine, and an operator told it was left
+	// in place would look for it where it no longer is.
+	ReleaseCancelledArtifacts(ctx context.Context, req *ReleaseArtifactsRequest) (*ReleaseArtifactsResult, error)
+}
+
+// ReleaseArtifactsRequest names the target and the tables whose cancelled
+// schema change artifacts should be reclaimed. Tables are the target's own
+// table names, not the engine's derived ones — deriving those is the engine's
+// job, because only the engine knows how it names them.
+type ReleaseArtifactsRequest struct {
+	Database    string
+	Tables      []string
+	Credentials *Credentials
+}
+
+// ReleaseArtifactsResult reports what a release reclaimed and what it left
+// alone, so a caller can tell an operator where their copy went and what is
+// still on the target. All three are empty when the schema change left nothing
+// behind, which is the ordinary outcome for a cancel that arrives before any
+// copying started.
+//
+// Every table in every field is named in full, as schema.table, so an operator
+// reading one release can act on any line of it without having to supply the
+// schema from context — including the lines naming tables that left the schema
+// the release ran against.
+type ReleaseArtifactsResult struct {
+	// Preserved names each table whose data was kept, and where it was kept.
+	Preserved []PreservedArtifact
+	// Discarded names each table that was removed outright.
+	Discarded []string
+	// Retained names each artifact the release deliberately left on the target
+	// because another schema change may own it, with RetainedReason saying what
+	// the engine saw. An operator reclaims these by hand once they know the
+	// schema is idle; a release never guesses on their behalf.
+	Retained []string
+	// RetainedReason states why Retained was left alone, in terms an operator
+	// can act on. Empty when Retained is empty.
+	RetainedReason string
+}
+
+// PreservedArtifact records where a cancelled schema change's copied data was
+// put, so an operator can find it while it is still recoverable.
+type PreservedArtifact struct {
+	Source      string
+	Destination string
+}
+
+// ReleaseCancelledArtifacts reclaims eng's leftovers for the given target when
+// eng owns any, and reports whether the engine implements the capability at
+// all. An engine that does not is one whose unfinished work is not this
+// process's to reclaim, so there is nothing to release and nothing to report.
+func ReleaseCancelledArtifacts(ctx context.Context, eng Engine, req *ReleaseArtifactsRequest) (supported bool, result *ReleaseArtifactsResult, err error) {
+	releaser, ok := eng.(CancelledArtifactReleaser)
+	if !ok {
+		return false, nil, nil
+	}
+	result, err = releaser.ReleaseCancelledArtifacts(ctx, req)
+	return true, result, err
 }
 
 // Credentials contains the resolved credentials for accessing a database.
@@ -229,6 +416,17 @@ type PlanRequest struct {
 	// and the re-plan an apply runs predicts the shape it is actually about to
 	// use.
 	GroupedExecution bool
+
+	// IgnoreTables lists the live tables the repository's ignore_tables config
+	// withholds from the planner, so a table no schema file declares is not
+	// proposed for DROP TABLE. Entries are matched against the target's own
+	// catalog, in every namespace the plan covers: a plain entry exactly and
+	// case-sensitively, an entry wrapped in slashes as a regular expression over
+	// the whole name. An entry that does not compile fails the plan.
+	// Every engine honors the list, discloses what it actually withheld through
+	// ExemptTables, and refuses a table the config withholds that a schema file
+	// also declares (see IgnoredTables).
+	IgnoreTables []string
 }
 
 // PlanResult contains the computed schema change plan.
@@ -246,6 +444,24 @@ type PlanResult struct {
 	// namespace that holds any. Empty when the target holds none, which is the
 	// ordinary case.
 	ExistingCopies []*ExistingCopy
+
+	// ExistingCopiesChecked is set by an engine that read the target for every
+	// copy applying this plan could meet, so an empty ExistingCopies means the
+	// target holds none. It stays false when the engine does not look, or when
+	// any lookup failed, and a caller that must know nothing is at stake treats
+	// that as unknown rather than clean.
+	ExistingCopiesChecked bool
+
+	// ExemptTables lists live tables intentionally excluded from a plan verdict,
+	// grouped by namespace and carrying the engine-agnostic reason for exemption.
+	ExemptTables []*ExemptTables
+}
+
+// ExemptTables describes live tables exempt from a plan verdict in one namespace.
+type ExemptTables struct {
+	Namespace string
+	Tables    []string
+	Reason    string
 }
 
 // HasErrors returns true if any lint warning has error severity.
@@ -322,6 +538,53 @@ type SchemaChange struct {
 	OriginalFilesCaptured bool              // True when OriginalFiles was captured, including an empty namespace
 }
 
+// MetadataNeedsFinalizer is the plan change-metadata key ("true") an engine
+// sets on a namespace's change when the namespace needs its group finalizer to
+// run once every shard's DDL has landed, whether or not its VSchema changes.
+// It is the scheduling signal for the finalizer; a VSchema change schedules one
+// too, because applying the VSchema is finalizer work. Engines that finish a
+// namespace's work in its DDL never set it.
+const MetadataNeedsFinalizer = "needs_finalizer"
+
+// MetadataVSchemaGeneratedOnly is the plan change-metadata key ("true") an
+// engine sets beside vschema_changed when every difference in the namespace's
+// VSchema is one the engine generates from the plan's own DDL, such as the
+// entries and column lists of the tables the plan creates or alters. The
+// VSchema is still written, but there is nothing hand-written to review, so
+// the engine sends no rendered diff, and plan surfaces show the namespace as
+// finalized after its DDL rather than as a VSchema change with no diff.
+// Engines set it on every change of the namespace that reports VSchema work; a
+// sharded namespace whose changes disagree renders without it. Display-only:
+// no scheduling or safety gate reads it.
+const MetadataVSchemaGeneratedOnly = "vschema_generated_only"
+
+// NeedsFinalizer reports whether the engine asked for this change's namespace
+// to be finalized after its DDL.
+func (sc SchemaChange) NeedsFinalizer() bool {
+	return sc.Metadata[MetadataNeedsFinalizer] == "true"
+}
+
+// ShardName returns the shard this change targets, trimmed of surrounding
+// whitespace. Empty when the change targets the whole namespace.
+func (sc SchemaChange) ShardName() string {
+	return strings.TrimSpace(sc.Shard.Name)
+}
+
+// Sharded reports whether the change targets one shard of its namespace. A
+// sharded engine plans one SchemaChange per changed shard, so the same table
+// repeats across a keyspace's shards; a non-sharded change lists each
+// statement once, and a table may legitimately appear more than once when its
+// change is a multi-statement sequence.
+//
+// An engine that fans a change out to its shards behind one endpoint reports
+// a whole-namespace change like a single-node engine does, so any repeated
+// table in it is a statement sequence, never a per-shard repeat. Per-shard
+// changes come from callers that scope a change to one shard — a shard-scoped
+// dispatch, or a task that recorded the shard it ran on.
+func (sc SchemaChange) Sharded() bool {
+	return sc.ShardName() != ""
+}
+
 // Shard identifies a shard within a namespace for a sharded schema change. It is
 // the zero value for non-sharded engines, where a SchemaChange targets the whole
 // namespace.
@@ -337,6 +600,12 @@ type LintViolation struct {
 	Message  string // Human-readable description
 	Severity string // "warning" or "error"
 }
+
+// TableSizeProbeTimeout bounds the plan-time table-size statistics probe.
+// Size estimates are display-only, so a probe that cannot answer within this
+// budget is abandoned and the plan proceeds without sizes — a slow or wedged
+// statistics read must never extend plan latency past this bound.
+const TableSizeProbeTimeout = 5 * time.Second
 
 // TableChange describes a change to a single table within a SchemaChange namespace.
 type TableChange struct {
@@ -357,7 +626,77 @@ type TableChange struct {
 	// *can* run but the operator must acknowledge.
 	ExecutionMode string
 	ModeReason    string // Engine's reason for any non-empty ExecutionMode verdict
+
+	// EstimatedRows is the approximate number of rows in the table at plan
+	// time, for display only. Sourced from engine statistics, which may be
+	// stale — never an exact count and never a gate input. An engine that
+	// aggregates a sharded target itself reports the sum across shards; an
+	// engine that emits one SchemaChange per shard reports each shard's own
+	// estimate and the core sums them into the namespace-level view. Nil when
+	// no estimate is available (e.g. the table is being created, or statistics
+	// could not be read). Several TableChanges for one table each carry that
+	// table's full estimate, so a consumer aggregating across changes must
+	// dedupe by table.
+	EstimatedRows *int64
+	// EstimatedBytes is the table's approximate on-disk footprint (data plus
+	// indexes) at plan time, for display only. Same sourcing, aggregation, and
+	// nil semantics as EstimatedRows.
+	EstimatedBytes *int64
+	// ShardCount is the number of shards this table change spans. Zero means
+	// there is no shard count to render: the target is not sharded, or its
+	// shard topology could not be read. The two are indistinguishable here, so
+	// a renderer must omit the shard count on zero rather than assert the
+	// table is unsharded.
+	ShardCount int
+	// LargestShardRows is the approximate row count of the largest single
+	// shard, the biggest chunk a shard-at-a-time apply works through at once.
+	// Nil when the target is not sharded, or when any planned shard has no row
+	// estimate: the shard with no estimate could be the largest, so a maximum
+	// over the others would name a smaller shard as the largest.
+	LargestShardRows *int64
+	// CollationChanges lists the existing columns whose collation this change
+	// moves, so a reviewer can see what it does to how their values sort and
+	// compare equal. Empty when the change re-collates no column, and for an
+	// engine that does not report it.
+	CollationChanges []CollationChange
 }
+
+// CollationChange is one existing column a planned change moves onto another
+// collation.
+type CollationChange struct {
+	Column string
+	// From is the collation the column compares under now, and To the one it
+	// compares under once the change applies. To is empty when the change
+	// leaves the collation to a server default the plan cannot read.
+	From, To string
+	// Case says whether 'abc' and 'ABC' stop or start comparing equal, and
+	// TrailingSpaces whether 'abc' and 'abc ' do.
+	Case, TrailingSpaces ComparisonChange
+	// CanMergeValues reports whether values that compare unequal now can
+	// compare equal after the move, whether or not Case and TrailingSpaces
+	// name the reason: collations also differ in how they weigh accents and
+	// other characters. It is false only for a move onto a binary collation of
+	// the same charset that does not start ignoring trailing spaces.
+	CanMergeValues bool
+	// UniqueIndexes names the primary key and unique indexes that cover the
+	// column when CanMergeValues, since those are the indexes that reject
+	// values once they compare equal.
+	UniqueIndexes []string
+}
+
+// ComparisonChange is how a collation change moves one way values compare.
+type ComparisonChange string
+
+// ComparisonChange values. Sensitive means the difference is significant:
+// values that differ only by it compare unequal.
+const (
+	ComparisonUnchanged          ComparisonChange = "unchanged"
+	ComparisonBecomesSensitive   ComparisonChange = "becomes_sensitive"
+	ComparisonBecomesInsensitive ComparisonChange = "becomes_insensitive"
+	// ComparisonUnknown is reported when either collation is not known, or
+	// its properties cannot be read. A consumer treats it as a possible change.
+	ComparisonUnknown ComparisonChange = "unknown"
+)
 
 // Execution-mode verdicts recorded on a planned table change. The verdict
 // answers "how will this statement actually run?" so operators learn about
@@ -372,10 +711,67 @@ const (
 
 	// ExecutionModeDirect marks a statement the engine refuses but that the
 	// database's direct execution policy routes to native DDL on the target
-	// instead: it runs synchronously, it blocks writes to the table while it
-	// runs, and it is not revertible.
+	// instead: it runs synchronously and blocks writes to the table while it
+	// runs.
 	ExecutionModeDirect = "direct"
 )
+
+// blockedCauseSeparator separates independent reasons for a blocked verdict.
+// The double vertical line is readable in raw text, unlike a control character,
+// and is unlikely to occur in natural refusal prose. It is also distinct from
+// the semicolon separator used for clauses within one reason and survives the
+// reason sanitizers used by rendering surfaces.
+const blockedCauseSeparator = " ‖ "
+
+// blockedCauseSeparatorRune is the character that makes the separator
+// distinctive. Its presence anywhere in a cause is what would let the cause
+// masquerade as several, so neutralization targets the rune, not only the
+// space-padded separator.
+const blockedCauseSeparatorRune = "‖"
+
+// SanitizeBlockedCause makes one cause safe to carry in ModeReason by
+// replacing the reserved separator character. Cause text embeds identifiers
+// from the planner and the target database, which a schema author controls,
+// so without this a table named after the separator would decode as extra
+// causes and could forge a refusal the engine never issued. Engines call this
+// on every reason they compose; JoinBlockedCauses also applies it, so a cause
+// reaching BlockedCauses is exactly one cause.
+func SanitizeBlockedCause(cause string) string {
+	return strings.ReplaceAll(cause, blockedCauseSeparatorRune, "//")
+}
+
+// JoinBlockedCauses encodes independent blocked causes in ModeReason. Each
+// cause is sanitized so it decodes as the single cause it was given as.
+func JoinBlockedCauses(causes []string) string {
+	clean := make([]string, 0, len(causes))
+	for _, cause := range causes {
+		if cause = strings.TrimSpace(SanitizeBlockedCause(cause)); cause != "" {
+			clean = append(clean, cause)
+		}
+	}
+	return strings.Join(clean, blockedCauseSeparator)
+}
+
+// BlockedCauses decodes the independent causes carried by ModeReason. The
+// separator is reserved: producers neutralize it with SanitizeBlockedCause
+// before a cause enters ModeReason, so each decoded element is one cause.
+func BlockedCauses(reason string) []string {
+	if strings.TrimSpace(reason) == "" {
+		return nil
+	}
+	return splitNonEmptyTrimmed(reason, blockedCauseSeparator)
+}
+
+func splitNonEmptyTrimmed(value, separator string) []string {
+	parts := strings.Split(value, separator)
+	clean := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			clean = append(clean, part)
+		}
+	}
+	return clean
+}
 
 // CopyDisposition is what applying a plan will do with work an earlier schema
 // change already did on the target and left behind — for engines that copy a
@@ -466,11 +862,17 @@ const (
 	MetadataDirectExecution = "direct_execution"
 
 	// MetadataDirectExecutionMaxTableRows bounds direct execution by the
-	// target table's row count. Required (a positive integer) when direct
-	// execution is enabled, so a native table rebuild can never run
-	// unbounded: above the bound — or when the size cannot be determined —
-	// the statement stays blocked.
+	// target table's row count. An enabled policy carries exactly one of this
+	// bound and the byte bound, so a native table rebuild can never run
+	// unbounded. When present it must be a positive integer.
 	MetadataDirectExecutionMaxTableRows = "direct_execution_max_table_rows"
+
+	// MetadataDirectExecutionMaxTableBytes bounds direct execution by the
+	// target table's on-disk footprint, data plus indexes, in bytes. Optional;
+	// when present it must be a positive integer, and the row bound must be
+	// absent. A statement runs directly when the table is within the bound
+	// the policy sets; a table whose size cannot be determined stays blocked.
+	MetadataDirectExecutionMaxTableBytes = "direct_execution_max_table_bytes"
 
 	// MetadataDirectExecutionLockAcquisitionTimeoutSeconds bounds, in whole
 	// seconds, how long each direct statement waits to acquire its locks
@@ -479,6 +881,65 @@ const (
 	// default when the key is absent.
 	MetadataDirectExecutionLockAcquisitionTimeoutSeconds = "direct_execution_lock_acquisition_timeout_seconds"
 )
+
+// DirectExecutionSettings is a direct execution policy in the shape the
+// metadata keys above carry it. Zero-valued optional bounds state nothing.
+type DirectExecutionSettings struct {
+	Enabled                       bool
+	MaxTableRows                  int64
+	MaxTableBytes                 int64
+	LockAcquisitionTimeoutSeconds int64
+}
+
+// DirectExecutionMetadata renders a direct execution policy into the metadata
+// keys above. It is the one place the policy becomes metadata, so the server
+// config that states it, the wire that forwards it to the target that runs
+// the statement, and an apply's durable record of the policy it was admitted
+// under all spell the keys identically — a plan's verdict and the apply that
+// acts on it cannot disagree because one surface omitted a key.
+//
+// A disabled policy renders the enabled key as false rather than rendering
+// nothing. Both leave a refused statement blocked on the engine that reads
+// them, but only the explicit key distinguishes an opt-out from a caller that
+// stated no policy at all — and a surface that cannot tell those apart
+// overlays its own grant onto the opt-out. A lock timeout of zero renders
+// nothing, leaving the engine's own default in effect.
+//
+// Both size bounds are optional, and each renders whenever it is non-zero,
+// negative included: a surface that could not read a stored bound records it
+// as negative, and the engine must see that value to refuse it, where omitting
+// it would quietly change the policy the apply was admitted under. An enabled
+// policy with neither bound, or with both, renders as stated, and the engine
+// refuses it.
+func DirectExecutionMetadata(s DirectExecutionSettings) map[string]string {
+	if !s.Enabled {
+		return map[string]string{MetadataDirectExecution: "false"}
+	}
+	md := map[string]string{MetadataDirectExecution: "true"}
+	if s.MaxTableRows != 0 {
+		md[MetadataDirectExecutionMaxTableRows] = strconv.FormatInt(s.MaxTableRows, 10)
+	}
+	if s.MaxTableBytes != 0 {
+		md[MetadataDirectExecutionMaxTableBytes] = strconv.FormatInt(s.MaxTableBytes, 10)
+	}
+	if s.LockAcquisitionTimeoutSeconds > 0 {
+		md[MetadataDirectExecutionLockAcquisitionTimeoutSeconds] = strconv.FormatInt(s.LockAcquisitionTimeoutSeconds, 10)
+	}
+	return md
+}
+
+// DirectExecutionKeys are the metadata keys carrying the policy. They move as
+// one: a surface that states any of them states the whole policy, so a
+// default from elsewhere is never merged in to supply the bound a grant left
+// out.
+func DirectExecutionKeys() []string {
+	return []string{
+		MetadataDirectExecution,
+		MetadataDirectExecutionMaxTableRows,
+		MetadataDirectExecutionMaxTableBytes,
+		MetadataDirectExecutionLockAcquisitionTimeoutSeconds,
+	}
+}
 
 // ApplyRequest contains the input for starting a schema change.
 // On first apply, set the resume context to group related DDL.
@@ -493,7 +954,13 @@ type ApplyRequest struct {
 	ResumeState  *ResumeState       // Fresh context or full resume state after restart
 	Credentials  *Credentials       // Resolved credentials (from discovery)
 
-	// Logger is an optional schema-change-scoped logger, already bound with
+	// IgnoreTables lists the live tables the plan was reviewed under the
+	// ignore_tables config withholding (see PlanRequest.IgnoreTables). An engine
+	// that compares a target's live schema against SchemaFiles during apply
+	// leaves these tables out of the comparison, as the plan did.
+	IgnoreTables []string
+
+	// Logger is an optional logger scoped to this schema change, already bound with
 	// the caller's triage identity (apply id, repo, PR, environment). Engines
 	// use it for every log line about this schema change so engine lines stay
 	// filterable by the same identity as the drive logs. Nil falls back to
@@ -505,7 +972,9 @@ type ApplyRequest struct {
 	// This enables crash recovery: if the driver dies mid-Apply, the tern layer can
 	// resume from the last persisted state instead of starting over.
 	// Nil means no persistence (state is only returned at the end of Apply).
-	OnStateChange func(state *ResumeState)
+	// The returned error reports whether the state was durably saved, so an
+	// engine never relies on a record that did not land.
+	OnStateChange func(state *ResumeState) error
 
 	// OnEvent is called by the engine to emit structured lifecycle events during Apply.
 	// These events are recorded in apply_logs so operators can see intermediate progress
@@ -575,10 +1044,23 @@ type ProgressResult struct {
 	// False for engines without checkpoint resume.
 	ResumedFromCheckpoint bool
 
+	// TargetHeld reports that a failed result is the engine being refused the
+	// target because another run holds it (ErrTargetHeld), not the schema
+	// change failing. The drive waits for the holder instead of recording a
+	// failure.
+	TargetHeld bool
+
 	// Metadata carries engine-specific display fields for the progress response
 	// (e.g. PlanetScale branch_name, deploy_request_url, is_instant). It lets the
 	// engine surface structured status to the renderer without core decoding the
 	// opaque ResumeState.Metadata or reading an engine-specific side table.
+	//
+	// The driver persists Metadata on the apply operation whenever it differs
+	// from the last persisted value, so it is also the durable read model the
+	// API serves once the engine is no longer polled. Engines must keep it
+	// stable between polls while the underlying position is unchanged: a
+	// value that moves on every poll (wall-clock elapsed time, a timestamp)
+	// defeats the change detection and turns every poll into a storage write.
 	Metadata map[string]string
 
 	// PerShardProgressUnavailable is set by sharded engines when a progress poll
@@ -597,7 +1079,7 @@ const (
 	// DSN, so SHOW VITESS_MIGRATIONS cannot be queried. This persists for the
 	// whole apply — a target-resolution gap (missing vtgate endpoint).
 	PerShardUnavailableNoVtgateDSN = "no_vtgate_dsn"
-	// PerShardUnavailableNoChangeContext means no schema-change context
+	// PerShardUnavailableNoChangeContext means no schema change context
 	// identifier is known for the deploy yet, so per-shard rows cannot be
 	// correlated to this apply. Transient during setup/recovery.
 	PerShardUnavailableNoChangeContext = "no_change_context"
@@ -631,10 +1113,15 @@ type TableProgress struct {
 	ThrottleReason string
 	Shards         []ShardProgress // Per-shard breakdown (for Vitess)
 	IsInstant      bool            // True if using instant DDL
-	ProgressDetail string          // Human-readable progress (e.g., Spirit: "12.5% copyRows ETA 1h 30m")
-	DDL            string          // The DDL statement being applied
-	StartedAt      *time.Time      // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
-	CompletedAt    *time.Time      // When execution completed (from engine)
+	// ProgressDetail is a free-text note an engine may attach to a table, such
+	// as a summary line from before per-table progress exists or a marker that
+	// a statement ran as native DDL outside the runner. It stops at the engine
+	// boundary: nothing parses it, the drive writes task rows that carry no
+	// detail column, and so it reaches no operator surface.
+	ProgressDetail string
+	DDL            string     // The DDL statement being applied
+	StartedAt      *time.Time // When execution actually began (from engine, e.g., SHOW VITESS_MIGRATIONS started_timestamp)
+	CompletedAt    *time.Time // When execution completed (from engine)
 }
 
 // ShardProgress tracks progress for a single shard.

@@ -37,7 +37,7 @@ func seedOperationScopedApply(t *testing.T, repo, database string) *operationSco
 	t.Helper()
 	ctx := t.Context()
 
-	schemabotDB, err := sql.Open("mysql", e2eSchemabotDSN)
+	schemabotDB, err := sql.Open("block-mysql", e2eSchemabotDSN)
 	require.NoError(t, err)
 	t.Cleanup(func() { utils.CloseAndLog(schemabotDB) })
 	require.NoError(t, schemabotDB.PingContext(ctx))
@@ -317,7 +317,7 @@ func TestLeaseHeldApplyKeepsLeaseAuthoritative(t *testing.T) {
 	requireNoGitHubCalls(t, capture)
 	assert.True(t, stale.Superseded(), "a rotated-away lease must latch supersession")
 	var supersededWarns int
-	for _, entry := range staleLogger.warnings {
+	for _, entry := range staleLogger.warns {
 		if entry.msg == "observer: apply lease superseded by a newer owner; this observer stops publishing GitHub side effects" {
 			supersededWarns++
 		}

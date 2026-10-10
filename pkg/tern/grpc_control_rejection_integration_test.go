@@ -83,7 +83,7 @@ func dispatchQueuedApplyWithOptions(t *testing.T, stor storage.Storage, client *
 // test whose stub engine stands in for a real one sets the column directly.
 func setApplyEngine(t *testing.T, dsn string, applyID int64, engine string) {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database to set the apply engine")
 	defer utils.CloseAndLog(db)
 	_, err = db.ExecContext(t.Context(), "UPDATE applies SET engine = ? WHERE id = ?", engine, applyID)
@@ -374,7 +374,7 @@ func failLocallyQueuedControlRequest(t *testing.T, dsn string, stor storage.Stor
 	})
 	require.NoError(t, err, "queue the %s control request", operation)
 
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err, "open database to settle the control request")
 	defer utils.CloseAndLog(db)
 	_, err = db.ExecContext(t.Context(), `

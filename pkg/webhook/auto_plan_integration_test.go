@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	mysql "github.com/go-sql-driver/mysql"
+	mysql "github.com/block/mysql"
 	gh "github.com/google/go-github/v86/github"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,7 +80,10 @@ func TestE2EAutoPlan(t *testing.T) {
 		assert.Contains(t, body, "**Tenant**: `alpha`")
 		assert.Contains(t, body, "CREATE TABLE")
 		assert.Contains(t, body, dbName)
+		// One config is discovered, so the apply this comment offers resolves
+		// without being told which database it means.
 		assert.Contains(t, body, "schemabot apply -e staging --tenant alpha")
+		assert.NotContains(t, body, " -d ")
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for auto-plan comment")
 	}
@@ -229,7 +232,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeRefreshesStalePlan(t *testin
 		t.Fatal("timed out waiting for replacement auto-plan comment")
 	}
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		comments, err := svc.Storage().PlanComments().ListUnminimizedForSlot(
+		comments, err := svc.Storage().PlanComments().ListUnretiredForSlot(
 			t.Context(), "octocat/hello-world", 1, dbName, "mysql")
 		if !assert.NoError(collect, err) || !assert.NotEmpty(collect, comments) {
 			return
@@ -288,7 +291,7 @@ func TestE2EAutoPlanSynchronizeApplicationOnlyChangeWithoutTrackedPlanPostsComme
 		t.Fatal("timed out waiting for auto-plan comment")
 	}
 	require.EventuallyWithT(t, func(collect *assert.CollectT) {
-		comments, err := svc.Storage().PlanComments().ListUnminimizedForSlot(
+		comments, err := svc.Storage().PlanComments().ListUnretiredForSlot(
 			t.Context(), "octocat/hello-world", 1, dbName, "mysql")
 		if !assert.NoError(collect, err) || !assert.NotEmpty(collect, comments) {
 			return
@@ -342,15 +345,94 @@ func TestE2EAutoPlanNoticesUnmanagedConfigOnNonAggregateRepo(t *testing.T) {
 		assert.Contains(t, body, "Schema Changes Not Managed by SchemaBot")
 		assert.Contains(t, body, "`schema`")
 		assert.Contains(t, body, fmt.Sprintf("declares database `%s`", dbName))
-		assert.Contains(t, body, "will **not** be planned or applied")
+		assert.Contains(t, body, "will **not** be planned or applied in any environment")
 	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for unmanaged schema config notice")
+	}
+
+	// The passing aggregate names the unmanaged schema rather than claiming
+	// the PR changed no schema files.
+	select {
+	case run := <-result.checkRuns:
+		assert.Equal(t, "completed", run.Status)
+		assert.Equal(t, "success", run.Conclusion)
+		require.NotNil(t, run.Output)
+		assert.Equal(t, "No schema changes managed by SchemaBot", run.Output.Title)
+		assert.Contains(t, run.Output.Summary, "This PR changes schema only under paths SchemaBot does not manage in any environment")
+		assert.Contains(t, run.Output.Summary, fmt.Sprintf("- `schema` declares database `%s`", dbName))
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the passing aggregate check")
 	}
 
 	plans, err := svc.Storage().Plans().GetByPR(t.Context(), "octocat/hello-world", 1)
 	require.NoError(t, err)
 	for _, plan := range plans {
 		assert.NotEqual(t, dbName, plan.Database, "unmanaged config must not produce a plan")
+	}
+}
+
+// TestE2EAutoPlanNamesUnmanagedSchemaOnEnvironmentScopedPlanComment verifies a
+// PR that changes one directory a staging-scoped deployment manages and one it
+// does not. The deployment posts no separate notice, since a deployment serving
+// another environment may manage the second directory, so its plan comment is
+// where the PR shows what was left out: the comment plans the managed database
+// and names the other directory and its database beneath the plan.
+func TestE2EAutoPlanNamesUnmanagedSchemaOnEnvironmentScopedPlanComment(t *testing.T) {
+	dbName := "webhook_autoplan_mixed_scoped"
+	svc := setupE2EService(t, dbName)
+	svc.Config().AllowedEnvironments = []string{"staging"}
+	dbConfig := svc.Config().Databases[dbName]
+	dbConfig.AllowedRepos = []string{"octocat/hello-world"}
+	dbConfig.AllowedDirs = []string{"schema/" + dbName}
+	svc.Config().Databases[dbName] = dbConfig
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	configs := map[string]string{
+		"schema/" + dbName + "/schemabot.yaml": fmt.Sprintf("database: %s\ntype: mysql\n", dbName),
+		"schema/ledger_sandbox/schemabot.yaml": "database: ledger_sandbox\ntype: mysql\n",
+	}
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":        "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"ledger_sandbox/entries.sql": "CREATE TABLE `entries` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlanWithConfigs(t, mux, schemaFiles, configs, dbName, nil)
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		require.Contains(t, body, "Schema Change Plan", "the first comment is the plan, not a separate notice")
+		assert.Contains(t, body, "`users`")
+		assert.NotContains(t, body, "`entries`", "the unmanaged directory is not planned")
+		assert.NotContains(t, body, "Schema Changes Not Managed by SchemaBot")
+		assert.Contains(t, body, "This PR also changes schema under paths SchemaBot does not manage in `staging`, so this plan does not cover them:")
+		assert.Contains(t, body, "- `schema/ledger_sandbox` declares database `ledger_sandbox`")
+		assert.Less(t, strings.Index(body, "`users`"), strings.Index(body, "does not manage in `staging`"), "the note follows the plan")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the auto-plan comment")
+	}
+
+	select {
+	case body := <-result.comments:
+		t.Fatalf("expected the plan comment alone, got another comment: %s", body)
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 
@@ -528,6 +610,7 @@ func TestE2EAutoPlanEmptySchemaRootNamesDatabase(t *testing.T) {
 	case body := <-result.comments:
 		assert.Contains(t, body, "failed to plan")
 		assert.Contains(t, body, "no schema files found")
+		assert.Contains(t, body, "removes the last schema files under it")
 		assert.Contains(t, body, "**Database**: `"+dbName+"`")
 		assert.Contains(t, body, "**Type**: `MySQL`")
 	case <-time.After(webhookIntegrationPollDeadline):
@@ -980,24 +1063,31 @@ func TestE2EAutoPlanWithLintViolations(t *testing.T) {
 	}
 }
 
-// TestE2EAutoPlanNoChangesSkipsComment exercises the up-to-date-PR UX through
-// the full webhook path: a synchronize delivery whose auto-plan resolves to no
-// changes posts no plan comment (the check run alone reports the green state),
-// and the outcome supersedes the slot's plan comments from prior heads — their
-// pending DDL and apply prompt no longer match the branch, so they collapse
-// even though no new comment replaces them.
-func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
-	dbName := "webhook_autoplan_nochange"
-	svc := setupE2EService(t, dbName)
+// autoPlanCommentFixture is a PR whose schema files create one table. When
+// upToDate is set the table already exists on the live database, so every
+// auto-plan on the PR resolves to no changes; otherwise it plans the CREATE
+// TABLE. deleted receives the ID of each plan comment the handler deletes from
+// the timeline.
+type autoPlanCommentFixture struct {
+	svc      *api.Service
+	mux      *http.ServeMux
+	result   *planFlowResult
+	h        *Handler
+	deleted  chan string
+	upToDate bool
+}
 
-	// Pre-create the table so there are no changes
-	ctx := t.Context()
-	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
-	db, err := sql.Open("mysql", appDSN)
-	require.NoError(t, err)
-	_, err = db.ExecContext(ctx, "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci")
-	require.NoError(t, err)
-	_ = db.Close()
+func setupNoChangesAutoPlan(t *testing.T, dbName string) *autoPlanCommentFixture {
+	t.Helper()
+	return setupAutoPlanCommentFixture(t, dbName, true)
+}
+
+func setupAutoPlanCommentFixture(t *testing.T, dbName string, upToDate bool) *autoPlanCommentFixture {
+	t.Helper()
+	svc := setupE2EService(t, dbName)
+	if upToDate {
+		preCreateUsersTable(t, dbName)
+	}
 
 	mux := http.NewServeMux()
 	server := httptest.NewServer(mux)
@@ -1008,77 +1098,233 @@ func TestE2EAutoPlanNoChangesSkipsComment(t *testing.T) {
 
 	schemabotConfig := fmt.Sprintf("database: %s\ntype: mysql\n", dbName)
 	schemaFiles := map[string]string{
-		"users.sql": "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		"users.sql": usersTableDDL + ";",
 	}
-
 	result := setupFakeGitHubForPlan(t, mux, schemaFiles, schemabotConfig, dbName)
 
-	// A plan comment from a prior head is still expanded on the PR; the
-	// no-changes outcome must collapse it.
-	insertPlanCommentRow(t, svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "priorsha", 9001, "IC_stale_prior")
-
-	minimized := make(chan string, 4)
-	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
-		var gql struct {
-			Variables map[string]string `json:"variables"`
-		}
-		assert.NoError(t, json.NewDecoder(r.Body).Decode(&gql))
-		minimized <- gql.Variables["id"]
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"data": map[string]any{
-				"minimizeComment": map[string]any{
-					"minimizedComment": map[string]any{"isMinimized": true},
-				},
-			},
-		})
+	deleted := make(chan string, 4)
+	mux.HandleFunc("DELETE /repos/octocat/hello-world/issues/comments/{id}", func(w http.ResponseWriter, r *http.Request) {
+		deleted <- r.PathValue("id")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("an unactioned plan comment must be deleted, not minimized")
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 	installClient := ghclient.NewInstallationClient(client, logger)
-	factory := &fakeClientFactory{client: installClient}
+	h := NewHandler(svc, &fakeClientFactory{client: installClient}, nil, logger)
 
-	h := NewHandler(svc, factory, nil, logger)
+	return &autoPlanCommentFixture{svc: svc, mux: mux, result: result, h: h, deleted: deleted, upToDate: upToDate}
+}
 
+// usersTableDDL is the table the fixture's schema files declare.
+const usersTableDDL = "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+
+// preCreateUsersTable creates the fixture's table on the live database so the
+// PR's schema files already match it.
+func preCreateUsersTable(t *testing.T, dbName string) {
+	t.Helper()
+	appDSN := strings.Replace(e2eTargetDSN, "/target_test", "/"+dbName, 1) + "&multiStatements=true"
+	db, err := sql.Open("block-mysql", appDSN)
+	require.NoError(t, err)
+	defer utils.CloseAndLog(db)
+	_, err = db.ExecContext(t.Context(), usersTableDDL)
+	require.NoError(t, err)
+}
+
+// synchronize delivers a synchronize webhook moving the PR from beforeSHA to
+// headSHA and waits for the auto-plan's check run: passing when the PR is up
+// to date, action required when it still has changes.
+func (f *autoPlanCommentFixture) synchronize(t *testing.T, beforeSHA, headSHA string) {
+	t.Helper()
 	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
-		action:  "synchronize",
-		headSHA: "abc123",
-		headRef: "feature-branch",
+		action:    "synchronize",
+		beforeSHA: beforeSHA,
+		headSHA:   headSHA,
+		headRef:   "feature-branch",
 	}, nil)
-
 	rr := httptest.NewRecorder()
-	h.ServeHTTP(rr, req)
-
+	f.h.ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code)
 	assert.Contains(t, rr.Body.String(), "auto-plan started")
 
-	// Check run should still be created (for PR status)
 	select {
-	case cr := <-result.checkRuns:
+	case cr := <-f.result.checkRuns:
 		assert.Equal(t, "completed", cr.Status)
-		assert.Equal(t, "success", cr.Conclusion)
-	case <-time.After(30 * time.Second):
+		if f.upToDate {
+			assert.Equal(t, "success", cr.Conclusion)
+		} else {
+			assert.Equal(t, "action_required", cr.Conclusion)
+		}
+	case <-time.After(webhookIntegrationPollDeadline):
 		t.Fatal("timed out waiting for check run")
 	}
+}
 
-	// The prior head's plan comment collapses even though no new comment is
-	// posted: the no-changes outcome supersedes it.
+// requireNoCommentActivity fails if the handler posts or deletes a comment
+// within a short settling window.
+func (f *autoPlanCommentFixture) requireNoCommentActivity(t *testing.T) {
+	t.Helper()
 	select {
-	case node := <-minimized:
-		assert.Equal(t, "IC_stale_prior", node)
-	case <-time.After(30 * time.Second):
-		t.Fatal("timed out waiting for the prior head's plan comment to be minimized")
-	}
-	require.Eventually(t, func() bool {
-		return len(unminimizedHeads(t, svc.Storage(), "octocat/hello-world", 1, dbName, "mysql")) == 0
-	}, 10*time.Second, 100*time.Millisecond, "the minimized plan comment must be recorded in storage")
-
-	// No comment should be posted — give it a moment to confirm nothing arrives
-	select {
-	case body := <-result.comments:
+	case body := <-f.result.comments:
 		t.Fatalf("expected no comment for auto-plan with no changes, but got: %s", body)
+	case id := <-f.deleted:
+		t.Fatalf("expected no plan comment to be deleted, but comment %s was", id)
 	case <-time.After(3 * time.Second):
-		// expected: no comment posted
 	}
+}
+
+// A user ran `schemabot plan` and got an answer, then a push that touches the
+// schema files lands and its auto-plan resolves to no changes. The PR already
+// showed a plan, so it must keep showing a current one: the auto-plan posts its
+// no-changes plan comment, which supersedes the prior head's comment through
+// the normal tracked-post path. No apply acted on the prior head, so its
+// comment is deleted rather than minimized — but only after its replacement is
+// on the PR.
+func TestE2EAutoPlanNoChangesSupersedesPriorHeadPlan(t *testing.T) {
+	dbName := "webhook_autoplan_nochange"
+	f := setupNoChangesAutoPlan(t, dbName)
+	registerCompareFiles(t, f.mux, "priorsha", "abc123", []*gh.CommitFile{{
+		Filename: new("schema/" + dbName + "/users.sql"),
+		Status:   new("modified"),
+	}})
+	insertPlanCommentRow(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "priorsha", 9001, "IC_stale_prior")
+
+	f.synchronize(t, "priorsha", "abc123")
+
+	select {
+	case body := <-f.result.comments:
+		firstLine, _, _ := strings.Cut(body, "\n")
+		assert.Equal(t, "## Schema Change Plan — Staging", firstLine)
+		assert.Contains(t, body, "No schema changes detected")
+		assert.Contains(t, body, dbName)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the no-changes plan comment")
+	}
+	select {
+	case id := <-f.deleted:
+		assert.Equal(t, "9001", id)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the prior head's plan comment to be deleted")
+	}
+	requireOnlyVisiblePlanComment(t, f, dbName, "abc123", true)
+}
+
+// requireOnlyVisiblePlanComment waits until the slot's only visible plan
+// comment is the one posted at headSHA, recorded with the given outcome.
+func requireOnlyVisiblePlanComment(t *testing.T, f *autoPlanCommentFixture, dbName, headSHA string, upToDate bool) {
+	t.Helper()
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		comments, err := f.svc.Storage().PlanComments().ListUnretiredForSlot(
+			t.Context(), "octocat/hello-world", 1, dbName, "mysql")
+		if !assert.NoError(collect, err) || !assert.Len(collect, comments, 1) {
+			return
+		}
+		assert.Equal(collect, headSHA, comments[0].HeadSHA)
+		assert.Equal(collect, upToDate, comments[0].UpToDate)
+	}, webhookIntegrationPollDeadline, 100*time.Millisecond)
+}
+
+// A PR whose auto-plan resolves to no changes and that has never shown a plan
+// comment stays quiet: the passing check run alone reports the green state.
+func TestE2EAutoPlanNoChangesWithoutPriorPlanSkipsComment(t *testing.T) {
+	dbName := "webhook_autoplan_nochange_quiet"
+	f := setupNoChangesAutoPlan(t, dbName)
+
+	f.synchronize(t, "", "abc123")
+
+	f.requireNoCommentActivity(t)
+	assert.Empty(t, unretiredHeads(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "mysql"))
+}
+
+// schemaNeutralSync lays out a push from oldsha to newsha that touches no
+// schema input, as a merge of the default branch does.
+func schemaNeutralSync(t *testing.T, f *autoPlanCommentFixture) {
+	t.Helper()
+	f.result.HeadSHAs = []string{"newsha"}
+	registerCompareFiles(t, f.mux, "oldsha", "newsha", []*gh.CommitFile{{
+		Filename: new("app/service.go"),
+		Status:   new("modified"),
+	}})
+}
+
+// A user ran `schemabot plan` and got a no-changes answer, then pushed a
+// schema-neutral commit (a merge of the default branch) whose auto-plan also
+// resolves to no changes. The visible plan comment covers the current schema
+// inputs and still matches the plan, so it stays on the PR as the answer
+// instead of being deleted, and no new comment is posted for the push.
+func TestE2EAutoPlanNoChangesSchemaNeutralSyncKeepsVisiblePlan(t *testing.T) {
+	dbName := "webhook_autoplan_nochange_neutral"
+	f := setupNoChangesAutoPlan(t, dbName)
+	schemaNeutralSync(t, f)
+	insertPlanCommentRowWithOutcome(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "oldsha", 9001, "IC_command_reply", true)
+
+	f.synchronize(t, "oldsha", "newsha")
+
+	f.requireNoCommentActivity(t)
+	assert.Equal(t, []string{"oldsha"}, unretiredHeads(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "mysql"),
+		"the visible plan comment stays on the PR")
+}
+
+// The visible plan comment shows DDL, and the change is applied outside the PR
+// before a schema-neutral push. The schema inputs did not change, but the plan
+// did: the auto-plan resolves to no changes, so the comment still offering the
+// DDL and its apply prompt no longer matches. The auto-plan posts its
+// no-changes comment, which supersedes the outdated one.
+func TestE2EAutoPlanNoChangesSchemaNeutralSyncReplacesOutdatedPlan(t *testing.T) {
+	dbName := "webhook_autoplan_nochange_neutral_outdated"
+	f := setupNoChangesAutoPlan(t, dbName)
+	schemaNeutralSync(t, f)
+	insertPlanCommentRowWithOutcome(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "oldsha", 9001, "IC_shows_ddl", false)
+
+	f.synchronize(t, "oldsha", "newsha")
+
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "No schema changes detected")
+		assert.NotContains(t, body, "CREATE TABLE")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the no-changes plan comment")
+	}
+	select {
+	case id := <-f.deleted:
+		assert.Equal(t, "9001", id)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the outdated plan comment to be deleted")
+	}
+	requireOnlyVisiblePlanComment(t, f, dbName, "newsha", true)
+}
+
+// The visible plan comment says the schema is up to date, and the live table
+// is dropped outside the PR before a schema-neutral push. The auto-plan now
+// plans the CREATE TABLE, so the comment saying there is nothing to do no
+// longer matches. The auto-plan posts the plan with the DDL, which supersedes
+// the outdated comment.
+func TestE2EAutoPlanSchemaNeutralSyncReplacesOutdatedUpToDatePlan(t *testing.T) {
+	dbName := "webhook_autoplan_neutral_outdated_up_to_date"
+	f := setupAutoPlanCommentFixture(t, dbName, false)
+	schemaNeutralSync(t, f)
+	insertPlanCommentRowWithOutcome(t, f.svc.Storage(), "octocat/hello-world", 1, dbName, "staging", "oldsha", 9001, "IC_shows_no_changes", true)
+
+	f.synchronize(t, "oldsha", "newsha")
+
+	select {
+	case body := <-f.result.comments:
+		assert.Contains(t, body, "CREATE TABLE")
+		assert.Contains(t, body, "users")
+		assert.NotContains(t, body, "No schema changes detected")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the replacement plan comment")
+	}
+	select {
+	case id := <-f.deleted:
+		assert.Equal(t, "9001", id)
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for the outdated plan comment to be deleted")
+	}
+	requireOnlyVisiblePlanComment(t, f, dbName, "newsha", false)
 }
 
 func TestE2EAutoPlanNoSchemaFiles(t *testing.T) {
@@ -1582,7 +1828,7 @@ func TestE2EAutoPlanWithOnlySchemaBotConfigChangeClearsRollbackCheck(t *testing.
 	cfg, err := mysql.ParseDSN(e2eTargetDSN)
 	require.NoError(t, err)
 	cfg.DBName = dbName
-	db, err := sql.Open("mysql", cfg.FormatDSN())
+	db, err := sql.Open("block-mysql", cfg.FormatDSN())
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(ctx))
@@ -2060,5 +2306,66 @@ func TestE2EAutoPlanFailsClosedWhenTheBaseBranchCannotBeRead(t *testing.T) {
 	case body := <-result.comments:
 		t.Fatalf("expected no plan comment when the base branch could not be read, got: %s", body)
 	case <-time.After(3 * time.Second):
+	}
+}
+
+// A pull request touches two databases, but only one of its files is a change
+// the pull request proposes — the other is one its branch carries unchanged
+// from the default branch. Auto-plan narrows to what the pull request proposes
+// and plans that one database, while the command an operator would paste is
+// resolved over the pull request's raw changed-file list, across every
+// deployment, and reaches both. So the comment names the database it planned:
+// bare, the command it offers would resolve somewhere the comment never
+// mentioned, or come back rejected as ambiguous.
+func TestE2EAutoPlanScopesItsCommandWhenABareOneReachesMore(t *testing.T) {
+	dbName := "webhook_autoplan_scope"
+	peerDB := "webhook_autoplan_scope_peer"
+	svc := setupE2EService(t, dbName)
+
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	client := gh.NewClient(nil)
+	client.BaseURL, _ = url.Parse(server.URL + "/")
+
+	// Two schema directories, each managed by its own config, so the raw
+	// changed-file list resolves two databases.
+	configs := map[string]string{
+		"schema/" + dbName + "/schemabot.yaml": fmt.Sprintf("database: %s\ntype: mysql\n", dbName),
+		"schema/" + peerDB + "/schemabot.yaml": fmt.Sprintf("database: %s\ntype: mysql\n", peerDB),
+	}
+	schemaFiles := map[string]string{
+		dbName + "/users.sql":    "CREATE TABLE `users` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  `name` varchar(255) NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+		peerDB + "/invoices.sql": "CREATE TABLE `invoices` (\n  `id` bigint unsigned NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;",
+	}
+
+	result := setupFakeGitHubForPlanWithConfigs(t, mux, schemaFiles, configs, dbName, nil)
+	// The peer database's file is one the default branch already holds, so
+	// auto-plan drops it and plans this database alone. A pasted command still
+	// sees it.
+	result.baseHolds("schema/" + peerDB + "/invoices.sql")
+
+	h := newE2EHandler(t, svc, client)
+
+	req := buildPRWebhookRequest(t, prWebhookPayloadOpts{
+		action:  "opened",
+		headSHA: "abc123",
+		headRef: "feature-branch",
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	select {
+	case body := <-result.comments:
+		require.Contains(t, body, "Schema Change Plan")
+		require.Contains(t, body, "`users`", "the comment plans this database alone")
+		require.NotContains(t, body, "`invoices`", "the inherited file is not this PR's change")
+		assert.Contains(t, body, "schemabot apply -e staging -d "+dbName,
+			"a bare command would reach the peer database too, so the comment names its own")
+	case <-time.After(webhookIntegrationPollDeadline):
+		t.Fatal("timed out waiting for auto-plan comment")
 	}
 }

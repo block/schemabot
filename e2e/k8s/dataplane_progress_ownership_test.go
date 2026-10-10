@@ -234,7 +234,7 @@ func waitForPodRowCopyInFlight(t *testing.T, client ternv1.TernClient, applyID, 
 // indexExists reports whether the named index is present on the table.
 func indexExists(t *testing.T, dsn, tableName, indexName string) bool {
 	t.Helper()
-	db, err := sql.Open("mysql", dsn)
+	db, err := sql.Open("block-mysql", dsn)
 	require.NoError(t, err)
 	defer utils.CloseAndLog(db)
 	require.NoError(t, db.PingContext(t.Context()))

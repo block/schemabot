@@ -68,6 +68,14 @@ func SetupTelemetry(logger *slog.Logger) (*Telemetry, error) {
 	meterOpts := []sdkmetric.Option{
 		sdkmetric.WithResource(res),
 		sdkmetric.WithReader(promExporter),
+		// Collect every attribute set rather than capping datapoints per
+		// instrument. Instruments here are keyed by repository, database, and
+		// deployment, and the SDK retires overflow by folding it into a single
+		// otel.metric.overflow series — so a gauge an operator reads during an
+		// incident, such as remaining GitHub rate limit, would report one
+		// arbitrary target's value instead of the one they asked about.
+		// Cardinality is bounded by the targets this server is configured for.
+		sdkmetric.WithCardinalityLimit(0),
 	}
 
 	var tp *sdktrace.TracerProvider

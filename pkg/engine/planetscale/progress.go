@@ -66,10 +66,24 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	}
 
 	engineState := deployStateToEngineState(dr.DeploymentState)
+	message := deployStateToMessage(dr.DeploymentState)
 
 	// Deferred deploy: the deploy request is ready but hasn't been triggered yet.
 	if meta.DeferredDeploy && dr.DeploymentState == deployState.Ready {
 		engineState = engine.StateWaitingForDeploy
+	}
+
+	// A deploy request closed before it was deployed keeps the deployment state
+	// it had (pending or ready), so read from that alone it would still look
+	// like a deploy waiting to start. Nothing can start it any more: a cancel
+	// or stop retires an undeployed deploy request by closing it, and so does
+	// an operator closing it in the PlanetScale UI. It is the cancelled outcome,
+	// and reporting it as such is what lets the apply settle — the
+	// waiting-for-deploy timeout stops the deploy request and then relies on
+	// this poll to read the result, as the cutover timeout does.
+	if deployRequestClosedUndeployed(dr) {
+		engineState = engine.StateCancelled
+		message = fmt.Sprintf("Deploy request #%d closed before it was deployed", dr.Number)
 	}
 
 	// Recover the instant DDL flag for an apply whose metadata was persisted
@@ -115,7 +129,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	}
 
-	// Late schema-change-context recovery. A progress poll can run in a process
+	// Late recovery of the schema change context. A progress poll can run in a process
 	// that never captured the pre-deploy baseline — a different replica, or an
 	// apply whose deploy was created before Vitess exposed its context — so the
 	// stored context is empty even though the deploy is live and producing
@@ -149,7 +163,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 
 	result := &engine.ProgressResult{
 		State:       engineState,
-		Message:     deployStateToMessage(dr.DeploymentState),
+		Message:     message,
 		ResumeState: req.ResumeState,
 		Metadata:    psDisplayMetadata(meta),
 	}
@@ -160,12 +174,32 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 	hasVtgateDSN := req.Credentials.DSN != ""
 	hasMigrationContext := req.ResumeState != nil && req.ResumeState.MigrationContext != ""
 	if hasVtgateDSN && hasMigrationContext {
-		tables, overallProgress := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
+		tables, overallProgress, failed, shardFailed := e.queryVitessMigrations(ctx, client, req.Database, req.Credentials, req.ResumeState.MigrationContext)
 		e.logger.Debug("vitess migrations queried",
 			"database", req.Database,
 			"table_count", len(tables),
 			"overall_progress", overallProgress,
 		)
+		// The deploy request reports that the schema change failed but never why.
+		// The shard rows carry the reason, so attach it to the failure the drive
+		// is about to record; without it the pull request and the CLI show a
+		// state and nothing an operator can act on.
+		if reason := adoptedFailureReason(engineState, failed, shardFailed); reason != "" {
+			result.ErrorMessage = reason
+			// The target's own words are the triage detail and stay server-side.
+			// The rendered reason names this log, so it carries them at the
+			// severity of the failure rather than behind a debug level an
+			// operator would have to turn on after the fact.
+			e.logger.Warn("schema change failed on the target",
+				"database", req.Database,
+				"deploy_request", meta.DeployRequestID,
+				"keyspace", failed.Keyspace,
+				"shard", failed.Shard,
+				"table", failed.Table,
+				"reason", reason,
+				"target_message", clampTargetMessage(failed.Message),
+			)
+		}
 		if len(tables) > 0 {
 			result.Tables = tables
 			if overallProgress > 0 {
@@ -179,7 +213,7 @@ func (e *Engine) Progress(ctx context.Context, req *engine.ProgressRequest) (*en
 		}
 	} else {
 		// No per-shard/row-copy progress this poll. A missing vtgate DSN is a target
-		// resolution gap that persists for the whole apply; a missing schema-change
+		// resolution gap that persists for the whole apply; a missing schema change
 		// context is transient during setup/recovery. Either way the comment and CLI
 		// fall back to deploy-request state, and the drive surfaces the reason once
 		// per apply.
@@ -541,11 +575,18 @@ type vitessMigrationRow struct {
 	RequestedAt      *time.Time
 	StartedAt        *time.Time
 	CompletedAt      *time.Time
+	// Message is Vitess's own account of what happened to this shard. On a
+	// failed shard it carries the reason the schema change stopped, which is
+	// the only place that reason exists: the deploy request reports a state
+	// and no cause.
+	Message string
 }
 
 // queryVitessMigrations queries SHOW VITESS_MIGRATIONS across all keyspaces via vtgate
-// and aggregates per-shard results into per-table TableProgress entries.
-func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, migrationContext string) ([]engine.TableProgress, int) {
+// and aggregates per-shard results into per-table TableProgress entries. The
+// last two returns are the shard whose failure the apply should report and
+// whether there was one.
+func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSClient, database string, creds *engine.Credentials, migrationContext string) ([]engine.TableProgress, int, vitessMigrationRow, bool) {
 	branch := mainBranch(creds)
 	keyspaces, err := client.ListKeyspaces(ctx, &ps.ListKeyspacesRequest{
 		Organization: credOrg(creds),
@@ -554,7 +595,7 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 	})
 	if err != nil {
 		e.logger.Warn("queryVitessMigrations: failed to list keyspaces", "error", err)
-		return nil, 0
+		return nil, 0, vitessMigrationRow{}, false
 	}
 
 	var allRows []vitessMigrationRow
@@ -568,14 +609,44 @@ func (e *Engine) queryVitessMigrations(ctx context.Context, client psclient.PSCl
 	}
 
 	if len(allRows) == 0 {
-		return nil, 0
+		return nil, 0, vitessMigrationRow{}, false
 	}
 
-	return aggregateShardProgress(allRows)
+	tables, overallProgress := aggregateShardProgress(allRows)
+	failed, shardFailed := failedShard(allRows)
+	return tables, overallProgress, failed, shardFailed
+}
+
+// failedShard returns the shard whose failure the apply should report, or false
+// when no shard failed or Vitess recorded nothing about the one that did.
+// Shards that fail together almost always fail for the same reason, so the
+// first failure in a stable ordering is representative, and ordering by
+// keyspace, table and shard keeps successive polls reporting the same one
+// rather than alternating between them.
+func failedShard(rows []vitessMigrationRow) (vitessMigrationRow, bool) {
+	failed := make([]vitessMigrationRow, 0, len(rows))
+	for _, r := range rows {
+		if r.Status == state.Vitess.Failed && strings.TrimSpace(r.Message) != "" {
+			failed = append(failed, r)
+		}
+	}
+	if len(failed) == 0 {
+		return vitessMigrationRow{}, false
+	}
+	sort.Slice(failed, func(i, j int) bool {
+		if failed[i].Keyspace != failed[j].Keyspace {
+			return failed[i].Keyspace < failed[j].Keyspace
+		}
+		if failed[i].Table != failed[j].Table {
+			return failed[i].Table < failed[j].Table
+		}
+		return shardLess(failed[i].Shard, failed[j].Shard)
+	})
+	return failed[0], true
 }
 
 // showVitessMigrationsForKeyspace connects to vtgate and runs
-// SHOW VITESS_MIGRATIONS LIKE '<context>' for a single keyspace.
+// SHOW VITESS_MIGRATIONS FROM `<keyspace>` LIKE '<context>' for a single keyspace.
 // If migrationContext is empty, returns all migrations.
 func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keyspace, migrationContext string) ([]vitessMigrationRow, error) {
 	if migrationContext != "" {
@@ -589,23 +660,10 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		return nil, fmt.Errorf("get vtgate connection for keyspace %s: %w", keyspace, err)
 	}
 
-	conn, err := db.Conn(ctx)
+	query := showVitessMigrationsQuery(keyspace, migrationContext)
+	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("get connection: %w", err)
-	}
-	defer utils.CloseAndLog(conn)
-
-	if _, err := conn.ExecContext(ctx, "USE `"+keyspace+"`"); err != nil {
-		return nil, fmt.Errorf("use keyspace %s: %w", keyspace, err)
-	}
-
-	query := "SHOW VITESS_MIGRATIONS"
-	if migrationContext != "" {
-		query += " LIKE '" + migrationContext + "'"
-	}
-	rows, err := conn.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("show vitess_migrations: %w", err)
+		return nil, fmt.Errorf("show vitess_migrations for keyspace %s: %w", keyspace, err)
 	}
 	defer utils.CloseAndLog(rows)
 
@@ -642,6 +700,7 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 			ReadyToComplete:  colMap["ready_to_complete"] == "1",
 			DDLAction:        colMap["ddl_action"],
 			IsImmediate:      colMap["is_immediate_operation"] == "1",
+			Message:          colMap["message"],
 		}
 		if v, err := parseProgressPercent(colMap["progress"]); err != nil {
 			e.logger.Debug("parse vitess_migrations field", "field", "progress", "value", colMap["progress"], "error", err)
@@ -680,6 +739,20 @@ func (e *Engine) showVitessMigrationsForKeyspace(ctx context.Context, dsn, keysp
 		result = append(result, row)
 	}
 	return result, rows.Err()
+}
+
+// showVitessMigrationsQuery builds the SHOW VITESS_MIGRATIONS statement for one
+// keyspace. The keyspace is named in the statement rather than selected with
+// USE, so the query leaves no session state on the pooled vtgate connection:
+// the pool is shared with other readers, and a connection handed back still
+// switched to this keyspace would silently point the next reader at the wrong
+// keyspace. migrationContext must already have passed validateMigrationContext.
+func showVitessMigrationsQuery(keyspace, migrationContext string) string {
+	query := "SHOW VITESS_MIGRATIONS FROM `" + strings.ReplaceAll(keyspace, "`", "``") + "`"
+	if migrationContext != "" {
+		query += " LIKE '" + migrationContext + "'"
+	}
+	return query
 }
 
 // validateMigrationContext rejects migration context strings containing unsafe characters.

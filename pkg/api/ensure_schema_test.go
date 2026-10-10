@@ -1,15 +1,18 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"log/slog"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/schema"
 )
 
@@ -68,127 +71,631 @@ func TestEnsureSchemaDefaultsToMySQLDialect(t *testing.T) {
 	require.ErrorContains(t, err, "plan schema")
 }
 
-// partitionDestructiveChanges delegates its refusal vocabulary to Spirit's
-// UnsafeLinter, so these cases pin the accept/refuse boundary the
-// storage-schema bootstrap relies on: statements that destroy data are
-// refused, statements that lose nothing execute, an ALTER that mixes both is
-// split so only its destructive clauses are refused, and a statement Spirit
-// cannot classify fails the bootstrap rather than executing unclassified.
-func TestPartitionDestructiveChangesPinsUnsafeVocabulary(t *testing.T) {
+// partitionDestructiveChanges gates on the verdict the plan already carries,
+// so these cases pin what it does with that verdict rather than restating the
+// linter registry that produces it: an unsafe statement is refused whole and
+// carries the plan's own reason, a safe one executes, and the two are sorted
+// per statement so one refusal does not withhold another table's change.
+// Whether a given statement is unsafe is the engine's answer, exercised
+// end-to-end against a real plan in the integration tests.
+func TestPartitionDestructiveChangesHonorsThePlanVerdict(t *testing.T) {
 	t.Parallel()
 
-	single := func(ddlStmt string) []engine.SchemaChange {
-		// Operation mirrors what the Spirit engine sets on planned changes; a
-		// classification error leaves it Unknown, matching a change the
-		// engine could not classify.
-		stmtType, _, _ := ddl.ClassifyStatement(ddlStmt)
-		return []engine.SchemaChange{{TableChanges: []engine.TableChange{{Table: "applies", Operation: stmtType, DDL: ddlStmt}}}}
+	const mixedDDL = "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP INDEX `idx_state`"
+
+	unsafeChange := engine.TableChange{
+		Table:        "applies",
+		Operation:    ddl.StatementAlterTable,
+		DDL:          mixedDDL,
+		IsUnsafe:     true,
+		UnsafeReason: "Unsafe operation detected: \"DROP INDEX `idx_state`\"",
+	}
+	safeChange := engine.TableChange{
+		Table:     "plans",
+		Operation: ddl.StatementAlterTable,
+		DDL:       "ALTER TABLE `plans` ADD COLUMN `caller` VARCHAR(64)",
 	}
 
-	refusedCases := []struct {
-		name string
-		ddl  string
-	}{
-		{name: "DROP TABLE", ddl: "DROP TABLE `applies`"},
-		{name: "DROP COLUMN", ddl: "ALTER TABLE `applies` DROP COLUMN `caller`"},
-		{name: "DROP PRIMARY KEY", ddl: "ALTER TABLE `applies` DROP PRIMARY KEY"},
-		{name: "DROP PARTITION", ddl: "ALTER TABLE `applies` DROP PARTITION p2020"},
-		{name: "TRUNCATE PARTITION", ddl: "ALTER TABLE `applies` TRUNCATE PARTITION p2020"},
-	}
-	for _, tt := range refusedCases {
-		t.Run("refuses "+tt.name, func(t *testing.T) {
-			t.Parallel()
-			allowed, refused, err := partitionDestructiveChanges(single(tt.ddl))
-			require.NoError(t, err)
-			assert.Empty(t, allowed)
-			require.Len(t, refused, 1)
-			assert.Equal(t, tt.ddl, refused[0].change.DDL)
-			assert.NotEmpty(t, refused[0].reason)
-			scope, _, _ := refused[0].refusalTelemetry()
-			assert.Equal(t, metrics.StorageSchemaRefusalWhole, scope)
-		})
-	}
-
-	allowedCases := []struct {
-		name string
-		ddl  string
-	}{
-		{name: "ADD COLUMN", ddl: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)"},
-		{name: "DROP INDEX loses no data", ddl: "ALTER TABLE `applies` DROP INDEX `idx_state`"},
-		{name: "CREATE TABLE", ddl: "CREATE TABLE `audit` (`id` BIGINT UNSIGNED AUTO_INCREMENT, PRIMARY KEY (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"},
-	}
-	for _, tt := range allowedCases {
-		t.Run("allows "+tt.name, func(t *testing.T) {
-			t.Parallel()
-			allowed, refused, err := partitionDestructiveChanges(single(tt.ddl))
-			require.NoError(t, err)
-			assert.Empty(t, refused)
-			require.Len(t, allowed, 1)
-			require.Len(t, allowed[0].TableChanges, 1)
-			assert.Equal(t, tt.ddl, allowed[0].TableChanges[0].DDL)
-		})
-	}
-
-	t.Run("a mixed ALTER splits so only its destructive clauses are refused", func(t *testing.T) {
+	// The additive clause is what the starting binary needs to run at all, and
+	// it is not a consequence of the drop it was bundled with, so it executes
+	// while the drop waits for an operator.
+	t.Run("an unsafe statement runs the clauses that only add", func(t *testing.T) {
 		t.Parallel()
-		allowed, refused, err := partitionDestructiveChanges(single("ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP COLUMN `lease_owner`"))
-		require.NoError(t, err)
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{unsafeChange}}})
 		require.Len(t, allowed, 1)
 		require.Len(t, allowed[0].TableChanges, 1)
+		executed := allowed[0].TableChanges[0]
+		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)", executed.DDL,
+			"only the additive clause executes")
+		assert.False(t, executed.IsUnsafe, "the partition that executes carries no unsafe verdict")
+
+		require.Len(t, refused, 1)
+		assert.Equal(t, "ALTER TABLE `applies` DROP INDEX `idx_state`", refused[0].change.DDL,
+			"the refusal carries the clauses that did not run")
+		assert.True(t, refused[0].partial, "the statement was split, not refused whole")
+		assert.Equal(t, unsafeChange.UnsafeReason, refused[0].reason, "the reason is the plan's, not this package's")
+	})
+
+	// A statement with nothing to keep is all or nothing: there is no partition
+	// to report as having run.
+	t.Run("a statement whose every clause is withheld is refused whole", func(t *testing.T) {
+		t.Parallel()
+		dropOnly := engine.TableChange{
+			Table:        "applies",
+			Operation:    ddl.StatementAlterTable,
+			DDL:          "ALTER TABLE `applies` DROP INDEX `idx_state`",
+			IsUnsafe:     true,
+			UnsafeReason: "Unsafe operation detected: \"DROP INDEX `idx_state`\"",
+		}
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{dropOnly}}})
+		assert.Empty(t, allowed, "no part of the statement executes")
+		require.Len(t, refused, 1)
+		assert.Equal(t, dropOnly.DDL, refused[0].change.DDL)
+		assert.False(t, refused[0].partial, "nothing ran, so this is not a split")
+	})
+
+	t.Run("a statement with no clauses is refused whole", func(t *testing.T) {
+		t.Parallel()
+		dropTable := engine.TableChange{
+			Table:        "applies",
+			Operation:    ddl.StatementDropTable,
+			DDL:          "DROP TABLE `applies`",
+			IsUnsafe:     true,
+			UnsafeReason: "Unsafe operation detected: \"DROP TABLE\"",
+		}
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{dropTable}}})
+		assert.Empty(t, allowed)
+		require.Len(t, refused, 1)
+		assert.Equal(t, dropTable.DDL, refused[0].change.DDL)
+		assert.False(t, refused[0].partial)
+		assert.NoError(t, refused[0].splitErr, "a statement with no clauses is not a split failure")
+	})
+
+	// An index whose definition changed is diffed as a drop and an add of one
+	// name. Executing the add against the index the refusal leaves in place
+	// fails on a duplicate name and takes the whole convergence down, so the
+	// add is withheld with the drop it depends on.
+	t.Run("an addition that needs a withheld clause to have run is withheld with it", func(t *testing.T) {
+		t.Parallel()
+		redefinedIndex := engine.TableChange{
+			Table:        "applies",
+			Operation:    ddl.StatementAlterTable,
+			DDL:          "ALTER TABLE `applies` DROP INDEX `idx_state`, ADD INDEX `idx_state` (`state`, `deployment`)",
+			IsUnsafe:     true,
+			UnsafeReason: "Unsafe operation detected: \"DROP INDEX `idx_state`\"",
+		}
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{redefinedIndex}}})
+		assert.Empty(t, allowed, "the add cannot run without the drop")
+		require.Len(t, refused, 1)
+		assert.Equal(t, redefinedIndex.DDL, refused[0].change.DDL,
+			"both clauses wait for an operator together, as the plan wrote them")
+	})
+
+	t.Run("a safe statement executes", func(t *testing.T) {
+		t.Parallel()
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{safeChange}}})
+		assert.Empty(t, refused)
+		require.Len(t, allowed, 1)
+		require.Len(t, allowed[0].TableChanges, 1)
+		assert.Equal(t, safeChange.DDL, allowed[0].TableChanges[0].DDL)
+	})
+
+	// One table's refusal must not withhold another's convergence: a pod
+	// starting against newer storage should still add the columns its own
+	// binary needs.
+	t.Run("a refusal withholds only its own clauses", func(t *testing.T) {
+		t.Parallel()
+		allowed, refused := partitionDestructiveChanges([]engine.SchemaChange{{
+			TableChanges: []engine.TableChange{unsafeChange, safeChange},
+		}})
+		require.Len(t, allowed, 1)
+		require.Len(t, allowed[0].TableChanges, 2)
 		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64)", allowed[0].TableChanges[0].DDL)
+		assert.Equal(t, safeChange.DDL, allowed[0].TableChanges[1].DDL, "the other table still converges")
 		require.Len(t, refused, 1)
-		assert.Equal(t, "ALTER TABLE `applies` DROP COLUMN `lease_owner`", refused[0].change.DDL)
-		assert.Contains(t, refused[0].reason, "DROP COLUMN")
-		assert.Contains(t, refused[0].reason, "lease_owner")
-		assert.Equal(t, "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64), DROP COLUMN `lease_owner`", refused[0].splitFrom)
-		scope, _, attrs := refused[0].refusalTelemetry()
-		assert.Equal(t, metrics.StorageSchemaRefusalSplit, scope)
-		assert.Contains(t, attrs, "split_from_ddl")
+		assert.Equal(t, "ALTER TABLE `applies` DROP INDEX `idx_state`", refused[0].change.DDL)
 	})
 
-	t.Run("a primary-key change is refused whole because its ADD half cannot run alone", func(t *testing.T) {
+	// The warning is what an operator reads during a rolling deploy, so it
+	// carries the DDL that did not run and the reason it did not.
+	t.Run("the refusal warning names the withheld clauses and the reason", func(t *testing.T) {
 		t.Parallel()
-		pkChange := "ALTER TABLE `applies` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`, `caller`)"
-		allowed, refused, err := partitionDestructiveChanges(single(pkChange))
-		require.NoError(t, err)
-		assert.Empty(t, allowed)
+		_, refused := partitionDestructiveChanges([]engine.SchemaChange{{TableChanges: []engine.TableChange{unsafeChange}}})
 		require.Len(t, refused, 1)
-		assert.Equal(t, pkChange, refused[0].change.DDL)
-		assert.NotEmpty(t, refused[0].reason)
-		assert.Empty(t, refused[0].splitFrom)
-		scope, _, _ := refused[0].refusalTelemetry()
-		assert.Equal(t, metrics.StorageSchemaRefusalWhole, scope)
+		message, attrs := refused[0].refusalTelemetry()
+		assert.Contains(t, message, "allow_destructive_schema_changes", "the warning names the option that runs them")
+		assert.Contains(t, message, "additions ran", "a split says what did run, not only what did not")
+		assert.Contains(t, attrs, "ddl")
+		assert.Contains(t, attrs, "ALTER TABLE `applies` DROP INDEX `idx_state`")
+		assert.NotContains(t, attrs, mixedDDL, "the whole statement did not fail to run")
+		assert.Contains(t, attrs, "reason")
+		assert.Contains(t, attrs, unsafeChange.UnsafeReason)
+		assert.Contains(t, attrs, "applies")
+	})
+}
+
+// stalledCanceller stands in for an engine whose cancel does not come back:
+// the copy it is waiting on has stopped answering, or the target has. It is
+// the case the release budget exists for, and the only way to reach it is an
+// engine that never returns.
+type stalledCanceller struct {
+	called chan struct{}
+}
+
+func (s *stalledCanceller) Cancel(ctx context.Context, _ *engine.ControlRequest) (*engine.ControlResult, error) {
+	close(s.called)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A stop reports even when the release it asked for does not come back. The
+// operator pressed Ctrl-C: a terminal that sits there indefinitely is the one
+// outcome that reads as the stop having been ignored, and the artifacts the
+// release was dropping are uncommitted copies that the next boot's stale-table
+// cleanup reclaims.
+func TestReleaseStoppedConvergence_ReportsWhenTheReleaseStalls(t *testing.T) {
+	t.Parallel()
+	canceller := &stalledCanceller{called: make(chan struct{})}
+	stopped, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		releaseStoppedConvergence(stopped, canceller, closedPortDSN, 50*time.Millisecond, slog.New(slog.DiscardHandler))
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a release that does not come back must not keep the stop from returning")
+	}
+
+	select {
+	case <-canceller.called:
+	default:
+		t.Fatal("the stop must ask the engine to release the schema change before giving up on it")
+	}
+}
+
+// recordingCanceller answers a cancel the way an engine does when the change
+// it was asked to cancel had already finished.
+type recordingCanceller struct {
+	ctx context.Context
+	err error
+}
+
+func (r *recordingCanceller) Cancel(ctx context.Context, _ *engine.ControlRequest) (*engine.ControlResult, error) {
+	r.ctx = ctx
+	if r.err != nil {
+		return nil, r.err
+	}
+	return &engine.ControlResult{Accepted: true}, nil
+}
+
+// The release runs on a context the stop cannot cancel. Handing it the context
+// that just ended would cancel the cleanup along with the thing being cleaned
+// up, leaving the artifacts of every stopped convergence behind.
+func TestReleaseStoppedConvergence_RunsOnALiveContext(t *testing.T) {
+	t.Parallel()
+	canceller := &recordingCanceller{}
+	stopped, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	releaseStoppedConvergence(stopped, canceller, closedPortDSN, time.Second, slog.New(slog.DiscardHandler))
+
+	require.NotNil(t, canceller.ctx, "the engine must be asked to release the schema change")
+	assert.NoError(t, canceller.ctx.Err(), "the release must not run on the context that just ended")
+}
+
+// A change that finished between the last progress poll and the stop is not a
+// failed release: there is nothing left to release, the statement is applied,
+// and the next plan is what says so. Reporting it as a leak would send an
+// operator looking for artifacts that were never created.
+func TestReleaseStoppedConvergence_AcceptsAChangeThatAlreadyFinished(t *testing.T) {
+	t.Parallel()
+	canceller := &recordingCanceller{err: engine.NewAlreadyCompletedError("cancel rejected: already completed")}
+	logs := &strings.Builder{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	releaseStoppedConvergence(t.Context(), canceller, closedPortDSN, time.Second, logger)
+
+	assert.Contains(t, logs.String(), "completed before the stop reached it")
+	assert.NotContains(t, logs.String(), "level=WARN",
+		"a change that finished on its own leaves nothing behind to warn about")
+}
+
+// A convergence hands the engine one table at a time. The engine attempts
+// native DDL only for a change confined to a single table, so a delta spanning
+// several tables that arrived as one run would copy every one of them on the
+// path a pod starts on. The runs are ordered by phase and then by table name,
+// so a convergence that stops partway converges the same prefix every time.
+func TestStorageConvergenceRuns(t *testing.T) {
+	t.Parallel()
+
+	alter := func(table string) engine.TableChange {
+		return engine.TableChange{
+			Table:     table,
+			Operation: ddl.StatementAlterTable,
+			DDL:       "ALTER TABLE `" + table + "` ADD COLUMN `caller` VARCHAR(64) NULL",
+		}
+	}
+	create := func(table string) engine.TableChange {
+		return engine.TableChange{
+			Table:     table,
+			Operation: ddl.StatementCreateTable,
+			DDL:       "CREATE TABLE `" + table + "` (`id` BIGINT UNSIGNED NOT NULL PRIMARY KEY)",
+		}
+	}
+	drop := func(table string) engine.TableChange {
+		return engine.TableChange{
+			Table:     table,
+			Operation: ddl.StatementDropTable,
+			DDL:       "DROP TABLE `" + table + "`",
+		}
+	}
+	runTables := func(runs []storageConvergenceRun) []string {
+		tables := make([]string, 0, len(runs))
+		for _, r := range runs {
+			tables = append(tables, r.table)
+		}
+		return tables
+	}
+
+	t.Run("each table is its own run", func(t *testing.T) {
+		t.Parallel()
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), alter("applies"), alter("tasks")},
+		}})
+
+		require.Len(t, runs, 3, "three tables must converge as three engine runs, not one")
+		assert.Equal(t, []string{"applies", "plans", "tasks"}, runTables(runs),
+			"tables converge in name order within a phase")
+		for i, r := range runs {
+			require.Len(t, r.changes, 1, "a per-table run carries one plan")
+			require.Len(t, r.changes[0].TableChanges, 1, "a run carries one table's statements")
+			assert.Equal(t, r.table, r.changes[0].TableChanges[0].Table)
+			assert.Equal(t, "schemabot", r.changes[0].Namespace, "the plan's namespace carries onto every run")
+			assert.Equal(t, i+1, r.position)
+			assert.Equal(t, 3, r.runCount)
+			assert.Equal(t, i, r.doneDDL, "each run knows how many statements finished before it")
+			assert.Equal(t, 1, r.runDDL)
+			assert.Equal(t, 3, r.totalDDL)
+		}
 	})
 
-	t.Run("an unsafe ALTER whose clauses cannot be partitioned is refused whole", func(t *testing.T) {
+	t.Run("creates run before alters and alters before drops", func(t *testing.T) {
 		t.Parallel()
-		// The Operation is set directly: the DDL carries two statements,
-		// which the splitter rejects, standing in for any split failure on
-		// an unsafe ALTER — for example a future linter rule with
-		// cross-clause reasoning tripping the safe-partition re-check. The
-		// fallback must refuse the statement whole, so nothing in it
-		// executes and the bootstrap still succeeds rather than
-		// crash-looping every starting pod.
-		multi := "ALTER TABLE `applies` DROP COLUMN `caller`; ALTER TABLE `applies` DROP COLUMN `lease_owner`"
-		changes := []engine.SchemaChange{{TableChanges: []engine.TableChange{{Table: "applies", Operation: ddl.StatementAlterTable, DDL: multi}}}}
-		allowed, refused, err := partitionDestructiveChanges(changes)
-		require.NoError(t, err)
-		assert.Empty(t, allowed)
-		require.Len(t, refused, 1)
-		assert.Equal(t, multi, refused[0].change.DDL)
-		assert.NotEmpty(t, refused[0].reason)
-		assert.Empty(t, refused[0].splitFrom)
-		require.Error(t, refused[0].splitErr)
-		scope, message, attrs := refused[0].refusalTelemetry()
-		assert.Equal(t, metrics.StorageSchemaRefusalWhole, scope)
-		assert.Contains(t, message, "could not be partitioned")
-		assert.Contains(t, attrs, "split_error")
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace: "schemabot",
+			TableChanges: []engine.TableChange{
+				drop("zeta"), alter("plans"), create("nu"), drop("alpha"), create("beta"),
+			},
+		}})
+
+		assert.Equal(t, []string{"beta", "nu", "plans", "alpha", "zeta"}, runTables(runs),
+			"a table created by this convergence exists before a later run drops another one")
 	})
 
-	t.Run("a statement Spirit cannot classify fails the bootstrap", func(t *testing.T) {
+	t.Run("a table's statements stay in one run", func(t *testing.T) {
 		t.Parallel()
-		_, _, err := partitionDestructiveChanges(single("TRUNCATE TABLE `applies`"))
-		require.Error(t, err)
-		require.ErrorContains(t, err, "classify storage schema change")
+		second := alter("plans")
+		second.DDL = "ALTER TABLE `plans` ADD INDEX `idx_caller` (`caller`)"
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), alter("tasks"), second},
+		}})
+
+		require.Len(t, runs, 2)
+		require.Equal(t, "plans", runs[0].table)
+		require.Len(t, runs[0].changes, 1)
+		assert.Len(t, runs[0].changes[0].TableChanges, 2, "one table converges once, with all of its statements")
+		assert.Equal(t, 2, runs[0].runDDL)
+		assert.Equal(t, 3, runs[0].totalDDL)
+		assert.Equal(t, 2, runs[1].doneDDL, "the second run starts after both of the first run's statements")
 	})
+
+	t.Run("an empty plan has no runs", func(t *testing.T) {
+		t.Parallel()
+		assert.Empty(t, storageConvergenceRuns(nil))
+	})
+
+	// Splitting a delta apart means a convergence that fails partway leaves
+	// some of it applied. That is harmless while every statement is one the
+	// bootstrap runs unattended, and is not harmless once the engine calls one
+	// of them unsafe: a storage schema left missing an object the fleet still
+	// reads is not a state a later boot repairs, because the next diff reads
+	// the removal as already done. A delta holding any statement the engine
+	// called unsafe therefore converges in one run, the way every delta did
+	// before tables were split apart.
+	t.Run("a delta holding an unsafe statement converges in one run", func(t *testing.T) {
+		t.Parallel()
+		removal := alter("applies")
+		removal.DDL = "ALTER TABLE `applies` DROP COLUMN `caller`"
+		removal.IsUnsafe = true
+		removal.UnsafeReason = "Unsafe operation detected: \"DROP COLUMN `caller`\""
+
+		changes := []engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), removal, alter("tasks")},
+		}}
+		require.True(t, holdsUnsafeChange(changes))
+
+		runs := storageConvergenceRuns(changes)
+		require.Len(t, runs, 1, "a delta holding an unsafe statement must not be split across runs")
+		assert.Equal(t, changes, runs[0].changes, "the one run carries the whole delta")
+		assert.Empty(t, runs[0].table, "a run over the whole delta is about no single table")
+		assert.Equal(t, 1, runs[0].position)
+		assert.Equal(t, 1, runs[0].runCount)
+		assert.Equal(t, 3, runs[0].runDDL)
+		assert.Equal(t, 3, runs[0].totalDDL)
+	})
+
+	t.Run("a delta with no unsafe statement is split", func(t *testing.T) {
+		t.Parallel()
+		changes := []engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), alter("applies")},
+		}}
+		assert.False(t, holdsUnsafeChange(changes))
+		assert.Len(t, storageConvergenceRuns(changes), 2)
+	})
+
+	// The split reads the engine's verdict, not the statement. A statement
+	// can take something away without the engine calling it unsafe, such as
+	// dropping an index already made invisible, and that statement is one the
+	// bootstrap runs unattended like any other, so it is split like any other.
+	t.Run("a removal the engine did not call unsafe is split", func(t *testing.T) {
+		t.Parallel()
+		invisible := alter("applies")
+		invisible.DDL = "ALTER TABLE `applies` DROP INDEX `idx_invisible`"
+
+		changes := []engine.SchemaChange{{
+			Namespace:    "schemabot",
+			TableChanges: []engine.TableChange{alter("plans"), invisible},
+		}}
+		assert.False(t, holdsUnsafeChange(changes))
+		assert.Equal(t, []string{"applies", "plans"}, runTables(storageConvergenceRuns(changes)))
+	})
+}
+
+// A watcher is told how far along the whole convergence is, not how far along
+// the run in front of it. Reporting the engine's own percentage would reach
+// 100% once per table and say the convergence had finished while most of it
+// was still ahead.
+func TestStorageConvergenceRunObserve(t *testing.T) {
+	t.Parallel()
+
+	runs := storageConvergenceRuns([]engine.SchemaChange{{
+		Namespace: "schemabot",
+		TableChanges: []engine.TableChange{
+			{Table: "applies", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NULL"},
+			{Table: "plans", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `plans` ADD COLUMN `caller` VARCHAR(64) NULL"},
+			{Table: "tasks", Operation: ddl.StatementAlterTable, DDL: "ALTER TABLE `tasks` ADD COLUMN `caller` VARCHAR(64) NULL"},
+		},
+	}})
+	require.Len(t, runs, 3)
+
+	t.Run("the percentage spans the convergence", func(t *testing.T) {
+		t.Parallel()
+		first := runs[0].observe(&engine.ProgressResult{State: engine.StateRunning, Progress: 60})
+		assert.Equal(t, 20, first.Percent, "60% of the first of three runs is 20% of the convergence")
+		assert.Equal(t, 3, first.DDLCount)
+
+		done := runs[0].observe(&engine.ProgressResult{State: engine.StateCompleted, Progress: 100})
+		assert.Equal(t, 33, done.Percent, "the first run finishing is not the convergence finishing")
+
+		last := runs[2].observe(&engine.ProgressResult{State: engine.StateCompleted, Progress: 100})
+		assert.Equal(t, 100, last.Percent, "the convergence is done when its last run is")
+
+		// The engine stops measuring a run it has finished, so its last poll
+		// reads zero. A finished run is all of its own share regardless.
+		silent := runs[2].observe(&engine.ProgressResult{State: engine.StateCompleted})
+		assert.Equal(t, 100, silent.Percent,
+			"a convergence must not report itself short of done on the observation that says it finished")
+	})
+
+	t.Run("the state is the convergence's, not the run's", func(t *testing.T) {
+		t.Parallel()
+		done := runs[0].observe(&engine.ProgressResult{State: engine.StateCompleted, Progress: 100})
+		assert.Equal(t, string(engine.StateRunning), done.State,
+			"a watcher told the convergence completed at its first table stops reading")
+
+		last := runs[2].observe(&engine.ProgressResult{State: engine.StateCompleted, Progress: 100})
+		assert.Equal(t, string(engine.StateCompleted), last.State,
+			"the last run completing is the convergence completing")
+
+		// A run that failed ends the convergence with it, so its state is the
+		// convergence's however early it happened.
+		failed := runs[0].observe(&engine.ProgressResult{State: engine.StateFailed, ErrorMessage: "boom"})
+		assert.Equal(t, string(engine.StateFailed), failed.State)
+	})
+
+	t.Run("a finished run naming no table is reported under its own", func(t *testing.T) {
+		t.Parallel()
+		// A metadata-only statement can finish before the engine ever reports a
+		// table for it. That the run is over is still something to say about
+		// the table it converged, and a watcher keyed on table names needs it.
+		o := runs[1].observe(&engine.ProgressResult{State: engine.StateCompleted})
+		require.Len(t, o.Tables, 1)
+		assert.Equal(t, "plans", o.Tables[0].Table)
+		assert.Equal(t, string(engine.StateCompleted), o.Tables[0].State)
+
+		// Mid-run there is nothing honest to say: how far in the statement got
+		// is a measurement nobody took, and the per-table phases are the
+		// engine's vocabulary, not this package's.
+		assert.Empty(t, runs[1].observe(&engine.ProgressResult{State: engine.StateRunning}).Tables)
+	})
+
+	t.Run("a finished run's tables are reported finished", func(t *testing.T) {
+		t.Parallel()
+		// A statement the server takes natively copies nothing, so the engine
+		// never marks its table done and the last poll catches whatever phase
+		// the run was winding down through. Passing that through would show an
+		// operator every table starting and none of them finishing.
+		o := runs[0].observe(&engine.ProgressResult{
+			State: engine.StateCompleted,
+			Tables: []engine.TableProgress{
+				{Table: "applies", State: "close"},
+			},
+		})
+		require.Len(t, o.Tables, 1)
+		assert.Equal(t, "applies", o.Tables[0].Table)
+		assert.Equal(t, string(engine.StateCompleted), o.Tables[0].State)
+		assert.Equal(t, 100, o.Tables[0].Percent)
+	})
+
+	t.Run("the engine's own table progress is passed through", func(t *testing.T) {
+		t.Parallel()
+		o := runs[0].observe(&engine.ProgressResult{
+			State:    engine.StateRunning,
+			Message:  "12.5% copyRows ETA 1h30m",
+			Progress: 12,
+			Tables: []engine.TableProgress{
+				{Table: "applies", State: "copyRows", Progress: 12, RowsCopied: 4096},
+			},
+		})
+		assert.Equal(t, "12.5% copyRows ETA 1h30m", o.Message)
+		require.Len(t, o.Tables, 1)
+		assert.Equal(t, "applies", o.Tables[0].Table)
+		assert.Equal(t, "copyRows", o.Tables[0].State)
+		assert.Equal(t, 12, o.Tables[0].Percent)
+		assert.Equal(t, int64(4096), o.Tables[0].RowsCopied)
+	})
+}
+
+// recordingApplyEngine counts the applies a convergence issues. Progress and
+// Cancel are the rest of the path a stop takes, so a run that does start
+// reports the count rather than panicking on an unimplemented method. Every
+// other method is the embedded nil interface.
+type recordingApplyEngine struct {
+	engine.Engine
+	applies int
+}
+
+func (e *recordingApplyEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	e.applies++
+	return &engine.ApplyResult{}, nil
+}
+
+func (e *recordingApplyEngine) Progress(ctx context.Context, _ *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return nil, ctx.Err()
+}
+
+func (e *recordingApplyEngine) Cancel(context.Context, *engine.ControlRequest) (*engine.ControlResult, error) {
+	return &engine.ControlResult{}, nil
+}
+
+// failingProgressEngine accepts a run and reports it failed on the first poll,
+// which is the path a convergence takes when the engine rejects a statement.
+// Every other method is the embedded nil interface.
+type failingProgressEngine struct {
+	engine.Engine
+}
+
+func (e *failingProgressEngine) Apply(context.Context, *engine.ApplyRequest) (*engine.ApplyResult, error) {
+	return &engine.ApplyResult{}, nil
+}
+
+func (e *failingProgressEngine) Progress(context.Context, *engine.ProgressRequest) (*engine.ProgressResult, error) {
+	return &engine.ProgressResult{
+		State:        engine.StateFailed,
+		ErrorMessage: "Duplicate entry 'x' for key 'idx_unique'",
+	}, nil
+}
+
+// A failed convergence names what failed, in the error the bootstrap returns
+// and in the log an operator searches for. A per-table run names its table. A
+// run over a whole delta has no single table, so it names every table it
+// carries rather than printing an empty name where the operator looks for the
+// one that failed.
+func TestApplyStorageConvergenceRunNamesWhatFailed(t *testing.T) {
+	t.Parallel()
+
+	alter := func(table, ddlText string, unsafe bool) engine.TableChange {
+		return engine.TableChange{
+			Table:     table,
+			Operation: ddl.StatementAlterTable,
+			DDL:       ddlText,
+			IsUnsafe:  unsafe,
+		}
+	}
+	converge := func(t *testing.T, run storageConvergenceRun) (string, error) {
+		t.Helper()
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		err := applyStorageConvergenceRun(t.Context(), &failingProgressEngine{}, closedPortDSN, run,
+			ensureSchemaOptions{convergenceTimeout: time.Minute}, logger)
+		return logBuf.String(), err
+	}
+
+	t.Run("a per-table run names its table", func(t *testing.T) {
+		t.Parallel()
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace: "schemabot",
+			TableChanges: []engine.TableChange{
+				alter("tasks", "ALTER TABLE `tasks` ADD UNIQUE INDEX `idx_unique` (`x`)", false),
+			},
+		}})
+		require.Len(t, runs, 1)
+
+		logs, err := converge(t, runs[0])
+		require.EqualError(t, err, "storage schema change to table \"tasks\" failed (run 1 of 1, 1 change(s) planned): "+
+			"Duplicate entry 'x' for key 'idx_unique'")
+		assert.Contains(t, logs, `msg="converging storage table"`)
+		assert.Contains(t, logs, "table=tasks")
+	})
+
+	t.Run("a run over a whole delta names every table it carries", func(t *testing.T) {
+		t.Parallel()
+		runs := storageConvergenceRuns([]engine.SchemaChange{{
+			Namespace: "schemabot",
+			TableChanges: []engine.TableChange{
+				alter("tasks", "ALTER TABLE `tasks` ADD UNIQUE INDEX `idx_unique` (`x`)", false),
+				alter("applies", "ALTER TABLE `applies` DROP COLUMN `caller`", true),
+				alter("tasks", "ALTER TABLE `tasks` ADD COLUMN `note` TEXT NULL", false),
+			},
+		}})
+		require.Len(t, runs, 1)
+		require.Empty(t, runs[0].table, "the run under test is the one over the whole delta")
+
+		logs, err := converge(t, runs[0])
+		require.EqualError(t, err, "storage schema change to tables \"applies\", \"tasks\" failed (run 1 of 1, 3 change(s) planned): "+
+			"Duplicate entry 'x' for key 'idx_unique'")
+		assert.Contains(t, logs, `msg="converging storage tables in one engine run"`)
+		assert.Contains(t, logs, "tables=\"[applies tasks]\"")
+		assert.NotContains(t, logs, `table=""`, "no log about the run may name an empty table")
+		assert.NotContains(t, logs, "table= ", "no log about the run may name an empty table")
+	})
+}
+
+// A convergence stopped between two runs stops there. The engine executes a
+// run's statements on a context of its own, so a stop does not reach DDL that
+// has not been issued yet: a run started after the budget expired or the
+// instance was told to stop would go on changing the storage database after
+// the convergence ended (AV-13, AV-14).
+func TestApplyStorageConvergenceRunStartsNothingAfterAStop(t *testing.T) {
+	t.Parallel()
+
+	runs := storageConvergenceRuns([]engine.SchemaChange{{
+		Namespace: "schemabot",
+		TableChanges: []engine.TableChange{{
+			Table:     "applies",
+			Operation: ddl.StatementAlterTable,
+			DDL:       "ALTER TABLE `applies` ADD COLUMN `caller` VARCHAR(64) NULL",
+		}},
+	}})
+	require.Len(t, runs, 1)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	eng := &recordingApplyEngine{}
+	err := applyStorageConvergenceRun(ctx, eng, closedPortDSN, runs[0],
+		ensureSchemaOptions{convergenceTimeout: time.Minute}, slog.New(slog.DiscardHandler))
+
+	require.Error(t, err, "a stopped convergence reports the stop rather than returning as if it converged")
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, eng.applies, "no statement may be issued after the convergence was stopped")
 }

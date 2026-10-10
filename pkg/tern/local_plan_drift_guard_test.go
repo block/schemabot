@@ -3,6 +3,8 @@ package tern
 import (
 	"context"
 	"errors"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -47,6 +49,112 @@ func TestDriftGuard_MatchMaterializes(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.Equal(t, int64(5), got.ID)
+}
+
+// bookkeepingTable is a live table no schema file declares, the shape
+// ignore_tables exists for.
+const bookkeepingTable = "flyway_schema_history"
+
+// replanWithoutWithheldTable is a re-plan against a deployment whose live schema
+// holds an undeclared bookkeeping table beside the reviewed ALTER. Naming that
+// table in the request withholds it from the planner; leaving it out is the
+// difference between a re-plan that reproduces the reviewed DDL and one that
+// also proposes dropping the table.
+func replanWithoutWithheldTable(ignore []string) *engine.PlanResult {
+	result := alterUsersEmailPlan()
+	if slices.Contains(ignore, bookkeepingTable) {
+		return result
+	}
+	result.Changes[0].TableChanges = append(result.Changes[0].TableChanges, engine.TableChange{
+		Table:     bookkeepingTable,
+		Operation: ddl.StatementDropTable,
+		DDL:       "DROP TABLE `" + bookkeepingTable + "`",
+	})
+	return result
+}
+
+// newBookkeepingTableDriftClient returns a materialize client whose re-plan sees
+// that undeclared live table and records the exclusions it was shown.
+func newBookkeepingTableDriftClient(store storage.PlanStore, shown *[]string) *LocalClient {
+	c := newPlanMaterializeClient(store)
+	c.config.TargetDSN = "user:pass@tcp(127.0.0.1:3306)/testapp"
+	c.spiritEngine = fakePlanEngine{
+		planFn: func(_ context.Context, req *engine.PlanRequest) (*engine.PlanResult, error) {
+			*shown = req.IgnoreTables
+			return replanWithoutWithheldTable(req.IgnoreTables), nil
+		},
+	}
+	return c
+}
+
+// A plan that withheld a live table from the planner records what it withheld,
+// and the dispatch carries that record. The drift guard's re-plan has to be
+// shown the same exclusions: the withheld table has no declaring schema file, so
+// a re-plan that sees it proposes dropping it — a change the reviewed DDL cannot
+// contain — and the guard would refuse every apply of such a plan on a
+// deployment that never planned locally.
+func TestDriftGuard_WithheldTablesTravelToTheReplan(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 9}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	got, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId:       "plan_withheld",
+		IgnoreTables: []string{bookkeepingTable},
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, int64(9), got.ID)
+	assert.Equal(t, []string{bookkeepingTable}, shown,
+		"the re-plan is shown the plan's own record of what it withheld")
+}
+
+// The materialized row has to carry the exclusions too, not just the drift
+// check that let it through. A rollback or resume on this deployment reads what
+// was withheld back off the stored plan, and a plan that forgot it re-plans the
+// withheld tables as drops.
+func TestDriftGuard_MaterializedPlanRecordsIgnoreTables(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 11}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId:       "plan_withheld",
+		IgnoreTables: []string{bookkeepingTable},
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, store.created)
+	assert.Equal(t, []string{bookkeepingTable}, store.created.IgnoreTables(),
+		"a later re-plan on this deployment withholds what the reviewed plan withheld")
+}
+
+// The exclusion comes from the dispatched plan's record and from nowhere else: a
+// dispatch that withheld nothing gets a re-plan that sees the whole live schema,
+// so the drop the reviewed DDL does not carry is drift and fails closed.
+func TestDriftGuard_NoWithheldRecordStillSeesTheWholeSchema(t *testing.T) {
+	store := &fakePlanStore{getFn: func(string) (*storage.Plan, error) { return nil, nil }, createID: 10}
+	var shown []string
+	c := newBookkeepingTableDriftClient(store, &shown)
+
+	_, err := c.planForApplyRequest(t.Context(), &ternv1.ApplyRequest{
+		PlanId: "plan_exposed",
+		DdlChanges: []*ternv1.TableChange{
+			{TableName: "users", Ddl: "ALTER TABLE `users` ADD COLUMN `email` varchar(255)", ChangeType: ternv1.ChangeType_CHANGE_TYPE_ALTER, Namespace: "testapp"},
+		},
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "local schema has drifted from the reviewed plan")
+	assert.Contains(t, err.Error(), bookkeepingTable)
+	assert.Empty(t, shown, "nothing was withheld, so the re-plan is shown no exclusions")
 }
 
 // Whitespace and quoting differences between the recomputed DDL and the reviewed
@@ -277,16 +385,26 @@ func TestCanonicalDDLForDrift_FailsClosed(t *testing.T) {
 	})
 
 	t.Run("multi-statement DDL is rejected", func(t *testing.T) {
-		// The parser rejects multi-statement input, so a destructive trailing
-		// statement cannot hide behind the classification of the first one and
-		// mask drift. It must fail closed instead.
+		// The only multi-statement shape drift admits is a greenfield create
+		// set, so a script of two ALTERs is refused at its first statement: a
+		// destructive trailing statement cannot hide behind the classification
+		// of the first one and mask drift. It must fail closed instead.
 		_, err := canonicalDDLForDrift(parser, "ALTER TABLE `users` ADD COLUMN `email` varchar(255); ALTER TABLE `users` ADD COLUMN `phone` varchar(255)")
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "parsed as 2 statements")
+		assert.Contains(t, err.Error(), "statement 1 is ALTER TABLE; a multi-statement DDL script must start with CREATE TABLE")
+	})
+
+	t.Run("destructive statement after CREATE TABLE is rejected", func(t *testing.T) {
+		// The first statement is a CREATE TABLE that would classify on its own,
+		// so the refusal has to come from the create set's shape rule: the
+		// trailing DROP TABLE is named as the statement that breaks it.
+		_, err := canonicalDDLForDrift(parser, "CREATE TABLE `users` (`id` bigint NOT NULL, PRIMARY KEY (`id`)); DROP TABLE `orders`")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "statement 2 is DROP TABLE; a multi-statement DDL script must be a CREATE TABLE followed only by CREATE INDEX statements on that table")
 	})
 
 	t.Run("DML is rejected", func(t *testing.T) {
-		// DML has no place in a schema-change drift comparison. It must fail
+		// DML has no place in a schema change drift comparison. It must fail
 		// closed instead of canonicalizing it as if it were DDL, and the error
 		// names the remedy's cause: the statement should not be in the change.
 		_, err := canonicalDDLForDrift(parser, "INSERT INTO `users` (`id`) VALUES (1)")
@@ -332,6 +450,28 @@ func TestCanonicalDDLForDrift_PostgresDialect(t *testing.T) {
 		compact, err := canonicalDDLForDrift(parser, "CREATE TABLE users (id uuid PRIMARY KEY, seq bigint GENERATED ALWAYS AS IDENTITY, created_at timestamptz NOT NULL DEFAULT now())")
 		require.NoError(t, err)
 		assert.Equal(t, compact, spaced, "formatting-only differences canonicalize to the same form")
+	})
+
+	t.Run("greenfield create set is canonicalized statement by statement", func(t *testing.T) {
+		spaced, err := canonicalDDLForDrift(parser, `CREATE TABLE  users (id bigint, email text);
+			CREATE INDEX users_email_idx ON users (email);
+			CREATE UNIQUE INDEX users_id_idx ON users (id);`)
+		require.NoError(t, err)
+		compact, err := canonicalDDLForDrift(parser, "create table users(id bigint,email text); create index users_email_idx on users using btree(email); create unique index users_id_idx on users using btree(id)")
+		require.NoError(t, err)
+
+		assert.Equal(t, compact, spaced)
+		assert.Equal(t, strings.Join([]string{
+			parser.Canonicalize("CREATE TABLE users (id bigint, email text)"),
+			parser.Canonicalize("CREATE INDEX users_email_idx ON users (email)"),
+			parser.Canonicalize("CREATE UNIQUE INDEX users_id_idx ON users (id)"),
+		}, ";\n"), spaced)
+	})
+
+	t.Run("greenfield create set rejects ALTER TABLE", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(parser, "CREATE TABLE users (id bigint); ALTER TABLE users ADD COLUMN email text")
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "statement 2 is ALTER TABLE")
 	})
 
 	t.Run("CREATE INDEX CONCURRENTLY is canonicalized", func(t *testing.T) {
@@ -405,7 +545,7 @@ func TestDriftMultisetFromPlanResult_SelectsParserByDatabaseType(t *testing.T) {
 	}
 
 	pg := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypePostgres}}
-	ms, err := pg.driftMultisetFromPlanResult(planResult(), false, "")
+	ms, _, err := pg.driftMultisetFromPlanResult(planResult(), false, "")
 	require.NoError(t, err)
 	require.Len(t, ms, 1)
 	for key := range ms {
@@ -415,7 +555,65 @@ func TestDriftMultisetFromPlanResult_SelectsParserByDatabaseType(t *testing.T) {
 	}
 
 	my := &LocalClient{config: LocalConfig{Type: storage.DatabaseTypeMySQL}}
-	_, err = my.driftMultisetFromPlanResult(planResult(), false, "")
+	_, _, err = my.driftMultisetFromPlanResult(planResult(), false, "")
 	require.Error(t, err, "PostgreSQL-only DDL must not parse under a MySQL-typed client")
 	assert.Contains(t, err.Error(), "DDL rejected by the statement parser")
+}
+
+func TestCanonicalDDLForDrift_RowSecurity(t *testing.T) {
+	parser := driftParserForDialect(t, schema.DialectPostgres)
+	reviewed := `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `
+	canonical, err := canonicalDDLForDrift(parser, reviewed)
+	require.NoError(t, err)
+	same, err := canonicalDDLForDrift(parser, `
+ drop policy "readers" on "staging"."documents";
+ create policy "readers" on "staging"."documents" for select to public using (owner_id=auth.uid());
+ `)
+	require.NoError(t, err)
+	assert.Equal(t, canonical, same)
+	mapped, err := canonicalDDLForDrift(parser, `
+ DROP POLICY readers ON production.documents;
+ CREATE POLICY readers ON production.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `)
+	require.NoError(t, err)
+	assert.NotEqual(t, canonical, mapped, "RLS review retains its physical target; a different schema needs a fresh review")
+	for _, tt := range []struct{ name, sql string }{
+		{"order", `
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ DROP POLICY readers ON staging.documents;
+ `},
+		{"predicate", `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (true);
+ `},
+		{"helper schema", `
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = other_auth.uid());
+ `},
+		{"duplicate", `
+ DROP POLICY readers ON staging.documents;
+ DROP POLICY readers ON staging.documents;
+ CREATE POLICY readers ON staging.documents FOR SELECT TO PUBLIC USING (owner_id = auth.uid());
+ `},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			changed, err := canonicalDDLForDrift(parser, tt.sql)
+			require.NoError(t, err)
+			assert.NotEqual(t, canonical, changed)
+		})
+	}
+	t.Run("mixed structural operation refuses", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(parser, `
+ DROP POLICY readers ON staging.documents;
+ ALTER TABLE staging.documents ADD COLUMN title text;
+ `)
+		require.Error(t, err)
+	})
+	t.Run("MySQL does not admit PostgreSQL policies", func(t *testing.T) {
+		_, err := canonicalDDLForDrift(driftParserForDialect(t, schema.DialectMySQL), reviewed)
+		require.Error(t, err)
+	})
 }

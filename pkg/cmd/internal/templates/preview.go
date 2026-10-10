@@ -86,6 +86,13 @@ const (
 	PreviewPullSchemaDetailed PreviewType = "pull_schema_detailed" // Pulled live schema with the detailed catalog's estimates
 	PreviewPullVitessSchema   PreviewType = "pull_schema_vitess"   // Multi-keyspace Vitess pull with VSchema artifacts
 
+	// Rate limit previews (pull refused for exceeding a request budget)
+	PreviewPullRateLimitedCaller   PreviewType = "pull_rate_limited_caller"   // CLI: caller spent its own request budget
+	PreviewPullRateLimitedShared   PreviewType = "pull_rate_limited_shared"   // CLI: budget shared by every client because auth is disabled
+	PreviewPullRateLimitedTarget   PreviewType = "pull_rate_limited_target"   // CLI: the target database is absorbing every client's reads
+	PreviewPullRateLimitedResponse PreviewType = "pull_rate_limited_response" // API: the 429 a service caller reads off the wire
+	PreviewRateLimitAll            PreviewType = "rate_limit_all"             // Show all rate limit previews
+
 	// Lint and unsafe previews
 	PreviewLintViolations PreviewType = "lint_violations" // Lint violations output
 	PreviewUnsafeBlocked  PreviewType = "unsafe_blocked"  // Unsafe changes blocked
@@ -112,7 +119,14 @@ const (
 	// Comment template previews (GitHub PR comments)
 	PreviewCommentPlan                         PreviewType = "comment_plan"                            // Plan comment with DDL changes + lint violations
 	PreviewCommentPlanIgnoredNamespaces        PreviewType = "comment_plan_ignored_namespaces"         // Plan with namespaces withheld by ignore_namespaces
+	PreviewCommentPlanUnmanagedSchema          PreviewType = "comment_plan_unmanaged_schema"           // Environment-scoped plan naming schema directories it does not manage
+	PreviewCommentPlanExemptTables             PreviewType = "comment_plan_exempt_tables"              // Plan with ignored live tables disclosed
+	PreviewCommentPlanIgnoreTables             PreviewType = "comment_plan_ignore_tables"              // Clean plan with a live table withheld by ignore_tables
+	PreviewCommentPlanColumnOnlyAlter          PreviewType = "comment_plan_column_only_alter"          // Plan whose alter is metadata-only, so no table-size section renders
+	PreviewCommentPlanManyTables               PreviewType = "comment_plan_many_tables"                // Plan touching more tables than the size section lists inline
+	PreviewCommentPlanCollationChanges         PreviewType = "comment_plan_collation_changes"          // Plan that moves existing columns onto another collation
 	PreviewCommentPlanBlocked                  PreviewType = "comment_plan_blocked"                    // Plan with a statement the engine refuses (blocked verdict)
+	PreviewCommentPlanBlockedPostgres          PreviewType = "comment_plan_blocked_postgres"           // PostgreSQL plan with a refused statement carrying two independent causes
 	PreviewCommentPlanDirect                   PreviewType = "comment_plan_direct"                     // Locked plan with a statement routed to direct execution (direct verdict)
 	PreviewCommentPlanCopyDiscarded            PreviewType = "comment_plan_copy_discarded"             // Plan whose apply would throw away an unfinished copy on the target
 	PreviewCommentPlanCopyDiscardedApplying    PreviewType = "comment_plan_copy_discarded_applying"    // Running apply recording the unfinished copy it threw away
@@ -124,7 +138,7 @@ const (
 	PreviewCommentPlanTenant                   PreviewType = "comment_plan_tenant"                     // Tenant-targeted plan comment
 	PreviewCommentPlanEmpty                    PreviewType = "comment_plan_empty"                      // Plan comment with no changes
 	PreviewCommentNoManagedSchema              PreviewType = "comment_no_managed_schema"               // No managed schema changes in current PR
-	PreviewCommentChecksRefreshed              PreviewType = "comment_checks_refreshed"                // Plan on no-schema-changes PR recreated passing checks
+	PreviewCommentChecksRefreshed              PreviewType = "comment_checks_refreshed"                // Plan on a PR with no schema changes recreated passing checks
 	PreviewCommentChecksRefreshedTenant        PreviewType = "comment_checks_refreshed_tenant"         // Checks refreshed but gated on tenant deployments
 	PreviewCommentReconcileInProgress          PreviewType = "comment_reconcile_in_progress"           // Empty diff with in-progress apply-owned state
 	PreviewCommentReconcileCompleted           PreviewType = "comment_reconcile_completed"             // Empty diff with completed apply-owned state
@@ -137,6 +151,7 @@ const (
 	PreviewCommentMySQLMultiSchema             PreviewType = "comment_mysql_multi_schema"              // MySQL plan with multiple schema names
 	PreviewCommentHelp                         PreviewType = "comment_help"                            // Help command reference comment
 	PreviewCommentSupportChannel               PreviewType = "comment_support_channel"                 // Comment with support-channel footer
+	PreviewCommentOversized                    PreviewType = "comment_oversized"                       // Notice posted in place of a comment over GitHub's size cap
 	PreviewCommentErrors                       PreviewType = "comment_errors"                          // All error comment templates
 	PreviewCommentUnsafeBlocked                PreviewType = "comment_unsafe_blocked"                  // Unsafe changes blocked (no --allow-unsafe)
 	PreviewCommentDropColumnBlocked            PreviewType = "comment_drop_column_blocked"             // Drop column blocked with destructive-drop guidance
@@ -165,11 +180,13 @@ const (
 	PreviewCommentMultiDeployAll        PreviewType = "comment_multi_deploy_all"         // Show all multi-deployment apply previews
 	PreviewCLIMultiDeployInProgress     PreviewType = "cli_multi_deploy_in_progress"     // Barrier rollout mid-flight
 	PreviewCLIMultiDeployFailed         PreviewType = "cli_multi_deploy_failed"          // Halt-on-failure: one deployment failed
+	PreviewCLIMultiDeployHalted         PreviewType = "cli_multi_deploy_halted"          // Halt-on-failure while a sibling deployment is still running
 	PreviewCLIMultiDeployCompleted      PreviewType = "cli_multi_deploy_completed"       // All deployments completed
 	PreviewCLIMultiDeployAll            PreviewType = "cli_multi_deploy_all"             // Show all CLI multi-deployment apply previews
 	PreviewCommentShardedAll            PreviewType = "comment_sharded_all"              // Show all sharded apply + plan previews
 	PreviewAggregateCheckSummary        PreviewType = "aggregate_check_summary"          // Aggregate check Details summary (own databases + tenant deployments)
 	PreviewAggregateCheckFileCapBlocked PreviewType = "aggregate_check_file_cap_blocked" // Failing aggregate when the PR exceeds GitHub's changed-file cap
+	PreviewAggregateCheckStopped        PreviewType = "aggregate_check_stopped"          // Aggregate check while a stopped apply holds the PR
 
 	// Single-table apply comment previews (most common case)
 	PreviewCommentSingleProgress           PreviewType = "comment_single_progress"             // Single table running
@@ -183,6 +200,7 @@ const (
 	PreviewCommentSummaryVitessVSchema     PreviewType = "comment_summary_vitess_vschema"      // Summary: completed Vitess DDL + VSchema
 	PreviewCommentSummaryVitessVSchemaOnly PreviewType = "comment_summary_vitess_vschema_only" // Summary: completed Vitess VSchema-only
 	PreviewCommentSummaryFailedLarge       PreviewType = "comment_summary_failed_large"        // Summary: failed (8 tables, rollup)
+	PreviewCommentSummaryFailedEngineLogs  PreviewType = "comment_summary_failed_engine_logs"  // Summary: failed on a data plane, with the engine-logs fold
 	PreviewCommentSummaryMultiNSFailed     PreviewType = "comment_summary_multi_ns_failed"     // Summary: failed (multi-namespace)
 	PreviewCommentSummaryMultiNSCompleted  PreviewType = "comment_summary_multi_ns_completed"  // Summary: completed (multi-namespace)
 	PreviewCommentAll                      PreviewType = "comment_all"                         // Show all comment template previews

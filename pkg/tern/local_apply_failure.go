@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/block/schemabot/pkg/metrics"
@@ -32,12 +33,58 @@ func (c *LocalClient) logApplyPausedForRetry(ctx context.Context, apply *storage
 		previousState, state.Apply.FailedRetryable)
 }
 
+// driveCancelled reports whether the drive's context has been cancelled, and
+// records in the server log that the apply is being handed back when it has.
+//
+// A cancelled drive is a process shutting down or a claim being released. From
+// that moment every engine call and storage write fails with the same
+// cancellation, so a failure observed under it describes the driver rather than
+// the schema change: the change itself is untouched and often still healthy on
+// the provider. Recording that failure would fail or pause a change that is
+// fine, and because the write recording it runs on the same cancelled context,
+// whether the false outcome lands at all is a race with the successor's claim.
+// That race is not the protection — this guard is. A settlement write detached
+// from the drive's context so it survives cancellation (context.WithoutCancel)
+// would record the false outcome reliably instead of rarely, so every
+// settlement write stays behind this guard whatever context it runs on.
+// The apply is left exactly as it stands, for the driver that reclaims it to
+// resume from its stored state.
+//
+// An operator-initiated stop or cancel does not rely on this path: the control
+// handler settles the tasks and the apply itself on its own request context,
+// and cancels the drive only so it stops iterating.
+func (c *LocalClient) driveCancelled(ctx context.Context, apply *storage.Apply, during string) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	c.logger.With(apply.IdentityLogAttrs()...).Info(
+		"drive cancelled "+during+"; handing the apply back for another driver to claim",
+		append(apply.MutableLogAttrs(), "error", ctx.Err())...)
+	return true
+}
+
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.
 // If the apply is already in a terminal state (e.g., cancelled by Stop()), the
 // stored state is not overwritten; the settled state is adopted into the
 // in-memory apply so callers that notify observers afterwards report the
 // concurrent verdict instead of the stale pre-failure state.
-func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
+//
+// The in-memory apply reads terminal on return only when storage holds a
+// terminal state for it. When the failed write does not land, the in-memory
+// apply is put back to its pre-failure state, the active-apply gauge is left
+// alone, and the write error is returned: the stored apply is still active, so
+// nothing that answers for its outcome may run, and the claim that picks it up
+// next settles it. A drive cancelled before or while recording the failure
+// hands the apply back with nil and the apply untouched.
+//
+// It records the failure only. The side effects a terminal apply owes —
+// settling the control requests it moots and posting the terminal summary —
+// are the caller's; failApplyAndNotify runs both for drives that owe nothing
+// else.
+func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) error {
+	if c.driveCancelled(ctx, apply, "before recording that the apply failed") {
+		return nil
+	}
 	now := time.Now()
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
@@ -58,7 +105,7 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 	if suppressParentApplyWrites(ctx) {
 		logger.Info("operation drive failed its tasks; operator derives the operation row and projects the parent",
 			"error_message", errMsg)
-		return
+		return nil
 	}
 	// Re-read the apply from storage — Stop() may have already set a terminal
 	// state (e.g., cancelled) between when the engine error occurred and now.
@@ -67,26 +114,105 @@ func (c *LocalClient) failApplyWithTasks(ctx context.Context, apply *storage.App
 		logger.Debug("apply already in terminal state, not overwriting",
 			"state", fresh.State)
 		*apply = *fresh
-		return
+		return nil
 	}
 
-	previousState := apply.State
+	previous := *apply
 	apply.State = state.Apply.Failed
 	apply.ErrorMessage = errMsg
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
-	} else {
-		c.logApplyFailure(ctx, apply, previousState, errMsg)
+		*apply = previous
+		if c.driveCancelled(ctx, apply, "while recording that the apply failed") {
+			return nil
+		}
+		logger.Error("failed to record the apply failed; current apply owner will exit for operator retry with the apply still active, its pending control requests pending, and no terminal summary posted",
+			append(apply.MutableLogAttrs(), "failure", errMsg, "error", err)...)
+		return fmt.Errorf("record apply %s (database %s) failed from stored state %s: %w",
+			apply.ApplyIdentifier, apply.Database, previous.State, err)
 	}
+	c.logApplyFailure(ctx, apply, previous.State, errMsg)
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+	return nil
+}
+
+// failApplyAndNotify fails the apply and, once storage holds a terminal state
+// for it, runs the side effects that state owes: the start that admitted this
+// claim is answered with the failure, the pending control requests the outcome
+// moots are settled, then the observer posts the terminal summary. Nothing
+// later re-claims a failed apply to do any of these, so a drive that fails an
+// apply and owes nothing more than that goes through here rather than calling
+// failApplyWithTasks directly. A settlement failure is logged and the summary
+// still posts (see settleRequestsForStoredOutcome); the operator's post-drive
+// settlement retries the requests left pending.
+//
+// A multi-operation drive owns only its operation, so there the operator's
+// projection settles the parent and posts the summary; failApplyWithTasks
+// already logged that handoff. A drive cancelled before the failure was
+// recorded leaves the apply non-terminal for another driver, so it owes
+// nothing. A failure write that did not land is returned with nothing settled.
+func (c *LocalClient) failApplyAndNotify(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) error {
+	if err := c.failApplyWithTasks(ctx, apply, tasks, errMsg); err != nil {
+		return err
+	}
+	if suppressParentApplyWrites(ctx) {
+		return nil
+	}
+	if !state.IsTerminalApplyState(apply.State) {
+		c.logger.Debug("apply left non-terminal by a cancelled drive; no terminal side effects are owed",
+			apply.LogAttrs()...)
+		return nil
+	}
+	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	if state.IsState(apply.State, state.Apply.Failed) {
+		c.failPendingStartForFailedApply(ctx, logger, apply, errMsg)
+	}
+	c.settleRequestsForStoredOutcome(ctx, logger, apply)
+	c.notifyTerminalObserver(apply, tasks)
+	return nil
+}
+
+// failPendingStartForFailedApply answers the pending start of an apply whose
+// stored state is failed. The start admitted the claim that failed, and no
+// later claim of a failed apply will consume it, so it fails with the apply's
+// reason: the operator reads that their command did not take effect. An apply
+// adopted into another terminal state keeps its pending start — a stopped
+// apply's start stays deliverable to the claim that resumes it.
+//
+// A read or write that does not land is logged rather than returned (RC-5):
+// the request stays pending and nothing re-claims the apply to settle it,
+// which the log says, while the caller still posts the summary the stored
+// failure owes.
+func (c *LocalClient) failPendingStartForFailedApply(ctx context.Context, logger *slog.Logger, apply *storage.Apply, errMsg string) {
+	startReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStart)
+	if err != nil {
+		logger.Warn("failed to read the pending start request for the stored failure; a pending start stays pending with nothing left to claim the failed apply, and the terminal summary still posts",
+			append(apply.MutableLogAttrs(), "error", err)...)
+		return
+	}
+	if startReq == nil {
+		logger.Debug("no pending start request to answer for the stored failure")
+		return
+	}
+	if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart, errMsg); err != nil {
+		logger.Warn("failed to fail the pending start request for the stored failure; it stays pending with nothing left to claim the failed apply, and the terminal summary still posts",
+			append(apply.MutableLogAttrs(), "error", err)...)
+	}
 }
 
 // markApplyRetryableWithTasks pauses an apply after a retryable engine failure.
 // Non-terminal tasks move to failed_retryable so operator recovery can decide
 // which work to re-dispatch on the next attempt.
-func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) {
+//
+// Like failApplyWithTasks, the pause's side effects — the retry log, the
+// active-apply gauge, and the observer's progress update — run only once the
+// pause is stored. When the write does not land, the in-memory apply is put
+// back to its pre-pause state and the write error is returned.
+func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) error {
+	if c.driveCancelled(ctx, apply, "before pausing the apply for retry") {
+		return nil
+	}
 	for _, task := range tasks {
 		if state.IsTerminalTaskState(task.State) {
 			continue
@@ -106,7 +232,7 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 	if suppressParentApplyWrites(ctx) {
 		logger.Info("operation drive paused its tasks for retry; operator derives the operation row and projects the parent",
 			"error_message", errMsg)
-		return
+		return nil
 	}
 	// Re-read the apply from storage; Stop() may have already moved it to a
 	// terminal state between the engine error and this update.
@@ -115,21 +241,28 @@ func (c *LocalClient) markApplyRetryableWithTasks(ctx context.Context, apply *st
 		logger.Debug("apply already in terminal state, not marking retryable",
 			"state", fresh.State)
 		*apply = *fresh
-		return
+		return nil
 	}
 
-	previousState := apply.State
+	previous := *apply
 	apply.State = state.Apply.FailedRetryable
 	apply.ErrorMessage = errMsg
 	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
-		logger.Error("failed to update apply state", append(apply.MutableLogAttrs(), "error", err)...)
-	} else {
-		c.logApplyPausedForRetry(ctx, apply, previousState, errMsg)
+		*apply = previous
+		if c.driveCancelled(ctx, apply, "while pausing the apply for retry") {
+			return nil
+		}
+		logger.Error("failed to record the apply paused for retry; current apply owner will exit for operator retry with the apply still active",
+			append(apply.MutableLogAttrs(), "failure", errMsg, "error", err)...)
+		return fmt.Errorf("record apply %s (database %s) paused for retry from stored state %s: %w",
+			apply.ApplyIdentifier, apply.Database, previous.State, err)
 	}
+	c.logApplyPausedForRetry(ctx, apply, previous.State, errMsg)
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 	if obs := c.getObserver(apply.ID); obs != nil {
 		obs.OnProgress(apply, tasks)
 	}
+	return nil
 }

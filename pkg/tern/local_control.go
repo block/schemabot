@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,7 +36,69 @@ func (c *LocalClient) requestCutover(ctx context.Context, req *ternv1.CutoverReq
 	if apply == nil {
 		return nil, fmt.Errorf("no active schema change")
 	}
-	return c.queueCutoverRequest(ctx, apply, caller)
+	bound, refusal, err := c.cutoverRequestOperation(ctx, apply, req.GetApplyOperationId())
+	if err != nil {
+		return nil, err
+	}
+	if refusal != "" {
+		c.logger.Warn("cutover refused before it was queued",
+			append(apply.LogAttrs(), "apply_operation_id", req.GetApplyOperationId(), "reason", refusal)...)
+		return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: refusal}, nil
+	}
+	return c.queueCutoverRequest(ctx, apply, caller, bound)
+}
+
+// cutoverRequestOperation resolves the operation a cutover request is for. A
+// request that names an operation is bound to it, so only that operation's
+// drive takes it: the rollout members of one deployment share its apply, each
+// with its own operation, and one member's turn to cut over is not its
+// siblings' turn. A request that names none is refused on an apply whose
+// operations run on several targets, since nothing says which target's swap
+// the caller meant. refusal is the reason a request is not queued; err is a
+// failure to decide.
+func (c *LocalClient) cutoverRequestOperation(ctx context.Context, apply *storage.Apply, applyOperationID string) (bound *storage.ApplyOperation, refusal string, err error) {
+	if applyOperationID != "" {
+		op, err := c.applyOperationOfApply(ctx, apply, applyOperationID)
+		if isNotAnOperationOfApply(err) {
+			return nil, fmt.Sprintf("cutover names an operation this apply does not have: %v", err), nil
+		}
+		if err != nil {
+			return nil, "", fmt.Errorf("resolve the operation a cutover of apply %s names: %w", apply.ApplyIdentifier, err)
+		}
+		return op, "", nil
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return nil, "", fmt.Errorf("apply operation store is not configured")
+	}
+	ops, err := store.ListByApply(ctx, apply.ID)
+	if err != nil {
+		return nil, "", fmt.Errorf("list operations of apply %s before cutover: %w", apply.ApplyIdentifier, err)
+	}
+	if operationsSpanSeveralTargets(ops) {
+		return nil, fmt.Sprintf("apply %s runs on several targets; a cutover must name the operation it is for", apply.ApplyIdentifier), nil
+	}
+	return nil, "", nil
+}
+
+// operationsSpanSeveralTargets reports whether an apply's operations run on
+// more than one target, which is the shape of a deployment's rollout members
+// sharing its apply.
+func operationsSpanSeveralTargets(ops []*storage.ApplyOperation) bool {
+	var first string
+	for i, op := range ops {
+		if op == nil {
+			continue
+		}
+		if i == 0 {
+			first = op.Target
+			continue
+		}
+		if op.Target != first {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveControlApply finds the apply a control request targets, by apply
@@ -89,6 +152,13 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 		tasks, lookupErr := c.storage.Tasks().GetByApplyID(ctx, apply.ID)
 		if lookupErr != nil {
 			return nil, fmt.Errorf("get tasks failed: %w", lookupErr)
+		}
+		if id := req.GetApplyOperationId(); id != "" {
+			op, opErr := c.applyOperationOfApply(ctx, apply, id)
+			if opErr != nil {
+				return nil, fmt.Errorf("cutover apply %s: %w", apply.ApplyIdentifier, opErr)
+			}
+			tasks = tasksForOperation(tasks, op.ID)
 		}
 		for _, t := range tasks {
 			if !state.IsTerminalTaskState(t.State) {
@@ -206,20 +276,38 @@ func (c *LocalClient) cutover(ctx context.Context, req *ternv1.CutoverRequest, c
 // stop and start are routed to the owner. A cutover RPC can land on any instance
 // sharing the route's storage, so it must never act on a local engine that may
 // not be running this schema change.
-func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Apply, caller string) (*ternv1.CutoverResponse, error) {
+func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Apply, caller string, bound *storage.ApplyOperation) (*ternv1.CutoverResponse, error) {
 	controlStore := c.storage.ControlRequests()
 	if controlStore == nil {
 		return nil, fmt.Errorf("control request store is not available")
 	}
 	requestedBy := controlRequestRequester(caller)
-	_, alreadyPending, err := controlStore.RequestPending(ctx, &storage.ApplyControlRequest{
+	request := &storage.ApplyControlRequest{
 		ApplyID:     apply.ID,
 		Operation:   storage.ControlOperationCutover,
 		Status:      storage.ControlRequestPending,
 		RequestedBy: requestedBy,
-	})
+	}
+	var boundID int64
+	if bound != nil {
+		boundID = bound.ID
+		request.Metadata = storage.CutoverRequestMetadata(bound.ID)
+	}
+	existing, alreadyPending, err := controlStore.RequestPending(ctx, request)
 	if err != nil {
 		return nil, fmt.Errorf("record cutover control request for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if alreadyPending {
+		pendingFor, err := existing.CutoverOperationID()
+		if err != nil {
+			return nil, fmt.Errorf("read the operation the pending cutover of apply %s is for: %w", apply.ApplyIdentifier, err)
+		}
+		if pendingFor != boundID {
+			message := fmt.Sprintf("a cutover of apply %s for operation %d is still pending; this cutover for operation %d was not queued", apply.ApplyIdentifier, pendingFor, boundID)
+			c.logger.Warn("cutover refused: a cutover for another operation of the apply is still pending",
+				append(apply.LogAttrs(), "pending_for_operation", pendingFor, "requested_for_operation", boundID)...)
+			return &ternv1.CutoverResponse{Accepted: false, ErrorMessage: message}, nil
+		}
 	}
 	if alreadyPending {
 		c.logger.Info("cutover request already pending for apply owner",
@@ -240,7 +328,12 @@ func (c *LocalClient) queueCutoverRequest(ctx context.Context, apply *storage.Ap
 	return &ternv1.CutoverResponse{Accepted: true}, nil
 }
 
-func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply) error {
+// processPendingCutoverControlRequest takes the apply's pending cutover
+// request on behalf of the drive that owns tasks. A request bound to one
+// operation is taken only by that operation's drive (see
+// boundCutoverRequestTurn); an unbound request is taken by whichever drive of
+// the apply sees it parked, as before.
+func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, apply *storage.Apply, tasks []*storage.Task) error {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCutover)
 	if err != nil {
 		return err
@@ -251,6 +344,17 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 	// Bind the apply's identity once so every consumption log line is
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
+	boundID, err := controlReq.CutoverOperationID()
+	if err != nil {
+		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	}
+	if boundID != 0 {
+		take, err := c.boundCutoverRequestTurn(ctx, apply, tasks, controlReq, boundID, logger)
+		if err != nil || !take {
+			return err
+		}
+		return c.takeBoundCutoverRequest(ctx, apply, controlReq, boundID, logger)
+	}
 	if cutoverRequestResolvedByApplyState(apply.State) {
 		logger.Info("completing pending cutover request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
@@ -312,17 +416,14 @@ func (c *LocalClient) processPendingCutoverControlRequest(ctx context.Context, a
 		return fmt.Errorf("process pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if resp == nil {
-		errorMessage := "not accepted"
+		errorMessage := "the cutover path returned neither a response nor an error"
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
 		return fmt.Errorf("process pending cutover for apply %s: %s", apply.ApplyIdentifier, errorMessage)
 	}
 	if !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
+		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
 			return err
 		}
@@ -371,12 +472,21 @@ func (c *LocalClient) requestCancel(ctx context.Context, req *ternv1.CancelReque
 		return nil, fmt.Errorf("schema change %s is already terminal (state: %s)", apply.ApplyIdentifier, apply.State)
 	}
 
+	// A revert-phase apply has already cut over, so this is a decision about the
+	// schema change rather than a failure to act on it. It answers as a refusal
+	// and not an error: a caller on the far side of a plane boundary sees every
+	// error as one generic internal status, so it cannot tell this apart from a
+	// transient failure and leaves its durable request pending to re-send the
+	// same doomed cancel on every later claim.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return nil, err
 	} else if revertPhase != "" {
-		c.logger.Warn("cancel rejected: schema change is in a revert phase and has already cut over",
+		c.logger.Warn("cancel refused: schema change is in a revert phase and has already cut over",
 			"apply_id", apply.ApplyIdentifier, "state", apply.State, "revert_phase", revertPhase)
-		return nil, errors.New(revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase))
+		return &ternv1.CancelResponse{
+			Accepted:     false,
+			ErrorMessage: revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase),
+		}, nil
 	}
 
 	controlStore := c.storage.ControlRequests()
@@ -426,14 +536,20 @@ func (c *LocalClient) requestStop(ctx context.Context, req *ternv1.StopRequest, 
 		return nil, fmt.Errorf("no active schema change")
 	}
 
+	// A revert-phase apply has already cut over, so this is a decision about the
+	// schema change rather than a failure to act on it, and it answers as a
+	// refusal for the same reason the cancel path does.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
 		return nil, err
 	} else if revertPhase != "" {
-		c.logger.Warn("stop rejected: schema change is in a revert phase and has already cut over",
+		c.logger.Warn("stop refused: schema change is in a revert phase and has already cut over",
 			"apply_id", apply.ApplyIdentifier,
 			"state", apply.State,
 			"revert_phase", revertPhase)
-		return nil, errors.New(revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase))
+		return &ternv1.StopResponse{
+			Accepted:     false,
+			ErrorMessage: revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase),
+		}, nil
 	}
 
 	controlStore := c.storage.ControlRequests()
@@ -541,7 +657,7 @@ func (c *LocalClient) stopOwnedApply(ctx context.Context, req *ternv1.StopReques
 	// For Vitess/PlanetScale, stopping means cancelling the deploy request —
 	// this is permanent (not resumable). Use "cancelled" instead of "stopped".
 	terminalState := state.Task.Stopped
-	var engineTableProgress map[string]*engine.TableProgress
+	var engineTableProgress StatementIndex[engine.TableProgress]
 	if stopTerminatesChange(c.config.Type) {
 		terminalState = state.Task.Cancelled
 	} else {
@@ -675,7 +791,16 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 	}
 	c.cancelApplyHandle(applyCancel)
 
-	cancelledCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, nil, state.Task.Cancelled)
+	if targetApply != nil {
+		if err := c.releaseCancelledArtifacts(ctx, eng, targetApply, tasks); err != nil {
+			c.logSkippedArtifactRelease(ctx, targetApply, err)
+		}
+	} else {
+		c.logger.Warn("cancel resolved no apply, so any artifacts its schema change left stay on the target",
+			"database", c.config.Database, "type", c.config.Type)
+	}
+
+	cancelledCount, skippedCount, applyID, err := c.markTasksWithState(ctx, tasks, targetApplyID, StatementIndex[engine.TableProgress]{}, state.Task.Cancelled)
 	if err != nil {
 		// Same reasoning as the stop: an apply recorded as cancelled over task
 		// rows that never moved detaches the apply from its own tasks.
@@ -707,12 +832,7 @@ func (c *LocalClient) cancelOwnedApply(ctx context.Context, req *ternv1.CancelRe
 		return c.settleCancelForTasklessApply(ctx, targetApply, caller)
 	}
 	if cancelledCount == 0 && skippedCount > 0 && applyID > 0 {
-		if targetApply != nil && state.IsState(targetApply.State, state.Apply.Cancelled) {
-			return &ternv1.CancelResponse{Accepted: true, CancelledCount: 0, SkippedCount: skippedCount}, nil
-		}
-		if err := c.markApplyCancelled(ctx, applyID); err != nil {
-			return nil, err
-		}
+		return c.settleCancelAllTasksTerminal(ctx, applyID, skippedCount, caller)
 	}
 	return &ternv1.CancelResponse{
 		Accepted:       true,
@@ -769,10 +889,13 @@ func (c *LocalClient) settleCancelForTasklessApply(ctx context.Context, targetAp
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
 		c.logger.Info("cancel found task-less apply already terminal; accepting without a state change",
 			append(apply.LogAttrs(), "requested_by", caller)...)
-		return &ternv1.CancelResponse{Accepted: true}, nil
+		return cancelAlreadySettledResponse(apply.State, 0), nil
 	}
 	previousState := apply.State
 	if err := c.markApplyCancelled(ctx, apply.ID); err != nil {
+		if errors.Is(err, storage.ErrApplyOutcomeSettled) {
+			return c.acceptCancelOverSettledApply(ctx, apply, 0, caller, err)
+		}
 		if !errors.Is(err, storage.ErrApplyLeaseLost) {
 			return nil, err
 		}
@@ -1028,16 +1151,18 @@ func (c *LocalClient) settleStopForTasklessApply(ctx context.Context, targetAppl
 	return &ternv1.StopResponse{Accepted: true}, nil
 }
 
-// stopHandledUnlessStartPending reports a completed stop as handled unless a
-// start request is also pending, in which case it returns not-handled so the
+// stopStandsDownUnlessStartPending stands the drive down on a completed stop
+// unless a start request is also pending, in which case it reports false so the
 // caller resumes the apply from the queued start in the same claim. Without
 // this, a stop and a start that race into the same claim would consume only the
 // stop, leaving the apply stopped with a pending start that the claim
-// lease-freshness gate cannot re-claim until the lease goes stale.
-func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger *slog.Logger, apply *storage.Apply) (bool, error) {
+// lease-freshness gate cannot re-claim until the lease goes stale. It is why
+// the drive's answer is about standing down rather than about the stop taking
+// effect: here the stop did take effect and the drive still keeps going.
+func (c *LocalClient) stopStandsDownUnlessStartPending(ctx context.Context, logger *slog.Logger, apply *storage.Apply) (standDown bool, err error) {
 	pendingStart, err := pendingStartControlRequest(ctx, c.storage, apply)
 	if err != nil {
-		return true, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
+		return false, fmt.Errorf("check pending start request after stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	if pendingStart != nil {
 		logger.Info("pending stop completed but a start is queued; continuing to resume in the same claim",
@@ -1056,9 +1181,8 @@ func (c *LocalClient) stopHandledUnlessStartPending(ctx context.Context, logger 
 // running change settles itself through its own apply path. Returns
 // declined=false when the error is not an unsupported-operation decline, so
 // the caller applies its normal error handling. When declined=true the
-// operation did not take effect: a stop or cancel caller must report the
-// request as not handled, or the drive loop would mark the still-running
-// apply stopped.
+// operation did not take effect: a stop or cancel caller must keep its drive
+// going, or the drive loop would mark the still-running apply stopped.
 func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
 	unsupported, ok := engine.AsUnsupportedOperation(opErr)
 	if !ok {
@@ -1084,7 +1208,75 @@ func (c *LocalClient) failPendingRequestForUnsupportedOperation(ctx context.Cont
 	return true, nil
 }
 
-func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+// failPendingRequestForSettledOutcome resolves a pending control request
+// terminally when the engine refused it because the schema change had already
+// settled on an outcome of its own, such as failed, that the operation must not
+// replace. The outcome will not change back, so leaving the request pending
+// would re-run the same refusal on every drive claim. The request is failed
+// with the engine's reason, and the apply is left for the drive to settle: its
+// next progress poll records the outcome the engine reports. Returns
+// settled=false when the error is not a settled-outcome refusal, so the caller
+// applies its normal error handling. When settled=true the operation did not
+// take effect, so a stop or cancel caller must keep its drive going, or the
+// drive loop would record the operator's command over the engine's outcome.
+func (c *LocalClient) failPendingRequestForSettledOutcome(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, opErr error) (bool, error) {
+	refusal, ok := engine.AsSettledOutcome(opErr)
+	if !ok {
+		return false, nil
+	}
+	message := refusal.Error()
+	caller := controlRequestCaller(controlReq)
+	logger.Warn("rejecting pending control request: the schema change already settled on its own outcome; the drive keeps going and records that outcome",
+		"operation", string(operation),
+		"requested_by", caller,
+		"state", apply.State,
+		"error", opErr)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
+		return true, fmt.Errorf("process pending %s for apply %s: %w; fail pending %s request: %w", operation, apply.ApplyIdentifier, opErr, operation, err)
+	}
+	return true, nil
+}
+
+// failRefusedControlRequest resolves a pending control request that the stop or
+// cancel path answered with an explicit refusal. The refusal is a decision, not
+// a delivery failure: the request is already recorded durably, so a later claim
+// can only re-send it and collect the same refusal while the schema change keeps
+// running unwatched. Failing it with the stated reason ends that loop and leaves
+// the operator a request whose answer they can read.
+//
+// The refusal means the operation did not take effect, so callers keep their
+// drive going: standing down would otherwise record an operator stop or cancel
+// over a change that is still running.
+func (c *LocalClient) failRefusedControlRequest(ctx context.Context, logger *slog.Logger, apply *storage.Apply, operation storage.ControlOperation, eventType string, controlReq *storage.ApplyControlRequest, errorMessage string) error {
+	message := controlRefusalMessage(operation, errorMessage)
+	caller := controlRequestCaller(controlReq)
+	logger.Warn("rejecting pending control request: the operation was refused; the schema change continues and settles on its own",
+		"operation", string(operation),
+		"requested_by", caller,
+		"state", apply.State,
+		"error_message", message)
+	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, eventType, storage.LogSourceSchemaBot,
+		fmt.Sprintf("Pending %s request rejected: %s%s", operation, message, callerApplyLogSuffix(caller)), "", "")
+	if err := failPendingControlRequests(ctx, c.storage, apply, operation, message); err != nil {
+		return fmt.Errorf("process pending %s for apply %s: refused with %q; fail pending %s request: %w", operation, apply.ApplyIdentifier, message, operation, err)
+	}
+	return nil
+}
+
+// processPendingStopControlRequest consumes a durable stop request against this
+// apply. Its return answers one question, and it is a question about the drive
+// rather than about the request: whether this drive must stand down and let the
+// apply settle. Whether the request was resolved is a separate fact the return
+// does not carry, and the two come apart in both directions — a refusal
+// resolves the request and keeps the drive going, an accepted stop can stand
+// the drive down while leaving the request pending on purpose. Nor does the
+// return mean the stop took effect: a completed stop with a start already
+// queued keeps the drive going so the same claim resumes from it. So a new
+// branch owes the drive an answer about its own disposition, not about its
+// bookkeeping.
+func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, apply *storage.Apply) (standDown bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
 		return false, err
@@ -1096,14 +1288,14 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if completed, err := completePendingRequestIfStoredApplyResolved(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-		return true, err
+		return false, err
 	} else if completed {
 		logger.Info("completing pending stop request for resolved apply",
 			"requested_by", controlRequestCaller(controlReq),
 			"state", apply.State)
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for resolved apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		return c.stopHandledUnlessStartPending(ctx, logger, apply)
+		return c.stopStandsDownUnlessStartPending(ctx, logger, apply)
 	}
 	if state.IsTerminalApplyState(apply.State) {
 		logger.Info("completing pending stop request for terminal apply",
@@ -1112,9 +1304,9 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
-			return true, err
+			return false, err
 		}
-		return c.stopHandledUnlessStartPending(ctx, logger, apply)
+		return c.stopStandsDownUnlessStartPending(ctx, logger, apply)
 	}
 
 	// A revert-phase apply has already cut over. Stop is a permanent rejection,
@@ -1122,7 +1314,7 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	// so the operator-owned retry loop stops re-running stop. The operator must
 	// revert (undo) or skip-revert (finalize), or wait out an in-flight revert.
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
-		return true, err
+		return false, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
 		logger.Warn("rejecting pending stop request: schema change is in a revert phase and has already cut over",
@@ -1132,9 +1324,15 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventStopRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending stop request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStop, message); err != nil {
-			return true, err
+			// Whether or not the request resolved, the refusal already decided
+			// that nothing was stopped, so the drive is owed the same answer.
+			return false, fmt.Errorf("process pending stop for apply %s: refused with %q; fail pending stop request: %w", apply.ApplyIdentifier, message, err)
 		}
-		return true, nil
+		// The request is resolved, but no stop took effect: the change is applied
+		// and its revert phase is still running against the database. Standing the
+		// drive down here would settle the apply stopped, contradicting what the
+		// engine is still doing underneath.
+		return false, nil
 	}
 
 	stopCtx := context.WithoutCancel(ctx)
@@ -1143,6 +1341,12 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if settled, settleErr := c.failPendingRequestForSettledOutcome(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); settled {
+			// The request is resolved terminally but no stop took effect: the
+			// schema change already settled, and the drive records that outcome
+			// rather than an operator stop.
+			return false, settleErr
+		}
 		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, err); declined {
 			// The request is resolved terminally but no stop took effect: the
 			// schema change keeps running, so the drive must not treat this as
@@ -1151,16 +1355,19 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 		}
 		return true, fmt.Errorf("process pending stop for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if resp == nil || !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp != nil && resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
-		return true, fmt.Errorf("process pending stop for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	if resp == nil {
+		return true, fmt.Errorf("process pending stop for apply %s: the stop path returned neither a response nor an error", apply.ApplyIdentifier)
+	}
+	if !resp.Accepted {
+		// The refusal is the answer, so resolve the request on it. Returning an
+		// error would leave the request pending and every later claim would
+		// collect the same refusal while the schema change kept running. The
+		// drive keeps going: no stop took effect.
+		return false, c.failRefusedControlRequest(stopCtx, logger, apply, storage.ControlOperationStop, storage.LogEventStopRequested, controlReq, resp.ErrorMessage)
 	}
 	completed, err := completePendingRequestIfStoredApplyResolved(stopCtx, c.storage, apply, storage.ControlOperationStop)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	if !completed {
 		// The stop was accepted but the apply row has not settled — the settle
@@ -1177,7 +1384,11 @@ func (c *LocalClient) processPendingStopControlRequest(ctx context.Context, appl
 	return true, nil
 }
 
-func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
+// processPendingCancelControlRequest consumes a durable cancel request against
+// this apply. Its return follows the same contract as the stop counterpart:
+// standDown reports what this drive must do, which is independent of both
+// whether the request was resolved and whether a cancel took effect.
+func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, apply *storage.Apply) (standDown bool, err error) {
 	controlReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationCancel)
 	if err != nil {
 		return false, err
@@ -1189,17 +1400,16 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	// filterable by apply_id/repo/pr without hand-listing the attrs per call.
 	logger := c.logger.With(apply.IdentityLogAttrs()...)
 	if state.IsTerminalApplyState(apply.State) && !state.IsState(apply.State, state.Apply.Stopped) {
-		logger.Info("completing pending cancel request for terminal apply",
-			append(apply.MutableLogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
-		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
-			fmt.Sprintf("Pending cancel request completed for terminal apply%s", callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
-		if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel); err != nil {
-			return true, err
+		// The apply already reached a terminal state, so settling its request
+		// decides nothing about what this drive does next: a failed write leaves
+		// the request pending for a later drive rather than standing this one down.
+		if err := settlePendingCancelForTerminalApply(ctx, c.storage, c.logger, apply); err != nil {
+			return false, err
 		}
 		return true, nil
 	}
 	if revertPhase, err := c.applyRevertPhaseBlock(ctx, apply); err != nil {
-		return true, err
+		return false, err
 	} else if revertPhase != "" {
 		message := revertPhaseControlRejectionMessage(apply.ApplyIdentifier, revertPhase)
 		logger.Warn("rejecting pending cancel request: schema change is in a revert phase and has already cut over",
@@ -1207,9 +1417,13 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelWarn, storage.LogEventCancelRequested, storage.LogSourceSchemaBot,
 			fmt.Sprintf("Pending cancel request rejected: %s%s", message, callerApplyLogSuffix(controlRequestCaller(controlReq))), "", "")
 		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCancel, message); err != nil {
-			return true, err
+			// See the stop counterpart: the refusal already decided nothing was
+			// cancelled, so a failed write does not change the drive's answer.
+			return false, fmt.Errorf("process pending cancel for apply %s: refused with %q; fail pending cancel request: %w", apply.ApplyIdentifier, message, err)
 		}
-		return true, nil
+		// See the stop counterpart: the request is resolved and nothing was
+		// cancelled, so the drive must not stand down over it.
+		return false, nil
 	}
 
 	cancelCtx := context.WithoutCancel(ctx)
@@ -1218,6 +1432,11 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		Environment: apply.Environment,
 	}, controlRequestCaller(controlReq))
 	if err != nil {
+		if settled, settleErr := c.failPendingRequestForSettledOutcome(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); settled {
+			// See the stop counterpart: the change already settled, so the drive
+			// records that outcome rather than an operator cancel.
+			return false, settleErr
+		}
 		if declined, declineErr := c.failPendingRequestForUnsupportedOperation(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, err); declined {
 			// The request is resolved terminally but no cancel took effect:
 			// the schema change keeps running, so the drive must not treat
@@ -1226,18 +1445,19 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 		}
 		return true, fmt.Errorf("process pending cancel for apply %s: %w", apply.ApplyIdentifier, err)
 	}
-	if resp == nil || !resp.Accepted {
-		errorMessage := "not accepted"
-		if resp != nil && resp.ErrorMessage != "" {
-			errorMessage = resp.ErrorMessage
-		}
-		return true, fmt.Errorf("process pending cancel for apply %s: %s", apply.ApplyIdentifier, errorMessage)
+	if resp == nil {
+		return true, fmt.Errorf("process pending cancel for apply %s: the cancel path returned neither a response nor an error", apply.ApplyIdentifier)
 	}
-	completed, err := completePendingRequestIfStoredApplyResolved(cancelCtx, c.storage, apply, storage.ControlOperationCancel)
+	if !resp.Accepted {
+		// See the stop counterpart: the refusal resolves the request, and the
+		// drive keeps going because no cancel took effect.
+		return false, c.failRefusedControlRequest(cancelCtx, logger, apply, storage.ControlOperationCancel, storage.LogEventCancelRequested, controlReq, resp.ErrorMessage)
+	}
+	settled, err := settlePendingCancelIfStoredApplyResolved(cancelCtx, c.storage, c.logger, apply)
 	if err != nil {
-		return true, err
+		return false, err
 	}
-	if !completed {
+	if !settled {
 		// The cancel was accepted but the apply row has not settled — the settle
 		// lost the apply lease and moved only the drive's own operation row, so
 		// the apply-state projection owns the rest. The request stays pending on
@@ -1251,9 +1471,13 @@ func (c *LocalClient) processPendingCancelControlRequest(ctx context.Context, ap
 	return true, nil
 }
 
-func (c *LocalClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply) (bool, error) {
-	if handled, err := c.processPendingCancelControlRequest(ctx, apply); handled || err != nil {
-		return handled, err
+// processPendingCancelOrStopControlRequest consumes whichever of the two the
+// operator issued, cancel first because it is the stronger intent. standDown
+// carries whichever processor answered, so the drive stands down only when the
+// apply is really settling stopped or cancelled.
+func (c *LocalClient) processPendingCancelOrStopControlRequest(ctx context.Context, apply *storage.Apply) (standDown bool, err error) {
+	if standDown, err := c.processPendingCancelControlRequest(ctx, apply); standDown || err != nil {
+		return standDown, err
 	}
 	return c.processPendingStopControlRequest(ctx, apply)
 }
@@ -1357,8 +1581,8 @@ func (c *LocalClient) applyRevertPhaseBlock(ctx context.Context, apply *storage.
 //   - WaitingForCutover: Spirit runner alive, holding connections until cutover.
 //   - Recovering: Spirit's runner is restarted with a detached context during
 //     recovery; only eng.Stop kills it, so without this the runner keeps copying
-//     rows while storage reports stopped and a later resume blocks in Drain()
-//     behind the abandoned runner.
+//     rows while storage reports stopped and every later resume waits in
+//     DrainContext behind the abandoned runner until its drive gives up.
 //   - WaitingForDeploy: the PlanetScale deferred deploy request exists and stays
 //     startable from the PlanetScale UI until eng.Stop cancels it.
 //   - FailedRetryable: a transient failure (e.g. repeated progress-poll errors)
@@ -1423,11 +1647,14 @@ func (c *LocalClient) stopEngineForTasks(ctx context.Context, eng engine.Engine,
 		if err != nil {
 			return nil, fmt.Errorf("build stop request for task %s: %w", task.TaskIdentifier, err)
 		}
-		if _, err := eng.Stop(ctx, req); err != nil {
-			if c.config.Type == storage.DatabaseTypeVitess {
-				return nil, fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, err)
+		if _, stopErr := eng.Stop(ctx, req); stopErr != nil {
+			if err := c.resolveFailedEngineStop(ctx, eng, task, creds, req.ResumeState, stopErr); err != nil {
+				return nil, err
 			}
-			return nil, fmt.Errorf("stop local engine for task %s: %w", task.TaskIdentifier, err)
+			// The engine tracks nothing for this task, so there is no live
+			// progress to snapshot: returning no stop credentials keeps the
+			// persisted checkpoint progress on the task rows.
+			return nil, nil
 		}
 		return creds, nil
 	}
@@ -1483,8 +1710,9 @@ func (c *LocalClient) cancelEngineForTasks(ctx context.Context, eng engine.Engin
 // (a failed probe) — surfaces the original cancel error unchanged. Typed
 // rejections with their own resolution paths also surface unchanged: an
 // already-completed rejection has the caller reconcile stored state to the
-// completed outcome, and an unsupported-operation decline resolves the durable
-// request without recording a cancel.
+// completed outcome, while an unsupported-operation decline and a
+// settled-outcome refusal each resolve the durable request without recording a
+// cancel.
 func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, cancelErr error) error {
 	if engine.IsAlreadyCompleted(cancelErr) {
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
@@ -1496,7 +1724,13 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 	if engine.IsUnsupportedOperation(cancelErr) {
 		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
 	}
-	progress, probeErr := eng.Progress(ctx, &engine.ProgressRequest{
+	// A settled-outcome refusal means the change already settled on an outcome
+	// a cancel must not replace; it surfaces so the pending-request path
+	// resolves the request and the drive records the engine's own outcome.
+	if engine.IsSettledOutcome(cancelErr) {
+		return fmt.Errorf("cancel engine for task %s: %w", task.TaskIdentifier, cancelErr)
+	}
+	progress, probeErr := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 		ResumeState: resumeState,
@@ -1520,11 +1754,82 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 	return nil
 }
 
+// resolveFailedEngineStop decides whether a failed engine stop may still
+// complete durably. A stop that cannot reach any running work has nothing left
+// to pause — the persisted checkpoint is already the resume point a stop
+// exists to preserve — so completing it records the tasks and apply as
+// stopped, the resumable state a later start resumes from. Surfacing such an
+// error instead would abort the drive, leave the durable stop request pending,
+// and re-run the same failing stop on every claim.
+//
+// The engine's own report decides: a progress probe scoped to the task shows
+// whether live work remains. Nothing running resolves to nil so the caller
+// proceeds to record the stop; live work — or any uncertainty about it (a
+// failed probe) — surfaces the original stop error unchanged, because a
+// stopped record over an engine still executing would let the change keep
+// running unwatched. Typed rejections with their own resolution paths also
+// surface unchanged: an already-completed rejection has the caller reconcile
+// stored state to the completed outcome, while an unsupported-operation decline
+// and a settled-outcome refusal each resolve the durable request without
+// recording a stop.
+func (c *LocalClient) resolveFailedEngineStop(ctx context.Context, eng engine.Engine, task *storage.Task, creds *engine.Credentials, resumeState *engine.ResumeState, stopErr error) error {
+	if engine.IsAlreadyCompleted(stopErr) {
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	// An unsupported-operation decline means the engine refuses stop for its
+	// database type while the schema change keeps executing; it surfaces so the
+	// pending-request decline path resolves the request terminally without
+	// touching the running change.
+	if engine.IsUnsupportedOperation(stopErr) {
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	// A settled-outcome refusal means the change already settled on an outcome
+	// a stop must not relabel as a resumable pause; it surfaces so the
+	// pending-request path resolves the request and the drive records the
+	// engine's own outcome.
+	if engine.IsSettledOutcome(stopErr) {
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	progress, probeErr := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
+		Database:    c.config.Database,
+		Credentials: creds,
+		ResumeState: resumeState,
+	})
+	if probeErr != nil {
+		c.logger.Warn("engine stop failed and the live-work probe also failed; the stop error surfaces and the drive will retry rather than record a stop over unknown engine state",
+			append(task.LogAttrs(), "probe_error", probeErr, "error", stopErr)...)
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	if engineProgressShowsLiveWork(eng, progress) {
+		engineState := ""
+		if progress != nil {
+			engineState = string(progress.State)
+		}
+		c.logger.Warn("engine stop failed while the engine still has live work; the stop error surfaces so the work is never recorded stopped while it keeps running",
+			append(task.LogAttrs(), "engine_state", engineState, "error", stopErr)...)
+		return c.wrapFailedEngineStop(task, stopErr)
+	}
+	c.logger.Warn("engine stop failed but the engine has no live work for the task; the durable stop proceeds and records the tasks stopped for a later resume",
+		append(task.LogAttrs(), "engine_state", string(progress.State), "error", stopErr)...)
+	return nil
+}
+
+// wrapFailedEngineStop names, in the surfaced error, the engine operation a
+// stop performs on this database type: on Vitess targets stop cancels the
+// provider deploy request, everywhere else it stops the local engine's work.
+func (c *LocalClient) wrapFailedEngineStop(task *storage.Task, stopErr error) error {
+	if c.config.Type == storage.DatabaseTypeVitess {
+		return fmt.Errorf("cancel deploy request for task %s: %w", task.TaskIdentifier, stopErr)
+	}
+	return fmt.Errorf("stop local engine for task %s: %w", task.TaskIdentifier, stopErr)
+}
+
 // engineProgressShowsLiveWork reports whether a progress probe shows engine
-// work that a cancel must still terminate before storage may record the
-// schema change as cancelled. It reads the engine's own report, unlike
-// hasLiveEngineWork, which reads the stored task state's expectation.
-// Uncertainty counts as live work — only an affirmative nothing-left-to-cancel
+// work that a stop or cancel must still terminate before storage may record
+// the schema change as stopped or cancelled. It reads the engine's own
+// report, unlike hasLiveEngineWork, which reads the stored task state's
+// expectation.
+// Uncertainty counts as live work — only an affirmative nothing-left-to-settle
 // answer clears the probe, and what qualifies depends on who owns the engine's
 // truth:
 //
@@ -1532,17 +1837,21 @@ func (c *LocalClient) resolveFailedEngineCancel(ctx context.Context, eng engine.
 //     provider's record of the change, so only a provider answer that closed
 //     the change clears the probe: cancelled, or failed with no retry path.
 //     Pending from such an engine is an open change the provider can still
-//     run, and a retryable failure remains runnable — both keep the cancel
-//     error surfacing so the change is never recorded cancelled while the
-//     provider can still land it.
+//     run, and a retryable failure remains runnable — both keep the control
+//     error surfacing so the change is never recorded stopped or cancelled
+//     while the provider can still land it.
 //   - Any other engine executes in this process, so pending — the idle
 //     sentinel — is the only answer proving nothing is left. A state the
 //     engine still tracks, terminal or not, means engine-owned work (such as
-//     target cleanup) remains that only a retried cancel finishes.
+//     target cleanup) remains that only a retried stop or cancel finishes.
 //
 // Completed deliberately counts as live for every engine: a change that
-// landed must reconcile to its completed outcome, never settle as cancelled.
+// landed must reconcile to its completed outcome, never settle as stopped or
+// cancelled.
 // The revert states keep the engine actively unwinding the change.
+//
+// A nil result is uncertainty of the same kind and counts as live, so a caller
+// that reaches the cleared branch always holds a result it can report.
 func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressResult) bool {
 	if progress == nil {
 		return true
@@ -1561,28 +1870,29 @@ func engineProgressShowsLiveWork(eng engine.Engine, progress *engine.ProgressRes
 }
 
 // snapshotEngineProgress captures per-table progress from the engine after stopping.
-func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Engine, creds *engine.Credentials) map[string]*engine.TableProgress {
+func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Engine, creds *engine.Credentials) StatementIndex[engine.TableProgress] {
+	var none StatementIndex[engine.TableProgress]
 	if eng == nil {
 		c.logger.Error("snapshotEngineProgress: engine is nil")
-		return nil
+		return none
 	}
 	if creds == nil {
 		c.logger.Debug("skipping engine progress snapshot because no live engine work was stopped", "database", c.config.Database, "type", c.config.Type)
-		return nil
+		return none
 	}
-	progress, err := eng.Progress(ctx, &engine.ProgressRequest{
+	progress, err := c.progressWithEngine(ctx, eng, &engine.ProgressRequest{
 		Database:    c.config.Database,
 		Credentials: creds,
 	})
 	if err != nil {
 		c.logger.Warn("failed to snapshot engine progress after stop",
 			"database", c.config.Database, "type", c.config.Type, "error", err)
-		return nil
+		return none
 	}
 	if progress != nil {
 		return indexEngineTableProgress(progress.Tables)
 	}
-	return nil
+	return none
 }
 
 // markTasksWithState settles all non-terminal targeted tasks into newState,
@@ -1597,7 +1907,7 @@ func (c *LocalClient) snapshotEngineProgress(ctx context.Context, eng engine.Eng
 // apply settled on top of task rows that never moved detaches the apply from
 // its own tasks. Every task is still attempted, so an operator retrying the
 // command has only the refused ones left to write.
-func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.Task, targetApplyID int64, engineProgress map[string]*engine.TableProgress, newState string) (int64, int64, int64, error) {
+func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.Task, targetApplyID int64, engineProgress StatementIndex[engine.TableProgress], newState string) (int64, int64, int64, error) {
 	var stoppedCount, skippedCount int64
 	var applyID int64
 	var refused []error
@@ -1617,7 +1927,7 @@ func (c *LocalClient) markTasksWithState(ctx context.Context, tasks []*storage.T
 		// Mark as STOPPED — even if Spirit reports per-table IsComplete.
 		// IsComplete means "row copy done", NOT "cutover done". The re-plan
 		// during Start() will detect which tables truly completed.
-		if et, ok := engineProgressForTask(engineProgress, task); ok {
+		if et, ok := engineProgress.ForTask(task); ok {
 			task.RowsCopied = et.RowsCopied
 			task.RowsTotal = et.RowsTotal
 			task.ProgressPercent = et.Progress
@@ -1730,6 +2040,99 @@ func (c *LocalClient) handleStopAllTasksTerminal(ctx context.Context, applyID in
 		StoppedCount: 0,
 		SkippedCount: skippedCount,
 	}, nil
+}
+
+// settleCancelAllTasksTerminal handles a cancel that found every targeted task
+// already terminal. The cancel stopped no work, so the apply records what its
+// tasks did rather than cancelled: a driver that finished its tasks but had not
+// yet written the apply row must not lose a completed outcome to a cancel that
+// arrived in between, since the settled cancelled row would then refuse the
+// driver's own completed write. An apply that already settled keeps its
+// outcome. Fails closed when the apply still owns unfinished tasks this client
+// could not see, because settling the apply over them would abandon live work.
+func (c *LocalClient) settleCancelAllTasksTerminal(ctx context.Context, applyID int64, skippedCount int64, caller string) (*ternv1.CancelResponse, error) {
+	apply, err := c.storage.Applies().Get(ctx, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("load apply %d after cancel found all tasks terminal: %w", applyID, err)
+	}
+	if apply == nil {
+		return nil, fmt.Errorf("load apply %d after cancel found all tasks terminal: %w", applyID, storage.ErrApplyNotFound)
+	}
+	if state.IsState(apply.State, state.SettledApplyStates...) {
+		c.logger.Info("cancel found all tasks terminal and the apply already settled; keeping its outcome",
+			append(apply.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller)...)
+		return cancelAlreadySettledResponse(apply.State, skippedCount), nil
+	}
+
+	// A multi-operation drive owns only its operation. Its tasks already carry
+	// the outcome, and the operator derives the operation row from them and
+	// projects the parent, so the parent write is the operator's to make. A
+	// direct write here fails closed under the operation-only lease and would
+	// turn an accepted cancel into a drive error the claim loop re-runs forever.
+	// The durable request stays pending until the projection resolves the
+	// stored apply.
+	if suppressParentApplyWrites(ctx) {
+		c.logger.Info("cancel found all tasks terminal; operation drive leaves the apply outcome to the operator's projection",
+			append(apply.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller)...)
+		return &ternv1.CancelResponse{Accepted: true, SkippedCount: skippedCount}, nil
+	}
+
+	tasks, err := c.storage.Tasks().GetByApplyID(ctx, applyID)
+	if err != nil {
+		return nil, fmt.Errorf("load tasks for apply %s to derive its outcome after cancel: %w", apply.ApplyIdentifier, err)
+	}
+	derivedState := state.DeriveApplyState(taskStates(tasks))
+	if !state.IsState(derivedState, state.SettledApplyStates...) {
+		c.logger.Warn("cancel found every targeted task terminal, but the apply's tasks do not settle it; failing closed rather than settling over unfinished task work",
+			append(apply.LogAttrs(), "derived_state", derivedState, "task_count", len(tasks), "client_database", c.config.Database)...)
+		return nil, fmt.Errorf("cancel cannot settle apply %s: its tasks derive %s, not a finished outcome", apply.ApplyIdentifier, derivedState)
+	}
+
+	oldState := apply.State
+	now := time.Now()
+	apply.State = derivedState
+	if state.IsState(derivedState, state.Apply.Failed) && apply.ErrorMessage == "" {
+		apply.ErrorMessage = firstFailedTaskError(tasks)
+	}
+	apply.CompletedAt = &now
+	apply.UpdatedAt = now
+	if err := c.storage.Applies().Update(ctx, apply); err != nil {
+		if !errors.Is(err, storage.ErrApplyOutcomeSettled) {
+			return nil, fmt.Errorf("update apply %s to derived state %s after cancel: %w", apply.ApplyIdentifier, derivedState, err)
+		}
+		return c.acceptCancelOverSettledApply(ctx, apply, skippedCount, caller, err)
+	}
+
+	c.logger.Info("cancel found all tasks terminal; apply state derived from tasks",
+		append(apply.LogAttrs(), "old_state", oldState, "skipped_count", skippedCount, "requested_by", caller)...)
+	c.logApplyEvent(ctx, applyID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
+		fmt.Sprintf("All tasks terminal before cancel took effect; apply state derived from tasks: %s", derivedState), oldState, derivedState)
+	return cancelAlreadySettledResponse(derivedState, skippedCount), nil
+}
+
+// acceptCancelOverSettledApply answers a cancel whose apply write was refused
+// because another writer settled the apply first. The recorded outcome stands
+// and the cancel is accepted, so its durable request completes instead of
+// retrying against an outcome that can no longer change.
+func (c *LocalClient) acceptCancelOverSettledApply(ctx context.Context, apply *storage.Apply, skippedCount int64, caller string, refusal error) (*ternv1.CancelResponse, error) {
+	current, err := c.storage.Applies().Get(ctx, apply.ID)
+	if err != nil {
+		return nil, fmt.Errorf("reload apply %s after cancel lost the race to settle it: %w", apply.ApplyIdentifier, err)
+	}
+	if current == nil {
+		return nil, fmt.Errorf("reload apply %s after cancel lost the race to settle it: %w", apply.ApplyIdentifier, storage.ErrApplyNotFound)
+	}
+	c.logger.Info("cancel arrived after the apply settled; keeping the recorded outcome",
+		append(current.LogAttrs(), "skipped_count", skippedCount, "requested_by", caller, "refusal", refusal)...)
+	return cancelAlreadySettledResponse(current.State, skippedCount), nil
+}
+
+func cancelAlreadySettledResponse(settledState string, skippedCount int64) *ternv1.CancelResponse {
+	return &ternv1.CancelResponse{
+		Accepted:     true,
+		ErrorMessage: fmt.Sprintf("Schema change already %s", settledState),
+		SkippedCount: skippedCount,
+	}
 }
 
 func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error {
@@ -1879,6 +2282,13 @@ func (c *LocalClient) settleControlForCompletedEngineChange(ctx context.Context,
 	}
 	c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
 		eventMsg, previousState, state.Apply.Completed)
+	// Settle the cancel the completed schema change outran before the summary is
+	// posted: the terminal comment renders the command-not-applied notice from
+	// the stored request, so a request still pending here posts a summary that
+	// says nothing about the command the operator issued.
+	if err := SettlePendingCancelForResolvedApply(ctx, c.storage, c.logger, apply); err != nil {
+		return 0, fmt.Errorf("settle the pending cancel the completed schema change outran for apply %s: %w", apply.ApplyIdentifier, err)
+	}
 	c.notifyTerminalObserver(apply, tasks)
 	return skippedCount, nil
 }
@@ -1977,6 +2387,10 @@ func (c *LocalClient) Revert(ctx context.Context, req *ternv1.RevertRequest) (*t
 	}
 	c.logger.Info("sending revert request to engine", task.LogAttrs()...)
 	if _, err = eng.Revert(ctx, controlReq); err != nil {
+		if unsupported, ok := engine.AsUnsupportedOperation(err); ok {
+			c.logDeclinedControlOperation(task, "revert", unsupported)
+			return &ternv1.RevertResponse{Accepted: false, ErrorMessage: unsupported.Error()}, nil
+		}
 		return nil, fmt.Errorf("revert failed: %w", err)
 	}
 	c.logger.Info("engine accepted the revert request", task.LogAttrs()...)
@@ -1996,10 +2410,27 @@ func (c *LocalClient) SkipRevert(ctx context.Context, req *ternv1.SkipRevertRequ
 	}
 	c.logger.Info("sending skip-revert request to engine", task.LogAttrs()...)
 	if _, err = eng.SkipRevert(ctx, controlReq); err != nil {
+		if unsupported, ok := engine.AsUnsupportedOperation(err); ok {
+			c.logDeclinedControlOperation(task, "skip-revert", unsupported)
+			return &ternv1.SkipRevertResponse{Accepted: false, ErrorMessage: unsupported.Error()}, nil
+		}
 		return nil, fmt.Errorf("skip revert failed: %w", err)
 	}
 	c.logger.Info("engine accepted the skip-revert request", task.LogAttrs()...)
 	return &ternv1.SkipRevertResponse{Accepted: true}, nil
+}
+
+// logDeclinedControlOperation records an engine declining a control operation
+// for its whole database type. The decline is returned to the caller as a
+// refused response rather than an error, because an error is the one shape that
+// cannot survive the RPC boundary: the gRPC server maps every error to a
+// generic internal status, and the caller cannot tell a deterministic refusal
+// from a transient failure, so it retries a request no retry can ever satisfy.
+// A refusal carries its reason to both the immediate caller and the durable
+// control request, which resolves on it.
+func (c *LocalClient) logDeclinedControlOperation(task *storage.Task, operation string, err error) {
+	c.logger.Warn("the engine does not support this control operation; refusing it so the request resolves instead of retrying",
+		append(task.LogAttrs(), "operation", operation, "error", err)...)
 }
 
 // getActiveTaskForDatabase finds the first non-terminal task for a database.
@@ -2015,4 +2446,115 @@ func (c *LocalClient) getActiveTaskForDatabase(ctx context.Context, database str
 		}
 	}
 	return nil, nil
+}
+
+// boundCutoverRequestTurn decides what the drive owning tasks does with a
+// pending cutover request bound to operation boundID. take is true only for
+// that operation's own drive while the operation is parked at the cutover. A
+// sibling's drive leaves the request pending, or settles it once the
+// operation it is for has ended, so the request never waits on a drive that
+// no longer exists. The dispatcher decides whose turn it is and says so by
+// naming the operation; this plane does not re-derive the order.
+func (c *LocalClient) boundCutoverRequestTurn(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) (take bool, err error) {
+	driveOperationID, err := applyOperationIDForTasks(tasks)
+	if err != nil {
+		logger.Warn("pending cutover request is bound to one operation but this drive's tasks do not name a single operation; leaving it for that operation's drive",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "error", err)
+		return false, nil
+	}
+	if driveOperationID == boundID {
+		if !tasksParkedAtCutover(tasks) {
+			logger.Info("pending cutover request is waiting for its operation to park at the cutover",
+				"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
+			return false, nil
+		}
+		return true, nil
+	}
+	store := c.storage.ApplyOperations()
+	if store == nil {
+		return false, fmt.Errorf("apply operation store is not configured")
+	}
+	bound, err := store.Get(ctx, boundID)
+	if err != nil {
+		return false, fmt.Errorf("load apply_operation %d the pending cutover of apply %s is for: %w", boundID, apply.ApplyIdentifier, err)
+	}
+	if bound == nil {
+		message := fmt.Sprintf("cutover request was not applied because the operation it was sent for (%d) does not exist", boundID)
+		logger.Warn("failing pending cutover request bound to an operation that does not exist",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
+		return false, failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, message)
+	}
+	switch {
+	case state.IsState(bound.State, state.ApplyOperation.Completed):
+		logger.Info("completing pending cutover request whose operation has cut over",
+			append(bound.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		return false, completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover)
+	case state.IsApplyOperationTerminal(bound.State):
+		logger.Warn("failing pending cutover request whose operation ended without cutting over",
+			append(bound.LogAttrs(), "requested_by", controlRequestCaller(controlReq))...)
+		return false, failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover,
+			fmt.Sprintf("cutover request was not applied because the operation it was sent for is %s", bound.State))
+	}
+	logger.Debug("pending cutover request is bound to a sibling operation; leaving it for that operation's drive",
+		"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "drive_operation_id", driveOperationID)
+	return false, nil
+}
+
+// takeBoundCutoverRequest cuts over the one operation a pending request is
+// bound to, from that operation's own drive, and settles the request with the
+// outcome. It follows the unbound path's recovery wait and its stop and
+// not-ready handling. The apply-state verdicts the unbound path settles on are
+// not this request's to read: the members sharing the apply end on their own,
+// so the bound operation's own state (see boundCutoverRequestTurn) decides
+// whether the request can still apply.
+func (c *LocalClient) takeBoundCutoverRequest(ctx context.Context, apply *storage.Apply, controlReq *storage.ApplyControlRequest, boundID int64, logger *slog.Logger) error {
+	if state.IsState(apply.State, state.Apply.Recovering) {
+		// The cutover path refuses a recovering apply, and settling the
+		// request on that refusal would fail an acknowledged cutover the
+		// operator then has to re-issue. It waits for recovery instead.
+		logger.Info("pending cutover request is waiting for recovery to complete",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "state", apply.State)
+		return nil
+	}
+	if stopReq, err := pendingControlRequest(ctx, c.storage, apply, storage.ControlOperationStop); err != nil {
+		return fmt.Errorf("check pending stop request before pending cutover for apply %s: %w", apply.ApplyIdentifier, err)
+	} else if stopReq != nil {
+		return fmt.Errorf("process pending cutover for apply %s: schema change has a pending stop request; cutover is blocked until stop is processed", apply.ApplyIdentifier)
+	}
+	resp, err := c.cutover(ctx, &ternv1.CutoverRequest{
+		ApplyId:          apply.ApplyIdentifier,
+		Environment:      apply.Environment,
+		ApplyOperationId: strconv.FormatInt(boundID, 10),
+	}, controlRequestCaller(controlReq))
+	if engine.IsNotReady(err) {
+		logger.Info("pending cutover request not accepted yet by engine backend; retrying at the next progress tick",
+			"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID, "error", err)
+		return nil
+	}
+	if err != nil {
+		if failErr := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, err.Error()); failErr != nil {
+			return fmt.Errorf("process pending cutover for apply %s operation %d: %w; fail pending cutover request: %w", apply.ApplyIdentifier, boundID, err, failErr)
+		}
+		return fmt.Errorf("process pending cutover for apply %s operation %d: %w", apply.ApplyIdentifier, boundID, err)
+	}
+	if resp == nil {
+		errorMessage := "the cutover path returned neither a response nor an error"
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, boundID, errorMessage)
+	}
+	if !resp.Accepted {
+		errorMessage := controlRefusalMessage(storage.ControlOperationCutover, resp.ErrorMessage)
+		if err := failPendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover, errorMessage); err != nil {
+			return err
+		}
+		return fmt.Errorf("process pending cutover for apply %s operation %d: %s", apply.ApplyIdentifier, boundID, errorMessage)
+	}
+	if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationCutover); err != nil {
+		return err
+	}
+	logger.Info("pending cutover request for one operation accepted and completed",
+		"requested_by", controlRequestCaller(controlReq), "bound_operation_id", boundID)
+	return nil
 }

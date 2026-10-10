@@ -58,6 +58,11 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
 2. **Apply** — the Spirit engine intercepts the `DROP TABLE` and renames the
    table into `_pending_drops` with a UTC timestamp prefix
    (`YYYYMMDDHHmmSSmmm_<table>`, capped at MySQL's 64-character name limit).
+   A table name too long to fit is shortened by characters and ends in
+   `_<hash>`, derived from its schema and full name. A name that would otherwise
+   match another table quarantined in the same rename (the same table name in
+   two schemas, say) uses progressively more hash characters until it is
+   unique, so every table gets its own copy.
    The rename is atomic and metadata-only, so it completes immediately
    regardless of table size. The apply log records the quarantine table name.
 3. **Retention** — the table sits in `_pending_drops` with its data intact.
@@ -66,6 +71,37 @@ plan: DROP TABLE `users`   RENAME TABLE `app`.`users`
    drops quarantined tables whose timestamp prefix is older than the retention
    period. Tables whose names do not carry a valid timestamp prefix are never
    auto-dropped, because their age is unknown.
+
+**A resumed schema change does not quarantine a table twice.** Before resuming,
+SchemaBot plans again against the live schema. A table an earlier attempt moved
+into `_pending_drops` is no longer part of the diff, so its completed DROP is
+not sent to the engine again. If the engine replays a stopped DROP phase in the
+same process, through its own start path, it skips a missing source table only
+when this attempt recorded moving that table and the recorded copy still
+exists. The record is written before the rename is issued, so a rename the
+server completes after a stop has abandoned it is still recognized on the
+replay. The record does not outlive the process; a resume on another server
+relies on the re-plan above. Any other missing table still fails unless the
+statement says `IF EXISTS`, and a recorded copy that retention has since
+removed fails too: the drop is final, and the message says so and asks for the
+schema change to be planned again against the live schema.
+
+**Cancelling a schema change quarantines its copy too.** A cancelled change
+leaves a shadow table holding every row copied so far, and — if it had already
+cut over — the original table it swapped out. Both hold data the change may
+have spent days producing, so both go through the same quarantine as a table an
+operator deleted from a schema file, under the same retention. The metadata
+describing where the copy had got to (the checkpoint tables and the deferred
+cutover sentinel) is dropped outright, because a checkpoint whose shadow table
+is gone describes a copy that no longer exists.
+
+The operational consequence is the one below: **cancelling no longer frees disk
+immediately.** Before the quarantine, cancelling dropped the shadow table and
+returned its space. Now the copy survives until retention expires, and the
+quarantine rename is metadata-only — it does not release the tablespace. An
+operator cancelling a change *because the target is running out of disk* must
+drop the quarantined copy by hand to get the space back, exactly as they would
+to reclaim space from a quarantined `DROP TABLE`.
 
 ## Recovering a dropped table
 
@@ -79,6 +115,16 @@ WHERE table_schema = '_pending_drops' ORDER BY table_name DESC;
 -- Restore it.
 RENAME TABLE `_pending_drops`.`20260610143022123_users` TO `app`.`users`;
 ```
+
+A quarantined name does not record which schema the table came from, and a
+name that was shortened to fit the 64-character limit (one ending in `_<hash>`)
+does not carry the full table name either, so neither can be mapped back to
+its source from `information_schema` alone. The apply log is the map: for every
+table it quarantines, the apply writes a line of the form
+``table `app`.`users` quarantined as `_pending_drops`.`20260610143022123_users`; recoverable until the pending drops retention period expires``,
+and that line is the authoritative source-to-copy pairing. Look the table up
+there first; the query above only identifies a copy by its own (possibly
+shortened) name.
 
 Also restore the table's `.sql` file in the schema repository, otherwise the
 next plan will produce another `DROP TABLE` for it.
@@ -142,6 +188,19 @@ The apply log for a schema change that drops a table records the quarantine
 database and table name, so operators can locate the table for recovery without
 querying `information_schema`.
 
+### Why a process is not reaping
+
+A process that quarantines without reaping is what leaves tables on a target
+forever, so each way the cleaner can decline to start logs its own line at
+startup, naming the consequence:
+
+| Startup log says | Meaning |
+| --- | --- |
+| the quarantine is disabled | Expected. `DROP TABLE` executes as written. Note that disabling the quarantine disables its cleaner too, so tables quarantined before it was turned off stay on the target until someone removes them. |
+| no local MySQL database targets are configured | Expected for a control plane. Every target is routed to the deployment that executes against it and reaps it. The line carries `routed_mysql_targets`, which separates this from a process with no MySQL topology at all. |
+| cleanup is disabled for this process | Safe only while another deployment reaps the same targets. |
+| retention is invalid | Config bug. Logged at error, and blocks reaping until it is fixed. |
+
 ## Limitations
 
 - **Triggers**: MySQL cannot rename a table with triggers into another
@@ -155,5 +214,8 @@ querying `information_schema`.
   until an operator removes the referencing constraints. Plans that drop a
   parent table should drop the referencing tables or constraints in the same
   change.
-- **Disk space**: quarantined tables keep their data, so dropping a large table
-  does not free space until the retention period expires.
+- **Disk space**: quarantined tables keep their data, so neither dropping a
+  large table nor cancelling a schema change part-way through copying one frees
+  space until the retention period expires. The quarantine rename is
+  metadata-only and does not release the tablespace. Reclaiming the space
+  sooner means dropping the quarantined table by hand.

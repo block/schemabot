@@ -7,8 +7,10 @@ import (
 	"net/url"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/block/spirit/pkg/utils"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -67,6 +69,46 @@ func TestOpenPinsSessionTimezoneToUTC(t *testing.T) {
 	assert.Equal(t, "UTC", tz)
 }
 
+// A time.Time bound to a plain timestamp column is stored as the UTC reading of
+// its instant on every pool this package opens, including the reloadable
+// storage pool, and reads back as that instant in UTC. A process whose local
+// zone is west of UTC would otherwise store its local wall clock, hours behind
+// the session's now().
+func TestPoolsStoreTimestampParametersAsUTC(t *testing.T) {
+	dsn, adminDB := testutil.StartPostgres(t, "postgresconn_timestamps")
+	_, err := adminDB.ExecContext(t.Context(), `CREATE TABLE stamps (pool text PRIMARY KEY, recorded_at timestamp NOT NULL)`)
+	require.NoError(t, err)
+
+	driverZone := time.FixedZone("UTC-5", -5*60*60)
+	instant := time.Date(2026, time.September, 28, 6, 30, 0, 123456000, driverZone)
+
+	pools := map[string]func(t *testing.T) (*sql.DB, error){
+		"Open": func(*testing.T) (*sql.DB, error) { return Open(dsn) },
+		"OpenReloadable": func(*testing.T) (*sql.DB, error) {
+			return OpenReloadable(dsn, func() (string, error) { return dsn, nil })
+		},
+	}
+	for name, open := range pools {
+		t.Run(name, func(t *testing.T) {
+			db, err := open(t)
+			require.NoError(t, err)
+			t.Cleanup(func() { utils.CloseAndLog(db) })
+			require.NoError(t, db.PingContext(t.Context()))
+
+			_, err = db.ExecContext(t.Context(), `INSERT INTO stamps (pool, recorded_at) VALUES ($1, $2)`, name, instant)
+			require.NoError(t, err)
+
+			var wallClock string
+			var got time.Time
+			require.NoError(t, db.QueryRowContext(t.Context(),
+				`SELECT recorded_at::text, recorded_at FROM stamps WHERE pool = $1`, name,
+			).Scan(&wallClock, &got))
+			assert.Equal(t, "2026-09-28 11:30:00.123456", wallClock, "the stored wall clock is the UTC reading")
+			assert.Equal(t, instant.UTC(), got, "the column reads back as the written instant, in UTC")
+		})
+	}
+}
+
 // Rotating the storage password out from under a running pool must be
 // transparent: the next fresh physical connection is rejected with an
 // authentication error, the pool re-resolves the DSN through reload, retries,
@@ -118,4 +160,95 @@ func withPassword(t *testing.T, dsn, password string) string {
 	require.NotNil(t, u.User)
 	u.User = url.UserPassword(u.User.Username(), password)
 	return u.String()
+}
+
+// requireSessionStatementTimeout asserts the session-level statement_timeout a
+// pool's connections run under, as the server reports it.
+func requireSessionStatementTimeout(t *testing.T, db *sql.DB, want string) {
+	t.Helper()
+	var got string
+	require.NoError(t, db.QueryRowContext(t.Context(), "SHOW statement_timeout").Scan(&got))
+	assert.Equal(t, want, got)
+}
+
+// A statement budget SchemaBot states wins over one the platform imposed at
+// the database level. Hosted PostgreSQL providers set statement_timeout on the
+// role or database and tune it for API queries, so a SchemaBot connection that
+// set nothing would silently run DDL under someone else's budget.
+// Startup-packet parameters take precedence over ALTER DATABASE defaults,
+// which this pins.
+func TestWithStatementTimeoutOverridesDatabaseDefault(t *testing.T) {
+	dsn, adminDB := testutil.StartPostgres(t, "postgresconn_stmt")
+
+	_, err := adminDB.ExecContext(t.Context(),
+		`ALTER DATABASE postgresconn_stmt SET statement_timeout = '50ms'`)
+	require.NoError(t, err)
+
+	// Baseline: a fresh session with no option must observe the hostile
+	// database default, so the assertion below tests the option rather than a
+	// server that never had a budget.
+	baseline, err := Open(dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(baseline) })
+	requireSessionStatementTimeout(t, baseline, "50ms")
+
+	db, err := Open(dsn, WithStatementTimeout(45*time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
+
+	requireSessionStatementTimeout(t, db, "45s")
+
+	// The budget is real, not just reported: a statement that outlives it is
+	// cancelled with 57014 rather than running on.
+	shortDB, err := Open(dsn, WithStatementTimeout(100*time.Millisecond))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(shortDB) })
+	_, err = shortDB.ExecContext(t.Context(), "SELECT pg_sleep(5)")
+	require.Error(t, err)
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	assert.Equal(t, "57014", pgErr.Code)
+}
+
+// A zero budget disables statement_timeout explicitly rather than falling back
+// to the platform's value. The bootstrap advisory-lock connection depends on
+// this: it must be free to block inside pg_advisory_lock for the leader's
+// whole bootstrap, and a database-level budget shorter than that wait would
+// otherwise cancel a trailing pod's legitimate queue.
+func TestWithStatementTimeoutZeroDisablesInheritedBudget(t *testing.T) {
+	dsn, adminDB := testutil.StartPostgres(t, "postgresconn_stmt_zero")
+
+	_, err := adminDB.ExecContext(t.Context(),
+		`ALTER DATABASE postgresconn_stmt_zero SET statement_timeout = '50ms'`)
+	require.NoError(t, err)
+
+	db, err := Open(dsn, WithStatementTimeout(0))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
+
+	requireSessionStatementTimeout(t, db, "0")
+
+	// A statement that would have died under the inherited 50ms budget runs to
+	// completion.
+	_, err = db.ExecContext(t.Context(), "SELECT pg_sleep(0.5)")
+	assert.NoError(t, err)
+}
+
+// Omitting the option leaves whatever the platform set in place, so callers
+// that have not chosen a budget are not silently given one.
+func TestWithStatementTimeoutNegativeLeavesInheritedBudget(t *testing.T) {
+	dsn, adminDB := testutil.StartPostgres(t, "postgresconn_stmt_unset")
+
+	_, err := adminDB.ExecContext(t.Context(),
+		`ALTER DATABASE postgresconn_stmt_unset SET statement_timeout = '50ms'`)
+	require.NoError(t, err)
+
+	db, err := Open(dsn, WithStatementTimeout(-1))
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(db) })
+	require.NoError(t, db.PingContext(t.Context()))
+
+	requireSessionStatementTimeout(t, db, "50ms")
 }
