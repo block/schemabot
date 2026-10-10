@@ -25,6 +25,8 @@ engine is what touches your tables.
 | PlanetScale | Vitess | [PlanetScale deploy requests](https://planetscale.com/docs/vitess/schema-changes/deploy-requests) |
 | pg-sprite | PostgreSQL | [pg-sprite](https://github.com/block/pg-sprite) |
 
+For primary key choices and online copy progress, see the [MySQL guide](mysql.md).
+
 Engines are adapters rather than implementations. None of them reimplements online schema change;
 each one drives existing machinery and translates between it and the rest of SchemaBot. In every
 case the work itself lands in the target database: your MySQL, Vitess, or PostgreSQL server is what
@@ -409,6 +411,7 @@ place to keep data.
   guarantees deliberately do not cover.
 - [postgresql.md](postgresql.md) for the full PostgreSQL support envelope: which plans are
   blocked, which statements are admitted, and how each refusal is reported.
+- [vitess.md](vitess.md) for the PlanetScale service token permissions the Vitess engine needs.
 - [throttle.md](throttle.md) for what each throttle signal means when you see one.
 - [pending-drops.md](pending-drops.md) for the quarantine lifecycle.
 - [direct-execution.md](direct-execution.md) for when a change runs directly instead of through a

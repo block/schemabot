@@ -55,11 +55,27 @@ func plannedPrimaryMember(planResp *apitypes.PlanResponse) routing.ExecutionTarg
 // preview is always non-nil (Computed:false), regardless of deployment count,
 // so the PR comment explains why the check is failing closed.
 //
+// A plan narrowed to one rollout member with --target is not rolled up: the
+// rollup compares every deployment against the rollout's primary member, and a
+// narrowed plan is of whichever member it names. It is reported not evaluated,
+// which records nothing about drift; a narrowed apply blocks the check on its
+// own terms (storeNarrowedApplyCheck) and keeps a drift block already stored.
+// A narrowed apply is not refused on drift: applying to one target at a time
+// is how an operator brings diverged targets back in line, and the stored
+// block stays until a rollup of the whole environment finds them converged.
+//
 // primaryPlan is the primary plan proto returned by
 // executePlanProtoWithTransientRetry, reused as the rollup baseline so the
 // comparison is against exactly what was reviewed. primaryMember is the
 // deployment and target that plan was created against.
-func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, primaryPlan *ternv1.PlanResponse, primaryMember routing.ExecutionTarget, repo string, pr int) (reviewDriftOutcome, *templates.DeploymentDriftData) {
+func (h *Handler) reviewTimeDrift(ctx context.Context, planReq api.PlanRequest, primaryPlan *ternv1.PlanResponse, planResp *apitypes.PlanResponse, repo string, pr int) (reviewDriftOutcome, *templates.DeploymentDriftData) {
+	if planResp.NarrowedTo != "" {
+		h.logger.Info("skipping review-time drift rollup: the plan was narrowed to one rollout member",
+			"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment,
+			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+		return reviewDriftOutcome{state: driftNotEvaluated}, nil
+	}
+	primaryMember := plannedPrimaryMember(planResp)
 	if len(primaryPlan.GetErrors()) > 0 {
 		h.logger.Debug("skipping review-time drift rollup: primary plan reported errors",
 			"repo", repo, "pr", pr, "database", planReq.Database, "environment", planReq.Environment)

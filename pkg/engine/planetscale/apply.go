@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"strings"
@@ -84,6 +85,14 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// Check if resuming
 	if req.ResumeState != nil && req.ResumeState.Metadata != "" {
 		return e.resumeApply(ctx, client, org, req)
+	}
+
+	// The tables the plan was reviewed with ignore_tables withholding are
+	// resolved before the branch is created, so an entry that cannot be read
+	// stops the apply before it has anything to clean up.
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("apply plan %s to database %s: %w", req.PlanID, req.Database, err)
 	}
 
 	emitEvent := e.eventEmitter(req)
@@ -170,11 +179,18 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 			return
 		}
 		if ctx.Err() != nil && recordedBranch == ownedBranch {
-			e.logger.Info("drive ended before the deploy request was created; keeping the branch for the driver that resumes the apply",
-				"organization", org, "database", req.Database, "branch", ownedBranch, "apply_error", retErr)
+			e.applyLogger(req).Info("drive ended before the deploy request was created; keeping the branch for the driver that resumes the apply",
+				"organization", org, "planetscale_database", req.Database, "branch", ownedBranch, "apply_error", retErr)
 			return
 		}
-		e.deleteOwnedBranch(ctx, client, org, req.Database, ownedBranch, retErr)
+		// A branch the stored state names stays resumable until the delete
+		// lands, so its delete follows the drive's context; one it does not
+		// name is deleted even after the drive's context ends.
+		deleteCtx := ctx
+		if recordedBranch != ownedBranch {
+			deleteCtx = context.WithoutCancel(ctx)
+		}
+		e.deleteOwnedBranch(deleteCtx, e.applyLogger(req), client, org, req.Database, ownedBranch, retErr)
 	}()
 
 	if existingBranch != "" {
@@ -305,7 +321,7 @@ func (e *Engine) Apply(ctx context.Context, req *engine.ApplyRequest) (result *e
 	// PlanetScale API which may return stale data after UpdateKeyspaceVSchema.
 	// Retry up to 30s to allow the API to converge.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, engine.NewIgnoredTables(req.IgnoreTables), password); err != nil {
+	if err := e.verifyBranchMatchesDesiredWithRetry(ctx, client, org, req.Database, branchName, keyspaces, req.SchemaFiles, ignored, password); err != nil {
 		return nil, fmt.Errorf("branch validation failed after DDL apply: %w", err)
 	}
 	emitEvent(engine.ApplyEvent{
@@ -867,6 +883,16 @@ func plannedTableName(keyspace string, tc engine.TableChange) (string, error) {
 	return name, nil
 }
 
+// applyLogger returns the logger scoped to this schema change when the caller
+// supplied one, so a line about the apply carries the caller's triage identity
+// (apply id, repo, PR, environment), and the engine logger otherwise.
+func (e *Engine) applyLogger(req *engine.ApplyRequest) *slog.Logger {
+	if req.Logger != nil {
+		return req.Logger
+	}
+	return e.logger
+}
+
 // eventEmitter returns a closure that logs a lifecycle event and sends it to
 // the caller for apply_logs recording.
 func (e *Engine) eventEmitter(req *engine.ApplyRequest) func(engine.ApplyEvent) {
@@ -902,7 +928,7 @@ func rowCopyDeclineEvent(unsafe bool, unsafeReason string) engine.ApplyEvent {
 // Handles two crash scenarios:
 //   - Branch exists, no deploy request: diff branch against desired schema, apply remaining DDL, then create and deploy the deploy request
 //   - Branch exists, deploy request exists: reattach, deploy it when it was created but never started, and rediscover the Vitess migration_context for progress
-func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest) (*engine.ApplyResult, error) {
+func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org string, req *engine.ApplyRequest) (_ *engine.ApplyResult, retErr error) {
 	meta, err := decodePSMetadata(req.ResumeState.Metadata)
 	if err != nil {
 		return nil, fmt.Errorf("decode resume state: %w", err)
@@ -939,6 +965,25 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 		return nil, fmt.Errorf("wait for branch %s on resume: %w", meta.BranchName, err)
 	}
 
+	// The branch exists and is ready, and until the deploy request is created
+	// nothing else owns its teardown, so every exit from here to that point
+	// reclaims it. Once the deploy request exists it owns the teardown
+	// (auto_delete_branch) and the reclaim is disarmed. A create response lost
+	// to a timeout leaves the reclaim armed; deleting the branch is still safe
+	// there, for the reasons the fresh drive's cleanup in Apply gives.
+	handedToDeployRequest := false
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if handedToDeployRequest {
+			e.applyLogger(req).Info("resumed apply failed after its deploy request was created; the deploy request owns the branch's teardown",
+				"organization", org, "planetscale_database", req.Database, "branch", meta.BranchName, "apply_error", retErr)
+			return
+		}
+		e.reclaimBranchAfterFailedResume(ctx, client, org, req, meta.BranchName, retErr)
+	}()
+
 	resumePwCtx, resumePwCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer resumePwCancel()
 	password, err := client.CreateBranchPassword(resumePwCtx, &ps.DatabaseBranchPasswordRequest{
@@ -955,7 +1000,10 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	// Tables the plan was reviewed with ignore_tables withholding are left out,
 	// as the plan left them out.
 	keyspaces := sortedKeyspaces(req.SchemaFiles)
-	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("resume branch %s: %w", meta.BranchName, err)
+	}
 	branchSchema, err := e.fetchBranchSchemaViaMySQL(ctx, password, keyspaces)
 	if err != nil {
 		return nil, fmt.Errorf("fetch branch %s schema via MySQL on resume: %w", meta.BranchName, err)
@@ -970,12 +1018,12 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	}
 
 	if len(remainingChanges) > 0 {
-		e.logger.Info("applying remaining planned changes on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
+		e.applyLogger(req).Info("applying remaining planned changes on resume", "branch", meta.BranchName, "keyspaces", len(remainingChanges))
 		if err := e.applyChangesToBranch(ctx, remainingChanges, req.SchemaFiles, password, client, org, req.Database, meta.BranchName, emitEvent); err != nil {
 			return nil, fmt.Errorf("apply remaining changes on resume: %w", err)
 		}
 	} else {
-		e.logger.Info("all planned changes already applied on branch", "branch", meta.BranchName)
+		e.applyLogger(req).Info("all planned changes already applied on branch", "branch", meta.BranchName)
 	}
 
 	// The resumed branch must match the declared schema before a deploy request
@@ -1006,6 +1054,7 @@ func (e *Engine) resumeApply(ctx context.Context, client psclient.PSClient, org 
 	if err != nil {
 		return nil, fmt.Errorf("create deploy request on resume: %w", err)
 	}
+	handedToDeployRequest = true
 	dr, err = e.waitForDeployRequestPending(ctx, client, org, req.Database, dr, emitEvent)
 	if err != nil {
 		return nil, fmt.Errorf("wait for deploy request on resume: %w", err)

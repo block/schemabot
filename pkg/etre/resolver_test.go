@@ -262,10 +262,11 @@ func TestNewEtreResolverValidatesConfig(t *testing.T) {
 	require.NoError(t, err)
 
 	cases := map[string]func(*EtreResolverConfig){
-		"etre client is required":          func(c *EtreResolverConfig) { c.Client = nil },
-		"target label is required":         func(c *EtreResolverConfig) { c.TargetLabel = "" },
-		"credential resolver is required":  func(c *EtreResolverConfig) { c.Credentials = nil },
-		"connection assembler is required": func(c *EtreResolverConfig) { c.Assembler = nil },
+		"etre client is required":                    func(c *EtreResolverConfig) { c.Client = nil },
+		"target label is required":                   func(c *EtreResolverConfig) { c.TargetLabel = "" },
+		"credential resolver is required":            func(c *EtreResolverConfig) { c.Credentials = nil },
+		"connection assembler is required":           func(c *EtreResolverConfig) { c.Assembler = nil },
+		"table_owner is only supported for postgres": func(c *EtreResolverConfig) { c.TableOwner = "app_owner" },
 	}
 	for wantErr, mutate := range cases {
 		cfg := base
@@ -274,4 +275,34 @@ func TestNewEtreResolverValidatesConfig(t *testing.T) {
 		require.Error(t, err, wantErr)
 		assert.Contains(t, err.Error(), wantErr)
 	}
+}
+
+// End to end with the real PostgreSQL assembler: the inventory records the
+// cluster endpoint but no database name, so the database comes from the
+// credential secret (decoded from the JSON format AWS uses for RDS database
+// secrets), and every resolved target carries the configured table owner so
+// tables the engine creates are owned by the application's owner role.
+func TestEtreResolverResolvesPostgresTarget(t *testing.T) {
+	var gotQuery string
+	entity := etre.Entity{"writer_endpoint": "orders.cluster-abc.us-east-1.rds.amazonaws.com", "name": "orders-cluster"}
+	r := newEtreResolverForTest(t, &gotQuery, []etre.Entity{entity}, EtreResolverConfig{
+		TargetLabel: "dsid",
+		EnvLabel:    "env",
+		HostField:   "writer_endpoint",
+		Credentials: inventory.SecretRefCredentialResolver{
+			PasswordRef: `{"username":"engine","password":"s3cret","dbname":"orders"}`,
+			Decode:      inventory.DecodePostgresSecret,
+		},
+		Assembler:  inventory.PostgresConnectionAssembler{DefaultPort: "5432"},
+		TableOwner: "app_owner",
+	})
+
+	target, err := r.ResolveTarget(t.Context(), inventory.Request{Target: "orders-dsid", DatabaseType: "postgres", Environment: "staging"})
+	require.NoError(t, err)
+
+	assert.Equal(t, "dsid=orders-dsid,env=staging", gotQuery)
+	assert.Equal(t, "postgres", target.DatabaseType)
+	assert.Equal(t, "postgresql://engine:s3cret@orders.cluster-abc.us-east-1.rds.amazonaws.com:5432/orders?sslmode=verify-full", target.DSN) // sadscan:disable np.postgres.1
+	assert.Equal(t, map[string]string{inventory.MetadataPostgresCARef: inventory.PostgresCARefEmbeddedRDSGlobal}, target.Metadata)
+	assert.Equal(t, "app_owner", target.TableOwner)
 }

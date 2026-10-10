@@ -20,6 +20,7 @@ import (
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
 	postgresengine "github.com/block/schemabot/pkg/engine/postgres"
+	"github.com/block/schemabot/pkg/inventory"
 	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
 	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
@@ -5128,4 +5129,11 @@ func TestLocalClient_ProgressCarriesPerTableErrorMessage(t *testing.T) {
 	assert.Empty(t, byTable["orders"].ErrorMessage, "a table that did not fail carries no error")
 	assert.Empty(t, byTable["payments"].ErrorMessage,
 		"a table cancelled because an earlier table's failure ended the apply has no error of its own, so the root-cause table stays identifiable")
+}
+
+// A database configured locally without an api_url and one resolved through
+// inventory without one both address the public PlanetScale API. The two
+// paths default in different packages, so the defaults are held equal here.
+func TestPlanetScaleDefaultAPIURLsAgree(t *testing.T) {
+	assert.Equal(t, inventory.DefaultPlanetScaleAPIURL, psclient.DefaultBaseURL)
 }

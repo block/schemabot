@@ -237,6 +237,50 @@ func TestPlanGetHandler(t *testing.T) {
 	assert.Equal(t, "carts", resp.Plan.Shards[0].Changes[0].TableName)
 }
 
+// A stored Vitess plan shows the VSchema diff it was reviewed with, so
+// reading the plan back later shows the same routing change the PR comment
+// did. A plan recorded without a diff still reads as changing its VSchema.
+func TestPlanGetHandlerCarriesTheRecordedVSchemaDiff(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	const diff = "--- a/commerce.json\n+++ b/commerce.json\n+    \"carts_seq\": {\n+      \"type\": \"sequence\"\n+    },\n"
+	cases := []struct {
+		name     string
+		metadata map[string]string
+		wantDiff string
+	}{
+		{
+			name:     "diff recorded at plan time",
+			metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true", storage.PlanMetadataVSchemaDiff: diff},
+			wantDiff: diff,
+		},
+		{
+			name:     "no diff recorded",
+			metadata: map[string]string{storage.PlanMetadataVSchemaChanged: "true"},
+			wantDiff: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := storedTestPlans(now)[1]
+			plan.Namespaces["commerce"].Metadata = tc.metadata
+			mux := newPlansTestServer(t, &mockPlanLookupStore{plan: plan})
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/plans/plan-100", nil)
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+			var resp apitypes.StoredPlanResponse
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+			require.NotNil(t, resp.Plan)
+			require.Len(t, resp.Plan.Changes, 1)
+			change := resp.Plan.Changes[0]
+			assert.True(t, change.ShowsVSchemaChange(), "a stored VSchema change must still show as one")
+			assert.Equal(t, tc.wantDiff, change.Metadata[apitypes.VSchemaDiffMetadataKey])
+		})
+	}
+}
+
 // A stored plan narrowed to one rollout member reads back as narrowed, so it
 // is never mistaken for a plan of the whole rollout; a plan of the whole
 // rollout reads back with no narrowing.

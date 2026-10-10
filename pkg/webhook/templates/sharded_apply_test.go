@@ -553,7 +553,7 @@ func TestRenderShardedApplyComment_TableLinesReplaceShardTable(t *testing.T) {
 	})
 
 	assert.Contains(t, out, "**`mutes`**: 🔄 Row copy in progress")
-	assert.Contains(t, out, "└ shards: ◐ -40 45% · ⏳ 80-", "the in-flight table carries the compact shard summary")
+	assert.Contains(t, out, "- Shards: 2 (1 copying, 1 queued)\n  - ◉ `-40`: 45%\n  - ○ `80-`: queued\n", "the in-flight table lists its shards")
 	assert.NotContains(t, out, "| Shard | Status |", "a healthy uniform keyspace renders no per-shard table")
 }
 
@@ -581,7 +581,8 @@ func TestRenderShardedApplyComment_TableCopyProgressBar(t *testing.T) {
 
 	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62%")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s")
-	assert.Contains(t, out, "└ shards: ◐ -40 71% · ◐ 80- 54%", "the shard summary stays below the rows line")
+	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 · ETA: 3m 15s\n- Shards: 2 (2 copying)\n  - ◉ `80-`: 54%\n  - ◉ `-40`: 71%\n",
+		"the shard list sits below the rows line, the shard furthest behind first")
 	assert.NotContains(t, out, "Row copy in progress", "the bar replaces the state phrase")
 	assert.NotContains(t, out, "across", "full coverage needs no disclosure")
 	assert.NotContains(t, out, "62% (", "full coverage carries no headline qualifier")
@@ -611,7 +612,7 @@ func TestRenderShardedApplyComment_TableCopyPartialCoverageDisclosed(t *testing.
 
 	assert.Contains(t, out, "**`mutes`**: "+ui.ProgressBarRowCopy(62)+" 62% (1 of 2 shards)")
 	assert.Contains(t, out, "- Rows: 914,707 / 1,466,232 across 1 of 2 shards · ETA: ≥ 3m 15s")
-	assert.Contains(t, out, "└ shards: ◐ -40 62% · ⏳ 80-", "the shard summary stays below the rows line")
+	assert.Contains(t, out, "- Shards: 2 (1 copying, 1 queued)\n  - ◉ `-40`: 62%\n  - ○ `80-`: queued\n", "the shard list sits below the rows line")
 }
 
 // A copying table carries its planned size beside its rows. With every shard
@@ -1085,7 +1086,7 @@ func TestRenderShardedApplyComment_PartialLandingStatesCoverage(t *testing.T) {
 	inFlight := RenderShardedApplyComment(mixed(state.Task.Running, state.Task.Running))
 	assert.NotContains(t, inFlight, "applied on",
 		"an in-flight aggregate's shard summary already carries the breakdown")
-	assert.Contains(t, inFlight, "└ shards:")
+	assert.Contains(t, inFlight, "- Shards: 4 (")
 }
 
 // A table that changes on only some of the keyspace's shards names them above
@@ -1130,7 +1131,7 @@ func TestRenderShardedApplyComment_CopyingTableReadsLikeVitess(t *testing.T) {
 	bar := strings.Index(out, "**`mutes`**: 🟦")
 	ddl := strings.Index(out, "```sql\nALTER TABLE `mutes` ADD INDEX")
 	rows := strings.Index(out, "- Rows: 500 / 1,000")
-	shards := strings.Index(out, "└ shards:")
+	shards := strings.Index(out, "- Shards:")
 	require.NotEqual(t, -1, bar, "the aggregated progress bar renders:\n%s", out)
 	assert.Contains(t, out, "50%", "the bar aggregates both shards' rows")
 	assert.Less(t, bar, ddl, "the DDL follows the progress bar")

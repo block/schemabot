@@ -234,6 +234,38 @@ func RegistersWorkSynchronously(eng Engine) bool {
 	return ok && reg.RegistersWorkSynchronously()
 }
 
+// ShardKeyedPlanning is an optional interface for engines whose Plan describes
+// each shard of a sharded namespace on its own, and lists every shard that
+// still needs a change.
+//
+// This decides how a driver reads a re-plan that does not mention a task that
+// ran on one shard. An engine that fans a change out to its shards behind one
+// endpoint reports a namespace as a unit, so a shard missing from its plan says
+// nothing about that shard. An engine that plans each shard itself leaves a
+// shard out exactly when that shard already has the reviewed schema. That
+// includes the namespace whose every shard has it, which such a plan does not
+// mention at all, so the driver cannot tell the two kinds of plan apart from
+// the plan alone. Only the engine knows which kind it produces.
+//
+// Engines that do not implement this interface are treated as reporting
+// namespaces as a unit. A shard-tagged task the plan does not mention is then
+// never settled as completed on that evidence; the driver runs its reviewed
+// statement again instead.
+type ShardKeyedPlanning interface {
+	// PlansEachShard reports whether Plan lists every shard that still needs a
+	// change, so a shard it leaves out already has the reviewed schema.
+	PlansEachShard() bool
+}
+
+// PlansEachShard reports whether eng declares that its Plan lists every shard
+// that still needs a change. Engines that do not implement ShardKeyedPlanning
+// are treated as reporting namespaces as a unit, so their silence about a
+// shard is never read as the shard having the reviewed schema.
+func PlansEachShard(eng Engine) bool {
+	planner, ok := eng.(ShardKeyedPlanning)
+	return ok && planner.PlansEachShard()
+}
+
 // DeferredCutoverSignalRequest identifies the target database whose deferred
 // cutover signal should be inspected.
 type DeferredCutoverSignalRequest struct {
@@ -387,8 +419,10 @@ type PlanRequest struct {
 
 	// IgnoreTables lists the live tables the repository's ignore_tables config
 	// withholds from the planner, so a table no schema file declares is not
-	// proposed for DROP TABLE. Entries are matched exactly and case-sensitively
-	// against the target's own catalog, in every namespace the plan covers.
+	// proposed for DROP TABLE. Entries are matched against the target's own
+	// catalog, in every namespace the plan covers: a plain entry exactly and
+	// case-sensitively, an entry wrapped in slashes as a regular expression over
+	// the whole name. An entry that does not compile fails the plan.
 	// Every engine honors the list, discloses what it actually withheld through
 	// ExemptTables, and refuses a table the config withholds that a schema file
 	// also declares (see IgnoredTables).

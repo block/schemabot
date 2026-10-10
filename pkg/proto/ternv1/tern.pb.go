@@ -1142,10 +1142,12 @@ type PlanRequest struct {
 	GroupedExecution *bool `protobuf:"varint,12,opt,name=grouped_execution,json=groupedExecution,proto3,oneof" json:"grouped_execution,omitempty"`
 	// Live tables the repository's ignore_tables config withholds from the
 	// planner, so a table no schema file declares is not proposed for
-	// DROP TABLE. Matched exactly and case-sensitively against the target's own
-	// catalog, in every namespace the plan covers. The engine discloses what it
-	// actually withheld through exempt_tables on the response, and refuses a
-	// table the config withholds that a schema file also declares.
+	// DROP TABLE. Matched against the target's own catalog, in every namespace
+	// the plan covers: a plain entry exactly and case-sensitively, and an entry
+	// wrapped in slashes as a regular expression over the whole name. The
+	// engine discloses what it actually withheld through exempt_tables on the
+	// response, and refuses a table the config withholds that a schema file
+	// also declares.
 	IgnoreTables []string `protobuf:"bytes,13,rep,name=ignore_tables,json=ignoreTables,proto3" json:"ignore_tables,omitempty"`
 	// The caller's resolved direct execution policy for this database and
 	// environment. A control plane forwards it so the target that runs the

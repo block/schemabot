@@ -120,8 +120,8 @@ type ErrorResponse struct {
 
 	// RetryAfterSeconds is how long the client should wait before retrying,
 	// set only on responses that carry a Retry-After header. It repeats the
-	// header in the body because the CLI's HTTP client reads error bodies and
-	// not response headers.
+	// header in the body so a client that reads only the error body, such as
+	// an older CLI, still sees the wait.
 	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
@@ -850,6 +850,13 @@ type PlanRolloutResponse struct {
 	// schema, so members are expected to differ. False means every member is
 	// expected to run the primary's plan.
 	Independent bool `json:"independent,omitempty"`
+	// MultiTarget is true when some deployment of the rollout addresses more
+	// than one target. An apply of such a rollout refuses --defer-cutover.
+	MultiTarget bool `json:"multi_target,omitempty"`
+	// ShapeRefusal is why apply creation refuses an apply of the whole rollout
+	// whatever options it carries, naming the apply to run instead. It is
+	// empty when the rollout's shape admits one.
+	ShapeRefusal string `json:"shape_refusal,omitempty"`
 	// Groups holds one entry per distinct plan, naming the members that run
 	// it, with the primary's group first.
 	Groups []*PlanMemberGroupResponse `json:"groups,omitempty"`
@@ -1268,12 +1275,20 @@ func (r *PlanResponse) eachUnsafeChange(fn func(namespace string, c UnsafeChange
 // blocked change guarantees the apply fails, so gates use this to reject the
 // apply before it starts.
 func (r *PlanResponse) HasBlockedChanges() bool {
+	return r.FirstBlockedChange() != nil
+}
+
+// FirstBlockedChange returns the first planned change carrying the blocked
+// execution-mode verdict, namespace-level changes before per-shard ones, or
+// nil when there is none. A refusal names this change and its engine's reason,
+// which says what has to change before an apply can run it.
+func (r *PlanResponse) FirstBlockedChange() *TableChangeResponse {
 	if r == nil {
-		return false
+		return nil
 	}
 	for _, t := range r.FlatTables() {
 		if t.EngineBlocked() {
-			return true
+			return t
 		}
 	}
 	for _, sp := range r.Shards {
@@ -1282,11 +1297,11 @@ func (r *PlanResponse) HasBlockedChanges() bool {
 		}
 		for _, t := range sp.Changes {
 			if t.EngineBlocked() {
-				return true
+				return t
 			}
 		}
 	}
-	return false
+	return nil
 }
 
 // DiscardedCopies returns the unfinished copies on the target that applying
@@ -1765,9 +1780,13 @@ type ProgressOperationResponse struct {
 	// AlreadyConverged is true for an operation recorded completed when the
 	// apply was created, because its target already held the change and
 	// nothing ran there.
-	AlreadyConverged bool   `json:"already_converged,omitempty"`
-	StartedAt        string `json:"started_at,omitempty"`
-	CompletedAt      string `json:"completed_at,omitempty"`
+	AlreadyConverged bool `json:"already_converged,omitempty"`
+	// RolloutStep is the table step this operation runs, numbered from 1, when
+	// the rollout runs table by table: one operation per target and table.
+	// Omitted for an operation that runs its member's whole change.
+	RolloutStep int    `json:"rollout_step,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	CompletedAt string `json:"completed_at,omitempty"`
 }
 
 // TableProgressResponse represents progress for a single table.

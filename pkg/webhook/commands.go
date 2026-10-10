@@ -43,6 +43,10 @@ type CommandSpec struct {
 
 	// SupportsForce means `--force` is recognized.
 	SupportsForce bool
+
+	// SupportsTarget means `--target <target>` is recognized: the command can
+	// be narrowed to one rollout member of the environment `-e` names.
+	SupportsTarget bool
 }
 
 // commandSpecs is the registry of all SchemaBot commands. Order does not
@@ -50,10 +54,10 @@ type CommandSpec struct {
 // the start of "apply-confirm".
 var commandSpecs = []CommandSpec{
 	{Name: action.Help},
-	{Name: action.Plan, RequiresEnv: true, SupportsDB: true},
+	{Name: action.Plan, RequiresEnv: true, SupportsDB: true, SupportsTarget: true},
 	{Name: action.Apply, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true,
-		SupportsAllowUnsafe: true},
+		SupportsAllowUnsafe: true, SupportsTarget: true},
 	{Name: action.ApplyConfirm, RequiresEnv: true, SupportsDB: true,
 		SupportsSkipRevert: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 	{Name: action.Unlock, SupportsDB: true, SupportsForce: true},
@@ -66,7 +70,7 @@ var commandSpecs = []CommandSpec{
 	{Name: action.SkipRevert, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Cutover, RequiresEnv: true, HasApplyID: true},
 	{Name: action.Rollback, RequiresEnv: true, HasApplyID: true},
-	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true},
+	{Name: action.RollbackConfirm, RequiresEnv: true, SupportsDeferCutover: true, SupportsAllowUnsafe: true},
 }
 
 // CommandNames returns the command word of every registered PR comment
@@ -97,6 +101,11 @@ var specByName = func() map[string]CommandSpec {
 func commandSupportsDatabaseFlag(actionName string) bool {
 	spec, ok := specByName[actionName]
 	return ok && spec.SupportsDB
+}
+
+func commandSupportsTargetFlag(actionName string) bool {
+	spec, ok := specByName[actionName]
+	return ok && spec.SupportsTarget
 }
 
 // CommandParser parses SchemaBot commands from PR comments.
@@ -135,10 +144,14 @@ type CommandResult struct {
 	// CommentID is the PR comment that carried this command. Handlers
 	// acknowledge it with a reaction once they commit to acting, so on a
 	// fan-out only the deployments actually doing work acknowledge.
-	CommentID    int64
-	ApplyID      string // Positional apply identifier for apply-scoped commands.
-	Environment  string
-	Database     string // Optional -d flag value
+	CommentID   int64
+	ApplyID     string // Positional apply identifier for apply-scoped commands.
+	Environment string
+	Database    string // Optional -d flag value
+	// Target is the optional --target value: the one rollout member of the
+	// environment a plan or apply is narrowed to, by its target name or as
+	// deployment/target.
+	Target       string
 	Tenant       string // Optional --tenant/-t routing target for this command.
 	TenantError  bool   // True when --tenant/-t is present without a valid routing target.
 	SkipRevert   bool
@@ -254,6 +267,7 @@ var valueFlags = map[string]string{
 	"-d":       "-d",
 	"-t":       "-t",
 	"--tenant": "-t",
+	"--target": "--target",
 }
 
 // firstDirective returns the first line that opens with `schemabot` and is
@@ -287,9 +301,9 @@ func (p *CommandParser) firstDirective(body string) (d directive, ok, prose bool
 // is malformed when a token is close to one SchemaBot accepts but is not
 // exactly it (a punctuated command word, an unknown, punctuated, or
 // autocorrected flag, a punctuated apply ID, optional-argument brackets copied
-// from usage text, an invalid database, a missing environment or database),
-// or when it is ambiguous (a value flag given twice, two apply IDs). A
-// present -e or -t value is checked later, where an invalid one gets its own
+// from usage text, an invalid database or target, a missing environment,
+// database, or target), or when it is ambiguous (a value flag given twice, two
+// apply IDs). A present -e or -t value is checked later, where an invalid one gets its own
 // usage answer.
 func (p *CommandParser) parseDirective(words []string) directive {
 	d := directive{kind: lineCommand, flags: map[string]bool{}, values: map[string]string{}, repeated: map[string]bool{}}
@@ -351,6 +365,13 @@ func (p *CommandParser) parseDirective(words []string) directive {
 		malformed = true
 	}
 	if database, given := d.values["-d"]; given && !p.databaseNameRegex.MatchString(database) {
+		malformed = true
+	}
+	// Target names are opaque to the parser: the server matches the selector
+	// exactly against the rollout and names the valid ones when it matches
+	// none, so the word is forwarded as typed and only a missing one is
+	// rejected here.
+	if target, given := d.values["--target"]; given && target == "" {
 		malformed = true
 	}
 	if malformed {
@@ -618,6 +639,11 @@ func (p *CommandParser) applySpec(spec CommandSpec, d directive, tenant string, 
 	if spec.SupportsDB && d.values["-d"] != "" {
 		result.Database = storage.CanonicalKey(d.values["-d"])
 	}
+	// Target names are matched exactly against the server config, so the
+	// value is kept as typed.
+	if spec.SupportsTarget {
+		result.Target = d.values["--target"]
+	}
 	if spec.SupportsSkipRevert {
 		result.SkipRevert = d.flags["--skip-revert"]
 	}
@@ -695,6 +721,14 @@ func (p *CommandParser) HasAutoConfirmFlag(body string) bool {
 func (p *CommandParser) HasDatabaseFlag(body string) bool {
 	d, ok := p.commandDirective(body)
 	return ok && d.values["-d"] != ""
+}
+
+// HasTargetFlag reports whether the command carries a `--target <target>`
+// flag, regardless of which command it accompanies. Read off the directive
+// line for the same reason as HasDatabaseFlag.
+func (p *CommandParser) HasTargetFlag(body string) bool {
+	d, ok := p.commandDirective(body)
+	return ok && d.values["--target"] != ""
 }
 
 // HasDeferCutoverFlag reports whether the command carries `--defer-cutover`,

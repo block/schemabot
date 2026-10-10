@@ -14,6 +14,7 @@ import (
 	"github.com/block/schemabot/pkg/cmd/cliname"
 	"github.com/block/schemabot/pkg/cmd/internal/templates"
 	"github.com/block/schemabot/pkg/ddl"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -147,6 +148,22 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		return nil
 	}
 
+	// An apply that spans several deployments, one of them with several
+	// targets, is refused by apply creation whatever its flags; refusing it
+	// here, before the prompt and the lock, leaves nothing held. A rollout
+	// already up to date has nothing to apply, so it says so above instead,
+	// and an apply that confirms convergence stays a no-op.
+	if rollout := planResult.WholeRollout(); rollout != nil && rollout.ShapeRefusal != "" {
+		return errors.New(rollout.ShapeRefusal)
+	}
+
+	// Each target of a multi-target rollout cuts over as its table finishes,
+	// so the server refuses --defer-cutover there; refusing it before the
+	// prompt saves confirming an apply that will not start.
+	if rollout := planResult.WholeRollout(); cmd.DeferCutover && rollout != nil && rollout.MultiTarget {
+		return fmt.Errorf("--defer-cutover is not supported on an apply to more than one target; apply again without --defer-cutover, or apply one target with --target")
+	}
+
 	// A targeted apply's preflight: the plan has resolved its member, and has
 	// work that would conflict with a schema change on that deployment.
 	if cmd.Target != "" {
@@ -155,6 +172,21 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 		}); err != nil {
 			return err
 		}
+	}
+
+	// The primary is not listed among rollout member refusals. Its engine's
+	// blocked verdict also refuses single-target and narrowed applies, and no
+	// unsafe opt-in makes it executable. It is checked before the member
+	// refusals, whose remedy is a rerun of the rollout that this verdict would
+	// refuse after those members had already changed.
+	if err := blockedPlanError("apply", planResult); err != nil {
+		if cmd.Output != OutputFormatJSON {
+			// The refused statement is shown before the refusal, since the
+			// remedy, whichever the reason names, starts with reading it.
+			OutputPlanResult(planResult, cfg.Database, cmd.Environment, cfg.SchemaDir, true)
+			writeNarrowedTo(planResult)
+		}
+		return err
 	}
 
 	// The server lists the members whose own plans apply creation refuses in
@@ -589,6 +621,27 @@ func blockUnsafeApply(planResult *apitypes.PlanResponse, database, environment, 
 	// Then show the unsafe changes warning
 	templates.WriteUnsafeChangesBlocked(unsafeChanges, retry)
 	return ErrSilent
+}
+
+// blockedPlanError returns the refusal for a plan carrying a blocked
+// execution verdict, or nil when it carries none. It names the plan, the
+// first blocked table, and the engine's reason, which says what has to change:
+// the statement, the target's provisioning, or the server's policy. A reason
+// with several independent causes lists each on its own line, so an operator
+// fixing the first is not surprised by the second on the next attempt.
+func blockedPlanError(command string, plan *apitypes.PlanResponse) error {
+	change := plan.FirstBlockedChange()
+	if change == nil {
+		return nil
+	}
+	reason := change.ModeReason
+	if strings.TrimSpace(reason) == "" {
+		reason = "the engine refuses this statement"
+	}
+	if causes := engine.BlockedCauses(reason); len(causes) > 1 {
+		return fmt.Errorf("%s blocked: plan %s contains a blocked change for table %q:\n- %s", command, plan.PlanID, change.TableName, strings.Join(causes, "\n- "))
+	}
+	return fmt.Errorf("%s blocked: plan %s contains a blocked change for table %q: %s", command, plan.PlanID, change.TableName, reason)
 }
 
 // rolloutAttentionSummary names each rollout member that needs attention with

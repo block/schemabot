@@ -343,6 +343,7 @@ func TestBuildApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t *testi
 
 	assert.Equal(t, state.ApplyOperation.Pending, groups[0].Operation.State)
 	require.Len(t, groups[0].Tasks, 1)
+	assert.False(t, groups[0].Operation.IsConvergedPlaceholder(), "the working member is dispatched")
 	assert.False(t, groups[0].Operation.AlreadyConverged, "the member with work has the change still to run")
 
 	converged := groups[1].Operation
@@ -352,6 +353,7 @@ func TestBuildApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t *testi
 	assert.Nil(t, converged.StartedAt, "a converged member never started: nothing ran on its target")
 	require.NotNil(t, converged.CompletedAt)
 	assert.Equal(t, pershardTestTime(), *converged.CompletedAt)
+	assert.True(t, converged.IsConvergedPlaceholder(), "the row is written in the shape the remote manifest leaves out")
 }
 
 // A sharded plan describes the same (namespace, shard, table) work on every
@@ -645,10 +647,12 @@ func TestBuildApplyOperationGroups_ConvergedPrimaryIsCompletedWhenASiblingHasWor
 
 	assert.Empty(t, groups[0].Tasks, "the primary's own target already holds the change")
 	assert.Equal(t, state.ApplyOperation.Completed, groups[0].Operation.State)
+	assert.True(t, groups[0].Operation.IsConvergedPlaceholder(), "the primary's row is written in the shape the remote manifest leaves out")
 	assert.True(t, groups[0].Operation.AlreadyConverged)
 
 	assert.Equal(t, state.ApplyOperation.Pending, groups[1].Operation.State)
 	require.Len(t, groups[1].Tasks, 1, "the sibling's own DDL is still driven")
+	assert.False(t, groups[1].Operation.IsConvergedPlaceholder(), "the sibling is dispatched")
 }
 
 // An apply whose every member is converged has nothing for any driver to claim.
@@ -938,10 +942,12 @@ func TestBuildApplyOperationGroups_ConvergedMemberFinalizerIsCompletedOnCreation
 	}
 	assert.Equal(t, state.ApplyOperation.Pending, byTarget["testapp-001"].State, "the primary target's finalizer is driven")
 	assert.Nil(t, byTarget["testapp-001"].CompletedAt)
+	assert.False(t, byTarget["testapp-001"].IsConvergedPlaceholder(), "the driven finalizer is dispatched")
 	assert.Equal(t, state.ApplyOperation.Completed, byTarget["testapp-002"].State, "the converged member has nothing to finalize")
 	require.NotNil(t, byTarget["testapp-002"].CompletedAt)
 	assert.Equal(t, now, *byTarget["testapp-002"].CompletedAt)
 	assert.Nil(t, byTarget["testapp-002"].StartedAt, "nothing ran on the converged member")
+	assert.True(t, byTarget["testapp-002"].IsConvergedPlaceholder(), "the finalizer row is written in the shape the remote manifest leaves out")
 	assert.True(t, byTarget["testapp-002"].AlreadyConverged)
 	assert.False(t, byTarget["testapp-001"].AlreadyConverged)
 }
@@ -1171,6 +1177,7 @@ func TestBuildShardedApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t
 	require.Len(t, byDeployment["eu"], 1)
 	assert.Equal(t, pershardNamespace+"/-80/mutes", byDeployment["eu"][0].Operation.OperationKey)
 	assert.Equal(t, state.ApplyOperation.Pending, byDeployment["eu"][0].Operation.State, "the primary target's shard work is driven")
+	assert.False(t, byDeployment["eu"][0].Operation.IsConvergedPlaceholder(), "the shard work is dispatched")
 	require.Len(t, byDeployment["us"], 1, "the converged member stays in the apply")
 	settled := byDeployment["us"][0]
 	assert.Empty(t, settled.Tasks, "the converged member has nothing to run")
@@ -1181,6 +1188,7 @@ func TestBuildShardedApplyOperationGroups_ConvergedMemberIsCompletedOnCreation(t
 	assert.Nil(t, settled.Operation.StartedAt, "nothing ran on the converged member")
 	assert.True(t, settled.Operation.AlreadyConverged)
 	assert.Equal(t, int64(11), settled.Operation.PlanID)
+	assert.True(t, settled.Operation.IsConvergedPlaceholder(), "the sharded row is written in the shape the remote manifest leaves out")
 }
 
 // A review round is selected by its stamp. The pull request narrows the scan

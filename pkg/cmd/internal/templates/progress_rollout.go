@@ -49,6 +49,45 @@ func RolloutCountsUnit(groups []presentation.Group) string {
 	return "Deployments"
 }
 
+// RolloutCounts is the rollout's status counts as a label and its text, for
+// the progress header and the watch view. A rollout of one deployment run
+// table by table counts its table steps, "Tables: 1 of 3 done on 4 targets",
+// since between tables most targets are done with one and waiting on the
+// next, which a count of target states reads as queued. It counts the targets
+// that ran a table, not the ones that already had the change, and adds the
+// targets the PR comment's headline adds (TableStepOutcomes): "1 of 3 done on
+// 4 targets · 3 failed". Any other rollout counts its members' states. The
+// text is empty when there is nothing to count.
+func RolloutCounts(model presentation.Apply, groups []presentation.Group) (label, text string) {
+	if len(groups) == 1 && len(groups[0].Members) > 1 {
+		steps, ok := model.TableSteps(groups[0])
+		progress := model.TargetProgress(groups[0])
+		if ok && progress.Total > progress.AlreadyHad {
+			text := fmt.Sprintf("%d of %d done on %s", steps.Done, steps.Steps, targetCount(progress.Total-progress.AlreadyHad))
+			return "Tables", withTableStepOutcomes(text, model, steps, progress)
+		}
+	}
+	return RolloutCountsUnit(groups), FormatStateCounts(model.Counts)
+}
+
+// withTableStepOutcomes appends to a table-step count the target counts that
+// TableStepOutcomes says it carries.
+func withTableStepOutcomes(text string, model presentation.Apply, steps presentation.TableSteps, progress presentation.TargetProgress) string {
+	settled := state.IsState(model.State, state.SettledApplyStates...)
+	if outcomes := progress.TableStepOutcomes(steps, settled); len(outcomes) > 0 {
+		text += " · " + FormatStateCounts(outcomes)
+	}
+	return text
+}
+
+// targetCount is "1 target" or "3 targets".
+func targetCount(n int) string {
+	if n == 1 {
+		return "1 target"
+	}
+	return fmt.Sprintf("%d targets", n)
+}
+
 // FormatStateCounts joins a status histogram into "40 completed · 3 running".
 func FormatStateCounts(counts []presentation.StateCount) string {
 	parts := make([]string, 0, len(counts))
@@ -58,22 +97,18 @@ func FormatStateCounts(counts []presentation.StateCount) string {
 	return strings.Join(parts, " · ")
 }
 
-// targetWork is the targets of a deployment that run the same change, and the
-// first target's tables, which carry the DDL they share.
-type targetWork struct {
-	members []int
-	tables  []TableProgress
-}
-
 // FormatTargetRollup renders a deployment that addresses several targets as
 // one section, the way a sharded table rolls up its shards: one block per
-// table across the targets with each change's DDL once, a "what applies
-// where" split when targets run different changes, and the targets that need
-// an operator. Its size grows with distinct changes and failures, not with
+// table and DDL across the targets, each DDL once and naming its targets when
+// it runs on only some of them, and the targets that need an operator. Its size grows with distinct changes and failures, not with
 // the number of targets.
 func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, FormatStateCounts(g.Counts), len(g.Members))
+	status := FormatStateCounts(g.Counts)
+	if steps, ok := v.Model.TableSteps(g); ok {
+		status = withTableStepOutcomes(fmt.Sprintf("%d of %d tables done", steps.Done, steps.Steps), v.Model, steps, v.Model.TargetProgress(g))
+	}
+	fmt.Fprintf(&b, "%s %s — %s (%d targets)\n", g.Lead.Emoji, g.Deployment, status, len(g.Members))
 	if !v.SetupPhase {
 		writeTargetTables(&b, v, g)
 	}
@@ -84,18 +119,22 @@ func FormatTargetRollup(v RolloutView, g presentation.Group) string {
 }
 
 // writeTargetTables writes each table's progress across the targets that run
-// it. A target that has reported no table progress joins no group: missing
-// detail is not a different change, and setting it apart would show a false
-// divergence, so such targets are counted once below instead. Only a target
-// still to run is waiting to report; one that already held the change was
-// settled without running anything and is counted as such, and any other
-// finished target is accounted for by the deployment's counts and the
-// attention list.
+// it, one block per table and DDL. A block that runs on only some of the
+// targets names them above its DDL. A target that has reported no table
+// progress runs no block: missing detail is not a different change, so such
+// targets are counted once below instead. Only a target still to run is
+// waiting to report; one that already held the change was settled without
+// running anything and is counted as such, and any other finished target is
+// accounted for by the deployment's counts and the attention list.
 func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) {
-	var work []targetWork
-	bySignature := make(map[string]int)
+	var reporting []int
 	silent, converged := 0, 0
 	byMember := tablesByMember(v.Tables)
+	signatures := make(map[string]bool)
+	// settledUnreported counts the settled targets that reported no tables.
+	// They are not waiting to report, so the footer leaves them out, but no
+	// table detail is no evidence of a different change either.
+	settledUnreported := 0
 	for _, i := range g.Members {
 		d := v.Model.Deployments[i]
 		tables := byMember[rolloutMemberKey{d.Deployment, d.Target}]
@@ -107,41 +146,41 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 			// reported tables. A stopped one reports once the apply resumes.
 			case !state.IsState(d.State, state.SettledApplyStates...):
 				silent++
+			default:
+				settledUnreported++
 			}
 			continue
 		}
-		signature := tableChangeSignature(tables)
-		wi, seen := bySignature[signature]
-		if !seen {
-			wi = len(work)
-			bySignature[signature] = wi
-			// Sorted as a copy: the index is read again for every table below.
-			tables = slices.Clone(tables)
-			sortActiveTables(tables)
-			work = append(work, targetWork{tables: tables})
-		}
-		work[wi].members = append(work[wi].members, i)
+		reporting = append(reporting, i)
+		signatures[tableChangeSignature(tables)] = true
 	}
-	if len(work) > 1 {
+	// A target that has not reported has started no table, so it ranks every
+	// table as queued and a block that runs on every reporting target speaks
+	// for it. When the reporting targets diverge it is not known to run any
+	// one change, and no block speaks for it. A settled target with no tables
+	// is not queued, but it is no evidence of a different change either, so a
+	// block that runs on every reporting target speaks for it too, the way the
+	// PR comment's does.
+	lineSilent, lineSettled := silent, settledUnreported
+	if len(signatures) > 1 {
+		lineSilent, lineSettled = 0, 0
+	}
+	rolled := rolledTargetTables(v, byMember, reporting)
+	settled := v.Model.RolloutSettled(g)
+	for i := range rolled {
+		rolled[i].UnreportedTargets = lineSilent
+		rolled[i].RolloutSettled = settled
+		if covered := len(rolled[i].Shards) + lineSilent + lineSettled; covered < len(g.Members)-converged {
+			rolled[i].OnTargets = targetSubsetLabel(rolled[i].Shards, len(g.Members)-converged)
+		}
+	}
+	sortRolledTables(rolled)
+	// Tables are grouped under their namespace whenever they carry one, so
+	// the same table changed in two schemas reads as two changes.
+	if hasTableNamespaces(rolled) {
+		b.WriteString(FormatNamespacedTables(rolled))
+	} else {
 		b.WriteString("\n")
-	}
-	for _, w := range work {
-		rolled := make([]TableProgress, 0, len(w.tables))
-		for _, t := range w.tables {
-			rolled = append(rolled, tableAcrossTargets(v, byMember, w.members, t))
-		}
-		// Tables are grouped under their namespace whenever they carry one,
-		// so the same table changed in two schemas reads as two changes.
-		namespaced := hasTableNamespaces(rolled)
-		if len(work) > 1 {
-			b.WriteString(FormatRolloutGroupHeading(presentation.TargetNoun, rolloutMemberNames(v.Model, w.members), len(g.Members), namespaced))
-		} else if !namespaced {
-			b.WriteString("\n")
-		}
-		if namespaced {
-			b.WriteString(FormatNamespacedTables(rolled))
-			continue
-		}
 		for _, t := range rolled {
 			b.WriteString(FormatTableProgress(t))
 			b.WriteString("\n")
@@ -155,34 +194,76 @@ func writeTargetTables(b *strings.Builder, v RolloutView, g presentation.Group) 
 	}
 }
 
-// acrossTargetsCounts is the target counts that close a rolled-up table's
-// line: how many of the targets running the change have completed it, and
-// how many failed. A table every target completed carries no count, since its
-// line already reads complete, and neither does a table one target runs,
-// whose line is that target's state. The counts sit on the table line itself, so a
-// bar that sums only the targets that have started, or a table still copying
-// on one target while the rest failed, is not read as the rollout's state.
-func acrossTargetsCounts(t TableProgress) string {
-	if !t.AcrossTargets || len(t.Shards) < 2 {
-		return ""
-	}
-	completed, failed := 0, 0
-	for _, target := range t.Shards {
-		switch {
-		case state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow):
-			completed++
-		case state.IsState(target.Status, state.Task.Failed):
-			failed++
+// rolledTargetTables rolls each table and DDL the reporting members run up
+// across the members that run it, in plan order: the first member's tables,
+// then any table only a later member runs.
+func rolledTargetTables(v RolloutView, byMember map[rolloutMemberKey][]TableProgress, members []int) []TableProgress {
+	var rolled []TableProgress
+	seen := make(map[string]bool)
+	for _, i := range members {
+		d := v.Model.Deployments[i]
+		for _, t := range byMember[rolloutMemberKey{d.Deployment, d.Target}] {
+			key := tableChangeKey(t)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			rolled = append(rolled, tableAcrossTargets(v, byMember, members, t))
 		}
 	}
-	var counts string
-	if completed < len(t.Shards) {
-		counts = fmt.Sprintf(" · %d of %d targets complete", completed, len(t.Shards))
+	return rolled
+}
+
+// targetSubsetLabel names the targets a table's DDL runs on when they are only
+// some of the deployment's. Few read by name; more lead with how many of the
+// deployment's targets they are, then name every one, since the list under
+// the table is bounded and this label is the only place that says which
+// targets run this DDL.
+func targetSubsetLabel(targets []ShardProgress, total int) string {
+	names := make([]string, len(targets))
+	for i, t := range targets {
+		names[i] = t.Shard
 	}
-	if failed > 0 {
-		counts += fmt.Sprintf(" · %d failed", failed)
+	if len(targets) > memberNamesInlineLimit {
+		return presentation.CoveragePhrase(presentation.TargetNoun, len(targets), total) + ": " + strings.Join(names, ", ")
 	}
-	return counts
+	if len(names) == 1 {
+		return presentation.TargetNoun.Singular + " " + names[0]
+	}
+	return presentation.TargetNoun.Plural + " " + strings.Join(names, ", ")
+}
+
+// sortRolledTables orders tables rolled up across targets by
+// presentation.TableRolloutRank, the order the PR comment lists them in, so a
+// table finished on some targets stays above one no target has started. Tables
+// of equal rank keep plan order. Each table's rank is computed once, so a
+// watch frame does not rebuild it on every comparison.
+func sortRolledTables(tables []TableProgress) {
+	type ranked struct {
+		table TableProgress
+		rank  int
+	}
+	byRank := make([]ranked, len(tables))
+	for i, t := range tables {
+		byRank[i] = ranked{t, rolledTableRank(t)}
+	}
+	slices.SortStableFunc(byRank, func(a, b ranked) int { return a.rank - b.rank })
+	for i, r := range byRank {
+		tables[i] = r.table
+	}
+}
+
+// rolledTableRank is a rolled-up table's presentation.TableRolloutRank, from
+// its status on each target and its unreported targets queued.
+func rolledTableRank(t TableProgress) int {
+	statuses := make([]string, len(t.Shards), len(t.Shards)+t.UnreportedTargets)
+	for i, target := range t.Shards {
+		statuses[i] = target.Status
+	}
+	for range t.UnreportedTargets {
+		statuses = append(statuses, state.Task.Pending)
+	}
+	return presentation.TableRolloutRank(statuses)
 }
 
 // rolloutMemberKey is the routing pair that names one rollout member.
@@ -207,12 +288,17 @@ func tablesByMember(tables []TableProgress) map[rolloutMemberKey][]TableProgress
 	return byMember
 }
 
+// tableChangeKey keys one table change by its namespace, table and DDL.
+func tableChangeKey(t TableProgress) string {
+	return t.Namespace + "\x00" + t.TableName + "\x00" + t.DDL
+}
+
 // tableChangeSignature keys the change a target runs by its tables and their
 // DDL, independent of the order its tasks were listed in.
 func tableChangeSignature(tables []TableProgress) string {
 	parts := make([]string, len(tables))
 	for i, t := range tables {
-		parts[i] = t.Namespace + "\x00" + t.TableName + "\x00" + t.DDL
+		parts[i] = tableChangeKey(t)
 	}
 	slices.Sort(parts)
 	return strings.Join(parts, "\x01")
@@ -285,6 +371,77 @@ func isHaltedAcrossTargets(t TableProgress) bool {
 		state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled)
 }
 
+// isPartlyCompletedAcrossTargets reports whether a table rolled up across
+// targets has completed on some of them and is queued on the rest, with
+// nothing in between. A target in its revert window has completed the change,
+// and a target that has reported no progress has not started it. Its
+// rolled-up status is queued, the revert window or complete, but the change is
+// live only where it completed, so its line leads with that, as the PR
+// comment's does.
+func isPartlyCompletedAcrossTargets(t TableProgress) bool {
+	if !t.AcrossTargets || !state.IsState(t.Status, state.Task.Pending, state.Task.RevertWindow, state.Task.Completed) {
+		return false
+	}
+	completed, queued := partlyCompletedCounts(t.Shards)
+	return completed > 0 && queued+t.UnreportedTargets > 0 && completed+queued == len(t.Shards)
+}
+
+// partlyCompletedCounts counts the targets that have completed a change and
+// the targets still queued for it.
+func partlyCompletedCounts(targets []ShardProgress) (completed, queued int) {
+	for _, target := range targets {
+		switch {
+		case state.IsState(target.Status, state.Task.Completed, state.Task.RevertWindow):
+			completed++
+		case state.IsState(target.Status, state.Task.Pending):
+			queued++
+		}
+	}
+	return completed, queued
+}
+
+// formatPartlyCompletedAcrossTargets renders a table completed on some targets
+// and queued on the rest: how many completed, then how many are queued, or not
+// started once the rollout has settled, with each target's line beneath.
+func formatPartlyCompletedAcrossTargets(t TableProgress) string {
+	var b strings.Builder
+	completed, queued := partlyCompletedCounts(t.Shards)
+	fmt.Fprintf(&b, indentTable+progressSymbol(t.ChangeType)+"%s: ✓ Complete on %d of %d targets · %d %s\n", t.TableName, completed, len(t.Shards)+t.UnreportedTargets, queued+t.UnreportedTargets, pendingTargetsWord(t))
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	b.WriteString("\n")
+	b.WriteString(formatTableParts(t))
+	return b.String()
+}
+
+// isNotStartedAcrossTargets reports whether a table rolled up across targets
+// is pending on every target of a rollout that has settled: no target ran it,
+// and none will.
+func isNotStartedAcrossTargets(t TableProgress) bool {
+	return t.AcrossTargets && t.RolloutSettled && state.IsState(t.Status, state.Task.Pending)
+}
+
+// formatNotStartedAcrossTargets renders a table no target of a settled rollout
+// ran the way the PR comment's table line does, with each target's line
+// beneath.
+func formatNotStartedAcrossTargets(t TableProgress) string {
+	var b strings.Builder
+	writeTableLine(&b, t, "⊘ Not started")
+	if t.DDL != "" {
+		b.WriteString(formatTableDDL(t))
+	}
+	b.WriteString("\n")
+	b.WriteString(formatTableParts(t))
+	return b.String()
+}
+
+// pendingTargetsWord is how a rolled-up table names the targets still pending
+// on it: queued while the rollout runs, not started once it has settled.
+func pendingTargetsWord(t TableProgress) string {
+	return presentation.PendingWord(t.RolloutSettled)
+}
+
 // formatHaltedAcrossTargets renders a halted table across targets the way the
 // PR comment's table line does: the table reads as its halt, with no bar, and
 // each target's line beneath says where that target finished or halted.
@@ -292,7 +449,7 @@ func formatHaltedAcrossTargets(t TableProgress) string {
 	var b strings.Builder
 	writeTableLine(&b, t, "%s", haltedAcrossTargetsPhrase(t))
 	if t.DDL != "" {
-		b.WriteString(formatProgressDDLForDialect(t.Dialect, t.DDL))
+		b.WriteString(formatTableDDL(t))
 	}
 	b.WriteString("\n")
 	b.WriteString(formatTableParts(t))
@@ -425,15 +582,6 @@ func writeTargetAttention(b *strings.Builder, v RolloutView, g presentation.Grou
 // and is being retried.
 func isTargetFailureState(opState string) bool {
 	return state.IsState(opState, state.ApplyOperation.Failed, state.ApplyOperation.FailedRetryable)
-}
-
-// rolloutMemberNames is each member's target, in the order given.
-func rolloutMemberNames(model presentation.Apply, members []int) []string {
-	names := make([]string, len(members))
-	for j, i := range members {
-		names[j] = memberTargetName(model.Deployments[i])
-	}
-	return names
 }
 
 // memberTargetName is a member's target, or its name when it carries none.

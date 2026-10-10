@@ -10,6 +10,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/glyph"
+	"github.com/block/schemabot/pkg/presentation"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
@@ -1066,7 +1067,7 @@ func renderTableProgress(sb *strings.Builder, dialect schema.Dialect, table Tabl
 		renderRunningTable(sb, dialect, table, budget)
 	}
 
-	renderShardSummary(sb, table)
+	renderShardSummary(sb, table, budget)
 
 	sb.WriteString("\n")
 }
@@ -1082,142 +1083,45 @@ func shardSummaryBreakdownState(status string) bool {
 	}
 }
 
-// renderShardSummary appends a single compact per-shard status line for a
-// sharded table, only while it is in flight. It keeps the PR
-// comment quiet: at most one extra line per table. With few shards it lists each
-// shard's state (and percent for actively-copying shards); with many it collapses
-// to per-state counts plus the slowest copying shard, so even hundreds of shards
-// fit on one line. Detailed per-shard rows/ETAs stay in the CLI.
-func renderShardSummary(sb *strings.Builder, table TableProgressData) {
-	if len(table.Shards) <= 1 {
+// renderShardSummary lists a sharded table's shards while it is in flight.
+func renderShardSummary(sb *strings.Builder, table TableProgressData, budget *ddlBlockBudget) {
+	writeMemberList(sb, presentation.ShardNoun, table.Status, table.Shards, presentation.PendingQueued, budget)
+}
+
+// writeMemberList lists a table's members, the shards of a sharded table or
+// the targets of a multi-target deployment, while the table is in flight: a
+// line counting them by state, then one line per member with its state in
+// words. It is the listing the CLI shows (presentation.ListParts), so a wide
+// table names only its failures and slowest members, leaving the rest to the
+// counts, rather than growing a line per member. A settled table's line
+// already says where it ended, so the listing stays out of the way then. A
+// comment that would not fit otherwise keeps only the line counting them
+// (ddlBlockBudget.listsMembers). pendingWord names the members still to run
+// (presentation.PendingWord), in the count and on their lines alike.
+func writeMemberList(sb *strings.Builder, noun presentation.Noun, status string, members []ShardProgressData, pendingWord string, budget *ddlBlockBudget) {
+	if len(members) <= 1 {
 		return
 	}
-	if !shardSummaryBreakdownState(table.Status) {
+	if !shardSummaryBreakdownState(status) {
 		return // completed/pending/cancelled/failed: no breakdown, stay quiet
 	}
-
-	if len(table.Shards) <= shardNamesInlineLimit {
-		parts := make([]string, 0, len(table.Shards))
-		for _, sh := range table.Shards {
-			if isCopyingShardStatus(sh.Status) && (sh.PercentComplete > 0 || sh.RowsCopied > 0) {
-				parts = append(parts, fmt.Sprintf("%s %s %s", shardGlyph(sh.Status), sh.Shard,
-					ui.FormatRowCopyPercent(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal)))
-				continue
-			}
-			part := fmt.Sprintf("%s %s", shardGlyph(sh.Status), sh.Shard)
-			// Glyphs whose meaning isn't self-evident carry the same word the
-			// bucketed form uses, so the line reads without a legend.
-			if word := shardStatusWord(sh.Status); word != "" {
-				part += " " + word
-			}
-			parts = append(parts, part)
-		}
-		fmt.Fprintf(sb, "  └ shards: %s\n", strings.Join(parts, " · "))
+	part := func(i int) presentation.Part {
+		m := members[i]
+		return presentation.Part{Name: m.Shard, Status: m.Status, PercentComplete: m.PercentComplete, RowsCopied: m.RowsCopied, RowsTotal: m.RowsTotal}
+	}
+	c := presentation.CountParts(len(members), func(i int) string { return members[i].Status })
+	c.PendingLabel = pendingWord
+	fmt.Fprintf(sb, "- %s: %d (%s)\n", ui.CapitalizeFirst(noun.Plural), len(members), strings.Join(c.Phrases(), ", "))
+	if !budget.listsMembers() {
 		return
 	}
-
-	var complete, copying, ready, failed, queued, other int
-	slowestShard, slowestText := "", ""
-	slowestFraction := -1.0
-	for _, sh := range table.Shards {
-		// Shards parked at the cutover barrier count through the shared
-		// readiness predicate, keeping the shard buckets consistent with the
-		// table summaries.
-		if TaskStatusReadyForCutover(sh.Status) {
-			ready++
+	for _, line := range presentation.ListParts(len(members), part, noun) {
+		if line.Summary != "" {
+			fmt.Fprintf(sb, "  - … %s\n", line.Summary)
 			continue
 		}
-		switch state.NormalizeShardStatus(sh.Status) {
-		case state.Task.Completed:
-			complete++
-		case state.Task.Failed, state.Task.FailedRetryable:
-			failed++
-		case state.Task.Pending:
-			queued++
-		default:
-			if isCopyingShardStatus(sh.Status) {
-				copying++
-				if frac := ui.RowCopyFraction(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal); slowestFraction < 0 || frac < slowestFraction {
-					slowestFraction = frac
-					slowestShard = sh.Shard
-					slowestText = ui.FormatRowCopyPercent(sh.PercentComplete, sh.RowsCopied, sh.RowsTotal)
-				}
-			} else {
-				other++
-			}
-		}
-	}
-	var buckets []string
-	if complete > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ✓", complete))
-	}
-	if copying > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ◐ copying", copying))
-	}
-	if ready > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ● ready", ready))
-	}
-	if queued > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ⏳", queued))
-	}
-	if failed > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d ✗ failed", failed))
-	}
-	if other > 0 {
-		buckets = append(buckets, fmt.Sprintf("%d …", other))
-	}
-	line := fmt.Sprintf("  └ %d shards: %s", len(table.Shards), strings.Join(buckets, " · "))
-	if slowestShard != "" && slowestFraction >= 0 {
-		line += fmt.Sprintf(" · slowest %s %s", slowestShard, slowestText)
-	}
-	sb.WriteString(line + "\n")
-}
-
-// shardGlyph maps a shard's status to its compact summary glyph.
-func shardGlyph(status string) string {
-	switch state.NormalizeShardStatus(status) {
-	case state.Task.Completed:
-		return "✓" // ✓
-	case state.Task.WaitingForCutover:
-		return "●" // ●
-	case state.Task.Failed, state.Task.FailedRetryable:
-		return "✗" // ✗
-	case state.Task.Pending:
-		return "⏳" // ⏳
-	default:
-		if isCopyingShardStatus(status) {
-			return "◐" // ◐
-		}
-		return "•" // •
-	}
-}
-
-// shardStatusWord returns the word the bucketed summary pairs with a shard's
-// glyph, for glyphs a reader can't decode on sight. Self-evident glyphs
-// (✓ complete, ⏳ queued) return "", and so does the unknown-status catch-all
-// — the bucketed form keeps its "…" bucket bare too. Copying shards return
-// "copying", which the caller replaces with a percent when one is available.
-func shardStatusWord(status string) string {
-	switch state.NormalizeShardStatus(status) {
-	case state.Task.WaitingForCutover:
-		return "ready"
-	case state.Task.Failed, state.Task.FailedRetryable:
-		return "failed"
-	default:
-		if isCopyingShardStatus(status) {
-			return "copying"
-		}
-		return ""
-	}
-}
-
-// isCopyingShardStatus reports whether a shard is actively doing copy/cutover work.
-func isCopyingShardStatus(status string) bool {
-	switch state.NormalizeShardStatus(status) {
-	case state.Task.Running, state.Task.Recovering, state.Task.CuttingOver:
-		return true
-	default:
-		return false
+		p := part(line.Part)
+		fmt.Fprintf(sb, "  - %s %s: %s\n", presentation.PartGlyph(p.Status), inlineCode(p.Name), presentation.PartDetail(p, pendingWord))
 	}
 }
 

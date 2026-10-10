@@ -254,10 +254,9 @@ func TestSectionExternalID_IgnoresOtherDeployments(t *testing.T) {
 }
 
 // Two targets of one deployment each run their own copy of the change against
-// their own schema. The rollup reads each target's own table rows: targets
-// that copied different tables are split by what applies where, each table is
-// shown once under the target that copied it, and no target is credited with
-// its sibling's copy.
+// their own schema. The rollup reads each target's own table rows: each table
+// is shown once, naming the target that copied it, and no target is credited
+// with its sibling's copy.
 func TestWriteProgressMultiTargetRollupIsMemberScoped(t *testing.T) {
 	output := captureStdout(t, func() {
 		WriteProgress(ProgressData{
@@ -275,9 +274,10 @@ func TestWriteProgressMultiTargetRollupIsMemberScoped(t *testing.T) {
 		})
 	})
 
-	assertLess(t, output, "▸ target testapp-001", "users_001")
-	assertLess(t, output, "users_001", "▸ target testapp-002")
-	assertLess(t, output, "▸ target testapp-002", "users_002")
+	// The copying table leads the one already complete.
+	assertLess(t, output, "users_002", ANSIBold+"target testapp-002"+ANSIReset+"\n")
+	assertLess(t, output, ANSIBold+"target testapp-002"+ANSIReset+"\n", "users_001")
+	assertLess(t, output, "users_001", ANSIBold+"target testapp-001"+ANSIReset+"\n")
 	assert.Equal(t, 1, strings.Count(output, "users_001:"))
 	assert.Equal(t, 1, strings.Count(output, "users_002:"))
 	assert.NotContains(t, output, "remote-apply-001", "a healthy target's apply ID is not lifted into the rollup")

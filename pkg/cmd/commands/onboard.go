@@ -251,7 +251,10 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 	// refuse — a table both withheld from the planner and declared to it — and
 	// re-onboarding an already-configured repository is where that happens,
 	// because the entries it preserves name tables the pull just returned.
-	ignored := engine.NewIgnoredTables(exclusions.Tables)
+	ignored, err := engine.NewIgnoredTables(exclusions.Tables)
+	if err != nil {
+		return nil, fmt.Errorf("read the existing schemabot.yaml's ignore_tables: %w", err)
+	}
 	var withheldGroups []*apitypes.ExemptTablesResponse
 	var formatErrors []error
 
@@ -276,9 +279,9 @@ func buildOnboardWritePlan(schemaRoot string, resp *apitypes.PullSchemaResponse,
 		if err := rejectCaseCollisions("table in "+namespace, tableNames); err != nil {
 			return nil, err
 		}
-		// The filter above is exact, because an entry must never withhold a
-		// table it does not name, while the engines refuse a declared-and-
-		// ignored table with case folded. A live DATABASECHANGELOG under an
+		// The filter above matches as written, because an entry must never
+		// withhold a table it does not name, while the engines refuse a
+		// declared-and-ignored table with case folded. A live DATABASECHANGELOG under an
 		// entry spelling it databasechangelog therefore survives the filter
 		// and lands in a file that every later plan refuses. Refusing here,
 		// against the tables about to be declared and with the engines' own

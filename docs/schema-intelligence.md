@@ -734,6 +734,30 @@ has no table rows and no `started_at`. A missing `started_at` alone does not
 mean that: an operation can also be settled to its apply's outcome without ever
 starting, and its target may not have the change.
 
+`rollout_step` is set when the rollout runs table by table: the apply then has
+one operation per target and table, and `rollout_step` is the table's place in
+the rollout, numbered from 1. Every target finishes one step before any target
+starts the next. Operations that each run their member's whole change omit it.
+Response excerpt for `orders` then `refunds` on two targets, with `orders` done
+on both:
+
+```json
+{
+  "operations": [
+    {"deployment": "commerce-a", "target": "shop-001", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "completed", "cutover_policy": "rolling", "rollout_step": 1},
+    {"deployment": "commerce-a", "target": "shop-001", "state": "running", "cutover_policy": "rolling", "rollout_step": 2},
+    {"deployment": "commerce-a", "target": "shop-002", "state": "pending", "cutover_policy": "rolling", "rollout_step": 2}
+  ]
+}
+```
+
+The CLI and the PR comment count such a rollout in tables, `Tables: 1 of 2
+done on 2 targets`, rather than in target states. A target that already had
+the change ran no table and is not counted. Targets in an outcome an operator
+acts on are named beside the count, so a failed `docks` on `shop-002` reads
+`Tables: 1 of 2 done on 2 targets · 1 failed`.
+
 </details>
 
 For event-based output while applying a rollout, use log mode:
@@ -1061,6 +1085,41 @@ schemabot list-plans -e production plan-example-42
 Error: plan plan-example-42 was made for environment "staging", not "production"; rerun with -e staging
 ```
 
+A blocked execution verdict is a refusal, not a request for unsafe consent.
+For example, when the fresh plan contains a blocked key alteration on `users`,
+`apply` shows the plan and stops before prompting or locking, even with
+`--allow-unsafe --yield`. The refusal names the plan, the table, and the
+engine's reason, which says what has to change; here it is a grant on the
+target, not the schema files:
+
+```sh
+schemabot apply -s ./schema -e staging --allow-unsafe --yield
+```
+
+```text
+╭─────────────────────────────────────────────╮
+│  MySQL Schema Change Apply                  │
+│                                             │
+│  Database: testdb                           │
+│  Schema name: schema                        │
+╰─────────────────────────────────────────────╯
+
+Staging
+     ~ users
+       ALTER TABLE `users` DROP PRIMARY KEY;
+
+📋 Plan: 1 table to alter
+
+Error: apply blocked: plan plan-example-43 contains a blocked change for table "users": dropping primary key is not supported; direct execution is enabled but SchemaBot lacks a grant it needs to end sessions blocking the statement: grant its database user SELECT on performance_schema, PROCESS, and CONNECTION_ADMIN (or SUPER), then plan again
+```
+
+A reason with several independent causes lists each on its own line. With
+`-o json` the plan is not rendered and the error alone carries the refusal.
+This also applies to a whole rollout, where it is reported before any member
+the rollout refuses, to an apply narrowed with `--target`, and to `rollback`,
+whose refusal starts `rollback blocked:`. No apply is submitted and no lock is
+acquired or released.
+
 History records executions. Plans describe what was proposed.
 `GET /api/plans` lists stored plans, filterable by `database`, `environment`,
 `repository`, and `pull_request` (with `repository`), plus a `last` window.
@@ -1157,7 +1216,10 @@ finalizer to run once its DDL lands (for Strata, registering tables and
 seeding sequences), independently of any VSchema change. The finalizer runs
 as its own `group_finalizer` operation of the apply, so a namespace can carry
 the marker with no table changes at all, and such a plan still has work to
-apply. `vschema_generated_only: "true"`, beside `vschema_changed`, means the
+apply. `vschema`, beside `vschema_changed`, is the VSchema diff the plan was
+reviewed with, so a stored plan shows the same VSchema change the plan did; a
+plan recorded without a diff carries `vschema_changed` alone.
+`vschema_generated_only: "true"`, beside `vschema_changed`, means the
 engine generates the namespace's whole VSchema change from the plan's DDL, so
 there is no VSchema diff to review; plans show such a namespace by its DDL
 alone.
@@ -1304,11 +1366,12 @@ exempted omits the field.
 
 Two things populate it. Tables withheld by the repository's `ignore_tables`
 config (see [Ignoring Tables](namespaces.md#ignoring-tables)) are reported by
-every engine, with `reason` naming the config key; the table names are also
-persisted with the plan so a rollback or resume re-plan withholds the same
-tables the reviewed plan did. Archive-named tables are reported by PostgreSQL
-targets only — the MySQL-family engines exempt them from their live-schema view
-without reporting which ones.
+every engine, with `reason` naming the config key. The configured entries,
+patterns included, are persisted with the plan as written, so a rollback or
+resume re-plan withholds by the same rules the reviewed plan did.
+Archive-named tables are reported by PostgreSQL targets only — the
+MySQL-family engines exempt them from their live-schema view without reporting
+which ones.
 
 Response excerpt from the plan request (illustrative values):
 

@@ -94,7 +94,7 @@ type PSClient interface {
 	// is created and no later call can change it, so reading it back is the only
 	// way to know the request that was sent is the one being honoured. The SDK
 	// models auto_cutover on the create request but on neither response, so this
-	// uses raw HTTP via baseURL; it returns an error if baseURL is not set.
+	// uses raw HTTP.
 	DeployRequestAutoCutover(ctx context.Context, org, database string, number uint64) (bool, error)
 }
 
@@ -102,7 +102,7 @@ type PSClient interface {
 type psClientWrapper struct {
 	client     *ps.Client
 	httpClient *http.Client // for endpoints not in the SDK
-	baseURL    string       // for endpoints not in the SDK
+	baseURL    string       // the SDK client's base URL, reused for endpoints not in the SDK
 	tokenName  string
 	tokenValue string
 }
@@ -160,34 +160,37 @@ func (e *APIError) summary() string {
 	return s
 }
 
-// NewPSClient creates a new PSClient using the real PlanetScale API.
-// Use NewPSClientWithBaseURL for endpoints not yet in the SDK (throttle).
-func NewPSClient(tokenName, tokenValue string, opts ...ps.ClientOption) (PSClient, error) {
-	allOpts := boundedClientOptions(tokenName, tokenValue, opts)
-	client, err := ps.NewClient(allOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return &psClientWrapper{
-		client:     client,
-		httpClient: newPlanetScaleHTTPClient(),
-		baseURL:    "https://api.planetscale.com",
-		tokenName:  tokenName,
-		tokenValue: tokenValue,
-	}, nil
+// DefaultBaseURL is the public PlanetScale API endpoint, used when no base URL
+// is configured.
+const DefaultBaseURL = "https://api.planetscale.com"
+
+// NewPSClient creates a new PSClient for the public PlanetScale API. It takes
+// no SDK options: a client for another endpoint, or with options of its own,
+// is built with NewPSClientWithBaseURL, which names the endpoint explicitly.
+func NewPSClient(tokenName, tokenValue string) (PSClient, error) {
+	return NewPSClientWithBaseURL(tokenName, tokenValue, "")
 }
 
-// NewPSClientWithBaseURL creates a new PSClient with a custom base URL.
-// The base URL is used for endpoints not yet in the SDK (throttle).
-func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string) (PSClient, error) {
-	var opts []ps.ClientOption
-	if baseURL != "" {
-		opts = append(opts, ps.WithBaseURL(baseURL))
+// NewPSClientWithBaseURL creates a new PSClient that addresses the PlanetScale
+// API at baseURL, or at DefaultBaseURL when baseURL is empty.
+//
+// SDK calls and the raw-HTTP calls for endpoints the SDK does not cover go to
+// the same base URL. It is installed after the caller's options, so a
+// ps.WithBaseURL among them cannot send SDK calls somewhere the raw calls do
+// not go. The two resolve paths differently: the SDK resolves its relative
+// endpoints against the URL, and the raw calls append an absolute path to it.
+// So trailing slashes are trimmed once, the raw calls get the trimmed URL, and
+// the SDK gets it with exactly one trailing slash. That way a base URL with a
+// trailing slash or a path prefix reaches the same path root on both.
+func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string, opts ...ps.ClientOption) (PSClient, error) {
+	baseURL = strings.TrimRight(baseURL, "/")
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
 	}
-	allOpts := boundedClientOptions(tokenName, tokenValue, opts)
+	allOpts := boundedClientOptions(tokenName, tokenValue, append(append([]ps.ClientOption{}, opts...), ps.WithBaseURL(baseURL+"/")))
 	client, err := ps.NewClient(allOpts...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create PlanetScale client for %s: %w", baseURL, err)
 	}
 	return &psClientWrapper{
 		client:     client,
@@ -246,8 +249,7 @@ const maxKeyspacePages = 100
 // Callers treat the result as the whole branch: progress and failure detail are
 // gathered keyspace by keyspace, so a keyspace missing from the list is one whose
 // schema change nobody sees. The SDK's list call reads only the first page and
-// takes no page options, so the listing uses raw HTTP via baseURL and returns an
-// error if baseURL is not set.
+// takes no page options, so the listing uses raw HTTP.
 //
 // The pages are numbered offsets into a set that can change between requests.
 // A keyspace added before a later page is read shifts the rest forward, so a
@@ -261,9 +263,6 @@ const maxKeyspacePages = 100
 // The HTTP client's timeout applies to each page request. The listing as a whole
 // is bounded by maxKeyspacePages and by ctx.
 func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
-	if w.baseURL == "" {
-		return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: no PlanetScale API base URL", req.Organization, req.Database, req.Branch)
-	}
 	// Each name is its own path segment, so a character that URL syntax gives
 	// meaning to cannot retarget the request or swallow the page query.
 	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/keyspaces",
@@ -334,12 +333,6 @@ func (w *psClientWrapper) UpdateKeyspaceVSchema(ctx context.Context, req *ps.Upd
 // Marshalling the body here is what makes false expressible. The response is
 // the deploy request object, the same shape the SDK decodes.
 func (w *psClientWrapper) CreateDeployRequest(ctx context.Context, req *ps.CreateDeployRequestRequest) (*ps.DeployRequest, error) {
-	if w.baseURL == "" {
-		// Falling back to the SDK here would silently drop the cutover setting
-		// and hand cutover control to the backend, so the deploy request is not
-		// created at all.
-		return nil, fmt.Errorf("create deploy request for %s/%s: cannot set auto_cutover without a PlanetScale API base URL", req.Organization, req.Database)
-	}
 	body, err := json.Marshal(map[string]any{
 		"branch":             req.Branch,
 		"into_branch":        req.IntoBranch,
@@ -384,9 +377,6 @@ var ErrAutoCutoverNotReported = errors.New("deployment reports no auto_cutover s
 // an error rather than a default: the caller is asking precisely because it
 // cannot assume one.
 func (w *psClientWrapper) DeployRequestAutoCutover(ctx context.Context, org, database string, number uint64) (bool, error) {
-	if w.baseURL == "" {
-		return false, fmt.Errorf("read auto_cutover for %s/%s deploy request #%d: no PlanetScale API base URL", org, database, number)
-	}
 	path := fmt.Sprintf("/v1/organizations/%s/databases/%s/deploy-requests/%d", org, database, number)
 	respBody, err := w.doRawJSON(ctx, http.MethodGet, path, nil)
 	if err != nil {

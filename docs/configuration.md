@@ -20,6 +20,7 @@
 - [Spirit Run Settings](#spirit-run-settings)
 - [Postgres](#postgres)
 - [Target TLS Posture](#target-tls-posture)
+- [PlanetScale Service Token](#planetscale-service-token)
 - [PlanetScale mTLS](#planetscale-mtls)
 - [Storage Schema Changes](#storage-schema-changes)
 - [Support Channel](#support-channel)
@@ -196,6 +197,196 @@ The PostgreSQL shape differs from MySQL in three ways:
   endpoint fails resolution: a verified CA is required, and the ambient trust
   store is never an implicit fallback.
 
+### PostgreSQL Etre targets
+
+An `etre` resolver with `database_type: postgres` discovers PostgreSQL targets
+the same way it discovers MySQL ones: it looks the opaque target up by a label,
+reads the host from an entity field, and fetches credentials from the
+configured backend. It reads its own `postgres` block.
+
+```yaml
+target_resolver:
+  etre:
+    - addr: "https://etre.example.com"
+      database_type: postgres
+      entity_type: db_cluster
+      target_label: target_id
+      env_label: env
+      attribute_fields: [cluster_name]
+      postgres:
+        host_field: writer_endpoint
+        table_owner: "app_owner"           # optional; see table_owner above
+        ca_ref: "embedded:rds-global"      # optional for RDS endpoints
+      credentials:
+        type: awssm
+        region: us-east-1
+        secret_name: "db/{cluster_name}/schemabot"
+```
+
+A PostgreSQL connection is made to one database, so the resolver needs its
+name. It comes from the credential secret, which is read as JSON in the format
+AWS uses for RDS database secrets; any `engine`, `host`, or `port` fields are
+ignored, because the entity decides where to connect:
+
+```json
+{"username": "schemabot", "password": "...", "dbname": "orders"}
+```
+
+Because the secret names the user, leave `credentials.username` unset. A
+resolver whose engine decodes its secret (`postgres` or `vitess`) refuses to
+start when a username is configured, on both the `secret_ref` and `awssm`
+backends, rather than ignoring it.
+
+The `awssm` backend reads the secret in the region its `region` settings
+choose; see [Etre credentials from AWS Secrets
+Manager](#etre-credentials-from-aws-secrets-manager).
+
+`table_owner` and `ca_ref` mean the same as on a `dsn_from` target. They apply
+to every target the resolver serves, so a resolver serves clusters that share
+one owner role.
+
+### Etre credentials from AWS Secrets Manager
+
+An `etre` resolver with `credentials.type: awssm` reads each target's database
+credentials from AWS Secrets Manager. Three groups of settings decide which
+secret it reads:
+
+| Settings | Decide | Default |
+|---|---|---|
+| `secret_name` | the secret, templated over `{target}` and any `{attribute}` | required |
+| `role_arn`, `account_attribute`, `external_id` | the AWS account, by assuming `role_arn` in the account `account_attribute` names | the data plane's own account |
+| `region`, `region_attribute`, `reachable_regions` | the region the secret is read in | required: `region` |
+
+#### Which region a secret is read in
+
+`region` is the data plane's home region. Roles are assumed through STS there,
+and secrets are read there unless the two optional settings place a target
+elsewhere:
+
+- `region_attribute` names the entity attribute that holds the region of each
+  target's cluster, for example `aws_region`.
+- `reachable_regions` lists the regions, besides `region`, whose Secrets
+  Manager the data plane can call. It requires `region_attribute`, and every
+  listed region must be in the same AWS partition as `region`.
+
+For each target:
+
+```
+region of the target's cluster, from region_attribute
+├─ region, or listed in reachable_regions → read the secret in the cluster's region
+└─ any other region                       → read the secret in region, as a replica
+```
+
+Without `region_attribute`, every secret is read in `region`.
+
+Each deployment shape below needs a different combination:
+
+**All clusters are in the data plane's region.** Set `region` alone.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-east-1
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+**Clusters run in several regions, and the data plane can call Secrets Manager
+only in its own.** Replicate every secret into the home region and add
+`region_attribute`. Reads stay in `region`, and when a secret is missing the
+error names the cluster's region and the replica it expected.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+**The data plane can call Secrets Manager in every region its clusters run
+in.** List those regions in `reachable_regions`, and each secret is read beside
+its cluster with no replica needed. Roles are still assumed through STS in
+`region`, because credentials from a regional STS endpoint are valid in every
+region of the same AWS partition, so only Secrets Manager has to be reachable
+in the listed regions. For the same reason, every listed region must be in the
+partition of `region`: credentials from the commercial partition cannot read a
+secret in GovCloud, China, or an isolated partition, so the resolver refuses
+to start with such a region listed.
+
+```yaml
+credentials:
+  type: awssm
+  region: us-west-2
+  region_attribute: aws_region
+  reachable_regions: [us-east-1]
+  role_arn: "arn:aws:iam::{account}:role/schemabot-reader"
+  secret_name: "{target}/schemabot"
+```
+
+Shapes can mix: a cluster in a region that is not listed still has its secret
+read in `region`, so it needs a replica there while the clusters in listed
+regions do not.
+
+#### What each target account provides
+
+In the account and region a target's secret is read in, the read needs:
+
+- The secret, named as `secret_name` renders for the target. In the home region
+  that is usually a replica of a secret whose primary is in the cluster's
+  region.
+- With `role_arn`: the role, trusting the data plane's identity and allowed to
+  call `secretsmanager:GetSecretValue` on the secret in that region.
+- Permission for the reading identity to decrypt with the KMS key that encrypts
+  the secret in that region. A replica is encrypted by a key in the replica's
+  own region, so a policy that grants decrypt by key alias needs the alias to
+  exist in that region as well.
+
+#### Errors
+
+With `reachable_regions` set, the attribute chooses where a secret is read, so
+a target whose entity has no value for `region_attribute`, or a value that is
+not an AWS region name, fails before any read rather than having its secret read
+in a region chosen for it:
+
+```
+target "orders" has no "aws_region" attribute naming the region of its cluster
+target "orders" has "aws_region" attribute "us-east", which is not an AWS region name
+```
+
+Without `reachable_regions`, every secret is read in `region` whatever the
+attribute says, so such a target is still read there. It only loses the
+cluster's region from the error below if its secret is missing, and the
+resolver logs a warning for a value that is not a region name.
+
+A secret missing from the home region, for a cluster in a region that is not
+reachable, names the fix:
+
+```
+fetch secret "orders/schemabot" for target "orders" in account 111111111111, region us-west-2:
+get secret value "orders/schemabot": ... ResourceNotFoundException: Secrets Manager can't find
+the specified secret.; the target's cluster is in us-east-1, which is not a reachable region, so
+its secret is read in us-west-2: replicate the secret to us-west-2, or list us-east-1 as a
+reachable region if this data plane can call Secrets Manager there
+```
+
+For a cluster in another AWS partition, where neither fix can work, the error
+says instead that the target has to be served by a data plane in that
+partition.
+
+#### Changing the region settings
+
+A change to these settings moves the reads of every target the resolver serves
+at once, and a target it breaks fails only when something next resolves it.
+Before listing `reachable_regions`, query the inventory for the entities the
+resolver matches and confirm each one carries a region name in
+`region_attribute`, since from then on a target without one fails. Before
+listing a region there, also confirm that the data plane can
+call Secrets Manager there and that every target in that region has its secret
+there: a listed region the data plane cannot reach turns each of those reads
+into a connection failure.
+
 ## gRPC Mode
 
 SchemaBot delegates to remote services that implement the Tern proto. This is useful for distributed deployments where schema changes need to run in separate isolated environments.
@@ -289,7 +480,7 @@ Being primary decides which plan is stored, not which deployment is reviewed. A 
 Every deployment name in `deployment_order` must be lowercase; the server
 refuses to start otherwise.
 
-Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
+Under `cutover_policy: barrier` or `parallel`, cutovers run one rollout member at a time in this order, and a later member waits until every earlier one has completed. A member is one deployment of a `deployments` map, or one target of a `targets` list. An earlier member that failed stops holding the rollout under `on_failure: continue`, or under `pause` once the rollout is released; under `halt`, and under `pause` until a release, it holds every later cutover. An apply started with `--defer-cutover` follows the same order. A deployment with a `targets` list is the exception: each of its targets cuts over as its table finishes, so an apply to it refuses `--defer-cutover`; apply one target at a time with `--target` to hold a target's cutover. Each `schemabot cutover` cuts over the member whose turn it is, and only that member: a second member waits for a second command. A cutover requested while every ready member is still waiting on an earlier one is refused, and the refusal names the member holding the turn. Within a member, copies never wait on each other to start, and how the cutovers are ordered depends on what triggers them. The automatic cutover takes one operation at a time, so two shards of one member cut over one after the other, in the order the rollout created them. A `schemabot cutover` addresses the member's data-plane apply as a whole, so SchemaBot does not order that member's shards and tables among themselves.
 
 ## Multi-Target Environment (preview)
 
@@ -324,6 +515,8 @@ A `targets` list can also sit inside a `deployments` map entry, for a database w
             target: payments-003
 ```
 
+An apply that spans several deployments, one of them with a `targets` list, is not supported yet and is refused before it takes the lock. Apply one target at a time instead, in rollout order: `schemabot apply -e production --target payments-001`, then the next target. The refusal names the first one. A rollout already up to date applies nothing, so an apply that confirms it converged still succeeds.
+
 ### Selecting namespaces per target
 
 When a database's namespaces are spread across its targets, an entry can be a mapping that names which namespaces live on that target. A bare string and a mapping without `namespaces` both mean the target holds every namespace the schema files declare.
@@ -348,7 +541,8 @@ Rules:
 - `targets` is mutually exclusive with `target` at the same level, and with a local `dsn` / `dsn_from`.
 - An environment-level `targets` list is mutually exclusive with an environment-level `deployments` map, the same way an environment-level `target` is. A `targets` list inside a `deployments` entry is how the two combine.
 - The list MUST contain at least one entry, and no entry may be empty.
-- `cutover_policy` and `on_failure` order the listed targets the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default, `rolling`, runs one target at a time, and under the default `on_failure: halt` a failed target stops every later one from starting. A large fleet can set `cutover_policy: parallel`, which starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order.
+- A rollout across the listed targets runs table by table: each table lands on every target before any target starts the next. Tables run in the order the reviewed plan lists them, then any table only another target's plan changes, sorted by name. A target whose plan does not change a table has nothing to run for it, and two statements on one table run together. The exception is a rollout where a target's plan changes a VSchema, which applies with that target's tables, so each target then runs its whole change in one go.
+- `cutover_policy` and `on_failure` order the listed targets within each table the same way they order the deployments of a `deployments` map: each target is a rollout member, taken in list order. The default, `rolling`, runs one target at a time, and under the default `on_failure: halt` a failed target stops every later one from starting. A large fleet can set `cutover_policy: parallel`, which starts up to the server's `max_drivers_per_apply` targets' copies at once, queues the rest, and still cuts over one target at a time in list order. Whatever `on_failure` says, a table that failed on any target ends the rollout at that table: `continue` or a released `pause` still runs it on the remaining targets, but no target starts the next table.
 - No entry may contain `/`. A deployment addressing several targets names each one in its members' operation keys, and `/` separates a key's components.
 - One deployment may not list the same target twice. A rollout member is identified by its deployment and target together, so the same target under two different deployments is two distinct members and is allowed.
 - Members resolve deployments outermost: every target of the first deployment, then every target of the next.
@@ -1261,6 +1455,12 @@ resolution, as described under
 [PostgreSQL `dsn_from` targets](#postgresql-dsn_from-targets), rather than
 silently never consulted.
 
+## PlanetScale Service Token
+
+The Vitess engine calls the PlanetScale API with a service token. The
+permissions it needs, and the ones it does not, are listed in
+[Vitess on PlanetScale](vitess.md#service-token-permissions).
+
 ## PlanetScale mTLS
 
 Some PlanetScale-compatible endpoints require mutual TLS: every MySQL
@@ -1980,10 +2180,22 @@ for the same set of environments. A same-commit comment covering different
 environments is kept expanded — it may be the only visible plan for those
 environments.
 
-A plan outcome can also supersede without posting: when an auto-plan resolves
-to no changes, no new comment appears (the check run alone reports the green
-state), but plan comments from prior commits are still retired — the pending
-DDL and apply prompt they show no longer match the branch.
+Once a PR shows a plan comment, it keeps showing a current one. When an
+auto-plan resolves to no changes and a plan comment from a prior commit is
+still visible, the auto-plan posts its no-changes plan comment, which
+supersedes the prior one like any other plan comment. A PR that has never shown
+a plan comment gets no comment for a no-changes auto-plan; the check run alone
+reports the green state. A push that changes no schema input files leaves the
+newest visible plan comment for the same environments in place while it
+still matches the plan: a comment that shows changes stays while there are
+still changes, and one that shows none stays while there are still none. When the live database moved
+without the schema files changing and the plan flipped between those two
+outcomes, for example after the PR's change was applied outside the PR, the
+auto-plan posts a new plan comment that supersedes the outdated one. The
+comparison is changes against no changes, not the DDL itself: a comment whose
+DDL was partly applied elsewhere stays until the next plan comment replaces
+it. A plan for a commit the PR has already moved past never posts a
+replacement; the current commit's own plan answers instead.
 
 By default, a superseded plan comment no apply ever acted on is deleted from
 the PR timeline outright — its DDL never ran and is reproducible from the

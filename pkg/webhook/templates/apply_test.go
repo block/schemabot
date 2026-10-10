@@ -594,6 +594,35 @@ func TestRenderUnsafeChangesBlockedIncludesDropIndexGuidance(t *testing.T) {
 	assert.NotContains(t, rendered, "reads from or writes to the dropped index")
 }
 
+// An apply blocked for unsafe changes is where the operator decides whether to
+// pass --allow-unsafe, so the comment carries the same reading the plan comment
+// carried: the lint fold, and the guides for the rules its findings name. An
+// error-severity finding reaches the comment as an unsafe change carrying the
+// lint message, so its guide has text above it explaining the link.
+func TestRenderUnsafeChangesBlockedCarriesLintFindingsAndTheirGuides(t *testing.T) {
+	rendered := RenderUnsafeChangesBlocked(PlanCommentData{
+		Database:    "testapp",
+		SchemaName:  "testapp",
+		Environment: "staging",
+		IsMySQL:     true,
+		Changes: []KeyspaceChangeData{
+			{Keyspace: "testapp", Statements: []string{"CREATE TABLE `orders` (`id` varchar(36) NOT NULL, PRIMARY KEY (`id`));"}},
+		},
+		HasUnsafeChanges: true,
+		UnsafeChanges: []UnsafeChangeData{
+			{Table: "orders", Reason: `Primary key column "id" has type "varchar"`},
+		},
+		LintRuleNames:  []string{"primary_key", "rename_column"},
+		LintViolations: []LintViolationData{{Table: "customers", LinterName: "rename_column", Message: "Column rename detected"}},
+	})
+
+	assert.Contains(t, rendered, "Column rename detected", "the lint fold reaches the decision point")
+	assert.Contains(t, rendered, primaryKeyDocURL, "the blocking finding links its guide")
+	assert.Contains(t, rendered, "#renaming-a-column-or-table")
+	assert.Less(t, strings.Index(rendered, "📖 **Related guidance:**"), strings.Index(rendered, "--allow-unsafe`:**"),
+		"the reading comes before the command it informs")
+}
+
 // The apply-blocked comment classifies drops with the target's parser: a
 // PostgreSQL statement whose reason never says DROP still gets the guidance.
 // Passing an empty database type here would fall back to the reason and
@@ -803,14 +832,14 @@ func TestRenderApplyStatusComment_VSchema(t *testing.T) {
 	})
 }
 
-// A sharded table renders a compact per-shard summary while in flight: each
-// shard inline when few, collapsed to per-state counts + the slowest copier when
-// many, and nothing once the table completes or when there is a single shard.
+// A sharded table lists its shards while in flight: a line counting them by
+// state, then one line per shard with its state in words, with failures first
+// and complete shards last. Past the inline limit the list names only the
+// failures and the slowest copiers. A completed table, or one with
+// a single shard, lists nothing.
 func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 	withTemplateTimestamp(t, "2026-06-16 19:42:00 UTC")
 
-	// Inline: ≤8 shards list each shard's status; only the copying shard shows a
-	// percent, and glyphs that aren't self-evident carry the bucketed form's word.
 	inline := RenderApplyStatusComment(ApplyStatusCommentData{
 		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
 		Tables: []TableProgressData{{
@@ -824,23 +853,16 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 			},
 		}},
 	})
-	assert.Contains(t, inline, "shards:")
-	// A completed shard's glyph is self-evident — bare, no word before the
-	// separator.
-	assert.Contains(t, inline, "✓ -40 ·")
-	assert.Contains(t, inline, "◐ 80-c0 45%")
-	// A copying shard that has not reported progress yet reads "copying"
-	// instead of a misleading 0%.
-	assert.Contains(t, inline, "◐ 40-80 copying")
-	assert.NotContains(t, inline, "◐ 40-80 0%")
-	assert.Contains(t, inline, "✗ c0-e0 failed")
-	// A shard waiting for cutover reads "ready" with no percent (it is no
-	// longer copying).
-	assert.Contains(t, inline, "● e0- ready")
-	assert.NotContains(t, inline, "● e0- 100%")
+	assert.Contains(t, inline, "- Shards: 5 (1 failed, 2 copying, 1 waiting for cutover, 1 complete)\n"+
+		"  - ✗ `c0-e0`: failed\n"+
+		// A shard that has not reported progress reads as copying, not 0%,
+		// and is listed after the ones that have, which set the pace.
+		"  - ◉ `80-c0`: 45%\n"+
+		"  - ◉ `40-80`: copying\n"+
+		"  - ● `e0-`: waiting for cutover\n"+
+		"  - ✓ `-40`: complete\n")
 
-	// Collapsed: >8 shards bucket by state and name the slowest copier.
-	many := make([]ShardProgressData, 0, 12)
+	many := make([]ShardProgressData, 0, 13)
 	for i := range 9 {
 		many = append(many, ShardProgressData{Shard: fmt.Sprintf("c%d", i), Status: "completed", PercentComplete: 100})
 	}
@@ -854,11 +876,11 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		Database: "shop", Environment: "staging", State: "running", Engine: "Vitess",
 		Tables: []TableProgressData{{TableName: "orders", Status: "running", PercentComplete: 70, Shards: many}},
 	})
-	assert.Contains(t, collapsed, "13 shards:")
-	assert.Contains(t, collapsed, "9 ✓")
-	assert.Contains(t, collapsed, "2 ◐ copying")
-	assert.Contains(t, collapsed, "1 ● ready")
-	assert.Contains(t, collapsed, "slowest slow1 12%")
+	// Past the inline limit only failures and the slowest copiers are named;
+	// the heading counts the rest.
+	assert.Contains(t, collapsed, "- Shards: 13 (2 copying, 1 waiting for cutover, 1 queued, 9 complete)\n"+
+		"  - ◉ `slow1`: 12%\n"+
+		"  - ◉ `fast1`: 80%\n\n")
 
 	// Suppressed once the table completes — no shard line even with shard rows.
 	done := RenderApplyStatusComment(ApplyStatusCommentData{
@@ -866,7 +888,7 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		Tables: []TableProgressData{{TableName: "users", Status: "completed",
 			Shards: []ShardProgressData{{Shard: "-80", Status: "completed"}, {Shard: "80-", Status: "completed"}}}},
 	})
-	assert.NotContains(t, done, "shards:")
+	assert.NotContains(t, done, "- Shards:")
 
 	// A single shard adds no signal — no breakdown.
 	single := RenderApplyStatusComment(ApplyStatusCommentData{
@@ -874,7 +896,7 @@ func TestRenderApplyStatusComment_ShardSummary(t *testing.T) {
 		Tables: []TableProgressData{{TableName: "users", Status: "running", PercentComplete: 30,
 			Shards: []ShardProgressData{{Shard: "0", Status: "running", PercentComplete: 30}}}},
 	})
-	assert.NotContains(t, single, "shards:")
+	assert.NotContains(t, single, "- Shards:")
 }
 
 // A PlanetScale apply in a deploy-request phase renders its first-class phase

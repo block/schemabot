@@ -50,8 +50,11 @@ type ProgressOperation struct {
 	ErrorMessage        string
 	ErrorCode           string
 	AlreadyConverged    bool
-	StartedAt           string
-	CompletedAt         string
+	// RolloutStep is the table step the operation runs when the rollout runs
+	// table by table, and 0 otherwise.
+	RolloutStep int
+	StartedAt   string
+	CompletedAt string
 }
 
 // TableProgress represents progress for a single table schema change.
@@ -90,6 +93,18 @@ type TableProgress struct {
 	// AcrossTargets marks a table that stands for one change across a
 	// rollout's targets, rolled up the way a sharded table rolls up its shards.
 	AcrossTargets bool
+	// OnTargets names the targets a rolled-up table's DDL runs on when they
+	// are only some of the deployment's, shown above the DDL. Empty when the
+	// DDL runs on every target.
+	OnTargets string
+	// UnreportedTargets counts the targets a rolled-up table speaks for that
+	// are still to run and have reported no progress yet, so have not started
+	// it. A settled target is not among them.
+	UnreportedTargets int
+	// RolloutSettled marks a rolled-up table whose rollout has settled with no
+	// target left to run, so a target still pending on it never starts it and
+	// reads as not started rather than queued.
+	RolloutSettled bool
 }
 
 // ShardProgress contains per-shard progress for template rendering.
@@ -101,21 +116,6 @@ type ShardProgress struct {
 	ETASeconds      int64
 	PercentComplete int
 	CutoverAttempts int
-}
-
-// ShardCounts holds aggregated shard status counts.
-type ShardCounts struct {
-	Total             int
-	Complete          int
-	Running           int
-	WaitingForCutover int
-	CuttingOver       int
-	Queued            int
-	Failed            int
-	Cancelled         int
-	// Other counts every status the fields above do not name, keyed by
-	// status, so a part in any phase stays in the summary.
-	Other map[string]int
 }
 
 // Display-only task states. These are not persisted apply states (see pkg/applystate)
@@ -167,6 +167,7 @@ func ParseProgressResponse(result *apitypes.ProgressResponse) ProgressData {
 			ErrorMessage:        op.ErrorMessage,
 			ErrorCode:           op.ErrorCode,
 			AlreadyConverged:    op.AlreadyConverged,
+			RolloutStep:         op.RolloutStep,
 			StartedAt:           op.StartedAt,
 			CompletedAt:         op.CompletedAt,
 		})

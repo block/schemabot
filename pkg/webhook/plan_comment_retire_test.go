@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/webhook/templates"
 )
 
 func TestPlanCommentSupersedes(t *testing.T) {
@@ -51,4 +52,49 @@ func TestPlanCommentSlotEnvironmentScope(t *testing.T) {
 
 	assert.Equal(t, "staging", planCommentSlot{Environments: []string{"staging"}}.environmentScope())
 	assert.Equal(t, "", planCommentSlot{}.environmentScope())
+}
+
+func TestPlanCommentUpToDate(t *testing.T) {
+	noChanges := func() *templates.PlanCommentData { return &templates.PlanCommentData{} }
+	tests := []struct {
+		name           string
+		data           templates.MultiEnvPlanCommentData
+		rolloutHasWork bool
+		upToDate       bool
+	}{
+		{
+			name:     "no changes, errors, or drift",
+			data:     templates.MultiEnvPlanCommentData{Plans: map[string]*templates.PlanCommentData{"staging": noChanges()}},
+			upToDate: true,
+		},
+		{
+			name: "a plan with changes",
+			data: templates.MultiEnvPlanCommentData{Plans: map[string]*templates.PlanCommentData{
+				"staging": {Changes: []templates.KeyspaceChangeData{{Keyspace: "orders"}}},
+			}},
+		},
+		{
+			name: "an environment that failed to plan",
+			data: templates.MultiEnvPlanCommentData{
+				Plans:  map[string]*templates.PlanCommentData{"staging": noChanges()},
+				Errors: map[string]string{"production": "plan failed"},
+			},
+		},
+		{
+			name: "a plan the engine reported errors on",
+			data: templates.MultiEnvPlanCommentData{Plans: map[string]*templates.PlanCommentData{
+				"staging": {Errors: []string{"plan is incomplete for this shard"}},
+			}},
+		},
+		{
+			name:           "a rollout member that still has work",
+			data:           templates.MultiEnvPlanCommentData{Plans: map[string]*templates.PlanCommentData{"staging": noChanges()}},
+			rolloutHasWork: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.upToDate, planCommentUpToDate(tt.data, tt.rolloutHasWork))
+		})
+	}
 }

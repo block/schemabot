@@ -425,7 +425,7 @@ func writeShardKeyspaceSections(sb *strings.Builder, data ShardedApplyData, form
 	for _, ks := range keyspaces {
 		fmt.Fprintf(sb, "\n#### Keyspace %s\n\n", inlineCode(ks.Keyspace))
 		for _, t := range ks.Tables {
-			writeShardedTableLine(sb, t, func() {
+			writeShardedTableLine(sb, t, budget, func() {
 				writeShardedTableDDL(sb, shardedTableDDLGroups(ks, t.Table), len(ks.Shards), formatter, budget)
 			})
 		}
@@ -579,7 +579,7 @@ func keyspaceHasDivergentOutcome(shards []ShardStatus) bool {
 // aggregate phrase alone never hides or contradicts work that happened.
 // writeDDL writes the table's DDL directly under the headline, before the rows
 // and shard lines, where the single-deployment comment puts it.
-func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, writeDDL func()) {
+func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, budget *ddlBlockBudget, writeDDL func()) {
 	status := state.NormalizeTaskStatus(t.Status)
 	if status == state.Task.Running && t.RowsTotal > 0 {
 		writeShardedTableCopyProgress(sb, t, writeDDL)
@@ -600,7 +600,7 @@ func writeShardedTableLine(sb *strings.Builder, t ShardedTableStatus, writeDDL f
 		sb.WriteString(line + "\n")
 		writeDDL()
 	}
-	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards})
+	renderShardSummary(sb, TableProgressData{TableName: t.Table, Status: t.Status, Shards: t.Shards}, budget)
 }
 
 // writeShardedTableCopyProgress renders an actively copying table's live

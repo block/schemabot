@@ -12,6 +12,11 @@
 // from the same gate FindNextApplyOperation evaluates, so the presentation never
 // contradicts what the operator will actually claim next.
 //
+// Apply.Deployments has one entry per rollout member, not per operation: a
+// target whose rollout runs table by table folds its rows into one member. A
+// caller reaches a member's operations through Deployment.Rows and
+// Deployment.Row, never by the member's index.
+//
 // Vocabulary is deployment-facing only — the model never exposes the internal
 // "apply_operation" term.
 package presentation
@@ -60,6 +65,12 @@ type Operation struct {
 	// held the change when the apply was created, so nothing ran there.
 	AlreadyConverged bool
 
+	// RolloutStep is the table step the row runs when the rollout runs table
+	// by table, numbered from 1, and 0 for a row that runs its member's whole
+	// change. A target's stepped rows read as one member, and TableSteps
+	// counts a deployment's steps.
+	RolloutStep int
+
 	// Barrier is true when the operation's cutover_policy is "barrier" (resolved
 	// by the caller from storage.CutoverPolicyBarrier). Under barrier an earlier
 	// sibling stops blocking a later copy once it reaches the cutover barrier or
@@ -68,9 +79,12 @@ type Operation struct {
 
 	// Parallel is true when the operation's cutover_policy is "parallel" (resolved
 	// by the caller from storage.CutoverPolicyParallel). Under parallel the copy
-	// phase has no earlier-sibling gate at all — every deployment copies
-	// concurrently from the start — so a pending operation is never shown waiting
-	// for or halted by an earlier sibling. Cutover ordering is unchanged (it is
+	// phase has no earlier-sibling ordering — every deployment copies
+	// concurrently from the start — so a pending operation is never shown
+	// waiting for an earlier sibling, and a cancelled or reverted one does not
+	// hold it. Failure admission still applies: a terminal-failed earlier
+	// sibling holds it (halted, or paused under on_failure=pause) unless the
+	// policy continues past the failure. Cutover ordering is unchanged (it is
 	// strict-complete and policy-independent), so a parked parallel operation
 	// still waits for earlier cutovers exactly like barrier. Barrier and Parallel
 	// are mutually exclusive: the caller derives each from the same stored policy.
@@ -208,6 +222,13 @@ type Deployment struct {
 	// AlreadyConverged is whether the member's operation was recorded as a
 	// target that already held the change when the apply was created.
 	AlreadyConverged bool
+
+	// Rows are the indexes, into the operations Derive was given, of the rows
+	// this member's work spans, in input order. Row is the one that speaks for
+	// the member, most in need of an operator first: a surface that renders a
+	// member's own identifiers reads them from that row.
+	Rows []int
+	Row  int
 }
 
 // NextActionKind is the semantic operator action the aggregate suggests. The
@@ -277,6 +298,10 @@ type Apply struct {
 	// Deployments are the per-deployment presentations in resolved deployment
 	// order (the order the caller supplies, which mirrors the rollout order).
 	Deployments []Deployment
+
+	// rows are the operations the model was derived from, which
+	// Deployment.Rows index.
+	rows []Operation
 }
 
 // Group is one deployment's members of a rollout, so a surface can show a
@@ -381,10 +406,12 @@ func (a Apply) MultiDeployment() bool {
 
 // Derive projects the ordered operations of one apply into its rollup. The input
 // must be in resolved deployment order (as returned by ListByApply); earlier
-// siblings are those before a given index. The returned Deployments slice is
-// index-parallel to ops — one entry per operation, in the same order, each
-// carrying its operation's Deployment name — and callers rely on that
-// correspondence to key results back to their inputs.
+// siblings are those before a given index. The returned Deployments are one per
+// rollout member, in the order each member's first row appears: one per row,
+// except that a target's rows of a rollout run table by table are one member
+// however many tables they run (see memberRows). Each carries the rows it
+// covers (Rows, Row), which callers use to key results back to their inputs.
+// The aggregate state reads every row, as the stored apply state does.
 func Derive(ops []Operation) Apply {
 	rolloutOps := make([]state.RolloutOperation, len(ops))
 	for i, op := range ops {
@@ -393,6 +420,7 @@ func Derive(ops []Operation) Apply {
 			OperationKey:      op.OperationKey,
 			Work:              op.Work,
 			Finalizer:         op.Finalizer,
+			RolloutStep:       op.RolloutStep,
 			State:             op.State,
 			NeverStarted:      op.NeverStarted,
 			ContinueOnFailure: op.continuesPastFailure(),
@@ -401,11 +429,24 @@ func Derive(ops []Operation) Apply {
 	}
 	children := state.RolloutChildren(rolloutOps)
 
-	names := memberNames(ops)
-	deployments := make([]Deployment, len(ops))
-	for i := range ops {
-		deployments[i] = deriveDeployment(ops, names, i)
+	rows := memberRows(ops)
+	members := make([]Operation, len(rows))
+	memberOf := make([]int, len(ops))
+	leads := make([]int, len(rows))
+	for j, memberRows := range rows {
+		members[j], leads[j] = foldMember(ops, memberRows)
+		for _, i := range memberRows {
+			memberOf[i] = j
+		}
 	}
+	names := memberNames(members)
+	deployments := make([]Deployment, len(members))
+	for j := range members {
+		deployments[j] = deriveDeployment(members, names, j)
+		deployments[j].Rows = rows[j]
+		deployments[j].Row = leads[j]
+	}
+	orderFoldedMembersByRow(ops, members, names, memberOf, deployments)
 
 	aggState := state.DeriveRolloutApplyState(children)
 	return Apply{
@@ -413,21 +454,27 @@ func Derive(ops []Operation) Apply {
 		Label:        aggregateLabel(aggState),
 		Counts:       summaryCounts(deployments),
 		NextAction:   nextAction(aggState, deployments, hasFailClosedFailure(ops)),
-		FirstFailure: firstFailure(deployments),
+		FirstFailure: firstFailure(ops, deployments, memberOf),
 		Deployments:  deployments,
+		rows:         ops,
 	}
 }
 
-// firstFailure returns the first deployment, in resolved order, whose raw
-// operation state is terminally failed, or nil when none failed. failed_retryable
+// firstFailure returns the deployment of the first row, in resolved order,
+// whose raw operation state is terminally failed, or nil when none failed. A
+// folded member's failure is placed by its failed row, so a target that
+// failed a later table comes after one that failed an earlier one. memberOf
+// maps each row to its deployment. failed_retryable
 // is excluded: a retrying deployment is still in progress and surfaces no
 // operator-facing failure. The result is a copy, not an alias into Deployments,
 // so a caller that later re-slices or sorts Deployments cannot turn it into a
 // stale pointer.
-func firstFailure(deps []Deployment) *Deployment {
-	for i := range deps {
-		if deps[i].State == state.ApplyOperation.Failed {
-			failed := deps[i]
+func firstFailure(ops []Operation, deps []Deployment, memberOf []int) *Deployment {
+	for i, op := range ops {
+		if op.State != state.ApplyOperation.Failed {
+			continue
+		}
+		if failed := deps[memberOf[i]]; failed.State == state.ApplyOperation.Failed {
 			return &failed
 		}
 	}
@@ -461,7 +508,7 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 	switch op.State {
 	case state.ApplyOperation.Completed:
 		if d.AlreadyApplied() {
-			d.set(StateAlreadyApplied, "already had it", "✅", false)
+			d.set(StateAlreadyApplied, AlreadyAppliedLabel, "✅", false)
 			break
 		}
 		d.set(StateCompleted, "completed", "✅", false)
@@ -498,17 +545,27 @@ func deriveDeployment(ops []Operation, names []string, i int) Deployment {
 // label agrees with what the operator will claim next.
 func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 	op := ops[i]
-	// Under parallel the copy phase has no earlier-sibling gate, so a pending
-	// operation is immediately claimable regardless of any earlier sibling — it
-	// is never halted by or waiting for one. Mirror FindNextApplyOperation, whose
-	// copy-start gate matches no arm for parallel.
+	if h := earlierStepHolder(ops, i); h >= 0 {
+		setHeldByEarlierStep(d, ops[h], names[h])
+		return
+	}
+	// Under parallel the copy phase has no earlier-sibling ordering, so a
+	// pending operation never waits for an earlier sibling and a cancelled or
+	// reverted one does not hold it. Failure admission still applies: a
+	// terminal-failed earlier sibling holds it unless the policy continues past
+	// the failure. Mirror FindNextApplyOperation, whose copy-start gate matches
+	// only the failure arm for parallel.
 	if op.Parallel {
+		if h := failedSibling(ops, i); h >= 0 {
+			setHeldByFailure(d, op, names[h])
+			return
+		}
 		d.set(StateQueuedNext, "queued — next in order", "⏳", false)
 		return
 	}
-	if h, paused := blockingSibling(ops, i); h >= 0 {
-		if paused {
-			d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", names[h]), "⏸️", true)
+	if h := blockingSibling(ops, i); h >= 0 {
+		if ops[h].State == state.ApplyOperation.Failed {
+			setHeldByFailure(d, op, names[h])
 			return
 		}
 		d.set(StateHalted, fmt.Sprintf("halted — %s %s", names[h], haltedReason(ops[h].State)), "⏸️", true)
@@ -521,6 +578,49 @@ func derivePending(d *Deployment, ops []Operation, names []string, i int) {
 		}
 	}
 	d.set(StateQueuedNext, "queued — next in order", "⏳", false)
+}
+
+// earlierStepHolder returns the index of the row that holds a pending table
+// step behind an earlier one, or -1 when none does: a row of its deployment in
+// an earlier step that has not completed. A row the step can never pass, one
+// that failed, was cancelled or was reverted, is named ahead of one that is
+// still running, since it is what the operator has to act on. It mirrors the
+// claim's rolloutStepGateSQL, which holds a step under every cutover_policy and
+// on_failure.
+func earlierStepHolder(ops []Operation, i int) int {
+	op := ops[i]
+	if op.RolloutStep <= 0 {
+		return -1
+	}
+	holder := -1
+	for j, earlier := range ops {
+		if earlier.Deployment != op.Deployment || earlier.RolloutStep <= 0 || earlier.RolloutStep >= op.RolloutStep {
+			continue
+		}
+		if earlier.State == state.ApplyOperation.Completed {
+			continue
+		}
+		if state.StepRowCanNeverPass(earlier.State) {
+			return j
+		}
+		if holder < 0 {
+			holder = j
+		}
+	}
+	return holder
+}
+
+// setHeldByEarlierStep labels a pending table step held by an earlier step's
+// row. A row that settled without completing halts the step for good, whatever
+// on_failure says: the policy decides whether the rest of a step runs, never
+// whether the next table starts on a fleet missing the last one, so there is
+// nothing to release. Otherwise the step waits for that row.
+func setHeldByEarlierStep(d *Deployment, holder Operation, holderName string) {
+	if state.StepRowCanNeverPass(holder.State) {
+		d.set(StateHalted, fmt.Sprintf("halted — %s %s", holderName, haltedReason(holder.State)), "⏸️", true)
+		return
+	}
+	d.set(StateWaiting, fmt.Sprintf("waiting for %s", holderName), "⏳", false)
 }
 
 // deriveWaitingForCutover splits a copied-and-parked operation into ready-now or
@@ -538,15 +638,13 @@ func deriveWaitingForCutover(d *Deployment, ops []Operation, names []string, i i
 }
 
 // blockingSibling returns the index of the earliest earlier sibling that holds
-// the rollout for a pending operation, or -1 when none does, and whether the
-// hold is a human-gated pause rather than a halt. A terminal-failed sibling
-// holds unless the policy continues past it (continue, or a released pause);
-// when it does hold under on_failure=pause the hold is a pause (paused=true). A
-// cancelled/reverted sibling always halts, matching the predicate's lack of an
-// exemption for them. The index, rather than the operation, is what the caller
-// needs: the label names the blocker by its resolved member name, which is only
-// addressable by position.
-func blockingSibling(ops []Operation, i int) (blocker int, paused bool) {
+// the rollout for a pending operation under an ordered cutover policy, or -1
+// when none does. A terminal-failed sibling holds unless the policy continues
+// past it (continue, or a released pause). A cancelled/reverted sibling always
+// holds, matching the predicate's lack of an exemption for them. The index,
+// rather than the operation, is what the caller needs: the label names the
+// blocker by its resolved member name, which is only addressable by position.
+func blockingSibling(ops []Operation, i int) int {
 	op := ops[i]
 	for j := range i {
 		switch ops[j].State {
@@ -554,12 +652,41 @@ func blockingSibling(ops []Operation, i int) (blocker int, paused bool) {
 			if op.continuesPastFailure() {
 				continue
 			}
-			return j, op.pausesOnFailure()
+			return j
 		case state.ApplyOperation.Cancelled, state.ApplyOperation.Reverted:
-			return j, false
+			return j
 		}
 	}
-	return -1, false
+	return -1
+}
+
+// failedSibling returns the index of the earliest terminal-failed earlier
+// sibling that holds a pending operation, or -1 when none does or the policy
+// continues past failure (continue, or a released pause). It is the failure
+// admission arm of the copy-start gate alone, which is all that holds a
+// pending operation under parallel: a cancelled or reverted sibling does not.
+func failedSibling(ops []Operation, i int) int {
+	op := ops[i]
+	if op.continuesPastFailure() {
+		return -1
+	}
+	for j := range i {
+		if ops[j].State == state.ApplyOperation.Failed {
+			return j
+		}
+	}
+	return -1
+}
+
+// setHeldByFailure labels a pending operation held by an earlier sibling's
+// terminal failure: paused for a human under on_failure=pause, halted
+// otherwise. blocker is the failed sibling's resolved member name.
+func setHeldByFailure(d *Deployment, op Operation, blocker string) {
+	if op.pausesOnFailure() {
+		d.set(StatePaused, fmt.Sprintf("paused — %s failed; release or stop", blocker), "⏸️", true)
+		return
+	}
+	d.set(StateHalted, fmt.Sprintf("halted — %s failed", blocker), "⏸️", true)
 }
 
 // blocksPending reports whether an earlier sibling in earlierState blocks a
@@ -746,7 +873,7 @@ var summaryCategoryOrder = []struct {
 	states []PresentationState
 }{
 	{"completed", []PresentationState{StateCompleted}},
-	{"already had it", []PresentationState{StateAlreadyApplied}},
+	{AlreadyAppliedLabel, []PresentationState{StateAlreadyApplied}},
 	{"cutting over", []PresentationState{StateCuttingOver}},
 	{"ready for cutover", []PresentationState{StateReadyForCutoverNext, StateReadyForCutoverWaiting}},
 	{"running", []PresentationState{StateRunningCopy}},
@@ -801,6 +928,10 @@ func firstWithPresentation(deps []Deployment, ps PresentationState) (Deployment,
 	return Deployment{}, false
 }
 
+// AlreadyAppliedLabel is the status of a member whose target already had the
+// change, so a surface that leaves such targets out can find its count.
+const AlreadyAppliedLabel = "already had it"
+
 // AlreadyApplied reports whether the member's target already held the change
 // when the apply was created, so nothing ran there. It reads the stored mark the
 // apply records, never a missing start: an operation a reaper settled to its
@@ -833,6 +964,14 @@ type TargetProgress struct {
 	// target whose status is not final, an unknown one included. An apply can
 	// settle while one of them is still going, so it is counted on its own.
 	Unsettled int
+}
+
+// RolloutSettled reports whether g's rollout has settled with no target left
+// to run: the apply is in a settled state and every target in g is too. A
+// table still pending on some target then never starts there, so it reads as
+// not started rather than queued.
+func (a Apply) RolloutSettled(g Group) bool {
+	return state.IsState(a.State, state.SettledApplyStates...) && a.TargetProgress(g).Unsettled == 0
 }
 
 // TargetProgress counts g's targets for its status line. Done and AlreadyHad

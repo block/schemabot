@@ -173,8 +173,10 @@ var _ ConnectionAssembler = PostgresConnectionAssembler{}
 // DatabaseType returns the PostgreSQL engine type.
 func (PostgresConnectionAssembler) DatabaseType() string { return "postgres" }
 
-// Assemble builds a PostgreSQL libpq URL from the host, the "dbname" endpoint
-// attribute, and credentials, and emits the resolved CA reference in Metadata.
+// Assemble builds a PostgreSQL libpq URL from the host, the database name, and
+// credentials, and emits the resolved CA reference in Metadata. The database
+// name comes from the endpoint attribute or, failing that, from the
+// credentials; when both carry one they must agree.
 func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]string, creds *Credentials) (string, map[string]string, error) {
 	// Hosts are DNS names or IP literals, so trimming stray whitespace and
 	// lowercasing preserve identity. Normalizing here keeps the emitted DSN,
@@ -204,9 +206,9 @@ func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]stri
 	if strings.ContainsAny(host, " \t\r\n@/?#") {
 		return "", nil, fmt.Errorf("postgres host contains invalid characters, got %q", host)
 	}
-	dbname := strings.TrimSpace(attrs[PostgresDBNameAttribute])
-	if dbname == "" {
-		return "", nil, fmt.Errorf("postgres connection requires the %q endpoint attribute", PostgresDBNameAttribute)
+	dbname, err := postgresDatabaseName(attrs, creds)
+	if err != nil {
+		return "", nil, err
 	}
 	if strings.Contains(dbname, "/") {
 		return "", nil, fmt.Errorf("postgres database name must not contain \"/\", got %q", dbname)
@@ -242,13 +244,65 @@ func (a PostgresConnectionAssembler) Assemble(host string, attrs map[string]stri
 	return u.String(), metadata, nil
 }
 
+// postgresDatabaseName returns the database the connection is made to: the
+// endpoint's dbname attribute (static targets) or the database name the
+// credentials carry (see DecodePostgresSecret). When both are present and
+// differ the target is ambiguous, so it fails closed rather than connecting to
+// either.
+func postgresDatabaseName(attrs map[string]string, creds *Credentials) (string, error) {
+	fromEndpoint := strings.TrimSpace(attrs[PostgresDBNameAttribute])
+	fromCredentials := strings.TrimSpace(creds.Metadata[MetadataPostgresDBName])
+	switch {
+	case fromEndpoint != "" && fromCredentials != "" && fromEndpoint != fromCredentials:
+		return "", fmt.Errorf("postgres database name is ambiguous: endpoint attribute %q is %q but the credentials name %q", PostgresDBNameAttribute, fromEndpoint, fromCredentials)
+	case fromEndpoint != "":
+		return fromEndpoint, nil
+	case fromCredentials != "":
+		return fromCredentials, nil
+	default:
+		return "", fmt.Errorf("postgres connection requires the %q endpoint attribute or a database name in the credentials", PostgresDBNameAttribute)
+	}
+}
+
+// MetadataPostgresDBName is the credential metadata key carrying the database
+// name read from a PostgreSQL credential secret.
+const MetadataPostgresDBName = "dbname"
+
+// DecodePostgresSecret decodes a JSON PostgreSQL credential secret in the
+// format AWS uses for RDS database secrets:
+//
+//	{"username": "...", "password": "...", "dbname": "..."}
+//
+// The username and password are required. The optional dbname rides in
+// credential Metadata so the assembler can connect to it when the endpoint
+// records no database name. Other fields (engine, host, port) are ignored: the
+// endpoint, not the secret, decides where the connection goes.
+func DecodePostgresSecret(raw string) (*Credentials, error) {
+	var secret struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		DBName   string `json:"dbname"`
+	}
+	if err := json.Unmarshal([]byte(raw), &secret); err != nil {
+		return nil, fmt.Errorf("parse postgres secret as JSON {username, password, dbname}: %w", err)
+	}
+	if secret.Username == "" || secret.Password == "" {
+		return nil, fmt.Errorf("postgres secret is missing a username or password")
+	}
+	creds := &Credentials{Username: secret.Username, Password: secret.Password}
+	if dbname := strings.TrimSpace(secret.DBName); dbname != "" {
+		creds.Metadata = map[string]string{MetadataPostgresDBName: dbname}
+	}
+	return creds, nil
+}
+
 // resolveCARef returns the CA reference for the resolved host: the configured
 // one when set, the embedded RDS bundle for an RDS endpoint, and an error
 // otherwise — a verified CA is required, and the ambient trust store is never
 // an implicit fallback.
 func (a PostgresConnectionAssembler) resolveCARef(host string) (string, error) {
 	if a.CARef != "" {
-		if err := validatePostgresCARef(a.CARef); err != nil {
+		if err := ValidatePostgresCARef(a.CARef); err != nil {
 			return "", err
 		}
 		return a.CARef, nil
@@ -261,9 +315,9 @@ func (a PostgresConnectionAssembler) resolveCARef(host string) (string, error) {
 	return "", fmt.Errorf("a verified CA is required: host %q is not an RDS endpoint and no ca_ref is configured", host)
 }
 
-// validatePostgresCARef checks a CA reference's form: the embedded RDS bundle
+// ValidatePostgresCARef checks a CA reference's form: the embedded RDS bundle
 // selector, or a file reference with an absolute path.
-func validatePostgresCARef(caRef string) error {
+func ValidatePostgresCARef(caRef string) error {
 	if caRef == PostgresCARefEmbeddedRDSGlobal {
 		return nil
 	}

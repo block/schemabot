@@ -296,6 +296,45 @@ func TestOperatorMultiOperationMatrix(t *testing.T) {
 		}
 	})
 
+	// TableStepsHoldTheNextTableBehindAFailure drives a parallel rollout over
+	// payments-001 and payments-002 that runs `stations` and then `docks`, table
+	// by table, under continue. payments-002 fails `stations`. Continue lets the
+	// rest of the step run, but no target starts `docks` on a fleet where one
+	// target is missing `stations`, and the apply settles failed rather than
+	// waiting on the `docks` rows nothing will start.
+	t.Run("TableStepsHoldTheNextTableBehindAFailure", func(t *testing.T) {
+		resetMatrixTables(t, ctx, db)
+		targets := []string{"payments-001", "payments-002"}
+		seed := seedGroupedApply(t, ctx, stor, multiOpSeed{
+			applyIdentifier: "matrix-table-steps",
+			parentState:     state.Apply.Pending,
+			cutoverPolicy:   storage.CutoverPolicyParallel,
+			onFailure:       storage.OnFailureContinue,
+			deployments:     []string{"region-a"},
+			targets:         targets,
+			tables:          []string{"stations", "docks"},
+			opState:         state.ApplyOperation.Pending,
+			taskState:       state.Task.Pending,
+		})
+
+		rec := &driveRecorder{}
+		svc := newMatrixService(t, stor, matrixTargetClients(stor, rec, "region-a", map[string]matrixOutcome{
+			"payments-001": {taskState: state.Task.Completed},
+			"payments-002": {taskState: state.Task.Failed, errMsg: "duplicate key name 'idx_stations_note'"},
+		}))
+
+		for driver := 1; driver <= 4; driver++ {
+			driveNextOperation(t, ctx, svc, driver)
+		}
+
+		assert.Equal(t, []string{"payments-001/step-1", "payments-002/step-1"}, rec.resumeOperationKeys(),
+			"only stations is driven once payments-002 fails it")
+		for _, key := range []string{"payments-001/step-2", "payments-002/step-2"} {
+			assert.Equal(t, state.ApplyOperation.Pending, opState(t, ctx, stor, seed.opID(key)), "operation %s", key)
+		}
+		assert.Equal(t, state.Apply.Failed, getApply(t, ctx, stor, seed.applyID).State)
+	})
+
 	t.Run("PendingStopStopsPendingSiblingsAndCompletesStop", func(t *testing.T) {
 		resetMatrixTables(t, ctx, db)
 		// A continue rollout that already failed one deployment and still has a
@@ -501,6 +540,10 @@ type multiOpSeed struct {
 	// shape a deployment's targets list resolves to. Per-member maps and opID
 	// are then keyed by target instead of by deployment.
 	targets []string
+	// tables, when set with targets, seeds the rollout table by table: one
+	// operation per (table, target), in that order, each stamped with its table
+	// step. Per-member maps and opID are then keyed by operation key.
+	tables []string
 	// opState / taskState set a uniform initial state for every operation/task.
 	opState   string
 	taskState string
@@ -522,7 +565,16 @@ func (s seededMultiOpApply) opID(member string) int64 { return s.ops[member] }
 // matrixSeedMember is one operation seedGroupedApply creates: the member name
 // that keys the per-member maps, and the operation's deployment, target and key.
 type matrixSeedMember struct {
-	name, deployment, target, operationKey string
+	name, deployment, target, operationKey, table string
+	rolloutStep                                   int
+}
+
+// tableName is the table the member's one task alters.
+func (m matrixSeedMember) tableName() string {
+	if m.table == "" {
+		return "widgets"
+	}
+	return m.table
 }
 
 func (spec multiOpSeed) members() []matrixSeedMember {
@@ -530,6 +582,18 @@ func (spec multiOpSeed) members() []matrixSeedMember {
 		members := make([]matrixSeedMember, 0, len(spec.deployments))
 		for _, dep := range spec.deployments {
 			members = append(members, matrixSeedMember{name: dep, deployment: dep, target: "payments-" + dep})
+		}
+		return members
+	}
+	if len(spec.tables) > 0 {
+		members := make([]matrixSeedMember, 0, len(spec.tables)*len(spec.targets))
+		for i, table := range spec.tables {
+			for _, target := range spec.targets {
+				key := storage.TargetOperationKey(target, storage.RolloutStepOperationKey(i+1))
+				members = append(members, matrixSeedMember{
+					name: key, deployment: spec.deployments[0], target: target, operationKey: key, table: table, rolloutStep: i + 1,
+				})
+			}
 		}
 		return members
 	}
@@ -588,6 +652,7 @@ func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, s
 				Deployment:    member.deployment,
 				OperationKey:  member.operationKey,
 				Target:        member.target,
+				RolloutStep:   member.rolloutStep,
 				State:         opState,
 				CutoverPolicy: spec.cutoverPolicy,
 				OnFailure:     spec.onFailure,
@@ -605,8 +670,8 @@ func seedGroupedApply(t *testing.T, ctx context.Context, stor storage.Storage, s
 				State:          taskState,
 				Options:        storage.MarshalApplyOptions(storage.ApplyOptions{}),
 				Namespace:      "payments",
-				TableName:      "widgets",
-				DDL:            "ALTER TABLE widgets ADD COLUMN c int",
+				TableName:      member.tableName(),
+				DDL:            "ALTER TABLE " + member.tableName() + " ADD COLUMN c int",
 				DDLAction:      "alter",
 				CreatedAt:      now,
 				UpdatedAt:      now,

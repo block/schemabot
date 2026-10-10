@@ -587,12 +587,169 @@ ALTER TABLE `order_events` DROP INDEX `idx_events_archived`;
 
 </details>
 
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
 📋 **Plan**: **2** tables to alter
 
 
 ---
 
 ▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-existing-primary-key-warning"></a><strong>MySQL Plan (Existing Primary Key Warning)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+💡 **Lint Warnings**: 1 advisory finding
+- `customers`: Primary key column `id` has type `varchar`
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
+📋 **Plan**: **1** table to alter
+
+
+---
+
+▶️ **To apply**, comment:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-new-primary-key-issue"></a><strong>MySQL Plan (New Primary Key Issue)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+CREATE TABLE `customers` (
+    `id` varchar(64) NOT NULL,
+    `created_at` datetime(3) NOT NULL,
+    PRIMARY KEY(`id`)
+) ENGINE InnoDB,
+  CHARSET utf8mb4,
+  COLLATE utf8mb4_0900_ai_ci;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `customers`: Primary key column `id` has type `varchar`
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+
+📋 **Plan**: **1** table to create
+
+
+---
+
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `customers`:
+```
+schemabot apply -e staging
+```
+
+</details>
+
+<details>
+<summary><a name="mysql-plan-related-guidance"></a><strong>MySQL Plan (Related Guidance)</strong></summary>
+
+
+## Schema Change Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL` | **Schema Name**: `testapp`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC · planned from [`abcdef1`](https://github.com/block/schemabot/commit/abcdef1234567890abcdef1234567890abcdef12)*
+
+```sql
+ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
+```
+
+```sql
+ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `invoices` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `shipments` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `sessions` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+```sql
+ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `users`: Column rename detected in table `users`: `email` to `email_address`. Renaming a column cannot be done atomically across application pods, and ORMs that generate column names at compile time (e.g. jOOQ) will break until code is recompiled
+
+<details>
+<summary>💡 <b>Lint Warnings</b>: 6 advisory findings</summary>
+
+**`customers`**
+- Primary key column `id` has type `varchar`
+
+**`orders`**
+- Primary key column `id` has type `varchar`
+
+**`invoices`**
+- Primary key column `id` has type `varchar`
+
+**`shipments`**
+- Primary key column `id` has type `varchar`
+
+**`sessions`**
+- Primary key column `id` has type `varchar`
+
+**`events`**
+- Primary key column `id` has type `varchar`
+
+</details>
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+- [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
+
+📋 **Plan**: **7** tables to alter
+
+
+---
+
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `users`:
 ```
 schemabot apply -e staging
 ```
@@ -746,7 +903,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`orders`):
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `orders`:
 ```
 schemabot apply -e staging
 ```
@@ -789,7 +946,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`orders`, `reconcile_state`):
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `orders` and `reconcile_state`:
 ```
 schemabot apply -e staging
 ```
@@ -1368,7 +1525,7 @@ schemabot apply -e staging
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes (`commerce_sharded` VSchema):
+▶️ **To apply**, add `--allow-unsafe` to confirm 2 unsafe changes on `commerce_sharded` VSchema:
 ```
 schemabot apply -e staging
 ```
@@ -2093,14 +2250,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to 2 of 3 targets (1 already has it)
-
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_1`, `us/testapp_2` · Already has it: `us/testapp_3`
-
-</details>
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to targets `us/testapp_1`, `us/testapp_2`
 
 
 ---
@@ -2151,14 +2301,7 @@ CREATE TABLE `orders` (
 ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 ```
 
-📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to 2 of 3 targets (1 already has it)
-
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_2`, `us/testapp_3` · Already has it: `us/testapp_1`
-
-</details>
+📋 **Plan**: **2** tables to create, **1** table to alter · rolling out to targets `us/testapp_2`, `us/testapp_3`
 
 
 ---
@@ -2234,13 +2377,6 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 
 📋 **Plan**: **2** tables to alter · rolling out to both targets
 
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_1`, `us/testapp_2`
-
-</details>
-
 
 ---
 
@@ -2274,13 +2410,6 @@ ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 - `users`: ~297 MB across 3 targets · largest ~104 MB on `us/testapp_3` · smallest ~95.0 MB
 
 📋 **Plan**: **2** tables to alter · rolling out to all 3 targets
-
-<details>
-<summary>Targets</summary>
-
-Needs it: `us/testapp_1`, `us/testapp_2`, `us/testapp_3`
-
-</details>
 
 
 ---
@@ -2424,6 +2553,14 @@ ALTER TABLE `users` RENAME COLUMN `email` TO `email_address`;
 
 📋 **Plan**: **2** tables to alter
 
+💡 **Lint Warnings**: 1 advisory finding
+- `orders`: Column `created_at` uses `TIMESTAMP` which overflows on 2038-01-19. Consider using `DATETIME` instead.
+
+📖 **Related guidance:**
+
+- [Choosing a primary key](https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key)
+- [Renaming a column or table](https://github.com/block/schemabot/blob/main/docs/pre-merge-workflow.md#renaming-a-column-or-table)
+
 ---
 
 **⛔ Apply rejected**: 3 unsafe changes detected
@@ -2459,7 +2596,7 @@ schemabot apply -e staging --allow-unsafe
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
@@ -2490,7 +2627,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
@@ -2924,7 +3061,7 @@ That command wasn't recognized. Available commands:
 | `schemabot rollback <apply-id> -e <env> [-t <tenant>]` | Generate a rollback plan |
 | `schemabot rollback-confirm -e <env> [-t <tenant>]` | Execute a rollback |
 
-**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess)
+**Options**: `-e <env>` environment, `-d <db>` database, `-t, --tenant <name>` deployment routing, `--defer-cutover`, `--allow-unsafe`, `--skip-revert` (Vitess), `--target <target>` one target of the rollout (plan and apply)
 
 **Quick start**: `plan` → `apply`
 <!-- schemabot:offer-support-channel -->
@@ -3660,11 +3797,9 @@ ALTER TABLE `products` ADD INDEX `idx_category_price`(`category`, `price`);
 - `products`: ~1.1 GB
 
 ⚠️ **Schema changes differ from the plan this apply was started from**
-- `orders` (alter) runs a different statement than in the plan this apply was started from
-- `products` (alter) is in this plan but not in the one this apply was started from
-- `shipments` (create) was in the plan this apply was started from but is not in this one
-
-The statements above are what will run. Review them, then confirm to apply them.
+- `orders` (alter) now runs a different statement
+- `products` (alter) is new
+- `shipments` (create) is no longer planned
 
 📋 **Plan**: **2** tables to create, **1** table to alter
 
@@ -3996,7 +4131,7 @@ _Requested by @jackjackbits_
 
 ### Error
 
-> This confirmation no longer covers what the apply would run: the primary target is not the one the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target&#39;s own plan.
+> This confirmation no longer covers what the apply would run: target `us` is not the target the confirmed plan reviewed, so nothing was applied. Run apply again for this environment to review and confirm each target&#39;s own plan.
 <!-- schemabot:offer-support-channel -->
 
 </details>
@@ -4975,7 +5110,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `users` ADD INDEX `idx_email`(`email`);
 ```
 - Rows: 914,707 / 1,466,232 · ETA: 3m 15s
-  └ shards: ✓ -40 · ● 40-80 ready · ◐ 80-c0 31% · ⏳ c0-
+- Shards: 4 (1 copying, 1 waiting for cutover, 1 queued, 1 complete)
+  - ◉ `80-c0`: 31%
+  - ● `40-80`: waiting for cutover
+  - ○ `c0-`: queued
+  - ✓ `-40`: complete
 
 
 ---
@@ -5009,7 +5148,11 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 ALTER TABLE `orders` ADD COLUMN `region` varchar(32);
 ```
 - Rows: 4,200,000,000 / 6,000,000,000 · ETA: 1h 30m
-  └ 256 shards: 200 ✓ · 52 ◐ copying · 4 ⏳ · slowest f7- 12%
+- Shards: 256 (52 copying, 4 queued, 200 complete)
+  - ◉ `f7-`: 12%
+  - ◉ `c8-`: 55%
+  - ◉ `dc-`: 55%
+  - … 49 more copying shards
 
 
 ---
@@ -6629,6 +6772,89 @@ ALTER TABLE `events` ADD INDEX `idx_created_at`(`created_at`);
 </details>
 
 <details>
+<summary><a name="rollback-plan-unsafe-change"></a><strong>Rollback Plan (Unsafe Change)</strong></summary>
+
+
+## Schema Rollback Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+```sql
+DROP TABLE `audit_log`;
+```
+
+⚠️ **Issues**: 1 unsafe change detected
+1. `audit_log`: DROP TABLE removes all data
+
+<details>
+<summary>Destructive drop guidance</summary>
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
+
+</details>
+
+📋 **Plan**: **1** table to drop
+
+---
+
+To confirm this rollback, add `--allow-unsafe` to confirm 1 unsafe change on `audit_log`:
+```
+schemabot rollback-confirm -e staging
+```
+
+To cancel, comment:
+```
+schemabot unlock
+```
+
+</details>
+
+<details>
+<summary><a name="rollback-confirm-blocked-unsafe-change"></a><strong>Rollback Confirm Blocked (Unsafe Change)</strong></summary>
+
+
+## Schema Rollback Plan — Staging
+
+**Database**: `testapp` | **Type**: `MySQL`
+
+*Requested by @jackjackbits at 2026-01-01 00:00:00 UTC*
+
+```sql
+DROP TABLE `audit_log`;
+```
+
+📋 **Plan**: **1** table to drop
+
+---
+
+**⛔ Rollback rejected**: 1 unsafe change detected
+1. `audit_log`: DROP TABLE removes all data
+
+<details>
+<summary>Destructive drop guidance</summary>
+
+Before allowing a destructive drop, first deploy application code that no longer reads from or writes to the dropped table.
+
+</details>
+
+**🚨 To proceed with these destructive changes, re-run with `--allow-unsafe`:**
+```
+schemabot rollback-confirm -e staging --allow-unsafe
+```
+
+The lock still pins this rollback plan, so the command above confirms it.
+
+To cancel, comment:
+```
+schemabot unlock
+```
+<!-- schemabot:offer-support-channel -->
+
+</details>
+
+<details>
 <summary><a name="rollback-status-running"></a><strong>Rollback Status: Running</strong></summary>
 
 
@@ -7328,8 +7554,8 @@ Use 'schemabot start' to resume from checkpoint.
        ALTER TABLE `customers` ADD INDEX `idx_created_at`(`created_at`);
        • Rows: 0 / 124,760,460
        • Shards: 2 (2 copying)
-           ◉ -80: 0% (0/60,483,380 rows)
-           ◉ 80-: 0% (0/64,277,080 rows)
+           ◉ -80: copying
+           ◉ 80-: copying
 
 ```
 </details>
@@ -7552,8 +7778,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
 
        • Shards: 2 (2 cancelled)
-           ○ -80: cancelled at 38.10% (800,000/2,100,000 rows)
-           ○ 80-: cancelled at 21.05% (400,000/1,900,000 rows)
+           ○ -80: cancelled at 38.10% · 800,000 / 2,100,000 rows
+           ○ 80-: cancelled at 21.05% · 400,000 / 1,900,000 rows
 
 ```
 </details>
@@ -7579,17 +7805,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
      ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜ 57.21%
        ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
        • Rows: 110,573,340 / 193,280,000 · ETA: 4m 40s
-       • Shards: 256 (30 waiting for cutover, 226 copying)
-           ● -01: waiting for cutover
-           ● 01-02: waiting for cutover
-           ● 02-03: waiting for cutover
-           ... 27 more waiting for cutover
-           ◉ ff-: 10.00% (101,000/1,010,000 rows) ETA 4m 40s
-           ◉ fe-ff: 10.00% (100,800/1,008,000 rows) ETA 4m 40s
-           ◉ fd-fe: 11.00% (110,660/1,006,000 rows) ETA 4m 38s
-           ◉ fc-fd: 11.00% (110,440/1,004,000 rows) ETA 4m 38s
-           ◉ fb-fc: 12.00% (120,240/1,002,000 rows) ETA 4m 36s
-           ... 221 more copying shards
+       • Shards: 256 (226 copying, 30 waiting for cutover)
+           ◉ fe-ff: 10.00% · 100,800 / 1,008,000 rows · ETA: 4m 40s
+           ◉ ff-: 10.00% · 101,000 / 1,010,000 rows · ETA: 4m 40s
+           ◉ fc-fd: 11.00% · 110,440 / 1,004,000 rows · ETA: 4m 38s
+           ... 223 more copying shards
 
 ```
 </details>
@@ -7615,17 +7835,11 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
      ~ transactions: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜ 67.89%
        ALTER TABLE `transactions` ADD COLUMN `region_id` int DEFAULT NULL;
        • Rows: 29,435,000 / 43,360,000 · ETA: 2m 37s
-       • Shards: 32 (12 waiting for cutover, 20 copying)
-           ● -08: waiting for cutover
-           ● 08-10: waiting for cutover
-           ● 10-18: waiting for cutover
-           ... 9 more waiting for cutover
-           ◉ f8-: 23.00% (347,300/1,510,000 rows) ETA 2m 37s
-           ◉ f0-f8: 26.00% (390,000/1,500,000 rows) ETA 2m 34s
-           ◉ e8-f0: 29.00% (432,100/1,490,000 rows) ETA 2m 31s
-           ◉ e0-e8: 32.00% (473,600/1,480,000 rows) ETA 2m 28s
-           ◉ d8-e0: 35.00% (514,500/1,470,000 rows) ETA 2m 25s
-           ... 15 more copying shards
+       • Shards: 32 (20 copying, 12 waiting for cutover)
+           ◉ f8-: 23.00% · 347,300 / 1,510,000 rows · ETA: 2m 37s
+           ◉ f0-f8: 26.00% · 390,000 / 1,500,000 rows · ETA: 2m 34s
+           ◉ e8-f0: 29.00% · 432,100 / 1,490,000 rows · ETA: 2m 31s
+           ... 17 more copying shards
 
   ── commerce_001 ──
 
@@ -7794,8 +8008,8 @@ Press Enter to deploy or proceed via the PlanetScale console (ESC to detach)
        ALTER TABLE `orders` ADD INDEX `idx_total`(`total_cents`);
        • Rows: 2,800,000 / 4,000,000 · ETA: 2m 0s
        • Shards: 2 (2 copying)
-           ◉ -80: 95.24% (2,000,000/2,100,000 rows) ETA 10s
-           ◉ 80-: 42.11% (800,000/1,900,000 rows) ETA 2m 0s
+           ◉ 80-: 42.11% · 800,000 / 1,900,000 rows · ETA: 2m 0s
+           ◉ -80: 95.24% · 2,000,000 / 2,100,000 rows · ETA: 10s
 
 ```
 </details>
@@ -8489,29 +8703,28 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 <summary>❌ us — 40 completed, 4 running, 19 queued, 1 failed (64 targets)</summary>
 <dl><dd>
 
-#### 56 of 64 targets
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜ 75%
 
 <details>
-<summary>Target names</summary>
+<summary><b>56 of 64 targets</b></summary>
 
 `orders_000`, `orders_001`, `orders_002`, `orders_003`, `orders_004`, `orders_005`, `orders_006`, `orders_007`, `orders_008`, `orders_009`, `orders_010`, `orders_011`, `orders_012`, `orders_013`, `orders_014`, `orders_015`, `orders_016`, `orders_017`, `orders_018`, `orders_019`, `orders_020`, `orders_021`, `orders_022`, `orders_023`, `orders_024`, `orders_025`, `orders_026`, `orders_027`, `orders_028`, `orders_029`, `orders_030`, `orders_031`, `orders_032`, `orders_033`, `orders_034`, `orders_035`, `orders_036`, `orders_037`, `orders_038`, `orders_039`, `orders_040`, `orders_041`, `orders_042`, `orders_043`, `orders_044`, `orders_045`, `orders_046`, `orders_047`, `orders_048`, `orders_049`, `orders_050`, `orders_051`, `orders_052`, `orders_053`, `orders_054`, `orders_055`
 
 </details>
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜ 96% · 40 complete, 4 running, 12 queued
-- Rows: 62,308,108 / 64,514,208 across 44 of 56 targets · ETA: ≥ 3m 15s
-- Running: `orders_040`, `orders_041`, `orders_042`, `orders_043`
-
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
-
-#### 8 of 64 targets
-
-`orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`
+- Rows: 62,308,108 / 64,514,208 across 44 of 56 targets · ETA: ≥ 3m 15s
+- Targets: 56 (4 copying, 12 queued, 40 complete)
+  - ◉ `orders_040`: 62.38% · 914,707 / 1,466,232 rows
+  - ◉ `orders_041`: 62.38% · 914,707 / 1,466,232 rows
+  - ◉ `orders_042`: 62.38% · 914,707 / 1,466,232 rows
+  - … 1 more copying targets
 
 **`orders`**: ❌ Failed · 7 queued, 1 failed
 
+**targets `orders_056`, `orders_057`, `orders_058`, `orders_059`, `orders_060`, `orders_061`, `orders_062`, `orders_063`**
 ```sql
 ALTER TABLE `orders`
     ADD INDEX `idx_user_id`(`user_id`),
@@ -8530,13 +8743,17 @@ ALTER TABLE `orders`
 <summary>🔄 eu — 4 running, 60 queued (64 targets)</summary>
 <dl><dd>
 
-**`orders`**: 🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 12% · 4 running, 60 queued
-- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
-- Running: `orders_000`, `orders_001`, `orders_002`, `orders_003`
+**`orders`**: 🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 1%
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
+- Rows: 732,116 / 5,864,928 across 4 of 64 targets · ETA: ≥ 23m 0s
+- Targets: 64 (4 copying, 60 queued)
+  - ◉ `orders_000`: 12.48% · 183,029 / 1,466,232 rows
+  - ◉ `orders_001`: 12.48% · 183,029 / 1,466,232 rows
+  - ◉ `orders_002`: 12.48% · 183,029 / 1,466,232 rows
+  - … 1 more copying targets
 
 
 </dd></dl>
@@ -8563,15 +8780,18 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-🔄 Rolling out: 1 of 4 targets done, 1 running, 1 queued (1 already had it)
+🔄 Rolling out: 1 of 3 targets done, 1 running, 1 queued
 
-**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜ 81% · 1 complete, 1 running
-- Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
-- Running: `orders_001`
+**`orders`**: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 54%
 
 ```sql
 ALTER TABLE `orders` ADD INDEX `idx_user_id`(`user_id`);
 ```
+- Rows: 2,380,939 / 2,932,464 across 2 of 3 targets · ETA: ≥ 3m 15s
+- Targets: 3 (1 copying, 1 queued, 1 complete)
+  - ◉ `orders_001`: 62.38% · 914,707 / 1,466,232 rows
+  - ○ `orders_002`: queued
+  - ✓ `orders_000`: 1,466,232 rows
 
 
 ---
@@ -8595,7 +8815,7 @@ _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:0
 
 *Applied by @aparajon at 2026-01-01 00:00:00 UTC*
 
-✅ Rolled out to 3 of 4 targets (1 already had it)
+✅ Rolled out to 3 targets
 
 **`orders`**: ✅ Complete (3 targets)
 
@@ -9393,7 +9613,7 @@ Before allowing a destructive drop, first deploy application code that no longer
 
 ---
 
-▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change (`mutes` on shard `40-80`):
+▶️ **To apply**, add `--allow-unsafe` to confirm 1 unsafe change on `mutes`:
 ```
 schemabot apply -e production
 ```
@@ -9422,7 +9642,11 @@ schemabot apply -e production
 ALTER TABLE `mutes` ADD INDEX `created_at`(`created_at`);
 ```
 - Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
-  └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0 · ⏳ c0-
+- Shards: 4 (1 copying, 3 queued)
+  - ◉ `-40`: 62%
+  - ○ `40-80`: queued
+  - ○ `80-c0`: queued
+  - ○ `c0-`: queued
 
 _Last updated: <relative-time datetime="2026-01-01T00:00:00Z">2026-01-01 00:00:00 UTC</relative-time> (2026-01-01 00:00:00 UTC)_
 
@@ -9497,7 +9721,10 @@ ALTER TABLE `mutes`
     ADD INDEX `created_at`(`created_at`),
     ADD COLUMN `reason` varchar(255);
 ```
-  └ shards: ◐ -40 62% · ⏳ 40-80 · ⏳ 80-c0
+- Shards: 3 (1 copying, 2 queued)
+  - ◉ `-40`: 62%
+  - ○ `40-80`: queued
+  - ○ `80-c0`: queued
 
 Shards diverge — grouped by change:
 
@@ -9904,18 +10131,15 @@ A new apply can retry the failure once this one finishes or is stopped; it repro
 
 ❌ prod — 40 completed · 19 running · 4 queued · 1 failed (64 targets)
 
-     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72% · 40 of 60 targets complete · 1 failed
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜ 86.72%
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
        • Rows: 4,093,000 / 4,720,000 · ETA: 10m 0s
-       • Targets: 60 (40 complete, 19 copying, 1 failed)
+       • Targets: 60 (1 failed, 19 copying, 40 complete)
            ✗ payments-041: failed
-           ◉ payments-042: 25.00% (20,000/80,000 rows) ETA 10m 0s
-           ◉ payments-043: 28.75% (23,000/80,000 rows) ETA 9m 35s
-           ◉ payments-044: 32.50% (26,000/80,000 rows) ETA 9m 10s
-           ◉ payments-045: 36.25% (29,000/80,000 rows) ETA 8m 45s
-           ◉ payments-046: 40.00% (32,000/80,000 rows) ETA 8m 20s
-           ... 14 more copying targets
-           ... 40 complete
+           ◉ payments-042: 25.00% · 20,000 / 80,000 rows · ETA: 10m 0s
+           ◉ payments-043: 28.75% · 23,000 / 80,000 rows · ETA: 9m 35s
+           ◉ payments-044: 32.50% · 26,000 / 80,000 rows · ETA: 9m 10s
+           ... 16 more copying targets
 
   4 of 64 targets have not reported progress yet.
 
@@ -9947,18 +10171,16 @@ To stop this schema change:
 
 🟢 prod — 3 ready for cutover (3 targets)
 
-▸ targets payments-001, payments-002
-
-     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover · 0 of 2 targets complete
+     ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+       targets payments-001, payments-002
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
        • Targets: 2 (2 waiting for cutover)
            ● payments-001: waiting for cutover
            ● payments-002: waiting for cutover
 
-▸ target payments-003
-
      ~ orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 Waiting for cutover
+       target payments-003
        ALTER TABLE `orders` MODIFY COLUMN `source` varchar(32) DEFAULT NULL;
 
        • Targets: 1 (1 waiting for cutover)
@@ -9988,13 +10210,13 @@ To cut over prod/payments-001:
 
 ⏹️ prod — 1 completed · 2 stopped (3 targets)
 
-     ~ orders: ⏹️ Stopped · 1 of 3 targets complete
+     ~ orders: ⏹️ Stopped
        ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
 
-       • Targets: 3 (1 complete, 2 stopped)
+       • Targets: 3 (2 stopped, 1 complete)
+           ○ payments-002: stopped at 40.00% · 32,000 / 80,000 rows
+           ○ payments-003: stopped at 25.00% · 20,000 / 80,000 rows
            ✓ payments-001: 80,000 rows
-           ○ payments-002: stopped at 40.00% (32,000/80,000 rows)
-           ○ payments-003: stopped at 25.00% (20,000/80,000 rows)
 
 To resume from where it stopped:
   schemabot start apply-multi-a1b2c3d4 -e production
@@ -10455,9 +10677,13 @@ Tables are being renamed atomically...
 
 Lint violations: Non-blocking warnings during plan/apply
 
-💡 Lint Warnings (2):
+💡 Lint Warnings (3):
   • orders: has_float: New column uses floating-point data type
   • users: no_default: Column added without DEFAULT value
+  • customers: Primary key column "id" has type "varchar"
+
+📖 Related guidance:
+  • Choosing a primary key: https://github.com/block/schemabot/blob/main/docs/mysql.md#choosing-a-primary-key
 
 
 ```

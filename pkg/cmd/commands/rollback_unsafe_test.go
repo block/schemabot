@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/block/schemabot/pkg/apitypes"
+	"github.com/block/schemabot/pkg/engine"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -166,6 +167,30 @@ func TestRollbackShardOnlyUnsafeChangeRequiresAllowUnsafe(t *testing.T) {
 	assert.Contains(t, output, `orders: Column "legacy" is dropped`)
 	assert.Contains(t, output, "DROP COLUMN `legacy`")
 	assert.Contains(t, output, "rollback apply-example-90 -e production --allow-unsafe")
+	assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, requests())
+	assert.Empty(t, applyOptions())
+}
+
+// A rollback whose plan carries a blocked execution verdict is refused below
+// the plan that shows the refused statement, before the prompt, any lock, or
+// the apply, whatever the consent flags. The refusal names the plan, the table,
+// and the engine's reason.
+func TestRollbackCmd_BlockedPlanRefusesBeforeLock(t *testing.T) {
+	t.Setenv("SCHEMABOT_TOKEN", "fictional-rollback-test")
+	plan := apitypes.PlanResponse{PlanID: "plan-example-rollback", Database: "shop", DatabaseType: "mysql", Environment: "production",
+		Changes: []*apitypes.SchemaChangeResponse{{Namespace: "shop", TableChanges: []*apitypes.TableChangeResponse{{
+			TableName: "orders", ChangeType: "alter", DDL: "ALTER TABLE `orders` DROP INDEX `idx_status`;",
+			ExecutionMode: engine.ExecutionModeBlocked, ModeReason: "direct execution is enabled but the table's size is unavailable",
+		}}}}}
+	endpoint, requests, applyOptions := rollbackAPIServer(t, plan)
+	var runErr error
+	output := stripAnsi(captureStdout(func() {
+		cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true, AllowUnsafe: true}
+		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+	}))
+	assert.EqualError(t, runErr, `rollback blocked: plan plan-example-rollback contains a blocked change for table "orders": direct execution is enabled but the table's size is unavailable`)
+	assert.Contains(t, output, "DROP INDEX `idx_status`")
+	assert.NotContains(t, output, "Do you want to apply this rollback?")
 	assert.Equal(t, []string{"POST /api/rollback/plan", "GET /api/status"}, requests())
 	assert.Empty(t, applyOptions())
 }

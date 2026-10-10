@@ -168,6 +168,13 @@ type LockStore interface {
 	// rollback intent owned by the same PR remains intact.
 	ReleaseIfPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error)
 
+	// ClearPendingPlanID withdraws a pending plan from a lock the owner keeps
+	// holding, only while both its owner and pending plan still match: the lock
+	// stays held with no pending plan and no disclosure record. It reports
+	// whether it cleared the plan; a mismatch is a no-op so a newer intent
+	// pinned since stays intact. An empty pendingPlanID never matches.
+	ClearPendingPlanID(ctx context.Context, database, dbType, owner, pendingPlanID string) (bool, error)
+
 	// ForceRelease releases a lock regardless of owner (admin override).
 	// Used by `schemabot unlock` command and --force flag.
 	ForceRelease(ctx context.Context, database, dbType string) error
@@ -220,6 +227,14 @@ type CheckStore interface {
 	// than a refusal, so callers never report a vanished gate as one an apply
 	// is holding.
 	UpsertPlanResult(ctx context.Context, check *Check, drift PlanDriftState) (stored bool, err error)
+
+	// UpsertGuardBlock records a guard block over plan-derived check state. Like
+	// UpsertPlanResult it refuses (stored=false) while an in-progress apply owns
+	// the row. A row whose stored blocking reason is in preserve keeps that block:
+	// the write refreshes only its head SHA and check run id, so a weaker block
+	// never replaces a stronger one. The stored reason is read under the same row
+	// lock as the write.
+	UpsertGuardBlock(ctx context.Context, check *Check, preserve []string) (stored bool, err error)
 
 	// RecoverApplyOwnedCheckWithNoOpPlan updates same-head apply-owned stored check state
 	// from in_progress to a successful no-op plan result. Returns true when recovery occurred.
@@ -633,7 +648,9 @@ type ApplyStore interface {
 	// operation keyed by its target is refused with
 	// ErrApplyOperationKeyingMismatch when the deployment's existing work
 	// operations of the apply are not keyed that way, and the reverse, so one
-	// target's work can never attach under two keys. On success the operation's ID and every
+	// target's work can never attach under two keys. An attach to an apply
+	// whose work a newer generation took over (Apply.SupersededBy) fails with
+	// ErrApplyTakenOver. On success the operation's ID and every
 	// task's ID and ApplyOperationID are populated.
 	AttachOperationWithTasks(ctx context.Context, apply *Apply, operation *ApplyOperation, tasks []*Task) error
 
@@ -853,6 +870,13 @@ type ApplyStore interface {
 	// dispatch — the marked apply's hold on the database was already released
 	// when the marker was earned.
 	MarkSuperseded(ctx context.Context, applyID int64, successor string) error
+
+	// GetSupersededBy returns the apply's superseded_by marker, the identifier
+	// of the apply that took over its work, or "" when nothing has. It reads
+	// the one column, so a driver checking the marker on every projection pass
+	// does not reload the whole row. It returns ErrApplyNotFound when the apply
+	// does not exist.
+	GetSupersededBy(ctx context.Context, applyID int64) (string, error)
 
 	// CheckLease verifies that an operator apply lease is still current without
 	// mutating the apply row.

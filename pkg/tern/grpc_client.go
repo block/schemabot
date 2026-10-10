@@ -1750,11 +1750,12 @@ type applyTaskScope struct {
 	// so nothing derives its terminal state but this drive.
 	tasklessOperation bool
 
-	// deploymentOperationKeys is the full operation-key set of the claimed
-	// operation's deployment, captured from the parent's operation rows at claim
-	// load. Deployment-keyed dispatches send it as the generation manifest so
-	// the data plane knows the whole generation from the first dispatch. Empty
-	// for whole-apply scopes.
+	// deploymentOperationKeys is the operation-key set the claimed operation's
+	// deployment dispatches, excluding members already converged at creation.
+	// Captured from the parent's operation rows at claim load, it includes
+	// dispatched siblings that have since completed. Deployment-keyed dispatches
+	// send it as the generation manifest so the data plane knows the whole
+	// generation from the first dispatch. Empty for whole-apply scopes.
 	deploymentOperationKeys []string
 
 	// memberTarget is the claimed operation's target when its deployment
@@ -1871,8 +1872,10 @@ func (s applyTaskScope) generationOperationKeys() []string {
 
 // stampMemberTarget names the dispatch's rollout member target on the request,
 // so the data plane derives the same target-qualified operation key the
-// planner stored. A scope with no member target leaves the request untouched,
-// keeping every single-target dispatch byte-for-byte what it was.
+// planner stored, and the table step the operation runs when the rollout runs
+// table by table, so the data plane runs only that step's tables. A scope with
+// no member target leaves the request untouched, keeping every single-target
+// dispatch byte-for-byte what it was.
 func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
 	if s.memberTarget == "" {
 		return
@@ -1881,6 +1884,9 @@ func (s applyTaskScope) stampMemberTarget(req *ternv1.ApplyRequest) {
 		req.Options = make(map[string]string)
 	}
 	req.Options[dispatchMemberTargetOption] = s.memberTarget
+	if s.operation != nil && s.operation.RolloutStep > 0 {
+		req.Options[dispatchRolloutStepOption] = strconv.Itoa(s.operation.RolloutStep)
+	}
 }
 
 // remoteOperationScope returns the remote operation id this drive's Progress
@@ -1973,7 +1979,15 @@ func (c *GRPCClient) loadOperationApplyTaskScope(ctx context.Context, apply *sto
 		if op.ID == applyOperationID {
 			found = true
 		}
-		if op.Deployment == operation.Deployment {
+		if op.Deployment != operation.Deployment {
+			continue
+		}
+		// The manifest promises the data plane which keys will arrive. A
+		// converged placeholder never dispatches, so its key is left out;
+		// dispatched siblings keep StartedAt or a remote id and stay in. The
+		// claimed operation is the one key this dispatch is about to send, so
+		// it is always declared, whatever shape its row is in.
+		if op.ID == applyOperationID || !op.IsConvergedPlaceholder() {
 			deploymentOperationKeys = append(deploymentOperationKeys, op.OperationKey)
 		}
 	}

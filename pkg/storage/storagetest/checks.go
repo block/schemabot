@@ -643,6 +643,83 @@ func TestChecks(t *testing.T, h Harness) {
 		assert.Empty(t, stored.BlockingReason)
 	})
 
+	// A guard block never replaces a block the writer asked to preserve: the row
+	// keeps its reason, conclusion, summary, and apply ownership, and only its
+	// head SHA moves so the current-head aggregate still reads it. Any other
+	// row takes the guard block, a row an in-progress apply owns refuses it,
+	// and a missing row is created with it.
+	t.Run("UpsertGuardBlockDisposition", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+
+		lock := CreateLock(t, store, "guard_db", storage.DatabaseTypeMySQL)
+		finished := CreateApplyWithStateAndEnv(t, store, lock, "apply-guard-finished", 710, state.Apply.Completed, "production")
+		guard := func(database, headSHA string) *storage.Check {
+			return &storage.Check{
+				Repository: "org/repo", PullRequest: 125, HeadSHA: headSHA,
+				Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: database,
+				HasChanges: true, Status: "completed", Conclusion: "failure",
+				BlockingReason: "guard_reason", ChangeSummary: "guard summary",
+			}
+		}
+		get := func(database string) *storage.Check {
+			stored, err := store.Checks().Get(ctx, "org/repo", 125, "production", storage.DatabaseTypeMySQL, database)
+			require.NoError(t, err)
+			require.NotNil(t, stored)
+			return stored
+		}
+
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: "org/repo", PullRequest: 125, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "kept_db",
+			ApplyID: finished.ID, HasChanges: true, Status: "completed", Conclusion: "action_required",
+			BlockingReason: "kept_reason", ErrorMessage: "kept message", ChangeSummary: "kept summary",
+		}))
+		stored, err := store.Checks().UpsertGuardBlock(ctx, guard("kept_db", "sha-2"), []string{"other_reason", "kept_reason"})
+		require.NoError(t, err)
+		assert.True(t, stored)
+		kept := get("kept_db")
+		assert.Equal(t, "sha-2", kept.HeadSHA)
+		assert.Equal(t, "kept_reason", kept.BlockingReason, "a preserved block is never replaced by a guard")
+		assert.Equal(t, "action_required", kept.Conclusion)
+		assert.Equal(t, "kept message", kept.ErrorMessage)
+		assert.Equal(t, "kept summary", kept.ChangeSummary)
+		assert.Equal(t, finished.ID, kept.ApplyID)
+
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: "org/repo", PullRequest: 125, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "replaced_db",
+			ApplyID: finished.ID, Status: "completed", Conclusion: "success",
+		}))
+		stored, err = store.Checks().UpsertGuardBlock(ctx, guard("replaced_db", "sha-2"), []string{"kept_reason"})
+		require.NoError(t, err)
+		assert.True(t, stored)
+		replaced := get("replaced_db")
+		assert.Equal(t, "guard_reason", replaced.BlockingReason)
+		assert.Equal(t, "failure", replaced.Conclusion)
+		assert.Equal(t, "guard summary", replaced.ChangeSummary)
+		assert.Zero(t, replaced.ApplyID)
+
+		running := CreateApplyWithStateAndEnv(t, store, lock, "apply-guard-running", 711, state.Apply.Running, "production")
+		require.NoError(t, store.Checks().Upsert(ctx, &storage.Check{
+			Repository: "org/repo", PullRequest: 125, HeadSHA: "sha-1",
+			Environment: "production", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "owned_db",
+			ApplyID: running.ID, HasChanges: true, Status: "in_progress",
+		}))
+		stored, err = store.Checks().UpsertGuardBlock(ctx, guard("owned_db", "sha-2"), []string{"kept_reason"})
+		require.NoError(t, err)
+		assert.False(t, stored, "a row an in-progress apply owns refuses the guard block")
+		owned := get("owned_db")
+		assert.Equal(t, "in_progress", owned.Status)
+		assert.Empty(t, owned.BlockingReason)
+		assert.Equal(t, running.ID, owned.ApplyID)
+
+		stored, err = store.Checks().UpsertGuardBlock(ctx, guard("fresh_db", "sha-2"), []string{"kept_reason"})
+		require.NoError(t, err)
+		assert.True(t, stored)
+		assert.Equal(t, "guard_reason", get("fresh_db").BlockingReason)
+	})
+
 	t.Run("MarkStalePlanSuccessful", func(t *testing.T) {
 		ctx := t.Context()
 		store := h.NewStorage(t)
@@ -802,6 +879,14 @@ func TestChecks(t *testing.T, h Harness) {
 	apply := &storage.Apply{ID: 1}
 	t.Run("UpsertPlanResult_DBError", func(t *testing.T) {
 		_, err := h.NewUnreachableStorage(t).Checks().UpsertPlanResult(t.Context(), check, storage.PlanDriftClean)
+		require.Error(t, err)
+	})
+	t.Run("UpsertGuardBlock_DBError", func(t *testing.T) {
+		_, err := h.NewUnreachableStorage(t).Checks().UpsertGuardBlock(t.Context(), &storage.Check{
+			Repository: "org/repo", PullRequest: 123, HeadSHA: "sha",
+			Environment: "staging", DatabaseType: storage.DatabaseTypeMySQL, DatabaseName: "errors_db",
+			Status: "completed", Conclusion: "failure", BlockingReason: "guard_reason",
+		}, []string{"kept_reason"})
 		require.Error(t, err)
 	})
 	t.Run("RecoverApplyOwnedCheckWithNoOpPlan_DBError", func(t *testing.T) {

@@ -14,7 +14,7 @@ import (
 )
 
 // planCommentColumns lists all columns for SELECT queries.
-const planCommentColumns = `id, repository, pull_request, database_name, database_type, environment_scope, head_sha, github_comment_id, github_node_id, minimized_at, deleted_at, created_at, updated_at`
+const planCommentColumns = `id, repository, pull_request, database_name, database_type, environment_scope, head_sha, github_comment_id, github_node_id, up_to_date, minimized_at, deleted_at, created_at, updated_at`
 
 // planCommentStore implements storage.PlanCommentStore using MySQL.
 type planCommentStore struct {
@@ -28,10 +28,10 @@ func (s *planCommentStore) Insert(ctx context.Context, comment *storage.PlanComm
 	canonicalizePlanCommentIdentity(comment)
 
 	id, err := s.identity.InsertID(ctx, s.db, `
-		INSERT INTO plan_comments (repository, pull_request, database_name, database_type, environment_scope, head_sha, github_comment_id, github_node_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO plan_comments (repository, pull_request, database_name, database_type, environment_scope, head_sha, github_comment_id, github_node_id, up_to_date)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, comment.Repository, comment.PullRequest, comment.DatabaseName, comment.DatabaseType,
-		comment.EnvironmentScope, comment.HeadSHA, comment.GitHubCommentID, comment.GitHubNodeID)
+		comment.EnvironmentScope, comment.HeadSHA, comment.GitHubCommentID, comment.GitHubNodeID, comment.UpToDate)
 	if err != nil {
 		return fmt.Errorf("insert plan comment for %s#%d database %s: %w", comment.Repository, comment.PullRequest, comment.DatabaseName, err)
 	}
@@ -140,7 +140,7 @@ func scanPlanComment(s scanner) (*storage.PlanComment, error) {
 	err := s.Scan(
 		&comment.ID, &comment.Repository, &comment.PullRequest,
 		&comment.DatabaseName, &comment.DatabaseType, &comment.EnvironmentScope,
-		&comment.HeadSHA, &comment.GitHubCommentID, &comment.GitHubNodeID,
+		&comment.HeadSHA, &comment.GitHubCommentID, &comment.GitHubNodeID, &comment.UpToDate,
 		&comment.MinimizedAt, &comment.DeletedAt, &comment.CreatedAt, &comment.UpdatedAt,
 	)
 	if err != nil {

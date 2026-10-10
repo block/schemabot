@@ -46,6 +46,11 @@ var (
 	// for the same database, type, and environment.
 	ErrActiveApplyExists = errors.New("active apply already exists")
 
+	// ErrApplyTakenOver is returned when an operation would attach to an
+	// apply whose work a newer apply took over (Apply.SupersededBy). The older
+	// apply can only settle over what it already attached.
+	ErrApplyTakenOver = errors.New("a newer apply took over the work of this apply")
+
 	// ErrApplyNotActive is returned when a write requires the apply to still be
 	// active (non-terminal) and it is not — e.g. attaching a new operation to
 	// an apply no drive will pick up again.

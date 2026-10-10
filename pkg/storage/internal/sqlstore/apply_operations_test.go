@@ -1239,9 +1239,9 @@ func TestApplyOperationStore_FindNextApplyOperation_TerminalParentDoesNotBlockNe
 
 // TestApplyOperationStore_FindNextApplyOperation_StoppedParentResumesThroughStoppedRow
 // verifies the resume path for a stopped rollout with a not-yet-started sibling
-// under a parallel cutover policy (which has no earlier-sibling gate, so the
-// parent's state is the only thing standing between the pending row and a
-// claim). A pending start request makes the stopped apply claimable again, and
+// under a parallel cutover policy (which leaves copy starts unordered when no
+// earlier member has failed, so only the parent's state holds the pending row).
+// A pending start request makes the stopped apply claimable again, and
 // the whole rollout resumes with it: the stopped operation — the row that was
 // already under way — is claimed first, and the not-yet-started sibling is
 // claimable behind it.
@@ -3741,44 +3741,6 @@ func TestApplyOperationStore_FindNextApplyOperation_DispatchedMemberFinalizerLea
 			assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, claimed.OperationKind)
 		})
 	}
-}
-
-// TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling
-// verifies that parallel drops copy-phase ordering entirely: a terminal-failed
-// earlier sibling does not block a later deployment's copy start, because the
-// copy gate has no earlier-sibling arm for parallel at all. Cutover ordering
-// (where halt-on-failure still applies) is enforced separately on the cutover
-// claim path.
-func TestApplyOperationStore_FindNextApplyOperation_ParallelClaimsPastFailedSibling(t *testing.T) {
-	clearTables(t)
-	ctx := t.Context()
-	store := NewMySQL(testDB)
-
-	lock := createTestLock(t, store, "testdb", "mysql")
-	apply := createTestApply(t, store, lock, "apply_op_parallel_failed", 1)
-
-	failedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-a",
-		State: state.ApplyOperation.Failed, CutoverPolicy: storage.CutoverPolicyParallel,
-	})
-	require.NoError(t, err)
-	regionBID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
-		ApplyID: apply.ID, Deployment: "region-b", CutoverPolicy: storage.CutoverPolicyParallel,
-	})
-	require.NoError(t, err)
-
-	// Backdate the failed row so staleness can't be confused with the reason the
-	// later row is claimable; parallel claims past it on copy regardless.
-	_, err = testDB.ExecContext(ctx, `
-		UPDATE apply_operations SET updated_at = NOW() - INTERVAL 1 HOUR WHERE id = ?
-	`, failedID)
-	require.NoError(t, err)
-
-	claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "test-operator")
-	require.NoError(t, err)
-	require.NotNil(t, claimed, "parallel must let a later deployment copy past a failed earlier sibling")
-	assert.Equal(t, regionBID, claimed.ID)
-	assert.Equal(t, "region-b", claimed.Deployment)
 }
 
 // TestApplyOperationStore_FindNextApplyOperation_BarrierHaltsOnFailedSibling

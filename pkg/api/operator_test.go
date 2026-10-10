@@ -298,11 +298,18 @@ func (s *listingApplyOperationStore) ListByApply(context.Context, int64) ([]*sto
 // recordingApplyStore captures the projection persisted by UpdateDerivedState so
 // the test can assert the derived state and completed_at stamping. swapped is
 // returned to model whether the compare-and-swap matched the expected state.
+// supersededBy is the handoff marker the stored row carries, which the
+// projection reads from storage whatever the caller's copy says.
 type recordingApplyStore struct {
 	storage.ApplyStore
 	updated       *storage.Apply
 	expectedState string
 	swapped       bool
+	supersededBy  string
+}
+
+func (s *recordingApplyStore) GetSupersededBy(context.Context, int64) (string, error) {
+	return s.supersededBy, nil
 }
 
 func (s *recordingApplyStore) UpdateDerivedState(_ context.Context, applyID int64, expectedState, newState, errorMessage string, startedAt, completedAt *time.Time) (bool, error) {
@@ -483,16 +490,20 @@ func TestUpdateApplyStateFromOperations_SwapAppendsDurableApplyLog(t *testing.T)
 // read "all attached operations succeeded" (or "an attached operation
 // reverted") as the generation's outcome while declared siblings are still on
 // their way — it holds the apply running instead, for completed and reverted
-// alike. Failure verdicts pass through unheld, and an apply without a manifest
-// keeps the attached-rows-only semantics.
+// alike. Once a newer generation has taken over the apply's work, recorded on
+// the stored row, the missing siblings can no longer arrive, so the hold ends
+// and the verdict is the one over what attached.
+// Failure verdicts pass through unheld, and an apply without a manifest keeps
+// the attached-rows-only semantics.
 func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 	const shardA, shardB = "ns/-80/users", "ns/80-/users"
 	cases := []struct {
-		name      string
-		manifest  []string
-		ops       []*storage.ApplyOperation
-		wantState string
-		wantDone  bool
+		name         string
+		manifest     []string
+		ops          []*storage.ApplyOperation
+		supersededBy string
+		wantState    string
+		wantDone     bool
 	}{
 		{
 			name:     "completed attached subset holds the apply running",
@@ -502,6 +513,16 @@ func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 			},
 			wantState: state.Apply.Running,
 			wantDone:  false,
+		},
+		{
+			name:     "a newer generation taking over the work settles the completed attached subset",
+			manifest: []string{shardA, shardB},
+			ops: []*storage.ApplyOperation{
+				{ID: 1, OperationKey: shardA, State: state.ApplyOperation.Completed},
+			},
+			supersededBy: "apply-newer",
+			wantState:    state.Apply.Completed,
+			wantDone:     true,
 		},
 		{
 			name:     "full manifest attached and completed completes the apply",
@@ -553,7 +574,7 @@ func TestUpdateApplyStateFromOperations_ManifestGatesCompletion(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			applyStore := &recordingApplyStore{swapped: true}
+			applyStore := &recordingApplyStore{swapped: true, supersededBy: tc.supersededBy}
 			svc := newOperatorStateTestService(&listingApplyOperationStore{ops: tc.ops}, applyStore)
 
 			apply := &storage.Apply{

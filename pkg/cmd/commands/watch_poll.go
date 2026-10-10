@@ -123,18 +123,30 @@ func isRetryableStatusWithoutCode(status int) bool {
 	return status >= http.StatusInternalServerError || status == http.StatusTooManyRequests
 }
 
-// progressRetryWait is the fetch-error backoff for this many consecutive
-// failures, stretched to any delay the server asked for so a rate-limited
-// watch never polls sooner than it was told to.
+// progressRetryWait is the wait before polling again after a failure the
+// watch has already judged retryable: the fetch-error backoff for this many
+// consecutive failures, stretched to the longest delay the response asked for.
+// The delay can come from the body's retry_after_seconds or from a Retry-After
+// header, which a proxy or rate limiter may send without a SchemaBot error
+// code. When both are present the larger wins, so a rate-limited watch never
+// polls sooner than either asked.
 func progressRetryWait(err error, consecutiveErrors int) time.Duration {
-	wait := fetchErrorBackoff(consecutiveErrors)
+	return max(fetchErrorBackoff(consecutiveErrors), requestedRetryDelay(err))
+}
+
+// requestedRetryDelay is the delay a failed fetch's response asked for: the
+// longer of the body's and the Retry-After header's when the error code is
+// retryable, and the header alone for a response with no SchemaBot error code,
+// as a proxy in front of the server sends. Zero when nothing was asked for.
+func requestedRetryDelay(err error) time.Duration {
 	var apiErr *client.APIError
-	if errors.As(err, &apiErr) {
-		if retry, after := apiErr.RetryAfter(); retry && after > wait {
-			wait = after
-		}
+	if !errors.As(err, &apiErr) {
+		return 0
 	}
-	return wait
+	if retry, after := apiErr.RetryAfter(); retry {
+		return after
+	}
+	return apiErr.RetryAfterHeader
 }
 
 // printProgressRetry reports a transient progress failure on stderr, keeping

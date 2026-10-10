@@ -489,7 +489,13 @@ A narrowed plan speaks for its one target. It shows only that target's
 changes, never the whole rollout's split of what applies where, and it is
 never gated on another target that needs attention. It never records a GitHub
 check result, so a narrowed plan or apply cannot pass a PR merge gate while
-other targets still need the change. The server records the narrowing on the
+other targets still need the change. On a pull request, `schemabot plan -e
+<env> --target <target>` and `schemabot apply -e <env> --target <target>`
+narrow the same way. A narrowed plan comment leaves the schema check as it
+was; a narrowed apply blocks it with `narrowed_apply` from the moment it is
+dispatched, and an apply or plan of the whole environment lifts that block
+once every target has the change. `apply-confirm` takes no `--target`: it confirms the
+target its apply named. The server records the narrowing on the
 stored plan and refuses to apply it anywhere but the target it was made for,
 and a narrowed apply cannot be rolled back with `rollback`: restore that
 target by planning and applying the previous schema with the same `--target`.
@@ -538,6 +544,12 @@ targets are now each planned against their own schema.
 Changes classified as unsafe require an explicit `--allow-unsafe` opt-in.
 Review the exact DDL and its consequences before providing it. Some changes
 are unsupported or blocked by the engine; the flag does not make them valid.
+`apply` and `rollback` refuse a blocked plan before they check or take a lock
+or ask for confirmation, for a single target, the whole rollout, or `--target`
+alike. The refusal follows the plan and names the plan, the first blocked
+table, and the engine's reason, one line per cause. Fix what the reason names:
+the statement, a grant on the target, or the server's policy. `--yield` has no
+lock to release on this refusal.
 
 An apply of the whole rollout runs each target's own plan, but holds every
 target to what the first target's plan discloses, since that is the plan you
@@ -596,6 +608,9 @@ It includes rows copied, ETA when available, and the reason for throttling.
 Press **Esc** to detach while copying; the apply keeps running. **s** requests
 a stop for this MySQL example. At deferred cutover, **Enter** requests the
 swap. During cutover, the watcher asks you to wait and disables Esc/stop.
+
+For progress bar colors, phase labels, and keyboard controls, see the
+[progress display reference](#progress-display-reference).
 
 ### Understand throttling
 
@@ -670,11 +685,11 @@ $ schemabot progress apply-example-84
      ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜ 72.50%
        ALTER TABLE `orders` ADD INDEX `idx_status`(`status`);
        • Rows: 2,900,000 / 4,000,000 · ETA: 2m 45s
-       • Shards: 4 (1 complete, 3 copying)
+       • Shards: 4 (3 copying, 1 complete)
+           ◉ c0-: 45.00% · 450,000 / 1,000,000 rows · ETA: 2m 45s
+           ◉ 80-c0: 65.00% · 650,000 / 1,000,000 rows · ETA: 1m 45s
+           ◉ 40-80: 80.00% · 800,000 / 1,000,000 rows · ETA: 1m 0s
            ✓ -40: 1,000,000 rows
-           ◉ 40-80: 80.00% (800,000/1,000,000 rows) ETA 1m 0s
-           ◉ 80-c0: 65.00% (650,000/1,000,000 rows) ETA 1m 45s
-           ◉ c0-: 45.00% (450,000/1,000,000 rows) ETA 2m 45s
 
 
 ESC detach • c cancel
@@ -1008,6 +1023,141 @@ a fleet sweep would otherwise pay a storage read per pull request for runs
 that started minutes ago and never get printed. `--stuck-after` sets that
 threshold, and a run whose start time cannot be read is always explained.
 
+### Progress display reference
+
+<details>
+<summary>MySQL progress bars, phase labels, and keyboard controls</summary>
+
+The TUI and CLI use emoji progress bars to convey state at a glance. Each color maps to a
+specific state. The bar is 20 squares wide; filled squares represent percent complete.
+
+#### Progress bar colors
+
+| Color | Emoji | Meaning | Used when |
+|-------|-------|---------|-----------|
+| Blue  | `🟦`  | In progress | Engine actively working: copying rows, cutting over, recovering state |
+| Yellow | `🟨` | Not final | Waiting for cutover, revert window open, reverting, skipping revert, or retrying after a recoverable failure |
+| Green | `🟩`  | Complete | Table finished successfully |
+| Orange | `🟧` | Stopped | Stopped mid-progress (partially complete) |
+| Red   | `🟥`  | Failed | Table failed |
+| White | `⬜`  | Empty | Remaining (unfilled portion of any bar) |
+
+#### Per-table display by state
+
+**Copying rows** — blue bar with percent, row counts, and ETA while the estimate still holds:
+```
+  orders: 🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 32% (71,436/221,193 rows) ETA 5m 30s
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Copying rows after estimate exceeded** — full-width activity indicator with no percentage:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 Finalizing copy
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 145,000 so far
+       • ℹ️ More rows than initially estimated, copying is still active and will continue
+```
+
+**Catching up** — blue bar at 100% with the first-drain label:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Catching up on accumulated changes...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 1,466,232
+```
+
+**Checksumming** — blue bar tracking verify progress once Spirit reports a total
+(indeterminate "Checksumming to verify data..." before that):
+```
+  orders: 🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ 🔍 Checksumming to verify data (21%)
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows verified: 321,450 / 1,466,232
+```
+
+**Post-checksum** — blue bar at 100% with the second-drain label:
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 ⏩ Data verified, applying final changes...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+       • Rows copied: 1,466,232
+```
+
+**Queued** (pending, not yet started) — empty bar:
+```
+  products: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ queued
+            ALTER TABLE `products` ADD COLUMN `weight` decimal(10,2)
+```
+
+**Starting** (running but no row data yet):
+```
+  users: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ starting...
+         ALTER TABLE `users` ADD COLUMN `phone` varchar(20)
+```
+
+**Waiting for cutover** — yellow bar at 100%:
+```
+  orders: 🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨🟨 ⏸️ Waiting for cutover
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Cutting over** — blue bar at 100% with spinner (the engine is working again, so the
+bar returns to blue):
+```
+  orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦 🔄 Cutting over...
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Complete** — green bar at 100%:
+```
+  orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Stopped** — orange bar at the progress when stop occurred:
+```
+  orders: 🟧🟧🟧🟧🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ⏹️ Stopped at 32%
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Failed** — red bar at the progress when failure occurred:
+```
+  orders: 🟥🟥🟥🟥🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+          ALTER TABLE `orders` ADD COLUMN `discount` int NOT NULL DEFAULT 0
+```
+
+**Cancelled** (sequential mode — earlier table failed, this one never ran):
+```
+  products: ⊘ Cancelled (not started)
+            ALTER TABLE `products` ADD COLUMN `weight` decimal(10,2)
+```
+
+#### Status line (above tables)
+
+The TUI shows a single status line above the table list. It varies by overall state:
+
+| State | Status line |
+|-------|-------------|
+| Starting | `⠋ Loading...` |
+| Pending | `⠋ Starting...` |
+| Running | `⠋ 🔄 Copying rows... ETA 5m 30s` |
+| Stopping | `⠋ Stopping...` |
+| Waiting for cutover | *(cutover prompt shown in footer instead)* |
+| Cutting over | `⠋ Cutting over...` |
+| Completed | *(no status line — completion message shown after tables)* |
+| Stopped | *(no status line — stopped message shown after tables)* |
+
+The `⠋` is a Braille spinner (animated in the TUI, static here).
+
+#### Footer
+
+| State | Footer |
+|-------|--------|
+| Running | `ESC detach • s stop` |
+| Waiting for cutover (with `--cutover`) | `Press Enter to proceed with cutover (or ESC to detach)` |
+| Waiting for cutover (no `--cutover`) | `To proceed: schemabot cutover -e <env> <id>` |
+| Cutting over | `Cutover in progress - please wait...` |
+| Stopped | `Use 'schemabot start -e <env> <id>' to resume.` |
+
+</details>
+
 ## Use the CLI from scripts and agents
 
 Prefer structured output when another program consumes the result:
@@ -1053,7 +1203,11 @@ server retries with backoff, and exits non-zero once polls have kept failing
 for a few minutes in a row; the interactive watcher gives up on the same
 schedule. Giving up does not affect the apply. The error tells the operator to
 rerun the original watch command, preserving its output format and connection
-flags, or to run `progress` with the apply ID to see its current state.
+flags, or to run `progress` with the apply ID to see its current state. When a
+refused poll carries a `Retry-After` header, as a proxy or rate limiter in
+front of SchemaBot may send, a watcher waits at least that long before polling
+again, up to 5 minutes per poll, so a watcher held off this way takes longer
+to give up.
 
 Do not scrape colored tables or progress bars. Check the exit status and the
 returned payload, and retain plan/apply IDs for follow-up reads. An accepted

@@ -227,33 +227,48 @@ func renderUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBudget) st
 
 	writePlanSummary(&sb, summary, totalStatements, keyspaceUpdates)
 
-	// Unsafe changes blocked section
+	// Lint findings, and the guides for what they name. This is where the
+	// operator decides whether to pass --allow-unsafe, so the reading that
+	// informs the decision belongs above the rejection rather than only on the
+	// plan comment that preceded it.
+	if len(data.LintViolations) > 0 {
+		writeLintViolations(&sb, data.LintViolations)
+	}
+	writeRelatedGuidance(&sb, data.disclosesEverySeverity())
+
+	applyCmd := appendTargetFlag(appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase), data.Target)
+	if data.Tenant != "" {
+		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
+	}
+	writeUnsafeChangesRejection(&sb, data, "Apply rejected", applyCmd+" --allow-unsafe")
+
+	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
+}
+
+// writeUnsafeChangesRejection writes the refusal for a command that would run
+// unsafe changes without `--allow-unsafe`: the heading names what was
+// rejected, each unsafe change is listed, and the comment ends in the exact
+// command that consents to them.
+func writeUnsafeChangesRejection(sb *strings.Builder, data PlanCommentData, rejected, retryCommand string) {
 	sb.WriteString("---\n\n")
 	unsafeCount := countUnsafeFindings(data.UnsafeChanges)
-	fmt.Fprintf(&sb, "**"+glyph.Refused+" Apply rejected**: %d unsafe %s detected\n", unsafeCount, pluralize("change", unsafeCount))
+	fmt.Fprintf(sb, "**"+glyph.Refused+" %s**: %d unsafe %s detected\n", rejected, unsafeCount, pluralize("change", unsafeCount))
 	item := 0
 	for _, c := range data.UnsafeChanges {
-		writeUnsafeChangeItem(&sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, "")
+		writeUnsafeChangeItem(sb, &item, unsafeChangeLabel(c), c.Reason, c.ChangeType, "")
 	}
 	sb.WriteString("\n")
-	writeUnsafeDropGuidance(&sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
+	writeUnsafeDropGuidance(sb, data.UnsafeChanges, data.DatabaseType, data.IsMySQL)
 
 	// Attribution comes before the opt-in this comment coaches: --allow-unsafe
 	// is consent to destroy the data, and whether the change is this pull
 	// request's to make is part of what the operator is consenting to.
 	if len(data.AttributedChanges) > 0 {
-		writeAttributedChanges(&sb, data.AttributedChanges)
+		writeAttributedChanges(sb, data.AttributedChanges)
 	}
 
 	sb.WriteString("**" + glyph.Escalation + " To proceed with these destructive changes, re-run with `--allow-unsafe`:**\n")
-	applyCmd := appendDatabaseFlag(fmt.Sprintf("schemabot apply -e %s", data.Environment), data.ScopedDatabase)
-	if data.Tenant != "" {
-		applyCmd += fmt.Sprintf(" --tenant %s", data.Tenant)
-	}
-	applyCmd += " --allow-unsafe"
-	fmt.Fprintf(&sb, "```\n%s\n```\n", applyCmd)
-
-	return appendAgentHint(offerSupportChannel(sb.String()), data.AgentHint)
+	fmt.Fprintf(sb, "```\n%s\n```\n", retryCommand)
 }
 
 // RenderBlockedChangesApplyRejected renders the rejection comment for an

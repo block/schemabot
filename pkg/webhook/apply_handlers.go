@@ -281,7 +281,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"observed_pending_plan_id", existingLock.PendingPlanID)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database))
+				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
 	}
@@ -333,6 +333,9 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		// that consent, so both have to predict the same apply. The command
 		// carrying the decision is already parsed here.
 		GroupedExecution: storage.GroupsEngineExecution(schemaResult.Type, result.DeferCutover),
+		// A --target apply plans, and then applies, only the rollout member it
+		// names; the other targets are neither planned nor ordered against it.
+		Target: result.Target,
 	}
 
 	planProto, planResp, err := h.executePlanProtoWithTransientRetry(ctx, planReq, repo, pr)
@@ -367,7 +370,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// other targets have work, the apply runs their own plans in the same step,
 	// as it runs the primary plan: every gate below reads each target's plan,
 	// and the comment the apply posts renders every target's plan.
-	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, plannedPrimaryMember(planResp), repo, pr)
+	rollout, rolloutPreview := h.reviewTimeDrift(ctx, planReq, planProto, planResp, repo, pr)
 	primaryTargetConverged := !planResp.HasChanges()
 	runsMemberWork := rolloutRunsMemberWork(rollout, rolloutPreview)
 	switch {
@@ -398,7 +401,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 			}
 			return true, fmt.Errorf("apply command member-work preflight %s#%d: %w", repo, pr, refusalErr)
 		}
-		if refusal != "" {
+		if refusal.refuses() {
 			h.postRolloutRefusal(repo, pr, installationID, schemaResult, planResp, environment, requestedBy, action.Apply, rollout, primaryTargetConverged, memberWorkRefusalMessage(refusal))
 			return false, nil
 		}
@@ -420,6 +423,17 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	case !primaryTargetConverged:
 		h.logger.Debug("apply: only the primary target's own plan runs",
 			"repo", repo, "pr", pr, "database", database, "environment", environment, "plan_id", planResp.PlanID)
+	case planResp.NarrowedTo != "":
+		// The named target already has the change. Its empty plan says nothing
+		// about the other targets, so it records no stored check state.
+		h.logger.Info("apply: the target the apply was narrowed to has no changes; posting its plan without updating stored check state",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "narrowed_to", planResp.NarrowedTo)
+		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
+		commentData.ScopedDatabase = result.Database
+		commentData.Target = result.Target
+		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
+		return false, nil
 	default:
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
@@ -434,6 +448,19 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		return false, nil
 	}
 
+	// A rollout shape apply creation refuses is refused here, before the lock
+	// is taken, so the command holds nothing. It follows the no-change branch
+	// above: a rollout already up to date records its passing check and says
+	// so, and an apply that confirms convergence stays a no-op.
+	if refused := h.unsupportedRolloutShape(database, environment, result); refused != nil {
+		h.logger.Info("apply rejected: the multi-target rollout does not run what the command asked for",
+			"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
+			"plan_id", planResp.PlanID, "targets", refused.Targets, "deployments", refused.Deployments, "defer_cutover", result.DeferCutover)
+		h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
+			rolloutShapeRefusalMessage(refused, action.Apply, environment))
+		return false, nil
+	}
+
 	// Engine-blocked changes reject the apply before the unsafe gate: no flag
 	// lets a refused statement through, so the user must never be coached
 	// toward --allow-unsafe for a guaranteed failure. No lock is held yet, so
@@ -441,6 +468,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	if planResp.HasBlockedChanges() {
 		commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 		commentData.ScopedDatabase = result.Database
+		commentData.Target = narrowedTarget(planResp, result.Target)
 		h.logger.Info("apply rejected: plan contains engine-blocked changes",
 			"repo", repo, "pr", pr, "database", database, "environment", environment)
 		h.postComment(repo, pr, installationID, templates.RenderBlockedChangesApplyRejected(commentData))
@@ -516,7 +544,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 				"repo", repo, "pr", pr, "database", database, "database_type", dbType, "environment", environment,
 				"plan_id", planResp.PlanID)
 			h.postCommandError(repo, pr, installationID, action.Apply, environment, requestedBy,
-				applyLockIntentChangedRefusal(database))
+				applyLockIntentChangedRefusal(database, templates.ApplyCommand(environment, databaseName, applyCommandOptionsOf(result))))
 			return false, nil
 		}
 		h.logger.Error("failed to acquire lock", "error", err)
@@ -534,6 +562,7 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 	// disclosure coaches is no longer open.
 	commentData := buildPlanCommentData(schemaResult, planResp, environment, result.Tenant, requestedBy, h.agentHint(), h.cliName())
 	commentData.ScopedDatabase = result.Database
+	commentData.Target = narrowedTarget(planResp, result.Target)
 	h.annotateAttributedChanges(ctx, client, &commentData, planResp, rolloutPreview, repo, pr, environment)
 	commentData.IsLocked = true
 	commentData.LockOwner = lockOwner
@@ -616,8 +645,6 @@ func (h *Handler) applyCommandCore(parent context.Context, repo string, pr int, 
 		commentData.PendingManualConfirmation = true
 		commentData.PausedApplyCause = &templates.PausedApplyCauseData{
 			Heading: "The plan this apply would be checked against could not be read",
-			Remedy: "Nothing has run. The statements above were planned fresh from this pull request; " +
-				"review them, then confirm to apply them.",
 		}
 		h.postComment(repo, pr, installationID, templates.RenderPlanComment(commentData))
 		headSHA, checkRunErr := h.storeApplyCheckRecord(ctx, client, repo, pr, schemaResult, planResp, environment, rollout, runsMemberWork)
@@ -1085,22 +1112,26 @@ func pendingRollbackApplyRefusal(database string, rollbackPlan *storage.Plan) st
 		"Use `%s` to execute the rollback, or `schemabot unlock` to cancel it, then retry the apply.", database, confirm)
 }
 
-// applyLockIntentChangedRefusal tells the operator that another command on the
-// same PR pinned the lock while this apply was checking or planning against it.
-// The apply leaves that pin in place; a retry finds it and reports which
-// command holds the lock and how to settle it.
-func applyLockIntentChangedRefusal(database string) string {
-	return fmt.Sprintf("Another SchemaBot command on this PR changed the lock on `%s` while this apply was running, "+
-		"so the apply was rejected to keep that command's lock in place. Retry the apply; "+
-		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database)
+// applyLockIntentChangedRefusal tells the operator that another command pinned
+// or released the lock while this apply was checking or planning against it.
+// The apply leaves the lock as that command set it; a retry finds it and
+// reports which command holds the lock and how to settle it, or plans afresh
+// when the lock is free. command is the apply to re-run, scoped and optioned
+// as the operator sent it.
+func applyLockIntentChangedRefusal(database, command string) string {
+	return fmt.Sprintf("Another SchemaBot command changed the lock on `%s` while this apply was running, "+
+		"so the apply was rejected to leave the lock as that command set it. Re-run `%s`; "+
+		"if the lock belongs to a pending rollback, the retry will say how to confirm or cancel it.", database, command)
 }
 
-// applyCommandOptionsOf carries the option flags the operator typed on a
-// rejected apply-confirm into the recovery command the rejection recommends.
-// apply-confirm reads its options from the confirm comment alone, so a hint
-// that dropped them would run with defaults the operator did not choose.
+// applyCommandOptionsOf carries the target and option flags the operator typed
+// on a rejected apply or apply-confirm into the recovery command the rejection
+// recommends. Both commands read their options from the comment that carries
+// them alone, so a hint that dropped them would run with defaults the operator
+// did not choose.
 func applyCommandOptionsOf(result CommandResult) templates.ApplyCommandOptions {
 	return templates.ApplyCommandOptions{
+		Target:       result.Target,
 		Tenant:       result.Tenant,
 		AllowUnsafe:  result.AllowUnsafe,
 		DeferCutover: result.DeferCutover,

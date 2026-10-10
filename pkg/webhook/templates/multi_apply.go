@@ -3,6 +3,7 @@ package templates
 import (
 	"fmt"
 	"html"
+	"slices"
 	"strings"
 
 	"github.com/block/schemabot/pkg/glyph"
@@ -81,13 +82,15 @@ func RenderMultiDeploymentApplyComment(data MultiDeploymentApplyData) string {
 // countDeploymentTablesWithDDL counts the DDL blocks the per-deployment detail
 // sections render between them, so one comment's DDL budget is shared across
 // every deployment rather than granted to each. A rolled-up deployment renders
-// each distinct change once, however many targets run it.
+// each table's DDL once, however many targets run it.
 func countDeploymentTablesWithDDL(data MultiDeploymentApplyData) int {
 	count := 0
 	for _, g := range data.Model.Groups() {
 		if len(g.Members) > 1 {
-			for _, work := range targetWorkGroups(data, g) {
-				count += countTablesWithDDL(work.tables)
+			for _, line := range targetTableLines(data, g) {
+				if line.table.DDL != "" {
+					count++
+				}
 			}
 			continue
 		}
@@ -105,7 +108,7 @@ func renderMultiDeploymentApplyComment(data MultiDeploymentApplyData, renderedAt
 	// single-deployment comment so the headline vocabulary stays shared.
 	writeApplyStatusHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, renderedAt)
-	groups := data.Model.Groups()
+	groups := groupsWithChanges(data.Model, data.Model.Groups())
 	if g, ok := soleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
@@ -151,7 +154,7 @@ func renderMultiDeploymentApplySummaryComment(data MultiDeploymentApplyData, bud
 
 	writeApplyHeader(&sb, ApplyStatusCommentData{State: data.Model.State, Environment: data.Environment, Rollback: data.Rollback})
 	writeAggregateMetadata(&sb, data, currentTimestamp())
-	groups := data.Model.Groups()
+	groups := groupsWithChanges(data.Model, data.Model.Groups())
 	if g, ok := soleTargetRollout(groups); ok {
 		writeTargetRolloutBody(&sb, data, g, budget)
 		writeRolloutFooter(&sb, data)
@@ -185,47 +188,103 @@ func soleTargetRollout(groups []presentation.Group) (presentation.Group, bool) {
 // its status line, the first failure, and the rolled-up table lines.
 func writeTargetRolloutBody(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
 	settled := state.IsState(data.Model.State, state.SettledApplyStates...)
-	status := targetRolloutStatus(data.Model.TargetProgress(g), settled, data.Rollback)
+	progress := data.Model.TargetProgress(g)
+	// The comment leaves out a deployment only when every target in it
+	// already had the change, so counting those targets keeps "all" for a
+	// rollout that changed every target and only then.
+	if leftOut := len(data.Model.Deployments) - len(g.Members); leftOut > 0 {
+		progress.Total += leftOut
+		progress.AlreadyHad += leftOut
+	}
+	status := targetRolloutStatus(progress, settled, data.Rollback)
+	if steps, ok := data.Model.TableSteps(g); ok && progress.Total > progress.AlreadyHad {
+		status = tableStepsStatus(steps, progress, settled, data.Rollback)
+	}
 	fmt.Fprintf(sb, "\n%s\n", glyphTag(g.Lead.Emoji, status))
 	writeAggregateFirstFailure(sb, data.Model.FirstFailure)
 	sb.WriteString("\n")
-	writeTargetRollup(sb, data, g, budget, true)
+	writeTargetRollup(sb, data, g, budget)
 }
 
 // targetRolloutStatus states a multi-target rollout's progress in one line:
-// "Rolled out to 3 of 4 targets (1 already had it)" once the apply has
-// settled and no target can still run, and "Rolling out: 1 of 4 targets done,
-// 1 running, 1 queued" until then. A stopped apply has not settled: its
-// targets run again once it resumes. An apply can settle as cancelled while a
-// target is still running, and that target keeps the line in the present
-// tense. A rollback says "Rolled back on" and "Rolling back" instead. Every
-// count is out of all the targets, so the parts add up. A settled rollout
-// where every target already had the change ran nothing, and says so.
+// "Rolled out to all 4 targets" (or "both targets") once the apply has settled
+// and no target can still run, and "Rolling out: 1 of 4 targets done, 1 running, 1 queued" until
+// then. A stopped apply has not settled: its targets run again once it
+// resumes. An apply can settle as cancelled while a target is still running,
+// and that target keeps the line in the present tense. A rollback says
+// "Rolled back on" and "Rolling back" instead.
+//
+// Every count is out of the targets that get the change, so the parts add up
+// and a target already at the schema is neither named nor counted: a rollout
+// where one of four targets had it reads "Rolled out to 3 targets". A settled
+// rollout where every target already had the change ran nothing, and says so.
 func targetRolloutStatus(p presentation.TargetProgress, settled, rollback bool) string {
 	ongoing, finished := "Rolling out:", "Rolled out to"
 	if rollback {
 		ongoing, finished = "Rolling back:", "Rolled back on"
 	}
+	changing := p.Total - p.AlreadyHad
 	var line string
 	switch {
 	case !settled || p.Unsettled > 0:
-		line = fmt.Sprintf("%s %d of %d targets done", ongoing, p.Done, p.Total)
-	case p.AlreadyHad == p.Total:
+		line = fmt.Sprintf("%s %d of %s done", ongoing, p.Done, targetCount(changing))
+	case changing == 0:
 		return fmt.Sprintf("All %d targets already had this schema", p.Total)
-	case p.Done == p.Total:
-		line = fmt.Sprintf("%s all %d targets", finished, p.Total)
+	case p.Done == changing && p.AlreadyHad > 0:
+		line = fmt.Sprintf("%s %s", finished, targetCount(changing))
+	case p.Done == changing && changing == 2:
+		line = finished + " both targets"
+	case p.Done == changing:
+		line = fmt.Sprintf("%s all %d targets", finished, changing)
 	case p.Done == 0:
 		line = finished + " no targets"
 	default:
-		line = fmt.Sprintf("%s %d of %d targets", finished, p.Done, p.Total)
+		line = fmt.Sprintf("%s %d of %s", finished, p.Done, targetCount(changing))
 	}
 	if len(p.Others) > 0 {
 		line += ", " + countsPhrase(p.Others)
 	}
-	if p.AlreadyHad > 0 {
-		line += fmt.Sprintf(" (%d already had it)", p.AlreadyHad)
+	return line
+}
+
+// tableStepsStatus states the progress of a multi-target rollout run table by
+// table in one line: "Rolling out: 1 of 3 tables done on 4 targets" until the
+// apply settles, then "Rolled out 3 tables to 4 targets", or "Rolled out 1 of
+// 3 tables to 4 targets" when it settled short. A table finishes on every
+// target before the next starts, so while it runs the targets are counted only
+// as the rollout's size: most of them are between tables, which a count of
+// target states would read as queued. The line adds the targets in an outcome
+// an operator acts on, and the targets that finished once it settled short
+// (TableStepOutcomes): "Rolling out: 1 of 3 tables done on 4 targets, 3
+// failed". A target that already had the change ran no table, so it is not
+// counted. A rollback says "Rolling back" and "Rolled back ... on" instead.
+func tableStepsStatus(steps presentation.TableSteps, p presentation.TargetProgress, settled, rollback bool) string {
+	ongoing, finished, onto := "Rolling out:", "Rolled out", "to"
+	if rollback {
+		ongoing, finished, onto = "Rolling back:", "Rolled back", "on"
+	}
+	targets := targetCount(p.Total - p.AlreadyHad)
+	var line string
+	switch {
+	case !settled || p.Unsettled > 0:
+		line = fmt.Sprintf("%s %d of %d tables done on %s", ongoing, steps.Done, steps.Steps, targets)
+	case steps.Done == steps.Steps:
+		line = fmt.Sprintf("%s %d tables %s %s", finished, steps.Steps, onto, targets)
+	default:
+		line = fmt.Sprintf("%s %d of %d tables %s %s", finished, steps.Done, steps.Steps, onto, targets)
+	}
+	if outcomes := p.TableStepOutcomes(steps, settled); len(outcomes) > 0 {
+		line += ", " + countsPhrase(outcomes)
 	}
 	return line
+}
+
+// targetCount is "1 target" or "3 targets".
+func targetCount(n int) string {
+	if n == 1 {
+		return "1 " + targetNoun.Singular
+	}
+	return fmt.Sprintf("%d %s", n, targetNoun.Plural)
 }
 
 // writeAggregateMetadata writes the apply-level metadata line. The database is
@@ -248,7 +307,12 @@ func writeAggregateMetadata(sb *strings.Builder, data MultiDeploymentApplyData, 
 // writeDeploymentCounts writes the per-status histogram so an operator sees
 // rollout health at a glance without expanding anything. The histogram counts
 // members, so once a deployment addresses several targets it counts targets.
+// Members that already had the change are left out, unless every member
+// already had it: then the count is how the reader learns nothing ran.
 func writeDeploymentCounts(sb *strings.Builder, counts []presentation.StateCount, groups []presentation.Group) {
+	if changed := countsWithChanges(counts); len(changed) > 0 {
+		counts = changed
+	}
 	if len(counts) == 0 {
 		return
 	}
@@ -445,7 +509,7 @@ func writeDeploymentSummaryList(sb *strings.Builder, model presentation.Apply, g
 	sb.WriteString("\n")
 	for _, g := range groups {
 		if len(g.Members) > 1 {
-			fmt.Fprintf(sb, "- %s — %s\n", glyphTag(g.Lead.Emoji, inlineCode(g.Deployment)), groupCountsLabel(g))
+			fmt.Fprintf(sb, "- %s — %s\n", glyphTag(g.Lead.Emoji, inlineCode(g.Deployment)), groupCountsLabel(model, g))
 			continue
 		}
 		d := model.Deployments[g.Members[0]]
@@ -454,9 +518,48 @@ func writeDeploymentSummaryList(sb *strings.Builder, model presentation.Apply, g
 }
 
 // groupCountsLabel is a multi-target deployment's status: its own histogram
-// and how many targets it addresses.
-func groupCountsLabel(g presentation.Group) string {
-	return fmt.Sprintf("%s (%d targets)", countsPhrase(g.Counts), len(g.Members))
+// and how many of its targets get the change. A deployment whose every target
+// already had the change says so, since nothing else ran there.
+func groupCountsLabel(model presentation.Apply, g presentation.Group) string {
+	changing := changingMembers(model, g)
+	if changing == 0 {
+		return fmt.Sprintf("%s (%s)", presentation.AlreadyAppliedLabel, targetCount(len(g.Members)))
+	}
+	return fmt.Sprintf("%s (%s)", countsPhrase(countsWithChanges(g.Counts)), targetCount(changing))
+}
+
+// countsWithChanges drops the count of members that already had the change:
+// a PR comment shows only the targets a rollout changes.
+func countsWithChanges(counts []presentation.StateCount) []presentation.StateCount {
+	return slices.DeleteFunc(slices.Clone(counts), func(c presentation.StateCount) bool {
+		return c.Label == presentation.AlreadyAppliedLabel
+	})
+}
+
+// changingMembers counts g's members that get the change, leaving out those
+// that already had it.
+func changingMembers(model presentation.Apply, g presentation.Group) int {
+	n := 0
+	for _, i := range g.Members {
+		if !model.Deployments[i].AlreadyApplied() {
+			n++
+		}
+	}
+	return n
+}
+
+// groupsWithChanges drops the deployments whose every target already had the
+// change, so the comment lists only the deployments the rollout changes. When
+// no deployment gets the change, the rollout ran nothing, and every deployment
+// stays so the comment can say so.
+func groupsWithChanges(model presentation.Apply, groups []presentation.Group) []presentation.Group {
+	changed := slices.DeleteFunc(slices.Clone(groups), func(g presentation.Group) bool {
+		return changingMembers(model, g) == 0
+	})
+	if len(changed) == 0 {
+		return groups
+	}
+	return changed
 }
 
 // writeDeploymentSections writes the in-progress status detail per deployment,
@@ -491,8 +594,12 @@ func writeDeploymentDetailSections(sb *strings.Builder, data MultiDeploymentAppl
 		}
 		if len(g.Members) > 1 {
 			fmt.Fprintf(sb, "\n<details%s>\n<summary>%s — %s</summary>\n<dl><dd>\n\n", openAttr,
-				glyphTag(g.Lead.Emoji, html.EscapeString(flattenIdentifier(g.Deployment))), groupCountsLabel(g))
-			writeTargetRollup(sb, data, g, budget, false)
+				glyphTag(g.Lead.Emoji, html.EscapeString(flattenIdentifier(g.Deployment))), groupCountsLabel(data.Model, g))
+			if changingMembers(data.Model, g) == 0 {
+				sb.WriteString("_Every target already had this schema; nothing ran._\n")
+			} else {
+				writeTargetRollup(sb, data, g, budget)
+			}
 			sb.WriteString("\n</dd></dl>\n</details>\n")
 			continue
 		}

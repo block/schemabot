@@ -1618,3 +1618,54 @@ func TestSchemaErrorGuidanceUsesServerStrataSetting(t *testing.T) {
 		})
 	}
 }
+
+// Only plan and apply can be narrowed to one target. apply-confirm confirms
+// the target its apply already named, so a --target on it is answered with a
+// usage comment instead of being ignored or applied to the whole rollout.
+func TestWebhookTargetFlagRejectedOnApplyConfirm(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot apply-confirm -e staging --target payments-002",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "unsupported flag")
+
+	select {
+	case body := <-comments:
+		assert.Equal(t, "The `--target` flag is not supported for `apply-confirm`. Only `plan` and `apply` take it.", body)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+}
+
+// A target is a member of one environment's rollout, so a narrowed plan
+// without -e is a usage error that keeps the target the caller typed. It
+// never falls back to planning every environment.
+func TestWebhookNarrowedPlanWithoutEnvironmentAsksForIt(t *testing.T) {
+	h, comments, _ := newTestHandler(t)
+
+	req := buildWebhookRequest(t, webhookPayloadOpts{
+		comment: "schemabot plan --target payments-002",
+		isPR:    true,
+	}, nil)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Contains(t, rr.Body.String(), "missing environment flag")
+
+	select {
+	case body := <-comments:
+		assert.Contains(t, body, "needs `-e` too")
+		assert.Contains(t, body, "`schemabot plan -e <environment> --target payments-002`")
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for error comment")
+	}
+}

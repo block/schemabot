@@ -15,7 +15,7 @@ import (
 	"github.com/block/schemabot/pkg/apitypes"
 	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/engine"
-	"github.com/block/schemabot/pkg/lint"
+	"github.com/block/schemabot/pkg/psclient"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/vschema"
 )
@@ -112,103 +112,46 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 	// diff below, per keyspace, and disclosed on the result: the diff never
 	// sees a withheld table, so without the disclosure it would be
 	// indistinguishable from an unchanged one.
-	ignored := engine.NewIgnoredTables(req.IgnoreTables)
+	ignored, err := engine.NewIgnoredTables(req.IgnoreTables)
+	if err != nil {
+		return nil, fmt.Errorf("plan database %s: %w", req.Database, err)
+	}
 	exemptTables, err := e.withholdIgnoredTables(ignored, req, keyspaces, currentSchema)
 	if err != nil {
 		return nil, err
 	}
 
-	// Diff and lint per keyspace in parallel using Spirit's PlanChanges.
-	type keyspaceResult struct {
-		change     engine.SchemaChange
-		violations []engine.LintViolation
-		hasChanges bool
-	}
-
+	// Diff and lint per keyspace in parallel using Spirit's PlanChanges. A
+	// failing keyspace does not cancel the others: every keyspace runs to
+	// completion, so when several keyspaces fail the plan reports the first
+	// failure in keyspace order, the same one on every run, rather than
+	// whichever goroutine finished first.
 	var mu sync.Mutex
 	results := make(map[string]*keyspaceResult, len(keyspaces))
-	g, gCtx := errgroup.WithContext(ctx)
+	failures := make(map[string]error, len(keyspaces))
+	var g errgroup.Group
 	g.SetLimit(20)
 
 	for _, keyspace := range keyspaces {
 		ks := keyspace
 		g.Go(func() error {
-			ns := req.SchemaFiles[ks]
-
-			tableChanges, vschemaChanged, currentVSchemaRaw, diffErr := e.diffKeyspace(gCtx, client, org, req.Database, branch, ks, ns, currentSchema)
-			if diffErr != nil {
-				return diffErr
-			}
-
-			sc := engine.SchemaChange{
-				Namespace:    ks,
-				Metadata:     make(map[string]string),
-				TableChanges: tableChanges,
-			}
-			if tables, ok := currentSchema[ks]; ok {
-				sc.OriginalFiles = make(map[string]string, len(tables)+1)
-				for _, t := range tables {
-					sc.OriginalFiles[t.Name+".sql"] = t.Schema
-				}
-			}
-
-			if vschemaChanged {
-				sc.Metadata["vschema_changed"] = "true"
-				sc.Metadata["vschema"] = vschema.Diff(currentVSchemaRaw, ns.Files["vschema.json"])
-				deletionsMeta, delErr := vschemaDeletionsMetadata(currentVSchemaRaw, ns.Files["vschema.json"])
-				if delErr != nil {
-					return fmt.Errorf("detect VSchema deletions for keyspace %s: %w", ks, delErr)
-				}
-				if deletionsMeta != "" {
-					sc.Metadata[apitypes.VSchemaDeletionsMetadataKey] = deletionsMeta
-				}
-				mutationsMeta, mutErr := vschemaMutationsMetadata(currentVSchemaRaw, ns.Files["vschema.json"], liveTableNames(currentSchema[ks]))
-				if mutErr != nil {
-					return fmt.Errorf("detect VSchema mutations for keyspace %s: %w", ks, mutErr)
-				}
-				if mutationsMeta != "" {
-					sc.Metadata[apitypes.VSchemaMutationsMetadataKey] = mutationsMeta
-				}
-				if strings.TrimSpace(currentVSchemaRaw) == "" {
-					currentVSchemaRaw = "{}"
-				}
-				if sc.OriginalFiles == nil {
-					sc.OriginalFiles = make(map[string]string, 1)
-				}
-				sc.OriginalFiles["vschema.json"] = currentVSchemaRaw
-			}
-			if len(sc.TableChanges) > 0 || vschemaChanged {
-				sc.OriginalFilesCaptured = true
-				if sc.OriginalFiles == nil {
-					sc.OriginalFiles = make(map[string]string)
-				}
-			}
-
-			var currentTableSchemas []table.TableSchema
-			if tables, ok := currentSchema[ks]; ok {
-				currentTableSchemas = append(currentTableSchemas, tables...)
-			}
-			desiredTableSchemas, _ := parseDesiredSchemas(ks, ns)
-			plan, _ := lint.PlanChanges(currentTableSchemas, desiredTableSchemas, nil, e.linter.SpiritConfig())
-
-			var violations []engine.LintViolation
-			if plan != nil {
-				for _, pc := range plan.Changes {
-					violations = append(violations, lint.PlannedChangeViolations(pc)...)
-				}
-			}
-
+			result, err := e.planKeyspace(ctx, client, org, req.Database, branch, ks, req.SchemaFiles[ks], currentSchema)
 			mu.Lock()
-			results[ks] = &keyspaceResult{
-				change:     sc,
-				violations: violations,
-				hasChanges: len(sc.TableChanges) > 0 || sc.Metadata["vschema_changed"] == "true",
+			defer mu.Unlock()
+			if err != nil {
+				failures[ks] = err
+				return err
 			}
-			mu.Unlock()
+			results[ks] = result
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
+		for _, ks := range keyspaces {
+			if failure := failures[ks]; failure != nil {
+				return nil, failure
+			}
+		}
 		return nil, err
 	}
 
@@ -248,6 +191,74 @@ func (e *Engine) Plan(ctx context.Context, req *engine.PlanRequest) (*engine.Pla
 		Changes:        changes,
 		LintViolations: lintViolations,
 		ExemptTables:   exemptTables,
+	}, nil
+}
+
+// keyspaceResult is one keyspace's share of a plan.
+type keyspaceResult struct {
+	change     engine.SchemaChange
+	violations []engine.LintViolation
+	hasChanges bool
+}
+
+// planKeyspace diffs and lints one keyspace's desired schema files against its
+// current schema and builds the keyspace's SchemaChange, including the VSchema
+// diff and the metadata that gates VSchema removals and in-place mutations.
+func (e *Engine) planKeyspace(ctx context.Context, client psclient.PSClient, org, database, branch, ks string, ns *schema.Namespace, currentSchema map[string][]table.TableSchema) (*keyspaceResult, error) {
+	diff, diffErr := e.diffKeyspace(ctx, client, org, database, branch, ks, ns, currentSchema)
+	if diffErr != nil {
+		return nil, diffErr
+	}
+	vschemaChanged, currentVSchemaRaw := diff.vschemaChanged, diff.currentVSchemaRaw
+
+	sc := engine.SchemaChange{
+		Namespace:    ks,
+		Metadata:     make(map[string]string),
+		TableChanges: diff.tableChanges,
+	}
+	if tables, ok := currentSchema[ks]; ok {
+		sc.OriginalFiles = make(map[string]string, len(tables)+1)
+		for _, t := range tables {
+			sc.OriginalFiles[t.Name+".sql"] = t.Schema
+		}
+	}
+
+	if vschemaChanged {
+		sc.Metadata["vschema_changed"] = "true"
+		sc.Metadata["vschema"] = vschema.Diff(currentVSchemaRaw, ns.Files["vschema.json"])
+		deletionsMeta, delErr := vschemaDeletionsMetadata(currentVSchemaRaw, ns.Files["vschema.json"])
+		if delErr != nil {
+			return nil, fmt.Errorf("detect VSchema deletions for keyspace %s: %w", ks, delErr)
+		}
+		if deletionsMeta != "" {
+			sc.Metadata[apitypes.VSchemaDeletionsMetadataKey] = deletionsMeta
+		}
+		mutationsMeta, mutErr := vschemaMutationsMetadata(currentVSchemaRaw, ns.Files["vschema.json"], liveTableNames(currentSchema[ks]))
+		if mutErr != nil {
+			return nil, fmt.Errorf("detect VSchema mutations for keyspace %s: %w", ks, mutErr)
+		}
+		if mutationsMeta != "" {
+			sc.Metadata[apitypes.VSchemaMutationsMetadataKey] = mutationsMeta
+		}
+		if strings.TrimSpace(currentVSchemaRaw) == "" {
+			currentVSchemaRaw = "{}"
+		}
+		if sc.OriginalFiles == nil {
+			sc.OriginalFiles = make(map[string]string, 1)
+		}
+		sc.OriginalFiles["vschema.json"] = currentVSchemaRaw
+	}
+	if len(sc.TableChanges) > 0 || vschemaChanged {
+		sc.OriginalFilesCaptured = true
+		if sc.OriginalFiles == nil {
+			sc.OriginalFiles = make(map[string]string)
+		}
+	}
+
+	return &keyspaceResult{
+		change:     sc,
+		violations: diff.violations,
+		hasChanges: len(sc.TableChanges) > 0 || sc.Metadata["vschema_changed"] == "true",
 	}, nil
 }
 

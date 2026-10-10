@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/postgresconn"
 	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
@@ -65,6 +66,7 @@ func TestPostgresStorageParity(t *testing.T) {
 	t.Run("ApplyCommentClaimConversionRestartsStaleWindow", func(t *testing.T) { testPostgresApplyCommentClaimConversionRestartsStaleWindow(t, h) })
 	t.Run("ApplyCommentProgressAuthorityStaleTakeover", func(t *testing.T) { testPostgresApplyCommentProgressAuthorityStaleTakeover(t, h) })
 	t.Run("ApplyUpdateRefusesReopenAcrossSnapshotRace", func(t *testing.T) { testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t, h) })
+	t.Run("AttachSeesSuccessorAdmittedWhileWaiting", func(t *testing.T) { testPostgresAttachSeesSuccessorAdmittedWhileWaiting(t, h) })
 	t.Run("LeaseFencedWritesFailClosedAgainstConcurrentSteal", func(t *testing.T) {
 		testLeaseFencedWritesFailClosedAgainstConcurrentSteal(t, func(t *testing.T) *Storage {
 			t.Helper()
@@ -178,6 +180,128 @@ func testPostgresApplyUpdateRefusesReopenAcrossSnapshotRace(t *testing.T, h post
 			require.NotNil(t, persisted)
 			assert.Equal(t, state.Apply.Completed, persisted.State)
 		})
+	}
+}
+
+// testPostgresAttachSeesSuccessorAdmittedWhileWaiting pins the attach guard
+// against a successor that commits while the attach waits for the apply target
+// lock. An apply is held open for target-001, which never attached, and
+// everything it did attach has settled. A late attach of target-001 waits
+// while the target lock is held; a newer generation's admission commits, with
+// the handoff it records on the held apply, and the lock is released. The
+// attach must see that handoff and refuse, so its snapshot has to be taken
+// after the lock is granted rather than before the wait.
+func testPostgresAttachSeesSuccessorAdmittedWhileWaiting(t *testing.T, h postgresHarness) {
+	ctx := t.Context()
+	store := h.NewStorage(t)
+	lock := storagetest.CreateLock(t, store, "attach_successor_race_db", storage.DatabaseTypeMySQL)
+	held := &storage.Apply{
+		ApplyIdentifier:       "apply_attach_race_held",
+		LockID:                lock.ID,
+		PlanID:                9501,
+		Database:              lock.DatabaseName,
+		DatabaseType:          lock.DatabaseType,
+		Repository:            lock.Repository,
+		PullRequest:           lock.PullRequest,
+		Environment:           "production",
+		Deployment:            "default",
+		Engine:                storage.EngineForType(lock.DatabaseType),
+		State:                 state.Apply.Pending,
+		ExpectedOperationKeys: []string{"target-001", "target-002"},
+	}
+	settledTask := attachRaceTask(held, "task_attach_race_settled")
+	settledTask.State = state.Task.Completed
+	settledOp := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-002", Target: "target-002", State: state.ApplyOperation.Completed}
+	heldID, err := store.Applies().CreateWithTasksAndOperations(ctx, held, []*storage.Task{settledTask}, []*storage.ApplyOperation{settledOp})
+	require.NoError(t, err)
+	held.ID = heldID
+	held.State = state.Apply.Running
+	require.NoError(t, store.Applies().Update(ctx, held))
+
+	lockConn, err := h.db.Conn(ctx)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lockConn.Close() })
+	lockName := applyTargetLockName(held.Database, held.DatabaseType, held.Environment)
+	acquired, err := namedlock.Postgres{}.Acquire(ctx, lockConn, lockName, attachRaceDeadline)
+	require.NoError(t, err)
+	require.True(t, acquired)
+
+	late := &storage.ApplyOperation{Deployment: "default", OperationKey: "target-001", Target: "target-001", State: state.ApplyOperation.Pending}
+	attachErr := make(chan error, 1)
+	go func() {
+		attachErr <- store.Applies().AttachOperationWithTasks(ctx, held, late, []*storage.Task{attachRaceTask(held, "task_attach_race_late")})
+	}()
+	waitForPostgresAdvisoryLockWaiter(t, h.db)
+
+	admission, err := h.db.BeginTx(ctx, nil)
+	require.NoError(t, err)
+	_, err = admission.ExecContext(ctx, `
+		INSERT INTO applies (apply_identifier, lock_id, plan_id, database_name, database_type, repository, pull_request, environment, deployment, engine, state, options)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, '{}')
+	`, "apply_attach_race_successor", lock.ID, 9502, held.Database, held.DatabaseType, held.Repository, held.PullRequest, held.Environment, held.Deployment, held.Engine, state.Apply.Pending)
+	require.NoError(t, err)
+	_, err = admission.ExecContext(ctx, `UPDATE applies SET superseded_by = $1 WHERE id = $2`, "apply_attach_race_successor", held.ID)
+	require.NoError(t, err)
+	require.NoError(t, admission.Commit())
+	released, err := namedlock.Postgres{}.Release(ctx, lockConn, lockName)
+	require.NoError(t, err)
+	require.True(t, released)
+
+	select {
+	case err := <-attachErr:
+		require.ErrorIs(t, err, storage.ErrApplyTakenOver, "the attach must see the handoff that committed while it waited")
+		assert.Contains(t, err.Error(), "apply_attach_race_successor")
+	case <-time.After(attachRaceDeadline):
+		require.FailNow(t, "the attach did not return after the target lock was released")
+	}
+	ops, err := store.ApplyOperations().ListByApply(ctx, held.ID)
+	require.NoError(t, err)
+	assert.Len(t, ops, 1, "the refused attach leaves no operation behind")
+}
+
+// attachRaceDeadline bounds each wait in the attach race: the attach reaching
+// the target lock, and the attach returning once the lock is released.
+const attachRaceDeadline = 30 * time.Second
+
+func attachRaceTask(apply *storage.Apply, identifier string) *storage.Task {
+	now := time.Now()
+	return &storage.Task{
+		TaskIdentifier: identifier,
+		ApplyID:        apply.ID,
+		PlanID:         apply.PlanID,
+		Database:       apply.Database,
+		DatabaseType:   apply.DatabaseType,
+		Engine:         apply.Engine,
+		Repository:     apply.Repository,
+		PullRequest:    apply.PullRequest,
+		Environment:    apply.Environment,
+		State:          state.Task.Pending,
+		Namespace:      apply.Database,
+		TableName:      "users",
+		DDL:            "ALTER TABLE `users` ADD COLUMN `email` varchar(255)",
+		DDLAction:      "alter",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+}
+
+// waitForPostgresAdvisoryLockWaiter blocks until a backend is waiting on an
+// advisory lock, so the test commits the successor only once the attach is
+// waiting for the target lock.
+func waitForPostgresAdvisoryLockWaiter(t *testing.T, db *sql.DB) {
+	t.Helper()
+	deadline := time.Now().Add(attachRaceDeadline)
+	for {
+		var waiters int
+		require.NoError(t, db.QueryRowContext(t.Context(), `
+			SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND wait_event = 'advisory'
+		`).Scan(&waiters))
+		if waiters > 0 {
+			return
+		}
+		require.True(t, time.Now().Before(deadline), "the attach never waited on the apply target lock")
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

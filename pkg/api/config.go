@@ -1031,7 +1031,8 @@ type EtreConfig struct {
 	Addr string `yaml:"addr"`
 	// DatabaseType selects the engine the resolver assembles connections for and
 	// is required (no implicit default): "mysql" and "strata" read the MySQL
-	// block; "vitess" reads the Vitess block.
+	// block; "vitess" reads the Vitess block; "postgres" reads the Postgres
+	// block.
 	DatabaseType string `yaml:"database_type"`
 	// EntityType is the Etre entity type recording the target clusters.
 	EntityType string `yaml:"entity_type"`
@@ -1052,6 +1053,9 @@ type EtreConfig struct {
 	MySQL EtreMySQLConfig `yaml:"mysql,omitempty"`
 	// Vitess holds the Vitess engine knobs, read when DatabaseType is "vitess".
 	Vitess EtreVitessConfig `yaml:"vitess,omitempty"`
+	// Postgres holds the PostgreSQL engine knobs, read when DatabaseType is
+	// "postgres".
+	Postgres EtrePostgresConfig `yaml:"postgres,omitempty"`
 	// Credentials configures the credentials for the connection.
 	Credentials EtreCredentialsConfig `yaml:"credentials"`
 }
@@ -1101,6 +1105,25 @@ type EtreVitessConfig struct {
 	DefaultPort string `yaml:"default_port,omitempty"`
 }
 
+// EtrePostgresConfig holds the PostgreSQL knobs for an Etre resolver: how to
+// find the host, how to verify the server, and which role owns the tables the
+// engine creates. The database a connection is made to comes from the
+// credential secret, read as JSON {username, password, dbname} (the format AWS
+// uses for RDS database secrets).
+type EtrePostgresConfig struct {
+	// HostField is the entity field holding the connection host.
+	HostField string `yaml:"host_field"`
+	// DefaultPort is appended to the host when it has no port.
+	DefaultPort string `yaml:"default_port,omitempty"`
+	// CARef selects the CA bundle the server certificate is verified against:
+	// "embedded:rds-global" or "file:<absolute-path>". Optional for RDS
+	// endpoints, which default to the embedded RDS bundle; required otherwise.
+	CARef string `yaml:"ca_ref,omitempty"`
+	// TableOwner is the role new tables are created as. Optional: empty creates
+	// them as the connected role.
+	TableOwner string `yaml:"table_owner,omitempty"`
+}
+
 // EtreCredentialsConfig configures credentials for an Etre-resolved target.
 // Credentials never come from Etre. Type selects the backend; each backend is
 // one pluggable implementation behind the same resolver interface, so the data
@@ -1112,9 +1135,10 @@ type EtreCredentialsConfig struct {
 	// Username is the database user. For secret_ref it is a literal username. For
 	// awssm it is optional: when set, it is a template (over {target} and
 	// {attribute} placeholders, e.g. "{app}_ddl") and the fetched secret is treated
-	// as the plain-text password instead of a JSON payload. For awssm it is mutually
-	// exclusive with token-decoding engines (e.g. vitess), which interpret the
-	// secret themselves.
+	// as the plain-text password instead of a JSON payload. On both backends it
+	// must be unset for engines that decode the secret themselves (vitess,
+	// postgres), because the secret names the user; setting it fails resolver
+	// construction rather than being ignored.
 	// PasswordRef (secret_ref) is a password secret reference (env:, file:,
 	// secretsmanager:, or a literal), optionally carrying a {target} placeholder.
 	Username    string `yaml:"username,omitempty"`
@@ -1131,11 +1155,24 @@ type EtreCredentialsConfig struct {
 	// AWS account id (defaults to aws_account_id); when empty, secrets are read from
 	// the caller's own account. ExternalID is an optional STS external id used only
 	// with RoleARN.
-	Region           string `yaml:"region,omitempty"`
-	RoleARN          string `yaml:"role_arn,omitempty"`
-	ExternalID       string `yaml:"external_id,omitempty"`
-	SecretName       string `yaml:"secret_name,omitempty"`
-	AccountAttribute string `yaml:"account_attribute,omitempty"`
+	//
+	// Region is the data plane's home region, and is required: roles are assumed
+	// through STS there, and a target's secret is read there unless its cluster
+	// is in one of ReachableRegions. RegionAttribute names the entity attribute
+	// holding the region of each target's cluster (e.g. "aws_region"); with
+	// ReachableRegions set, a target whose entity has no value for it, or one
+	// that is not a region name, fails resolution. ReachableRegions lists the other regions whose Secrets Manager
+	// this data plane can call, all in Region's AWS partition, and requires
+	// RegionAttribute: a target whose cluster is in one of them has its secret
+	// read there, and every other target's secret is read in Region, so it must
+	// be replicated there.
+	Region           string   `yaml:"region,omitempty"`
+	RegionAttribute  string   `yaml:"region_attribute,omitempty"`
+	ReachableRegions []string `yaml:"reachable_regions,omitempty"`
+	RoleARN          string   `yaml:"role_arn,omitempty"`
+	ExternalID       string   `yaml:"external_id,omitempty"`
+	SecretName       string   `yaml:"secret_name,omitempty"`
+	AccountAttribute string   `yaml:"account_attribute,omitempty"`
 }
 
 // DatabaseConfig holds configuration for a registered database.

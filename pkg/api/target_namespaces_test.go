@@ -438,9 +438,11 @@ func TestMemberPullNamespaces(t *testing.T) {
 }
 
 // A target holding several namespaces can hold the same table in more than one
-// of them. Unsharded work is one operation per target, keyed by the target, and
-// each table's task carries its namespace, so two namespaces' orders tables are
-// two distinct tasks under one operation and no key collides.
+// of them. A rollout across targets runs table by table, and a step is the
+// table across every namespace of every target: each target's step is one
+// operation keyed by the target and step, and each table's task carries its
+// namespace, so two namespaces' orders tables are two distinct tasks under one
+// operation and no key collides.
 func TestBuildApplyOperationGroups_SameTableInTwoNamespacesOfOneTarget(t *testing.T) {
 	alter := "ALTER TABLE `orders` ADD COLUMN `note` varchar(64)"
 	applyPlan := primaryPlanRow("orders-001")
@@ -461,8 +463,10 @@ func TestBuildApplyOperationGroups_SameTableInTwoNamespacesOfOneTarget(t *testin
 	assert.False(t, sharded)
 	require.Len(t, groups, 2)
 
-	assert.Equal(t, "orders-001", groups[0].Operation.OperationKey)
-	assert.Equal(t, "orders-002", groups[1].Operation.OperationKey)
+	assert.Equal(t, "orders-001/step-1", groups[0].Operation.OperationKey)
+	assert.Equal(t, "orders-002/step-1", groups[1].Operation.OperationKey)
+	assert.Equal(t, 1, groups[0].Operation.RolloutStep)
+	assert.Equal(t, 1, groups[1].Operation.RolloutStep)
 
 	tasks := make([]string, 0, len(groups[0].Tasks))
 	for _, task := range groups[0].Tasks {

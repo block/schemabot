@@ -677,6 +677,83 @@ func TestEngine_Plan_RefusesTableDeclaredTwice(t *testing.T) {
 	})
 }
 
+// The live database has `orders (id, status)`. In a two-namespace request,
+// billing/orders.sql declares a new `invoices` table and testdb/tables.sql
+// declares `orders` with an added `note` column. Each change is grouped under
+// the namespace whose file declares its table, not one whose file happens to
+// be named after it: the ALTER on `orders` belongs to testdb and the CREATE
+// of `invoices` to billing, on every run.
+func TestEngine_Plan_GroupsChangesByDeclaringNamespace(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+
+	_, err := db.ExecContext(t.Context(), `CREATE TABLE orders (
+		id INT NOT NULL,
+		status VARCHAR(50) NOT NULL,
+		PRIMARY KEY (id)
+	)`)
+	require.NoError(t, err, "create table")
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	req := &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: schema.SchemaFiles{
+			"billing": &schema.Namespace{Files: map[string]string{"orders.sql": `CREATE TABLE invoices (
+				id INT NOT NULL,
+				PRIMARY KEY (id)
+			)`}},
+			"testdb": &schema.Namespace{Files: map[string]string{"tables.sql": `CREATE TABLE orders (
+				id INT NOT NULL,
+				status VARCHAR(50) NOT NULL,
+				note VARCHAR(50),
+				PRIMARY KEY (id)
+			)`}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	}
+
+	for range 20 {
+		result, err := eng.Plan(t.Context(), req)
+		require.NoError(t, err, "Plan()")
+		tablesByNamespace := make(map[string][]string)
+		var namespaces []string
+		for _, sc := range result.Changes {
+			namespaces = append(namespaces, sc.Namespace)
+			for _, tc := range sc.TableChanges {
+				tablesByNamespace[sc.Namespace] = append(tablesByNamespace[sc.Namespace], tc.Table)
+			}
+		}
+		require.Equal(t, []string{"billing", "testdb"}, namespaces)
+		require.Equal(t, map[string][]string{"billing": {"invoices"}, "testdb": {"orders"}}, tablesByNamespace)
+	}
+}
+
+// The live database has `orders` and `invoices`. In a two-namespace request,
+// billing/orders.sql has been emptied and testdb/invoices.sql still declares
+// `invoices`, so the only change would be dropping `orders`. An empty file
+// declares nothing and a file's name is not a declaration, so no namespace
+// owns `orders` and the plan fails rather than guessing where the drop runs.
+func TestEngine_Plan_DropByEmptiedFileInMultiNamespaceFails(t *testing.T) {
+	dsn, db := setupTestMySQL(t)
+	cleanupTables(t, db)
+	_, err := db.ExecContext(t.Context(), "CREATE TABLE orders (id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE invoices (id INT NOT NULL, PRIMARY KEY (id))")
+	require.NoError(t, err)
+
+	eng := New(Config{Logger: slog.New(slog.NewTextHandler(os.Stdout, nil))})
+	result, err := eng.Plan(t.Context(), &engine.PlanRequest{
+		Database: "testdb",
+		SchemaFiles: schema.SchemaFiles{
+			"billing": &schema.Namespace{Files: map[string]string{"orders.sql": ""}},
+			"testdb":  &schema.Namespace{Files: map[string]string{"invoices.sql": "CREATE TABLE `invoices` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"}},
+		},
+		Credentials: &engine.Credentials{DSN: dsn},
+	})
+	require.EqualError(t, err, `namespace lookup for table "orders": no namespace defines table "orders" among 2 schema namespaces [billing testdb]`)
+	assert.Nil(t, result)
+}
+
 func TestEngine_Plan_NewTable(t *testing.T) {
 	dsn, _ := setupTestMySQL(t)
 

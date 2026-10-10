@@ -70,6 +70,42 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.ErrorContains(t, err, "an already converged operation must be completed and never started")
 	})
 
+	// Insert_RolloutStepRoundTrips verifies that a row inserted with a table
+	// step reads that step back, that a row of a member's whole change reads
+	// step 0, and that a negative step is refused rather than stored as a
+	// step that sorts before every other.
+	t.Run("Insert_RolloutStepRoundTrips", func(t *testing.T) {
+		ctx := t.Context()
+		store := h.NewStorage(t)
+		lock := CreateLock(t, store, "operation_step_db", storage.DatabaseTypeMySQL)
+		apply := CreateApply(t, store, lock, "apply_operation_step", 932)
+
+		steppedID, err := store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "primary", Target: "orders-002", OperationKey: "orders-002/docks", RolloutStep: 2,
+		})
+		require.NoError(t, err)
+		wholeID := createOperation(t, store, apply.ID, "region-b", "")
+
+		stepped, err := store.ApplyOperations().Get(ctx, steppedID)
+		require.NoError(t, err)
+		require.NotNil(t, stepped)
+		assert.Equal(t, 2, stepped.RolloutStep)
+
+		listed, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+		require.NoError(t, err)
+		require.Len(t, listed, 2)
+		steps := map[int64]int{}
+		for _, op := range listed {
+			steps[op.ID] = op.RolloutStep
+		}
+		assert.Equal(t, map[int64]int{steppedID: 2, wholeID: 0}, steps)
+
+		_, err = store.ApplyOperations().Insert(ctx, &storage.ApplyOperation{
+			ApplyID: apply.ID, Deployment: "primary", Target: "orders-001", OperationKey: "orders-001/docks", RolloutStep: -1,
+		})
+		require.ErrorContains(t, err, "rollout step -1 is negative")
+	})
+
 	// FindNextApplyOperation_ClaimsInDeploymentOrder verifies the operation
 	// ladder: a pending operation is claimed into running with a fresh lease,
 	// and a later deployment remains blocked until its earlier sibling
@@ -193,6 +229,108 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		}
 		return ids
 	}
+
+	// insertTableSteps inserts a rollout run table by table over targets, one
+	// work row per (step, target) for steps tables, in (step, target) order as
+	// the planner creates them, and returns the ids indexed [step-1][target].
+	insertTableSteps := func(t *testing.T, store storage.Storage, applyID int64, cutoverPolicy, onFailure string, steps int, targets ...string) [][]int64 {
+		t.Helper()
+		ids := make([][]int64, steps)
+		for step := 1; step <= steps; step++ {
+			for _, target := range targets {
+				id, err := store.ApplyOperations().Insert(t.Context(), &storage.ApplyOperation{
+					ApplyID: applyID, Deployment: "payments-a", Target: target,
+					OperationKey:  storage.TargetOperationKey(target, storage.RolloutStepOperationKey(step)),
+					OperationKind: storage.ApplyOperationKindWork,
+					CutoverPolicy: cutoverPolicy, OnFailure: onFailure, RolloutStep: step,
+				})
+				require.NoError(t, err)
+				ids[step-1] = append(ids[step-1], id)
+			}
+		}
+		return ids
+	}
+
+	// FindNextApplyOperation_TableStepWaitsForEveryTarget verifies the table-step
+	// boundary under every cutover_policy. payments-001 has finished `stations`
+	// and payments-002 has copied it and is parked for cutover, which a barrier
+	// rollout would otherwise take as leave for later copies to start. Neither
+	// target starts `docks` until payments-002's `stations` completes, and then
+	// payments-001 starts it first.
+	t.Run("FindNextApplyOperation_TableStepWaitsForEveryTarget", func(t *testing.T) {
+		for _, policy := range []string{storage.CutoverPolicyRolling, storage.CutoverPolicyBarrier, storage.CutoverPolicyParallel} {
+			t.Run(policy, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_table_step_"+policy, storage.DatabaseTypeMySQL)
+				apply := CreateApply(t, store, lock, "apply_operation_table_step_"+policy, 933)
+				ids := insertTableSteps(t, store, apply.ID, policy, storage.OnFailureHalt, 2, "payments-001", "payments-002")
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0][0]))
+				require.NoError(t, store.ApplyOperations().UpdateState(ctx, ids[0][1], state.ApplyOperation.WaitingForCutover))
+
+				held, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				assert.Nil(t, held, "no target starts docks while payments-002 has not finished stations")
+
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0][1]))
+				next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, next, "docks starts once every target finished stations")
+				assert.Equal(t, ids[1][0], next.ID)
+				assert.Equal(t, 2, next.RolloutStep)
+			})
+		}
+	})
+
+	// FindNextApplyOperation_FailedTableStepEndsTheRollout verifies that the
+	// table-step boundary is strict under every on_failure. payments-001 failed
+	// `stations`. Continue and a released pause still run `stations` on
+	// payments-002, as they would run any later target, but once it completes
+	// no target starts `docks`: the rollout never starts the next table on a
+	// fleet missing the last one.
+	t.Run("FindNextApplyOperation_FailedTableStepEndsTheRollout", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			policy    string
+			onFailure string
+			release   bool
+		}{
+			{name: "rolling_continue", policy: storage.CutoverPolicyRolling, onFailure: storage.OnFailureContinue},
+			{name: "parallel_continue", policy: storage.CutoverPolicyParallel, onFailure: storage.OnFailureContinue},
+			{name: "barrier_pause_released", policy: storage.CutoverPolicyBarrier, onFailure: storage.OnFailurePause, release: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := t.Context()
+				store := h.NewStorage(t)
+				lock := CreateLock(t, store, "operation_table_step_fail_"+tc.name, storage.DatabaseTypeMySQL)
+				apply := CreateApply(t, store, lock, "apply_operation_table_step_fail_"+tc.name, 934)
+				ids := insertTableSteps(t, store, apply.ID, tc.policy, tc.onFailure, 2, "payments-001", "payments-002")
+
+				first, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-a")
+				require.NoError(t, err)
+				require.NotNil(t, first)
+				require.Equal(t, ids[0][0], first.ID)
+				require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0][0], "duplicate key name 'idx_stations_note'"))
+				if tc.release {
+					_, _, err := store.ControlRequests().RequestPending(ctx, &storage.ApplyControlRequest{
+						ApplyID: apply.ID, Operation: storage.ControlOperationRelease, Status: storage.ControlRequestPending,
+						RequestedBy: "operator-a", Metadata: []byte(`{}`),
+					})
+					require.NoError(t, err)
+				}
+
+				sameStep, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+				require.NoError(t, err)
+				require.NotNil(t, sameStep, "%s runs stations on payments-002 past payments-001's failure", tc.name)
+				assert.Equal(t, ids[0][1], sameStep.ID)
+				require.NoError(t, store.ApplyOperations().MarkCompleted(ctx, ids[0][1]))
+
+				nextStep, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+				require.NoError(t, err)
+				assert.Nil(t, nextStep, "no target starts docks after payments-001 failed stations")
+			})
+		}
+	})
 
 	// FindNextApplyOperation_RollingOrdersTargetsOfOneDeployment verifies that
 	// the targets of one deployment are rollout members in their own right. A
@@ -333,6 +471,168 @@ func TestApplyOperations(t *testing.T, h Harness) {
 		require.NoError(t, err)
 		require.NotNil(t, next)
 		assert.Equal(t, ids[2], next.ID, "the next target in list order cuts over once the earlier one completes")
+	})
+
+	// FindNextApplyOperation_ParallelFailureAdmission verifies that parallel
+	// copy starts remain subject to on_failure. With payments-001 and payments-002
+	// occupying both drivers, payments-003 queues. When payments-001 fails, halt
+	// and unreleased pause keep payments-003 from starting despite the free slot;
+	// continue and a released pause admit it. A stop before payments-003 started
+	// uses the same gate, without preventing payments-002's already-started work
+	// from resuming.
+	t.Run("FindNextApplyOperation_ParallelFailureAdmission", func(t *testing.T) {
+		for _, stopped := range []bool{false, true} {
+			for _, tc := range []struct {
+				name          string
+				onFailure     string
+				releaseStatus storage.ControlRequestStatus
+				laterAdmitted bool
+			}{
+				{name: "halt", onFailure: storage.OnFailureHalt},
+				{name: "unrecognized", onFailure: "unknown"},
+				{name: "pause", onFailure: storage.OnFailurePause},
+				{name: "pause_release_pending", onFailure: storage.OnFailurePause, releaseStatus: storage.ControlRequestPending, laterAdmitted: true},
+				{name: "pause_release_completed", onFailure: storage.OnFailurePause, releaseStatus: storage.ControlRequestCompleted, laterAdmitted: true},
+				{name: "pause_release_failed", onFailure: storage.OnFailurePause, releaseStatus: storage.ControlRequestFailed},
+				{name: "continue", onFailure: storage.OnFailureContinue, laterAdmitted: true},
+			} {
+				t.Run(fmt.Sprintf("%s/stopped_%t", tc.name, stopped), func(t *testing.T) {
+					ctx := t.Context()
+					store := h.NewStorage(t)
+					lock := CreateLock(t, store, "parallel_failure_admission_db", storage.DatabaseTypeMySQL)
+					apply := CreateApply(t, store, lock, "apply_parallel_failure_admission", 926)
+					require.Equal(t, 2, storage.DefaultMaxDriversPerApply, "the scenario fills two drivers before a third member queues")
+					ids := insertTargetMembers(t, store, apply.ID, storage.CutoverPolicyParallel, tc.onFailure,
+						"payments-001", "payments-002", "payments-003")
+					for i, id := range ids[:2] {
+						claimed, err := store.ApplyOperations().FindNextApplyOperation(ctx, fmt.Sprintf("driver-%d", i))
+						require.NoError(t, err)
+						require.NotNil(t, claimed, "parallel starts both copies without waiting for completion")
+						require.Equal(t, id, claimed.ID)
+					}
+					capped, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+					require.NoError(t, err)
+					require.Nil(t, capped, "payments-003 waits while both driver slots are occupied")
+					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "duplicate key name 'idx_orders_source'"))
+
+					queuedState := state.ApplyOperation.Pending
+					if stopped {
+						moved, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+						require.NoError(t, err)
+						require.Equal(t, int64(1), moved, "stop catches only payments-003 before it started")
+						require.NoError(t, store.ApplyOperations().UpdateState(ctx, ids[1], state.ApplyOperation.Stopped))
+						requestControl(t, store, apply.ID, storage.ControlOperationStart)
+						queuedState = state.ApplyOperation.Stopped
+					}
+
+					project := func(released bool) string {
+						t.Helper()
+						ops, err := store.ApplyOperations().ListByApply(ctx, apply.ID)
+						require.NoError(t, err)
+						rolloutOps := make([]state.RolloutOperation, len(ops))
+						for i, op := range ops {
+							rolloutOps[i] = op.RolloutOperation(released)
+						}
+						derived := state.DeriveRolloutApplyState(state.RolloutChildren(rolloutOps))
+						swapped, err := store.Applies().UpdateDerivedState(ctx, apply.ID, apply.State, derived, "", nil, nil)
+						require.NoError(t, err)
+						require.True(t, swapped)
+						apply.State = derived
+						return derived
+					}
+					wantParent := state.Apply.RunningDegraded
+					if tc.onFailure == storage.OnFailurePause {
+						wantParent = state.Apply.Paused
+					}
+					require.Equal(t, wantParent, project(false), "the parent stays open while payments-002 still owns its target")
+
+					if stopped {
+						resumed, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+						require.NoError(t, err)
+						require.NotNil(t, resumed, "on_failure never blocks resuming work that already started")
+						require.Equal(t, ids[1], resumed.ID)
+					}
+					if tc.releaseStatus != "" {
+						requestControl(t, store, apply.ID, storage.ControlOperationRelease)
+						switch tc.releaseStatus {
+						case storage.ControlRequestCompleted:
+							require.NoError(t, store.ControlRequests().CompletePending(ctx, apply.ID, storage.ControlOperationRelease))
+						case storage.ControlRequestFailed:
+							require.NoError(t, store.ControlRequests().FailPending(ctx, apply.ID, storage.ControlOperationRelease, "release refused"))
+						}
+						released := tc.releaseStatus != storage.ControlRequestFailed
+						if released {
+							wantParent = state.Apply.RunningDegraded
+						}
+						require.Equal(t, wantParent, project(released))
+					}
+
+					next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-c")
+					require.NoError(t, err)
+					if tc.laterAdmitted {
+						require.NotNil(t, next, "the policy admits payments-003 after payments-001 failed")
+						assert.Equal(t, ids[2], next.ID)
+						assert.Equal(t, queuedState, next.State, "the claim returns the pre-transition state")
+					} else {
+						assert.Nil(t, next, "a free driver slot does not override fail-closed admission")
+						queued, err := store.ApplyOperations().Get(ctx, ids[2])
+						require.NoError(t, err)
+						require.NotNil(t, queued)
+						assert.Equal(t, queuedState, queued.State)
+						assert.Nil(t, queued.StartedAt)
+					}
+					sibling, err := store.ApplyOperations().Get(ctx, ids[1])
+					require.NoError(t, err)
+					require.NotNil(t, sibling)
+					wantSibling := state.ApplyOperation.Running
+					if stopped {
+						wantSibling = state.ApplyOperation.Resuming
+					}
+					assert.Equal(t, wantSibling, sibling.State, "failure admission cancels no already-started work")
+					assert.NotNil(t, sibling.StartedAt)
+				})
+			}
+		}
+	})
+
+	// FindNextApplyOperation_DispatchedFailureAdmissionLeavesPolicyToDispatcher
+	// verifies that the data plane does not re-gate a member already admitted by
+	// its dispatcher. Even with the data plane's halt default and a failed earlier
+	// member, a dispatched member starts or resumes after a stop caught it pending.
+	t.Run("FindNextApplyOperation_DispatchedFailureAdmissionLeavesPolicyToDispatcher", func(t *testing.T) {
+		for _, cutoverPolicy := range []string{storage.CutoverPolicyRolling, storage.CutoverPolicyParallel} {
+			for _, stopped := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/stopped_%t", cutoverPolicy, stopped), func(t *testing.T) {
+					ctx := t.Context()
+					store := h.NewStorage(t)
+					lock := CreateLock(t, store, "dispatched_failure_admission_db", storage.DatabaseTypeMySQL)
+					apply := &storage.Apply{
+						ApplyIdentifier: "apply_dispatched_failure_admission", LockID: lock.ID, PlanID: 927,
+						Database: lock.DatabaseName, DatabaseType: lock.DatabaseType,
+						Repository: lock.Repository, PullRequest: lock.PullRequest, Environment: "staging",
+						Engine: storage.EngineSpirit, State: state.Apply.RunningDegraded,
+						IdempotencyKey: "schemabot:v1:dispatched-failure-admission",
+					}
+					id, err := store.Applies().Create(ctx, apply)
+					require.NoError(t, err)
+					apply.ID = id
+					ids := insertTargetMembers(t, store, apply.ID, cutoverPolicy, storage.OnFailureHalt,
+						"payments-001", "payments-002")
+					require.NoError(t, store.ApplyOperations().MarkFailed(ctx, ids[0], "duplicate key name"))
+					if stopped {
+						moved, err := store.ApplyOperations().MarkPendingStoppedByApply(ctx, apply.ID)
+						require.NoError(t, err)
+						require.Equal(t, int64(1), moved)
+						requestControl(t, store, apply.ID, storage.ControlOperationStart)
+					}
+
+					next, err := store.ApplyOperations().FindNextApplyOperation(ctx, "driver-b")
+					require.NoError(t, err)
+					require.NotNil(t, next, "the dispatcher already admitted payments-002")
+					assert.Equal(t, ids[1], next.ID)
+				})
+			}
+		}
 	})
 
 	// FindNextApplyOperation_RollingKeepsOneTargetsShardsTogether verifies that

@@ -76,7 +76,7 @@ func TestDiffBranchForResume_LeavesOutIgnoredTables(t *testing.T) {
 	require.Len(t, unfiltered["commerce"], 1, "without the filter the ignored table reads as a drop")
 	assert.Equal(t, ddl.StatementDropTable, unfiltered["commerce"][0].Operation)
 
-	diff, err := e.diffBranchForResume(withoutIgnoredTables(current, engine.NewIgnoredTables([]string{"legacy_audit"})), desired)
+	diff, err := e.diffBranchForResume(withoutIgnoredTables(current, mustIgnoredTables(t, []string{"legacy_audit"})), desired)
 	require.NoError(t, err)
 	assert.Empty(t, diff["commerce"])
 }

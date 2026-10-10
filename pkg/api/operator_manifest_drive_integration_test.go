@@ -4,15 +4,22 @@ package api
 
 import (
 	"context"
+	"log/slog"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/block/spirit/pkg/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 
+	ternv1 "github.com/block/schemabot/pkg/proto/ternv1"
+	"github.com/block/schemabot/pkg/routing"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/storage/mysqlstore"
+	"github.com/block/schemabot/pkg/tern"
 )
 
 // A deployment-keyed apply receives its operations one dispatch at a time, so
@@ -97,6 +104,154 @@ func TestOperatorManifestKeyedApplyWaitsForLateSiblings(t *testing.T) {
 		assert.ErrorIs(t, err, storage.ErrApplyLeaseLost,
 			"a manifest-carrying apply's drives hold only operation leases, so a direct parent applies write must be refused")
 	}
+}
+
+// One deployment addresses two targets, but only commerce-001 needs work.
+// The converged member stays completed on the control plane without a remote
+// dispatch. Real gRPC admission and both planes' operator projections settle
+// the deployment's one remote parent, releasing it for the next apply. The
+// matrix driver supplies only deterministic task execution, not admission or
+// parent state, so the immutable manifest and target reservation are exercised.
+func TestOperatorRemoteManifestConvergedMemberSettlesAndAcceptsNextApply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const (
+		deployment = "region-a"
+		working    = "commerce-001"
+		converged  = "commerce-002"
+	)
+	cpStor := mysqlstore.New(openMatrixStorage(t))
+	dpDatabase := newStorageDatabaseWithSchema(t)
+	dpStor := mysqlstore.New(openStorageDB(t, dpDatabase.DSN))
+	logger := slog.Default()
+	dpClient, err := tern.NewLocalClient(tern.LocalConfig{
+		Database: deployment, Type: storage.DatabaseTypeMySQL, TargetDSN: dpDatabase.DSN,
+	}, dpStor, logger)
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(dpClient) })
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "localhost:0")
+	require.NoError(t, err)
+	grpcServer := grpc.NewServer()
+	tern.NewServer(dpClient, logger).Register(grpcServer)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- grpcServer.Serve(listener) }()
+	t.Cleanup(func() {
+		// Stop returns nil from Serve, so any other result is a server failure
+		// the fixture would otherwise report only as a later timeout.
+		grpcServer.Stop()
+		assert.NoError(t, <-serveErr)
+	})
+	cpClient, err := tern.NewGRPCClient(tern.Config{Address: listener.Addr().String(), Storage: cpStor, Logger: logger})
+	require.NoError(t, err)
+	t.Cleanup(func() { utils.CloseAndLog(cpClient) })
+
+	now := time.Now()
+	plan := &storage.Plan{
+		PlanIdentifier: "remote-manifest-working", Database: "commerce", DatabaseType: storage.DatabaseTypeMySQL,
+		Deployment: deployment, Target: working, Environment: "staging", CreatedAt: now,
+		Namespaces: map[string]*storage.NamespacePlanData{
+			"commerce": {Tables: []storage.TableChange{{Namespace: "commerce", Table: "users", DDL: "ALTER TABLE `users` ADD COLUMN `c` int", Operation: "alter"}}},
+		},
+	}
+	plan.ID, err = cpStor.Plans().Create(ctx, plan)
+	require.NoError(t, err)
+	// The reviewed working target's plan already exists on the data plane that
+	// produced it. No target re-plan or DDL execution is needed in this fixture.
+	remotePlan := *plan
+	remotePlan.ID = 0
+	_, err = dpStor.Plans().Create(ctx, &remotePlan)
+	require.NoError(t, err)
+	convergedPlan := &storage.Plan{
+		PlanIdentifier: "remote-manifest-converged", Database: "commerce", DatabaseType: storage.DatabaseTypeMySQL,
+		Deployment: deployment, Target: converged, Environment: "staging", CreatedAt: now,
+	}
+	convergedPlan.ID, err = cpStor.Plans().Create(ctx, convergedPlan)
+	require.NoError(t, err)
+	options := storage.ApplyOptions{Target: working}
+	groups, _, err := buildApplyOperationGroups(plan, applyTaskChanges(plan), []applyMember{
+		{Target: routing.ExecutionTarget{Deployment: deployment, Target: working}, Plan: plan},
+		{Target: routing.ExecutionTarget{Deployment: deployment, Target: converged}, Plan: convergedPlan},
+	}, "staging", options, storage.CutoverPolicyRolling, storage.OnFailureHalt, now)
+	require.NoError(t, err)
+	require.Len(t, groups, 2)
+	require.Empty(t, groups[1].Tasks)
+	require.Equal(t, state.ApplyOperation.Completed, groups[1].Operation.State)
+	require.Nil(t, groups[1].Operation.StartedAt)
+	apply := &storage.Apply{
+		ApplyIdentifier: "remote-manifest-rollout", PlanID: plan.ID, Database: "commerce", DatabaseType: storage.DatabaseTypeMySQL,
+		Deployment: deployment, Environment: "staging", Engine: storage.EngineSpirit, State: state.Apply.Pending,
+		Options: storage.MarshalApplyOptions(options), CreatedAt: now, UpdatedAt: now,
+	}
+	apply.ID, err = cpStor.Applies().CreateWithGroupedOperations(ctx, apply, groups)
+	require.NoError(t, err)
+	cpService := newMatrixService(t, cpStor, map[string]tern.Client{deployment + "/staging": cpClient})
+	dpRecorder := &driveRecorder{}
+	dpService := newMatrixService(t, dpStor, matrixClients(dpStor, dpRecorder, map[string]matrixOutcome{
+		deployment: {taskState: state.Task.Completed},
+	}))
+
+	driveDone := make(chan struct{})
+	go func() {
+		cpService.recoverApplyOperation(ctx, 1, "remote-manifest-driver")
+		close(driveDone)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-driveDone:
+		case <-time.After(30 * time.Second):
+			t.Error("control-plane drive did not exit before teardown")
+		}
+	})
+	var remoteID string
+	require.Eventually(t, func() bool {
+		op, getErr := cpStor.ApplyOperations().Get(ctx, groups[0].Operation.ID)
+		if getErr != nil || op == nil {
+			return false
+		}
+		remoteID = op.RemoteApplyID()
+		return remoteID != ""
+	}, 10*time.Second, 20*time.Millisecond, "the working member never dispatched")
+
+	remote, err := dpStor.Applies().GetByApplyIdentifier(ctx, remoteID)
+	require.NoError(t, err)
+	require.NotNil(t, remote)
+	workingStep := storage.TargetOperationKey(working, storage.RolloutStepOperationKey(1))
+	assert.Equal(t, []string{workingStep}, remote.ExpectedOperationKeys)
+	remoteOps, err := dpStor.ApplyOperations().ListByApply(ctx, remote.ID)
+	require.NoError(t, err)
+	require.Len(t, remoteOps, 1)
+	assert.Equal(t, workingStep, remoteOps[0].OperationKey, "the converged member still requires target-qualified dispatch keys")
+	assert.Equal(t, 1, remoteOps[0].RolloutStep, "the data plane runs the step the control plane dispatched")
+	driveNextOperation(t, ctx, dpService, 2)
+	remote = getApply(t, ctx, dpStor, remote.ID)
+	require.Equal(t, state.Apply.Completed, remote.State, "the remote parent must settle without waiting for a converged member dispatch")
+	assert.Equal(t, []string{workingStep}, remote.ExpectedOperationKeys, "settling the generation never changes its manifest")
+	assert.Equal(t, []string{workingStep}, dpRecorder.resumeOperationKeys())
+	select {
+	case <-driveDone:
+	case <-ctx.Done():
+		t.Fatal("the control-plane drive did not finish after remote completion")
+	}
+	require.Equal(t, state.Apply.Completed, getApply(t, ctx, cpStor, apply.ID).State)
+	settled, err := cpStor.ApplyOperations().Get(ctx, groups[1].Operation.ID)
+	require.NoError(t, err)
+	require.NotNil(t, settled)
+	assert.Nil(t, settled.StartedAt)
+	assert.Empty(t, settled.RemoteApplyID(), "the converged member remains a local placeholder")
+
+	next, err := cpClient.Apply(ctx, &ternv1.ApplyRequest{
+		PlanId: plan.PlanIdentifier, Database: "commerce", Type: storage.DatabaseTypeMySQL,
+		Target: working, Environment: "staging", IdempotencyKey: "remote-manifest-next-apply",
+	})
+	require.NoError(t, err)
+	require.True(t, next.Accepted, "the completed remote parent must release the deployment for the next apply: %s", next.ErrorMessage)
+	assert.NotEqual(t, remoteID, next.ApplyId)
 }
 
 type seededKeyedManifestApply struct {

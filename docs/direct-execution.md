@@ -27,12 +27,13 @@ Some refused changes are still genuinely necessary — the canonical case is a
 primary-key reshape on a small table. Without direct execution, the only path
 is running the DDL by hand against the target, outside SchemaBot, with no PR
 trail, no plan, and no audit record. Direct execution brings that category of
-change inside the system: under a size-bounded policy, a refused statement
-can run verbatim as native MySQL DDL.
+change inside the system: under a size-bounded policy, the default or one stated
+for the server or an environment, a refused statement can run verbatim as native
+MySQL DDL.
 
 A direct statement behaves nothing like a normal SchemaBot apply. It is
-synchronous, it blocks writes to the table for its full duration, and there is
-no throttling or checkpointing. The policy exists to
+synchronous, it can block writes while MySQL executes the statement, there is no
+throttling or checkpointing, and it has no Spirit revert window. The policy exists to
 bound those consequences, and every uncertain input fails closed.
 
 Lock acquisition is bounded too. Native DDL queues on the table's metadata
@@ -84,7 +85,8 @@ force, and the plan records a per-table execution-mode verdict:
 ```diagram
 engine refuses statement (e.g. primary-key reshape)
         │ direct_execution policy in force for this database/environment?
-        ├─ absent or disabled ───────────────────► blocked
+        │ (none stated: the default, enabled at max_table_bytes 100MiB)
+        ├─ disabled (enabled: false) ────────────► blocked
         ├─ table size unavailable ───────────────► blocked
         ├─ above the policy's one size bound ────► blocked
         └─ within it ────────────────────────────► direct: statement runs verbatim
