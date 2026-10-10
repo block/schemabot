@@ -121,27 +121,42 @@ func TestProgressByApplyIDRollsAShardedApplyUpByTable(t *testing.T) {
 // as every operation its manifest declares: with only its first shard
 // attached, the apply is still served as the rollout, the declared shard still
 // to attach lists as pending under the table and among the operations, and the
-// declared finalizer's VSchema change shows.
+// declared finalizer's VSchema change shows. A table none of whose shards has
+// attached still names the change the plan reviewed for it, so a queued drop
+// reads as a drop: each shard's own statement where the plan recorded one, the
+// keyspace's otherwise.
 func TestProgressByApplyIDReadsAShardedApplyAsItsDeclaredOperations(t *testing.T) {
+	const dropRefunds = "DROP TABLE `refunds`"
 	ops := []*storage.ApplyOperation{shardOp(1, "shop_001/-80/orders", state.ApplyOperation.Running)}
 	plan := &storage.Plan{Namespaces: map[string]*storage.NamespacePlanData{"shop_001": {
-		Tables:   []storage.TableChange{{Table: "orders"}},
+		Tables: []storage.TableChange{
+			{Table: "orders", ShardCount: 2},
+			{Table: "refunds", DDL: "DROP TABLE `refunds` /* keyspace */", Operation: "drop"},
+		},
+		Shards:   []storage.ShardPlan{{Shard: "-80", Changes: []storage.TableChange{{Table: "refunds", DDL: dropRefunds, Operation: "drop"}}}},
 		Finalize: true,
 		Metadata: map[string]string{storage.PlanMetadataVSchemaDiff: "+ orders"},
 	}}}
 
 	resp := shardedProgress(t, ops, []*storage.Task{shardTask(1, state.Task.Running, 620, 1000)}, &staticPlanStore{plan: plan},
-		"shop_001/-80/orders", "shop_001/80-/orders", "shop_001/group_finalizer")
+		"shop_001/-80/orders", "shop_001/80-/orders", "shop_001/-80/refunds", "shop_001/80-/refunds", "shop_001/group_finalizer")
 
 	assert.Equal(t, state.Apply.Running, resp.State, "the stored apply state, not one operation's remote view")
 	assert.True(t, resp.Sharded)
-	require.Len(t, resp.Operations, 3)
+	require.Len(t, resp.Operations, 5)
 	assert.Equal(t, "shop_001/80-/orders", resp.Operations[1].OperationKey)
 	assert.Equal(t, state.ApplyOperation.Pending, resp.Operations[1].State)
 	assert.Equal(t, storage.ApplyOperationKindWork, resp.Operations[1].OperationKind)
-	assert.Equal(t, "shop_001/group_finalizer", resp.Operations[2].OperationKey)
-	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, resp.Operations[2].OperationKind)
-	require.Len(t, resp.Tables, 1)
+	assert.Equal(t, "shop_001/group_finalizer", resp.Operations[4].OperationKey)
+	assert.Equal(t, storage.ApplyOperationKindGroupFinalizer, resp.Operations[4].OperationKind)
+	require.Len(t, resp.Tables, 2)
+	assert.Equal(t, int32(2), resp.Tables[0].PlannedShards, "the plan's shard count holds without a size estimate")
+	assert.Nil(t, resp.Tables[0].EstimatedBytes)
+	refunds := resp.Tables[1]
+	assert.Equal(t, "refunds", refunds.TableName)
+	assert.Equal(t, "drop", refunds.ChangeType)
+	assert.Equal(t, dropRefunds+"\nDROP TABLE `refunds` /* keyspace */", refunds.DDL)
+	assert.Equal(t, state.ApplyOperation.Pending, refunds.Status)
 	require.Len(t, resp.Tables[0].Shards, 2)
 	assert.Equal(t, apitypes.ShardProgressResponse{Shard: "-80", Status: state.Task.Running, RowsCopied: 620, RowsTotal: 1000}, *resp.Tables[0].Shards[0])
 	assert.Equal(t, apitypes.ShardProgressResponse{Shard: "80-", Status: state.ApplyOperation.Pending}, *resp.Tables[0].Shards[1])
@@ -149,6 +164,39 @@ func TestProgressByApplyIDReadsAShardedApplyAsItsDeclaredOperations(t *testing.T
 	changes, err := apitypes.ParseVSchemaChanges(resp.Metadata)
 	require.NoError(t, err)
 	assert.Equal(t, []apitypes.VSchemaChange{{Namespace: "shop_001", Status: "", Diff: "+ orders"}}, changes)
+}
+
+// When the operation rows cannot be listed, an apply whose manifest declares
+// several operations is still served from storage, with its stored state and
+// task rows, rather than as one operation's remote view.
+func TestProgressByApplyIDServesADeclaredRolloutFromStorageWhenItsOperationsCannotBeListed(t *testing.T) {
+	apply := activeTestApply("apply-sharded")
+	apply.ExternalID = "remote-apply"
+	apply.ExpectedOperationKeys = []string{"shop_001/-80/orders", "shop_001/80-/orders"}
+	opID := int64(1)
+	tasks := []*storage.Task{{ApplyID: apply.ID, ApplyOperationID: &opID, TaskIdentifier: "task-1", TableName: "orders", State: state.Task.Running}}
+	client := &mockTernClient{isRemote: true}
+	svc := New(&mockStorageWithApplyStores{
+		plans:      &staticPlanStore{},
+		applies:    &staticApplyStore{apply: apply},
+		tasks:      &capturingTaskStore{tasks: tasks},
+		controls:   &memoryControlRequestStore{},
+		operations: &staticApplyOperationStore{err: errors.New("storage unavailable")},
+	}, testServerConfig(), map[string]tern.Client{"default/staging": client},
+		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})))
+	mux := http.NewServeMux()
+	svc.ConfigureRoutes(mux)
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/progress/apply/apply-sharded", nil))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var resp apitypes.ProgressResponse
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	assert.Nil(t, client.progressReq, "the data plane is not asked for one operation's view")
+	assert.Equal(t, state.Apply.Running, resp.State)
+	require.Len(t, resp.Tables, 1)
+	assert.Equal(t, "task-1", resp.Tables[0].TaskID)
 }
 
 // A table on its keyspace's only shard keeps its task row as it is, with no

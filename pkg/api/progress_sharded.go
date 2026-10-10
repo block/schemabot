@@ -121,8 +121,10 @@ func shardedTableRows(ops []*storage.ApplyOperation, tasks []*storage.Task, rows
 			out = append(out, rowsByOp[tableOps[0].ID]...)
 			continue
 		}
-		row := shardedTableRow(key.namespace, key.table, tableOps, tasksByOp, rowsByOp)
-		row.EstimatedBytes, row.PlannedShards = plannedTableSize(plan, key.namespace, key.table)
+		row := shardedTableRow(key.namespace, key.table, tableOps, tasksByOp, rowsByOp, plan)
+		if planned := plannedTable(plan, key.namespace, key.table); planned != nil {
+			row.EstimatedBytes, row.PlannedShards = planned.EstimatedBytes, int32(planned.ShardCount)
+		}
 		out = append(out, row)
 	}
 	return append(out, unattributed...)
@@ -143,8 +145,10 @@ func runsOnOnlyShard(tableOps []*storage.ApplyOperation) bool {
 // progress listed under it. The DDL is each distinct statement the shards run,
 // in the order they first appear, so a shard running a different change is
 // not hidden behind its siblings' statement. A shard with no rows yet, whose
-// wave has not started, reads as its operation's state.
-func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, rowsByOp map[int64][]*apitypes.TableProgressResponse) *apitypes.TableProgressResponse {
+// wave has not started or whose operation has not attached, reads as its
+// operation's state, with the change the stored plan reviewed for it, so the
+// table still names its statement and whether it creates, alters, or drops.
+func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation, tasksByOp map[int64][]*storage.Task, rowsByOp map[int64][]*apitypes.TableProgressResponse, plan *storage.Plan) *apitypes.TableProgressResponse {
 	row := &apitypes.TableProgressResponse{
 		TableName:  table,
 		Keyspace:   namespace,
@@ -164,7 +168,13 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 			ETASeconds:      sc.ETASeconds,
 			PercentComplete: int32(sc.PercentComplete),
 		})
-		for _, r := range rowsByOp[op.ID] {
+		shardRows := rowsByOp[op.ID]
+		if len(shardRows) == 0 {
+			if planned := plannedShardChange(plan, namespace, shard, table); planned != nil {
+				shardRows = []*apitypes.TableProgressResponse{{ChangeType: planned.Operation, DDL: planned.DDL}}
+			}
+		}
+		for _, r := range shardRows {
 			if row.ChangeType == "" {
 				row.ChangeType = r.ChangeType
 			}
@@ -190,19 +200,39 @@ func shardedTableRow(namespace, table string, tableOps []*storage.ApplyOperation
 	return row
 }
 
-// plannedTableSize is a keyspace table's size across all its shards and the
-// number of shards it spans, as plan recorded them, or nil and zero when plan
-// is nil or recorded no estimate for the table.
-func plannedTableSize(plan *storage.Plan, namespace, table string) (*int64, int32) {
+// plannedTable is the change the stored plan recorded for a keyspace table
+// across all its shards, or nil when plan is nil or records none.
+func plannedTable(plan *storage.Plan, namespace, table string) *storage.TableChange {
 	if plan == nil || plan.Namespaces[namespace] == nil {
-		return nil, 0
+		return nil
 	}
-	for _, tc := range plan.Namespaces[namespace].Tables {
-		if tc.Table == table && tc.EstimatedBytes != nil {
-			return tc.EstimatedBytes, int32(tc.ShardCount)
+	tables := plan.Namespaces[namespace].Tables
+	for i := range tables {
+		if tables[i].Table == table {
+			return &tables[i]
 		}
 	}
-	return nil, 0
+	return nil
+}
+
+// plannedShardChange is the change the stored plan reviewed for a table on
+// one shard: the shard's own entry, which carries the exact DDL the shard
+// applies, else the keyspace's entry for the table (plannedTable).
+func plannedShardChange(plan *storage.Plan, namespace, shard, table string) *storage.TableChange {
+	if plan == nil || plan.Namespaces[namespace] == nil {
+		return nil
+	}
+	for _, sp := range plan.Namespaces[namespace].Shards {
+		if sp.Shard != shard {
+			continue
+		}
+		for i := range sp.Changes {
+			if sp.Changes[i].Table == table {
+				return &sp.Changes[i]
+			}
+		}
+	}
+	return plannedTable(plan, namespace, table)
 }
 
 // taskCopies is a shard operation's stored tasks as the shard rollup reads

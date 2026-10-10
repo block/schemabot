@@ -13,8 +13,8 @@ func ShardCounts(ops []ProgressOperation, released bool) string {
 	index := make(map[keyspaceShard]int)
 	var work []presentation.ShardWork
 	sharded := false
-	for i, op := range ProgressOperationsForPresentation(ops, released) {
-		keyspace, shard, _, ok := state.ShardWorkKey(ops[i].OperationKey)
+	for _, op := range ProgressOperationsForPresentation(ops, released) {
+		keyspace, shard, _, ok := state.ShardWorkKey(op.OperationKey)
 		if !ok {
 			continue
 		}

@@ -637,7 +637,9 @@ changes its keyspace's VSchema appears in `metadata.vschema_changes` with its
 status and the diff from the stored plan. A sharded apply's operations can
 attach one dispatch at a time, so it reads as every operation its generation
 manifest declares: one still to attach is listed in `operations` as `pending`
-and under its table's `shards` as `pending` with no rows. The CLI and the PR
+and under its table's `shards` as `pending` with no rows, and a table none of
+whose shards has attached carries the `ddl` and `change_type` the stored plan
+reviewed for it. The CLI and the PR
 comments render the apply as one change, its tables under their keyspace.
 `operations` still lists every attached row.
 `task_id`, when present, identifies the individual task, including repeated
