@@ -228,6 +228,18 @@ The limit is shown in
 binary units, matching how it is configured, and the measurement is shown as
 an approximate decimal figure, matching how plan output shows table sizes.
 
+The byte bound needs a data plane that reads it. A data plane on a build that
+predates `max_table_bytes` drops the bound off the request and sees an enabled
+policy with no bound, which it refuses for every plan, including plans with no
+refused statement. A data plane advertises the request features it reads on
+its health check, and the byte bound is one of them,
+`direct_execution.max_table_bytes`. Before a control plane sends a remote data
+plane a plan or apply that states a byte bound, it reads that list, and when
+the capability is missing it refuses the request itself, naming the
+deployment, the capability, and the remedy: upgrade the data plane. A data
+plane that advertises nothing is treated as lacking the capability, so a build
+that reads `max_table_bytes` but predates capability reporting is refused too.
+
 ## Engine compatibility
 
 Direct execution is implemented by the MySQL (Spirit) engine. The contract it

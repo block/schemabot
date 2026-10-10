@@ -17,9 +17,17 @@ import (
 // DirectExecutionPolicyProto renders a resolved policy for the wire. Nil in,
 // nil out: a caller that states no policy leaves the executing server's own
 // configuration in force.
+//
+// A disabled policy travels as disabled and nothing else. It grants nothing
+// whatever bounds it carries, so stating them would only make the request
+// depend on the data plane reading them: a disabled policy with a byte bound
+// would be refused by a data plane that predates the byte bound.
 func DirectExecutionPolicyProto(policy *storage.DirectExecutionPolicy) *ternv1.DirectExecutionPolicy {
 	if policy == nil {
 		return nil
+	}
+	if !policy.Enabled {
+		return &ternv1.DirectExecutionPolicy{Enabled: false}
 	}
 	return &ternv1.DirectExecutionPolicy{
 		Enabled:                       policy.Enabled,

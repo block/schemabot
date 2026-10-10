@@ -205,7 +205,12 @@ live inside them.
 **Control plane first, normally.** The gRPC contract is additive only (new
 fields, never removed or renumbered), so a newer control plane and an older data
 plane interoperate: unknown fields are ignored on the way in, absent fields read
-as zero values on the way out. That tolerance is the gRPC surface's alone — the
+as zero values on the way out. A field an older data plane would misread rather
+than ignore, because the rest of the request means something else without it,
+carries the `requires_remote_capability` option instead: the control plane
+refuses a request that sets it until the data plane advertises the capability,
+so that skew surfaces as a refusal naming the upgrade rather than as a
+misread. That tolerance is the gRPC surface's alone — the
 control plane's HTTP JSON API rejects request fields it does not know, so a new
 request field the CLI sends needs the control plane upgraded before the CLI.
 The wrapper-last rule above already orders exactly that; this is why it is a
@@ -349,7 +354,13 @@ Only relevant to gRPC mode, but checked every release, since the two planes run
 different versions during a rollout. Protobuf changes must be additive: new
 fields with new numbers, no removals, no renumbering, no type changes. Diff the
 `.proto` sources rather than the generated code, where regeneration noise buries
-the field-level change.
+the field-level change. For each new request field, ask what an older data plane
+does with a request that sets it: if dropping the field changes what the rest of
+the request means, the field needs a `requires_remote_capability` annotation,
+and an older data plane that misreads it must still fail closed. The control
+plane checks capabilities in a call ahead of the request, so a request can
+still reach an older replica mid-rollout; the annotation makes the skew legible
+but is not what keeps it safe.
 
 ### 6. Error baseline
 

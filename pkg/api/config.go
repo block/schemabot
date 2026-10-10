@@ -1426,6 +1426,9 @@ type DirectExecutionConfig struct {
 	// policy chooses one rather than combining them: a second limit reads as
 	// a ceiling, and no combination rule makes both readings true. A table
 	// whose size cannot be determined is blocked.
+	//
+	// A remote data plane must advertise reading this bound before a plan or
+	// apply states it there; one that does not is refused on this side.
 	MaxTableBytes string `yaml:"max_table_bytes,omitempty"`
 
 	// LockAcquisitionTimeout bounds how long each attempt of a direct

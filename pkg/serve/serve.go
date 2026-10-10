@@ -988,7 +988,7 @@ func (s *Server) RegisterGRPC(ctx context.Context, gs *grpc.Server) error {
 	// database, which is the only way a control plane can read it: a data
 	// plane's storage is reachable from the data plane, and the gRPC endpoint
 	// is the connection that already exists between the two.
-	opts := []tern.ServerOption{}
+	opts := []tern.ServerOption{tern.WithVersion(attributableVersion(s.version))}
 	if s.storageSchema != nil {
 		opts = append(opts, tern.WithStorageSchemaService(s.storageSchema))
 	}
