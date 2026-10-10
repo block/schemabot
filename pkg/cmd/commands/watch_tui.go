@@ -33,6 +33,9 @@ type WatchModel struct {
 	tables     []templates.TableProgress
 	operations []templates.ProgressOperation
 	released   bool // apply-level release latch: a released pause runs degraded, not paused
+	// sharded is whether the apply is one change fanned out across its
+	// keyspaces' shards, so it renders without operation sections.
+	sharded bool
 	// deferCutover is whether the apply waits for an operator at each cutover.
 	deferCutover bool
 	errorMsg     string
@@ -69,6 +72,7 @@ type progressMsg struct {
 	tables       []templates.TableProgress
 	operations   []templates.ProgressOperation
 	released     bool              // apply-level release latch: a released pause runs degraded, not paused
+	sharded      bool              // one change fanned out across its keyspaces' shards
 	deferCutover bool              // the apply waits for an operator at each cutover
 	errorMsg     string            // Human-readable error message
 	failed       bool              // true when the API call didn't return usable progress data
@@ -196,6 +200,7 @@ func (m WatchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tables = msg.tables
 		m.operations = msg.operations
 		m.released = msg.released
+		m.sharded = msg.sharded
 		m.deferCutover = msg.deferCutover
 		m.errorMsg = msg.errorMsg
 

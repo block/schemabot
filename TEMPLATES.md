@@ -10247,6 +10247,115 @@ To cut over prod/payments-001:
 
 To resume from where it stopped:
   schemabot start apply-multi-a1b2c3d4 -e production
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-on-a-keyspaces-only-shard"></a><strong>Sharded Apply On A Keyspace's Only Shard</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-a1b2c3d4                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Completed                              │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:29:00 UTC                    │
+│  Duration:     6s                                     │
+└───────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩 ✓ Complete
+       ALTER TABLE `orders` ADD COLUMN `source` varchar(32) DEFAULT NULL;
+
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-copying-across-four-shards"></a><strong>Sharded Apply Copying Across Four Shards</strong></summary>
+
+```
+
+┌─────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                     │
+│  Database:     shop                                     │
+│  Environment:  production                               │
+│  State:        Running                                  │
+│  Shards:       1 running table copy, 3 waiting for -40  │
+│  Caller:       github:octocat                           │
+│  Source:       https://github.com/acme/shop/pull/412    │
+│  Started:      Jan 15 14:26:00 UTC                      │
+│  Duration:     4m                                       │
+└─────────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.38% (1 of 4 shards)
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+       • Rows: 914,707 / 1,466,232 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
+       • Shards: 4 (1 copying, 3 queued)
+           ◉ -40: 62.38% · 914,707 / 1,466,232 rows · ETA: 3m 15s
+           ○ 40-80: queued
+           ○ 80-c0: queued
+           ○ c0-: queued
+    ~ VSchema (shop_001): Pending
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
+
+
+```
+</details>
+
+<details>
+<summary><a name="sharded-apply-with-a-failed-shard"></a><strong>Sharded Apply With A Failed Shard</strong></summary>
+
+```
+
+┌───────────────────────────────────────────────────────┐
+│  Apply ID:     apply-shard-e5f6a7b8                   │
+│  Database:     shop                                   │
+│  Environment:  production                             │
+│  State:        Failed                                 │
+│  Shards:       1 failed, 3 cancelled                  │
+│  Caller:       github:octocat                         │
+│  Source:       https://github.com/acme/shop/pull/412  │
+│  Started:      Jan 15 14:26:00 UTC                    │
+│  Duration:     1m                                     │
+└───────────────────────────────────────────────────────┘
+
+  shard -40: resolve shard primary for -40: context deadline exceeded
+
+
+  ── shop_001 ──
+
+     ~ orders: ⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜ ❌ Failed
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+
+       • Shards: 4 (1 failed, 3 cancelled)
+           ✗ -40: failed
+           ○ 40-80: cancelled
+           ○ 80-c0: cancelled
+           ○ c0-: cancelled
+    ~ VSchema (shop_001): Cancelled
+          "tables": {
+            "orders": {
+       +      "column_vindexes": [{"column": "customer_id", "name": "hash"}]
+            }
+          }
+
+
+To recover: Fix the issue above, then run a new apply.
+The new apply will only process tables that haven't completed.
 ```
 </details>
 

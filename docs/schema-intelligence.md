@@ -623,6 +623,25 @@ so several rows for the same table share a deployment and differ in their
 target. The pair is read from the stored task's operation row, so a
 single-target apply reports its one member the same way, and a row the server
 cannot match to a stored task carries neither field.
+A sharded apply lists one operation per shard and table it changes, plus each
+keyspace's finalizer, and the response sets `sharded: true`. Its `tables` are
+then rolled up across the shards: one entry per keyspace table, with `status`
+the shard state that needs attention first, `rows_copied` and `rows_total`
+summed over the shards that have reported a total, and `shards` listing each
+shard's own state and rows. `estimated_bytes` is the table's planned size
+across all its shards, and `planned_shards` the number of shards the plan
+recorded it spanning. A shard whose wave has not started reports its
+operation's state and no rows. A table on its keyspace's only shard keeps its
+task's entry, with its `task_id`, and lists no shards. Each finalizer that
+changes its keyspace's VSchema appears in `metadata.vschema_changes` with its
+status and the diff from the stored plan. A sharded apply's operations can
+attach one dispatch at a time, so it reads as every operation its generation
+manifest declares: one still to attach is listed in `operations` as `pending`
+and under its table's `shards` as `pending` with no rows, and a table none of
+whose shards has attached carries the `ddl` and `change_type` the stored plan
+reviewed for it. The CLI and the PR
+comments render the apply as one change, its tables under their keyspace.
+`operations` still lists every attached row.
 `task_id`, when present, identifies the individual task, including repeated
 statements against the same member and table. It names the control plane's
 task and stays the same on every poll, whether the server answers from its
@@ -639,8 +658,9 @@ where the response comes from. While the data plane reports the apply's
 progress, it is the engine's display name: `Spirit`, `PlanetScale`, `Strata`, or
 `PostgreSQL`. A response served from SchemaBot's storage carries the stored
 engine name instead: `spirit`, `planetscale`, `strata`, or `postgres`. Storage
-serves a settled, retryable-failed, resuming, or multi-deployment apply, and a
-remote apply the data plane has not yet been handed. `Unknown` means the data
+serves a settled, retryable-failed, resuming, or multi-deployment apply, an
+apply whose manifest declares more than one operation, and a remote apply the
+data plane has not yet been handed. `Unknown` means the data
 plane reported an engine this server does not recognize.
 
 <details>
@@ -787,6 +807,90 @@ Table log lines include `deployment` and `target` when the response supplies
 them, which it does for every row the server can attribute to its stored task,
 on a single-target apply as well as a rollout. Task IDs are used for tracking
 but are not printed.
+
+<details>
+<summary>Sharded apply response example</summary>
+
+```http
+GET /api/progress/apply/apply-example-76
+```
+
+Response excerpt (illustrative values) for `orders` copying across a
+keyspace's four shards, of which only `-40` has started:
+
+```json
+{
+  "apply_id": "apply-example-76",
+  "database": "shop",
+  "database_type": "mysql",
+  "environment": "production",
+  "engine": "strata",
+  "state": "running",
+  "sharded": true,
+  "operations": [
+    {"deployment": "data-plane", "operation_key": "shop_001/-40/orders", "operation_kind": "work", "state": "running"},
+    {"deployment": "data-plane", "operation_key": "shop_001/40-80/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/80-c0/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/c0-/orders", "operation_kind": "work", "state": "pending"},
+    {"deployment": "data-plane", "operation_key": "shop_001/group_finalizer", "operation_kind": "group_finalizer", "state": "pending"}
+  ],
+  "tables": [
+    {
+      "table_name": "orders",
+      "keyspace": "shop_001",
+      "deployment": "data-plane",
+      "change_type": "alter",
+      "ddl": "ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`)",
+      "status": "running",
+      "rows_copied": 620,
+      "rows_total": 1000,
+      "percent_complete": 62,
+      "eta_seconds": 195,
+      "estimated_bytes": 23400000000,
+      "planned_shards": 4,
+      "shards": [
+        {"shard": "-40", "status": "running", "rows_copied": 620, "rows_total": 1000, "eta_seconds": 195, "percent_complete": 62},
+        {"shard": "40-80", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0},
+        {"shard": "80-c0", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0},
+        {"shard": "c0-", "status": "pending", "rows_copied": 0, "rows_total": 0, "percent_complete": 0}
+      ]
+    }
+  ],
+  "metadata": {
+    "vschema_changes": "[{\"namespace\":\"shop_001\",\"status\":\"\",\"diff\":\"+  \\\"orders\\\": {}\"}]"
+  }
+}
+```
+
+`schemabot progress apply-example-76` renders it as one change. The header
+counts the shards by status, the rows cover only the started shard, so the ETA
+is a floor, and the VSchema change shows its diff:
+
+```text
+┌─────────────────────────────────────────────────────────┐
+│  Apply ID:     apply-example-76                         │
+│  Database:     shop                                     │
+│  Environment:  production                               │
+│  State:        Running                                  │
+│  Shards:       1 running table copy, 3 waiting for -40  │
+└─────────────────────────────────────────────────────────┘
+
+
+  ── shop_001 ──
+
+     ~ orders: 🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦🟦⬜⬜⬜⬜⬜⬜⬜⬜ 62.00% (1 of 4 shards)
+       ALTER TABLE `orders` ADD INDEX `idx_created_at`(`created_at`);
+       • Rows: 620 / 1,000 across 1 of 4 shards · ~23.4 GB across all 4 shards · ETA: ≥ 3m 15s
+       • Shards: 4 (1 copying, 3 queued)
+           ◉ -40: 62.00% · 620 / 1,000 rows · ETA: 3m 15s
+           ○ 40-80: queued
+           ○ 80-c0: queued
+           ○ c0-: queued
+    ~ VSchema (shop_001): Pending
+       +  "orders": {}
+```
+
+</details>
 
 <details>
 <summary>PostgreSQL response example</summary>

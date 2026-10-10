@@ -666,6 +666,13 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 	return n.Artifacts[VSchemaArtifactName] != ""
 }
 
+// FinalizesWithoutVSchemaChange reports whether the engine finalizes this
+// namespace with no VSchema change for plan and apply surfaces to show: its
+// finalizer runs, but there is nothing of its own to review.
+func (n *NamespacePlanData) FinalizesWithoutVSchemaChange() bool {
+	return n != nil && n.Finalize && !n.ShowsVSchemaChange()
+}
+
 // ShowsVSchemaChange reports whether plan and apply surfaces show this
 // namespace's VSchema change as one. It is the stored-plan counterpart of
 // apitypes.SchemaChangeResponse.ShowsVSchemaChange: a change the engine

@@ -669,24 +669,11 @@ func writeShardedRowsAndETA(sb *strings.Builder, t ShardedTableStatus) {
 		ui.FormatNumber(ui.ClampRows(t.RowsCopied, t.RowsTotal)),
 		ui.FormatNumber(t.RowsTotal),
 		t.ShardsReporting, t.shardTotal())
-	// The planned size is the whole table's, so beside rows that cover only
-	// some shards it names the full span rather than reading as theirs.
-	if t.EstimatedBytes != nil {
-		line += fmt.Sprintf(" · %s %s", ui.FormatApproxBytes(*t.EstimatedBytes), plannedShardSpan(t.PlannedShards))
-	}
+	line += ui.FormatShardedTableSizeClause(t.EstimatedBytes, t.PlannedShards)
 	if t.ETASeconds > 0 {
 		line += fmt.Sprintf(" · ETA: ≥ %s", ui.FormatETA(t.ETASeconds))
 	}
 	sb.WriteString(line + "\n")
-}
-
-// plannedShardSpan names the shards a table's planned size covers: the plan's
-// count when it recorded one, otherwise every shard without a number.
-func plannedShardSpan(plannedShards int) string {
-	if plannedShards > 0 {
-		return fmt.Sprintf("across all %d shards", plannedShards)
-	}
-	return "across all shards"
 }
 
 // shardedTableStatusPhrase maps a table's aggregate task state to its display
@@ -805,35 +792,16 @@ func shardList(shards []ShardStatus, totalShards int) string {
 }
 
 // writeShardCounts writes the per-status histogram across shards so rollout
-// health is visible at a glance — the shard-unit analogue of the
-// multi-deployment "Deployments:" line.
+// health is visible at a glance (presentation.ShardCounts).
 func writeShardCounts(sb *strings.Builder, shards []ShardStatus) {
 	if len(shards) == 0 {
 		return
 	}
-	order := make([]string, 0, len(shards))
-	counts := make(map[string]int, len(shards))
+	labels := make([]string, 0, len(shards))
 	for _, s := range shards {
-		label := shardCountLabel(s)
-		if _, seen := counts[label]; !seen {
-			order = append(order, label)
-		}
-		counts[label]++
+		labels = append(labels, s.Label)
 	}
-	parts := make([]string, 0, len(order))
-	for _, label := range order {
-		parts = append(parts, fmt.Sprintf("%d %s", counts[label], label))
-	}
-	fmt.Fprintf(sb, "\n**Shards**: %s\n", strings.Join(parts, ", "))
-}
-
-// shardCountLabel collapses a shard's full label to its leading state word
-// ("halted — …" → "halted") for the histogram.
-func shardCountLabel(s ShardStatus) string {
-	if i := strings.Index(s.Label, " — "); i >= 0 {
-		return s.Label[:i]
-	}
-	return s.Label
+	fmt.Fprintf(sb, "\n**Shards**: %s\n", presentation.ShardCounts(labels))
 }
 
 // isShardFailureState reports whether a shard's state carries an operator-facing

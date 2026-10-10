@@ -32,7 +32,7 @@ func WriteRollbackPlan(plan *apitypes.PlanResponse, sourceApplyID string) {
 		switch {
 		case change.ShowsVSchemaChange():
 			fmt.Printf("  %s: VSchema update\n", change.Namespace)
-		case change.NeedsFinalizer() && len(change.TableChanges) == 0:
+		case plan.FinalizesOnly(change):
 			fmt.Printf("  %s: finalized by the engine once every shard's DDL has landed\n", change.Namespace)
 		}
 	}
