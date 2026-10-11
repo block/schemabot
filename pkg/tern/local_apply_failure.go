@@ -33,6 +33,23 @@ func (c *LocalClient) logApplyPausedForRetry(ctx context.Context, apply *storage
 		previousState, state.Apply.FailedRetryable)
 }
 
+// postTerminalReconcileError is a failure in the work an apply owes after its
+// terminal outcome is durably stored, such as answering the start that
+// admitted the claim. The outcome it follows is already recorded, so the error
+// describes a side effect left undone, never the schema change: a caller must
+// not record a failure or a retryable pause over the stored outcome, and
+// returns the error so the drive reports what it left undone.
+type postTerminalReconcileError struct {
+	storedState string
+	err         error
+}
+
+func (e *postTerminalReconcileError) Error() string {
+	return fmt.Sprintf("reconcile after the stored %s outcome: %v", e.storedState, e.err)
+}
+
+func (e *postTerminalReconcileError) Unwrap() error { return e.err }
+
 // driveCancelled reports whether the drive's context has been cancelled, and
 // records in the server log that the apply is being handed back when it has.
 //
