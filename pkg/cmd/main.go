@@ -150,7 +150,7 @@ func main() {
 		}
 		select {
 		case <-sigCh:
-			os.Exit(130)
+			os.Exit(commands.ExitInterrupted)
 		case <-runDone:
 		}
 	}()

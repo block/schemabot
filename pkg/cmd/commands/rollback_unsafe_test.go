@@ -79,7 +79,7 @@ func TestRollbackUnsafeChangesRequireAllowUnsafe(t *testing.T) {
 		var runErr error
 		output := stripAnsi(captureStdout(func() {
 			cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true}
-			runErr = cmd.Run(&Globals{Endpoint: endpoint})
+			runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 		}))
 		require.ErrorIs(t, runErr, ErrSilent)
 		assert.Contains(t, output, "Apply blocked: 1 unsafe change(s) detected")
@@ -95,7 +95,7 @@ func TestRollbackUnsafeChangesRequireAllowUnsafe(t *testing.T) {
 		var runErr error
 		output := stripAnsi(captureStdout(func() {
 			cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production"}
-			runErr = cmd.Run(&Globals{Endpoint: endpoint})
+			runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 		}))
 		require.ErrorIs(t, runErr, ErrSilent)
 		assert.Contains(t, output, "rollback apply-example-90 -e production --allow-unsafe")
@@ -110,7 +110,7 @@ func TestRollbackUnsafeChangesRequireAllowUnsafe(t *testing.T) {
 		var runErr error
 		output := stripAnsi(captureStdout(func() {
 			cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true, AllowUnsafe: true}
-			runErr = cmd.Run(&Globals{Endpoint: endpoint})
+			runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 		}))
 		require.NoError(t, runErr)
 		assert.Contains(t, output, "Unsafe Changes (--allow-unsafe enabled)")
@@ -127,7 +127,7 @@ func TestRollbackUnsafeChangesRequireAllowUnsafe(t *testing.T) {
 		var runErr error
 		output := stripAnsi(captureStdout(func() {
 			cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true}
-			runErr = cmd.Run(&Globals{Endpoint: endpoint})
+			runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 		}))
 		require.NoError(t, runErr)
 		assert.NotContains(t, output, "Unsafe Changes")
@@ -159,7 +159,7 @@ func TestRollbackShardOnlyUnsafeChangeRequiresAllowUnsafe(t *testing.T) {
 	var runErr error
 	output := stripAnsi(captureStdout(func() {
 		cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true}
-		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 	}))
 
 	require.ErrorIs(t, runErr, ErrSilent)
@@ -186,7 +186,7 @@ func TestRollbackCmd_BlockedPlanRefusesBeforeLock(t *testing.T) {
 	var runErr error
 	output := stripAnsi(captureStdout(func() {
 		cmd := RollbackCmd{ApplyID: "apply-example-90", Environment: "production", AutoApprove: true, AllowUnsafe: true}
-		runErr = cmd.Run(&Globals{Endpoint: endpoint})
+		runErr = cmd.Run(t.Context(), &Globals{Endpoint: endpoint})
 	}))
 	assert.EqualError(t, runErr, `rollback blocked: plan plan-example-rollback contains a blocked change for table "orders": direct execution is enabled but the table's size is unavailable`)
 	assert.Contains(t, output, "DROP INDEX `idx_status`")

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/block/schemabot/pkg/apitypes"
@@ -16,7 +17,7 @@ type CutoverCmd struct {
 }
 
 // Run executes the cutover command.
-func (cmd *CutoverCmd) Run(g *Globals) error {
+func (cmd *CutoverCmd) Run(ctx context.Context, g *Globals) error {
 	if err := cmd.RequireApplyID(); err != nil {
 		return err
 	}
@@ -77,5 +78,5 @@ func (cmd *CutoverCmd) Run(g *Globals) error {
 	}
 
 	// Watch progress until completion - cutover already triggered, so skip waiting instructions
-	return WatchApplyProgressAfterCutover(ep, cmd.ApplyID)
+	return WatchApplyProgressAfterCutover(ctx, ep, cmd.ApplyID)
 }
