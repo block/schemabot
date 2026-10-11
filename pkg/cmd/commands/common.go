@@ -3,6 +3,7 @@ package commands
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -476,11 +477,14 @@ func writeNarrowedTo(planResult *apitypes.PlanResponse) {
 // rollout-wide apply (apitypes.ApplyRequest.RendersRollout). Each caller
 // decides it for its own output, so a new caller has to decide it rather than
 // inherit it.
-func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
+func applyAndWatch(ctx context.Context, ep string, planResult *apitypes.PlanResponse, rendersRollout bool, database, environment, caller, operation string,
 	deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat, logHeartbeat time.Duration) (string, error) {
 
 	if planResult.PlanID == "" {
 		return "", fmt.Errorf("no plan_id in response")
+	}
+	if ctx.Err() != nil {
+		return "", stoppedBeforeSubmit(ctx, operation)
 	}
 
 	options := buildApplyOptions(planResult, deferCutover, deferDeploy, skipRevert, allowUnsafe, branch, watch, format)
@@ -527,11 +531,22 @@ func applyAndWatch(ep string, planResult *apitypes.PlanResponse, rendersRollout 
 	}
 
 	fmt.Println("Watching progress...")
-	if err := WatchApplyProgressWithFormat(ep, applyID, environment, true, format, logHeartbeat); err != nil {
+	if err := WatchApplyProgressWithFormat(ctx, ep, applyID, environment, true, format, logHeartbeat); err != nil {
 		return applyID, err
 	}
 
 	return applyID, nil
+}
+
+// stoppedBeforeSubmit ends a command whose operator pressed Ctrl-C before its
+// schema change was submitted. The signal arrived while the command was still
+// planning or taking the lock, so nothing that starts a schema change has
+// reached the server; the notice says so, because the command would otherwise
+// answer the signal by starting the schema change and stopping its watch at
+// once, which reads as a deliberate stop of something that ran.
+func stoppedBeforeSubmit(ctx context.Context, operation string) error {
+	fmt.Fprintf(os.Stderr, "Stopped before the %s was submitted; nothing was started.\n", operation)
+	return interrupted(ctx)
 }
 
 func buildApplyOptions(planResult *apitypes.PlanResponse, deferCutover, deferDeploy, skipRevert, allowUnsafe bool, branch string, watch bool, format OutputFormat) map[string]string {
