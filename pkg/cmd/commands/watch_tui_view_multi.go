@@ -12,7 +12,10 @@ import (
 	"github.com/block/schemabot/pkg/state"
 )
 
-func (m WatchModel) multiDeploymentProgressView() string {
+// multiDeploymentProgressSections renders the rollout as its body (the header
+// and each deployment's section) and its footer (the rollout's next command
+// and the keys the operator can press).
+func (m WatchModel) multiDeploymentProgressSections() (string, string) {
 	model := presentation.Derive(templates.ProgressOperationsForPresentation(m.operations, m.released))
 	groups := model.Groups()
 	view := templates.RolloutView{
@@ -30,25 +33,25 @@ func (m WatchModel) multiDeploymentProgressView() string {
 
 	// A deployment that addresses several targets renders as one rollup
 	// section, shared with the progress output; any other member keeps a
-	// section of its own. Group members index model.Deployments, which Derive
-	// returns index-parallel to m.operations, so each section renders its own
-	// operation's identifiers; a deployment can own several operations, so a
-	// name-based lookup cannot tell them apart.
+	// section of its own. Each member names the row it reads its identifiers
+	// from, so each section renders its own operation's; a deployment can own
+	// several operations, so a name-based lookup cannot tell them apart.
 	for _, g := range groups {
 		if len(g.Members) > 1 {
 			b.WriteString(templates.FormatTargetRollup(view, g))
 			continue
 		}
-		i := g.Members[0]
-		m.writeDeploymentSection(&b, model.Deployments[i], m.operations[i])
+		d := model.Deployments[g.Members[0]]
+		m.writeDeploymentSection(&b, d, m.operations[d.Row])
 	}
 
 	b.WriteString(templates.FormatThrottleReference(m.tables))
+	var f strings.Builder
 	if footer := templates.FormatRolloutFooter(view); footer != "" {
-		b.WriteString(footer + "\n")
+		f.WriteString(footer + "\n")
 	}
-	m.writeMultiDeploymentFooter(&b, model)
-	return b.String()
+	m.writeMultiDeploymentFooter(&f, model)
+	return b.String(), f.String()
 }
 
 func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model presentation.Apply, groups []presentation.Group) {
@@ -57,8 +60,8 @@ func (m WatchModel) writeMultiDeploymentHeader(b *strings.Builder, model present
 	} else {
 		b.WriteString(model.Label + "\n")
 	}
-	if counts := templates.FormatStateCounts(model.Counts); counts != "" {
-		fmt.Fprintf(b, "%s: %s\n", templates.RolloutCountsUnit(groups), counts)
+	if label, counts := templates.RolloutCounts(model, groups); counts != "" {
+		fmt.Fprintf(b, "%s: %s\n", label, counts)
 	}
 	if model.FirstFailure != nil {
 		errStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))

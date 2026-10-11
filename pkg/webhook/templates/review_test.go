@@ -49,8 +49,31 @@ func TestRenderReviewRequired_ChangedApprovers(t *testing.T) {
 	})
 
 	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob, @carol. Ask for an approval of the latest commit.\n")
+	assert.NotContains(t, result, "This PR targets", "a PR whose base branch is unknown is not told it targets another branch")
 	assert.Less(t, strings.Index(result, "Approvals on an earlier commit"), strings.Index(result, "**Operators of `payments`**"),
 		"the explanation precedes the reviewer lists")
+}
+
+// A PR targeting a branch other than the default has approvals carried only
+// where its base content is unchanged, so the comment says that changes to its
+// base branch count, and the author knows the difference may not be theirs.
+func TestRenderReviewRequired_ChangedApproversOnOtherBranch(t *testing.T) {
+	data := ReviewGateData{
+		Database:         "payments",
+		Environment:      "staging",
+		RequestedBy:      "alice",
+		OtherReviewers:   []string{"bob"},
+		PRAuthor:         "alice",
+		ChangedApprovers: []string{"bob"},
+		BaseRef:          "release-1.2",
+		DefaultBranch:    "main",
+	}
+
+	result := RenderReviewRequired(data)
+	assert.Contains(t, result, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: @bob. This PR targets `release-1.2`, not `main`, so changes that reach `release-1.2` count as a change too. Ask for an approval of the latest commit.\n")
+
+	data.BaseRef = "main"
+	assert.NotContains(t, RenderReviewRequired(data), "This PR targets", "a PR targeting the default branch gets no branch sentence")
 }
 
 // An authorized reviewer approved an earlier commit the review gate could not

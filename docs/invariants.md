@@ -810,8 +810,9 @@ completeness test over it (`pkg/state/metadata.go`).
 `failed_retryable` tasks reset to `pending`, so completed tasks are never re-run, and the apply
 settles to permanent `failed` when the attempt budget is spent or the recovery window closes.
 *Enforced:* retry preparation in the drive loop (`pkg/api/operator.go`), the re-plan before a drive
-starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), and the
-expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
+starts again a task another run held the table from (`pkg/tern/local_apply_sequential.go`), the
+resume re-plan that settles a task whose change already landed (`pkg/tern/local_control_resume.go`),
+and the expiry sweep (`pkg/api/reaper.go`, `pkg/storage/internal/sqlstore/applies.go`); budget semantics in
 [apply-lifecycle.md](apply-lifecycle.md).
 
 ### ST-10: Rollouts respect order and fail closed on policy
@@ -821,7 +822,10 @@ pair taken in `deployment_order` and then in each deployment's `targets` order, 
 earlier member blocks later ones unless the config says otherwise. Copy start is ordered per
 member, not per operation: one member's work never waits on its own member's work to start, and a
 later member's work waits on every earlier member's, until it completes under `rolling` or reaches
-the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Cutover
+the cutover barrier under `barrier`, while `parallel` does not order copy start at all. Where a
+rollout is laid out table by table, work on a table starts on any target only once every earlier
+table has completed on every target, under every cutover policy and every on_failure value, and
+work held behind an earlier table that settled without completing can never start, so it holds no target. Cutover
 under `barrier` and `parallel` is ordered across every operation, not per member: operations cut
 over strictly one at a time in the order the rollout created them, so two shards of one member cut
 over one after the other. A member's finalizer publishes its change without parking at the
@@ -850,7 +854,8 @@ has reached every operation: the pending request is what `start` consults, so ho
 without completing the request would refuse the start the hold exists to preserve (CO-2).
 *Enforced:* the ordered-claim gates in `FindNextApplyOperation`, whose work and finalizer arms
 each gate on earlier members and whose stopped+start arm holds a finalizer, and work that never
-started, to the same gate, with the failure exemption shared by every gate, and `FindNextApplyOperationCutover`
+started, to the same gate, with the failure exemption shared by every gate and the table-step
+boundary `rolloutStepGateSQL` in the work gate, and `FindNextApplyOperationCutover`
 (`pkg/storage/internal/sqlstore/apply_operations.go`), pinned per policy on both dialects by the
 storage parity suite (`pkg/storage/storagetest/apply_operations.go`); on a data plane, an apply a
 dispatcher created leaves member order to the dispatcher's claim (`rolloutMembersOrderedHereSQL`,
@@ -862,7 +867,8 @@ check `CutoverBlocker` (`pkg/storage/internal/sqlstore/apply_operations.go`, sha
 (`operationCutoverRequestTurn`, `pkg/tern/cutover_barrier.go`) and at request intake
 (`cutoverTurnForRequest`, `pkg/api/control_handlers.go`); and the rollout state derivation
 (`DeriveRolloutApplyState`, `hasStartedUnsettledWork` and `childHoldsItsTarget`,
-`pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`), through which every
+`pkg/state/apply.go`), fed by `RolloutChildren` (`pkg/state/rollout.go`, whose
+`stepOrphanedByEarlierStep` marks work held behind a table that settled without completing, read through `StepRowCanNeverPass`), through which every
 projection builds its children, with `RolloutHeldByResumableChild` (`pkg/state/apply.go`), which
 `updateApplyStateFromOperations` consults to keep a held-open rollout's recovery claim quiet, and
 `completeLandedStopForHeldOpenApply` keeping its stop resolved (`pkg/api/operator.go`).
@@ -1759,10 +1765,13 @@ A PR apply requires an actor authorized for the target (configured operators, ad
 admins, or CODEOWNERS, per config), evaluated per database. The change's author cannot satisfy
 their own review requirement. An approval counts only for the schema change it reviewed: it was
 given on the commit being applied, or on an earlier commit at which the change's own effect on every
-schema input is provably the same, so any difference between the two came from newer base branch
-content; when that cannot be proved, the approval does not count. This relies on the base branch
-requiring review for every change that reaches it: a change pushed to it without review is
-carried past an earlier approval as base branch content. *Enforced:* the review gate and actor
+schema input is provably the same, or the change has stopped touching an input that newer default
+branch content has changed since, so any difference between the two came from newer content on the
+repository's default branch; when that cannot be proved, the approval does not count. A change
+targeting any other branch keeps an approval only where its own effect and its base content are
+both the same. This relies on the default branch requiring review for every change that reaches
+it: a change pushed to it without review is carried past an earlier approval as default branch
+content. *Enforced:* the review gate and actor
 authorization (`pkg/webhook/review_gate.go`, `pkg/webhook/actor_authorization.go`), with the
 comparison in `PRSchemaChangeUnchangedSince` (`pkg/github/client.go`).
 

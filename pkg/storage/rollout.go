@@ -15,6 +15,7 @@ func (op *ApplyOperation) RolloutOperation(released bool) state.RolloutOperation
 		OperationKey:      op.OperationKey,
 		Work:              op.OperationKind == ApplyOperationKindWork,
 		Finalizer:         op.OperationKind == ApplyOperationKindGroupFinalizer,
+		RolloutStep:       op.RolloutStep,
 		State:             op.State,
 		NeverStarted:      op.StartedAt == nil,
 		ContinueOnFailure: op.OnFailure == OnFailureContinue || (isPause && released),

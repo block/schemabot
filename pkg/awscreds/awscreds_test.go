@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	smtypes "github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -294,50 +296,102 @@ func TestResolverFetchErrorIncludesAccountInAssumeRoleMode(t *testing.T) {
 	assert.NotContains(t, err.Error(), "in account")
 }
 
-// A cluster's credential secret is provisioned in the region the cluster runs
-// in. With a region attribute, a us-east-1 cluster's secret is read from
-// us-east-1 even though other targets of the same resolver live in us-west-2.
-func TestResolverReadsSecretInEntityRegion(t *testing.T) {
-	fetch := &fakeFetcher{payload: `{"username":"ddl","password":"s3cret"}`}
-	r := testResolver(t, Config{RegionAttribute: "aws_region", RoleARN: testRoleARN, SecretName: "ddl-password"}, fetch)
-
-	creds, err := r.ResolveCredentials(t.Context(),
-		inventory.Request{Target: "inventory-dsid"},
-		map[string]string{"aws_account_id": "222222222222", "aws_region": "us-east-1"})
-	require.NoError(t, err)
-
-	assert.Equal(t, "222222222222", fetch.gotAccount)
-	assert.Equal(t, "us-east-1", fetch.gotRegion)
-	assert.Equal(t, "ddl-password", fetch.gotSecret)
-	assert.Equal(t, "ddl", creds.Username)
+// regionResolver reads in us-west-2 by default and can also call Secrets
+// Manager in us-east-1, placing each target by its aws_region attribute.
+func regionResolver(t *testing.T, fetch secretFetcher) *Resolver {
+	t.Helper()
+	return testResolver(t, Config{
+		Region:           "us-west-2",
+		RegionAttribute:  "aws_region",
+		ReachableRegions: []string{"us-east-1"},
+		RoleARN:          testRoleARN,
+		SecretName:       "ddl-password",
+	}, fetch)
 }
 
-// A target whose entity does not name a region fails before any fetch: reading
-// the secret from some other region would be a guess.
+// accountInRegion returns entity attributes placing a target in an account and
+// a cluster region.
+func accountInRegion(account, region string) map[string]string {
+	return map[string]string{"aws_account_id": account, "aws_region": region}
+}
+
+// A data plane that can call Secrets Manager in its cluster's region reads the
+// secret there: a us-east-1 cluster's secret is read in us-east-1 and a
+// us-west-2 cluster's in us-west-2, from one resolver.
+func TestResolverReadsSecretInReachableClusterRegion(t *testing.T) {
+	for _, region := range []string{"us-east-1", "us-west-2"} {
+		fetch := &fakeFetcher{payload: `{"username":"ddl","password":"s3cret"}`}
+		creds, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
+			inventory.Request{Target: "inventory-dsid"}, accountInRegion("222222222222", region))
+		require.NoError(t, err, region)
+
+		assert.Equal(t, "222222222222", fetch.gotAccount, region)
+		assert.Equal(t, region, fetch.gotRegion, region)
+		assert.Equal(t, "ddl-password", fetch.gotSecret, region)
+		assert.Equal(t, "ddl", creds.Username, region)
+	}
+}
+
+// A cluster in a region the data plane cannot call has its secret read in the
+// home region, where it is expected as a replica.
+func TestResolverReadsSecretInHomeRegionWhenClusterRegionUnreachable(t *testing.T) {
+	fetch := &fakeFetcher{payload: `{"username":"ddl","password":"s3cret"}`}
+	_, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
+		inventory.Request{Target: "inventory-dsid"}, accountInRegion("222222222222", "eu-west-1"))
+	require.NoError(t, err)
+	assert.Equal(t, "us-west-2", fetch.gotRegion)
+}
+
+// With reachable regions configured, a target whose entity does not name its
+// cluster's region fails before any fetch: reading the secret in the home region
+// would be a guess about where the target runs.
 func TestResolverFailsWhenRegionAttributeMissing(t *testing.T) {
 	fetch := &fakeFetcher{payload: `{"username":"u","password":"p"}`}
-	r := testResolver(t, Config{RegionAttribute: "aws_region", RoleARN: testRoleARN, SecretName: "secret"}, fetch)
-
-	_, err := r.ResolveCredentials(t.Context(),
+	_, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
 		inventory.Request{Target: "orders-dsid"},
 		map[string]string{"aws_account_id": "111111111111"})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), `target "orders-dsid" has no "aws_region" attribute`)
+	assert.Contains(t, err.Error(), `target "orders-dsid" has no "aws_region" attribute naming the region of its cluster`)
 	assert.Equal(t, 0, fetch.calls)
 }
 
-// A region attribute whose value is not a region name fails before any fetch,
-// naming the value, rather than as an opaque endpoint error from the SDK.
+// With reachable regions configured, a region attribute whose value is not a
+// region name fails before any fetch, naming the value, rather than as an opaque
+// endpoint error from the SDK.
 func TestResolverFailsOnMalformedEntityRegion(t *testing.T) {
 	fetch := &fakeFetcher{payload: `{"username":"u","password":"p"}`}
-	r := testResolver(t, Config{RegionAttribute: "aws_region", RoleARN: testRoleARN, SecretName: "secret"}, fetch)
-
-	_, err := r.ResolveCredentials(t.Context(),
-		inventory.Request{Target: "orders-dsid"},
-		map[string]string{"aws_account_id": "111111111111", "aws_region": "us-east"})
+	_, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
+		inventory.Request{Target: "orders-dsid"}, accountInRegion("111111111111", "us-east"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `target "orders-dsid" has "aws_region" attribute "us-east", which is not an AWS region name`)
 	assert.Equal(t, 0, fetch.calls)
+}
+
+// With only the home region reachable, the attribute cannot change where a
+// secret is read, so a target with a missing or malformed cluster region is read
+// in the home region rather than failed. A missing secret is then reported
+// without a cluster region to name.
+func TestResolverHomeOnlyReadsTargetWithoutUsableClusterRegion(t *testing.T) {
+	cfg := Config{Region: "us-west-2", RegionAttribute: "aws_region", RoleARN: testRoleARN, SecretName: "ddl-password"}
+	cases := map[string]map[string]string{
+		"missing":   {"aws_account_id": "111111111111"},
+		"malformed": accountInRegion("111111111111", "us-east"),
+	}
+	for name, attrs := range cases {
+		fetch := &fakeFetcher{payload: `{"username":"ddl","password":"s3cret"}`}
+		creds, err := testResolver(t, cfg, fetch).ResolveCredentials(t.Context(),
+			inventory.Request{Target: "orders-dsid"}, attrs)
+		require.NoError(t, err, name)
+		assert.Equal(t, "us-west-2", fetch.gotRegion, name)
+		assert.Equal(t, "ddl", creds.Username, name)
+
+		fetch = &fakeFetcher{err: secretNotFound()}
+		_, err = testResolver(t, cfg, fetch).ResolveCredentials(t.Context(),
+			inventory.Request{Target: "orders-dsid"}, attrs)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), `fetch secret "ddl-password" for target "orders-dsid" in account 111111111111, region us-west-2`, name)
+		assert.NotContains(t, err.Error(), "the target's cluster is in", name)
+	}
 }
 
 func TestIsRegionName(t *testing.T) {
@@ -349,37 +403,112 @@ func TestIsRegionName(t *testing.T) {
 	}
 }
 
-// A fixed region is used for every target, whatever region its entity reports.
-func TestResolverFixedRegionIgnoresEntityRegion(t *testing.T) {
+// Each region belongs to one AWS partition, decided by its name's prefix.
+func TestPartitionOf(t *testing.T) {
+	for region, partition := range map[string]string{
+		"us-east-1":       "aws",
+		"eu-central-1":    "aws",
+		"us-gov-west-1":   "aws-us-gov",
+		"cn-north-1":      "aws-cn",
+		"us-iso-east-1":   "aws-iso",
+		"us-isob-east-1":  "aws-iso-b",
+		"us-isof-south-1": "aws-iso-f",
+		"eu-isoe-west-1":  "aws-iso-e",
+		"eusc-de-east-1":  "aws-eusc",
+	} {
+		assert.Equal(t, partition, partitionOf(region), region)
+	}
+}
+
+// Reachable regions in the home region's partition are accepted outside the
+// commercial partition too.
+func TestNewAcceptsReachableRegionsInHomePartition(t *testing.T) {
+	_, err := New(Config{Region: "us-gov-west-1", RegionAttribute: "aws_region", ReachableRegions: []string{"us-gov-east-1"}, RoleARN: "arn:aws-us-gov:iam::{account}:role/role", SecretName: "secret"})
+	require.NoError(t, err)
+
+	_, err = New(Config{Region: "us-gov-west-1", RegionAttribute: "aws_region", ReachableRegions: []string{"us-east-1"}, RoleARN: "arn:aws-us-gov:iam::{account}:role/role", SecretName: "secret"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `reachable region "us-east-1" at index 0 is in partition aws, not the home region us-gov-west-1's partition aws-us-gov`)
+}
+
+// Without a region attribute every secret is read in the home region, whatever
+// region the target's entity reports.
+func TestResolverHomeRegionIgnoresEntityRegion(t *testing.T) {
 	fetch := &fakeFetcher{payload: `{"username":"u","password":"p"}`}
 	r := testResolver(t, Config{Region: "us-west-2", RoleARN: testRoleARN, SecretName: "secret"}, fetch)
 
 	_, err := r.ResolveCredentials(t.Context(),
-		inventory.Request{Target: "orders-dsid"},
-		map[string]string{"aws_account_id": "111111111111", "aws_region": "us-east-1"})
+		inventory.Request{Target: "orders-dsid"}, accountInRegion("111111111111", "us-east-1"))
 	require.NoError(t, err)
 	assert.Equal(t, "us-west-2", fetch.gotRegion)
 }
 
-// A fetch failure names the account and region it read from, so a secret that
-// exists in one region but not another is diagnosable from the error alone.
-func TestResolverFetchErrorIncludesRegion(t *testing.T) {
-	r := testResolver(t, Config{RegionAttribute: "aws_region", RoleARN: testRoleARN, SecretName: "ddl-password"}, &fakeFetcher{err: fmt.Errorf("ResourceNotFoundException")})
-
-	_, err := r.ResolveCredentials(t.Context(),
-		inventory.Request{Target: "inventory-dsid"},
-		map[string]string{"aws_account_id": "222222222222", "aws_region": "us-east-1"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), `target "inventory-dsid" in account 222222222222, region us-east-1`)
+// secretNotFound is the error Secrets Manager returns for a secret that does
+// not exist in the region it was read in, wrapped as the SDK wraps it.
+func secretNotFound() error {
+	return fmt.Errorf("operation error Secrets Manager: GetSecretValue: %w",
+		&smtypes.ResourceNotFoundException{Message: aws.String("Secrets Manager can't find the specified secret.")})
 }
 
-// Assumed-role clients are cached per account and region: a client built for
-// one region is never reused to read another region's secret.
-func TestAssumeRoleFetcherCachesClientPerAccountAndRegion(t *testing.T) {
-	r, err := New(Config{RegionAttribute: "aws_region", RoleARN: "arn:aws:iam::{account}:role/role", SecretName: "secret"})
+// A secret missing from the home region, for a cluster in a region the data
+// plane cannot call, is reported with the fix: replicate the secret to the home
+// region, or make the cluster's region reachable.
+func TestResolverSecretMissingFromHomeRegionNamesTheFix(t *testing.T) {
+	fetch := &fakeFetcher{err: secretNotFound()}
+	_, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
+		inventory.Request{Target: "inventory-dsid"}, accountInRegion("222222222222", "eu-west-1"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `fetch secret "ddl-password" for target "inventory-dsid" in account 222222222222, region us-west-2`)
+	assert.Contains(t, err.Error(), "the target's cluster is in eu-west-1, which is not a reachable region, so its secret is read in us-west-2: replicate the secret to us-west-2, or list eu-west-1 as a reachable region if this data plane can call Secrets Manager there")
+
+	var notFound *smtypes.ResourceNotFoundException
+	assert.ErrorAs(t, err, &notFound)
+}
+
+// A cluster in another AWS partition can neither have its secret replicated
+// into the home region nor be listed as reachable, so the error names the fix
+// that can work: a data plane in the cluster's partition.
+func TestResolverSecretMissingForClusterInOtherPartitionNamesTheFix(t *testing.T) {
+	fetch := &fakeFetcher{err: secretNotFound()}
+	_, err := regionResolver(t, fetch).ResolveCredentials(t.Context(),
+		inventory.Request{Target: "inventory-dsid"}, accountInRegion("222222222222", "us-gov-west-1"))
+	require.Error(t, err)
+	assert.Equal(t, "us-west-2", fetch.gotRegion)
+	assert.Contains(t, err.Error(), "the target's cluster is in us-gov-west-1, in partition aws-us-gov, whose secrets this data plane's credentials cannot read: serve the target from a data plane in partition aws-us-gov")
+	assert.NotContains(t, err.Error(), "reachable region")
+	assert.NotContains(t, err.Error(), "replicate")
+}
+
+// The replication fix is offered only where it applies: not when the secret
+// was read in the cluster's own region, and not for a failure other than a
+// missing secret.
+func TestResolverFetchErrorOmitsReplicaFixWhenItDoesNotApply(t *testing.T) {
+	cases := map[string]struct {
+		region string
+		err    error
+	}{
+		"missing in the cluster's own region": {region: "us-east-1", err: secretNotFound()},
+		"access denied in the home region":    {region: "eu-west-1", err: fmt.Errorf("AccessDeniedException")},
+	}
+	for name, tc := range cases {
+		_, err := regionResolver(t, &fakeFetcher{err: tc.err}).ResolveCredentials(t.Context(),
+			inventory.Request{Target: "inventory-dsid"}, accountInRegion("222222222222", tc.region))
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), `target "inventory-dsid" in account 222222222222`, name)
+		assert.NotContains(t, err.Error(), "replicate", name)
+	}
+}
+
+// Assumed-role credentials are cached per account and assumed through STS in
+// the home region, so reading a secret in another region needs only that
+// region's Secrets Manager. Clients are cached per account and region: a client
+// built for one region is never reused to read another region's secret.
+func TestAssumeRoleFetcherSharesCredentialsAcrossRegions(t *testing.T) {
+	r, err := New(Config{Region: "us-west-2", RegionAttribute: "aws_region", ReachableRegions: []string{"us-east-1"}, RoleARN: "arn:aws:iam::{account}:role/role", SecretName: "secret"})
 	require.NoError(t, err)
 	f, ok := r.fetch.(*assumeRoleFetcher)
 	require.True(t, ok)
+	assert.Equal(t, "us-west-2", f.awsCfg.Region, "roles are assumed in the home region")
 
 	west := f.clientFor("111111111111", "us-west-2")
 	east := f.clientFor("111111111111", "us-east-1")
@@ -387,12 +516,16 @@ func TestAssumeRoleFetcherCachesClientPerAccountAndRegion(t *testing.T) {
 	assert.Same(t, west, f.clientFor("111111111111", "us-west-2"))
 	assert.Equal(t, "us-west-2", west.Options().Region)
 	assert.Equal(t, "us-east-1", east.Options().Region)
-	assert.NotSame(t, west, f.clientFor("222222222222", "us-west-2"))
+	assert.Same(t, west.Options().Credentials, east.Options().Credentials)
+
+	other := f.clientFor("222222222222", "us-west-2")
+	assert.NotSame(t, west, other)
+	assert.NotSame(t, west.Options().Credentials, other.Options().Credentials)
 }
 
 // Own-account clients are cached per region the same way.
 func TestOwnAccountFetcherCachesClientPerRegion(t *testing.T) {
-	r, err := New(Config{RegionAttribute: "aws_region", SecretName: "secret"})
+	r, err := New(Config{Region: "us-west-2", RegionAttribute: "aws_region", ReachableRegions: []string{"us-east-1"}, SecretName: "secret"})
 	require.NoError(t, err)
 	f, ok := r.fetch.(*ownAccountFetcher)
 	require.True(t, ok)
@@ -410,29 +543,17 @@ func TestNewValidatesConfig(t *testing.T) {
 	_, err := New(base)
 	require.NoError(t, err)
 
-	noRegion := base
-	noRegion.Region = ""
-	_, err = New(noRegion)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "region or region attribute is required")
-
-	// A region attribute stands in for the fixed region.
-	regionAttr := noRegion
+	// A region attribute alone keeps every read in the home region and names the
+	// cluster's region when a secret is missing.
+	regionAttr := base
 	regionAttr.RegionAttribute = "aws_region"
 	_, err = New(regionAttr)
 	require.NoError(t, err)
 
-	bothRegions := base
-	bothRegions.RegionAttribute = "aws_region"
-	_, err = New(bothRegions)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "mutually exclusive")
-
-	malformedRegion := base
-	malformedRegion.Region = "us-west"
-	_, err = New(malformedRegion)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), `region "us-west" is not an AWS region name`)
+	crossRegion := regionAttr
+	crossRegion.ReachableRegions = []string{"us-east-1", "eu-west-1"}
+	_, err = New(crossRegion)
+	require.NoError(t, err)
 
 	// RoleARN is optional: without it, secrets are read from the caller's own
 	// account, so New succeeds.
@@ -441,11 +562,35 @@ func TestNewValidatesConfig(t *testing.T) {
 	_, err = New(noRole)
 	require.NoError(t, err)
 
-	noSecret := base
-	noSecret.SecretName = ""
-	_, err = New(noSecret)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "secret")
+	cases := map[string]func(*Config){
+		"region is required":                           func(c *Config) { c.Region = "" },
+		`region "us-west" is not an AWS region name`:   func(c *Config) { c.Region = "us-west" },
+		"secret name is required":                      func(c *Config) { c.SecretName = "" },
+		"reachable regions require a region attribute": func(c *Config) { c.ReachableRegions = []string{"us-east-1"} },
+		`reachable region "us-east" at index 0 is not an AWS region`: func(c *Config) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-east"}
+		},
+		`reachable region "us-west-2" at index 0 is the home region`: func(c *Config) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-west-2"}
+		},
+		`reachable region "cn-north-1" at index 1 is in partition aws-cn, not the home region us-west-2's partition aws`: func(c *Config) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-east-1", "cn-north-1"}
+		},
+		`reachable region "us-east-1" at index 1 is listed more than once`: func(c *Config) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-east-1", "us-east-1"}
+		},
+	}
+	for want, mutate := range cases {
+		cfg := base
+		mutate(&cfg)
+		_, err := New(cfg)
+		require.Error(t, err, want)
+		assert.Contains(t, err.Error(), want)
+	}
 }
 
 // When no account attribute is configured, New wires the default.

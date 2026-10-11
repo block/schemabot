@@ -151,6 +151,7 @@ func parseProgressResult(result *apitypes.ProgressResponse) progressMsg {
 		tables:       data.Tables,
 		operations:   data.Operations,
 		released:     data.Released,
+		sharded:      data.Sharded,
 		deferCutover: data.Options["defer_cutover"] == "true",
 		errorMsg:     data.ErrorMessage,
 		applyID:      result.ApplyID,
@@ -181,6 +182,16 @@ func sortStoppedByProgress(tables []templates.TableProgress) {
 
 func isTableStopped(s string) bool {
 	return state.IsState(s, state.Apply.Stopped)
+}
+
+// watchHasEnded reports whether the apply has reached a state the watch
+// exits on: it finished, failed, stopped, or was cancelled, or there is no
+// active schema change to follow.
+func (m WatchModel) watchHasEnded() bool {
+	return state.IsState(m.state,
+		state.Apply.Completed, state.Apply.Failed,
+		state.Apply.Stopped, state.Apply.Cancelled,
+		state.NoActiveChange)
 }
 
 // isEffectivelyStopped returns true if the apply is effectively stopped.

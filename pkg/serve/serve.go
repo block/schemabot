@@ -1005,7 +1005,7 @@ func (s *Server) Handler() http.Handler {
 	s.svc.ConfigureRoutes(mux)
 	mux.Handle("POST /webhook", s.webhook.handler)
 
-	authedHandler := s.authz.Middleware(mux)
+	authedHandler := withMatchedRoute(mux, s.authz.Middleware(mux))
 
 	// Wrap with OTel HTTP instrumentation for automatic request duration,
 	// request body size, and response body size metrics.
@@ -1015,6 +1015,23 @@ func (s *Server) Handler() http.Handler {
 		authedHandler.ServeHTTP(w, r)
 	})
 	return otelhttp.NewHandler(metricHandler, "schemabot")
+}
+
+// withMatchedRoute records the mux pattern a request matches before the auth
+// middleware sees it, so the OTel HTTP metrics carry the route of every
+// endpoint. The middleware hands the mux a copy of the request carrying the
+// verified caller, and the mux records the pattern on that copy, which the
+// instrumentation never sees. A request the middleware rejects is labeled with
+// its route too, so a burst of 401s names the endpoint it hit. A request that
+// matches no route carries no route, even when an embedder's outer mux already
+// recorded the pattern this handler is mounted under. The request written here
+// is the copy the OTel handler made, so an embedder's own request keeps its
+// pattern.
+func withMatchedRoute(mux *http.ServeMux, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, r.Pattern = mux.Handler(r)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // MetricsHandler returns the Prometheus /metrics handler. Run serves it on the

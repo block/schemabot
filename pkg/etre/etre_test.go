@@ -223,3 +223,31 @@ func TestNewDialsUnixSocket(t *testing.T) {
 	assert.Equal(t, "etre.invalid", got.host, "request Host (from Addr) is preserved for proxy routing")
 	assert.Equal(t, "production", got.headers.Get("X-Env-Override"))
 }
+
+func TestQueryReturnsEveryMatch(t *testing.T) {
+	var gotQuery string
+	c := newClient(mockClient(&gotQuery, []etre.Entity{{"name": "orders"}, {"name": "orders-green"}}, nil), "cluster", nil)
+
+	got, err := c.Query(t.Context(), map[string]string{"dsid": "orders", "env": "staging"})
+	require.NoError(t, err)
+	assert.Equal(t, "dsid=orders,env=staging", gotQuery)
+	require.Len(t, got, 2)
+	assert.Equal(t, "orders", got[0]["name"])
+	assert.Equal(t, "orders-green", got[1]["name"])
+}
+
+func TestQueryNotFoundIsErrNotFound(t *testing.T) {
+	c := newClient(mockClient(nil, nil, nil), "cluster", nil)
+
+	_, err := c.Query(t.Context(), map[string]string{"name": "orders"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestQueryRequiresSelector(t *testing.T) {
+	c := newClient(mockClient(nil, nil, nil), "cluster", nil)
+
+	_, err := c.Query(t.Context(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "selector is required")
+}

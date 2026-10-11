@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -756,4 +757,26 @@ func unsafeReasonFindings(reason string) []string {
 	findings := ui.LintReasons(reason)
 	slices.Sort(findings)
 	return findings
+}
+
+// unsupportedRolloutShape is apply creation's refusal of the rollout an apply
+// command would run, from the server config, or nil when apply creation would
+// admit it. A command narrowed with --target runs on one target and is never
+// refused. A config that cannot resolve the rollout is logged and admitted
+// here, since apply creation resolves the same targets and refuses there.
+func (h *Handler) unsupportedRolloutShape(database, environment string, result CommandResult) *api.RolloutShapeRefusedError {
+	if result.Target != "" {
+		return nil
+	}
+	targets, err := h.service.Config().ResolveDatabaseTargets(database, environment)
+	if err != nil {
+		h.logger.Warn("could not resolve the rollout targets to check the apply's rollout shape; apply creation checks it again",
+			"database", database, "environment", environment, "error", err)
+		return nil
+	}
+	refused, ok := errors.AsType[*api.RolloutShapeRefusedError](api.RefuseUnsupportedRolloutShape(database, environment, targets, result.DeferCutover))
+	if !ok {
+		return nil
+	}
+	return refused
 }

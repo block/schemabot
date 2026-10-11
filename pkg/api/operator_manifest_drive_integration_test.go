@@ -221,16 +221,18 @@ func TestOperatorRemoteManifestConvergedMemberSettlesAndAcceptsNextApply(t *test
 	remote, err := dpStor.Applies().GetByApplyIdentifier(ctx, remoteID)
 	require.NoError(t, err)
 	require.NotNil(t, remote)
-	assert.Equal(t, []string{working}, remote.ExpectedOperationKeys)
+	workingStep := storage.TargetOperationKey(working, storage.RolloutStepOperationKey(1))
+	assert.Equal(t, []string{workingStep}, remote.ExpectedOperationKeys)
 	remoteOps, err := dpStor.ApplyOperations().ListByApply(ctx, remote.ID)
 	require.NoError(t, err)
 	require.Len(t, remoteOps, 1)
-	assert.Equal(t, working, remoteOps[0].OperationKey, "the converged member still requires target-qualified dispatch keys")
+	assert.Equal(t, workingStep, remoteOps[0].OperationKey, "the converged member still requires target-qualified dispatch keys")
+	assert.Equal(t, 1, remoteOps[0].RolloutStep, "the data plane runs the step the control plane dispatched")
 	driveNextOperation(t, ctx, dpService, 2)
 	remote = getApply(t, ctx, dpStor, remote.ID)
 	require.Equal(t, state.Apply.Completed, remote.State, "the remote parent must settle without waiting for a converged member dispatch")
-	assert.Equal(t, []string{working}, remote.ExpectedOperationKeys, "settling the generation never changes its manifest")
-	assert.Equal(t, []string{working}, dpRecorder.resumeOperationKeys())
+	assert.Equal(t, []string{workingStep}, remote.ExpectedOperationKeys, "settling the generation never changes its manifest")
+	assert.Equal(t, []string{workingStep}, dpRecorder.resumeOperationKeys())
 	select {
 	case <-driveDone:
 	case <-ctx.Done():

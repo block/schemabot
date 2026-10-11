@@ -487,13 +487,18 @@ The `otelhttp` middleware automatically produces standard HTTP metrics for every
 
 | Metric | Type | Attributes | Description |
 |---|---|---|---|
-| `http.server.request.duration` | Histogram | environment, http.request.method, http.response.status_code | Request latency by method and status code |
+| `http.server.request.duration` | Histogram | environment, http.request.method, http.response.status_code, http.route | Request latency by method, status code, and route |
 | `http.server.request.body.size` | Histogram | environment | Request body sizes |
 | `http.server.response.body.size` | Histogram | environment | Response body sizes |
 
 SchemaBot attaches `environment="unknown"` to these process-wide HTTP metrics
 because routing-level request metrics do not belong to one schema change
 environment. Environment-specific operation metrics use the real environment.
+
+`http.route` is the route pattern the request matched, such as
+`/api/history/{database}`, never the request path, so its values are bounded by
+the route table. It is set for requests the auth middleware rejects as well as
+ones it lets through. A request that matches no route omits it.
 
 ## Adding New Metrics
 

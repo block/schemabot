@@ -123,17 +123,24 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	_, err = buildCredentialResolver(t.Context(), ownAccount, nil)
 	require.NoError(t, err)
 
-	// region_attribute stands in for a fixed region.
-	regionAttr := base
-	regionAttr.Region = ""
-	regionAttr.RegionAttribute = "aws_region"
-	_, err = buildCredentialResolver(t.Context(), regionAttr, nil)
+	// A region attribute and reachable regions add to the home region.
+	crossRegion := base
+	crossRegion.RegionAttribute = "aws_region"
+	crossRegion.ReachableRegions = []string{"us-west-2"}
+	_, err = buildCredentialResolver(t.Context(), crossRegion, nil)
 	require.NoError(t, err)
 
 	cases := map[string]func(*EtreCredentialsConfig){
-		"region or region_attribute is required": func(c *EtreCredentialsConfig) { c.Region = "" },
-		"mutually exclusive":                     func(c *EtreCredentialsConfig) { c.RegionAttribute = "aws_region" },
-		"secret_name":                            func(c *EtreCredentialsConfig) { c.SecretName = "" },
+		"region is required for the awssm backend": func(c *EtreCredentialsConfig) { c.Region = "" },
+		"reachable_regions requires region_attribute": func(c *EtreCredentialsConfig) {
+			c.ReachableRegions = []string{"us-west-2"}
+		},
+		`target_resolver.etre.credentials: region "us-west" is not an AWS region name`: func(c *EtreCredentialsConfig) { c.Region = "us-west" },
+		`target_resolver.etre.credentials: reachable region "us-west" at index 0 is not an AWS region name`: func(c *EtreCredentialsConfig) {
+			c.RegionAttribute = "aws_region"
+			c.ReachableRegions = []string{"us-west"}
+		},
+		"secret_name": func(c *EtreCredentialsConfig) { c.SecretName = "" },
 	}
 	for field, mutate := range cases {
 		cfg := base
@@ -150,6 +157,32 @@ func TestBuildCredentialResolverAWSSMRequiresFields(t *testing.T) {
 	_, err = buildCredentialResolver(t.Context(), withUsername, inventory.DecodePlanetScaleSecret)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "username")
+}
+
+// A mistyped region is reported before AWS config is loaded, so it is not
+// hidden behind, or delayed by, a credential chain that cannot load.
+func TestBuildCredentialResolverAWSSMValidatesRegionsBeforeLoadingAWSConfig(t *testing.T) {
+	t.Setenv("AWS_PROFILE", "profile-that-does-not-exist")
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "aws-config"))
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "aws-credentials"))
+
+	cfg := EtreCredentialsConfig{
+		Type:             "awssm",
+		Region:           "us-east-1",
+		RegionAttribute:  "aws_region",
+		RoleARN:          "arn:aws:iam::{account}:role/tern-assumed",
+		SecretName:       "{target}_ddl_password",
+		ReachableRegions: []string{"us-west-2"},
+	}
+	_, err := buildCredentialResolver(t.Context(), cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "load AWS config", "a valid config reaches the AWS config load, which fails on the missing profile")
+
+	cfg.ReachableRegions = []string{"us-west-2", "eu-west"}
+	_, err = buildCredentialResolver(t.Context(), cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `target_resolver.etre.credentials: reachable region "eu-west" at index 1 is not an AWS region name`)
+	assert.NotContains(t, err.Error(), "load AWS config")
 }
 
 // The assume-role backend's account attribute is surfaced to the resolver even
@@ -183,17 +216,17 @@ func TestCredentialAttributeFields(t *testing.T) {
 	}
 	assert.Equal(t, []string{"cluster"}, resolverAttributeFields(templated))
 
-	// A per-target secret region is surfaced alongside the account attribute.
+	// The cluster region attribute is surfaced alongside the account attribute.
 	regionAttr := EtreConfig{
 		AttributeFields: []string{"name"},
-		Credentials:     EtreCredentialsConfig{Type: "awssm", RoleARN: "arn:aws:iam::{account}:role/ddl", RegionAttribute: "aws_region", SecretName: "secret"},
+		Credentials:     EtreCredentialsConfig{Type: "awssm", RoleARN: "arn:aws:iam::{account}:role/ddl", Region: "us-west-2", RegionAttribute: "aws_region", SecretName: "secret"},
 	}
 	assert.Equal(t, []string{"name", "aws_account_id", "aws_region"}, resolverAttributeFields(regionAttr))
 
 	// Own-account mode needs the region attribute too, with no account attribute.
 	ownAccountRegionAttr := EtreConfig{
 		AttributeFields: []string{"name"},
-		Credentials:     EtreCredentialsConfig{Type: "awssm", RegionAttribute: "aws_region", SecretName: "secret"},
+		Credentials:     EtreCredentialsConfig{Type: "awssm", Region: "us-west-2", RegionAttribute: "aws_region", SecretName: "secret"},
 	}
 	assert.Equal(t, []string{"name", "aws_region"}, resolverAttributeFields(ownAccountRegionAttr))
 
@@ -422,4 +455,14 @@ func TestBuildResolverRejectsNeitherConfigured(t *testing.T) {
 	_, err := TargetResolverConfig{}.BuildResolver(t.Context(), slog.New(slog.DiscardHandler))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "neither etre nor static")
+}
+
+// A MySQL resolver always carries the writer probe, so a lookup matching both
+// sides of a replicated pair resolves to the writer. Every other engine has no
+// probe and keeps refusing a lookup that matches more than one entity.
+func TestEtreWriterProbe(t *testing.T) {
+	assert.Equal(t, inventory.MySQLWriterProbe{ConnectTimeout: writerProbeConnectTimeout}, etreWriterProbe(EtreConfig{DatabaseType: storage.DatabaseTypeMySQL}))
+	for _, dbType := range []string{storage.DatabaseTypeStrata, storage.DatabaseTypeVitess, storage.DatabaseTypePostgres} {
+		assert.Nil(t, etreWriterProbe(EtreConfig{DatabaseType: dbType}), dbType)
+	}
 }

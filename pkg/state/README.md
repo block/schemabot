@@ -320,14 +320,15 @@ For Vitess tables, per-shard progress is rendered below the table progress bar. 
 | ○ | Dim | `pending` | "queued" |
 | ✗ | Red | `failed` | "failed" |
 
-**Collapsed view for large shard counts (>8 shards):**
-- Failed, waiting-for-cutover, and cutting-over shards are always shown
-- Up to 5 copying shards are shown, sorted by lowest percent complete (most behind first)
-- Remaining shards are summarized: "... N more copying shards" and "... N more shards (M complete, K queued)"
+**Order:** failed shards first, then copying shards furthest behind first, then the other phases (waiting for cutover, cutting over), then queued shards in order, so the next to run leads them, and complete shards last. The PR comment lists a table's shards, and a rollout's targets, the same way. The order and the caps below live in `pkg/presentation/part_listing.go`.
 
-**Cutover attempts:** When shards have `cutover_attempts > 0`, the total is shown in the shard summary (e.g., "cutover attempts: 3"). This indicates previous cutover failures with exponential backoff in progress.
+**Wide listings (>8 shards):** only the failed shards (up to 5, then "... N more failed shards") and the 3 slowest copying shards (then "... N more copying shards") are named. The heading already counts every state, so the listing does not repeat the rest.
 
-**Summary line:** `Shards: N (M complete, K copying, J queued)` — uses "copying" not "running" for user clarity.
+**Copying order:** copying shards are listed furthest behind first. A shard that has not reported progress yet is not known to be behind, so it follows the shards that have reported.
+
+**Comment size:** the shard lines share the PR comment's size limit with the DDL. The DDL is cut first; when the comment would not fit even with the DDL cut to nothing, each table keeps its heading line and drops the line per shard.
+
+**Heading:** `Shards: N (F failed, C copying, W waiting for cutover, X cutting over, Q queued, M complete)`, naming only the states with a count, in the order the listing follows. It uses "copying" not "running" for user clarity.
 
 ## Comment states
 

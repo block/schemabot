@@ -466,7 +466,7 @@ func (c *LocalClient) resumeApplySequential(ctx context.Context, apply *storage.
 				append(task.LogAttrs(), "error", err)...)
 			return fmt.Errorf("re-plan before resuming task %s on table %s: %w", task.TaskIdentifier, task.TableName, err)
 		}
-		verdict, replanKey := replanVerdictForTask(replanDDL, task)
+		verdict, replanKey := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
 		if verdict == replanCannotAttribute {
 			logger.Warn("the re-plan describes the table's namespace as a unit and does not mention this shard; the task resumes with its reviewed statement and the engine decides its outcome",
 				task.LogAttrs()...)
@@ -666,48 +666,63 @@ const (
 //
 // A table still in the re-plan needs its change. A table absent from it is
 // where the caller has to be careful: absence only means "already applied"
-// when the re-plan actually covers the scope the task ran in. Re-planning the
-// reviewed schema set describes whole namespaces — no engine's Plan emits a
-// per-shard change, because an engine that fans a change out to its shards
-// behind one endpoint reports the namespace as a unit — while a shard-scoped
-// dispatch tags its tasks with the shard they ran on. Such a task can never
-// match a whole-namespace key, so reading its absence as success would
+// when the re-plan actually covers the scope the task ran in. A shard-scoped
+// dispatch tags its tasks with the shard they ran on, but not every engine's
+// Plan speaks per shard: an engine that fans a change out to its shards behind
+// one endpoint reports the namespace as a unit. A shard-tagged task can never
+// match such a whole-namespace key, so reading its absence as success would
 // complete a shard's change on evidence that never mentioned the shard. It is
 // unattributable instead, and no caller completes it on that evidence.
 //
-// The check is on what the re-plan demonstrably covered rather than on the
-// engine, so a plan that does key by shard settles its shard-tagged tasks
-// normally.
+// Coverage comes from two places. An engine that plans each shard on its own
+// declares it (plansEachShard, see engine.ShardKeyedPlanning), and its plan
+// covers every namespace, including one whose every shard already has the
+// change and which its plan therefore does not mention at all. Without the
+// declaration, a plan that keys any of the namespace's tables by shard is read
+// as covering the namespace's shards.
 //
 // A namespace-unit re-plan that still lists the table is read as needing the
-// change on the task's shard too, and an unattributable task runs its reviewed
+// change on the task's shard too, whether or not the engine declares that it
+// plans each shard: the declaration settles a task the plan is silent about,
+// never one the plan still asks for. An unattributable task runs its reviewed
 // statement again. Either can be wrong for a shard that already has the
 // change, but it is wrong in the direction that runs the statement rather than
-// the direction that reports a change as made. Running it is not free: an
-// engine whose statement is not idempotent, such as MySQL adding a column the
-// shard already has, fails the task, and the apply fails on a change that may
-// have landed. The operator plans the schema change again to see the target as
-// it is. Callers record each such start in the apply's timeline
-// (logUnattributableTaskStart), so that failure traces back to this decision.
+// the direction that reports a change as made. Running it is not free. Most
+// statements a shard already has fail the second time, such as MySQL adding a
+// column the shard already has, and the apply fails on a change that may have
+// landed; the operator plans the schema change again to see the target as it
+// is. Some succeed instead: MySQL names an unnamed index or foreign key itself,
+// so adding one again leaves the shard with two. That is why an engine that
+// can say its plan covers every shard should declare it. Callers record each
+// such start in the apply's timeline (logUnattributableTaskStart), so the
+// outcome traces back to this decision.
 //
 // The returned key is where the re-plan's statements for the task live when
 // it needs the change. When that is the namespace unit's key rather than the
 // task's own, the statements describe the namespace, so the task's statement
 // missing from them is not evidence that it landed on the shard; callers check
 // this with replanKeyedByTaskShard before settling on that absence.
-func replanVerdictForTask(replanDDL map[shardTableKey][]string, task *storage.Task) (replanVerdict, shardTableKey) {
+func replanVerdictForTask(replanDDL map[shardTableKey][]string, plansEachShard bool, task *storage.Task) (replanVerdict, shardTableKey) {
 	key := shardTableKey{namespace: task.Namespace, shard: task.Shard, table: task.TableName}
 	if _, needsChange := replanDDL[key]; needsChange {
 		return replanNeedsChange, key
 	}
-	if task.Shard != "" && !replanCoversShards(replanDDL, task.Namespace) {
+	if task.Shard != "" {
 		unitKey := shardTableKey{namespace: task.Namespace, table: task.TableName}
 		if _, needsChange := replanDDL[unitKey]; needsChange {
 			return replanNeedsChange, unitKey
 		}
-		return replanCannotAttribute, key
+		if !plansEachShard && !replanCoversShards(replanDDL, task.Namespace) {
+			return replanCannotAttribute, key
+		}
 	}
 	return replanChangeLanded, key
+}
+
+// enginePlansEachShard reports whether this client's engine declares that its
+// Plan lists every shard that still needs a change (engine.ShardKeyedPlanning).
+func (c *LocalClient) enginePlansEachShard() bool {
+	return engine.PlansEachShard(c.getEngine())
 }
 
 // replanKeyedByTaskShard reports whether the re-plan statements read for a
@@ -818,7 +833,7 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			activeTasks = append(activeTasks, task)
 			continue
 		}
-		verdict, replanKey := replanVerdictForTask(replanDDL, task)
+		verdict, replanKey := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
 		if verdict == replanCannotAttribute {
 			// The re-plan's silence says nothing about this shard, and
 			// completion is the one direction it must never be guessed in.

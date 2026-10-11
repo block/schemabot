@@ -29,6 +29,7 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 				ErrorMessage:        "retryable failure",
 				StartedAt:           "2026-06-16T10:00:00Z",
 				CompletedAt:         "2026-06-16T10:05:00Z",
+				RolloutStep:         2,
 			},
 			{
 				Deployment:       "deploy-a",
@@ -66,6 +67,8 @@ func TestParseProgressResponseIncludesOperationsAndTableDeployments(t *testing.T
 	assert.Equal(t, "retryable failure", data.Operations[0].ErrorMessage)
 	assert.Equal(t, "2026-06-16T10:00:00Z", data.Operations[0].StartedAt)
 	assert.Equal(t, "2026-06-16T10:05:00Z", data.Operations[0].CompletedAt)
+	assert.Equal(t, 2, data.Operations[0].RolloutStep)
+	assert.Equal(t, 0, data.Operations[1].RolloutStep)
 	require.Len(t, data.Tables, 1)
 	assert.Equal(t, "deploy-a", data.Tables[0].Deployment)
 	assert.Equal(t, state.Task.Running, data.Tables[0].Status)

@@ -49,9 +49,11 @@ const MaxWebhookEventAttempts = 5
 // environment config at apply-create time and persisted on each apply_operations
 // row so the policy in force when the apply was created travels with it.
 const (
-	// CutoverPolicyRolling is the default: a later deployment does not start
-	// until every earlier sibling in deployment_order has completed, keeping the
-	// rollout fully serial.
+	// CutoverPolicyRolling keeps the rollout fully serial: a later deployment
+	// does not start until every earlier sibling in deployment_order has
+	// completed. It is the default for an environment with any member outside
+	// a targets list, and the fallback for an operation inserted without a
+	// policy.
 	CutoverPolicyRolling = "rolling"
 
 	// CutoverPolicyBarrier lets later deployments run their copy phase once
@@ -63,7 +65,8 @@ const (
 	// the cutover phase stays deployment-ordered, exactly like barrier. This
 	// collapses copy wall-clock toward "longest copy" for rollouts whose
 	// hours-long copy dominates, while preserving the ordered, one-at-a-time
-	// cutover swaps.
+	// cutover swaps. It is the default for an environment whose every member
+	// comes from a targets list.
 	CutoverPolicyParallel = "parallel"
 )
 
@@ -413,6 +416,15 @@ func TargetOperationKey(target, scopedKey string) string {
 	return target + OperationKeyDelimiter + scopedKey
 }
 
+// RolloutStepOperationKey is the key within a target for its work on one table
+// step of a rollout run table by table ("step-2"). Behind TargetOperationKey it
+// names one target's rows of one step ("orders-002/step-2"). It carries the
+// step's number rather than its tables, so the key stays one component however
+// many statements the step runs and no reader mistakes it for a shard key.
+func RolloutStepOperationKey(step int) string {
+	return fmt.Sprintf("step-%d", step)
+}
+
 // KeyedByTarget reports whether the operation is whole-target work keyed by
 // its target alone (TargetOperationKey(target, "")), the key each target of a
 // deployment addressing several attaches its own work under. Within one apply,
@@ -652,6 +664,13 @@ func (n *NamespacePlanData) ChangesVSchema() bool {
 		return false
 	}
 	return n.Artifacts[VSchemaArtifactName] != ""
+}
+
+// FinalizesWithoutVSchemaChange reports whether the engine finalizes this
+// namespace with no VSchema change for plan and apply surfaces to show: its
+// finalizer runs, but there is nothing of its own to review.
+func (n *NamespacePlanData) FinalizesWithoutVSchemaChange() bool {
+	return n != nil && n.Finalize && !n.ShowsVSchemaChange()
 }
 
 // ShowsVSchemaChange reports whether plan and apply surfaces show this
@@ -1348,10 +1367,10 @@ type ApplyOperation struct {
 
 	// CutoverPolicy is the rollout sequencing policy captured for this
 	// operation's parent apply at apply-create time, drawn from the resolved
-	// environment config. "rolling" (the default) keeps the fully serial
-	// rollout — a later deployment waits for every earlier sibling to complete.
-	// "barrier" allows later deployments to run their copy phase once earlier
-	// siblings reach the cutover barrier. Persisted on each row so the policy in
+	// environment config. "rolling" keeps the fully serial rollout — a later
+	// deployment waits for every earlier sibling to complete. "barrier" allows
+	// later deployments to run their copy phase once earlier siblings reach the
+	// cutover barrier, and "parallel" starts their copies without waiting. Persisted on each row so the policy in
 	// force when the apply was created travels with the operation. Insert treats
 	// an empty value as "rolling", matching the column's NOT NULL DEFAULT.
 	CutoverPolicy string
@@ -1388,6 +1407,12 @@ type ApplyOperation struct {
 	// also completed and never started, so this flag, not the missing start, is
 	// what says the target already had the change.
 	AlreadyConverged bool
+
+	// RolloutStep is the table step of a rollout that runs table by table:
+	// each of a target's tables is a step, numbered from 1 in rollout order,
+	// and one operation runs one target's step. Zero is an operation that runs
+	// a member's whole change.
+	RolloutStep int
 
 	// StartedAt is when the operator claimed this child row and execution began.
 	StartedAt *time.Time

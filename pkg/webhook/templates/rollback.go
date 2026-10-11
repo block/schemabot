@@ -45,10 +45,13 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 		writeUnsafeWarning(&sb, data.UnsafeChanges, nil, data.DatabaseType, data.IsMySQL, true)
 	}
 
-	// Lint violations
+	// Lint violations. Only the lint fold names a finding's rule here: the
+	// unsafe section lists changes, not findings, so error-severity findings
+	// link no guide.
 	if len(data.LintViolations) > 0 {
 		writeLintViolations(&sb, data.LintViolations)
 	}
+	writeRelatedGuidance(&sb, data.disclosesNonErrorsOnly())
 
 	// Errors
 	if len(data.Errors) > 0 {
@@ -67,7 +70,7 @@ func renderRollbackPlanComment(data PlanCommentData, budget *ddlBlockBudget) str
 	} else {
 		sb.WriteString("To confirm this rollback, comment:\n")
 	}
-	fmt.Fprintf(&sb, "```\n%s\n```\n\n", tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
+	fmt.Fprintf(&sb, "```\n%s\n```\n\n", TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant))
 	writeRollbackCancel(&sb, data.Tenant)
 
 	return appendAgentHint(sb.String(), data.AgentHint)
@@ -106,7 +109,7 @@ func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBu
 
 	// The retry keeps every option the rejected command carried, so following
 	// it changes only the consent, never how the rollback runs.
-	retryCommand := tenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant) + " --allow-unsafe"
+	retryCommand := TenantCommand("schemabot rollback-confirm", data.Environment, data.Tenant) + " --allow-unsafe"
 	if data.DeferCutover {
 		retryCommand += " --defer-cutover"
 	}
@@ -121,7 +124,7 @@ func renderRollbackUnsafeChangesBlocked(data PlanCommentData, budget *ddlBlockBu
 // without a held lock. Tenant is the deployment's own tenant; when set, the
 // suggested command carries it so pasting the hint addresses this deployment.
 func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
-	rollbackCmd := tenantCommand("schemabot rollback <apply-id>", environment, tenant)
+	rollbackCmd := TenantCommand("schemabot rollback <apply-id>", environment, tenant)
 	if database == "" {
 		return fmt.Sprintf("## 🔒 No Lock Found\n\n"+
 			"**Environment**: `%s`\n\n"+
@@ -144,8 +147,8 @@ func RenderRollbackConfirmNoLock(database, environment, tenant string) string {
 // through its endpoint or profile, which cliName's wrapper selects.
 func RenderRollbackMissingApplyID(cliName, environment, tenant string) string {
 	return offerSupportChannel("## Missing Apply ID\n\n" +
-		fmt.Sprintf("Usage: `%s`\n\n", tenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
-		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", tenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
+		fmt.Sprintf("Usage: `%s`\n\n", TenantCommand("schemabot rollback <apply-id>", "<environment>", tenant)) +
+		fmt.Sprintf("Confirm a generated rollback with `%s`.\n\n", TenantCommand("schemabot rollback-confirm", "<environment>", tenant)) +
 		"You can find the apply ID in the summary comment of a completed apply, " +
 		fmt.Sprintf("or by running `%s`.", cliCommand(cliName, "status "+environmentFlag(environment))))
 }

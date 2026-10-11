@@ -25,6 +25,10 @@ type ReviewGateData struct {
 	// UncomparedApprovers are authorized reviewers whose approval was given
 	// on an earlier commit the review gate could not compare with the head.
 	UncomparedApprovers []string
+	// BaseRef is the PR's base branch and DefaultBranch the repository's
+	// default branch; either may be empty when unknown.
+	BaseRef       string
+	DefaultBranch string
 }
 
 // RenderReviewRequired renders a PR comment when the review gate blocks an apply.
@@ -38,7 +42,7 @@ func RenderReviewRequired(data ReviewGateData) string {
 	writeRequesterOrTimestamp(&sb, data.RequestedBy)
 
 	sb.WriteString("\nSchema changes require approval from an authorized reviewer before applying.\n")
-	writeChangedApprovers(&sb, data.ChangedApprovers)
+	writeChangedApprovers(&sb, data)
 	writeReviewersAndNextSteps(&sb, data)
 
 	return sb.String()
@@ -58,18 +62,33 @@ func RenderReviewGateError(data ReviewGateData) string {
 
 	fmt.Fprintf(&sb, "\n**This apply needs an approval of the latest commit.** %s approved an earlier commit. An earlier approval normally still counts when the PR's schema change has not changed since, but SchemaBot hit an error checking that for this PR, so that approval does not count. Operators can find the error in the server logs.\n",
 		mentionList(data.UncomparedApprovers))
-	writeChangedApprovers(&sb, data.ChangedApprovers)
+	writeChangedApprovers(&sb, data)
 	writeReviewersAndNextSteps(&sb, data)
 
 	return sb.String()
 }
 
-func writeChangedApprovers(sb *strings.Builder, changedApprovers []string) {
-	if len(changedApprovers) == 0 {
+// writeChangedApprovers says which approvals no longer count. A PR that
+// targets a branch other than the default also learns that changes reaching
+// its base branch count as a change, since only default branch content is
+// trusted to have had its own review.
+func writeChangedApprovers(sb *strings.Builder, data ReviewGateData) {
+	if len(data.ChangedApprovers) == 0 {
 		return
 	}
-	fmt.Fprintf(sb, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: %s. Ask for an approval of the latest commit.\n",
-		mentionList(changedApprovers))
+	fmt.Fprintf(sb, "\nApprovals on an earlier commit no longer count because this PR's schema change is different now: %s.",
+		mentionList(data.ChangedApprovers))
+	if targetsOtherThanDefaultBranch(data) {
+		fmt.Fprintf(sb, " This PR targets `%s`, not `%s`, so changes that reach `%s` count as a change too.",
+			data.BaseRef, data.DefaultBranch, data.BaseRef)
+	}
+	sb.WriteString(" Ask for an approval of the latest commit.\n")
+}
+
+// targetsOtherThanDefaultBranch reports whether the PR is known to target a
+// branch other than the repository's default branch.
+func targetsOtherThanDefaultBranch(data ReviewGateData) bool {
+	return data.BaseRef != "" && data.DefaultBranch != "" && data.BaseRef != data.DefaultBranch
 }
 
 // writeReviewersAndNextSteps lists who can approve, the database's own

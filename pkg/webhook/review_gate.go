@@ -33,6 +33,12 @@ type ReviewGateResult struct {
 	// proves such an approval still describes the head, so it does not count,
 	// and the gate-error comment names the remedy that needs no comparison.
 	UncomparedApprovers []string
+	// BaseRef and DefaultBranch are the PR's base branch and the repository's
+	// default branch. An approval is carried across base branch changes only
+	// when they are the same, so the review-required comment says so when they
+	// differ.
+	BaseRef       string
+	DefaultBranch string
 }
 
 // errApprovalNotComparable marks an approval on an earlier commit that could
@@ -81,6 +87,8 @@ func (h *Handler) enforceReviewGate(ctx context.Context, client *ghclient.Instal
 			PRAuthor:            gateResult.PRAuthor,
 			ChangedApprovers:    gateResult.ChangedApprovers,
 			UncomparedApprovers: gateResult.UncomparedApprovers,
+			BaseRef:             gateResult.BaseRef,
+			DefaultBranch:       gateResult.DefaultBranch,
 		}
 		if len(gateResult.UncomparedApprovers) > 0 {
 			h.postComment(repo, pr, installationID, templates.RenderReviewGateError(data))
@@ -148,6 +156,11 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		return nil, fmt.Errorf("review policy has no configured reviewers for database %q", database)
 	}
 
+	if prInfo.DefaultBranch == "" {
+		h.logger.Warn("review gate: GitHub reports no default branch for the PR's repository, so approvals on earlier commits will count only where base branch content is unchanged",
+			"repo", repo, "pr", pr, "database", database, "base_ref", prInfo.BaseRef, "head_sha", headSHA)
+	}
+
 	approvals := ghclient.GetApprovedReviews(reviews)
 	h.logger.Info("review gate: fetched reviews",
 		"repo", repo, "pr", pr, "database", database,
@@ -172,13 +185,14 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 	validApprovals := slices.Concat(headApprovals, earlierApprovals)
 
 	coverage := approvalCoverage{
-		repo:       repo,
-		pr:         pr,
-		database:   database,
-		baseRef:    prInfo.BaseRef,
-		headSHA:    headSHA,
-		inputPaths: reviewGateInputPaths(schema),
-		verdicts:   make(map[string]approvalVerdict),
+		repo:          repo,
+		pr:            pr,
+		database:      database,
+		baseRef:       prInfo.BaseRef,
+		defaultBranch: prInfo.DefaultBranch,
+		headSHA:       headSHA,
+		inputPaths:    reviewGateInputPaths(schema),
+		verdicts:      make(map[string]approvalVerdict),
 	}
 	var changedApprovers, uncomparedApprovers []string
 	for _, approval := range validApprovals {
@@ -236,6 +250,8 @@ func (h *Handler) checkReviewGate(ctx context.Context, client *ghclient.Installa
 		PRAuthor:            prInfo.User,
 		ChangedApprovers:    changedApprovers,
 		UncomparedApprovers: uncomparedApprovers,
+		BaseRef:             prInfo.BaseRef,
+		DefaultBranch:       prInfo.DefaultBranch,
 	}, nil
 }
 
@@ -256,7 +272,10 @@ type approvalCoverage struct {
 	// baseRef is the PR's base branch, which each commit's change is measured
 	// against.
 	baseRef string
-	headSHA string
+	// defaultBranch is the repository's default branch. Base branch content
+	// is trusted only when baseRef is the default branch.
+	defaultBranch string
+	headSHA       string
 	// inputPaths are the database's schema inputs: every path whose change at
 	// the approved commit must match the head for the approval to count.
 	inputPaths []string
@@ -305,7 +324,7 @@ func (h *Handler) approvalCoversHead(ctx context.Context, client *ghclient.Insta
 // errApprovalNotComparable, and a GitHub outage is returned as a retryable
 // error.
 func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclient.InstallationClient, c *approvalCoverage, approval *ghclient.ReviewInfo) (approvalVerdict, error) {
-	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, approval.CommitID, c.headSHA, c.inputPaths)
+	comparison, err := client.PRSchemaChangeUnchangedSince(ctx, c.repo, c.baseRef, c.defaultBranch, approval.CommitID, c.headSHA, c.inputPaths)
 	if err != nil {
 		if ghclient.IsUnavailableError(err) {
 			return approvalVerdict{}, fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
@@ -322,6 +341,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 			"base_moved_forward", comparison.BaseMovedForward,
+			"base_is_default_branch", comparison.BaseIsDefaultBranch,
 			"input_paths", c.inputPaths, "error", err)
 		return approvalVerdict{notComparable: fmt.Errorf("compare schema change for %s#%d database %q at approved commit %s and head %s: %w",
 			c.repo, c.pr, c.database, approval.CommitID, c.headSHA, errors.Join(errApprovalNotComparable, err))}, nil
@@ -334,6 +354,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 			"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 			"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 			"base_moved_forward", comparison.BaseMovedForward,
+			"base_is_default_branch", comparison.BaseIsDefaultBranch,
 			"differing_path", comparison.DifferingPath)
 		return approvalVerdict{}, nil
 	}
@@ -344,6 +365,7 @@ func (h *Handler) schemaChangeUnchangedSince(ctx context.Context, client *ghclie
 		"approved_merge_base_sha", comparison.ApprovedMergeBaseSHA,
 		"head_merge_base_sha", comparison.HeadMergeBaseSHA,
 		"base_moved_forward", comparison.BaseMovedForward,
+		"base_is_default_branch", comparison.BaseIsDefaultBranch,
 		"input_paths", c.inputPaths)
 	return approvalVerdict{covers: true}, nil
 }

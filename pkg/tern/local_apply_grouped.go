@@ -1382,7 +1382,7 @@ func (c *LocalClient) settleLostEngineWorkForTasks(ctx context.Context, apply *s
 		return settled, fmt.Errorf("verify target schema for apply %s: %w", apply.ApplyIdentifier, err)
 	}
 	for _, task := range unverified {
-		verdict, _ := replanVerdictForTask(replanDDL, task)
+		verdict, _ := replanVerdictForTask(replanDDL, c.enginePlansEachShard(), task)
 		if err := c.settleLostVerifiedTask(ctx, apply, task, verdict, engineState); err != nil {
 			return settled, err
 		}

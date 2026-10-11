@@ -75,6 +75,13 @@ func setupReviewGateHandler(t *testing.T, config *api.ServerConfig) (*Handler, *
 }
 
 func registerPREndpoint(mux *http.ServeMux, prAuthor string) {
+	registerPREndpointWithDefaultBranch(mux, prAuthor, "main")
+}
+
+// registerPREndpointWithDefaultBranch serves a PR targeting main in a
+// repository whose default branch is defaultBranch, so a PR can be made to
+// target a branch other than the default.
+func registerPREndpointWithDefaultBranch(mux *http.ServeMux, prAuthor, defaultBranch string) {
 	mux.HandleFunc("GET /repos/octocat/hello-world/pulls/1", func(w http.ResponseWriter, _ *http.Request) {
 		pr := &gh.PullRequest{
 			Head: &gh.PullRequestBranch{
@@ -82,8 +89,9 @@ func registerPREndpoint(mux *http.ServeMux, prAuthor string) {
 				SHA: new(reviewGateTestHeadSHA),
 			},
 			Base: &gh.PullRequestBranch{
-				Ref: new("main"),
-				SHA: new("def456"),
+				Ref:  new("main"),
+				SHA:  new("def456"),
+				Repo: &gh.Repository{DefaultBranch: new(defaultBranch)},
 			},
 			User: &gh.User{Login: new(prAuthor)},
 		}
@@ -275,9 +283,14 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 		headChange        func(map[string]string)
 		headOnOldBase     bool
 		approvedOnNewBase bool
-		schemaPath        string
-		schemaLinkPath    string
-		configPath        string
+		// targetsOtherBranch makes the PR's base branch something other than
+		// the repository's default branch; defaultBranchUnknown makes GitHub
+		// report no default branch at all.
+		targetsOtherBranch   bool
+		defaultBranchUnknown bool
+		schemaPath           string
+		schemaLinkPath       string
+		configPath           string
 		// approvedUnknown leaves the approved commit unknown to GitHub.
 		approvedUnknown  bool
 		treesUnavailable bool
@@ -375,6 +388,86 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				files["schema/testdb/orders/votes.sql"] = "CREATE TABLE `votes` (`id` bigint NOT NULL, `score` int, PRIMARY KEY (`id`))"
 			},
 			want: wantChanged,
+		},
+		{
+			// The PR was stacked on another, so its approved diff carried the
+			// lower PR's table. The lower PR merged with a revised table, and
+			// the rebase left this PR changing only its own files.
+			name: "a rebase after the stacked PR below it merged a revised table counts",
+			prChange: addVotesAnd(func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			}),
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, `task_id` bigint, PRIMARY KEY (`id`))"
+			},
+			headChange: addVotes,
+			want:       wantCovers,
+		},
+		{
+			name: "a rebase onto a target branch other than the default that took over a stacked table does not count",
+			prChange: addVotesAnd(func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			}),
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, `task_id` bigint, PRIMARY KEY (`id`))"
+			},
+			headChange:         addVotes,
+			targetsOtherBranch: true,
+			want:               wantChanged,
+		},
+		{
+			name:     "a rebase onto a target branch other than the default that added tables beside the PR's does not count",
+			prChange: addVotes,
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/feedback.sql"] = "CREATE TABLE `feedback` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			targetsOtherBranch: true,
+			want:               wantChanged,
+		},
+		{
+			name:     "a rebase in a repository whose default branch GitHub does not report does not count",
+			prChange: addVotes,
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/feedback.sql"] = "CREATE TABLE `feedback` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			defaultBranchUnknown: true,
+			want:                 wantChanged,
+		},
+		{
+			name: "a rebase after the stacked PR below it merged unchanged counts",
+			prChange: addVotesAnd(func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			}),
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			headChange: addVotes,
+			want:       wantCovers,
+		},
+		{
+			name: "a table the PR dropped beside one the default branch took over does not count",
+			prChange: func(files map[string]string) {
+				files["schema/testdb/captures/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+				files["schema/testdb/captures/capture_events.sql"] = "CREATE TABLE `capture_events` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/captures/captures.sql"] = "CREATE TABLE `captures` (`id` bigint NOT NULL, PRIMARY KEY (`id`))"
+			},
+			headChange: func(map[string]string) {},
+			want:       wantChanged,
+		},
+		{
+			name: "a head rebuilt on an older default branch that no longer carries the PR's edit does not count",
+			baseChange: func(files map[string]string) {
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, PRIMARY KEY (`id`))"
+			},
+			prChange: func(files map[string]string) {
+				files["schema/testdb/orders/orders.sql"] = "CREATE TABLE `orders` (`id` bigint NOT NULL, `total` bigint, `note` text, PRIMARY KEY (`id`))"
+			},
+			headChange:        func(map[string]string) {},
+			approvedOnNewBase: true,
+			headOnOldBase:     true,
+			want:              wantChanged,
 		},
 		{
 			name:       "the PR dropping a table it had added after the approval does not count",
@@ -536,7 +629,14 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 				db.OperatorUsers = []string{"bob"}
 				cfg.Databases["orders"] = db
 			}))
-			registerPREndpoint(mux, "alice")
+			defaultBranch := "main"
+			if tt.targetsOtherBranch {
+				defaultBranch = "trunk"
+			}
+			if tt.defaultBranchUnknown {
+				defaultBranch = ""
+			}
+			registerPREndpointWithDefaultBranch(mux, "alice", defaultBranch)
 			registerReviewsEndpoint(mux, []*gh.PullRequestReview{
 				{User: &gh.User{Login: new("bob")}, State: new(ghclient.ReviewApproved), SubmittedAt: &gh.Timestamp{Time: time.Now()}, CommitID: new(reviewGateApproved)},
 			})
@@ -599,6 +699,10 @@ func TestCheckReviewGate_ApprovalCoverage(t *testing.T) {
 			require.NoError(t, err, "an approval that does not count blocks on the merits, not as an evaluation failure")
 			require.NotNil(t, result)
 			assertApprovalVerdict(t, result, tt.want, "bob")
+			if !result.Approved {
+				assert.Equal(t, "main", result.BaseRef, "the review-required comment names the PR's base branch")
+				assert.Equal(t, defaultBranch, result.DefaultBranch, "the review-required comment names the default branch")
+			}
 		})
 	}
 }

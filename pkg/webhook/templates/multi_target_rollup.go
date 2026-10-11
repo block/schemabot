@@ -5,77 +5,102 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/block/schemabot/pkg/ddl"
 	"github.com/block/schemabot/pkg/presentation"
+	"github.com/block/schemabot/pkg/schema"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/ui"
 )
-
-// runningTargetNameLimit bounds the running-target names a table's line lists.
-const runningTargetNameLimit = 10
 
 // failedTargetRowLimit bounds the failed-target table so a deployment whose
 // every target failed still fits one comment; the <summary> counts carry the total.
 const failedTargetRowLimit = 20
 
-// targetWork is the targets of a deployment that run the same change, and the
-// first target's tables, which carry the DDL they share.
-type targetWork struct {
+// targetTableLine is one line of a target rollup: a table and the DDL that
+// changes it, its progress on each target that runs that DDL, and those
+// targets as member indexes and as names.
+type targetTableLine struct {
+	table   TableProgressData
+	cells   []TableProgressData
 	members []int
-	tables  []TableProgressData
+	targets []string
+	rank    int
 }
 
 // writeTargetRollup writes a multi-target deployment's body the way the
-// sharded apply comment writes a keyspace: one line per table across the
-// targets, each change's DDL once, a heading per group of targets when they
-// diverge, and a row per failed target. Its size grows with distinct changes
-// and failures, not with the number of targets. Targets that already had the
-// change ran nothing, so the rollup neither names nor counts them.
+// sharded apply comment writes a keyspace: one line per table and DDL across
+// the targets, each DDL once, the targets named above it when it runs on only
+// some of them, and a row per failed target. Its size grows with distinct
+// changes and failures, not with the number of targets. Targets that already
+// had the change ran nothing, so the rollup neither names nor counts them.
 func writeTargetRollup(sb *strings.Builder, data MultiDeploymentApplyData, g presentation.Group, budget *ddlBlockBudget) {
-	work := targetWorkGroups(data, g)
+	lines := targetTableLines(data, g)
 	silent := unreportedTargets(data, g)
 	// A target that already had the change ran nothing and never reports
 	// details, so a deployment where every target had it is not waiting on any.
-	if len(work) == 0 && silent > 0 {
+	if len(lines) == 0 && silent > 0 {
 		sb.WriteString("_No details available yet._\n")
 	}
-	// A target that has not reported is not known to run any one group's
-	// change, so when the groups diverge each line counts only its own
+	// A target that has not reported is not known to run any one change, so
+	// when the reporting targets diverge each line counts only its own
 	// targets and the silent ones are counted once, for the deployment.
-	lineSilent := silent
-	if len(work) > 1 {
-		lineSilent = 0
+	lineSilent, lineWaiting := silent, waitingTargets(data, g)
+	if targetsDiverge(data, g) {
+		lineSilent, lineWaiting = 0, 0
 	}
-	for _, w := range work {
-		if len(work) > 1 {
-			writeTargetGroupHeading(sb, "####", targetNames(data.Model, w.members), changingMembers(data.Model, g))
-		}
-		first := memberDetail(data.Details, w.members[0])
+	changing := changingMembers(data.Model, g)
+	settled := data.Model.RolloutSettled(g)
+	rankTargetTableLines(lines, lineSilent)
+	for _, line := range lines {
+		first := memberDetail(data.Details, line.members[0])
 		dialect := dialectForEngine(first.Engine, data.ApplyID)
-		// The group's DDL is its first target's, so a cut block names that
+		// A line that leaves out some changing targets names the ones it runs
+		// on above its DDL, so the DDL never reads as running everywhere.
+		subset := len(line.targets)+lineSilent < changing
+		// The line's DDL is its first target's, so a cut block names that
 		// target's stored plan and says which other targets run the same.
-		restoreGroup := planScopeForWork(budget, targetNames(data.Model, w.members), len(work), silent)
+		restoreScope := planScopeForLine(budget, line.targets, subset, silent)
 		restorePlan := budget.pointAt(first.storedPlan())
-		for _, t := range w.tables {
-			cells, targets := tableAcrossTargets(data, w.members, t)
-			writeTargetTableLine(sb, t.TableName, cells, targets, lineSilent)
-			writeDDLLine(sb, dialect, t.DDL, budget)
-			sb.WriteString("\n")
-		}
+		strip := targetStrip(data, g, line.cells, line.targets, lineSilent > 0)
+		writeTargetTableLine(sb, line.table.TableName, line.cells, strip, lineSilent, lineWaiting, settled, budget, func() {
+			writeTargetLineDDL(sb, dialect, line, subset, changing, budget)
+		})
+		sb.WriteString("\n")
 		restorePlan()
-		restoreGroup()
+		restoreScope()
 	}
 	writeFailedTargets(sb, data.Model, g)
 }
 
-// planScopeForWork scopes the pointer a cut block in one work group carries.
-// Under a group heading the marker speaks for the targets the heading names;
-// a sole group has no heading, so the marker names its plan's target and
-// speaks only for the targets that have reported.
-func planScopeForWork(budget *ddlBlockBudget, members []string, groups, unreported int) (restore func()) {
-	if groups > 1 {
-		return budget.forTargetGroup(members)
+// writeTargetLineDDL writes a table line's DDL under its headline, headed by
+// the targets that run it when they are only some of the deployment's.
+func writeTargetLineDDL(sb *strings.Builder, dialect schema.Dialect, line targetTableLine, subset bool, changing int, budget *ddlBlockBudget) {
+	if line.table.DDL == "" {
+		return
 	}
-	return budget.forSoleTargetGroup(members, unreported)
+	if !subset {
+		writeDDLLine(sb, dialect, line.table.DDL, budget)
+		return
+	}
+	if len(line.targets) <= shardNamesInlineLimit {
+		fmt.Fprintf(sb, "\n**%s**\n", planGroupList(targetNoun, line.targets, changing))
+	} else {
+		// A wide subset's names collapse under its count rather than drop, so
+		// the heading still says which targets run this DDL.
+		fmt.Fprintf(sb, "\n<details>\n<summary><b>%s</b></summary>\n\n%s\n\n</details>\n\n",
+			presentation.CoveragePhrase(targetNoun, len(line.targets), changing), strings.Join(inlineCodeList(line.targets), ", "))
+	}
+	writeSQLFencedBlock(sb, ddl.FormatDDLForDialect(dialect, line.table.DDL), budget)
+}
+
+// planScopeForLine scopes the pointer a cut block on one table line carries.
+// When the line names its targets the marker speaks for those; otherwise it
+// names its plan's target and speaks only for the targets that have reported.
+func planScopeForLine(budget *ddlBlockBudget, targets []string, subset bool, unreported int) (restore func()) {
+	if subset {
+		return budget.forNamedTargets(targets)
+	}
+	return budget.forSoleTargetGroup(targets, unreported)
 }
 
 // unreportedTargets counts the targets with work that have no table progress
@@ -85,37 +110,113 @@ func planScopeForWork(budget *ddlBlockBudget, members []string, groups, unreport
 func unreportedTargets(data MultiDeploymentApplyData, g presentation.Group) int {
 	n := 0
 	for _, i := range g.Members {
-		if data.Model.Deployments[i].AlreadyApplied() {
-			continue
-		}
-		if detail := memberDetail(data.Details, i); detail == nil || len(detail.Tables) == 0 {
+		if targetUnreported(data, i) {
 			n++
 		}
 	}
 	return n
 }
 
-// targetWorkGroups partitions a deployment's targets by the change they run.
-// A target with no table detail yet joins no group: missing detail is not a
-// different change, and setting it apart would show a false divergence.
-func targetWorkGroups(data MultiDeploymentApplyData, g presentation.Group) []targetWork {
-	var groups []targetWork
-	bySignature := make(map[string]int)
+// waitingTargets counts the unreported targets still to run: a settled target
+// with no table progress has its outcome and is not queued for any table.
+func waitingTargets(data MultiDeploymentApplyData, g presentation.Group) int {
+	n := 0
+	for _, i := range g.Members {
+		if targetUnreported(data, i) && !state.IsState(data.Model.Deployments[i].State, state.SettledApplyStates...) {
+			n++
+		}
+	}
+	return n
+}
+
+// targetUnreported reports whether member i has work but no table progress to
+// show yet. A target that already had the change ran nothing, so it has
+// nothing to report.
+func targetUnreported(data MultiDeploymentApplyData, i int) bool {
+	if data.Model.Deployments[i].AlreadyApplied() {
+		return false
+	}
+	detail := memberDetail(data.Details, i)
+	return detail == nil || len(detail.Tables) == 0
+}
+
+// targetStrip is a table line's targets in the deployment's order, each with
+// its progress on the table, for the per-target strip under the line. With
+// includeUnreported, a target that has not reported yet is listed as queued,
+// since it has not started any table.
+func targetStrip(data MultiDeploymentApplyData, g presentation.Group, cells []TableProgressData, targets []string, includeUnreported bool) []ShardProgressData {
+	byTarget := make(map[string]TableProgressData, len(cells))
+	for i, c := range cells {
+		byTarget[targets[i]] = c
+	}
+	strip := make([]ShardProgressData, 0, len(g.Members))
+	for _, i := range g.Members {
+		name := memberTarget(data.Model.Deployments[i])
+		if c, ok := byTarget[name]; ok {
+			strip = append(strip, ShardProgressData{Shard: name, Status: c.Status, PercentComplete: c.PercentComplete, RowsCopied: c.RowsCopied, RowsTotal: c.RowsTotal})
+			continue
+		}
+		if includeUnreported && targetUnreported(data, i) {
+			strip = append(strip, ShardProgressData{Shard: name, Status: state.Task.Pending})
+		}
+	}
+	return strip
+}
+
+// targetTableLines is a deployment's table lines, one per table and DDL across
+// the targets that report table detail, each with its progress on every
+// target that runs it. Lines come in plan order: the first reporting target's
+// tables, then any table only a later target runs. A table changed by two
+// statements, or by different DDL on different targets, gets a line per
+// statement. A target with no table detail yet runs no line: missing detail
+// is not a different change.
+func targetTableLines(data MultiDeploymentApplyData, g presentation.Group) []targetTableLine {
+	var lines []targetTableLine
+	byKey := make(map[string]int)
+	for _, i := range g.Members {
+		detail := memberDetail(data.Details, i)
+		if detail == nil {
+			continue
+		}
+		for _, t := range detail.Tables {
+			key := tableChangeKey(t)
+			li, seen := byKey[key]
+			if !seen {
+				li = len(lines)
+				byKey[key] = li
+				lines = append(lines, targetTableLine{table: t})
+			}
+			lines[li].cells = append(lines[li].cells, t)
+			lines[li].members = append(lines[li].members, i)
+			lines[li].targets = append(lines[li].targets, memberTarget(data.Model.Deployments[i]))
+		}
+	}
+	return lines
+}
+
+// targetsDiverge reports whether the targets that report table detail run
+// different changes, so a target that has not reported is not known to run
+// any one of them.
+func targetsDiverge(data MultiDeploymentApplyData, g presentation.Group) bool {
+	signature := ""
+	seen := false
 	for _, i := range g.Members {
 		detail := memberDetail(data.Details, i)
 		if detail == nil || len(detail.Tables) == 0 {
 			continue
 		}
-		signature := tableChangeSignature(detail.Tables)
-		gi, seen := bySignature[signature]
-		if !seen {
-			gi = len(groups)
-			bySignature[signature] = gi
-			groups = append(groups, targetWork{tables: detail.Tables})
+		s := tableChangeSignature(detail.Tables)
+		if seen && s != signature {
+			return true
 		}
-		groups[gi].members = append(groups[gi].members, i)
+		signature, seen = s, true
 	}
-	return groups
+	return false
+}
+
+// tableChangeKey keys one table change by its namespace, table and DDL.
+func tableChangeKey(t TableProgressData) string {
+	return t.Namespace + "\x00" + t.TableName + "\x00" + t.DDL
 }
 
 // tableChangeSignature keys the change a target runs by its tables and their
@@ -123,49 +224,57 @@ func targetWorkGroups(data MultiDeploymentApplyData, g presentation.Group) []tar
 func tableChangeSignature(tables []TableProgressData) string {
 	parts := make([]string, len(tables))
 	for i, t := range tables {
-		parts[i] = t.Namespace + "\x00" + t.TableName + "\x00" + t.DDL
+		parts[i] = tableChangeKey(t)
 	}
 	slices.Sort(parts)
 	return strings.Join(parts, "\x01")
 }
 
-// tableAcrossTargets returns table's progress on each of members, and the
-// target each cell belongs to. A cell matches on its DDL as well as its table,
-// so a table changed by two statements gets a line per statement.
-func tableAcrossTargets(data MultiDeploymentApplyData, members []int, table TableProgressData) ([]TableProgressData, []string) {
-	cells := make([]TableProgressData, 0, len(members))
-	targets := make([]string, 0, len(members))
-	for _, i := range members {
-		for _, t := range memberDetail(data.Details, i).Tables {
-			if t.Namespace == table.Namespace && t.TableName == table.TableName && t.DDL == table.DDL {
-				cells = append(cells, t)
-				targets = append(targets, memberTarget(data.Model.Deployments[i]))
-				break
-			}
+// rankTargetTableLines orders a rollup's table lines by
+// presentation.TableRolloutRank across each line's targets, so the table being
+// copied leads and one no target has started sits below one already finished
+// on some. silent is the targets with no progress reported that the lines
+// speak for; they have not started any table, so they rank as queued. Lines of
+// equal rank keep plan order.
+func rankTargetTableLines(lines []targetTableLine, silent int) {
+	for li := range lines {
+		statuses := make([]string, len(lines[li].cells), len(lines[li].cells)+silent)
+		for i, c := range lines[li].cells {
+			statuses[i] = c.Status
 		}
+		for range silent {
+			statuses = append(statuses, state.Task.Pending)
+		}
+		lines[li].rank = presentation.TableRolloutRank(statuses)
 	}
-	return cells, targets
+	slices.SortStableFunc(lines, func(a, b targetTableLine) int { return a.rank - b.rank })
 }
 
 // writeTargetTableLine writes one table's line across the targets that run it.
 // While any target copies, the bar sums the rows of targets copying or done,
 // and the rows line names its coverage only when a target is left out of the
-// sum; until every target still to copy reports, the ETA (the slowest
-// target's) is a floor. Failed targets are counted rather than summed, since
+// sum. Until every target still to copy reports, the ETA (the slowest
+// target's) is a floor, and the bar is the table's share across all of its
+// targets (targetSharePercent) rather than the rows of the ones that reported. Failed targets are counted rather than summed, since
 // their rows are not progressing, and so are retrying targets. A completed
-// target has reported even when it had no rows to copy. The running targets
-// are named unless every target is running. With nothing copying, the line
-// names the table's phase. silent is the targets with no progress reported at
-// all that this line speaks for; they widen the row denominator and make the
-// ETA a floor.
-func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, targets []string, silent int) {
+// target has reported even when it had no rows to copy. With nothing copying,
+// the line names the table's phase. silent is the targets with no progress
+// reported at all that this line speaks for; they widen the row denominator
+// and make the ETA a floor. writeDDL writes the table's DDL directly under the
+// headline, and while the table is in flight strip lists each target's state
+// under the rows, the way the sharded comment lays out a table and its shards.
+// waiting is the silent targets still to run, which the line counts as queued.
+// Once the rollout has settled, a target still pending on the table never
+// starts it, so the line says not started rather than queued.
+func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgressData, strip []ShardProgressData, silent, waiting int, settled bool, budget *ddlBlockBudget, writeDDL func()) {
 	var done, queued, failed, retrying, reporting, unreported int
 	var copied, total, eta int64
-	var running []string
-	for i, c := range cells {
+	var running int
+	for _, c := range cells {
 		status := state.NormalizeTaskStatus(c.Status)
 		switch status {
-		case state.Task.Completed:
+		case state.Task.Completed, state.Task.RevertWindow:
+			// A target in its revert window has completed the change.
 			done++
 			if c.RowsTotal == 0 {
 				reporting++
@@ -182,7 +291,7 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		case state.Task.Stopped, state.Task.Cancelled:
 			continue
 		case state.Task.Running:
-			running = append(running, targets[i])
+			running++
 			eta = max(eta, c.ETASeconds)
 		}
 		if c.RowsTotal == 0 {
@@ -194,10 +303,21 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 		total += c.RowsTotal
 	}
 	name := inlineCode(table)
-	coverage := targetCoverage(done, len(running), queued, failed, retrying)
-	if len(running) > 0 && total > 0 {
-		if pct := ui.RowCopyDisplayPercent(int(copied*100/total), copied); pct > 0 {
-			fmt.Fprintf(sb, "**%s**: %s %d%%%s\n", name, ui.ProgressBarRowCopy(pct), pct, coverage)
+	// A target still to run that has reported no progress has not started the
+	// table, so the line counts it as queued.
+	pending := queued + waiting
+	pendingWord := presentation.PendingWord(settled)
+	coverage := presentation.TargetCoverage(done, running, pending, failed, retrying, pendingWord)
+	if running > 0 && total > 0 {
+		percent := int(copied * 100 / total)
+		if unreported+silent > 0 {
+			percent = targetSharePercent(cells, silent)
+		}
+		if pct := ui.RowCopyDisplayPercent(percent, copied); pct > 0 {
+			// The list under the rows counts the targets, so the headline
+			// carries only the table's progress, the way a sharded table's does.
+			fmt.Fprintf(sb, "**%s**: %s %d%%\n", name, ui.ProgressBarRowCopy(pct), pct)
+			writeDDL()
 			line := fmt.Sprintf("- Rows: %s / %s", ui.FormatNumber(copied), ui.FormatNumber(total))
 			partial := reporting < len(cells)+silent
 			if partial {
@@ -220,22 +340,100 @@ func writeTargetTableLine(sb *strings.Builder, table string, cells []TableProgre
 				line += " · ETA: " + floor + ui.FormatETA(eta)
 			}
 			sb.WriteString(line + "\n")
-			writeRunningTargets(sb, running, len(cells))
+			writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
 			return
 		}
 	}
 	status := rollupTaskStatus(cells)
+	if partlyCompleted(status, done, pending) {
+		// Complete on some targets and queued on the rest: the change is live
+		// where it completed, so the line leads with that, not with Queued.
+		fmt.Fprintf(sb, "**%s**: %s on %d of %d targets%s\n", name, shardedTableStatusPhrase(state.Task.Completed), done, len(cells)+silent, presentation.TargetCoverage(0, 0, pending, 0, 0, pendingWord))
+		writeDDL()
+		return
+	}
 	if status == state.Task.Completed {
 		fmt.Fprintf(sb, "**%s**: %s (%d targets)\n", name, shardedTableStatusPhrase(status), len(cells))
+		writeDDL()
 		return
 	}
 	phrase := shardedTableStatusPhrase(status)
+	if status == state.Task.Pending && settled {
+		// No target ran the table, so there is nothing to count.
+		phrase, coverage = "⊘ Not started", ""
+	}
 	if status == state.Task.Cancelled && done > 0 {
 		// The pure-cancelled parenthetical ("not started") would be false:
 		// the change is live on the completed targets.
 		phrase = "⊘ Cancelled"
 	}
+	lists := listsTargets(strip)
+	if lists {
+		// The list counts the targets, so the headline does not repeat them.
+		coverage = ""
+	}
 	fmt.Fprintf(sb, "**%s**: %s%s\n", name, phrase, coverage)
+	writeDDL()
+	if lists {
+		writeMemberList(sb, presentation.TargetNoun, strip, pendingWord, budget)
+	}
+}
+
+// listsTargets reports whether a table line lists its targets one per line
+// under it (writeMemberList, presentation.ListsTargets), decided by where each
+// target stands rather than by the table's rolled-up status.
+func listsTargets(strip []ShardProgressData) bool {
+	if len(strip) <= 1 {
+		return false
+	}
+	statuses := make([]string, len(strip))
+	for i, s := range strip {
+		statuses[i] = s.Status
+	}
+	return presentation.ListsTargets(statuses)
+}
+
+// partlyCompleted reports whether a rolled-up table has completed on some of
+// its targets and is queued on the rest, with nothing else in between. A target
+// in its revert window has completed, so a table in its revert window on some
+// targets and queued on the rest is partly completed too; once every target
+// is in its revert window, the line keeps the revert window's wording. queued
+// counts the targets with no progress reported, so a table complete on every
+// target that reported is partly completed while others have not.
+func partlyCompleted(status string, done, queued int) bool {
+	if done == 0 || queued == 0 {
+		return false
+	}
+	return status == state.Task.Pending || status == state.Task.RevertWindow || status == state.Task.Completed
+}
+
+// targetSharePercent is how much of a table is done across every target that
+// runs it, for a line where some of those targets have not reported rows: a
+// completed target counts in full, a target copying or verifying counts by the
+// rows its engine reports, and every other target counts as nothing yet. It
+// only combines what the engines report, so it is not an estimate. silent is
+// the targets with no progress at all that the line speaks for.
+func targetSharePercent(cells []TableProgressData, silent int) int {
+	targets := len(cells) + silent
+	if targets == 0 {
+		return 0
+	}
+	var share float64
+	for _, c := range cells {
+		switch state.NormalizeTaskStatus(c.Status) {
+		case state.Task.Completed, state.Task.RevertWindow:
+			// A target in its revert window has completed the change, and may
+			// have run it without copying any rows.
+			share++
+		case state.Task.Pending, state.Task.Failed, state.Task.FailedRetryable, state.Task.Stopped, state.Task.Cancelled:
+			// Not copying: queued, halted, or waiting on a retry.
+		default:
+			if c.RowsTotal > 0 {
+				share += float64(ui.ClampRows(c.RowsCopied, c.RowsTotal)) / float64(c.RowsTotal)
+			}
+		}
+	}
+	return int(share * 100 / float64(targets))
 }
 
 // targetsTableBytes totals a table's planned size across the targets that run
@@ -254,50 +452,6 @@ func targetsTableBytes(cells []TableProgressData, silent int) *int64 {
 		total += *c.EstimatedBytes
 	}
 	return &total
-}
-
-// targetCoverage is the " · 40 complete, 4 running, 19 queued, 1 failed,
-// 1 retrying" suffix of a table's line, naming only the states some target is
-// in. Queued targets are waiting on the apply's driver cap or on their turn in
-// order.
-func targetCoverage(done, running, queued, failed, retrying int) string {
-	var parts []string
-	if done > 0 {
-		parts = append(parts, fmt.Sprintf("%d complete", done))
-	}
-	if running > 0 {
-		parts = append(parts, fmt.Sprintf("%d running", running))
-	}
-	if queued > 0 {
-		parts = append(parts, fmt.Sprintf("%d queued", queued))
-	}
-	if failed > 0 {
-		parts = append(parts, fmt.Sprintf("%d failed", failed))
-	}
-	if retrying > 0 {
-		parts = append(parts, fmt.Sprintf("%d retrying", retrying))
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return " · " + strings.Join(parts, ", ")
-}
-
-// writeRunningTargets names the targets copying the table, unless all of them
-// are, where the count alone already says which.
-func writeRunningTargets(sb *strings.Builder, running []string, targets int) {
-	if len(running) == 0 || len(running) == targets {
-		return
-	}
-	names := make([]string, 0, runningTargetNameLimit)
-	for _, r := range running[:min(len(running), runningTargetNameLimit)] {
-		names = append(names, inlineCode(r))
-	}
-	line := "- Running: " + strings.Join(names, ", ")
-	if more := len(running) - runningTargetNameLimit; more > 0 {
-		line += fmt.Sprintf(", and %d more", more)
-	}
-	sb.WriteString(line + "\n")
 }
 
 // rollupTaskStatus is a table's status across targets: a failure or halt
@@ -343,15 +497,6 @@ func writeFailedTargets(sb *strings.Builder, model presentation.Apply, g present
 	if more := len(failed) - failedTargetRowLimit; more > 0 {
 		fmt.Fprintf(sb, "\n…and %d more failed targets.\n", more)
 	}
-}
-
-// targetNames is each member's target, in the order given.
-func targetNames(model presentation.Apply, members []int) []string {
-	names := make([]string, len(members))
-	for j, i := range members {
-		names[j] = memberTarget(model.Deployments[i])
-	}
-	return names
 }
 
 // memberTarget is a member's target, or its name when it carries none.

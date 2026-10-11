@@ -941,13 +941,19 @@ func (l *concurrentRollbackLocks) AcquireIfPendingPlanID(ctx context.Context, lo
 // the lock: as it releases a stale apply lock it inspected, or as it acquires
 // the lock for the plan it just built. In both the apply is refused with a
 // reply saying the lock changed under it, and the rollback's pin stays in
-// place so rollback-confirm still has it to execute.
+// place so rollback-confirm still has it to execute. The apply the reply asks
+// the operator to re-run repeats the database and option flags they typed, so
+// pasting it re-runs the apply they asked for rather than one with defaults
+// they did not choose.
 func TestE2EApplyKeepsConcurrentRollbackPin(t *testing.T) {
 	tests := []struct {
 		name      string
 		dbName    string
 		moment    rollbackPinMoment
 		staleLock bool
+		// flags are the database and option flags the operator types after
+		// `schemabot apply -e staging`; the refusal's command repeats them.
+		flags string
 		// wantPlans is how many plans the apply builds before it is refused:
 		// none when the refusal comes at the stale release, one when it comes
 		// at the acquire after planning.
@@ -966,9 +972,18 @@ func TestE2EApplyKeepsConcurrentRollbackPin(t *testing.T) {
 			moment:    pinDuringPlanning,
 			wantPlans: 1,
 		},
+		{
+			name:      "rollback pins during the stale release of a scoped apply with options",
+			dbName:    "webhook_apply_rb_race_opts",
+			moment:    pinDuringStaleRelease,
+			staleLock: true,
+			flags:     " -d webhook_apply_rb_race_opts --skip-revert",
+			wantPlans: 0,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			command := "schemabot apply -e staging" + tt.flags
 			locks := &concurrentRollbackLocks{
 				moment: tt.moment,
 				pin: &storage.Lock{
@@ -1003,12 +1018,12 @@ func TestE2EApplyKeepsConcurrentRollbackPin(t *testing.T) {
 			h := newE2EHandler(t, svc, client)
 
 			rr := httptest.NewRecorder()
-			h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: "schemabot apply -e staging", isPR: true}, nil))
+			h.ServeHTTP(rr, buildWebhookRequest(t, webhookPayloadOpts{comment: command, isPR: true}, nil))
 			require.Equal(t, http.StatusOK, rr.Code)
 
 			refusal := awaitCommentContaining(t, result, "changed the lock on")
 			assert.Contains(t, refusal, "`"+tt.dbName+"`")
-			assert.Contains(t, refusal, "Retry the apply")
+			assert.Contains(t, refusal, "Re-run `"+command+"`")
 			require.NoError(t, locks.pinErr, "the concurrent rollback must have pinned the lock")
 
 			lock, err := svc.Storage().Locks().Get(ctx, tt.dbName, "mysql")
