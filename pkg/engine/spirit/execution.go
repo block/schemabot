@@ -28,29 +28,41 @@ import (
 // write-thread autoscaler grow above its starting value.
 const maxCommitLatency = 100 * time.Millisecond
 
-// classifyRunnerError marks runner failures that are verdicts about the data
-// as permanent, so operator retries are not spent repeating a lossy schema
-// change: the checksum had to repair row differences on every pass it ran
-// (checksum.ErrDifferencesExhausted). Everything else remains retryable:
-//   - attempts that errored before establishing row differences;
-//   - the checksum's pass budget running out without that verdict
-//     (checksum.ErrVerificationUnresolved alone), which proves no divergence,
-//     only that ranges were still changing too fast to verify;
-//   - a divergence found by the continuous checksum during the deferred
-//     cutover wait. That checksum never repairs, because a cutover may be
-//     imminent; the resumed run's initial checksum repairs the range.
+// classifyRunnerError marks runner failures that a retry would repeat as
+// permanent, so operator retries are not spent repeating a lossy schema change
+// (see retryRepeatsChecksumVerdict). Everything else remains retryable.
 //
 // A run refused the table's advisory lock is marked ErrTargetHeld: another run
 // is still working on the table, so the refusal says nothing about this schema
 // change and it can start once that run lets go.
 func classifyRunnerError(err error) error {
-	if errors.Is(err, checksum.ErrDifferencesExhausted) {
+	if retryRepeatsChecksumVerdict(err) {
 		return &engine.PermanentError{Err: err}
 	}
 	if errors.Is(err, dbconn.ErrLockHeld) {
 		return fmt.Errorf("%w: %w", engine.ErrTargetHeld, err)
 	}
 	return err
+}
+
+// retryRepeatsChecksumVerdict reports whether err is a checksum verdict that a
+// retry of the schema change would reach again. Spirit's checksum.IsReproducible
+// decides which checksum failures are verdicts about the data, such as the
+// checksum finding a difference again after it was repaired (a lossy ALTER).
+// Failures it does not count stay retryable: attempts that errored before a
+// repair was re-read, and a pass budget that ran out with ranges still
+// changing too fast to verify.
+//
+// One reproducible verdict is still retryable here. The continuous checksum
+// during the deferred cutover wait reports checksum.ErrPermanentDivergence
+// without repairing, because a cutover may be imminent. Re-reading the data
+// finds it again, but a retry resumes the schema change, and the resumed run's
+// initial checksum repairs the range.
+func retryRepeatsChecksumVerdict(err error) bool {
+	if errors.Is(err, checksum.ErrPermanentDivergence) {
+		return false
+	}
+	return checksum.IsReproducible(err)
 }
 
 // newSpiritMigration builds the Spirit migration for a statement against the
