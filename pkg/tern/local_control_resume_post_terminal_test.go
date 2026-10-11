@@ -215,6 +215,75 @@ func TestResumeApplyWithTasks_GroupedStartAnswerFailureKeepsTheStoredOutcome(t *
 	}
 }
 
+// The same restarted grouped apply, with an operator's revert also pending
+// beside the start. The resume records the apply completed and storage then
+// refuses the start's answer. A completed outcome moots the revert, and the
+// drive is the last owner that will settle it, so the revert is completed even
+// though the start could not be answered.
+func TestResumeApplyWithTasks_GroupedStartAnswerFailureStillSettlesMootedRequests(t *testing.T) {
+	eng := &replanSequenceEngine{plans: []*engine.PlanResult{usersEmailChange(), {}}}
+	r := newGroupedStartResume(t, eng, func(requests *testControlRequestStore) storage.ControlRequestStore {
+		requests.requests = append(requests.requests, &storage.ApplyControlRequest{
+			ID: 2, ApplyID: 21, Operation: storage.ControlOperationRevert,
+			Status: storage.ControlRequestPending, RequestedBy: "operator",
+		})
+		return &startAnswerRefusingStore{testControlRequestStore: requests, err: errors.New("control request store unavailable")}
+	})
+
+	var reconcileErr *postTerminalReconcileError
+	require.ErrorAs(t, r.resume(t), &reconcileErr)
+
+	var revert *storage.ApplyControlRequest
+	for _, req := range r.requests.requests {
+		if req.Operation == storage.ControlOperationRevert {
+			revert = req
+		}
+	}
+	require.NotNil(t, revert)
+	assert.Equal(t, storage.ControlRequestCompleted, revert.Status, "the pending revert the completed outcome moots is settled")
+}
+
+// An operator started a stopped apply again, and the resume's first re-plan
+// finds the live schema already matching the reviewed target, so there is no
+// grouped resume to run and the resume records the apply completed directly.
+// Storage then refuses the write answering the start. The completed outcome
+// is stored, so it stands: the completed summary posts once, and the drive
+// returns the reconciliation it could not finish as post-terminal.
+func TestResumeApplyWithTasks_NoRemainingWorkStartAnswerFailurePostsTheSummary(t *testing.T) {
+	startErr := errors.New("control request store unavailable")
+	eng := &replanSequenceEngine{plans: []*engine.PlanResult{{}}}
+	r := newGroupedStartResume(t, eng, func(requests *testControlRequestStore) storage.ControlRequestStore {
+		return &startAnswerRefusingStore{testControlRequestStore: requests, err: startErr}
+	})
+
+	err := r.resume(t)
+
+	var reconcileErr *postTerminalReconcileError
+	require.ErrorAs(t, err, &reconcileErr, "a failure after the stored outcome surfaces as post-terminal reconciliation")
+	require.ErrorIs(t, err, startErr)
+	assert.Equal(t, state.Apply.Completed, reconcileErr.storedState)
+
+	assert.Equal(t, state.Apply.Completed, r.applies.stored.State, "the stored outcome stands")
+	assert.NotNil(t, r.applies.stored.CompletedAt)
+	assert.Empty(t, r.applies.stored.ErrorMessage, "no failure reason is recorded over the completed outcome")
+	assert.Zero(t, eng.applied, "an apply with no remaining work hands nothing to the engine")
+
+	require.Len(t, r.requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestPending, r.requests.requests[0].Status,
+		"the start whose answer storage refused stays pending")
+
+	require.Len(t, r.observer.terminal, 1, "the completed summary posts even when the start cannot be answered")
+	assert.Equal(t, state.Apply.Completed, r.observer.terminal[0].State)
+
+	warning := requireCapturedLog(t, *r.records,
+		"resume stored the apply completed but could not reconcile after it; the stored outcome stands, no failure is recorded over it, and the current apply owner will exit with the error")
+	assert.Equal(t, slog.LevelWarn, warning.level)
+	assert.Equal(t, "apply-3f9a", warning.attrs["apply_id"])
+	assert.Equal(t, "testapp", warning.attrs["database"])
+	assert.Equal(t, state.Apply.Completed, warning.attrs["state"])
+	assert.Equal(t, err, warning.attrs["error"])
+}
+
 // The same restarted grouped apply, but the change is still pending when the
 // grouped resume hands it to the engine, and the engine refuses it
 // permanently. Nothing was stored for the apply before the refusal, so the

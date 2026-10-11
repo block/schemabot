@@ -2725,9 +2725,14 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		if err := c.storage.Applies().Update(ctx, apply); err != nil {
 			return fmt.Errorf("mark resumed apply %s completed after re-plan found no remaining work: %w", apply.ApplyIdentifier, err)
 		}
+		// The outcome is stored from here, so a start that cannot be answered
+		// is reconciliation left undone, not a failure of the schema change:
+		// the stored outcome still owes its settlement and summary, and the
+		// drive reports the error only after they run.
+		var reconcileErr error
 		if startRequested {
 			if err := completePendingControlRequests(ctx, c.storage, apply, storage.ControlOperationStart); err != nil {
-				return err
+				reconcileErr = &postTerminalReconcileError{storedState: state.Apply.Completed, err: err}
 			}
 		}
 		// A previous drive can have settled every task and exited before it
@@ -2736,7 +2741,11 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 		// re-claims a completed apply to do it.
 		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 		c.notifyTerminalObserver(apply, tasks)
-		return nil
+		if reconcileErr != nil {
+			logger.Warn("resume stored the apply completed but could not reconcile after it; the stored outcome stands, no failure is recorded over it, and the current apply owner will exit with the error",
+				append(apply.MutableLogAttrs(), "error", reconcileErr)...)
+		}
+		return reconcileErr
 	}
 
 	grouped := c.usesGroupedApply(apply, options)

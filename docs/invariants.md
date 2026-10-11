@@ -243,9 +243,11 @@ another. Repeated errors observing remote progress mark the apply
 control plane cannot see, not that the change is unhealthy. *Enforced:* failure-class handling in
 the drive loop (`pkg/api/operator.go`), the pre-start task re-read and the outcome-write gate on
 terminal side effects in the sequential drive (`pkg/tern/local_apply_sequential.go`), the same gate
-in the grouped drive (`pkg/tern/local_apply_grouped.go`), the grouped resume's refusal to record a
-failure over an outcome it already stored (`postTerminalReconcileError`,
-`pkg/tern/local_control_resume.go`) and the remote progress error limit (`pkg/tern/grpc_client.go`).
+in the grouped drive (`pkg/tern/local_apply_grouped.go`), the resume's refusal to record a failure
+over an outcome it already stored (the no-remaining-work branches of `resumeApplyWithTasks` and
+`launchAtomicResume` return a `postTerminalReconcileError` that `handleGroupedResumeFailure` passes
+through, `pkg/tern/local_control_resume.go`) and the remote progress error limit
+(`pkg/tern/grpc_client.go`).
 
 ### AV-5: Panics are contained and permanent
 
