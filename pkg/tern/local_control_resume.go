@@ -851,7 +851,11 @@ func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.A
 			// this shard's live schema. A table dropping out of that diff means
 			// live already matches the reviewed target, so there is no remaining
 			// resume work for it — treat it as completed rather than drifted.
+			// A task that paused on a retryable failure arrives here with that
+			// failure's message still on it; the settlement is its outcome, so
+			// the completed row carries no error.
 			task.ProgressPercent = 100
+			task.ErrorMessage = ""
 			task.CompletedAt = &now
 			// The completed state must durably land before the task counts as
 			// settled: the caller derives parent apply state from this
