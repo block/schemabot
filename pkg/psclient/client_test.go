@@ -530,6 +530,28 @@ func TestListKeyspacesEndsAtTheOverallBound(t *testing.T) {
 	assert.Less(t, elapsed, stalledPageRequestTimeout/2, "the listing must end at its overall bound, not at a page timeout")
 }
 
+// The default bound is two per-request timeouts: one slow page can spend its
+// whole budget and the rest of the listing still has room to finish, and no
+// listing can hold a driver for the page bound times the per-request timeout.
+func TestDefaultKeyspaceListingTimeoutValue(t *testing.T) {
+	require.Equal(t, 2*planetScaleHTTPTimeout, defaultKeyspaceListingTimeout)
+}
+
+// A wrapper built as a struct literal carries no listing bound of its own. It
+// lists under the default bound rather than expiring before its first request.
+func TestListKeyspacesOnLiteralWrapper(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"current_page":1,"data":[{"name":"orders"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	wrapper := &psClientWrapper{httpClient: srv.Client(), baseURL: srv.URL, tokenName: "token-name", tokenValue: "token-value"}
+
+	keyspaces, err := listOrdersKeyspacesWith(t.Context(), wrapper)
+	require.NoError(t, err)
+	require.Len(t, keyspaces, 1)
+	assert.Equal(t, "orders", keyspaces[0].Name)
+}
+
 // Which deadline ended a page request is decided by which fired first, not by
 // which contexts have ended by the time the failure is classified. Both
 // deadlines have expired before classification in every case here.

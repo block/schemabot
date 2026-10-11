@@ -106,8 +106,20 @@ type psClientWrapper struct {
 	tokenName  string
 	tokenValue string
 	// keyspaceListingTimeout bounds a whole ListKeyspaces call, every page
-	// included. The constructors set it to defaultKeyspaceListingTimeout.
+	// included. The constructors set it to defaultKeyspaceListingTimeout, and a
+	// wrapper that carries no bound of its own lists under that default too.
 	keyspaceListingTimeout time.Duration
+}
+
+// listingTimeout returns the bound a keyspace listing runs under. A wrapper
+// built without a constructor carries no bound of its own, and a zero bound
+// would end every listing before its first request, so it lists under the
+// default instead.
+func (w *psClientWrapper) listingTimeout() time.Duration {
+	if w.keyspaceListingTimeout > 0 {
+		return w.keyspaceListingTimeout
+	}
+	return defaultKeyspaceListingTimeout
 }
 
 // APIError is a non-2xx response from a PlanetScale endpoint this package calls
@@ -255,6 +267,13 @@ const maxKeyspacePages = 100
 // its whole budget and still leaves the rest of the listing room to finish, while
 // a branch whose API answers every page just inside the per-request timeout ends
 // after a couple of pages rather than after all of them.
+//
+// A progress poll lists keyspaces, and a stop or cancel queued behind that poll
+// is looked at only once the poll returns, so this bound is also the longest an
+// acknowledged operator request waits on an API that has stopped answering. That
+// is accepted: the poll already waits a per-request timeout on each of its other
+// API calls, and a bound tight enough to change the operator's wait would cut off
+// listings of a branch that is merely slow.
 const defaultKeyspaceListingTimeout = 2 * planetScaleHTTPTimeout
 
 // ListKeyspaces returns every keyspace on the branch, reading each page the API
@@ -281,7 +300,8 @@ const defaultKeyspaceListingTimeout = 2 * planetScaleHTTPTimeout
 // whole timed out and how many pages it had read, which tells it apart from a
 // single page timing out and from ctx itself ending.
 func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
-	listCtx, cancel := context.WithTimeoutCause(ctx, w.keyspaceListingTimeout, errKeyspaceListingBound)
+	listingTimeout := w.listingTimeout()
+	listCtx, cancel := context.WithTimeoutCause(ctx, listingTimeout, errKeyspaceListingBound)
 	defer cancel()
 
 	// Each name is its own path segment, so a character that URL syntax gives
@@ -302,7 +322,7 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 		if err != nil {
 			if listingBoundEnded(listCtx, err) {
 				return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: listing as a whole timed out after %s (pages read: %d, waiting on page %d): %w",
-					req.Organization, req.Database, req.Branch, w.keyspaceListingTimeout, fetched-1, page, err)
+					req.Organization, req.Database, req.Branch, listingTimeout, fetched-1, page, err)
 			}
 			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
 		}
