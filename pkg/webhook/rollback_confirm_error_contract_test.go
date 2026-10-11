@@ -464,10 +464,35 @@ func TestRollbackConfirmCommandCoreTerminalDispositions(t *testing.T) {
 		assert.False(t, retry, "an attempted dispatch must never be re-driven; a re-drive could double-execute rollback DDL")
 		assert.Zero(t, lockStore.releaseCalls, "the pinned lock must survive a dispatch failure so the user can re-issue the command")
 		body := requireComment(t, comments, "dispatch failure comment")
-		assert.Contains(t, body, "Failed to execute rollback")
+		assert.Contains(t, body, "Plan `rbplan-1` was stored without its `target`")
 		assert.False(t, h.service.HasPendingObserver("orders", "default", "staging"),
 			"a failed dispatch must withdraw the observer it registered for the apply it did not create")
 	})
+}
+
+// A rollback plan stored before plans recorded their routing has no
+// deployment, so the apply it pins can never be dispatched, and confirming it
+// again would be refused the same way. The comment names the plan and the
+// missing field from what SchemaBot stored, then the commands that replace the
+// plan; the refusal's own text, which tells an API caller to "retry apply",
+// never reaches the PR.
+func TestRollbackConfirmLegacyPlanWithoutRoutingNamesTheReplan(t *testing.T) {
+	client, mux := setupGitHubServer(t)
+	comments := recordComments(t, mux)
+	lockStore := &rollbackConfirmTestLockStore{locks: []*storage.Lock{pinnedRollbackLock()}}
+	st := pinnedRollbackStorage(lockStore, pinnedRollbackPlan())
+	h := unlockTestHandler(t, st, ghclient.NewInstallationClient(client, testLogger()))
+
+	retry, err := h.rollbackConfirmCommandCore(t.Context(), "octocat/hello-world", 1, "staging", 12345, "testuser", rollbackConfirmCommand())
+
+	require.NoError(t, err)
+	assert.False(t, retry, "an attempted dispatch must never be re-driven")
+	body := requireComment(t, comments, "legacy rollback plan refusal comment")
+	assert.Contains(t, body, "Plan `rbplan-1` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. "+
+		"Run `schemabot rollback -e staging` followed by the apply ID from the rollback plan comment to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`.")
+	assert.NotContains(t, body, "server-side routing metadata")
+	assert.NotContains(t, body, "retry apply")
+	assert.NotContains(t, body, "Failed to execute rollback")
 }
 
 // A rollback-confirm that asked for deferred cutover on a database type that

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -21,7 +22,7 @@ type RollbackCmd struct {
 }
 
 // Run executes the rollback command.
-func (cmd *RollbackCmd) Run(g *Globals) error {
+func (cmd *RollbackCmd) Run(ctx context.Context, g *Globals) error {
 	ep, err := resolveControlFlags(g.Endpoint, g.Profile, cmd.ApplyID, cmd.Environment)
 	if err != nil {
 		return err
@@ -118,6 +119,13 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	}
 
 	// Step 4: Acquire lock and apply the rollback
+
+	// A Ctrl-C during planning or the prompt ends the command here, before
+	// any lock is taken on the operator's behalf.
+	if ctx.Err() != nil {
+		return stoppedBeforeSubmit(ctx, "rollback")
+	}
+
 	owner := client.GenerateCLIOwner()
 
 	var existingLock *client.LockInfo
@@ -165,6 +173,6 @@ func (cmd *RollbackCmd) Run(g *Globals) error {
 	// a rollout-wide rollback where members are planned on their own, since
 	// none of them has a rollback plan. So showing this plan shows what runs
 	// on every member, though not which members those are.
-	_, err = applyAndWatch(ep, planResult, true, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
+	_, err = applyAndWatch(ctx, ep, planResult, true, database, environment, owner, "rollback", cmd.DeferCutover, false, false, cmd.AllowUnsafe, "", cmd.Watch, OutputFormatInteractive, 0)
 	return err
 }

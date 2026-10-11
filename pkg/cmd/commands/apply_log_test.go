@@ -452,6 +452,7 @@ func runLogProgress(t *testing.T, frames ...*apitypes.ProgressResponse) string {
 	polls := 0
 	var watchErr error
 	poller := &progressPoller{
+		ctx:     t.Context(),
 		applyID: "apply-log-test",
 		fetch: func() (*apitypes.ProgressResponse, error) {
 			require.Less(t, polls, len(frames), "watcher must exit on the final frame")

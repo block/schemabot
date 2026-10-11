@@ -3,6 +3,7 @@ package webhook
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"testing"
 
 	"github.com/block/schemabot/pkg/api"
@@ -11,6 +12,7 @@ import (
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/schemabot/pkg/webhook/action"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // An apply the database type refused for a requested feature is told which
@@ -23,18 +25,18 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 		assert.Equal(t,
 			"database \"orders\": deferred cutover is not supported for database_type: postgres. "+
 				"Run `schemabot apply -e production` again without `--defer-cutover`.",
-			applyExecutionErrorMessage(action.Apply, "production", err))
+			applyExecutionErrorMessage(action.Apply, "production", "", err))
 	})
 
 	t.Run("unsupported feature no command option requests has no remedy", func(t *testing.T) {
 		err := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureMultiTarget}
-		msg := applyExecutionErrorMessage(action.Apply, "staging", err)
+		msg := applyExecutionErrorMessage(action.Apply, "staging", "", err)
 		assert.Equal(t, err.Error()+".", msg)
 		assert.NotContains(t, msg, "again without")
 	})
 
 	t.Run("lock intent change remains actionable", func(t *testing.T) {
-		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "staging", fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "staging", "", fmt.Errorf("verify lock: %w", storage.ErrLockIntentChanged)), "review the latest plan")
 	})
 
 	// A refusal of one target's own plan names that target and the table, from
@@ -45,7 +47,7 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 		blocked := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
 			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanBlocked, Table: "orders", Err: cause,
 		})
-		msg := applyExecutionErrorMessage(action.Apply, "production", blocked)
+		msg := applyExecutionErrorMessage(action.Apply, "production", "", blocked)
 		assert.Equal(t, "Target `payments-002` has a change on table `orders` that its engine refuses to execute, so nothing was applied. Fix what that target's plan names as the reason, then run the command again.", msg)
 		assert.NotContains(t, msg, "10.0.0.7")
 		assert.NotContains(t, msg, "plan-7f3a")
@@ -53,7 +55,7 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 		unsafe := fmt.Errorf("queue apply: %w", &api.MemberPlanRefusedError{
 			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Table: "legacy_orders", Err: cause,
 		})
-		msg = applyExecutionErrorMessage(action.Apply, "production", unsafe)
+		msg = applyExecutionErrorMessage(action.Apply, "production", "", unsafe)
 		assert.Equal(t, "Target `payments-002` has an unsafe change on table `legacy_orders` that the plan comment never showed, so nothing was applied. Run apply again for this environment: its comment shows each target's own plan, and `--allow-unsafe` can then consent to this change.", msg)
 		assert.NotContains(t, msg, "10.0.0.7")
 		assert.NotContains(t, msg, "plan-7f3a")
@@ -61,17 +63,52 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 		vschema := &api.MemberPlanRefusedError{
 			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanUndisclosedUnsafe, Namespace: "ns_0", Err: cause,
 		}
-		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", vschema), "an unsafe change on the VSchema of namespace `ns_0` that the plan comment never showed")
+		assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", "", vschema), "an unsafe change on the VSchema of namespace `ns_0` that the plan comment never showed")
 
 		unknown := &api.MemberPlanRefusedError{
 			MemberID: "eu/payments-002", Target: "payments-002", Refusal: api.MemberPlanRefusal(99), Table: "orders", Err: cause,
 		}
-		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "production", unknown),
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "production", "", unknown),
 			"a refusal kind with no line of its own never renders the error text")
 	})
 
+	// A stored plan the apply cannot run is named from the fields SchemaBot
+	// stored with it, followed by the apply that creates a new plan; the
+	// refusal's text, written for an API caller, never reaches the comment.
+	t.Run("plan refusals name the plan and the apply to re-plan", func(t *testing.T) {
+		const replan = "Run `schemabot apply -e production` to create a new plan."
+		tests := []struct {
+			name string
+			err  error
+			want string
+		}{
+			{
+				name: "not found",
+				err:  &api.PlanNotFoundError{PlanID: "plan-7f3a"},
+				want: "Plan `plan-7f3a` no longer exists, so nothing was applied. " + replan,
+			},
+			{
+				name: "environment mismatch",
+				err:  &api.PlanEnvironmentMismatchError{PlanID: "plan-7f3a", PlanEnvironment: "staging", RequestedEnvironment: "production"},
+				want: "Plan `plan-7f3a` was created for `staging`, not `production`, so nothing was applied. " + replan,
+			},
+			{
+				name: "missing routing",
+				err:  &api.PlanRoutingMetadataError{PlanID: "plan-7f3a", Field: "target"},
+				want: "Plan `plan-7f3a` was stored without its `target`, so SchemaBot cannot route it and nothing was applied. " + replan,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				msg := applyExecutionErrorMessage(action.ApplyConfirm, "production", "", tt.err)
+				assert.Equal(t, tt.want, msg)
+				assert.NotContains(t, msg, tt.err.Error())
+			})
+		}
+	})
+
 	t.Run("internal error remains sanitized", func(t *testing.T) {
-		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "staging", errors.New("secret DSN")))
+		assert.Equal(t, "Failed to execute apply. See SchemaBot server logs for details.", applyExecutionErrorMessage(action.Apply, "staging", "", errors.New("secret DSN")))
 	})
 }
 
@@ -85,7 +122,7 @@ func TestApplyExecutionErrorMessage(t *testing.T) {
 // does not promise a retry will succeed.
 func TestRollbackExecutionErrorMessage(t *testing.T) {
 	t.Run("lock intent change coaches a fresh rollback", func(t *testing.T) {
-		msg := rollbackExecutionErrorMessage("staging", fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
+		msg := rollbackExecutionErrorMessage("staging", "", fmt.Errorf("store apply and tasks: %w", storage.ErrLockIntentChanged))
 		assert.Equal(t, msgRollbackLockIntentChanged, msg)
 		assert.Contains(t, msg, "nothing was applied")
 		assert.Contains(t, msg, "run the rollback command again")
@@ -98,16 +135,93 @@ func TestRollbackExecutionErrorMessage(t *testing.T) {
 			"database \"orders\": deferred cutover is not supported for database_type: postgres. "+
 				"Run `schemabot rollback-confirm -e staging` again without `--defer-cutover`. "+
 				"The pending rollback stays pinned for it.",
-			rollbackExecutionErrorMessage("staging", err))
+			rollbackExecutionErrorMessage("staging", "", err))
+	})
+
+	// A stored plan the dispatch cannot run is named from the fields SchemaBot
+	// stored with it, followed by the commands that replace it; the refusal's
+	// text, written for an API caller, never reaches the comment.
+	t.Run("plan refusals name the plan and the rollback to re-plan", func(t *testing.T) {
+		const replan = "Run `schemabot rollback -e staging` followed by the apply ID from the rollback plan comment to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging`."
+		tests := []struct {
+			name string
+			err  error
+			want string
+		}{
+			{
+				name: "not found",
+				err:  &api.PlanNotFoundError{PlanID: "rbplan-1"},
+				want: "Plan `rbplan-1` no longer exists, so nothing was applied. " + replan,
+			},
+			{
+				name: "environment mismatch",
+				err:  &api.PlanEnvironmentMismatchError{PlanID: "rbplan-1", PlanEnvironment: "production", RequestedEnvironment: "staging"},
+				want: "Plan `rbplan-1` was created for `production`, not `staging`, so nothing was applied. " + replan,
+			},
+			{
+				name: "missing routing",
+				err:  &api.PlanRoutingMetadataError{PlanID: "rbplan-1", Field: "deployment"},
+				want: "Plan `rbplan-1` was stored without its `deployment`, so SchemaBot cannot route it and nothing was applied. " + replan,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				msg := rollbackExecutionErrorMessage("staging", "", fmt.Errorf("execute apply: %w", tt.err))
+				assert.Equal(t, tt.want, msg)
+				assert.NotContains(t, msg, tt.err.Error())
+				assert.NotContains(t, msg, "execute apply")
+			})
+		}
 	})
 
 	t.Run("internal errors use fixed guidance without a retry promise", func(t *testing.T) {
 		err := errors.New("dial tcp storage.internal:3306: connection refused")
-		msg := rollbackExecutionErrorMessage("staging", err)
+		msg := rollbackExecutionErrorMessage("staging", "", err)
 		assert.Equal(t, "Failed to execute rollback. See SchemaBot server logs for details.", msg)
 		assert.NotContains(t, msg, err.Error())
 		assert.NotContains(t, msg, "retry")
 	})
+}
+
+// On a deployment with a tenant, every command a dispatch failure coaches
+// carries it, so a pasted command addresses this deployment instead of being
+// ignored as unscoped.
+func TestDispatchErrorMessagesCarryTenant(t *testing.T) {
+	refused := &api.UnsupportedFeatureError{Database: "orders", DatabaseType: storage.DatabaseTypePostgres, Feature: schema.FeatureDeferredCutover}
+	missing := &api.PlanNotFoundError{PlanID: "plan-7f3a"}
+
+	assert.Contains(t, applyExecutionErrorMessage(action.ApplyConfirm, "production", "acme", refused),
+		"Run `schemabot apply-confirm -e production --tenant acme` again without `--defer-cutover`.")
+	assert.Contains(t, applyExecutionErrorMessage(action.Apply, "production", "acme", missing),
+		"Run `schemabot apply -e production --tenant acme` to create a new plan.")
+	assert.Contains(t, rollbackExecutionErrorMessage("staging", "acme", refused),
+		"Run `schemabot rollback-confirm -e staging --tenant acme` again without `--defer-cutover`.")
+	assert.Equal(t,
+		"Plan `plan-7f3a` no longer exists, so nothing was applied. Run `schemabot rollback -e staging --tenant acme` followed by the apply ID from the rollback plan comment to create a new rollback plan, then confirm it with `schemabot rollback-confirm -e staging --tenant acme`.",
+		rollbackExecutionErrorMessage("staging", "acme", missing))
+}
+
+// Every command a plan refusal coaches is answered when an operator pastes it
+// as written: the parser reads it as the command it names, never as a
+// sentence about SchemaBot that it stays silent on.
+func TestPlanRefusalReplanCommandsParseAsCommands(t *testing.T) {
+	refusal := &api.PlanRoutingMetadataError{PlanID: "rbplan-1", Field: "deployment"}
+	spans := regexp.MustCompile("`(schemabot [^`]+)`")
+	parser := NewCommandParser()
+	for name, msg := range map[string]string{
+		"apply":           applyExecutionErrorMessage(action.ApplyConfirm, "staging", "", refusal),
+		"apply tenant":    applyExecutionErrorMessage(action.ApplyConfirm, "staging", "acme", refusal),
+		"rollback":        rollbackExecutionErrorMessage("staging", "", refusal),
+		"rollback tenant": rollbackExecutionErrorMessage("staging", "acme", refusal),
+	} {
+		commands := spans.FindAllStringSubmatch(msg, -1)
+		require.NotEmpty(t, commands, name)
+		for _, c := range commands {
+			result := parser.ParseCommand(c[1])
+			assert.False(t, result.ProseMention, "%s: pasting %q is read as prose and goes unanswered", name, c[1])
+			assert.NotEmpty(t, result.Action, "%s: %q", name, c[1])
+		}
+	}
 }
 
 func TestPendingRollbackApplyRefusal(t *testing.T) {
@@ -634,14 +748,21 @@ func TestRolloutShapeRefusalMessage(t *testing.T) {
 
 	assert.Equal(t,
 		"`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `schemabot apply-confirm -e production` again without `--defer-cutover`.",
-		applyExecutionErrorMessage(action.ApplyConfirm, "production", wrapped(deferred)))
+		applyExecutionErrorMessage(action.ApplyConfirm, "production", "", wrapped(deferred)))
 	assert.Equal(t,
 		"`--defer-cutover` is not supported on an apply to more than one target: each target cuts over as its table finishes. Run `schemabot rollback-confirm -e production` again without `--defer-cutover`. The pending rollback stays pinned for it.",
-		rollbackExecutionErrorMessage("production", wrapped(deferred)))
+		rollbackExecutionErrorMessage("production", "", wrapped(deferred)))
 	assert.Equal(t,
 		"An apply to more than one deployment is not supported yet when a deployment has several targets. Apply one target at a time, starting with `schemabot apply -e production --target orders-001`.",
-		applyExecutionErrorMessage(action.ApplyConfirm, "production", wrapped(spanning)))
+		applyExecutionErrorMessage(action.ApplyConfirm, "production", "", wrapped(spanning)))
 	assert.Equal(t,
 		"A rollback to more than one deployment is not supported yet when a deployment has several targets. Release this PR's lock with `schemabot unlock`, then revert the schema files in a new PR and apply it one target at a time, starting with `schemabot apply -e production --target orders-001`.",
-		rollbackExecutionErrorMessage("production", wrapped(spanning)))
+		rollbackExecutionErrorMessage("production", "", wrapped(spanning)))
+
+	// A tenant deployment ignores a pasted command without its tenant, so
+	// every command the refusal names carries it.
+	assert.Contains(t, applyExecutionErrorMessage(action.ApplyConfirm, "production", "acme", wrapped(deferred)),
+		"Run `schemabot apply-confirm -e production --tenant acme` again without `--defer-cutover`.")
+	assert.Contains(t, rollbackExecutionErrorMessage("production", "acme", wrapped(spanning)),
+		"Release this PR's lock with `schemabot unlock --tenant acme`, then revert the schema files in a new PR and apply it one target at a time, starting with `schemabot apply -e production --tenant acme --target orders-001`.")
 }

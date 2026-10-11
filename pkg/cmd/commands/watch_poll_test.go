@@ -41,6 +41,7 @@ func scriptedPoller(t *testing.T, steps ...pollStep) (*progressPoller, *[]time.D
 	var waits []time.Duration
 	calls := 0
 	p := &progressPoller{
+		ctx:     t.Context(),
 		applyID: scriptedApplyID,
 		fetch: func() (*apitypes.ProgressResponse, error) {
 			require.Less(t, calls, len(steps), "watch kept polling after its scripted progress ran out")
@@ -277,7 +278,7 @@ func TestProgressPoller_FailsAfterConsecutiveTransientFailures(t *testing.T) {
 	var connErr *client.ConnectionError
 	require.ErrorAs(t, err, &connErr)
 	assert.Contains(t, err.Error(), "fetch progress for apply "+scriptedApplyID+": 10 consecutive attempts failed")
-	assert.Contains(t, err.Error(), "this watch does not affect the apply; rerun the original watch command, or 'schemabot progress "+scriptedApplyID+"', to see its current state")
+	assert.Contains(t, err.Error(), "this watch does not affect the apply; watch it again with 'schemabot progress "+scriptedApplyID+"'")
 	assert.Len(t, *waits, maxConsecutiveProgressFailures-1)
 	assert.Equal(t, maxConsecutiveProgressFailures-1, strings.Count(out, "Progress unavailable, retrying"))
 	assert.Contains(t, out, `attempt=1/10 retry_in=4s error="cannot connect to http://schemabot.test (is the server running?)"`)
@@ -433,7 +434,7 @@ func proxiedProgressPoller(t *testing.T, responses ...proxyResponse) (*progressP
 	t.Cleanup(srv.Close)
 
 	var waits []time.Duration
-	p := newProgressPoller(srv.URL, scriptedApplyID)
+	p := newProgressPoller(t.Context(), srv.URL, scriptedApplyID)
 	p.sleep = func(d time.Duration) { waits = append(waits, d) }
 	return p, &waits
 }

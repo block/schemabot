@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,7 +44,7 @@ type ApplyCmd struct {
 }
 
 // Run executes the apply command.
-func (cmd *ApplyCmd) Run(g *Globals) error {
+func (cmd *ApplyCmd) Run(ctx context.Context, g *Globals) error {
 	if cmd.NoLock && cmd.Force {
 		return fmt.Errorf("--force requires locking to break an existing lock; remove --no-lock to use it")
 	}
@@ -262,6 +263,12 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 
 	// Step 4: Acquire lock and apply the plan
 
+	// A Ctrl-C during planning or the prompt ends the command here, before
+	// any lock is taken or released on the operator's behalf.
+	if ctx.Err() != nil {
+		return stoppedBeforeSubmit(ctx, "apply")
+	}
+
 	if !cmd.NoLock {
 		// If --force, break any existing lock first
 		if cmd.Force {
@@ -326,7 +333,7 @@ func (cmd *ApplyCmd) Run(g *Globals) error {
 	// what each runs. Members the server listed as refused were turned away
 	// before the prompt; a member whose own plan apply creation refuses
 	// without having listed it is refused by POST /api/apply instead.
-	applyID, err := applyAndWatch(ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
+	applyID, err := applyAndWatch(ctx, ep, planResult, true, cfg.Database, cmd.Environment, owner, "apply", cmd.DeferCutover, cmd.DeferDeploy, cmd.SkipRevert, cmd.AllowUnsafe, cmd.Branch, cmd.Watch, cmd.Output, cmd.LogHeartbeat)
 	if err != nil {
 		if cmd.Yield && !cmd.NoLock && applyID != "" {
 			return errors.Join(err, yieldLock(ep, cfg.Database, cfg.Type, owner, cmd.Environment, applyID))
@@ -461,16 +468,16 @@ const (
 // WatchApplyProgressWithFormat polls the progress API by apply ID with the
 // specified output format. logHeartbeat controls the interval between progress
 // heartbeats in log mode (0 = default 10s).
-func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowControlActions bool, format OutputFormat, logHeartbeat time.Duration) error {
+func WatchApplyProgressWithFormat(ctx context.Context, endpoint, applyID, environment string, allowControlActions bool, format OutputFormat, logHeartbeat time.Duration) error {
 	// Use log format for CI/server environments
 	if format == OutputFormatLog {
 		if logHeartbeat <= 0 {
 			logHeartbeat = logHeartbeatDefault
 		}
-		return watchApplyProgressLog(newProgressPoller(endpoint, applyID), logHeartbeat)
+		return watchApplyProgressLog(newProgressPoller(ctx, endpoint, applyID), logHeartbeat)
 	}
 	if format == OutputFormatJSON {
-		return watchApplyProgressJSON(newProgressPoller(endpoint, applyID))
+		return watchApplyProgressJSON(newProgressPoller(ctx, endpoint, applyID))
 	}
 
 	// Interactive format: use Bubbletea TUI
@@ -479,8 +486,8 @@ func WatchApplyProgressWithFormat(endpoint, applyID, environment string, allowCo
 
 // WatchApplyProgressAfterCutover polls the progress API after cutover has been triggered.
 // It waits for completion without showing the "waiting for cutover" instructions.
-func WatchApplyProgressAfterCutover(endpoint, applyID string) error {
-	return watchAfterCutover(newProgressPoller(endpoint, applyID))
+func WatchApplyProgressAfterCutover(ctx context.Context, endpoint, applyID string) error {
+	return watchAfterCutover(newProgressPoller(ctx, endpoint, applyID))
 }
 
 func watchAfterCutover(poller *progressPoller) error {
@@ -516,7 +523,9 @@ func watchAfterCutover(poller *progressPoller) error {
 		}
 
 		// Still processing - just wait (don't show waiting instructions since cutover was already triggered)
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 	}
 }
 
@@ -1064,7 +1073,9 @@ func watchApplyProgressLog(poller *progressPoller, heartbeatInterval time.Durati
 			return terminalWatchExit(result)
 		}
 
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 		// Ramp up to 5s over the first few polls to avoid hammering the API on long schema changes
 		if pollInterval < 5*time.Second {
 			pollInterval *= 2
@@ -1302,7 +1313,9 @@ func watchApplyProgressJSON(poller *progressPoller) error {
 			return noActiveChangeError(poller.applyID)
 		}
 
-		poller.sleep(pollInterval)
+		if err := poller.pause(pollInterval); err != nil {
+			return err
+		}
 	}
 }
 
