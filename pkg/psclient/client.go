@@ -105,6 +105,21 @@ type psClientWrapper struct {
 	baseURL    string       // the SDK client's base URL, reused for endpoints not in the SDK
 	tokenName  string
 	tokenValue string
+	// keyspaceListingTimeout bounds a whole ListKeyspaces call, every page
+	// included. The constructors set it to defaultKeyspaceListingTimeout, and a
+	// wrapper that carries no bound of its own lists under that default too.
+	keyspaceListingTimeout time.Duration
+}
+
+// listingTimeout returns the bound a keyspace listing runs under. A wrapper
+// built without a constructor carries no bound of its own, and a zero bound
+// would end every listing before its first request, so it lists under the
+// default instead.
+func (w *psClientWrapper) listingTimeout() time.Duration {
+	if w.keyspaceListingTimeout > 0 {
+		return w.keyspaceListingTimeout
+	}
+	return defaultKeyspaceListingTimeout
 }
 
 // APIError is a non-2xx response from a PlanetScale endpoint this package calls
@@ -198,6 +213,8 @@ func NewPSClientWithBaseURL(tokenName, tokenValue, baseURL string, opts ...ps.Cl
 		baseURL:    baseURL,
 		tokenName:  tokenName,
 		tokenValue: tokenValue,
+
+		keyspaceListingTimeout: defaultKeyspaceListingTimeout,
 	}, nil
 }
 
@@ -243,6 +260,22 @@ const keyspacesPerPage = 100
 // page, and the listing fails rather than loop or return a partial view.
 const maxKeyspacePages = 100
 
+// defaultKeyspaceListingTimeout bounds a keyspace listing as a whole. The page
+// bound alone does not: each page request may run for the full per-request
+// timeout, so a caller with no deadline of its own could otherwise wait for the
+// page bound times that timeout. Two per-request timeouts let one slow page use
+// its whole budget and still leaves the rest of the listing room to finish, while
+// a branch whose API answers every page just inside the per-request timeout ends
+// after a couple of pages rather than after all of them.
+//
+// A progress poll lists keyspaces, and a stop or cancel queued behind that poll
+// is looked at only once the poll returns, so this bound is also the longest an
+// acknowledged operator request waits on an API that has stopped answering. That
+// is accepted: the poll already waits a per-request timeout on each of its other
+// API calls, and a bound tight enough to change the operator's wait would cut off
+// listings of a branch that is merely slow.
+const defaultKeyspaceListingTimeout = 2 * planetScaleHTTPTimeout
+
 // ListKeyspaces returns every keyspace on the branch, reading each page the API
 // reports.
 //
@@ -261,8 +294,16 @@ const maxKeyspacePages = 100
 // the next listing heals one that did not.
 //
 // The HTTP client's timeout applies to each page request. The listing as a whole
-// is bounded by maxKeyspacePages and by ctx.
+// reads at most maxKeyspacePages pages and ends by the wrapper's
+// keyspaceListingTimeout whatever ctx carries; a ctx deadline that comes sooner
+// ends it sooner. When the overall bound fires, the error says the listing as a
+// whole timed out and how many pages it had read, which tells it apart from a
+// single page timing out and from ctx itself ending.
 func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspacesRequest) ([]*ps.Keyspace, error) {
+	listingTimeout := w.listingTimeout()
+	listCtx, cancel := context.WithTimeoutCause(ctx, listingTimeout, errKeyspaceListingBound)
+	defer cancel()
+
 	// Each name is its own path segment, so a character that URL syntax gives
 	// meaning to cannot retarget the request or swallow the page query.
 	basePath := fmt.Sprintf("/v1/organizations/%s/databases/%s/branches/%s/keyspaces",
@@ -277,8 +318,12 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 		query := url.Values{}
 		query.Set("page", strconv.Itoa(page))
 		query.Set("per_page", strconv.Itoa(keyspacesPerPage))
-		respBody, err := w.doRawJSON(ctx, http.MethodGet, basePath+"?"+query.Encode(), nil)
+		respBody, err := w.doRawJSON(listCtx, http.MethodGet, basePath+"?"+query.Encode(), nil)
 		if err != nil {
+			if listingBoundEnded(listCtx, err) {
+				return nil, fmt.Errorf("list keyspaces for %s/%s branch %s: listing as a whole timed out after %s (pages read: %d, waiting on page %d): %w",
+					req.Organization, req.Database, req.Branch, listingTimeout, fetched-1, page, err)
+			}
 			return nil, fmt.Errorf("list keyspaces for %s/%s branch %s page %d: %w", req.Organization, req.Database, req.Branch, page, err)
 		}
 		var payload struct {
@@ -306,6 +351,24 @@ func (w *psClientWrapper) ListKeyspaces(ctx context.Context, req *ps.ListKeyspac
 		}
 		page = *payload.NextPage
 	}
+}
+
+// errKeyspaceListingBound is the cancellation cause recorded on a listing's
+// context when its own overall bound, rather than the caller's deadline or
+// cancellation, ends it. It wraps context.DeadlineExceeded because the HTTP
+// client reports a request ended by its context with the context's cause, and
+// callers match a listing that ran out of time as a deadline.
+var errKeyspaceListingBound = fmt.Errorf("keyspace listing bound reached: %w", context.DeadlineExceeded)
+
+// listingBoundEnded reports whether a page request failed because the
+// listing's own overall bound ended listCtx. The context's cause records which
+// deadline fired first, so the answer does not depend on when this runs: a
+// caller deadline that expires after the listing bound fired does not take the
+// failure over, and a caller deadline that fired first is never reported as
+// the listing's. The request error must itself be a deadline, so a page that
+// failed for another reason as the bound fired keeps its own error.
+func listingBoundEnded(listCtx context.Context, err error) bool {
+	return errors.Is(context.Cause(listCtx), errKeyspaceListingBound) && errors.Is(err, context.DeadlineExceeded)
 }
 
 func (w *psClientWrapper) GetKeyspaceVSchema(ctx context.Context, req *ps.GetKeyspaceVSchemaRequest) (*ps.VSchema, error) {
