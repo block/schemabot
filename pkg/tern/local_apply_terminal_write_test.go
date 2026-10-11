@@ -3,6 +3,7 @@ package tern
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -1180,16 +1181,37 @@ func TestApplyFailureWrites_RefusedWriteLeavesTheApplyAsStored(t *testing.T) {
 	}
 }
 
+// verdictCancellingTaskStore cancels the drive's context inside the write it refuses,
+// modelling a shutdown that lands while a task verdict is being recorded.
+type verdictCancellingTaskStore struct {
+	*verdictRefusingTaskStore
+	cancel context.CancelFunc
+}
+
+func (s *verdictCancellingTaskStore) Update(ctx context.Context, task *storage.Task) error {
+	refusedBefore := s.refused
+	err := s.verdictRefusingTaskStore.Update(ctx, task)
+	if s.refused > refusedBefore {
+		s.cancel()
+	}
+	return err
+}
+
 // A grouped drive fails or pauses an apply over two running tables, and storage
 // refuses the write that records the first table's verdict. The apply's outcome
 // — and, for an operation drive, the operation row the operator derives — is
 // read from the task rows, so nothing may be recorded on top of a verdict that
-// never landed: the error is returned, the apply stays running in storage with
-// no apply write, no apply log entry, no observer update, and its pending
-// revert still pending, and the refused table keeps the state and message it
-// arrived with.
+// never landed: the apply stays running in storage with no apply write, no
+// apply log entry, no observer update, and its pending revert still pending,
+// and the refused table keeps the state and message it arrived with.
+//
+// What the drive returns depends on why the write was refused. A storage error
+// is returned and logged as an error. A lost lease is returned so the caller
+// can recognise it, and logged as a warning, since another driver now owns the
+// apply. A drive cancelled during the write hands the apply back with nil and
+// logs neither, like every other write a cancelled drive makes.
 func TestApplyFailureWrites_RefusedTaskVerdictLeavesTheApplyActive(t *testing.T) {
-	writeErr := errors.New("storage unavailable")
+	storageErr := errors.New("storage unavailable")
 	record := map[string]func(c *LocalClient, ctx context.Context, apply *storage.Apply, tasks []*storage.Task, errMsg string) error{
 		"record the failure":        (*LocalClient).failApplyWithTasks,
 		"fail and post the summary": (*LocalClient).failApplyAndNotify,
@@ -1201,48 +1223,74 @@ func TestApplyFailureWrites_RefusedTaskVerdictLeavesTheApplyActive(t *testing.T)
 			return storage.WithOperationLease(t.Context(), storage.OperationLease{ApplyID: 7, OperationID: 3, Owner: "driver", Token: "op-token"})
 		},
 	}
+	refusals := map[string]struct {
+		err          error
+		cancelsDrive bool
+		wantErr      error // nil: the drive hands the apply back
+		wantErrors   int
+		wantWarnings int
+	}{
+		"storage error":                    {err: storageErr, wantErr: storageErr, wantErrors: 1},
+		"lease lost":                       {err: fmt.Errorf("lease-guarded task update: %w", storage.ErrApplyLeaseLost), wantErr: storage.ErrApplyLeaseLost, wantWarnings: 1},
+		"drive cancelled during the write": {err: context.Canceled, cancelsDrive: true},
+	}
 	for name, recordOutcome := range record {
 		for driveName, driveCtx := range drives {
-			t.Run(name+"/"+driveName, func(t *testing.T) {
-				stored := failureLogTestApply(state.Apply.Running, 0)
-				orders := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Running}
-				users := &storage.Task{ID: 2, TaskIdentifier: "task-2", ApplyID: stored.ID, TableName: "users", State: state.Task.Running}
-				tasks := newVerdictRefusingTaskStore(writeErr, 1, orders, users)
-				applies := &mockApplyStore{apply: stored}
-				logs := &mockApplyLogStore{}
-				controlRequests := pendingControlRequestStore(stored.ID, storage.ControlOperationRevert)
-				client := &LocalClient{
-					config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
-					storage: &exactProgressStorage{
-						applies:         applies,
-						tasks:           tasks,
-						logs:            logs,
-						controlRequests: controlRequests,
-					},
-					logger: slog.Default(),
-				}
-				observer := &progressRecordingObserver{}
-				client.SetObserver(stored.ID, observer)
+			for refusalName, refusal := range refusals {
+				t.Run(name+"/"+driveName+"/"+refusalName, func(t *testing.T) {
+					ctx, cancel := context.WithCancel(driveCtx(t))
+					defer cancel()
+					stored := failureLogTestApply(state.Apply.Running, 0)
+					orders := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Running}
+					users := &storage.Task{ID: 2, TaskIdentifier: "task-2", ApplyID: stored.ID, TableName: "users", State: state.Task.Running}
+					refusing := newVerdictRefusingTaskStore(refusal.err, 1, orders, users)
+					var tasks storage.TaskStore = refusing
+					if refusal.cancelsDrive {
+						tasks = &verdictCancellingTaskStore{verdictRefusingTaskStore: refusing, cancel: cancel}
+					}
+					applies := &mockApplyStore{apply: stored}
+					logs := &mockApplyLogStore{}
+					controlRequests := pendingControlRequestStore(stored.ID, storage.ControlOperationRevert)
+					handler := &recordingLogHandler{}
+					client := &LocalClient{
+						config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+						storage: &exactProgressStorage{
+							applies:         applies,
+							tasks:           tasks,
+							logs:            logs,
+							controlRequests: controlRequests,
+						},
+						logger: slog.New(handler),
+					}
+					observer := &progressRecordingObserver{}
+					client.SetObserver(stored.ID, observer)
 
-				drive := *stored
-				err := recordOutcome(client, driveCtx(t), &drive, []*storage.Task{orders, users}, "engine lost its connection to the target")
+					drive := *stored
+					err := recordOutcome(client, ctx, &drive, []*storage.Task{orders, users}, "engine lost its connection to the target")
 
-				require.ErrorIs(t, err, writeErr)
-				assert.Contains(t, err.Error(), "apply-7", "the error names the apply whose task verdicts were not stored")
-				assert.Equal(t, 1, tasks.refused)
-				assert.Equal(t, state.Task.Running, tasks.stored["task-1"].State)
-				assert.Equal(t, state.Task.Running, orders.State, "the refused table keeps the state storage holds")
-				assert.Empty(t, orders.ErrorMessage)
-				assert.Nil(t, orders.CompletedAt)
-				assert.Equal(t, state.Task.Running, tasks.stored["task-2"].State, "no later table is recorded after a refused verdict")
-				assert.Equal(t, state.Apply.Running, drive.State)
-				assert.Empty(t, applies.updates, "the apply is not written over an unrecorded task verdict")
-				assert.Empty(t, logs.logs)
-				assert.Empty(t, observer.progress)
-				assert.Empty(t, observer.terminal)
-				require.Len(t, controlRequests.requests, 1)
-				assert.Equal(t, storage.ControlRequestPending, controlRequests.requests[0].Status)
-			})
+					if refusal.wantErr == nil {
+						require.NoError(t, err)
+					} else {
+						require.ErrorIs(t, err, refusal.wantErr)
+						assert.Contains(t, err.Error(), "apply-7", "the error names the apply whose task verdicts were not stored")
+					}
+					assert.Len(t, handler.messages(slog.LevelError), refusal.wantErrors)
+					assert.Len(t, handler.messages(slog.LevelWarn), refusal.wantWarnings)
+					assert.Equal(t, 1, refusing.refused)
+					assert.Equal(t, state.Task.Running, refusing.stored["task-1"].State)
+					assert.Equal(t, state.Task.Running, orders.State, "the refused table keeps the state storage holds")
+					assert.Empty(t, orders.ErrorMessage)
+					assert.Nil(t, orders.CompletedAt)
+					assert.Equal(t, state.Task.Running, refusing.stored["task-2"].State, "no later table is recorded after a refused verdict")
+					assert.Equal(t, state.Apply.Running, drive.State)
+					assert.Empty(t, applies.updates, "the apply is not written over an unrecorded task verdict")
+					assert.Empty(t, logs.logs)
+					assert.Empty(t, observer.progress)
+					assert.Empty(t, observer.terminal)
+					require.Len(t, controlRequests.requests, 1)
+					assert.Equal(t, storage.ControlRequestPending, controlRequests.requests[0].Status)
+				})
+			}
 		}
 	}
 }

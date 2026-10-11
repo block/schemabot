@@ -89,7 +89,7 @@ func (c *LocalClient) refusedTaskVerdict(ctx context.Context, apply *storage.App
 	if errors.Is(err, storage.ErrApplyLeaseLost) {
 		c.logger.Warn("task verdict was refused because the drive's lease was lost; this driver exits and leaves the apply to the lease holder", attrs...)
 	} else {
-		c.logger.Error("failed to record a task verdict; current apply owner will exit for operator retry with the apply still active and no terminal side effects run", attrs...)
+		c.logger.Error("failed to record a task verdict; current driver will exit with the apply still active and no terminal side effects run, for the next claim to settle", attrs...)
 	}
 	return fmt.Errorf("record %s task verdicts for apply %s (database %s): %w",
 		verdict, apply.ApplyIdentifier, apply.Database, err)
