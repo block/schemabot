@@ -1025,47 +1025,96 @@ func TestExecuteApplyTrace(t *testing.T) {
 // reason, so a requeue storage keeps refusing shows as a rate of
 // task_requeue_refused rather than blending into resume_error.
 func TestResumeClaimedApplyCountsARefusedTaskRequeue(t *testing.T) {
-	reader := sdkmetric.NewManualReader()
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-	prevMP := otel.GetMeterProvider()
-	otel.SetMeterProvider(mp)
-	cleanupCtx := context.WithoutCancel(t.Context())
-	t.Cleanup(func() {
-		otel.SetMeterProvider(prevMP)
-		require.NoError(t, mp.Shutdown(cleanupCtx))
-	})
 	refused := fmt.Errorf("%w: stopped task task_email for start of apply apply-42: storage unavailable", tern.ErrTaskRequeueRefused)
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
-	svc := New(&mockStorageWithApplyStores{
-		plans:   &staticPlanStore{},
-		applies: &staticApplyStore{},
-	}, &ServerConfig{}, map[string]tern.Client{
-		"east/staging": &mockTernClient{resumeErr: refused},
-	}, logger)
-	apply := &storage.Apply{
-		ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
-		Deployment: "east", Environment: "staging", State: state.Apply.Stopped,
+	cases := []struct {
+		name        string
+		applyState  string
+		resumeErr   error
+		cancelCtx   bool
+		wantReasons []string
+		// wantGaugeSeries asserts that the active-applies gauge has a series
+		// for the apply, which only a retryable claim creates.
+		wantGaugeSeries bool
+	}{
+		{
+			name:        "a stopped apply's refused start requeue",
+			applyState:  state.Apply.Stopped,
+			resumeErr:   refused,
+			wantReasons: []string{"task_requeue_refused"},
+		},
+		{
+			name:            "a retryable apply's refused retry requeue releases the active-applies gauge",
+			applyState:      state.Apply.FailedRetryable,
+			resumeErr:       refused,
+			wantReasons:     []string{"task_requeue_refused"},
+			wantGaugeSeries: true,
+		},
+		{
+			name:        "a refusal caused by a lost lease is counted as the lost lease",
+			applyState:  state.Apply.Stopped,
+			resumeErr:   fmt.Errorf("%w: stopped task task_email for start of apply apply-42: %w", tern.ErrTaskRequeueRefused, storage.ErrApplyLeaseLost),
+			wantReasons: []string{"lease_lost"},
+		},
+		{
+			name:       "a refusal during shutdown is not counted",
+			applyState: state.Apply.Stopped,
+			resumeErr:  refused,
+			cancelCtx:  true,
+		},
 	}
-
-	resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0, "")
-
-	require.ErrorIs(t, err, tern.ErrTaskRequeueRefused)
-	assert.False(t, resumed)
-	var rm metricdata.ResourceMetrics
-	require.NoError(t, reader.Collect(t.Context(), &rm))
-	var reasons []string
-	for _, sm := range rm.ScopeMetrics {
-		for _, m := range sm.Metrics {
-			if m.Name != "schemabot.operator.resume_failures_total" {
-				continue
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := sdkmetric.NewManualReader()
+			mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+			prevMP := otel.GetMeterProvider()
+			otel.SetMeterProvider(mp)
+			cleanupCtx := context.WithoutCancel(t.Context())
+			t.Cleanup(func() {
+				otel.SetMeterProvider(prevMP)
+				require.NoError(t, mp.Shutdown(cleanupCtx))
+			})
+			logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+			svc := New(&mockStorageWithApplyStores{
+				plans:   &staticPlanStore{},
+				applies: &staticApplyStore{},
+			}, &ServerConfig{}, map[string]tern.Client{
+				"east/staging": &mockTernClient{resumeErr: tc.resumeErr},
+			}, logger)
+			apply := &storage.Apply{
+				ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+				Deployment: "east", Environment: "staging", State: tc.applyState,
 			}
-			sum, ok := m.Data.(metricdata.Sum[int64])
-			require.True(t, ok)
-			for _, dp := range sum.DataPoints {
-				reason, _ := dp.Attributes.Value(attribute.Key("reason"))
-				reasons = append(reasons, reason.AsString())
+			ctx := t.Context()
+			if tc.cancelCtx {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
 			}
-		}
+
+			resumed, err := svc.resumeClaimedApply(ctx, 1, apply, 0, "")
+
+			require.ErrorIs(t, err, tern.ErrTaskRequeueRefused)
+			assert.False(t, resumed)
+			var rm metricdata.ResourceMetrics
+			require.NoError(t, reader.Collect(t.Context(), &rm))
+			var reasons []string
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if m.Name != "schemabot.operator.resume_failures_total" {
+						continue
+					}
+					sum, ok := m.Data.(metricdata.Sum[int64])
+					require.True(t, ok)
+					for _, dp := range sum.DataPoints {
+						reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+						reasons = append(reasons, reason.AsString())
+					}
+				}
+			}
+			assert.Equal(t, tc.wantReasons, reasons)
+			active, found := activeAppliesValue(t, reader, "appdb", "east", "staging")
+			assert.Equal(t, tc.wantGaugeSeries, found)
+			assert.Zero(t, active, "a refused requeue must not leave a unit on the active-applies gauge")
+		})
 	}
-	assert.Equal(t, []string{"task_requeue_refused"}, reasons)
 }

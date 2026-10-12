@@ -120,13 +120,13 @@ var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 // task's DDL while storage records it at rest would leave work no stored state
 // accounts for. A gRPC drive requeues its stopped tasks only after the data
 // plane accepted the start, so there the remote work is already running; the
-// start request stays pending and the next claim's start is repeated against
-// it before the requeue is retried. A retry's claim spends one of the
-// apply's recovery attempts, so that loop ends with the recovery budget; a
-// start's claim spends none, so the request stays pending until the write
-// lands. The operator counts every exit under its own resume failure reason,
-// so a requeue that keeps being refused is visible rather than one warning per
-// claim.
+// start request stays pending, and the next claim adopts the data plane's
+// state and retries the requeue before completing it. A retry's claim spends
+// one of the apply's recovery attempts, so that loop ends with the recovery
+// budget; a start's claim spends none, so the request stays pending until the
+// write lands. The operator counts every exit under its own resume failure
+// reason, so a requeue that keeps being refused is visible rather than one
+// warning per claim.
 var ErrTaskRequeueRefused = errors.New("task requeue refused")
 
 var (
