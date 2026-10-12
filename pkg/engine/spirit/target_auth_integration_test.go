@@ -41,7 +41,7 @@ func TestEngine_FetchCurrentSchema_ClassifiesTargetAuthFailure(t *testing.T) {
 			require.NoError(t, err)
 			tc.mutate(cfg)
 
-			_, _, err = New(Config{}).fetchCurrentSchema(t.Context(), cfg.FormatDSN(), cfg.DBName, engine.IgnoredTables{})
+			_, err = New(Config{}).fetchCurrentSchema(t.Context(), cfg.FormatDSN(), cfg.DBName, engine.IgnoredTables{})
 			require.Error(t, err)
 
 			classification, ok := targetauth.ClassificationOf(err)
