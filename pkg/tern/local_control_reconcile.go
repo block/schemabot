@@ -221,11 +221,13 @@ func (c *LocalClient) adoptEngineTerminalTruth(ctx context.Context, apply *stora
 		// The apply's outcome is recorded only over task rows that carry it: a
 		// task left active under a settled apply is work storage still offers to
 		// a drive. A refused write returns with the apply untouched, for the next
-		// claim to reconcile again.
+		// claim to reconcile again. Tasks adopted before it stay adopted; the
+		// error wraps ErrTaskVerdictRefused so an operation drive's row is not
+		// derived from that partly settled set.
 		if err := c.persistTaskStateTransition(ctx, task, task.ApplyID, taskState,
 			fmt.Sprintf("Task %s adopted the engine's %s outcome (the engine reached it before the pending command was consumed)", task.TaskIdentifier, taskState)); err != nil {
-			return fmt.Errorf("adopt engine terminal state %s for task %s of apply %s (database %s): %w",
-				taskState, task.TaskIdentifier, apply.ApplyIdentifier, apply.Database, err)
+			return fmt.Errorf("%w: adopt engine terminal state %s for task %s of apply %s (database %s): %w",
+				ErrTaskVerdictRefused, taskState, task.TaskIdentifier, apply.ApplyIdentifier, apply.Database, err)
 		}
 		settledCount++
 	}

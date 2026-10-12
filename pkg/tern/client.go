@@ -129,6 +129,20 @@ var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 // warning per claim.
 var ErrTaskRequeueRefused = errors.New("task requeue refused")
 
+// ErrTaskVerdictRefused is returned by a drive whose write recording a task's
+// terminal outcome — failed, failed_retryable, cancelled behind a permanent
+// failure, or an outcome adopted from the engine — did not land. The apply's
+// outcome, and in a multi-operation drive the operation row the operator
+// derives, is read from the task rows, so the drive records nothing on top of
+// a verdict storage never took: the apply stays active and the next claim reads
+// every task as stored and settles it. Verdicts already stored for earlier
+// tasks stay stored. The operator leaves an operation whose drive returned this
+// as found, running and claimable, rather than deriving its row from a task
+// set that is only partly settled: a stored failure ahead of a refused write
+// would otherwise terminalize the operation over a task that still reads
+// active, and a terminal operation gets no next claim.
+var ErrTaskVerdictRefused = errors.New("task verdict refused")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.

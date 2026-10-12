@@ -99,11 +99,11 @@ func taskVerdictMessage(task *storage.Task, errMsg string) string {
 // it up next reads every task as stored and settles it. A write refused because
 // the drive was cancelled hands the apply back with nil, like the apply write.
 //
-// Verdicts already stored for earlier tasks stay stored. A whole-apply drive's
-// next claim reads one of them as the apply's outcome and settles the refused
-// table from it. An operation drive gets no next claim: the operator derives
-// the operation row from the task rows as they stand, so the row settles over a
-// table that still reads running until the stranded-task reaper closes it.
+// Verdicts already stored for earlier tasks stay stored, and the next claim
+// reads one of them as the apply's outcome and settles the refused table from
+// it. The error wraps ErrTaskVerdictRefused so the operator leaves an operation
+// drive's row as found and claimable instead of deriving it from the partly
+// settled task set.
 func (c *LocalClient) refusedTaskVerdict(ctx context.Context, apply *storage.Apply, task *storage.Task, verdict, errMsg string, err error) error {
 	if c.driveCancelled(ctx, apply, "while recording a task verdict") {
 		return nil
@@ -122,8 +122,8 @@ func (c *LocalClient) refusedTaskVerdict(ctx context.Context, apply *storage.App
 	default:
 		c.logger.Error("failed to record a task verdict; current driver will exit with the apply still active and no terminal side effects run, for the next claim to settle", attrs...)
 	}
-	return fmt.Errorf("record %s task verdicts for apply %s (database %s): %w",
-		verdict, apply.ApplyIdentifier, apply.Database, err)
+	return fmt.Errorf("%w: record %s task verdicts for apply %s (database %s): %w",
+		ErrTaskVerdictRefused, verdict, apply.ApplyIdentifier, apply.Database, err)
 }
 
 // failApplyWithTasks marks all tasks and the apply as failed with the given error.

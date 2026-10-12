@@ -164,6 +164,7 @@ func TestFinalizeSequentialApply_QueuedTaskCancellationMustLandBeforeTheOutcome(
 
 			if tc.taskUpdateErr != nil {
 				require.ErrorIs(t, err, tc.taskUpdateErr)
+				require.ErrorIs(t, err, ErrTaskVerdictRefused, "the operator reads this to leave an operation drive's row claimable")
 				assert.Contains(t, err.Error(), "apply-7", "the error names the apply the drive could not finalize")
 			} else {
 				require.NoError(t, err)

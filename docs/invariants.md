@@ -223,9 +223,11 @@ Supervision reattaches to the still-running change once storage returns.
 
 Uncertainty is never converted into a verdict. A terminal outcome that cannot be persisted leaves
 the row non-terminal and claimable, to be re-derived on the next claim rather than fabricated.
-*Enforced:* per-failure-class handling in the drive loop (`pkg/api/operator.go`), in the apply
-failure helpers (`pkg/tern/local_apply_failure.go`), and in the sequential outcome and engine
-terminal-truth adoption, which record the apply's outcome only once its task rows carry it
+*Enforced:* per-failure-class handling in the drive loop (`pkg/api/operator.go`), which also leaves
+an operation whose drive returned `tern.ErrTaskVerdictRefused` as found and claimable rather than
+deriving its row from a partly settled task set; in the apply failure helpers
+(`pkg/tern/local_apply_failure.go`); and in the sequential outcome and engine terminal-truth
+adoption, which record the apply's outcome only once its task rows carry it
 (`pkg/tern/local_apply_sequential.go`, `pkg/tern/local_control_reconcile.go`), modelled in
 [storage-outage-behavior.md](storage-outage-behavior.md).
 
