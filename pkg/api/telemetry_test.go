@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"github.com/block/schemabot/pkg/metrics"
 	"github.com/block/schemabot/pkg/state"
 	"github.com/block/schemabot/pkg/storage"
+	"github.com/block/schemabot/pkg/tern"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -1016,4 +1018,53 @@ func TestExecuteApplyTrace(t *testing.T) {
 	attrs := spanAttrs(s)
 	assert.Equal(t, "nonexistent", attrs["plan_id"])
 	assert.Equal(t, "staging", attrs["environment"])
+}
+
+// A resume whose task requeue storage refuses starts nothing, and the next
+// claim repeats it. The operator counts that exit under its own resume failure
+// reason, so a requeue storage keeps refusing shows as a rate of
+// task_requeue_refused rather than blending into resume_error.
+func TestResumeClaimedApplyCountsARefusedTaskRequeue(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	prevMP := otel.GetMeterProvider()
+	otel.SetMeterProvider(mp)
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prevMP)
+		require.NoError(t, mp.Shutdown(t.Context()))
+	})
+	refused := fmt.Errorf("%w: stopped task task_email for start of apply apply-42: storage unavailable", tern.ErrTaskRequeueRefused)
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
+	svc := New(&mockStorageWithApplyStores{
+		plans:   &staticPlanStore{},
+		applies: &staticApplyStore{},
+	}, &ServerConfig{}, map[string]tern.Client{
+		"east/staging": &mockTernClient{resumeErr: refused},
+	}, logger)
+	apply := &storage.Apply{
+		ID: 42, ApplyIdentifier: "apply-42", Database: "appdb",
+		Deployment: "east", Environment: "staging", State: state.Apply.Stopped,
+	}
+
+	resumed, err := svc.resumeClaimedApply(t.Context(), 1, apply, 0, "")
+
+	require.ErrorIs(t, err, tern.ErrTaskRequeueRefused)
+	assert.False(t, resumed)
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	var reasons []string
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "schemabot.operator.resume_failures_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			require.True(t, ok)
+			for _, dp := range sum.DataPoints {
+				reason, _ := dp.Attributes.Value(attribute.Key("reason"))
+				reasons = append(reasons, reason.AsString())
+			}
+		}
+	}
+	assert.Equal(t, []string{"task_requeue_refused"}, reasons)
 }

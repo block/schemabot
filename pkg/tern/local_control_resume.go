@@ -1199,7 +1199,7 @@ func (c *LocalClient) prepareRetryableTasksForResume(ctx context.Context, apply 
 		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
 			fmt.Sprintf("Task %s queued for retry", task.TaskIdentifier)); err != nil {
 			*task = previous
-			return fmt.Errorf("requeue retryable task %s for retry of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			return fmt.Errorf("%w: retryable task %s for retry of apply %s: %w", ErrTaskRequeueRefused, task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 	}
 	return nil
@@ -1222,7 +1222,7 @@ func (c *LocalClient) prepareStoppedTasksForResume(ctx context.Context, apply *s
 		if err := c.persistTaskStateTransition(ctx, task, apply.ID, state.Task.Pending,
 			fmt.Sprintf("Task %s queued for start", task.TaskIdentifier)); err != nil {
 			*task = previous
-			return fmt.Errorf("requeue stopped task %s for start of apply %s: %w", task.TaskIdentifier, apply.ApplyIdentifier, err)
+			return fmt.Errorf("%w: stopped task %s for start of apply %s: %w", ErrTaskRequeueRefused, task.TaskIdentifier, apply.ApplyIdentifier, err)
 		}
 	}
 	return nil

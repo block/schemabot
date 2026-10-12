@@ -1618,7 +1618,8 @@ func TestResumeApplyWithTasks_RetryStaysPendingWhenRetryableTaskRequeueFails(t *
 	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
-	assert.ErrorContains(t, err, "requeue retryable task task_email for retry of apply apply-retry-requeue-refused")
+	require.ErrorIs(t, err, ErrTaskRequeueRefused)
+	assert.ErrorContains(t, err, "retryable task task_email for retry of apply apply-retry-requeue-refused")
 	assert.True(t, state.IsState(task.State, state.Task.FailedRetryable), "the refused requeue leaves the task retryable, got %s", task.State)
 	assert.Empty(t, eng.applied, "nothing is handed to the engine")
 	stored, err := applies.Get(t.Context(), apply.ID)
@@ -1686,7 +1687,8 @@ func TestResumeApplyWithTasks_StartStaysPendingWhenStoppedTaskRequeueFails(t *te
 	err := c.resumeApplyWithTasks(t.Context(), apply, nil, []*storage.Task{task}, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
-	assert.ErrorContains(t, err, "requeue stopped task task_email for start of apply apply-start-requeue-refused")
+	require.ErrorIs(t, err, ErrTaskRequeueRefused)
+	assert.ErrorContains(t, err, "stopped task task_email for start of apply apply-start-requeue-refused")
 	assert.True(t, state.IsState(task.State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", task.State)
 	assert.Empty(t, eng.applied, "nothing is handed to the engine")
 	stored, err := applies.Get(t.Context(), apply.ID)
@@ -1788,7 +1790,8 @@ func TestResumeApplyWithTasks_StartStaysPendingWhenGroupedStoppedTaskRequeueFail
 	err := c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false)
 
 	require.ErrorIs(t, err, storageErr)
-	assert.ErrorContains(t, err, "requeue stopped task task_name for start of apply apply-grouped-start-requeue-refused")
+	require.ErrorIs(t, err, ErrTaskRequeueRefused)
+	assert.ErrorContains(t, err, "stopped task task_name for start of apply apply-grouped-start-requeue-refused")
 	assert.True(t, state.IsState(tasks[0].State, state.Task.Pending), "the requeue that landed stays pending, got %s", tasks[0].State)
 	assert.True(t, state.IsState(tasks[1].State, state.Task.Stopped), "the refused requeue leaves the task stopped, got %s", tasks[1].State)
 	assert.Empty(t, eng.applied, "nothing is handed to the engine")

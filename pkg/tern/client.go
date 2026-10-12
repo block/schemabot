@@ -112,6 +112,18 @@ var ErrApplyTasksNotLoaded = errors.New("apply owns task rows the drive loader d
 // an operator intervenes.
 var ErrApplyTaskRowMissing = errors.New("apply task row not found on re-read")
 
+// ErrTaskRequeueRefused is returned by a resume whose write putting a
+// failed_retryable task back to pending for a retry, or a stopped task back to
+// pending for a start, did not land. Driving on would run the task's DDL while
+// storage records it at rest, so the drive exits without starting anything and
+// the next claim repeats the requeue. A retry's claim spends one of the
+// apply's recovery attempts, so that loop ends with the recovery budget; a
+// start's claim spends none, so the request stays pending until the write
+// lands. The operator counts every exit under its own resume failure reason,
+// so a requeue that keeps being refused is visible rather than one warning per
+// claim.
+var ErrTaskRequeueRefused = errors.New("task requeue refused")
+
 var (
 	// ErrPullSchemaUnsupportedType marks a pull request for a database type that
 	// the data plane does not yet support.

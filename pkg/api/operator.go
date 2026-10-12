@@ -2311,6 +2311,19 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 			}
 			return false, err
 		}
+		if errors.Is(err, tern.ErrTaskRequeueRefused) && ctx.Err() == nil {
+			// The drive could not put a task back to pending, so it started
+			// nothing and the apply stays as it was claimed. The next claim
+			// repeats the requeue; this reason makes a requeue that storage
+			// keeps refusing visible as a rate rather than one warning per claim.
+			logger.Error("operator: could not requeue the apply's tasks for the resume; nothing was started and the next claim retries the requeue",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "task_requeue_refused")
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			logger.Debug("operator: stopped while running claimed apply",
 				"error", err)
