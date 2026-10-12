@@ -169,18 +169,15 @@ func cancelAttemptMayHaveActed(signalErr error, callerGaveUp bool) bool {
 
 // cancelSignalNotSent reports whether a CancelBuild error positively says no
 // signal was sent to the build backend: no build was tracked, the server
-// showed no statement running on its backend, or the backend's state was
-// hidden so none was sent blind.
-//
-// The set is not exhaustive. The tracker also sends nothing when the caller
-// has given up by the time it holds its poll lock, but it reports that as a
-// wrapped context error, which cannot be told apart from a signal that timed
-// out after it was sent; that case is therefore read as possibly signalled.
-// A typed not-dispatched outcome from the tracker would close the gap.
+// showed no statement running on its backend, the backend's state was hidden
+// so none was sent blind, or the caller gave up before the signal was
+// dispatched. A bare context error is not in the set: it can come back after
+// the signal was sent, so it is read as possibly signalled.
 func cancelSignalNotSent(err error) bool {
 	return errors.Is(err, progress.ErrNoActiveBuild) ||
 		errors.Is(err, progress.ErrBuildNotRunning) ||
-		errors.Is(err, progress.ErrBuildUnobservable)
+		errors.Is(err, progress.ErrBuildUnobservable) ||
+		errors.Is(err, progress.ErrCancelNotDispatched)
 }
 
 // cancelRequested reports whether a Cancel may have acted on the apply, or is
