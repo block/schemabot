@@ -1217,6 +1217,84 @@ func TestResumeApplyWithTasks_FailedTaskWhoseStatementLandedKeepsItsVerdict(t *t
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 }
 
+// The same re-claim, but the failed task's table has left the re-plan diff
+// entirely: live already matches the reviewed target for it, so the re-plan
+// would otherwise read the table as done. The stored failure still decides the
+// apply, the task stays failed, the task behind it is cancelled, and nothing
+// reaches the engine.
+func TestResumeApplyWithTasks_FailedTaskWhoseTableLeftTheDiffKeepsItsVerdict(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	failed, pending := tasks[0], tasks[1]
+	failed.TableName = "orders"
+	failed.DDL = "ALTER TABLE `orders` ADD COLUMN `email` varchar(255)"
+	failed.State = state.Task.Failed
+	failed.ErrorMessage = "lost connection to the target during cutover"
+	pending.State = state.Task.Pending
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	stored, err := applies.Get(t.Context(), apply.ID)
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, stored.State)
+	assert.Equal(t, "table orders failed: lost connection to the target during cutover", stored.ErrorMessage)
+	assert.Equal(t, state.Task.Failed, failed.State, "a table that left the diff does not settle its failed task completed")
+	assert.Equal(t, state.Task.Cancelled, pending.State, "the task behind a permanent failure does not run")
+	assert.Empty(t, eng.applied, "nothing reaches the engine after a permanent failure")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
+// An apply paused for operator retry holds a permanently failed task ahead of
+// a task that never ran, and an operator's start admits the claim. The stored
+// failure is the first thing the sequential drive would read, so the apply
+// fails from it without resuming anything, and the start is answered with that
+// failure rather than reported completed over a resume that never happened
+// (CO-2). The task behind the failure is cancelled, as on every sequential
+// failure.
+func TestResumeApplyWithTasks_FailedTaskAheadOfPendingTaskAnswersTheAdmittingStart(t *testing.T) {
+	logs := &mockApplyLogStore{}
+	taskStore := &exactProgressTaskStore{}
+	c, eng, apply, applies, tasks := newLandedSiblingResume(t, taskStore, logs)
+	plan := &storage.Plan{ID: 5}
+	apply.PlanID = plan.ID
+	apply.State = state.Apply.FailedRetryable
+	applies.stored = *apply
+	store := c.storage.(*exactProgressStorage)
+	store.plans = &fakePlanStore{getByIDFn: func(int64) (*storage.Plan, error) { return plan, nil }}
+	requests := pendingControlRequestStore(apply.ID, storage.ControlOperationStart)
+	store.controlRequests = requests
+	failed, pending := tasks[0], tasks[1]
+	failed.State = state.Task.Failed
+	failed.ErrorMessage = "lost connection to the target during cutover"
+	pending.State = state.Task.Pending
+	taskStore.tasks = tasks
+	observer := &terminalRecordingObserver{}
+	c.SetObserver(apply.ID, observer)
+
+	require.NoError(t, c.resumeApplyWithTasks(t.Context(), apply, nil, tasks, nil, false, false))
+
+	assert.Equal(t, state.Apply.Failed, applies.stored.State)
+	assert.Equal(t, "table users failed: lost connection to the target during cutover", applies.stored.ErrorMessage)
+	require.Len(t, requests.requests, 1)
+	assert.Equal(t, storage.ControlRequestFailed, requests.requests[0].Status,
+		"the start that admitted the claim is answered with the failure, not reported completed")
+	assert.Contains(t, requests.requests[0].ErrorMessage, "lost connection to the target during cutover")
+	assert.Equal(t, state.Task.Cancelled, pending.State, "the task behind a permanent failure does not run")
+	assert.Empty(t, eng.applied, "nothing reaches the engine after a permanent failure")
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
 // A landed-statement settlement on the sequential path is only real once the
 // task row's completed state durably lands. When the task store refuses the
 // write — a lease-guarded update that lost the drive's lease to a peer — the

@@ -1674,6 +1674,13 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		c.logApplyPausedForRetry(ctx, apply, previousState, apply.ErrorMessage)
 	}
 	if state.IsTerminalApplyState(apply.State) {
+		// A start still pending here admitted a claim that read a stored
+		// failure before it resumed anything; a start the drive completed
+		// when it handed the engine work is no longer pending and stays as
+		// answered.
+		if state.IsState(apply.State, state.Apply.Failed) {
+			c.failPendingStartForFailedApply(ctx, logger, apply, apply.ErrorMessage)
+		}
 		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 	}
 	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)

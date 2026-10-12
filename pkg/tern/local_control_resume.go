@@ -775,19 +775,25 @@ func (c *LocalClient) drainEngineForDrive(ctx context.Context, apply *storage.Ap
 
 // replanResult holds the result of replanAndFilterTasks.
 type replanResult struct {
-	// ActiveTasks are tasks that still need changes. Each carries the DDL the
-	// re-plan would now run and, where the re-plan refuses that statement,
-	// the blocked verdict it reached.
+	// ActiveTasks are the tasks the drive still has to weigh, in drive order.
+	// A task that still needs changes carries the DDL the re-plan would now
+	// run and, where the re-plan refuses that statement, the blocked verdict
+	// it reached. A task a previous drive failed permanently is kept exactly
+	// as stored, with its reviewed DDL, for the drive to read as the apply's
+	// verdict; it needs no change, so the count of active tasks is not a
+	// count of remaining work.
 	ActiveTasks []*storage.Task
 	// CompletedCount is the number of tasks marked completed (no longer in diff).
 	CompletedCount int64
 }
 
 // replanAndFilterTasks re-plans against the current DB state to determine which
-// tasks still need changes. Tasks whose tables no longer appear in the diff are
-// marked completed. Remaining tasks get their DDL updated from the re-plan result.
-// Used by both Start() and ResumeApply() to handle tables that completed before
-// stop or crash.
+// tasks still need changes. Tasks whose tables no longer appear in the diff, or
+// whose own statement already landed, are marked completed. Remaining tasks get
+// their DDL updated from the re-plan result. A task a previous drive failed
+// permanently is neither settled nor re-planned: it stays active as stored for
+// the drive to read as the apply's verdict. Used by the resume paths that pick
+// up an apply whose tables may have completed before a stop or crash.
 func (c *LocalClient) replanAndFilterTasks(ctx context.Context, apply *storage.Apply, tasks []*storage.Task, plan *storage.Plan) (*replanResult, error) {
 	replanOut, err := c.planWithEngine(ctx, &ternv1.PlanRequest{
 		IgnoreTables:    plan.IgnoreTables(),
@@ -2470,6 +2476,25 @@ func (c *LocalClient) failedTaskDecidingResume(apply *storage.Apply, tasks []*st
 	return failedTaskDecidingOutcome(tasks, c.usesGroupedApply(apply, options))
 }
 
+// storedFailureAheadOfWork returns the task a previous drive failed permanently
+// when a sequential drive would read it before handing any task to the engine:
+// every task ahead of it in drive order is already terminal. It returns nil
+// when no task is failed or when a task that still has to run comes first. A
+// failed task found this way is the apply's verdict before the resume does
+// anything, so the start that admitted the claim is answered with that failure
+// rather than completed over a resume that never resumed.
+func storedFailureAheadOfWork(tasks []*storage.Task) *storage.Task {
+	for _, task := range tasks {
+		if state.IsState(task.State, state.Task.Failed) {
+			return task
+		}
+		if !state.IsTerminalTaskState(task.State) {
+			return nil
+		}
+	}
+	return nil
+}
+
 // tasksShareOneOperation reports whether every task belongs to the same
 // operation, so a failed task among them is that operation's outcome. Tasks
 // that name no operation are one operation's work.
@@ -2844,7 +2869,18 @@ func (c *LocalClient) resumeApplyWithTasks(ctx context.Context, apply *storage.A
 			return c.handleGroupedResumeFailure(ctx, apply, activeTasks, err)
 		}
 	} else {
-		// Sequential mode: process each task one at a time
+		// Sequential mode: process each task one at a time.
+		//
+		// A permanent failure a previous drive stored, with nothing left to run
+		// ahead of it, is the first thing the drive would read, so the apply
+		// fails from it here without being written running or resuming
+		// anything: finalization cancels the tasks behind it and answers the
+		// admitting start with the failure instead of reporting it completed.
+		if failed := storedFailureAheadOfWork(activeTasks); failed != nil {
+			logger.Warn("a stored task failure is the first thing the sequential resume would read; recording the apply failed from it without resuming",
+				append(apply.MutableLogAttrs(), "failed_task_id", failed.TaskIdentifier, "table", failed.TableName)...)
+			return c.finalizeSequentialApply(ctx, apply, activeTasks, failed, false)
+		}
 		now := time.Now()
 		apply.State = state.Apply.Running
 		apply.UpdatedAt = now

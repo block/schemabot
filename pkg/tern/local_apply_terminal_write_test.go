@@ -298,6 +298,33 @@ func TestTasksShareOneOperation(t *testing.T) {
 	}
 }
 
+// A stored permanent failure is the sequential drive's first read only when
+// every task ahead of it in drive order is already terminal; a task that still
+// has to run first, or a retryable pause, leaves the drive to resume as usual.
+func TestStoredFailureAheadOfWork(t *testing.T) {
+	failed := &storage.Task{TaskIdentifier: "task_failed", State: state.Task.Failed}
+	pending := &storage.Task{TaskIdentifier: "task_pending", State: state.Task.Pending}
+	cancelled := &storage.Task{TaskIdentifier: "task_cancelled", State: state.Task.Cancelled}
+	retryable := &storage.Task{TaskIdentifier: "task_retryable", State: state.Task.FailedRetryable}
+	cases := []struct {
+		name  string
+		tasks []*storage.Task
+		want  *storage.Task
+	}{
+		{name: "no tasks", want: nil},
+		{name: "failed task first", tasks: []*storage.Task{failed, pending}, want: failed},
+		{name: "failed task behind a settled task", tasks: []*storage.Task{cancelled, failed, pending}, want: failed},
+		{name: "failed task behind work that still has to run", tasks: []*storage.Task{pending, failed}, want: nil},
+		{name: "retryable pause is not a verdict", tasks: []*storage.Task{retryable, failed}, want: nil},
+		{name: "only work left", tasks: []*storage.Task{pending, pending}, want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Same(t, tc.want, storedFailureAheadOfWork(tc.tasks))
+		})
+	}
+}
+
 // An apply paused for operator retry over a task row that is already failed is
 // retried by an operator's start. The claim is admitted and the failed task
 // decides the outcome: the apply fails from it, and the start that admitted
