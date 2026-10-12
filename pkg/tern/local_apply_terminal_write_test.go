@@ -1160,6 +1160,123 @@ func (o *progressRecordingObserver) OnProgress(apply *storage.Apply, _ []*storag
 	o.progress = append(o.progress, &cp)
 }
 
+// lostReplyApplyStore commits every apply write and then reports err, modelling
+// a write whose acknowledgement was lost when the connection dropped.
+type lostReplyApplyStore struct {
+	*snapshotApplyStore
+	err error
+}
+
+func (s *lostReplyApplyStore) Update(ctx context.Context, apply *storage.Apply) error {
+	if err := s.snapshotApplyStore.Update(ctx, apply); err != nil {
+		return err
+	}
+	return s.err
+}
+
+// A grouped drive fails an apply over a failed table while an operator's
+// start and revert are pending. The write recording the apply failed commits,
+// but its reply is lost, so the drive sees an error. Storage holds the
+// failure, so the write landed: the drive answers the start with the failure,
+// settles the revert the failure moots, records the failure in the apply log,
+// and posts the failed summary now, rather than leaving all of it for the
+// next restart's reconciliation.
+func TestFailApplyAndNotify_LandedWriteWithALostReplyOwesItsSideEffects(t *testing.T) {
+	stored := failureLogTestApply(state.Apply.Running, 0)
+	applies := &lostReplyApplyStore{snapshotApplyStore: &snapshotApplyStore{stored: *stored}, err: errors.New("connection reset by peer")}
+	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Running}
+	logs := &mockApplyLogStore{}
+	controlRequests := &testControlRequestStore{requests: []*storage.ApplyControlRequest{
+		{ID: 1, ApplyID: stored.ID, Operation: storage.ControlOperationStart, Status: storage.ControlRequestPending, RequestedBy: "operator"},
+		{ID: 2, ApplyID: stored.ID, Operation: storage.ControlOperationRevert, Status: storage.ControlRequestPending, RequestedBy: "operator"},
+	}}
+	client := &LocalClient{
+		config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies:         applies,
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: controlRequests,
+		},
+		logger: slog.Default(),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(stored.ID, observer)
+
+	drive := *stored
+	err := client.failApplyAndNotify(t.Context(), &drive, []*storage.Task{task}, "engine lost its connection to the target")
+
+	require.NoError(t, err)
+	assert.Equal(t, state.Apply.Failed, applies.stored.State)
+	assert.Equal(t, state.Apply.Failed, drive.State, "the drive adopts the outcome storage holds")
+	require.Len(t, controlRequests.requests, 2)
+	assert.Equal(t, storage.ControlRequestFailed, controlRequests.requests[0].Status, "the admitting start is answered with the failure")
+	assert.Equal(t, storage.ControlRequestCompleted, controlRequests.requests[1].Status, "the failure moots the pending revert")
+	assert.True(t, hasLogMessageContaining(logs.logs, "Apply failed: engine lost its connection to the target"))
+	require.Len(t, observer.terminal, 1)
+	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
+}
+
+// The write recording the apply failed returns an error and storage holds the
+// apply failed, but with another drive's message: that is not this write
+// landing, so the drive does not claim it. It returns the write error and runs
+// none of the failure's side effects, which belong to the writer that stored
+// it.
+func TestFailApplyAndNotify_AnotherDrivesStoredFailureIsNotThisWriteLanding(t *testing.T) {
+	writeErr := errors.New("connection reset by peer")
+	stored := failureLogTestApply(state.Apply.Failed, 0)
+	stored.ErrorMessage = "another drive's failure"
+	applies := &storedThenRefusingApplyStore{stored: *stored, running: true, err: writeErr}
+	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Running}
+	logs := &mockApplyLogStore{}
+	client := &LocalClient{
+		config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+		storage: &exactProgressStorage{
+			applies:         applies,
+			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+			logs:            logs,
+			controlRequests: &testControlRequestStore{},
+		},
+		logger: slog.Default(),
+	}
+	observer := &terminalRecordingObserver{}
+	client.SetObserver(stored.ID, observer)
+
+	drive := *stored
+	drive.State = state.Apply.Running
+	drive.ErrorMessage = ""
+	err := client.failApplyAndNotify(t.Context(), &drive, []*storage.Task{task}, "engine lost its connection to the target")
+
+	require.ErrorIs(t, err, writeErr)
+	assert.Equal(t, state.Apply.Running, drive.State)
+	assert.Empty(t, logs.logs)
+	assert.Empty(t, observer.terminal)
+}
+
+// storedThenRefusingApplyStore reads the apply as running until its first
+// write, which it refuses with err, and as stored from then on, modelling a
+// concurrent writer that settled the apply while this drive's write failed.
+type storedThenRefusingApplyStore struct {
+	storage.ApplyStore
+	stored  storage.Apply
+	running bool
+	err     error
+}
+
+func (s *storedThenRefusingApplyStore) Get(context.Context, int64) (*storage.Apply, error) {
+	cp := s.stored
+	if s.running {
+		cp.State = state.Apply.Running
+		cp.ErrorMessage = ""
+	}
+	return &cp, nil
+}
+
+func (s *storedThenRefusingApplyStore) Update(context.Context, *storage.Apply) error {
+	s.running = false
+	return s.err
+}
+
 // A drive fails or pauses an apply and the write recording it fails. Storage
 // still reports the apply running, so the drive's own copy must not claim
 // otherwise: it is put back to the state storage holds and the write error is
