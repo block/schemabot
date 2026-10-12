@@ -299,8 +299,9 @@ func tablesDeclaredBy(declared map[string]*ternv1.SchemaFiles, namespaces []stri
 // through. Folding errs toward refusing, the safe direction for a guard that
 // lets a missed match drop a table, so on a server that keeps `orders` and
 // `Orders` apart a drop of one is refused while an unselected namespace
-// declares the other. ddl.TableDeclarations deliberately keeps them apart,
-// because a miss there produces a redundant CREATE TABLE the apply refuses.
+// declares the other. ddl.TableDeclarations folds only when told the target
+// does, because there a miss produces a redundant CREATE TABLE the apply
+// refuses, while a fold the target does not make would refuse two real tables.
 func declaredTableKey(table string) string {
 	return strings.ToLower(table)
 }
