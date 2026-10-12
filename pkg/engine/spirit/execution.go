@@ -185,7 +185,7 @@ func (e *Engine) resumeSchemaChange(ctx context.Context, host, username, passwor
 // that statement or a later phase returns early on the cancelled context.
 func (e *Engine) completeSchemaChange(ctx context.Context, logger *slog.Logger, database string) {
 	if ctx.Err() != nil {
-		logger.Info("schema change completed as it was being stopped; recording it completed, since the target holds the whole change",
+		logger.Info("schema change completed after its context was cancelled by a stop, cancel, or shutdown; recording it completed, since the target holds the whole change",
 			"database", database,
 			"reason", ctx.Err(),
 		)
