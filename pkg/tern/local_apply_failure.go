@@ -51,6 +51,10 @@ func (e *postTerminalReconcileError) Error() string {
 
 func (e *postTerminalReconcileError) Unwrap() error { return e.err }
 
+// Is matches ErrPostTerminalReconcile, so a caller outside this package can
+// recognise the failure without depending on its concrete type.
+func (e *postTerminalReconcileError) Is(target error) bool { return target == ErrPostTerminalReconcile }
+
 // driveCancelled reports whether the drive's context has been cancelled, and
 // records in the server log that the apply is being handed back when it has.
 //

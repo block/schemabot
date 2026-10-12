@@ -1114,15 +1114,18 @@ func (s *Service) recoverSingleApplyOperation(ctx context.Context, driverID int,
 			return
 		}
 		var drivePanic *panicsafe.Error
-		if !errors.As(resumeErr, &drivePanic) {
+		if !errors.As(resumeErr, &drivePanic) && !errors.Is(resumeErr, tern.ErrPostTerminalReconcile) {
 			// Transient drive failures leave the operation claimable so a later
 			// poll retries it; resumeClaimedApply already logged the cause.
 			return
 		}
 		// A contained drive panic already failed this operation's tasks and the
-		// parent apply. Fall through so the operation row is persisted from its
-		// now-failed tasks immediately instead of waiting to be re-leased once
-		// its heartbeat goes stale.
+		// parent apply. A drive that stored the apply's terminal outcome and then
+		// could not answer a request after it has settled the schema change, and
+		// nothing re-claims a settled apply to finish that work. Either way, fall
+		// through so the operation row is persisted from its now-terminal tasks
+		// immediately and the post-drive settlement answers the requests the
+		// outcome resolves.
 	}
 
 	// Persist the operation row from its OWN drive outcome — the aggregate of
@@ -1711,14 +1714,14 @@ func (s *Service) markPendingOperationsStopped(ctx context.Context, driverID int
 	return nil
 }
 
-// completePendingControlRequestsIfApplyResolved completes pending stop and
-// cancel control requests once the apply has settled to a terminal state, so
-// the requests do not stay pending forever after the rollout resolves. The
+// completePendingControlRequestsIfApplyResolved settles pending stop, start,
+// and cancel control requests once the apply has settled to a terminal state,
+// so the requests do not stay pending forever after the rollout resolves. The
 // apply is reloaded because the derived-state write operates on a copy and
 // does not mutate the caller's row. A pending stop completes at any terminal
-// state. A pending cancel is handed to the shared settlement, which decides
-// whether the cancel took effect or the schema change outran it, so this path
-// discloses the same outcome as every other drive shape. A still-non-terminal
+// state. A pending start and a pending cancel are handed to the shared
+// settlements, which decide from the stored outcome whether the command took
+// effect, so this path discloses the same outcome as every other drive shape. A still-non-terminal
 // apply resolves only its stop, and only once that stop has reached every
 // operation. No-op when nothing is pending.
 func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Context, driverID int, applyID int64) error {
@@ -1736,7 +1739,11 @@ func (s *Service) completePendingControlRequestsIfApplyResolved(ctx context.Cont
 	if err := s.completePendingRequestForResolvedApply(ctx, driverID, apply, storage.ControlOperationStop); err != nil {
 		return err
 	}
-	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, s.logger.With("driver", driverID), apply)
+	logger := s.logger.With("driver", driverID)
+	if err := tern.SettlePendingStartForResolvedApply(ctx, s.storage, logger, apply); err != nil {
+		return err
+	}
+	return tern.SettlePendingCancelForResolvedApply(ctx, s.storage, logger, apply)
 }
 
 // completeLandedStopForHeldOpenApply completes a pending stop request on an
@@ -2328,6 +2335,18 @@ func (s *Service) resumeClaimedApplyWithOptions(ctx context.Context, driverID in
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			logger.Debug("operator: stopped while running claimed apply",
 				"error", err)
+			if retryableClaim {
+				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
+			}
+			return false, err
+		}
+		if errors.Is(err, tern.ErrPostTerminalReconcile) {
+			// The drive stored the apply's terminal outcome; only an answer owed
+			// after it did not land. The caller's post-drive settlement retries
+			// that answer against the stored outcome.
+			logger.Warn("operator: drive stored the apply's terminal outcome but could not reconcile after it; the post-drive settlement retries the unanswered requests",
+				"error", err)
+			metrics.RecordOperatorResumeFailure(ctx, apply.Database, deployment, apply.Environment, "post_terminal_reconcile")
 			if retryableClaim {
 				metrics.AdjustActiveApplies(ctx, -1, apply.Database, deployment, apply.Environment)
 			}
