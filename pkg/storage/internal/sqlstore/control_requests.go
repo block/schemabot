@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/block/schemabot/pkg/namedlock"
 	"github.com/block/schemabot/pkg/storage"
 	"github.com/block/spirit/pkg/utils"
 )
@@ -19,6 +20,105 @@ type controlRequestStore struct {
 	identity   identityInserter
 	classifier ErrorClassifier
 	dialect    Dialect
+	locker     namedlock.Locker
+}
+
+// strandedControlRequestReaperLockName is the advisory lock that elects one
+// stranded control-request reaper per pass. Instance-wide, like the other
+// reaper locks: the sweep scans every apply's requests in one pass.
+const strandedControlRequestReaperLockName = "schemabot_stranded_control_request_reaper"
+
+// strandedControlRequestSweep identifies the stranded control-request sweep to
+// the shared election wrapper.
+var strandedControlRequestSweep = strandedSweep{
+	lockName: strandedControlRequestReaperLockName,
+	busy:     storage.ErrStrandedControlRequestReaperBusy,
+	subject:  "stranded control requests",
+}
+
+// ListStrandedPending elects one reaper per pass and lists under the lock. See
+// storage.ControlRequestStore for the contract.
+func (s *controlRequestStore) ListStrandedPending(ctx context.Context, limit int) ([]*storage.StrandedControlRequest, error) {
+	return reapUnderElection(ctx, s.db, s.locker, strandedControlRequestSweep,
+		func(ctx context.Context) ([]*storage.StrandedControlRequest, error) {
+			return s.listStrandedPending(ctx, limit)
+		})
+}
+
+// listStrandedPending lists pending control requests on settled, quiescent,
+// unleased applies without electing a reaper. ListStrandedPending is the entry
+// point that holds the lock; this is separate so the listing itself can be
+// exercised on its own.
+//
+// It shares the operation sweep's parent gate and quiescence window: a drive
+// that has just settled an apply may still be running its own post-drive
+// settlement, and the window keeps the reaper's answer from racing it. The
+// lease gate is apply-granular because a control request belongs to the apply
+// rather than to one operation: under a fan-out rollout a sibling drive holding
+// only an operation lease is still a drive of this apply, and its post-drive
+// settlement is the one that should answer the request.
+func (s *controlRequestStore) listStrandedPending(ctx context.Context, limit int) ([]*storage.StrandedControlRequest, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("list stranded control requests: limit must be positive, got %d", limit)
+	}
+
+	parentGate, parentGateArgs := strandedParentGate(s.dialect, "apply_control_requests.apply_id", strandedParentQuiescence)
+
+	selectArgs := []any{storage.ControlRequestPending}
+	selectArgs = append(selectArgs, parentGateArgs...)
+	selectArgs = append(selectArgs, limit)
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT %s
+		FROM apply_control_requests
+		WHERE status = ?
+			AND %s
+			AND %s
+		ORDER BY created_at, id
+		LIMIT ?
+	`, controlRequestColumns, parentGate,
+		undrivenApplyGateCorrelatedOn(s.dialect, "apply_control_requests.apply_id")), selectArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("query stranded control requests: %w", err)
+	}
+	defer utils.CloseAndLog(rows)
+
+	var stranded []*storage.ApplyControlRequest
+	for rows.Next() {
+		req, err := scanControlRequest(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan stranded control request: %w", err)
+		}
+		stranded = append(stranded, req)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read stranded control requests: %w", err)
+	}
+	if len(stranded) == 0 {
+		return nil, nil
+	}
+
+	applyIDs := make([]int64, 0, len(stranded))
+	for _, req := range stranded {
+		applyIDs = append(applyIDs, req.ApplyID)
+	}
+	parents, err := loadSettledParents(ctx, s.db, applyIDs, "stranded control requests")
+	if err != nil {
+		return nil, err
+	}
+
+	listed := make([]*storage.StrandedControlRequest, 0, len(stranded))
+	for _, req := range stranded {
+		parent, ok := parents[req.ApplyID]
+		if !ok {
+			// The apply was deleted between the two reads (PR cleanup races the
+			// reaper). Its requests go with it, so there is nothing left to answer.
+			slog.WarnContext(ctx, "apply disappeared while listing a stranded control request; the request is being deleted with it",
+				"operation", req.Operation, "requested_by", req.RequestedBy)
+			continue
+		}
+		listed = append(listed, &storage.StrandedControlRequest{Request: req, Apply: parent})
+	}
+	return listed, nil
 }
 
 func (s *controlRequestStore) RequestPending(ctx context.Context, req *storage.ApplyControlRequest) (*storage.ApplyControlRequest, bool, error) {

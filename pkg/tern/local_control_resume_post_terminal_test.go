@@ -181,6 +181,7 @@ func TestResumeApplyWithTasks_GroupedStartAnswerFailureKeepsTheStoredOutcome(t *
 	var reconcileErr *postTerminalReconcileError
 	require.ErrorAs(t, err, &reconcileErr, "a failure after the stored outcome surfaces as post-terminal reconciliation")
 	require.ErrorIs(t, err, startErr)
+	require.ErrorIs(t, err, ErrPostTerminalReconcile, "the operator recognises the failure by its exported sentinel")
 	assert.Equal(t, state.Apply.Completed, reconcileErr.storedState)
 
 	assert.Equal(t, state.Apply.Completed, r.applies.stored.State, "the stored outcome stands")

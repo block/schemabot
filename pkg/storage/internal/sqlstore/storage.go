@@ -90,7 +90,7 @@ func NewWithDependencies(deps Dependencies) *Storage {
 		applies:         &applyStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		tasks:           &taskStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier},
 		applyLogs:       &applyLogStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity},
-		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect},
+		controlRequests: &controlRequestStore{db: rdb, identity: deps.Identity, classifier: deps.Classifier, dialect: deps.Dialect, locker: deps.Locker},
 		applyComments:   &applyCommentStore{db: rdb, dialect: deps.Dialect},
 		planComments:    &planCommentStore{db: rdb, identity: deps.Identity, dialect: deps.Dialect},
 		applyOperations: &applyOperationStore{db: rdb, dialect: deps.Dialect, identity: deps.Identity, locker: deps.Locker, classifier: deps.Classifier, maxDriversPerApply: maxDriversPerApply},

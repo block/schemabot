@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -98,6 +99,18 @@ import (
 // with no operation a driver is part-way through driving, and then takes the
 // tree whole. It locks every operation and rechecks leases before writing;
 // a fresh retryable lease is protected too. See storage.ApplyStore.ExpireRetryable.
+//
+// The stranded control-request sweep answers pending stop, start, and cancel
+// requests left on a settled apply. A drive answers the requests of the apply it
+// settles, but that answer is a write of its own, made after the verdict is
+// stored; when it fails, the verdict stands and nothing re-claims a settled apply
+// to try again. The sweep reads such requests through
+// storage.ControlRequestStore.ListStrandedPending and hands each apply to the
+// same settlement the drive would have run, so what the operator reads about
+// their command is the same whichever writer answered it. The sweep shape is
+// the same as above: its own election lock, the operation sweep's quiescence
+// window, and the apply-granular lease gate, so a sibling drive still working
+// under a settled fan-out parent keeps the answer for itself.
 
 // StrandedReaperInterval is how often the reaper runs a pass. Override with
 // SetStrandedReaperInterval.
@@ -186,7 +199,7 @@ func (s *Service) reaperLoop(ctx context.Context, stop <-chan struct{}, interval
 	}
 }
 
-// runStrandedReaperPass runs one pass over the three kinds of dead row. It is
+// runStrandedReaperPass runs one pass over the four kinds of dead row. It is
 // best-effort maintenance: a storage error is logged and recorded, and the next
 // pass retries. Losing the election is the expected outcome on every instance
 // but one, so it is not an error.
@@ -201,6 +214,7 @@ func (s *Service) runStrandedReaperPass(ctx context.Context) {
 	sweeps.Go(func() { s.reapStrandedOperations(ctx) })
 	sweeps.Go(func() { s.reapStrandedRetryableTasks(ctx) })
 	sweeps.Go(func() { s.reapStrandedActiveTasks(ctx) })
+	sweeps.Go(func() { s.reapStrandedControlRequests(ctx) })
 	sweeps.Wait()
 }
 
@@ -229,6 +243,11 @@ var (
 		busy:          storage.ErrStrandedActiveTaskReaperBusy,
 		subject:       "stranded active tasks",
 		failureReason: "stranded_active_task_reaper_error",
+	}
+	strandedControlRequestSweep = reapSweep{
+		busy:          storage.ErrStrandedControlRequestReaperBusy,
+		subject:       "stranded control requests",
+		failureReason: "stranded_control_request_reaper_error",
 	}
 	retryableExpirySweep = reapSweep{
 		busy:          storage.ErrRetryableExpiryBusy,
@@ -385,4 +404,65 @@ func (s *Service) reapStrandedActiveTasks(ctx context.Context) {
 	}
 
 	s.recordSweepOutcome(ctx, strandedActiveTaskSweep, len(reaped), err)
+}
+
+// reaperLogger is the identity the reaper settles under, in place of a driver
+// id, so a settlement line names which writer answered.
+func (s *Service) reaperLogger() *slog.Logger {
+	return s.logger.With("reaper", "stranded_control_requests")
+}
+
+// reapStrandedControlRequests answers pending control requests left on settled
+// applies, running the same post-drive settlement a drive would have run.
+//
+// The storage read lists requests, but the settlement runs per apply: it reloads
+// the apply and reads the pending requests itself, deciding each one's outcome
+// from the stored state, so the sweep only has to name which applies to visit.
+// Settlements are logged by the settlement itself and not counted here: they
+// are the rare residue of a storage failure that outlived a drive, so a rate
+// would read zero for weeks.
+//
+// Each apply is settled by its own committed writes, so a failure part-way
+// through leaves the earlier settlements in place and surfaces the error for
+// the next pass to retry the rest.
+func (s *Service) reapStrandedControlRequests(ctx context.Context) {
+	requests := s.storage.ControlRequests()
+	if requests == nil {
+		s.recordSweepOutcome(ctx, strandedControlRequestSweep, 0,
+			fmt.Errorf("list stranded control requests: control request store is not available"))
+		return
+	}
+	stranded, err := requests.ListStrandedPending(ctx, strandedReaperBatch)
+	if err != nil {
+		s.recordSweepOutcome(ctx, strandedControlRequestSweep, 0, err)
+		return
+	}
+	settled, err := s.settleStrandedControlRequests(ctx, stranded)
+	s.recordSweepOutcome(ctx, strandedControlRequestSweep, settled, err)
+}
+
+// settleStrandedControlRequests runs the post-drive settlement once per
+// distinct apply among the listed requests, in listing order, and reports how
+// many applies it settled before the first failure.
+func (s *Service) settleStrandedControlRequests(ctx context.Context, stranded []*storage.StrandedControlRequest) (int, error) {
+	logger := s.reaperLogger()
+	visited := make(map[int64]bool, len(stranded))
+	settled := 0
+	for _, entry := range stranded {
+		apply, req := entry.Apply, entry.Request
+		logger.Info("operator: reaping a control request stranded on a settled apply; no drive is left to answer it",
+			append(apply.LogAttrs(),
+				"operation", req.Operation,
+				"requested_by", req.RequestedBy,
+				"requested_at", req.CreatedAt)...)
+		if visited[apply.ID] {
+			continue
+		}
+		visited[apply.ID] = true
+		if err := s.completePendingControlRequestsIfApplyResolved(ctx, logger, apply.ID); err != nil {
+			return settled, fmt.Errorf("settle control requests stranded on apply %s: %w", apply.ApplyIdentifier, err)
+		}
+		settled++
+	}
+	return settled, nil
 }
