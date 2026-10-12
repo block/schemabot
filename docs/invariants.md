@@ -775,8 +775,9 @@ elected reaper, so every write either goes through this resolution or is a reape
 no driver is touching. *Enforced:* the forward-only state resolution
 the drive loop reconciles through (`taskStateWithNoBackwardProgress`,
 `pkg/tern/local_client.go`), and the resume's reading of a settled failed task as the apply's
-outcome rather than as work to re-plan (`failedTaskDecidingOutcome`,
-`pkg/tern/local_control_resume.go`).
+outcome rather than as work to re-plan (`failedTaskDecidingOutcome` and `replanAndFilterTasks`,
+`pkg/tern/local_control_resume.go`; `checkTaskReady`, `pkg/tern/local_apply_sequential.go`, where
+the sequential drive reads the kept failed row as the verdict).
 
 ### ST-5: Unknown engine states are visible and blocking
 
