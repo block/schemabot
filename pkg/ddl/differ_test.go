@@ -136,3 +136,23 @@ func TestDiffStatements_ParseError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "SQL syntax error")
 }
+
+// The differ is handed two definitions of one desired table, the way a caller
+// that skipped TableDeclarations would. It refuses rather than keeping either
+// definition: a plan built from one of them would silently drop every column
+// only the other declares.
+func TestDiffStatements_DesiredTableDeclaredTwice(t *testing.T) {
+	d := NewDiffer()
+
+	current := []string{"CREATE TABLE orders (id INT PRIMARY KEY, email VARCHAR(255))"}
+	desired := []string{
+		"CREATE TABLE orders (id INT PRIMARY KEY, email VARCHAR(255), status VARCHAR(16))",
+		"CREATE TABLE orders (id INT PRIMARY KEY, email VARCHAR(255))",
+	}
+
+	result, err := d.DiffStatements(current, desired)
+	require.Error(t, err)
+	assert.Nil(t, result)
+	assert.Contains(t, err.Error(), `"orders"`)
+	assert.Contains(t, err.Error(), "more than once")
+}
