@@ -2150,12 +2150,14 @@ func (c *LocalClient) markApplyStopped(ctx context.Context, applyID int64) error
 		return nil
 	}
 
+	previousState := apply.State
 	apply.State = state.Apply.Stopped
 	apply.CompletedAt = nil
 	apply.UpdatedAt = time.Now()
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("mark apply %s stopped: %w", apply.ApplyIdentifier, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	return nil
 }
 
@@ -2181,13 +2183,38 @@ func (c *LocalClient) markApplyCancelled(ctx context.Context, applyID int64) err
 		return fmt.Errorf("mark apply %s cancelled: %s", apply.ApplyIdentifier, revertPhaseControlRejectionMessage(apply.ApplyIdentifier, apply.State))
 	}
 	now := time.Now()
+	previousState := apply.State
 	apply.State = state.Apply.Cancelled
 	apply.CompletedAt = &now
 	apply.UpdatedAt = now
 	if err := c.storage.Applies().Update(ctx, apply); err != nil {
 		return fmt.Errorf("mark apply %s cancelled: %w", apply.ApplyIdentifier, err)
 	}
+	adjustActiveAppliesForTransition(ctx, apply, previousState)
 	return nil
+}
+
+// countedAsActiveApply reports whether an apply in applyState is counted on the
+// active-apply gauge. An apply is counted from acceptance until it settles,
+// stopped included: a stopped apply is still an apply in progress, waiting on
+// an operator's start or cancel. A retryable pause is the exception, released
+// when the apply pauses and counted again when a driver reclaims it.
+func countedAsActiveApply(applyState string) bool {
+	return !state.IsState(applyState, state.SettledApplyStates...) &&
+		!state.IsState(applyState, state.Apply.FailedRetryable)
+}
+
+// adjustActiveAppliesForTransition moves the active-apply gauge for a stored
+// transition from previousState to apply.State, read from storage rather than
+// from a drive's snapshot: it releases the apply when the transition leaves the
+// counted states and counts it again when the transition re-enters them.
+func adjustActiveAppliesForTransition(ctx context.Context, apply *storage.Apply, previousState string) {
+	switch was, is := countedAsActiveApply(previousState), countedAsActiveApply(apply.State); {
+	case was && !is:
+		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+	case !was && is:
+		metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
+	}
 }
 
 // settleControlForCompletedEngineChange terminalizes a stop or cancel that the

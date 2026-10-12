@@ -4176,7 +4176,12 @@ func (c *GRPCClient) persistTerminalStateFromRemote(ctx context.Context, storedA
 	}
 	c.logApplyStateTransition(ctx, storedApply, remoteTerminalApplyLogLevel(storedApply), remoteTerminalApplyLogMessage(storedApply), oldState)
 	*remoteApply = *storedApply
-	metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
+	// A stopped apply stays counted until it settles (countedAsActiveApply), so
+	// the start that resumes it owes no re-count and its outcome releases it
+	// once.
+	if !state.IsState(storedApply.State, state.Apply.Stopped) {
+		metrics.AdjustActiveApplies(ctx, -1, storedApply.Database, storedApply.Deployment, storedApply.Environment)
+	}
 	return nil
 }
 

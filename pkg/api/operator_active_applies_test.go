@@ -177,6 +177,37 @@ func TestUpdateApplyStateFromOperations_ActiveAppliesAccounting(t *testing.T) {
 		assert.False(t, ok, "a CAS that loses the race must not adjust the gauge")
 	})
 
+	t.Run("a stopped multi-operation rollout stays counted until it settles", func(t *testing.T) {
+		// A stopped rollout is still in progress: it waits on an operator's
+		// start or cancel. Stopping it leaves the gauge alone, resuming it
+		// re-counts nothing, and the cancel that settles it releases it once.
+		reader := installManualMeterReader(t)
+		stopOps := &listingApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, State: state.ApplyOperation.Stopped},
+			{ID: 2, State: state.ApplyOperation.Stopped},
+		}}
+		stopStore := &recordingApplyStore{swapped: true}
+		_, err := newOperatorStateTestService(stopOps, stopStore).updateApplyStateFromOperations(t.Context(), 1, newApply(state.Apply.Running), allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+		require.NotNil(t, stopStore.updated)
+		require.Equal(t, state.Apply.Stopped, stopStore.updated.State)
+		_, ok := activeAppliesValue(t, reader, database, deployment, environment)
+		assert.False(t, ok, "stopping a rollout must leave it counted")
+
+		cancelOps := &listingApplyOperationStore{ops: []*storage.ApplyOperation{
+			{ID: 1, State: state.ApplyOperation.Cancelled},
+			{ID: 2, State: state.ApplyOperation.Cancelled},
+		}}
+		cancelStore := &recordingApplyStore{swapped: true}
+		_, err = newOperatorStateTestService(cancelOps, cancelStore).updateApplyStateFromOperations(t.Context(), 1, newApply(state.Apply.Stopped), allowLeaseScopedFailedReopen)
+		require.NoError(t, err)
+		require.NotNil(t, cancelStore.updated)
+		require.Equal(t, state.Apply.Cancelled, cancelStore.updated.State)
+		value, ok := activeAppliesValue(t, reader, database, deployment, environment)
+		require.True(t, ok, "the cancel that settles a stopped rollout must release it")
+		assert.Equal(t, int64(-1), value)
+	})
+
 	t.Run("continuable reopen re-increments the gauge", func(t *testing.T) {
 		reader := installManualMeterReader(t)
 		applyStore := &recordingApplyStore{swapped: true}

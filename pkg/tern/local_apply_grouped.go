@@ -1224,7 +1224,10 @@ func (c *LocalClient) handleAtomicProgressTick(ctx context.Context, eng engine.E
 			return true
 		}
 		c.settleRequestsForStoredOutcome(ctx, logger, apply)
-		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+		// A stopped apply stays counted until it settles (countedAsActiveApply).
+		if !state.IsState(apply.State, state.Apply.Stopped) {
+			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+		}
 		switch {
 		case retryableFailure:
 			logger.Warn("apply paused for operator retry",

@@ -3176,16 +3176,19 @@ func (s *Service) updateApplyStateFromOperations(ctx context.Context, driverID i
 	// enqueue-time increment is keyed to the parent's primary deployment, and
 	// operation-lease-only drives suppress the parent-level metric, so the
 	// projection that wins the parent transition is the single point that must
-	// release it: -1 when the rollout first reaches a terminal state, and +1
-	// if a held rollout reopens the parent to keep it running, so the
-	// gauge tracks whether the apply is still in flight. A legacy
+	// release it: -1 when the rollout first settles, and +1 if a held rollout
+	// reopens a settled parent to keep it running, so the gauge tracks whether
+	// the apply is still in flight. A stopped rollout is not settled and stays
+	// counted until it is resumed to an outcome or cancelled. A legacy
 	// single-operation apply keeps decrementing in its direct parent-lease
 	// drive and is left untouched here.
 	if projectionOwnsActiveAppliesGauge(apply, ops) {
+		wasSettled := state.IsState(apply.State, state.SettledApplyStates...)
+		isSettled := state.IsState(derived, state.SettledApplyStates...)
 		switch {
-		case !state.IsTerminalApplyState(apply.State) && state.IsTerminalApplyState(derived):
+		case !wasSettled && isSettled:
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
-		case state.IsTerminalApplyState(apply.State) && !state.IsTerminalApplyState(derived):
+		case wasSettled && !isSettled:
 			metrics.AdjustActiveApplies(ctx, 1, apply.Database, apply.Deployment, apply.Environment)
 		}
 	}

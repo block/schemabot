@@ -1683,7 +1683,10 @@ func (c *LocalClient) finalizeSequentialApply(ctx context.Context, apply *storag
 		}
 		c.settleRequestsForStoredOutcome(ctx, logger, apply)
 	}
-	metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+	// A stopped apply stays counted until it settles (countedAsActiveApply).
+	if !state.IsState(apply.State, state.Apply.Stopped) {
+		metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
+	}
 
 	if apply.State == state.Apply.FailedRetryable {
 		if obs := c.getObserver(apply.ID); obs != nil {

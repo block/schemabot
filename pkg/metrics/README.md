@@ -21,7 +21,7 @@ available, such as `repository`, `github_app`, and `installation_id`.
 | `schemabot.source_policy.blocks_total` | Counter | operation, database, environment, reason | Trusted-source plan/apply requests blocked by source policy |
 | `schemabot.pr_command_actor_authorization.total` | Counter | command, database, environment, repository, status, reason | GitHub PR command actor authorization decisions |
 | `schemabot.schema_request.errors_total` | Counter | repository, command, database, environment, reason | Schema request errors by reason |
-| `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies |
+| `schemabot.active_applies` | UpDownCounter | database, environment | In-progress applies: counted from acceptance until the apply settles (a stopped apply stays counted; a retryable pause is not) |
 | `schemabot.check_ownership_misses_total` | Counter | operation, repository, database, database_type, environment | Guarded check updates skipped because ownership changed |
 | `schemabot.promotion.config_error_blocks_total` | Counter | repository, database, environment | Applies blocked because the target environment is absent from the configured promotion order |
 | `schemabot.status_check_operations_total` | Counter | operation, status, repository, database, database_type, environment | Status-check storage and GitHub operations |

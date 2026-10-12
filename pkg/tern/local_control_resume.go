@@ -1400,7 +1400,10 @@ func (c *LocalClient) launchAtomicResume(ctx context.Context, apply *storage.App
 				reconcileErr = &postTerminalReconcileError{storedState: terminalState, err: err}
 			}
 		}
-		if !state.IsTerminalApplyState(oldApplyState) {
+		// The drive's snapshot of a stopped apply it was started on is still
+		// counted (countedAsActiveApply), so only a settled snapshot was released
+		// already, and a stopped outcome stays counted.
+		if !state.IsState(oldApplyState, state.SettledApplyStates...) && !state.IsState(terminalState, state.Apply.Stopped) {
 			metrics.AdjustActiveApplies(ctx, -1, apply.Database, apply.Deployment, apply.Environment)
 		}
 		c.logApplyEvent(ctx, apply.ID, nil, storage.LogLevelInfo, storage.LogEventStateTransition, storage.LogSourceSchemaBot,
