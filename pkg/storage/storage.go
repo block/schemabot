@@ -1035,7 +1035,9 @@ type TaskStore interface {
 	// discovered via SHOW VITESS_MIGRATIONS). It requires the operation lease on
 	// the context: the single lease-holding operator is the only writer of an
 	// operation's per-shard rows, so the lookup-then-write is serialized by that
-	// lease and needs no unique constraint. A displaced operator (lost lease)
+	// lease. The store also assigns a new row's TaskIdentifier from its key, so
+	// storage itself refuses a second row for the same shard; the caller's
+	// TaskIdentifier is not used for a shard row. A displaced operator (lost lease)
 	// fails closed with ErrApplyLeaseLost. On conflict the row is rewritten
 	// through Update: identity is preserved, and the statement text follows
 	// the caller's task like every other mutable column.

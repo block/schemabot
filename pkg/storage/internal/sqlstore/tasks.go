@@ -4,12 +4,15 @@ package sqlstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -315,12 +318,13 @@ func (s *taskStore) Update(ctx context.Context, task *storage.Task) error {
 // drive holds only the apply lease. Either is a sufficient single-writer
 // guarantee for this operation's per-shard rows, so accept both, preferring the
 // operation lease when present (it is the narrower claim). The lookup-then-write
-// is serialized by that lease without a database-level unique constraint, and
-// the insert is gated on the matching lease token so a displaced operator fails
-// closed (ErrApplyLeaseLost) instead of writing stale rows. The update path
-// reuses the lease-guarded Update, which applies the same lease precedence. On
-// conflict identity is preserved and the statement text follows the caller's
-// task like every other mutable column.
+// is serialized by that lease, and a new row's identifier is derived from its
+// key (shardTaskIdentifier), so the unique index on task_identifier also
+// refuses a second row for the same shard. The insert is gated on the matching
+// lease token so a displaced operator fails closed (ErrApplyLeaseLost) instead
+// of writing stale rows. The update path reuses the lease-guarded Update, which
+// applies the same lease precedence. On conflict identity is preserved and the
+// statement text follows the caller's task like every other mutable column.
 func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task) error {
 	canonicalizeTaskIdentity(task)
 
@@ -358,14 +362,13 @@ func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task)
 		return fmt.Errorf("upsert shard progress for operation %d table %q requires a non-empty shard", *task.ApplyOperationID, task.TableName)
 	}
 
-	// Find the existing per-shard row under this operation. The lookup-then-write
-	// is safe without a unique constraint because the held lease makes the caller
-	// the single writer of this operation's rows.
+	// Find the existing per-shard row under this operation. The held lease makes
+	// the caller the single writer of this operation's rows, and the derived
+	// identifier below backs that with the unique index.
 	var id int64
-	err = s.db.QueryRowContext(ctx, `
-		SELECT id FROM tasks
-		WHERE apply_operation_id = ? AND namespace = ? AND table_name = ? AND shard = ?
-	`, *task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM tasks WHERE `+shardKeyPredicate(s.dialect),
+		*task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
 	switch {
 	case err == nil:
 		// Existing shard row: update its progress fields under the lease guard.
@@ -381,15 +384,79 @@ func (s *taskStore) UpsertShardProgress(ctx context.Context, task *storage.Task)
 		if err := s.verifyOperationBelongsToApply(ctx, *task.ApplyOperationID, task.ApplyID); err != nil {
 			return err
 		}
+		// The row's identifier is derived from its key, so the unique index on
+		// task_identifier admits one row per (operation, namespace, table,
+		// shard) whatever the writers do. A second insert for the same key
+		// means a row appeared since the lookup above; it is not written
+		// twice, and its existing row is updated instead.
+		task.TaskIdentifier = shardTaskIdentifier(*task.ApplyOperationID, task.Namespace, task.TableName, task.Shard)
 		// Insert gated on the held lease so a displaced operator fails closed.
+		var insertErr error
 		if hasOpLease {
-			return s.insertShardTaskGuarded(ctx, task, opLease)
+			insertErr = s.insertShardTaskGuarded(ctx, task, opLease)
+		} else {
+			insertErr = s.insertShardTaskGuardedByApply(ctx, task, applyLease)
 		}
-		return s.insertShardTaskGuardedByApply(ctx, task, applyLease)
+		if insertErr == nil || !s.classifier.IsDuplicateKey(insertErr) {
+			return insertErr
+		}
+		return s.updateShardTaskAfterDuplicateInsert(ctx, task, insertErr)
 	default:
 		return fmt.Errorf("look up shard task for operation %d %s.%s shard %q: %w",
 			*task.ApplyOperationID, task.Namespace, task.TableName, task.Shard, err)
 	}
+}
+
+// shardKeyPredicate matches a per-shard task row by its key: operation,
+// namespace, table and shard, binding them in that order. The names compare
+// exactly on every dialect (BinaryEquals): MySQL's table default collation is
+// case- and accent-insensitive, and shardTaskIdentifier hashes the exact
+// bytes, so a looser lookup would treat `users` and `Users` as one shard while
+// their identifiers differ. Exact is also what the engine reports: on a
+// target that keeps `users` and `Users` apart they are two tables.
+func shardKeyPredicate(d Dialect) string {
+	return "apply_operation_id = ? AND " + d.BinaryEquals("namespace") +
+		" AND " + d.BinaryEquals("table_name") + " AND " + d.BinaryEquals("shard")
+}
+
+// shardTaskIdentifier derives a per-shard task row's identifier from the key
+// UpsertShardProgress looks it up by. Deriving it rather than drawing a random
+// one is what makes the existing unique index on task_identifier refuse a
+// second row for the same shard. The key's parts are hashed rather than
+// concatenated so the identifier fits the column for any table and shard
+// name, and each part is written with its length so two keys cannot share a
+// hash input whatever bytes their names hold.
+func shardTaskIdentifier(operationID int64, namespace, table, shard string) string {
+	var key strings.Builder
+	for _, part := range []string{namespace, table, shard} {
+		key.WriteString(strconv.Itoa(len(part)))
+		key.WriteByte(':')
+		key.WriteString(part)
+	}
+	sum := sha256.Sum256([]byte(key.String()))
+	return fmt.Sprintf("shard-%d-%s", operationID, hex.EncodeToString(sum[:]))
+}
+
+// updateShardTaskAfterDuplicateInsert handles a shard insert the unique index
+// refused: the row for this key was written after UpsertShardProgress looked
+// it up. It reads that row back by its identifier and its full key, and
+// writes the caller's progress through the lease-guarded Update, so the shard
+// keeps one row. A row holding the identifier under a different key is never
+// written over: it is returned as an error with the insert's refusal, as is a
+// row that cannot be found.
+func (s *taskStore) updateShardTaskAfterDuplicateInsert(ctx context.Context, task *storage.Task, insertErr error) error {
+	var id int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM tasks WHERE task_identifier = ? AND `+shardKeyPredicate(s.dialect),
+		task.TaskIdentifier, *task.ApplyOperationID, task.Namespace, nullString(task.TableName), task.Shard).Scan(&id)
+	if err != nil {
+		return fmt.Errorf("re-read shard task %s for operation %d %s.%s shard %q after its insert was refused as a duplicate (%w): %w",
+			task.TaskIdentifier, *task.ApplyOperationID, task.Namespace, task.TableName, task.Shard, insertErr, err)
+	}
+	slog.WarnContext(ctx, "shard progress insert found the shard's row already written; updating that row instead of adding a second",
+		append(task.LogAttrs(), "apply_operation_id", *task.ApplyOperationID, "namespace", task.Namespace, "shard", task.Shard)...)
+	task.ID = id
+	return s.Update(ctx, task)
 }
 
 // verifyOperationBelongsToApply fails closed when apply_operation operationID

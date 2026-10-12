@@ -4537,8 +4537,8 @@ func (c *GRPCClient) syncShardProgressFromRemote(ctx context.Context, storedAppl
 		if state.IsState(shardState, state.Task.Completed) {
 			pct = 100
 		}
+		// The store assigns the shard row's identifier from its key.
 		shardTask := &storage.Task{
-			TaskIdentifier:   engine.NewTaskID(),
 			ApplyID:          storedTask.ApplyID,
 			ApplyOperationID: storedTask.ApplyOperationID,
 			PlanID:           storedTask.PlanID,
