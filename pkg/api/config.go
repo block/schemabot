@@ -230,7 +230,10 @@ type ServerConfig struct {
 	// disables it is a complete opt out. Unset, the default policy applies
 	// (see defaultDirectExecution): enabled, bounded by the table's data and
 	// index footprint. Set enabled: false to leave refused statements blocked
-	// everywhere.
+	// on the databases this server plans. A control plane forwards its policy
+	// with every plan, and the server that runs the statement uses it in place
+	// of its own, so an opt-out stated only on a server that executes plans
+	// sent by a control plane is overridden.
 	DirectExecution *DirectExecutionConfig `yaml:"direct_execution,omitempty"`
 
 	// PlanetScale configures process-wide behavior for the Vitess engine's

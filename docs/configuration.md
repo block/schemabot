@@ -970,6 +970,15 @@ default. An older server rejects the forwarded default as missing its row
 bound, so every MySQL plan and apply it serves fails until it is upgraded.
 Stating a `max_table_rows` policy on the control plane first avoids this.
 
+Between the two upgrades, plans and applies disagree. The older control plane
+forwards no policy, so an upgraded server plans a refused statement as direct
+under its own default. The control plane records that plan as judged under no
+policy, and the apply carries that record, so the server blocks at apply the
+statement the plan showed as direct. To keep the two in agreement, set
+`enabled: false` on the upgraded servers until the control plane is upgraded.
+Once it is, the control plane's policy is the one forwarded, so the setting no
+longer has any effect.
+
 This is the form to reach for on a fleet: a per-database block for every
 database is the same policy written many times, and each copy is one more
 place for the size bounds to drift. It is also what covers a database with no
