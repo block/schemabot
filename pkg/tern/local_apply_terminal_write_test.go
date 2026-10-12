@@ -109,6 +109,72 @@ func TestFinalizeSequentialApply_OutcomeSideEffectsWaitForTheStoredOutcome(t *te
 	}
 }
 
+// A sequential apply's first table failed permanently with a second table still
+// queued behind it. The queued table must be cancelled before the apply is
+// recorded failed: a pending row under a settled apply is work storage still
+// offers to a drive. When storage refuses that cancellation, the drive returns
+// the error with the apply still running and no terminal summary posted, for
+// the next claim to finalize again. Once the write lands, the queued table reads
+// cancelled and the apply failed.
+func TestFinalizeSequentialApply_QueuedTaskCancellationMustLandBeforeTheOutcome(t *testing.T) {
+	cases := []struct {
+		name              string
+		taskUpdateErr     error
+		wantStoredState   string
+		wantQueuedState   string
+		wantTerminalCalls int
+	}{
+		{
+			name:            "cancellation refused",
+			taskUpdateErr:   errors.New("storage unavailable"),
+			wantStoredState: state.Apply.Running,
+			wantQueuedState: state.Task.Pending,
+		},
+		{
+			name:              "cancellation lands",
+			wantStoredState:   state.Apply.Failed,
+			wantQueuedState:   state.Task.Cancelled,
+			wantTerminalCalls: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := failureLogTestApply(state.Apply.Running, 0)
+			failed := &storage.Task{
+				ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders",
+				State: state.Task.Failed, ErrorMessage: "engine refused the statement",
+			}
+			queued := &storage.Task{ID: 2, TaskIdentifier: "task-2", ApplyID: stored.ID, TableName: "users", State: state.Task.Pending}
+			applies := &mockApplyStore{apply: stored}
+			client := &LocalClient{
+				config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+				storage: &mockStorage{
+					applies:         applies,
+					tasks:           &mockTaskStore{tasks: []*storage.Task{failed, queued}, updateErr: tc.taskUpdateErr},
+					logs:            &mockApplyLogStore{},
+					controlRequests: &testControlRequestStore{},
+				},
+				logger: slog.Default(),
+			}
+			observer := &terminalRecordingObserver{}
+			client.SetObserver(stored.ID, observer)
+
+			drive := *stored
+			err := client.finalizeSequentialApply(t.Context(), &drive, []*storage.Task{failed, queued}, failed, false)
+
+			if tc.taskUpdateErr != nil {
+				require.ErrorIs(t, err, tc.taskUpdateErr)
+				assert.Contains(t, err.Error(), "apply-7", "the error names the apply the drive could not finalize")
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.wantStoredState, applies.apply.State)
+			assert.Equal(t, tc.wantQueuedState, queued.State)
+			assert.Len(t, observer.terminal, tc.wantTerminalCalls)
+		})
+	}
+}
+
 // A previous drive settled every task of an apply but exited before it could
 // record the apply's outcome, so the apply was re-claimed still running with an
 // operator's revert pending. The re-claim finds no remaining work and records

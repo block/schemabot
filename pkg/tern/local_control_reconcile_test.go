@@ -1,6 +1,7 @@
 package tern
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"testing"
@@ -216,6 +217,34 @@ func TestReconcileEngineTerminalTruth_AdoptsFailedAndMootsStop(t *testing.T) {
 	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationStop)
 	require.NoError(t, err)
 	assert.Nil(t, controlReq)
+}
+
+// The engine's backend already completed the change, but storage refuses the
+// write adopting that outcome onto the task. The apply's outcome is recorded
+// only over task rows that carry it, so the drive returns the error with the
+// apply and the pending cancel as they were, for the next claim to reconcile
+// again, rather than recording the apply completed over a task still waiting.
+func TestReconcileEngineTerminalTruth_RefusedTaskWriteLeavesTheApplyUnsettled(t *testing.T) {
+	fx := newReconcileFixture(
+		&fakeControlEngine{
+			externallyAuthoritative: true,
+			progressResult:          &engine.ProgressResult{State: engine.StateCompleted},
+		},
+		pendingReconcileRequest(321, storage.ControlOperationCancel),
+	)
+	refused := errors.New("storage unavailable")
+	fx.storage.tasks.(*exactProgressTaskStore).updateErr = func(context.Context, *storage.Task) error { return refused }
+
+	handled, err := fx.client.reconcileEngineTerminalTruthBeforeCommands(t.Context(), fx.apply, []*storage.Task{fx.task})
+
+	require.ErrorIs(t, err, refused)
+	assert.Contains(t, err.Error(), "task-reconcile", "the error names the task whose outcome did not land")
+	assert.False(t, handled)
+	assert.Equal(t, state.Task.WaitingForDeploy, fx.task.State, "the task keeps the state storage holds")
+	assert.Equal(t, state.Apply.ValidatingDeployRequest, fx.apply.State, "the apply is not recorded completed over the waiting task")
+	controlReq, err := fx.controlRequests.GetPending(t.Context(), fx.apply.ID, storage.ControlOperationCancel)
+	require.NoError(t, err)
+	assert.NotNil(t, controlReq, "the cancel stays pending for the claim that reconciles next")
 }
 
 // When the engine reports the change still live, the reconcile must step aside
