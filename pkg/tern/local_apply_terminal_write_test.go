@@ -1167,6 +1167,15 @@ type lostReplyApplyStore struct {
 	err error
 }
 
+// CheckLease accepts the lease the stored apply carries, so the drive's
+// settlement writes run under it once the failure is stored.
+func (s *lostReplyApplyStore) CheckLease(_ context.Context, lease storage.ApplyLease) error {
+	if s.stored.LeaseToken != lease.Token {
+		return storage.ErrApplyLeaseLost
+	}
+	return nil
+}
+
 func (s *lostReplyApplyStore) Update(ctx context.Context, apply *storage.Apply) error {
 	if err := s.snapshotApplyStore.Update(ctx, apply); err != nil {
 		return err
@@ -1183,6 +1192,7 @@ func (s *lostReplyApplyStore) Update(ctx context.Context, apply *storage.Apply) 
 // next restart's reconciliation.
 func TestFailApplyAndNotify_LandedWriteWithALostReplyOwesItsSideEffects(t *testing.T) {
 	stored := failureLogTestApply(state.Apply.Running, 0)
+	stored.LeaseToken = "tok-a"
 	applies := &lostReplyApplyStore{snapshotApplyStore: &snapshotApplyStore{stored: *stored}, err: errors.New("connection reset by peer")}
 	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Running}
 	logs := &mockApplyLogStore{}
@@ -1204,7 +1214,8 @@ func TestFailApplyAndNotify_LandedWriteWithALostReplyOwesItsSideEffects(t *testi
 	client.SetObserver(stored.ID, observer)
 
 	drive := *stored
-	err := client.failApplyAndNotify(t.Context(), &drive, []*storage.Task{task}, "engine lost its connection to the target")
+	ctx := storage.WithApplyLease(t.Context(), storage.ApplyLease{ApplyID: stored.ID, Owner: "driver-a", Token: "tok-a"})
+	err := client.failApplyAndNotify(ctx, &drive, []*storage.Task{task}, "engine lost its connection to the target")
 
 	require.NoError(t, err)
 	assert.Equal(t, state.Apply.Failed, applies.stored.State)
@@ -1217,40 +1228,71 @@ func TestFailApplyAndNotify_LandedWriteWithALostReplyOwesItsSideEffects(t *testi
 	assert.Equal(t, state.Apply.Failed, observer.terminal[0].State)
 }
 
-// The write recording the apply failed returns an error and storage holds the
-// apply failed, but with another drive's message: that is not this write
-// landing, so the drive does not claim it. It returns the write error and runs
-// none of the failure's side effects, which belong to the writer that stored
-// it.
-func TestFailApplyAndNotify_AnotherDrivesStoredFailureIsNotThisWriteLanding(t *testing.T) {
-	writeErr := errors.New("connection reset by peer")
-	stored := failureLogTestApply(state.Apply.Failed, 0)
-	stored.ErrorMessage = "another drive's failure"
-	applies := &storedThenRefusingApplyStore{stored: *stored, running: true, err: writeErr}
-	task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Running}
-	logs := &mockApplyLogStore{}
-	client := &LocalClient{
-		config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
-		storage: &exactProgressStorage{
-			applies:         applies,
-			tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
-			logs:            logs,
-			controlRequests: &testControlRequestStore{},
-		},
-		logger: slog.Default(),
+// The write recording the apply failed returns an error, and storage holds the
+// apply failed, but nothing proves the write was this drive's: another drive
+// stored it, with its own message or with the same one under its own lease, or
+// this drive's write was refused because its lease was lost, or the drive holds
+// no apply lease at all. A displaced driver must not take another driver's
+// outcome, or its side effects, as its own (OW-2), so the drive returns the
+// write error, its copy stays as it was, and it logs and posts nothing.
+func TestFailApplyAndNotify_AFailureThisDriveCannotProveIsNotLanded(t *testing.T) {
+	const failure = "engine lost its connection to the target"
+	ownLease := storage.ApplyLease{ApplyID: 7, Owner: "driver-a", Token: "tok-a"}
+	leaseLost := fmt.Errorf("record apply: %w", storage.ErrApplyLeaseLost)
+	cases := []struct {
+		name          string
+		storedMessage string
+		storedToken   string
+		writeErr      error
+		lease         *storage.ApplyLease
+	}{
+		{name: "another drive's message", storedMessage: "another drive's failure", storedToken: "tok-a", writeErr: errors.New("connection reset by peer"), lease: &ownLease},
+		{name: "a successor's same message under its own lease", storedMessage: failure, storedToken: "tok-b", writeErr: errors.New("connection reset by peer"), lease: &ownLease},
+		{name: "the write was refused for a lost lease", storedMessage: failure, storedToken: "tok-a", writeErr: leaseLost, lease: &ownLease},
+		// An apply driven without a lease stores no token, so only the missing
+		// lease, not a token mismatch, tells this write apart.
+		{name: "the drive holds no apply lease", storedMessage: failure, storedToken: "", writeErr: errors.New("connection reset by peer")},
 	}
-	observer := &terminalRecordingObserver{}
-	client.SetObserver(stored.ID, observer)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stored := failureLogTestApply(state.Apply.Failed, 0)
+			stored.ErrorMessage = tc.storedMessage
+			stored.LeaseToken = tc.storedToken
+			applies := &storedThenRefusingApplyStore{stored: *stored, running: true, err: tc.writeErr}
+			task := &storage.Task{ID: 1, TaskIdentifier: "task-1", ApplyID: stored.ID, TableName: "orders", State: state.Task.Running}
+			logs := &mockApplyLogStore{}
+			client := &LocalClient{
+				config: LocalConfig{Database: "orders", Type: storage.DatabaseTypeMySQL},
+				storage: &exactProgressStorage{
+					applies:         applies,
+					tasks:           &exactProgressTaskStore{tasks: []*storage.Task{task}},
+					logs:            logs,
+					controlRequests: &testControlRequestStore{},
+				},
+				logger: slog.Default(),
+			}
+			observer := &terminalRecordingObserver{}
+			client.SetObserver(stored.ID, observer)
+			ctx := t.Context()
+			if tc.lease != nil {
+				ctx = storage.WithApplyLease(ctx, *tc.lease)
+			}
 
-	drive := *stored
-	drive.State = state.Apply.Running
-	drive.ErrorMessage = ""
-	err := client.failApplyAndNotify(t.Context(), &drive, []*storage.Task{task}, "engine lost its connection to the target")
+			drive := *stored
+			drive.State = state.Apply.Running
+			drive.ErrorMessage = ""
+			drive.LeaseToken = tc.storedToken
+			if tc.lease != nil {
+				drive.LeaseToken = tc.lease.Token
+			}
+			err := client.failApplyAndNotify(ctx, &drive, []*storage.Task{task}, failure)
 
-	require.ErrorIs(t, err, writeErr)
-	assert.Equal(t, state.Apply.Running, drive.State)
-	assert.Empty(t, logs.logs)
-	assert.Empty(t, observer.terminal)
+			require.ErrorIs(t, err, tc.writeErr)
+			assert.Equal(t, state.Apply.Running, drive.State)
+			assert.Empty(t, logs.logs)
+			assert.Empty(t, observer.terminal)
+		})
+	}
 }
 
 // storedThenRefusingApplyStore reads the apply as running until its first
@@ -1270,6 +1312,13 @@ func (s *storedThenRefusingApplyStore) Get(context.Context, int64) (*storage.App
 		cp.ErrorMessage = ""
 	}
 	return &cp, nil
+}
+
+func (s *storedThenRefusingApplyStore) CheckLease(_ context.Context, lease storage.ApplyLease) error {
+	if s.stored.LeaseToken != lease.Token {
+		return storage.ErrApplyLeaseLost
+	}
+	return nil
 }
 
 func (s *storedThenRefusingApplyStore) Update(context.Context, *storage.Apply) error {
